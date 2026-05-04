@@ -1,0 +1,22 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: node dist/worker.js
+    restart: unless-stopped
+    env_file:
+      - .env
+
+  api:
+    profiles:
+      - api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: node dist/api.js
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"

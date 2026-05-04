@@ -1,0 +1,27 @@
+# Copy to fly.toml and replace app/region before deploying:
+#   cp fly.worker.toml.example fly.toml
+#   fly launch --no-deploy --no-public-ips
+#   fly secrets set DATABASE_URL=... IMAP_ENCRYPTION_KEY=...
+#   fly deploy
+
+app = "supamail-worker"
+primary_region = "iad"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BODY_FETCH_POLICY = "priority_then_backfill"
+  SYNC_INTERVAL_MS = "60000"
+  WINDOW_DAYS = "90"
+  IMAP_MAX_COMMANDS_PER_MINUTE = "200"
+
+[processes]
+  worker = "node dist/worker.js"
+
+[[vm]]
+  processes = ["worker"]
+  size = "shared-cpu-1x"
+  memory = "512mb"

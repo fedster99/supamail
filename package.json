@@ -1,5 +1,5 @@
 {
-  "name": "imap-to-supabase",
+  "name": "supamail",
   "version": "0.1.0",
   "description": "Supabase/Postgres-native IMAP mirror with metadata, flags, attachments, sync health, and full message bodies.",
   "type": "module",
@@ -7,7 +7,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "imap-to-supabase": "dist/cli.js"
+    "supamail": "dist/cli.js"
   },
   "files": [
     "dist",

@@ -46,6 +46,8 @@ curl -X POST "$API_URL/accounts" \
 
 The worker loops on `SYNC_INTERVAL_MS`, claims eligible accounts with advisory locks, and records every run in `imap_sync_runs`.
 
+For lower-cost alternatives, see [deployment-options.md](deployment-options.md).
+
 ## Operational Checks
 
 - `imap_accounts.sync_state`

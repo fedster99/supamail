@@ -1,8 +1,8 @@
-# imap-to-supabase
+# Supamail
 
-`imap-to-supabase` is a self-hosted IMAP mirror for Supabase/Postgres. It syncs mailbox folders, message metadata, flags, attachment metadata, sync health, and full RFC822/MIME message bodies into neutral Postgres tables.
+Supamail is a self-hosted IMAP mirror for Supabase/Postgres. It syncs mailbox folders, message metadata, flags, attachment metadata, sync health, and full RFC822/MIME message bodies into neutral Postgres tables.
 
-The first target deployment is simple: Supabase hosts Postgres, Render runs the worker container, and an optional Render web service exposes the tiny control API.
+The first target deployment is simple: Supabase hosts Postgres, a container host runs the worker, and an optional web service exposes the tiny control API.
 
 ## What It Syncs
 
@@ -42,12 +42,14 @@ psql "$DATABASE_URL" -f supabase/migrations/0001_imap_mirror.sql
 
 Use a direct/session-affine Supabase Postgres URL for `DATABASE_URL`. Transaction pooler URLs are rejected because account-level advisory locks require session affinity.
 
-## Render Setup
+## Deployment
 
-The included `render.yaml` defines:
+Supported deployment files:
 
-- `imap-to-supabase-worker`: always-on Docker worker
-- `imap-to-supabase-api`: optional Hono control API
+- `render.yaml`: Render worker and optional API
+- `fly.worker.toml.example`: low-cost Fly.io worker-only deployment
+- `fly.api.toml.example`: optional Fly.io API deployment
+- `compose.yaml`: Docker Compose / Coolify / VPS deployment
 
 Required environment variables:
 
@@ -58,13 +60,15 @@ API_TOKEN=...
 BODY_FETCH_POLICY=priority_then_backfill
 ```
 
+See [docs/deployment-options.md](docs/deployment-options.md) for the cost/ops tradeoffs.
+
 ## CLI
 
 ```bash
 pnpm install
 pnpm migrate
 
-pnpm exec imap-to-supabase create-account \
+pnpm exec supamail create-account \
   --email alice@example.com \
   --host secure.emailsrvr.com \
   --port 993 \
@@ -72,9 +76,9 @@ pnpm exec imap-to-supabase create-account \
   --password "$IMAP_PASSWORD" \
   --profile rackspace
 
-pnpm exec imap-to-supabase list-accounts
-pnpm exec imap-to-supabase sync --account-id <uuid>
-pnpm exec imap-to-supabase refetch-body --message-id <uuid>
+pnpm exec supamail list-accounts
+pnpm exec supamail sync --account-id <uuid>
+pnpm exec supamail refetch-body --message-id <uuid>
 ```
 
 ## API
