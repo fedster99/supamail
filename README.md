@@ -132,6 +132,21 @@ pnpm dry-run:local
 
 `pnpm dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. It applies the migration, runs the real `MirrorEngine` twice, asserts the mirrored rows, then deletes the fixture account unless `SUPAMAIL_DRY_RUN_KEEP_DATA=true` is set.
 
+For stronger smoke coverage:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
+IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
+pnpm smoke:greenmail
+
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
+IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
+NODE_OPTIONS=--max-old-space-size=160 \
+pnpm smoke:load
+```
+
+`pnpm smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server, delivers fixture messages over SMTP, then syncs them through the real IMAP protocol. `pnpm smoke:load` generates a large fake mailbox and verifies metadata batching and body backfill stay bounded under the low-memory runtime profile.
+
 ## Source Extraction Notes
 
 This repository is intentionally independent from Signal. It excludes CRM hydration, identity/belief code, MCP routes, Trigger.dev coupling, and internal dashboard logic.

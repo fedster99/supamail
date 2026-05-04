@@ -60,5 +60,13 @@ export async function readInitialMigration(): Promise<string> {
 
 export async function applyInitialMigration(pool: PgPool = getPool()): Promise<void> {
   const sql = await readInitialMigration();
-  await pool.query(sql);
+  const client = await pool.connect();
+
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext('supamail.initial_migration'))");
+    await client.query(sql);
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext('supamail.initial_migration'))").catch(() => undefined);
+    client.release();
+  }
 }

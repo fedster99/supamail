@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { applyInitialMigration } from "../db.js";
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -39,5 +40,9 @@ describe("initial schema", () => {
     expect(sql.match(/SET search_path = ''/g)).toHaveLength(3);
     expect(sql).toContain("extensions.pgp_sym_encrypt");
     expect(sql).toContain("extensions.pgp_sym_decrypt");
+  });
+
+  it("serializes programmatic migration calls with an advisory lock", async () => {
+    expect(applyInitialMigration.toString()).toContain("pg_advisory_lock(hashtext('supamail.initial_migration'))");
   });
 });
