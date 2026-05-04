@@ -5,6 +5,7 @@ import { MirrorEngine } from "./sync-engine.js";
 const config = getConfig();
 const engine = new MirrorEngine();
 let stopping = false;
+let wakeSleep: (() => void) | null = null;
 
 async function tick(): Promise<void> {
   const startedAt = Date.now();
@@ -31,17 +32,34 @@ async function loop(): Promise<void> {
     } catch (error) {
       console.error("sync.tick.failed", error);
     }
-    await new Promise((resolve) => setTimeout(resolve, config.SYNC_INTERVAL_MS));
+    await sleep(config.SYNC_INTERVAL_MS);
   }
 }
 
-process.on("SIGTERM", () => {
-  stopping = true;
-});
+function sleep(ms: number): Promise<void> {
+  if (stopping) return Promise.resolve();
 
-process.on("SIGINT", () => {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      wakeSleep = null;
+      resolve();
+    }, ms);
+
+    wakeSleep = () => {
+      clearTimeout(timeout);
+      wakeSleep = null;
+      resolve();
+    };
+  });
+}
+
+function stop(): void {
   stopping = true;
-});
+  wakeSleep?.();
+}
+
+process.on("SIGTERM", stop);
+process.on("SIGINT", stop);
 
 await loop();
 await closePool();

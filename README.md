@@ -117,6 +117,21 @@ pnpm test
 pnpm build
 ```
 
+## Local Supabase Dry Run
+
+The repo includes a local Supabase config on alternate ports so it can run beside the Signal dev stack.
+
+```bash
+supabase db start
+supabase db reset --local
+
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
+IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
+pnpm dry-run:local
+```
+
+`pnpm dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. It applies the migration, runs the real `MirrorEngine` twice, asserts the mirrored rows, then deletes the fixture account unless `SUPAMAIL_DRY_RUN_KEEP_DATA=true` is set.
+
 ## Source Extraction Notes
 
 This repository is intentionally independent from Signal. It excludes CRM hydration, identity/belief code, MCP routes, Trigger.dev coupling, and internal dashboard logic.

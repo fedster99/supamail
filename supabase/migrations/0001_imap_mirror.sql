@@ -1,9 +1,11 @@
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS citext;
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA extensions;
 
 CREATE OR REPLACE FUNCTION public.imap_mirror_set_updated_at()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = ''
 AS $$
 BEGIN
   NEW.updated_at = now();
@@ -13,7 +15,7 @@ $$;
 
 CREATE TABLE IF NOT EXISTS public.imap_accounts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email_address citext NOT NULL UNIQUE,
+  email_address extensions.citext NOT NULL UNIQUE,
   provider_profile text NOT NULL DEFAULT 'generic-imap',
   host text NOT NULL,
   port integer NOT NULL,
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS public.imap_accounts (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+DROP TRIGGER IF EXISTS imap_accounts_set_updated_at ON public.imap_accounts;
 CREATE TRIGGER imap_accounts_set_updated_at
   BEFORE UPDATE ON public.imap_accounts
   FOR EACH ROW
@@ -92,6 +95,7 @@ CREATE TABLE IF NOT EXISTS public.imap_folders (
 CREATE INDEX IF NOT EXISTS imap_folders_due_idx
   ON public.imap_folders (account_id, tracked, status, sync_priority, next_sync_due_at);
 
+DROP TRIGGER IF EXISTS imap_folders_set_updated_at ON public.imap_folders;
 CREATE TRIGGER imap_folders_set_updated_at
   BEFORE UPDATE ON public.imap_folders
   FOR EACH ROW
@@ -155,6 +159,7 @@ CREATE INDEX IF NOT EXISTS imap_messages_body_backlog_idx
     AND window_status = 'IN_WINDOW'
     AND body_fetched_at IS NULL;
 
+DROP TRIGGER IF EXISTS imap_messages_set_updated_at ON public.imap_messages;
 CREATE TRIGGER imap_messages_set_updated_at
   BEFORE UPDATE ON public.imap_messages
   FOR EACH ROW
@@ -183,6 +188,7 @@ CREATE TABLE IF NOT EXISTS public.imap_message_bodies (
 CREATE INDEX IF NOT EXISTS imap_message_bodies_fetched_at_idx
   ON public.imap_message_bodies (fetched_at DESC);
 
+DROP TRIGGER IF EXISTS imap_message_bodies_set_updated_at ON public.imap_message_bodies;
 CREATE TRIGGER imap_message_bodies_set_updated_at
   BEFORE UPDATE ON public.imap_message_bodies
   FOR EACH ROW
@@ -245,13 +251,15 @@ CREATE INDEX IF NOT EXISTS imap_sync_events_account_type_idx
 CREATE OR REPLACE FUNCTION public.imap_encrypt_password(plaintext text, encryption_key text)
 RETURNS bytea
 LANGUAGE sql
+SET search_path = ''
 AS $$
-  SELECT pgp_sym_encrypt(plaintext, encryption_key)::bytea;
+  SELECT extensions.pgp_sym_encrypt(plaintext, encryption_key)::bytea;
 $$;
 
 CREATE OR REPLACE FUNCTION public.imap_decrypt_password(encrypted bytea, encryption_key text)
 RETURNS text
 LANGUAGE sql
+SET search_path = ''
 AS $$
-  SELECT pgp_sym_decrypt(encrypted, encryption_key);
+  SELECT extensions.pgp_sym_decrypt(encrypted, encryption_key);
 $$;
