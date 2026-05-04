@@ -201,10 +201,20 @@ export class MirrorEngine {
       }
 
       const uniqueUids = [...new Set(uids)].sort((a, b) => a - b);
-      const metadata = await fetchMessageMetadata(client, uniqueUids, this.config.INCREMENTAL_SYNC_BATCH_SIZE);
-      const messages = await this.repository.upsertMessages(account.id, folder, uidValidity, metadata, windowCutoff);
-      for (const message of messages) {
-        await this.hooks.onMessageUpsert?.(message);
+      const metadataBatchSize = folder.initial_sync_complete
+        ? this.config.INCREMENTAL_SYNC_BATCH_SIZE
+        : this.config.INITIAL_SYNC_BATCH_SIZE;
+      let messagesUpserted = 0;
+
+      for (let i = 0; i < uniqueUids.length; i += metadataBatchSize) {
+        const batchUids = uniqueUids.slice(i, i + metadataBatchSize);
+        const metadata = await fetchMessageMetadata(client, batchUids, metadataBatchSize);
+        const messages = await this.repository.upsertMessages(account.id, folder, uidValidity, metadata, windowCutoff);
+        messagesUpserted += messages.length;
+
+        for (const message of messages) {
+          await this.hooks.onMessageUpsert?.(message);
+        }
       }
 
       const liveUids = await searchAllUids(client, windowCutoff);
@@ -218,7 +228,7 @@ export class MirrorEngine {
       });
 
       return {
-        messagesUpserted: messages.length,
+        messagesUpserted,
         reconcileGapsFound
       };
     } finally {

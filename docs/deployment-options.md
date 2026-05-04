@@ -6,7 +6,7 @@ Supamail is just Docker plus outbound network access to IMAP and Supabase Postgr
 
 Use Render when the priority is fastest setup and low operational burden.
 
-Use Fly.io when the priority is keeping the always-on worker bill small without moving all the way to self-hosted VPS operations. The worker can run as one Docker Machine with no public IP.
+Use Fly.io when the priority is keeping the always-on worker bill small without moving all the way to self-hosted VPS operations. The worker can run as one Docker Machine with no public IP. The included worker profile targets Fly's 256 MB `shared-cpu-1x` shape.
 
 Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cost across multiple always-on services and you are comfortable owning OS updates, Docker, Coolify upgrades, monitoring, and server backups.
 
@@ -32,6 +32,24 @@ fly secrets set \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY"
 fly deploy
+```
+
+The 256 MB worker profile intentionally uses conservative runtime settings:
+
+- `NODE_OPTIONS=--max-old-space-size=160`
+- `BODY_RAW_MAX_BYTES=8388608`
+- `BODY_BACKFILL_BATCH_SIZE=3`
+- `INITIAL_SYNC_BATCH_SIZE=25`
+- `INCREMENTAL_SYNC_BATCH_SIZE=25`
+
+This keeps sync metadata and body parsing bounded. If a mailbox regularly has large MIME bodies or the machine OOMs, first increase `BODY_RAW_MAX_BYTES` only if needed; otherwise move the worker to `512mb`.
+
+If your Signal repo already has the Fly and database env vars loaded locally, you can reuse them:
+
+```bash
+fly secrets set \
+  DATABASE_URL="$DATABASE_URL" \
+  IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY"
 ```
 
 Optional API deploy:

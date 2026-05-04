@@ -5,7 +5,7 @@
 #   fly deploy
 
 app = "supamail-worker"
-primary_region = "iad"
+primary_region = "ord"
 kill_signal = "SIGINT"
 kill_timeout = "30s"
 
@@ -13,10 +13,15 @@ kill_timeout = "30s"
   dockerfile = "Dockerfile"
 
 [env]
+  NODE_OPTIONS = "--max-old-space-size=160"
   BODY_FETCH_POLICY = "priority_then_backfill"
   SYNC_INTERVAL_MS = "60000"
   WINDOW_DAYS = "90"
-  IMAP_MAX_COMMANDS_PER_MINUTE = "200"
+  BODY_RAW_MAX_BYTES = "8388608"
+  BODY_BACKFILL_BATCH_SIZE = "3"
+  INITIAL_SYNC_BATCH_SIZE = "25"
+  INCREMENTAL_SYNC_BATCH_SIZE = "25"
+  IMAP_MAX_COMMANDS_PER_MINUTE = "120"
 
 [processes]
   worker = "node dist/worker.js"
@@ -24,4 +29,4 @@ kill_timeout = "30s"
 [[vm]]
   processes = ["worker"]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "256mb"
