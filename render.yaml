@@ -1,0 +1,36 @@
+services:
+  - type: worker
+    name: imap-to-supabase-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: IMAP_ENCRYPTION_KEY
+        sync: false
+      - key: BODY_FETCH_POLICY
+        value: priority_then_backfill
+      - key: SYNC_INTERVAL_MS
+        value: "60000"
+      - key: WINDOW_DAYS
+        value: "90"
+      - key: IMAP_MAX_COMMANDS_PER_MINUTE
+        value: "200"
+
+  - type: web
+    name: imap-to-supabase-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: node dist/api.js
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: IMAP_ENCRYPTION_KEY
+        sync: false
+      - key: API_TOKEN
+        sync: false
+      - key: BODY_FETCH_POLICY
+        value: priority_then_backfill
