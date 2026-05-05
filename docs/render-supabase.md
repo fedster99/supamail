@@ -11,7 +11,7 @@ Set these Render environment variables on both services:
 - `DATABASE_URL`
 - `IMAP_ENCRYPTION_KEY`
 
-Set `API_TOKEN` on the API service if it is exposed outside a private network.
+Set `API_TOKEN` on the API service. The API refuses to start without it; only `/health` is public.
 
 ## 3. Apply Schema
 

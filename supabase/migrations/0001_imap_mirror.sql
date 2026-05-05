@@ -1,6 +1,5 @@
 CREATE SCHEMA IF NOT EXISTS extensions;
 CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;
-CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA extensions;
 
 CREATE OR REPLACE FUNCTION public.imap_mirror_set_updated_at()
 RETURNS trigger
@@ -15,7 +14,7 @@ $$;
 
 CREATE TABLE IF NOT EXISTS public.imap_accounts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email_address extensions.citext NOT NULL UNIQUE,
+  email_address text NOT NULL,
   provider_profile text NOT NULL DEFAULT 'generic-imap',
   host text NOT NULL,
   port integer NOT NULL,
@@ -45,6 +44,9 @@ CREATE TABLE IF NOT EXISTS public.imap_accounts (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS imap_accounts_email_address_lower_uidx
+  ON public.imap_accounts (lower(email_address));
 
 DROP TRIGGER IF EXISTS imap_accounts_set_updated_at ON public.imap_accounts;
 CREATE TRIGGER imap_accounts_set_updated_at
@@ -205,7 +207,7 @@ CREATE TABLE IF NOT EXISTS public.imap_attachments (
   disposition text CHECK (disposition IS NULL OR disposition IN ('attachment', 'inline')),
   storage_key text,
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (message_id, part_number, content_id, filename)
+  UNIQUE (message_id, part_number)
 );
 
 CREATE INDEX IF NOT EXISTS imap_attachments_message_id_idx
@@ -251,15 +253,51 @@ CREATE INDEX IF NOT EXISTS imap_sync_events_account_type_idx
 CREATE OR REPLACE FUNCTION public.imap_encrypt_password(plaintext text, encryption_key text)
 RETURNS bytea
 LANGUAGE sql
-SET search_path = ''
+SET search_path = extensions, public
 AS $$
-  SELECT extensions.pgp_sym_encrypt(plaintext, encryption_key)::bytea;
+  SELECT pgp_sym_encrypt(plaintext, encryption_key)::bytea;
 $$;
 
 CREATE OR REPLACE FUNCTION public.imap_decrypt_password(encrypted bytea, encryption_key text)
 RETURNS text
 LANGUAGE sql
-SET search_path = ''
+SET search_path = extensions, public
 AS $$
-  SELECT extensions.pgp_sym_decrypt(encrypted, encryption_key);
+  SELECT pgp_sym_decrypt(encrypted, encryption_key);
 $$;
+
+ALTER TABLE public.imap_accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imap_folders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imap_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imap_message_bodies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imap_attachments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imap_sync_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.imap_sync_events ENABLE ROW LEVEL SECURITY;
+
+REVOKE EXECUTE ON FUNCTION public.imap_encrypt_password(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.imap_decrypt_password(bytea, text) FROM PUBLIC;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE ALL ON TABLE public.imap_accounts FROM anon;
+    REVOKE ALL ON TABLE public.imap_folders FROM anon;
+    REVOKE ALL ON TABLE public.imap_messages FROM anon;
+    REVOKE ALL ON TABLE public.imap_message_bodies FROM anon;
+    REVOKE ALL ON TABLE public.imap_attachments FROM anon;
+    REVOKE ALL ON TABLE public.imap_sync_runs FROM anon;
+    REVOKE ALL ON TABLE public.imap_sync_events FROM anon;
+    REVOKE USAGE, SELECT ON SEQUENCE public.imap_accounts_lock_id_seq FROM anon;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON TABLE public.imap_accounts FROM authenticated;
+    REVOKE ALL ON TABLE public.imap_folders FROM authenticated;
+    REVOKE ALL ON TABLE public.imap_messages FROM authenticated;
+    REVOKE ALL ON TABLE public.imap_message_bodies FROM authenticated;
+    REVOKE ALL ON TABLE public.imap_attachments FROM authenticated;
+    REVOKE ALL ON TABLE public.imap_sync_runs FROM authenticated;
+    REVOKE ALL ON TABLE public.imap_sync_events FROM authenticated;
+    REVOKE USAGE, SELECT ON SEQUENCE public.imap_accounts_lock_id_seq FROM authenticated;
+  END IF;
+END $$;

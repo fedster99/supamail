@@ -36,6 +36,27 @@ export interface ImapAccount {
   updated_at: Date;
 }
 
+export interface AccountSummary {
+  id: string;
+  email_address: string;
+  provider_profile: string;
+  body_fetch_policy: BodyFetchPolicy;
+  sync_state: SyncState;
+  sync_state_reason: string | null;
+  last_sync_started_at: Date | null;
+  last_sync_finished_at: Date | null;
+  priority_sync_lag_seconds: number | null;
+  overall_sync_lag_seconds: number | null;
+  consecutive_failures: number;
+  consecutive_successes: number;
+  backoff_until: Date | null;
+  last_folder_discovery_at: Date | null;
+  next_folder_discovery_at: Date | null;
+  last_heartbeat_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export interface ImapFolder {
   id: string;
   account_id: string;

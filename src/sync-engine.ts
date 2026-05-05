@@ -67,7 +67,7 @@ export class MirrorEngine {
     };
 
     const locked = await withAccountLock(this.pool, account.lock_id, async () => {
-      await this.repository.markAccountSyncStarted(account.id, `imap-to-supabase:${process.pid}`);
+      await this.repository.markAccountSyncStarted(account.id, `supamail:${process.pid}`);
       let client: MirrorImapClient | null = null;
 
       try {
@@ -98,6 +98,8 @@ export class MirrorEngine {
 
         if (result.outcome === "failed") {
           await this.repository.markAccountSyncFailed(account.id, result.errors.join("; "));
+        } else if (result.outcome === "partial_success") {
+          await this.repository.markAccountSyncPartial(account.id, result.errors.join("; "));
         } else {
           await this.repository.markAccountSyncSucceeded(account.id);
         }
@@ -152,6 +154,10 @@ export class MirrorEngine {
 
   private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<void> {
     const folders = await client.list();
+    if (folders.length === 0) {
+      throw new Error(`Provider returned no folders for ${account.email_address}`);
+    }
+
     const upserted = await this.repository.upsertDiscoveredFolders(
       account,
       folders.map((folder) => ({
@@ -217,7 +223,10 @@ export class MirrorEngine {
         }
       }
 
-      const liveUids = await searchAllUids(client, windowCutoff);
+      const liveUids = await searchAllUids(client);
+      if (liveUids.length === 0 && (mailbox.exists ?? 0) > 0) {
+        throw new Error(`Reconcile returned no UIDs for non-empty mailbox ${folder.path}`);
+      }
       const reconcileGapsFound = await this.repository.markMissingMessages(account.id, folder, uidValidity, liveUids);
 
       await this.repository.markFolderSynced(folder.id, {

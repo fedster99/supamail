@@ -3,6 +3,7 @@ import { encryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
 import { getProviderProfile } from "./provider-profiles.js";
 import type {
+  AccountSummary,
   BodyFetchPolicy,
   CreateAccountInput,
   ImapAccount,
@@ -15,15 +16,36 @@ import type {
   SyncTriggerType
 } from "./types.js";
 
+const ACCOUNT_SUMMARY_COLUMNS = `
+  id,
+  email_address,
+  provider_profile,
+  body_fetch_policy,
+  sync_state,
+  sync_state_reason,
+  last_sync_started_at,
+  last_sync_finished_at,
+  priority_sync_lag_seconds,
+  overall_sync_lag_seconds,
+  consecutive_failures,
+  consecutive_successes,
+  backoff_until,
+  last_folder_discovery_at,
+  next_folder_discovery_at,
+  last_heartbeat_at,
+  created_at,
+  updated_at
+`;
+
 export class MirrorRepository {
   constructor(
     private readonly pool: PgPool,
     private readonly config: AppConfig
   ) {}
 
-  async createAccount(input: CreateAccountInput): Promise<ImapAccount> {
+  async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
     const encrypted = await encryptPassword(this.pool, input.password, this.config.IMAP_ENCRYPTION_KEY);
-    const result = await this.pool.query<ImapAccount>(
+    const result = await this.pool.query<AccountSummary>(
       `
       INSERT INTO public.imap_accounts (
         email_address,
@@ -36,7 +58,7 @@ export class MirrorRepository {
         body_fetch_policy
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
+      RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
       `,
       [
         input.emailAddress,
@@ -52,9 +74,9 @@ export class MirrorRepository {
     return result.rows[0];
   }
 
-  async listAccounts(): Promise<ImapAccount[]> {
-    const result = await this.pool.query<ImapAccount>(
-      "SELECT * FROM public.imap_accounts ORDER BY email_address"
+  async listAccounts(): Promise<AccountSummary[]> {
+    const result = await this.pool.query<AccountSummary>(
+      `SELECT ${ACCOUNT_SUMMARY_COLUMNS} FROM public.imap_accounts ORDER BY email_address`
     );
     return result.rows;
   }
@@ -74,11 +96,15 @@ export class MirrorRepository {
       FROM public.imap_accounts
       WHERE sync_state != 'PAUSED'
         AND (backoff_until IS NULL OR backoff_until <= now())
-        AND currently_syncing = false
+        AND (
+          currently_syncing = false
+          OR last_heartbeat_at IS NULL
+          OR last_heartbeat_at <= now() - ($2 * interval '1 millisecond')
+        )
       ORDER BY COALESCE(last_sync_finished_at, 'epoch'::timestamptz), created_at
       LIMIT $1
       `,
-      [limit]
+      [limit, this.config.MAX_LOCK_HOLD_MS]
     );
     return result.rows;
   }
@@ -172,6 +198,25 @@ export class MirrorRepository {
     );
   }
 
+  async markAccountSyncPartial(accountId: string, error: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET
+        currently_syncing = false,
+        sync_started_by = NULL,
+        last_sync_finished_at = now(),
+        last_heartbeat_at = now(),
+        sync_state = CASE WHEN consecutive_failures >= 4 THEN 'BROKEN' ELSE 'DEGRADED' END,
+        sync_state_reason = $2,
+        consecutive_failures = consecutive_failures + 1,
+        consecutive_successes = 0
+      WHERE id = $1
+      `,
+      [accountId, error.slice(0, 1000)]
+    );
+  }
+
   async markAccountSyncFailed(accountId: string, error: string): Promise<void> {
     await this.pool.query(
       `
@@ -256,6 +301,19 @@ export class MirrorRepository {
           tracked = false
       WHERE account_id = $1
         AND NOT (path = ANY($2::text[]))
+        AND missing_since IS NOT NULL
+        AND status != 'MISSING'
+      `,
+      [account.id, [...seen]]
+    );
+
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET missing_since = now()
+      WHERE account_id = $1
+        AND NOT (path = ANY($2::text[]))
+        AND missing_since IS NULL
         AND status != 'MISSING'
       `,
       [account.id, [...seen]]
@@ -474,7 +532,13 @@ export class MirrorRepository {
             disposition
           )
           VALUES ($1, $2, $3, $4, $5, $6, $7)
-          ON CONFLICT DO NOTHING
+          ON CONFLICT (message_id, part_number)
+          DO UPDATE SET
+            filename = EXCLUDED.filename,
+            mime_type = EXCLUDED.mime_type,
+            size_bytes = EXCLUDED.size_bytes,
+            content_id = EXCLUDED.content_id,
+            disposition = EXCLUDED.disposition
           `,
           [
             row.id,
@@ -504,6 +568,7 @@ export class MirrorRepository {
           AND folder_path = $2
           AND uidvalidity = $3
           AND deleted_in_provider = false
+          AND window_status = 'IN_WINDOW'
           AND NOT (uid = ANY($4::bigint[]))
         RETURNING id
       )

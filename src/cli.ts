@@ -12,7 +12,7 @@ const repository = new MirrorRepository(pool, config);
 const engine = new MirrorEngine({ pool, config, repository });
 
 program
-  .name("imap-to-supabase")
+  .name("supamail")
   .description("Supabase/Postgres-native IMAP mirror")
   .version("0.1.0");
 

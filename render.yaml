@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: imap-to-supabase-worker
+    name: supamail-worker
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: starter
@@ -19,7 +19,7 @@ services:
         value: "200"
 
   - type: web
-    name: imap-to-supabase-api
+    name: supamail-api
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerCommand: node dist/api.js

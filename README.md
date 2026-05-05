@@ -170,7 +170,7 @@ Attachment binaries are not downloaded by default. SupaMail stores attachment me
 
 ## API
 
-All endpoints require `Authorization: Bearer $API_TOKEN` when `API_TOKEN` is set.
+`API_TOKEN` is required to run the API service. Every endpoint except `/health` requires `Authorization: Bearer $API_TOKEN`.
 
 - `GET /health`
 - `POST /migrate`
@@ -178,6 +178,8 @@ All endpoints require `Authorization: Bearer $API_TOKEN` when `API_TOKEN` is set
 - `POST /accounts`
 - `POST /accounts/:id/sync`
 - `POST /messages/:id/refetch-body`
+
+Account responses intentionally omit encrypted passwords, lock IDs, and worker internals.
 
 Example:
 

@@ -11,16 +11,20 @@ const repository = new MirrorRepository(pool, config);
 const engine = new MirrorEngine({ pool, config, repository });
 const app = new Hono();
 
+if (!config.API_TOKEN) {
+  throw new Error("API_TOKEN is required to run the SupaMail API");
+}
+
+app.get("/health", (c) => c.json({ ok: true, service: "supamail" }));
+
 app.use("*", async (c, next) => {
-  if (!config.API_TOKEN) return next();
+  if (c.req.path === "/health") return next();
   const header = c.req.header("authorization") ?? "";
   if (header !== `Bearer ${config.API_TOKEN}`) {
     return c.json({ error: "unauthorized" }, 401);
   }
   return next();
 });
-
-app.get("/health", (c) => c.json({ ok: true, service: "imap-to-supabase" }));
 
 app.post("/migrate", async (c) => {
   await applyInitialMigration(pool);
@@ -58,4 +62,4 @@ app.post("/messages/:id/refetch-body", async (c) => {
 });
 
 serve({ fetch: app.fetch, port: config.PORT });
-console.log(`imap-to-supabase API listening on :${config.PORT}`);
+console.log(`SupaMail API listening on :${config.PORT}`);

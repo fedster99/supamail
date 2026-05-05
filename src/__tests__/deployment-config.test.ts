@@ -13,4 +13,12 @@ describe("deployment configs", () => {
     expect(toml).toContain('INITIAL_SYNC_BATCH_SIZE = "25"');
     expect(toml).toContain('INCREMENTAL_SYNC_BATCH_SIZE = "25"');
   });
+
+  it("uses SupaMail service names in Render config", async () => {
+    const yaml = await readFile(resolve(process.cwd(), "render.yaml"), "utf8");
+
+    expect(yaml).toContain("name: supamail-worker");
+    expect(yaml).toContain("name: supamail-api");
+    expect(yaml).not.toContain("imap-to-supabase");
+  });
 });
