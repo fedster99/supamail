@@ -1,55 +1,62 @@
-# Supamail
+# SupaMail
 
-Supamail is a self-hosted IMAP mirror for Supabase/Postgres. It syncs mailbox folders, message metadata, flags, attachment metadata, sync health, and full RFC822/MIME message bodies into neutral Postgres tables.
+Reliable IMAP sync for Supabase.
 
-The first target deployment is simple: Supabase hosts Postgres, a container host runs the worker, and an optional web service exposes the tiny control API.
+SupaMail turns any IMAP inbox into queryable Supabase tables. It runs a worker/API, connects to your mailboxes, and keeps folders, messages, flags, full MIME bodies, attachment metadata, and sync health up to date in Postgres.
 
-## What It Syncs
+The simplest deployment is Supabase + Render: Supabase hosts the database, Render runs the worker/API, and your app reads email from its own tables.
+
+## Background
+
+I kept running into the same annoying problem at work.
+
+Every new AI email tool integrates with Gmail. Some integrate with Outlook. But if your inbox is on any other email provider, you are usually out of luck. In my case, it was Rackspace.
+
+And that makes sense. IMAP is old. It is messy. It has folders, weird cursors, UIDVALIDITY resets, flags, MIME bodies, provider quirks, silent failures, and a thousand tiny ways to miss an email.
+
+But email is too valuable to leave locked behind whatever provider you happen to use.
+
+So I built SupaMail.
+
+It syncs any IMAP inbox into Supabase. Reliably. Full messages, folders, flags, bodies, attachments metadata, sync health, all of it.
+
+The point is simple: once email is in Supabase, you can build whatever you want on top of it.
+
+AI agents. Internal tools. CRM workflows. Search. Alerts. Automations.
+
+SupaMail is the boring sync layer that makes the fun stuff possible.
+
+## What You Get
 
 - IMAP accounts and folder state
-- Initial and incremental message metadata
-- UIDVALIDITY resets and soft-deletes
-- Reconciliation for messages no longer visible in a folder
-- Flags and MIME structure from IMAP metadata fetches
-- Attachment and inline-part metadata from BODYSTRUCTURE
-- Full raw RFC822/MIME body bytes
-- Parsed `text/plain`, `text/html`, normalized body text, headers, and parser metadata
-- Sync runs and append-only sync events
+- Initial and incremental message sync
+- UIDVALIDITY reset handling
+- Reconciliation for provider deletes and missing messages
+- Flags, headers, threading headers, and MIME structure
+- Raw RFC822/MIME bodies
+- Parsed text, HTML, normalized text, and parser metadata
+- Attachment and inline-part metadata
+- Sync runs, sync events, health, lag, retries, and backoff
+- Provider profiles for generic IMAP and provider-specific quirks
 
-## Body Fetch Policy
+## How It Works
 
-`BODY_FETCH_POLICY` controls when bodies are fetched:
-
-- `immediate`: fetch body rows for every in-window message during sync.
-- `lazy`: only fetch bodies when `refetch-body` or the API endpoint is called.
-- `priority_then_backfill`: fetch bodies for priority folders such as INBOX and Sent during normal sync. This is the default.
-
-Attachment binaries are not downloaded by default. The mirror stores attachment metadata, MIME part numbers, content IDs, and optional future storage keys.
-
-## Supabase Setup
-
-Apply the migration:
-
-```bash
-pnpm migrate
+```text
+IMAP mailbox -> SupaMail worker/API -> Supabase/Postgres -> your app
 ```
 
-or run:
+SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Supabase is where your application reads from.
 
-```bash
-psql "$DATABASE_URL" -f supabase/migrations/0001_imap_mirror.sql
-```
+Account-level advisory locks keep sync operations serialized. Folder state tracks UID cursors and UIDVALIDITY. Reconciliation catches gaps so missing messages do not silently become permanent.
 
-Use a direct/session-affine Supabase Postgres URL for `DATABASE_URL`. Transaction pooler URLs are rejected because account-level advisory locks require session affinity.
+## Quickstart: Supabase + Render
 
-## Deployment
-
-Supported deployment files:
-
-- `render.yaml`: Render worker and optional API
-- `fly.worker.toml.example`: low-cost Fly.io worker-only deployment
-- `fly.api.toml.example`: optional Fly.io API deployment
-- `compose.yaml`: Docker Compose / Coolify / VPS deployment
+1. Create a Supabase project.
+2. Use the direct/session-affine Postgres connection string for `DATABASE_URL`.
+3. Deploy the worker/API with `render.yaml`.
+4. Set environment variables.
+5. Run migrations.
+6. Add an IMAP account.
 
 Required environment variables:
 
@@ -60,9 +67,23 @@ API_TOKEN=...
 BODY_FETCH_POLICY=priority_then_backfill
 ```
 
-See [docs/deployment-options.md](docs/deployment-options.md) for the cost/ops tradeoffs.
+Apply the schema:
 
-## CLI
+```bash
+pnpm migrate
+```
+
+or:
+
+```bash
+psql "$DATABASE_URL" -f supabase/migrations/0001_imap_mirror.sql
+```
+
+Important: use a direct Supabase Postgres URL or session pooling. Do not use the transaction pooler. SupaMail uses advisory locks, and advisory locks need session affinity.
+
+See [docs/render-supabase.md](docs/render-supabase.md) for the full Render + Supabase setup.
+
+## Add a Mailbox
 
 ```bash
 pnpm install
@@ -70,16 +91,82 @@ pnpm migrate
 
 pnpm exec supamail create-account \
   --email alice@example.com \
-  --host secure.emailsrvr.com \
+  --host imap.example.com \
   --port 993 \
   --username alice@example.com \
   --password "$IMAP_PASSWORD" \
-  --profile rackspace
-
-pnpm exec supamail list-accounts
-pnpm exec supamail sync --account-id <uuid>
-pnpm exec supamail refetch-body --message-id <uuid>
+  --profile generic-imap
 ```
+
+Then start the worker:
+
+```bash
+pnpm build
+pnpm start:worker
+```
+
+Or run the API:
+
+```bash
+pnpm start:api
+```
+
+## Query Your Email
+
+Recent messages:
+
+```sql
+select
+  m.id,
+  m.internal_date,
+  m.from_email,
+  m.subject,
+  m.flags,
+  m.body_fetched_at
+from imap_messages m
+where m.deleted_in_provider = false
+order by m.internal_date desc
+limit 50;
+```
+
+Full body:
+
+```sql
+select
+  m.subject,
+  b.body_text,
+  b.body_html,
+  b.raw_bytes,
+  b.fetched_at
+from imap_messages m
+join imap_message_bodies b on b.message_id = m.id
+where m.id = '<message-id>';
+```
+
+Sync health:
+
+```sql
+select
+  email_address,
+  sync_state,
+  sync_state_reason,
+  priority_sync_lag_seconds,
+  overall_sync_lag_seconds,
+  last_sync_finished_at
+from imap_accounts;
+```
+
+## Body Sync
+
+`BODY_FETCH_POLICY` controls when full bodies are fetched:
+
+- `immediate`: fetch body rows for every in-window message during sync.
+- `lazy`: fetch bodies only when `refetch-body` or the API endpoint is called.
+- `priority_then_backfill`: fetch bodies for priority folders such as INBOX and Sent during normal sync. This is the default.
+
+SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.
+
+Attachment binaries are not downloaded by default. SupaMail stores attachment metadata, MIME part numbers, content IDs, and optional future storage keys.
 
 ## API
 
@@ -92,7 +179,25 @@ All endpoints require `Authorization: Bearer $API_TOKEN` when `API_TOKEN` is set
 - `POST /accounts/:id/sync`
 - `POST /messages/:id/refetch-body`
 
-## Hook Surface
+Example:
+
+```bash
+curl -X POST "$API_URL/accounts" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "emailAddress": "alice@example.com",
+    "host": "imap.example.com",
+    "port": 993,
+    "secure": true,
+    "username": "alice@example.com",
+    "password": "secret",
+    "providerProfile": "generic-imap",
+    "bodyFetchPolicy": "priority_then_backfill"
+  }'
+```
+
+## Library Hooks
 
 Library users can instantiate `MirrorEngine` with hooks:
 
@@ -108,7 +213,16 @@ new MirrorEngine({
 });
 ```
 
-## Development
+## Deployment Options
+
+- `render.yaml`: Render worker and optional API
+- `fly.worker.toml.example`: low-cost Fly.io worker-only deployment
+- `fly.api.toml.example`: optional Fly.io API deployment
+- `compose.yaml`: Docker Compose / Coolify / VPS deployment
+
+See [docs/deployment-options.md](docs/deployment-options.md) for tradeoffs.
+
+## Local Development
 
 ```bash
 pnpm install
@@ -117,9 +231,7 @@ pnpm test
 pnpm build
 ```
 
-## Local Supabase Dry Run
-
-The repo includes a local Supabase config on alternate ports so it can run beside the Signal dev stack.
+Local Supabase dry run:
 
 ```bash
 supabase db start
@@ -130,23 +242,27 @@ IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
 pnpm dry-run:local
 ```
 
-`pnpm dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. It applies the migration, runs the real `MirrorEngine` twice, asserts the mirrored rows, then deletes the fixture account unless `SUPAMAIL_DRY_RUN_KEEP_DATA=true` is set.
-
-For stronger smoke coverage:
+Protocol smoke test:
 
 ```bash
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
 pnpm smoke:greenmail
+```
 
+Load smoke test:
+
+```bash
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
 NODE_OPTIONS=--max-old-space-size=160 \
 pnpm smoke:load
 ```
 
-`pnpm smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server, delivers fixture messages over SMTP, then syncs them through the real IMAP protocol. `pnpm smoke:load` generates a large fake mailbox and verifies metadata batching and body backfill stay bounded under the low-memory runtime profile.
+`pnpm dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol.
 
-## Source Extraction Notes
+## Project Status
 
-This repository is intentionally independent from Signal. It excludes CRM hydration, identity/belief code, MCP routes, Trigger.dev coupling, and internal dashboard logic.
+SupaMail is early and intentionally focused: email sync only. No calendar, contacts, sending, scheduling, CRM, or AI features are included in the core.
+
+The repo is independent from the app it came from. It excludes CRM hydration, identity/belief code, MCP routes, Trigger.dev coupling, and internal dashboard logic.
