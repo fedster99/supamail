@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -14,12 +14,9 @@ describe("deployment configs", () => {
     expect(toml).toContain('INCREMENTAL_SYNC_BATCH_SIZE = "25"');
   });
 
-  it("uses SupaMail service names in Render config", async () => {
-    const yaml = await readFile(resolve(process.cwd(), "render.yaml"), "utf8");
-
-    expect(yaml).toContain("name: supamail-worker");
-    expect(yaml).toContain("name: supamail-api");
-    expect(yaml).not.toContain("imap-to-supabase");
+  it("does not keep a competing Render deployment path", async () => {
+    await expect(access(resolve(process.cwd(), "render.yaml"))).rejects.toThrow();
+    await expect(access(resolve(process.cwd(), "docs/render-supabase.md"))).rejects.toThrow();
   });
 
   it("keeps Fly.io as the recommended hosted deployment path", async () => {
@@ -29,8 +26,10 @@ describe("deployment configs", () => {
 
     expect(readme).toContain("Quickstart: Supabase + Fly.io");
     expect(readme).toContain("docs/fly-supabase.md");
-    expect(deploymentOptions).toContain("Use Fly.io as the default hosted path");
+    expect(deploymentOptions).toContain("Use Fly.io as the hosted path");
     expect(flyGuide).toContain("This is the recommended hosted setup for SupaMail.");
+    expect(readme).not.toContain("render.yaml");
+    expect(deploymentOptions).not.toContain("Render");
   });
 
   it("documents single-machine Fly launch commands for the starter worker/API", async () => {

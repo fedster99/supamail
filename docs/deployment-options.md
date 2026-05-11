@@ -4,9 +4,7 @@ SupaMail is just Docker plus outbound network access to IMAP and Supabase Postgr
 
 ## Recommendation
 
-Use Fly.io as the default hosted path for SupaMail. It fits the shape of the product: one small always-on worker with no public IP, plus an optional separate API app only if remote control endpoints are needed.
-
-Use Render when the priority is the most familiar PaaS setup and you do not mind paying for separate worker/API services.
+Use Fly.io as the hosted path for SupaMail. It fits the shape of the product: one small always-on worker with no public IP, plus an optional separate API app only if remote control endpoints are needed.
 
 Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cost across multiple always-on services and you are comfortable owning OS updates, Docker, Coolify upgrades, monitoring, and server backups.
 
@@ -14,12 +12,8 @@ Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cos
 
 | Platform | Good fit | Approximate shape |
 | --- | --- | --- |
-| Fly.io | Best default for SupaMail: managed Docker worker, no public IP required, optional API app | One small Machine for the worker, optional second Machine for API. |
-| Render | Familiar PaaS path | Per-service fixed pricing. Worker plus API means two service bills. |
-| DigitalOcean App Platform | Simple PaaS with worker components | Small worker is cheap and predictable; API is another component. |
-| Railway | Very easy Git-based deploys | Low monthly floor, usage-based CPU/RAM can drift with workload. |
+| Fly.io | Hosted SupaMail path: managed Docker worker, no public IP required, optional API app | One small Machine for the worker, optional second Machine for API. |
 | Hetzner + Coolify | Cheapest fixed infrastructure for several services | One VPS can run worker, API, and other small services; more ops responsibility. |
-| Koyeb | Good app platform, less attractive for this cost target | Current plan structure makes it a poor low-cost fit for one small worker. |
 
 ## Fly.io Worker
 
@@ -85,29 +79,3 @@ docker compose --profile api up -d
 ```
 
 In Coolify, add the repository as a Docker Compose app, set the required environment variables, and assign a domain only to the `api` service if you need remote control endpoints.
-
-## DigitalOcean App Platform
-
-Use the Dockerfile as the build source and create a worker component running:
-
-```bash
-node dist/worker.js
-```
-
-Create a separate web service running:
-
-```bash
-node dist/api.js
-```
-
-for the optional control API.
-
-## Railway
-
-Railway is a good fit for quick trials because it can deploy the Dockerfile from Git and run a worker start command:
-
-```bash
-node dist/worker.js
-```
-
-Use spend limits and watch RAM/CPU usage, because its billing is usage-based.

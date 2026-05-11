@@ -219,7 +219,6 @@ new MirrorEngine({
 
 - `fly.worker.toml.example`: low-cost Fly.io worker-only deployment
 - `fly.api.toml.example`: optional Fly.io API deployment
-- `render.yaml`: Render worker and optional API
 - `compose.yaml`: Docker Compose / Coolify / VPS deployment
 
 See [docs/deployment-options.md](docs/deployment-options.md) for tradeoffs.
