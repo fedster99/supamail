@@ -4,7 +4,7 @@ Reliable IMAP sync for Supabase.
 
 SupaMail turns any IMAP inbox into queryable Supabase tables. It runs a worker/API, connects to your mailboxes, and keeps folders, messages, flags, full MIME bodies, attachment metadata, and sync health up to date in Postgres.
 
-The simplest deployment is Supabase + Render: Supabase hosts the database, Render runs the worker/API, and your app reads email from its own tables.
+The simplest low-cost deployment is Supabase + Fly.io: Supabase hosts the database, Fly runs the always-on worker, and your app reads email from its own tables. The API is optional and can run as a separate Fly app when you need remote control endpoints.
 
 ## Background
 
@@ -49,11 +49,11 @@ SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Su
 
 Account-level advisory locks keep sync operations serialized. Folder state tracks UID cursors and UIDVALIDITY. Reconciliation catches gaps so missing messages do not silently become permanent.
 
-## Quickstart: Supabase + Render
+## Quickstart: Supabase + Fly.io
 
 1. Create a Supabase project.
 2. Use the direct/session-affine Postgres connection string for `DATABASE_URL`.
-3. Deploy the worker/API with `render.yaml`.
+3. Deploy the worker with `fly.worker.toml.example`.
 4. Set environment variables.
 5. Run migrations.
 6. Add an IMAP account.
@@ -81,7 +81,7 @@ psql "$DATABASE_URL" -f supabase/migrations/0001_imap_mirror.sql
 
 Important: use a direct Supabase Postgres URL or session pooling. Do not use the transaction pooler. SupaMail uses advisory locks, and advisory locks need session affinity.
 
-See [docs/render-supabase.md](docs/render-supabase.md) for the full Render + Supabase setup.
+See [docs/fly-supabase.md](docs/fly-supabase.md) for the full Fly.io + Supabase setup.
 
 ## Add a Mailbox
 
@@ -217,9 +217,9 @@ new MirrorEngine({
 
 ## Deployment Options
 
-- `render.yaml`: Render worker and optional API
 - `fly.worker.toml.example`: low-cost Fly.io worker-only deployment
 - `fly.api.toml.example`: optional Fly.io API deployment
+- `render.yaml`: Render worker and optional API
 - `compose.yaml`: Docker Compose / Coolify / VPS deployment
 
 See [docs/deployment-options.md](docs/deployment-options.md) for tradeoffs.

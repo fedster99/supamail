@@ -21,4 +21,25 @@ describe("deployment configs", () => {
     expect(yaml).toContain("name: supamail-api");
     expect(yaml).not.toContain("imap-to-supabase");
   });
+
+  it("keeps Fly.io as the recommended hosted deployment path", async () => {
+    const readme = await readFile(resolve(process.cwd(), "README.md"), "utf8");
+    const deploymentOptions = await readFile(resolve(process.cwd(), "docs/deployment-options.md"), "utf8");
+    const flyGuide = await readFile(resolve(process.cwd(), "docs/fly-supabase.md"), "utf8");
+
+    expect(readme).toContain("Quickstart: Supabase + Fly.io");
+    expect(readme).toContain("docs/fly-supabase.md");
+    expect(deploymentOptions).toContain("Use Fly.io as the default hosted path");
+    expect(flyGuide).toContain("This is the recommended hosted setup for SupaMail.");
+  });
+
+  it("documents single-machine Fly launch commands for the starter worker/API", async () => {
+    const workerToml = await readFile(resolve(process.cwd(), "fly.worker.toml.example"), "utf8");
+    const apiToml = await readFile(resolve(process.cwd(), "fly.api.toml.example"), "utf8");
+
+    expect(workerToml).toContain("fly launch --no-deploy --no-public-ips --ha=false");
+    expect(workerToml).toContain("fly deploy --ha=false");
+    expect(apiToml).toContain("fly launch --config fly.api.toml --no-deploy --ha=false");
+    expect(apiToml).toContain("fly deploy --config fly.api.toml --ha=false");
+  });
 });

@@ -1,8 +1,8 @@
 # Copy to fly.toml and replace app/region before deploying:
 #   cp fly.worker.toml.example fly.toml
-#   fly launch --no-deploy --no-public-ips
+#   fly launch --no-deploy --no-public-ips --ha=false
 #   fly secrets set DATABASE_URL=... IMAP_ENCRYPTION_KEY=...
-#   fly deploy
+#   fly deploy --ha=false
 
 app = "supamail-worker"
 primary_region = "ord"

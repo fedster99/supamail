@@ -1,8 +1,8 @@
 # Optional API app. Keep the always-on worker separate for the lowest bill.
 # Copy to fly.api.toml and deploy with:
-#   fly launch --config fly.api.toml --no-deploy
+#   fly launch --config fly.api.toml --no-deploy --ha=false
 #   fly secrets set --config fly.api.toml DATABASE_URL=... IMAP_ENCRYPTION_KEY=... API_TOKEN=...
-#   fly deploy --config fly.api.toml
+#   fly deploy --config fly.api.toml --ha=false
 
 app = "supamail-api"
 primary_region = "iad"

@@ -4,9 +4,9 @@ SupaMail is just Docker plus outbound network access to IMAP and Supabase Postgr
 
 ## Recommendation
 
-Use Render when the priority is fastest setup and low operational burden.
+Use Fly.io as the default hosted path for SupaMail. It fits the shape of the product: one small always-on worker with no public IP, plus an optional separate API app only if remote control endpoints are needed.
 
-Use Fly.io when the priority is keeping the always-on worker bill small without moving all the way to self-hosted VPS operations. The worker can run as one Docker Machine with no public IP. The included worker profile targets Fly's 256 MB `shared-cpu-1x` shape.
+Use Render when the priority is the most familiar PaaS setup and you do not mind paying for separate worker/API services.
 
 Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cost across multiple always-on services and you are comfortable owning OS updates, Docker, Coolify upgrades, monitoring, and server backups.
 
@@ -14,8 +14,8 @@ Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cos
 
 | Platform | Good fit | Approximate shape |
 | --- | --- | --- |
-| Render | Easiest PaaS path, best default for first production deploy | Per-service fixed pricing. Worker plus API means two service bills. |
-| Fly.io | Cheapest managed always-on worker path | One small Machine for the worker, optional second Machine for API. |
+| Fly.io | Best default for SupaMail: managed Docker worker, no public IP required, optional API app | One small Machine for the worker, optional second Machine for API. |
+| Render | Familiar PaaS path | Per-service fixed pricing. Worker plus API means two service bills. |
 | DigitalOcean App Platform | Simple PaaS with worker components | Small worker is cheap and predictable; API is another component. |
 | Railway | Very easy Git-based deploys | Low monthly floor, usage-based CPU/RAM can drift with workload. |
 | Hetzner + Coolify | Cheapest fixed infrastructure for several services | One VPS can run worker, API, and other small services; more ops responsibility. |
@@ -27,12 +27,14 @@ Worker-only deploy:
 
 ```bash
 cp fly.worker.toml.example fly.toml
-fly launch --no-deploy --no-public-ips
+fly launch --no-deploy --no-public-ips --ha=false
 fly secrets set \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY"
-fly deploy
+fly deploy --ha=false
 ```
+
+`--ha=false` keeps the starter worker to one Machine. Fly otherwise creates spare/standby Machines by default for availability.
 
 The 256 MB worker profile intentionally uses conservative runtime settings:
 
@@ -56,12 +58,12 @@ Optional API deploy:
 
 ```bash
 cp fly.api.toml.example fly.api.toml
-fly launch --config fly.api.toml --no-deploy
+fly launch --config fly.api.toml --no-deploy --ha=false
 fly secrets set --config fly.api.toml \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY" \
   API_TOKEN="$API_TOKEN"
-fly deploy --config fly.api.toml
+fly deploy --config fly.api.toml --ha=false
 ```
 
 Keep the API separate from the worker so a public HTTP service cannot accidentally change the worker's uptime or cost profile.
