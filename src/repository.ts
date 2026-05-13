@@ -1,6 +1,7 @@
 import type { AppConfig } from "./config.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
+import { assertSafeImapTarget } from "./host-validation.js";
 import { getProviderProfile } from "./provider-profiles.js";
 import type {
   AccountSummary,
@@ -15,6 +16,22 @@ import type {
   SyncRunStatus,
   SyncTriggerType
 } from "./types.js";
+
+const BROKEN_FAILURE_THRESHOLD = 4;
+const BACKOFF_FLOOR_MS = 60_000;
+const BACKOFF_CEILING_MS = 3_600_000;
+const ERROR_REASON_MAX_LEN = 1000;
+
+const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
+
+export function sanitizeErrorReason(error: string): string {
+  return error
+    .replace(CREDENTIAL_LEAK_PATTERN, "$1 [REDACTED]")
+    .replace(/[\x00-\x1F\x7F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, ERROR_REASON_MAX_LEN);
+}
 
 const ACCOUNT_SUMMARY_COLUMNS = `
   id,
@@ -44,6 +61,10 @@ export class MirrorRepository {
   ) {}
 
   async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
+    const secure = input.secure ?? true;
+    await assertSafeImapTarget(input.host, input.port, secure, {
+      allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
+    });
     const encrypted = await encryptPassword(this.pool, input.password, this.config.IMAP_ENCRYPTION_KEY);
     const result = await this.pool.query<AccountSummary>(
       `
@@ -65,7 +86,7 @@ export class MirrorRepository {
         input.providerProfile ?? "generic-imap",
         input.host,
         input.port,
-        input.secure ?? true,
+        secure,
         input.username,
         encrypted,
         input.bodyFetchPolicy ?? this.config.BODY_FETCH_POLICY
@@ -122,6 +143,7 @@ export class MirrorRepository {
   }
 
   async finishSyncRun(result: SyncResult): Promise<void> {
+    const sanitizedErrors = result.errors.map(sanitizeErrorReason);
     await this.pool.query(
       `
       UPDATE public.imap_sync_runs
@@ -145,8 +167,8 @@ export class MirrorRepository {
         result.bodiesFetched,
         result.flagsUpdated,
         result.reconcileGapsFound,
-        result.errors[0] ?? null,
-        JSON.stringify({ errors: result.errors })
+        sanitizedErrors[0] ?? null,
+        JSON.stringify({ errors: sanitizedErrors })
       ]
     );
   }
@@ -158,7 +180,7 @@ export class MirrorRepository {
       SET status = $2, finished_at = CASE WHEN $2 != 'running' THEN now() ELSE finished_at END, error = $3
       WHERE id = $1
       `,
-      [runId, status, error ?? null]
+      [runId, status, error ? sanitizeErrorReason(error) : null]
     );
   }
 
@@ -178,6 +200,9 @@ export class MirrorRepository {
   }
 
   async markAccountSyncSucceeded(accountId: string): Promise<void> {
+    // A clean run is the recovery signal — clobber DEGRADED/BROKEN/INITIAL_SYNC
+    // back to HEALTHY. PAUSED accounts never reach this method because
+    // getRunnableAccounts filters them out.
     await this.pool.query(
       `
       UPDATE public.imap_accounts
@@ -186,7 +211,7 @@ export class MirrorRepository {
         sync_started_by = NULL,
         last_sync_finished_at = now(),
         last_heartbeat_at = now(),
-        sync_state = CASE WHEN sync_state = 'INITIAL_SYNC' THEN 'HEALTHY' ELSE sync_state END,
+        sync_state = 'HEALTHY',
         sync_state_reason = NULL,
         consecutive_successes = consecutive_successes + 1,
         consecutive_failures = 0,
@@ -207,33 +232,47 @@ export class MirrorRepository {
         sync_started_by = NULL,
         last_sync_finished_at = now(),
         last_heartbeat_at = now(),
-        sync_state = CASE WHEN consecutive_failures >= 4 THEN 'BROKEN' ELSE 'DEGRADED' END,
+        sync_state = CASE WHEN consecutive_failures >= $3 THEN 'BROKEN' ELSE 'DEGRADED' END,
         sync_state_reason = $2,
         consecutive_failures = consecutive_failures + 1,
         consecutive_successes = 0
       WHERE id = $1
       `,
-      [accountId, error.slice(0, 1000)]
+      [accountId, sanitizeErrorReason(error), BROKEN_FAILURE_THRESHOLD]
     );
   }
 
   async markAccountSyncFailed(accountId: string, error: string): Promise<void> {
+    // CTE computes the doubled-and-clamped backoff once so the same value
+    // feeds both `current_backoff_ms` and `backoff_until` — without it the
+    // expression has to be duplicated and would drift on tuning changes.
     await this.pool.query(
       `
-      UPDATE public.imap_accounts
+      WITH next_backoff AS (
+        SELECT LEAST(GREATEST(current_backoff_ms * 2, $4::int), $5::int) AS ms
+        FROM public.imap_accounts WHERE id = $1
+      )
+      UPDATE public.imap_accounts a
       SET
         currently_syncing = false,
         sync_started_by = NULL,
         last_sync_finished_at = now(),
-        sync_state = CASE WHEN consecutive_failures >= 4 THEN 'BROKEN' ELSE 'DEGRADED' END,
+        sync_state = CASE WHEN consecutive_failures >= $3 THEN 'BROKEN' ELSE 'DEGRADED' END,
         sync_state_reason = $2,
         consecutive_failures = consecutive_failures + 1,
         consecutive_successes = 0,
-        current_backoff_ms = LEAST(GREATEST(current_backoff_ms * 2, 60000), 3600000),
-        backoff_until = now() + (LEAST(GREATEST(current_backoff_ms * 2, 60000), 3600000) * interval '1 millisecond')
-      WHERE id = $1
+        current_backoff_ms = next_backoff.ms,
+        backoff_until = now() + (next_backoff.ms * interval '1 millisecond')
+      FROM next_backoff
+      WHERE a.id = $1
       `,
-      [accountId, error.slice(0, 1000)]
+      [
+        accountId,
+        sanitizeErrorReason(error),
+        BROKEN_FAILURE_THRESHOLD,
+        BACKOFF_FLOOR_MS,
+        BACKOFF_CEILING_MS
+      ]
     );
   }
 
@@ -442,10 +481,16 @@ export class MirrorRepository {
     messages: MessageMetadata[],
     windowCutoff: Date
   ): Promise<ImapMessage[]> {
-    const rows: ImapMessage[] = [];
+    if (messages.length === 0) return [];
 
+    const rows: ImapMessage[] = [];
+    const client = await this.pool.connect();
+
+    try {
     for (const message of messages) {
-      const result = await this.pool.query<ImapMessage>(
+      await client.query("BEGIN");
+      try {
+      const result = await client.query<ImapMessage>(
         `
         INSERT INTO public.imap_messages (
           account_id,
@@ -517,10 +562,9 @@ export class MirrorRepository {
       );
 
       const row = result.rows[0];
-      rows.push(row);
 
       for (const attachment of message.attachments) {
-        await this.pool.query(
+        await client.query(
           `
           INSERT INTO public.imap_attachments (
             message_id,
@@ -551,6 +595,15 @@ export class MirrorRepository {
           ]
         );
       }
+      await client.query("COMMIT");
+      rows.push(row);
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    }
+    } finally {
+      client.release();
     }
 
     return rows;
@@ -577,6 +630,87 @@ export class MirrorRepository {
       [accountId, folder.path, uidValidity, liveUids]
     );
     return Number(result.rows[0].count);
+  }
+
+  // Reconcile via a streamed temp table rather than a `bigint[]` parameter:
+  // heavy mailboxes (e.g. Gmail "All Mail") routinely surface 100k+ UIDs,
+  // which blows up array-parameter encoding and forces the entire UID set
+  // into Node memory. The TEMP TABLE … ON COMMIT DROP scopes lifetime to
+  // the surrounding transaction, so no cleanup is needed on failure.
+  async markMissingMessagesFromLiveUidStream(
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    liveUids: AsyncIterable<number>,
+    options: { failIfEmpty?: boolean; emptyError?: string; batchSize?: number } = {}
+  ): Promise<{ markedCount: number; liveUidCount: number }> {
+    const batchSize = options.batchSize ?? 10_000;
+    const client = await this.pool.connect();
+    const batch: number[] = [];
+    let liveUidCount = 0;
+
+    const flush = async () => {
+      if (batch.length === 0) return;
+      await client.query(
+        `
+        INSERT INTO supamail_live_uids (uid)
+        SELECT DISTINCT unnest($1::bigint[])
+        ON CONFLICT DO NOTHING
+        `,
+        [batch.splice(0, batch.length)]
+      );
+    };
+
+    await client.query("BEGIN");
+    try {
+      await client.query("CREATE TEMP TABLE supamail_live_uids (uid bigint PRIMARY KEY) ON COMMIT DROP");
+
+      for await (const uid of liveUids) {
+        liveUidCount += 1;
+        batch.push(uid);
+        if (batch.length >= batchSize) await flush();
+      }
+      await flush();
+
+      if (liveUidCount === 0 && options.failIfEmpty) {
+        throw new Error(options.emptyError ?? `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`);
+      }
+
+      const result = await client.query<{ count: string }>(
+        `
+        WITH marked AS (
+          UPDATE public.imap_messages m
+          SET deleted_in_provider = true,
+              provider_deleted_at = now(),
+              deleted_reason = 'RECONCILE_MISSING'
+          WHERE m.account_id = $1
+            AND m.folder_path = $2
+            AND m.uidvalidity = $3
+            AND m.deleted_in_provider = false
+            AND m.window_status = 'IN_WINDOW'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM supamail_live_uids live
+              WHERE live.uid = m.uid
+            )
+          RETURNING m.id
+        )
+        SELECT count(*)::text AS count FROM marked
+        `,
+        [accountId, folder.path, uidValidity]
+      );
+
+      await client.query("COMMIT");
+      return {
+        markedCount: Number(result.rows[0].count),
+        liveUidCount
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async getMessage(id: string): Promise<ImapMessage | null> {

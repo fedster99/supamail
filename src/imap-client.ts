@@ -2,6 +2,7 @@ import { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
+import { assertSafeImapTarget } from "./host-validation.js";
 import { extractAttachmentMetadata, normalizeMessageId, parseHeaders, parseRawMime, selectBodyTextPart } from "./mime.js";
 import { ImapThrottle } from "./throttle.js";
 import type { ImapAccount, ImapMessage, MessageBodyInput, MessageMetadata } from "./types.js";
@@ -71,12 +72,8 @@ export interface MirrorImapClient {
 export class ThrottledImapClient implements MirrorImapClient {
   private readonly throttle: ImapThrottle;
 
-  constructor(
-    private readonly client: ImapFlow,
-    accountId: string,
-    maxCommandsPerMinute: number
-  ) {
-    this.throttle = new ImapThrottle(maxCommandsPerMinute, accountId);
+  constructor(private readonly client: ImapFlow, maxCommandsPerMinute: number) {
+    this.throttle = new ImapThrottle(maxCommandsPerMinute);
   }
 
   get mailbox(): MailboxStatus | false | null {
@@ -134,6 +131,9 @@ export async function createImapClient(
   config: AppConfig,
   account: ImapAccount
 ): Promise<MirrorImapClient> {
+  await assertSafeImapTarget(account.host, account.port, account.secure, {
+    allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
+  });
   const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
   const rawClient = new ImapFlow({
     host: account.host,
@@ -150,7 +150,7 @@ export async function createImapClient(
   });
 
   await rawClient.connect();
-  return new ThrottledImapClient(rawClient, account.id, config.IMAP_MAX_COMMANDS_PER_MINUTE);
+  return new ThrottledImapClient(rawClient, config.IMAP_MAX_COMMANDS_PER_MINUTE);
 }
 
 function firstAddress(addresses: Array<{ address?: string; name?: string }> | undefined): {
@@ -265,12 +265,18 @@ export async function searchUidsSince(
 }
 
 export async function searchAllUids(client: MirrorImapClient, since?: Date): Promise<number[]> {
-  const query: Record<string, unknown> = since ? { since } : { all: true };
   const uids: number[] = [];
-  for await (const msg of client.fetch(query, { uid: true }, { uid: true })) {
-    uids.push(msg.uid);
+  for await (const uid of iterateAllUids(client, since)) {
+    uids.push(uid);
   }
   return uids;
+}
+
+export async function* iterateAllUids(client: MirrorImapClient, since?: Date): AsyncIterable<number> {
+  const query: Record<string, unknown> = since ? { since } : { all: true };
+  for await (const msg of client.fetch(query, { uid: true }, { uid: true })) {
+    yield msg.uid;
+  }
 }
 
 async function streamToBuffer(stream: AsyncIterable<Buffer | Uint8Array | string>): Promise<Buffer> {

@@ -280,7 +280,8 @@ async function main(): Promise<void> {
     INITIAL_SYNC_BATCH_SIZE: 10,
     INCREMENTAL_SYNC_BATCH_SIZE: 10,
     CONNECT_TIMEOUT_MS: 10_000,
-    IMAP_COMMAND_TIMEOUT_MS: 10_000
+    IMAP_COMMAND_TIMEOUT_MS: 10_000,
+    IMAP_ALLOW_PRIVATE_HOSTS: true
   };
   const repository = new MirrorRepository(pool, config);
   const account = await repository.createAccount({

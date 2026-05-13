@@ -78,7 +78,8 @@ async function main(): Promise<void> {
     BODY_BACKFILL_BATCH_SIZE: bodyBatchSize,
     INITIAL_SYNC_BATCH_SIZE: metadataBatchSize,
     INCREMENTAL_SYNC_BATCH_SIZE: metadataBatchSize,
-    BODY_RAW_MAX_BYTES: Math.max(bodyBytes * 2, 1024 * 1024)
+    BODY_RAW_MAX_BYTES: Math.max(bodyBytes * 2, 1024 * 1024),
+    IMAP_ALLOW_PRIVATE_HOSTS: true
   };
 
   const folders = generateFolders(messageCount, bodyBytes);

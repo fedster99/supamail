@@ -13,7 +13,8 @@ describe("sync engine safety", () => {
   it("reconciles against all live provider UIDs", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    expect(source).toContain("const liveUids = await searchAllUids(client)");
+    expect(source).toContain("iterateAllUids(client)");
+    expect(source).toContain("markMissingMessagesFromLiveUidStream");
     expect(source).toContain("Reconcile returned no UIDs for non-empty mailbox");
     expect(source).not.toContain("searchAllUids(client, windowCutoff)");
   });

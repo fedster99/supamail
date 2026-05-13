@@ -77,6 +77,29 @@ describe("mime helpers", () => {
     expect(htmlToText("<p>Hello&nbsp;<b>there</b></p><script>x()</script>")).toBe("Hello there");
   });
 
+  it("does not crash on out-of-range or surrogate numeric entities", () => {
+    expect(() => htmlToText("hi &#x110000; there")).not.toThrow();
+    expect(() => htmlToText("hi &#xD800; there")).not.toThrow();
+    expect(() => htmlToText("hi &#-1; there")).not.toThrow();
+    expect(htmlToText("ok &#65; done")).toContain("A");
+  });
+
+  it("does not infinite-loop on a self-referential bodyStructure", () => {
+    const node: { type: string; childNodes: unknown[] } = { type: "multipart/mixed", childNodes: [] };
+    node.childNodes.push(node);
+    expect(() => selectBodyTextPart(node)).not.toThrow();
+    expect(() => extractAttachmentMetadata(node)).not.toThrow();
+  });
+
+  it("stops at depth limit on a deeply nested bodyStructure", () => {
+    let root: { type: string; childNodes?: unknown[] } = { type: "text/plain" };
+    for (let i = 0; i < 200; i += 1) {
+      root = { type: "multipart/mixed", childNodes: [root] };
+    }
+    expect(() => selectBodyTextPart(root)).not.toThrow();
+    expect(() => extractAttachmentMetadata(root)).not.toThrow();
+  });
+
   it("parses raw MIME into text, html, and headers", async () => {
     const raw = Buffer.from(
       [

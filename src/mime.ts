@@ -3,6 +3,9 @@ import type { AttachmentMetadata } from "./types.js";
 
 type BodyTextFormat = "plain" | "html";
 
+const MAX_BODYSTRUCTURE_DEPTH = 64;
+const MAX_HTML_PARSE_BYTES = 1_048_576;
+
 export interface BodyTextPartChoice {
   part: string;
   format: BodyTextFormat;
@@ -76,20 +79,40 @@ function filenameForPart(part: BodyStructurePart): string | null {
   return part.dispositionParameters?.filename ?? part.parameters?.name ?? null;
 }
 
+function walkBodyStructure(
+  bodyStructure: unknown,
+  onLeaf: (node: BodyStructurePart) => void
+): void {
+  if (!bodyStructure || typeof bodyStructure !== "object") return;
+  const visited = new WeakSet<object>();
+
+  const visit = (node: BodyStructurePart, depth: number) => {
+    if (depth > MAX_BODYSTRUCTURE_DEPTH) return;
+    if (typeof node === "object" && node !== null) {
+      if (visited.has(node)) return;
+      visited.add(node);
+    }
+    const children = Array.isArray(node.childNodes) ? node.childNodes : [];
+    if (children.length > 0) {
+      for (const child of children) visit(child, depth + 1);
+      return;
+    }
+    onLeaf(node);
+  };
+
+  if (Array.isArray(bodyStructure)) {
+    for (const node of bodyStructure) visit(node as BodyStructurePart, 0);
+  } else {
+    visit(bodyStructure as BodyStructurePart, 0);
+  }
+}
+
 export function selectBodyTextPart(
   bodyStructure: unknown,
   prefer: BodyTextFormat = "plain"
 ): BodyTextPartChoice | null {
-  if (!bodyStructure || typeof bodyStructure !== "object") return null;
   const candidates: BodyTextPartChoice[] = [];
-
-  const visit = (node: BodyStructurePart) => {
-    const children = Array.isArray(node.childNodes) ? node.childNodes : [];
-    if (children.length > 0) {
-      for (const child of children) visit(child);
-      return;
-    }
-
+  walkBodyStructure(bodyStructure, (node) => {
     const type = mimeType(node);
     if (type !== "text/plain" && type !== "text/html" && type !== "text/x-amp-html") return;
     const disposition = dispositionType(node);
@@ -99,13 +122,7 @@ export function selectBodyTextPart(
       part: node.part?.toString().trim() || "TEXT",
       format: type === "text/plain" ? "plain" : "html"
     });
-  };
-
-  if (Array.isArray(bodyStructure)) {
-    for (const node of bodyStructure) visit(node as BodyStructurePart);
-  } else {
-    visit(bodyStructure as BodyStructurePart);
-  }
+  });
 
   const plain = candidates.find((candidate) => candidate.format === "plain");
   const html = candidates.find((candidate) => candidate.format === "html");
@@ -113,16 +130,8 @@ export function selectBodyTextPart(
 }
 
 export function extractAttachmentMetadata(bodyStructure: unknown): AttachmentMetadata[] {
-  if (!bodyStructure || typeof bodyStructure !== "object") return [];
   const attachments: AttachmentMetadata[] = [];
-
-  const visit = (node: BodyStructurePart) => {
-    const children = Array.isArray(node.childNodes) ? node.childNodes : [];
-    if (children.length > 0) {
-      for (const child of children) visit(child);
-      return;
-    }
-
+  walkBodyStructure(bodyStructure, (node) => {
     const partNumber = node.part?.toString().trim();
     if (!partNumber) return;
 
@@ -144,14 +153,7 @@ export function extractAttachmentMetadata(bodyStructure: unknown): AttachmentMet
         partNumber
       });
     }
-  };
-
-  if (Array.isArray(bodyStructure)) {
-    for (const node of bodyStructure) visit(node as BodyStructurePart);
-  } else {
-    visit(bodyStructure as BodyStructurePart);
-  }
-
+  });
   return attachments;
 }
 
@@ -168,15 +170,23 @@ function decodeHtmlEntities(input: string): string {
   return input.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, raw) => {
     const token = String(raw);
     if (token.startsWith("#x") || token.startsWith("#X")) {
-      const value = Number.parseInt(token.slice(2), 16);
-      return Number.isFinite(value) ? String.fromCodePoint(value) : match;
+      return codePointToString(Number.parseInt(token.slice(2), 16)) ?? match;
     }
     if (token.startsWith("#")) {
-      const value = Number.parseInt(token.slice(1), 10);
-      return Number.isFinite(value) ? String.fromCodePoint(value) : match;
+      return codePointToString(Number.parseInt(token.slice(1), 10)) ?? match;
     }
     return named[token.toLowerCase()] ?? match;
   });
+}
+
+function codePointToString(value: number): string | null {
+  if (!Number.isFinite(value)) return null;
+  // Reject anything outside Unicode (> 0x10FFFF) and the surrogate halves
+  // (0xD800-0xDFFF). String.fromCodePoint throws RangeError on the first
+  // and emits invalid UTF-16 on the second — both break downstream JSON.
+  if (value < 0 || value > 0x10FFFF) return null;
+  if (value >= 0xD800 && value <= 0xDFFF) return null;
+  return String.fromCodePoint(value);
 }
 
 export function normalizeBodyText(text: string): string {
@@ -210,7 +220,14 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
   headersJson: Record<string, unknown>;
   parserWarnings: string[];
 }> {
-  const parsed = await simpleParser(rawMime);
+  const parserWarnings: string[] = [];
+  const parsed = await simpleParser(rawMime, {
+    skipImageLinks: true,
+    skipTextLinks: true,
+    skipHtmlToText: true,
+    skipTextToHtml: true,
+    maxHtmlLengthToParse: MAX_HTML_PARSE_BYTES
+  } as Parameters<typeof simpleParser>[1]);
   const headersJson: Record<string, unknown> = {};
 
   for (const [key, value] of parsed.headers) {
@@ -224,7 +241,11 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
   }
 
   const bodyPlain = parsed.text ? normalizeBodyText(parsed.text) : null;
-  const bodyHtml = typeof parsed.html === "string" ? parsed.html : null;
+  let bodyHtml: string | null = typeof parsed.html === "string" ? parsed.html : null;
+  if (bodyHtml && bodyHtml.length > MAX_HTML_PARSE_BYTES) {
+    parserWarnings.push("html_truncated_for_text_extraction");
+    bodyHtml = bodyHtml.slice(0, MAX_HTML_PARSE_BYTES);
+  }
   const bodyText = bodyPlain ?? (bodyHtml ? htmlToText(bodyHtml) : null);
 
   return {
@@ -232,6 +253,6 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
     bodyHtml,
     bodyPlain,
     headersJson,
-    parserWarnings: []
+    parserWarnings
   };
 }

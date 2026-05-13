@@ -2,34 +2,21 @@ export class ImapThrottle {
   private tokens: number;
   private lastRefill: number;
 
-  constructor(
-    private readonly maxCommandsPerMinute: number,
-    private readonly accountId: string
-  ) {
+  constructor(private readonly maxCommandsPerMinute: number) {
     this.tokens = maxCommandsPerMinute;
     this.lastRefill = Date.now();
   }
 
   async acquire(): Promise<void> {
-    this.refill();
-
-    if (this.tokens >= 1) {
-      this.tokens -= 1;
-      return;
+    while (true) {
+      this.refill();
+      if (this.tokens >= 1) {
+        this.tokens -= 1;
+        return;
+      }
+      const waitMs = Math.ceil(60_000 / this.maxCommandsPerMinute);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
-
-    const waitMs = Math.ceil(60_000 / this.maxCommandsPerMinute);
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-    return this.acquire();
-  }
-
-  getTokens(): number {
-    this.refill();
-    return this.tokens;
-  }
-
-  getAccountId(): string {
-    return this.accountId;
   }
 
   private refill(): void {

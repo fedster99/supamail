@@ -76,7 +76,8 @@ async function main(): Promise<void> {
     BODY_FETCH_POLICY: "immediate" as const,
     BODY_BACKFILL_BATCH_SIZE: 10,
     INITIAL_SYNC_BATCH_SIZE: 2,
-    INCREMENTAL_SYNC_BATCH_SIZE: 2
+    INCREMENTAL_SYNC_BATCH_SIZE: 2,
+    IMAP_ALLOW_PRIVATE_HOSTS: true
   };
 
   const email = `dryrun-${Date.now()}@example.test`;

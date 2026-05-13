@@ -14,8 +14,7 @@ const noisyFolderFragments = [
   "junk",
   "trash",
   "deleted",
-  "draft",
-  "archive"
+  "draft"
 ];
 
 export const genericImapProfile: ProviderProfile = {

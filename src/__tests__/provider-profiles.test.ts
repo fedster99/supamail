@@ -15,6 +15,7 @@ describe("provider profiles", () => {
   it("excludes noisy folders", () => {
     const profile = getProviderProfile("generic-imap");
     expect(profile.excludedReason("Trash")).toBe("excluded_trash");
+    expect(profile.excludedReason("Archive")).toBeNull();
     expect(profile.excludedReason("INBOX")).toBeNull();
   });
 

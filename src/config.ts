@@ -6,6 +6,11 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   IMAP_ENCRYPTION_KEY: z.string().min(16),
   API_TOKEN: z.string().optional(),
+  ADMIN_TOKEN: z.string().optional(),
+  IMAP_ALLOW_PRIVATE_HOSTS: z
+    .union([z.boolean(), z.string()])
+    .default(false)
+    .transform((v) => v === true || v === "true"),
   PORT: z.coerce.number().int().positive().default(3000),
   SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   WINDOW_DAYS: z.coerce.number().int().positive().default(90),

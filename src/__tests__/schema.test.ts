@@ -38,9 +38,10 @@ describe("initial schema", () => {
     }
 
     expect(sql.match(/SET search_path = ''/g)).toHaveLength(1);
-    expect(sql.match(/SET search_path = extensions, public/g)).toHaveLength(2);
-    expect(sql).toContain("pgp_sym_encrypt");
-    expect(sql).toContain("pgp_sym_decrypt");
+    expect(sql).toContain("DROP FUNCTION IF EXISTS public.imap_encrypt_password");
+    expect(sql).toContain("DROP FUNCTION IF EXISTS public.imap_decrypt_password");
+    expect(sql).not.toContain("pgp_sym_encrypt");
+    expect(sql).not.toContain("pgp_sym_decrypt");
   });
 
   it("locks down Supabase Data API exposure by default", async () => {
@@ -60,8 +61,8 @@ describe("initial schema", () => {
       expect(sql).toContain(`REVOKE ALL ON TABLE public.${table} FROM authenticated`);
     }
 
-    expect(sql).toContain("REVOKE EXECUTE ON FUNCTION public.imap_encrypt_password(text, text) FROM PUBLIC");
-    expect(sql).toContain("REVOKE EXECUTE ON FUNCTION public.imap_decrypt_password(bytea, text) FROM PUBLIC");
+    expect(sql).not.toContain("REVOKE EXECUTE ON FUNCTION public.imap_encrypt_password");
+    expect(sql).not.toContain("REVOKE EXECUTE ON FUNCTION public.imap_decrypt_password");
   });
 
   it("deduplicates attachments by stable MIME part number", async () => {

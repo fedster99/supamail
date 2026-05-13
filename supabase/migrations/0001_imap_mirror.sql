@@ -103,6 +103,13 @@ CREATE TRIGGER imap_folders_set_updated_at
   FOR EACH ROW
   EXECUTE FUNCTION public.imap_mirror_set_updated_at();
 
+-- Note on folder_id vs folder_path: messages carry both. folder_path is the
+-- canonical key (the UNIQUE constraint and IMAP semantics are folder-keyed by
+-- name + uidvalidity), and folder_id is a convenience FK kept loosely
+-- consistent. On a server-side folder rename we treat the old path as a new
+-- folder (with old messages tombstoning via the reconcile pass), rather than
+-- migrating folder_path in place. Do not try to JOIN on folder_id for
+-- correctness — always JOIN on (account_id, folder_path).
 CREATE TABLE IF NOT EXISTS public.imap_messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id uuid NOT NULL REFERENCES public.imap_accounts(id) ON DELETE CASCADE,
@@ -116,7 +123,7 @@ CREATE TABLE IF NOT EXISTS public.imap_messages (
   in_reply_to text,
   references_header text,
   internal_date timestamptz NOT NULL,
-  size_bytes integer,
+  size_bytes bigint,
   subject text,
   from_email text,
   from_name text,
@@ -161,6 +168,17 @@ CREATE INDEX IF NOT EXISTS imap_messages_body_backlog_idx
     AND window_status = 'IN_WINDOW'
     AND body_fetched_at IS NULL;
 
+-- Supporting index for the ON DELETE SET NULL FK on folder_id. Without this
+-- a folder delete triggers a sequential scan of imap_messages.
+CREATE INDEX IF NOT EXISTS imap_messages_folder_id_idx
+  ON public.imap_messages (folder_id)
+  WHERE folder_id IS NOT NULL;
+
+-- Threading / dedup lookups by canonical Message-Id.
+CREATE INDEX IF NOT EXISTS imap_messages_msgid_normalized_idx
+  ON public.imap_messages (account_id, message_id_normalized)
+  WHERE message_id_normalized IS NOT NULL;
+
 DROP TRIGGER IF EXISTS imap_messages_set_updated_at ON public.imap_messages;
 CREATE TRIGGER imap_messages_set_updated_at
   BEFORE UPDATE ON public.imap_messages
@@ -170,7 +188,7 @@ CREATE TRIGGER imap_messages_set_updated_at
 CREATE TABLE IF NOT EXISTS public.imap_message_bodies (
   message_id uuid PRIMARY KEY REFERENCES public.imap_messages(id) ON DELETE CASCADE,
   raw_mime bytea NOT NULL,
-  raw_bytes integer NOT NULL,
+  raw_bytes bigint NOT NULL,
   raw_truncated boolean NOT NULL DEFAULT false,
   body_text text,
   body_html text,
@@ -201,7 +219,7 @@ CREATE TABLE IF NOT EXISTS public.imap_attachments (
   message_id uuid NOT NULL REFERENCES public.imap_messages(id) ON DELETE CASCADE,
   filename text,
   mime_type text,
-  size_bytes integer,
+  size_bytes bigint,
   part_number text,
   content_id text,
   disposition text CHECK (disposition IS NULL OR disposition IN ('attachment', 'inline')),
@@ -250,21 +268,20 @@ CREATE TABLE IF NOT EXISTS public.imap_sync_events (
 CREATE INDEX IF NOT EXISTS imap_sync_events_account_type_idx
   ON public.imap_sync_events (account_id, event_type, occurred_at DESC);
 
-CREATE OR REPLACE FUNCTION public.imap_encrypt_password(plaintext text, encryption_key text)
-RETURNS bytea
-LANGUAGE sql
-SET search_path = extensions, public
-AS $$
-  SELECT pgp_sym_encrypt(plaintext, encryption_key)::bytea;
-$$;
+-- Supporting indexes for the ON DELETE SET NULL FKs on sync_run_id and message_id.
+CREATE INDEX IF NOT EXISTS imap_sync_events_sync_run_id_idx
+  ON public.imap_sync_events (sync_run_id)
+  WHERE sync_run_id IS NOT NULL;
 
-CREATE OR REPLACE FUNCTION public.imap_decrypt_password(encrypted bytea, encryption_key text)
-RETURNS text
-LANGUAGE sql
-SET search_path = extensions, public
-AS $$
-  SELECT pgp_sym_decrypt(encrypted, encryption_key);
-$$;
+CREATE INDEX IF NOT EXISTS imap_sync_events_message_id_idx
+  ON public.imap_sync_events (message_id)
+  WHERE message_id IS NOT NULL;
+
+-- Drop legacy SQL crypto functions: passwords are encrypted in the application
+-- process (AES-256-GCM via node:crypto) so the key never leaves Node, never
+-- transits as a SQL function argument, and never appears in pg_stat_statements.
+DROP FUNCTION IF EXISTS public.imap_encrypt_password(text, text);
+DROP FUNCTION IF EXISTS public.imap_decrypt_password(bytea, text);
 
 ALTER TABLE public.imap_accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.imap_folders ENABLE ROW LEVEL SECURITY;
@@ -273,9 +290,6 @@ ALTER TABLE public.imap_message_bodies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.imap_attachments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.imap_sync_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.imap_sync_events ENABLE ROW LEVEL SECURITY;
-
-REVOKE EXECUTE ON FUNCTION public.imap_encrypt_password(text, text) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.imap_decrypt_password(bytea, text) FROM PUBLIC;
 
 DO $$
 BEGIN

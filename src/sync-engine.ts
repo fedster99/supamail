@@ -2,10 +2,10 @@ import type { AppConfig } from "./config.js";
 import { getConfig, getWindowCutoff } from "./config.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
-import { fetchFullMessageBody, fetchMessageMetadata, searchAllUids, searchUidsSince } from "./imap-client.js";
+import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, searchUidsSince } from "./imap-client.js";
 import type { MirrorImapClient } from "./imap-client.js";
 import { withAccountLock } from "./locks.js";
-import { MirrorRepository } from "./repository.js";
+import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import type {
   ImapAccount,
   ImapFolder,
@@ -39,11 +39,15 @@ export class MirrorEngine {
     this.clientFactory = options.clientFactory ?? ((account) => createImapClient(this.pool, this.config, account));
   }
 
-  async syncDueAccounts(limit = 10): Promise<SyncResult[]> {
+  async syncDueAccounts(
+    limit = 10,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<SyncResult[]> {
     const accounts = await this.repository.getRunnableAccounts(limit);
     const results: SyncResult[] = [];
 
     for (const account of accounts) {
+      if (options.signal?.aborted) break;
       results.push(await this.syncAccount(account.id, "scheduled"));
     }
 
@@ -86,7 +90,9 @@ export class MirrorEngine {
             result.reconcileGapsFound += folderResult.reconcileGapsFound;
             await this.repository.heartbeat(account.id);
           } catch (error) {
-            result.errors.push(`${folder.path}: ${error instanceof Error ? error.message : String(error)}`);
+            const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
+            const message = error instanceof Error ? error.message : String(error);
+            result.errors.push(sanitizeErrorReason(`${sanitizedPath}: ${message}`));
           }
         }
 
@@ -106,7 +112,7 @@ export class MirrorEngine {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         result.outcome = "failed";
-        result.errors.push(message);
+        result.errors.push(sanitizeErrorReason(message));
         await this.repository.markAccountSyncFailed(account.id, message);
       } finally {
         if (client) await client.logout().catch(() => undefined);
@@ -223,16 +229,22 @@ export class MirrorEngine {
         }
       }
 
-      const liveUids = await searchAllUids(client);
-      if (liveUids.length === 0 && (mailbox.exists ?? 0) > 0) {
-        throw new Error(`Reconcile returned no UIDs for non-empty mailbox ${folder.path}`);
-      }
-      const reconcileGapsFound = await this.repository.markMissingMessages(account.id, folder, uidValidity, liveUids);
+      const reconcile = await this.repository.markMissingMessagesFromLiveUidStream(
+        account.id,
+        folder,
+        uidValidity,
+        iterateAllUids(client),
+        {
+          failIfEmpty: (mailbox.exists ?? 0) > 0,
+          emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`
+        }
+      );
+      const reconcileGapsFound = reconcile.markedCount;
 
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
-        lastUid: uniqueUids.length > 0 ? Math.max(...uniqueUids) : undefined,
+        lastUid: uniqueUids.length > 0 ? uniqueUids[uniqueUids.length - 1] : undefined,
         initialComplete: true
       });
 

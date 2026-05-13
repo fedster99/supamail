@@ -20,6 +20,29 @@ describe("repository safety", () => {
     expect(source).toContain("this.config.MAX_LOCK_HOLD_MS");
   });
 
+  it("recovers unhealthy accounts after a successful sync", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("sync_state = 'HEALTHY'");
+    expect(source).not.toContain("CASE WHEN sync_state = 'INITIAL_SYNC' THEN 'HEALTHY' ELSE sync_state END");
+  });
+
+  it("sanitizes sync run errors before persistence", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("const sanitizedErrors = result.errors.map(sanitizeErrorReason)");
+    expect(source).toContain("JSON.stringify({ errors: sanitizedErrors })");
+  });
+
+  it("does not hold account locks with idle transactions", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/locks.ts"), "utf8");
+
+    expect(source).toContain("pg_try_advisory_lock");
+    expect(source).toContain("pg_advisory_unlock");
+    expect(source).not.toContain("pg_try_advisory_xact_lock");
+    expect(source).not.toContain('client.query("BEGIN")');
+  });
+
   it("does not immediately untrack folders after one missing LIST pass", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
@@ -31,5 +54,13 @@ describe("repository safety", () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("AND window_status = 'IN_WINDOW'");
+  });
+
+  it("loads reconcile UIDs through a temporary table", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("CREATE TEMP TABLE supamail_live_uids");
+    expect(source).toContain("ON COMMIT DROP");
+    expect(source).toContain("SELECT DISTINCT unnest($1::bigint[])");
   });
 });
