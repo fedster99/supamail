@@ -37,6 +37,17 @@ export function isAuthError(message: string): boolean {
   return AUTH_ERROR_PATTERNS.some((p) => p.test(message));
 }
 
+// Thrown when the engine has already persisted the account's terminal state
+// (e.g. markAccountBroken for UIDVALIDITY_RESET_LIMIT_EXCEEDED). The outer
+// catch must NOT re-mark via markAccountSyncFailed — that would clobber the
+// BROKEN state back to DEGRADED via the failure-threshold CASE expression.
+export class AccountAlreadyFinalizedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AccountAlreadyFinalizedError";
+  }
+}
+
 export interface MirrorEngineOptions {
   pool?: PgPool;
   config?: AppConfig;
@@ -111,6 +122,11 @@ export class MirrorEngine {
             result.reconcileGapsFound += folderResult.reconcileGapsFound;
             await this.repository.heartbeat(account.id);
           } catch (error) {
+            // Account-finalising errors (e.g. UIDVALIDITY reset cap exceeded)
+            // must escape the per-folder catch so the outer handler sees them
+            // and skips re-marking; otherwise markAccountSyncPartial overrides
+            // the BROKEN state with DEGRADED.
+            if (error instanceof AccountAlreadyFinalizedError) throw error;
             const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
             const message = error instanceof Error ? error.message : String(error);
             result.errors.push(sanitizeErrorReason(`${sanitizedPath}: ${message}`));
@@ -134,7 +150,11 @@ export class MirrorEngine {
         const message = error instanceof Error ? error.message : String(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
-        if (isAuthError(message)) {
+        if (error instanceof AccountAlreadyFinalizedError) {
+          // Account state was already persisted (e.g. UIDVALIDITY reset limit
+          // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
+          // the DEGRADED/BROKEN-via-threshold CASE expression.
+        } else if (isAuthError(message)) {
           await this.repository.markAccountSyncAuthFailed(account.id, message);
         } else {
           await this.repository.markAccountSyncFailed(account.id, message);
@@ -230,7 +250,9 @@ export class MirrorEngine {
             account.id,
             `UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${resetCountIn24h} resets in 24h on ${folder.path}`
           );
-          throw new Error(`UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${folder.path}`);
+          throw new AccountAlreadyFinalizedError(
+            `UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${folder.path}`
+          );
         }
         return { messagesUpserted: 0, reconcileGapsFound: 0 };
       }

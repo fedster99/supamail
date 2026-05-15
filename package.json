@@ -21,6 +21,7 @@
     "dev:worker": "tsx watch --clear-screen=false src/worker.ts",
     "dev:api": "tsx watch --clear-screen=false src/api.ts",
     "dry-run:local": "tsx scripts/local-dry-run.ts",
+    "spec-conformance": "tsx scripts/spec-conformance.ts",
     "smoke:load": "tsx src/smoke/load-smoke.ts",
     "smoke:greenmail": "tsx scripts/greenmail-smoke.ts",
     "start:worker": "node dist/worker.js",
