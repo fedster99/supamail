@@ -29,6 +29,7 @@ const envSchema = z.object({
   IMAP_MAX_COMMANDS_PER_MINUTE: z.coerce.number().int().positive().default(200),
   MAX_LOCK_HOLD_MS: z.coerce.number().int().positive().default(10 * 60_000),
   MAX_UIDVALIDITY_RESETS_24H: z.coerce.number().int().positive().default(2),
+  FOLDER_MISSING_GRACE_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),
   PRIORITY_CUTOFF: z.coerce.number().int().positive().default(10),
   EXPIRE_AFTER_DAYS: z.coerce.number().int().positive().default(180)
 });

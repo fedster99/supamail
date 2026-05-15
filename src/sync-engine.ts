@@ -16,6 +16,27 @@ import type {
 } from "./types.js";
 import { createImapClient } from "./imap-client.js";
 
+// Patterns from real IMAP/SASL servers. Case-insensitive. Matched against
+// the full error message; one match is enough. Spec §13.1 — AUTH_ERROR is
+// non-retryable, so over-matching is preferable to under-matching here
+// (a legitimate transient error caught as auth means a manual unstuck;
+// a missed auth error means burning through retries on bad creds).
+const AUTH_ERROR_PATTERNS = [
+  /authentication failed/i,
+  /invalid credentials/i,
+  /invalid (user|username|login)/i,
+  /incorrect password/i,
+  /login failed/i,
+  /auth(?:enticate)? failed/i,
+  /AUTHENTICATIONFAILED/i,
+  /\bNO LOGIN\b/i,
+  /\b535\b/, // SMTP/IMAP auth fail code
+];
+
+export function isAuthError(message: string): boolean {
+  return AUTH_ERROR_PATTERNS.some((p) => p.test(message));
+}
+
 export interface MirrorEngineOptions {
   pool?: PgPool;
   config?: AppConfig;
@@ -113,7 +134,11 @@ export class MirrorEngine {
         const message = error instanceof Error ? error.message : String(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
-        await this.repository.markAccountSyncFailed(account.id, message);
+        if (isAuthError(message)) {
+          await this.repository.markAccountSyncAuthFailed(account.id, message);
+        } else {
+          await this.repository.markAccountSyncFailed(account.id, message);
+        }
       } finally {
         if (client) await client.logout().catch(() => undefined);
       }
@@ -195,40 +220,70 @@ export class MirrorEngine {
       const storedUidValidity = folder.uidvalidity ? Number(folder.uidvalidity) : null;
 
       if (storedUidValidity && storedUidValidity !== uidValidity) {
-        await this.repository.handleUidValidityReset(account, folder, uidValidity);
+        const { resetCountIn24h } = await this.repository.handleUidValidityReset(
+          account,
+          folder,
+          uidValidity
+        );
+        if (resetCountIn24h > this.config.MAX_UIDVALIDITY_RESETS_24H) {
+          await this.repository.markAccountBroken(
+            account.id,
+            `UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${resetCountIn24h} resets in 24h on ${folder.path}`
+          );
+          throw new Error(`UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${folder.path}`);
+        }
         return { messagesUpserted: 0, reconcileGapsFound: 0 };
       }
 
       const windowCutoff = getWindowCutoff(this.config);
-      let uids: number[];
-
-      if (!folder.initial_sync_complete) {
-        uids = await searchUidsSince(client, windowCutoff);
-      } else {
-        const lastUid = folder.last_uid ? Number(folder.last_uid) : 0;
-        const uidFloor = lastUid + 1;
-        const uidCeiling = Math.max(uidFloor, uidNext ? uidNext - 1 : uidFloor);
-        uids = (await searchUidsSince(client, windowCutoff, `${uidFloor}:${uidCeiling}`))
-          .filter((uid) => uid > lastUid);
-      }
-
-      const uniqueUids = [...new Set(uids)].sort((a, b) => a - b);
-      const metadataBatchSize = folder.initial_sync_complete
-        ? this.config.INCREMENTAL_SYNC_BATCH_SIZE
-        : this.config.INITIAL_SYNC_BATCH_SIZE;
       let messagesUpserted = 0;
 
-      for (let i = 0; i < uniqueUids.length; i += metadataBatchSize) {
-        const batchUids = uniqueUids.slice(i, i + metadataBatchSize);
-        const metadata = await fetchMessageMetadata(client, batchUids, metadataBatchSize);
-        const messages = await this.repository.upsertMessages(account.id, folder, uidValidity, metadata, windowCutoff);
-        messagesUpserted += messages.length;
+      // Spec §10.4: initial sync is snapshot-based and newest-first, with a
+      // watermark (`initial_sync_oldest_uid_synced`) so a crash mid-backfill
+      // resumes from where we left off instead of rescanning the world.
+      if (!folder.initial_sync_complete) {
+        const initial = await this.runInitialSyncBatch(
+          account,
+          folder,
+          client,
+          uidValidity,
+          uidNext,
+          windowCutoff
+        );
+        return { messagesUpserted: initial.messagesUpserted, reconcileGapsFound: 0 };
+      }
 
+      // Spec §10.5: incremental sync — only UIDs > last_uid, in window.
+      const lastUid = folder.last_uid ? Number(folder.last_uid) : 0;
+      const uidFloor = lastUid + 1;
+      const uidCeiling = Math.max(uidFloor, uidNext ? uidNext - 1 : uidFloor);
+      const incomingUids = [
+        ...new Set(
+          (await searchUidsSince(client, windowCutoff, `${uidFloor}:${uidCeiling}`))
+            .filter((uid) => uid > lastUid)
+        )
+      ].sort((a, b) => a - b);
+
+      const incrementalBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+      for (let i = 0; i < incomingUids.length; i += incrementalBatchSize) {
+        const batchUids = incomingUids.slice(i, i + incrementalBatchSize);
+        const metadata = await fetchMessageMetadata(client, batchUids, incrementalBatchSize);
+        const messages = await this.repository.upsertMessages(
+          account.id,
+          folder,
+          uidValidity,
+          metadata,
+          windowCutoff
+        );
+        messagesUpserted += messages.length;
         for (const message of messages) {
           await this.hooks.onMessageUpsert?.(message);
         }
       }
 
+      // Spec §10.7: only reconcile once initial sync is complete (otherwise
+      // unfinished backfill looks like a "gap"). The temp-table stream surfaces
+      // both deletions (missing-on-server) and gaps (missing-in-db).
       const reconcile = await this.repository.markMissingMessagesFromLiveUidStream(
         account.id,
         folder,
@@ -239,22 +294,166 @@ export class MirrorEngine {
           emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`
         }
       );
-      const reconcileGapsFound = reconcile.markedCount;
+
+      // Spec §10.7 step 3: missingInDb → fetch + upsert (closes the gap).
+      let backfilled = 0;
+      if (reconcile.missingInDbUids.length > 0) {
+        const backfillBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+        for (let i = 0; i < reconcile.missingInDbUids.length; i += backfillBatchSize) {
+          const batchUids = reconcile.missingInDbUids.slice(i, i + backfillBatchSize);
+          const metadata = await fetchMessageMetadata(client, batchUids, backfillBatchSize);
+          const messages = await this.repository.upsertMessages(
+            account.id,
+            folder,
+            uidValidity,
+            metadata,
+            windowCutoff
+          );
+          backfilled += messages.length;
+          for (const message of messages) {
+            await this.hooks.onMessageUpsert?.(message);
+          }
+        }
+        await this.repository.logEvent(
+          account.id,
+          null,
+          null,
+          folder.path,
+          null,
+          "RECONCILE_BACKFILL",
+          { backfilled, attempted: reconcile.missingInDbUids.length }
+        );
+      }
 
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
-        lastUid: uniqueUids.length > 0 ? uniqueUids[uniqueUids.length - 1] : undefined,
-        initialComplete: true
+        lastUid: incomingUids.length > 0 ? incomingUids[incomingUids.length - 1] : undefined,
+        initialComplete: true,
+        reconcileClean: reconcile.markedCount === 0 && reconcile.missingInDbUids.length === 0
       });
 
       return {
-        messagesUpserted,
-        reconcileGapsFound
+        messagesUpserted: messagesUpserted + backfilled,
+        reconcileGapsFound: reconcile.markedCount + reconcile.missingInDbUids.length
       };
     } finally {
       mailboxLock.release();
     }
+  }
+
+  // Spec §10.4: process ONE batch per cycle, newest-first, advancing the
+  // watermark only after a successful upsert. Multi-cycle runs gives big
+  // mailboxes resumability and prevents one folder from monopolising a tick.
+  private async runInitialSyncBatch(
+    account: ImapAccount,
+    folder: ImapFolder,
+    client: MirrorImapClient,
+    uidValidity: number,
+    uidNext: number | undefined,
+    windowCutoff: Date
+  ): Promise<{ messagesUpserted: number }> {
+    let targetMaxUid: number | null = folder.initial_sync_target_max_uid
+      ? Number(folder.initial_sync_target_max_uid)
+      : null;
+    let oldestSynced: number | null = folder.initial_sync_oldest_uid_synced
+      ? Number(folder.initial_sync_oldest_uid_synced)
+      : null;
+
+    // First pass for this folder: take the snapshot.
+    if (targetMaxUid === null || oldestSynced === null) {
+      const snapshot = await searchUidsSince(client, windowCutoff);
+      const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
+
+      if (sortedTargets.length === 0) {
+        // Empty folder in window — record the snapshot (target=0) and mark complete.
+        await this.repository.setInitialSyncSnapshot(folder.id, 0, 0);
+        await this.repository.markFolderSynced(folder.id, {
+          uidValidity,
+          uidNext,
+          lastUid: 0,
+          initialComplete: true
+        });
+        return { messagesUpserted: 0 };
+      }
+
+      targetMaxUid = sortedTargets[sortedTargets.length - 1];
+      oldestSynced = targetMaxUid + 1;
+      await this.repository.setInitialSyncSnapshot(folder.id, targetMaxUid, oldestSynced);
+    }
+
+    // Re-search and bound by the snapshot. Any UIDs the provider has expunged
+    // between cycles fall out naturally and we don't try to fetch them.
+    const candidates = await searchUidsSince(client, windowCutoff);
+    const inSnapshot = [...new Set(candidates)]
+      .filter((uid) => uid <= targetMaxUid!)
+      .sort((a, b) => a - b);
+
+    if (inSnapshot.length === 0) {
+      // Everything in the original snapshot has gone away — done.
+      await this.repository.markFolderSynced(folder.id, {
+        uidValidity,
+        uidNext,
+        lastUid: targetMaxUid,
+        initialComplete: true
+      });
+      return { messagesUpserted: 0 };
+    }
+
+    // Collect up to one batch of UIDs strictly less than the watermark,
+    // walking from the top down (newest-first within the unsynced region).
+    const batchSize = this.config.INITIAL_SYNC_BATCH_SIZE;
+    const descending: number[] = [];
+    for (let i = inSnapshot.length - 1; i >= 0; i--) {
+      if (inSnapshot[i] < oldestSynced!) {
+        descending.push(inSnapshot[i]);
+        if (descending.length >= batchSize) break;
+      }
+    }
+
+    if (descending.length === 0) {
+      // Watermark already at or below the minimum — initial sync is complete.
+      await this.repository.markFolderSynced(folder.id, {
+        uidValidity,
+        uidNext,
+        lastUid: targetMaxUid,
+        initialComplete: true
+      });
+      return { messagesUpserted: 0 };
+    }
+
+    const batch = descending.slice().reverse(); // ascending order for FETCH
+    const metadata = await fetchMessageMetadata(client, batch, batchSize);
+    const messages = await this.repository.upsertMessages(
+      account.id,
+      folder,
+      uidValidity,
+      metadata,
+      windowCutoff
+    );
+    for (const message of messages) {
+      await this.hooks.onMessageUpsert?.(message);
+    }
+
+    const newOldestSynced = batch[0];
+    await this.repository.advanceInitialSyncWatermark(
+      folder.id,
+      newOldestSynced,
+      batch[batch.length - 1]
+    );
+
+    // Was that the last batch?
+    const stillRemaining = inSnapshot.some((uid) => uid < newOldestSynced);
+    if (!stillRemaining) {
+      await this.repository.markFolderSynced(folder.id, {
+        uidValidity,
+        uidNext,
+        lastUid: targetMaxUid,
+        initialComplete: true
+      });
+    }
+
+    return { messagesUpserted: messages.length };
   }
 
   private async fetchBodyBacklog(account: ImapAccount, client: MirrorImapClient): Promise<number> {

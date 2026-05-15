@@ -223,6 +223,10 @@ export class MirrorRepository {
     );
   }
 
+  // Per spec §12.2: PARTIAL_SUCCESS means priority folders succeeded but some
+  // round-robin folders didn't. Counters increment as if it were SUCCESS
+  // (consecutive_successes++, failures=0); sync_state stays DEGRADED until
+  // round-robin folders catch up.
   async markAccountSyncPartial(accountId: string, error: string): Promise<void> {
     await this.pool.query(
       `
@@ -232,13 +236,36 @@ export class MirrorRepository {
         sync_started_by = NULL,
         last_sync_finished_at = now(),
         last_heartbeat_at = now(),
-        sync_state = CASE WHEN consecutive_failures >= $3 THEN 'BROKEN' ELSE 'DEGRADED' END,
+        sync_state = 'DEGRADED',
         sync_state_reason = $2,
-        consecutive_failures = consecutive_failures + 1,
-        consecutive_successes = 0
+        consecutive_successes = consecutive_successes + 1,
+        consecutive_failures = 0
       WHERE id = $1
       `,
-      [accountId, sanitizeErrorReason(error), BROKEN_FAILURE_THRESHOLD]
+      [accountId, sanitizeErrorReason(error)]
+    );
+  }
+
+  // Per spec §12.4 / §13.1: AUTH_ERROR is non-retryable. Skip backoff math and
+  // pin the account at BROKEN with a clear reason. Operator intervention is
+  // required (rotate creds, re-add account).
+  async markAccountSyncAuthFailed(accountId: string, error: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET
+        currently_syncing = false,
+        sync_started_by = NULL,
+        last_sync_finished_at = now(),
+        sync_state = 'BROKEN',
+        sync_state_reason = $2,
+        consecutive_failures = consecutive_failures + 1,
+        consecutive_successes = 0,
+        current_backoff_ms = 0,
+        backoff_until = NULL
+      WHERE id = $1
+      `,
+      [accountId, sanitizeErrorReason(`AUTH_ERROR: ${error}`)]
     );
   }
 
@@ -332,18 +359,21 @@ export class MirrorRepository {
       rows.push(result.rows[0]);
     }
 
+    // Spec §10.2: folder-missing grace. Only flip to MISSING + untrack after
+    // the folder has been absent for FOLDER_MISSING_GRACE_MS. A transient LIST
+    // glitch (provider hiccup, lock contention) should not tombstone messages.
     await this.pool.query(
       `
       UPDATE public.imap_folders
       SET status = 'MISSING',
-          missing_since = COALESCE(missing_since, now()),
           tracked = false
       WHERE account_id = $1
         AND NOT (path = ANY($2::text[]))
         AND missing_since IS NOT NULL
+        AND missing_since < now() - ($3 * interval '1 millisecond')
         AND status != 'MISSING'
       `,
-      [account.id, [...seen]]
+      [account.id, [...seen], this.config.FOLDER_MISSING_GRACE_MS]
     );
 
     await this.pool.query(
@@ -395,11 +425,49 @@ export class MirrorRepository {
     );
   }
 
+  // Spec §10.4: capture the SEARCH(since cutoff) snapshot at the start of an
+  // initial sync. `oldestUidSynced` is set to `targetMaxUid + 1` as a sentinel
+  // so the first downward batch picks up UIDs strictly less than it.
+  async setInitialSyncSnapshot(
+    folderId: string,
+    targetMaxUid: number,
+    oldestUidSynced: number
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET initial_sync_target_max_uid = $2,
+          initial_sync_oldest_uid_synced = $3,
+          last_progress_at = now()
+      WHERE id = $1
+      `,
+      [folderId, targetMaxUid, oldestUidSynced]
+    );
+  }
+
+  async advanceInitialSyncWatermark(
+    folderId: string,
+    newOldestUidSynced: number,
+    lastProgressUid: number
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET initial_sync_oldest_uid_synced = $2,
+          last_progress_at = now(),
+          last_progress_uid = $3
+      WHERE id = $1
+      `,
+      [folderId, newOldestUidSynced, lastProgressUid]
+    );
+  }
+
   async markFolderSynced(folderId: string, patch: {
     uidValidity: number;
     uidNext?: number;
     lastUid?: number;
     initialComplete?: boolean;
+    reconcileClean?: boolean;
   }): Promise<void> {
     await this.pool.query(
       `
@@ -411,16 +479,32 @@ export class MirrorRepository {
         last_uid = COALESCE($4, last_uid),
         initial_sync_complete = COALESCE($5, initial_sync_complete),
         last_synced_at = now(),
+        last_full_reconcile_at = CASE WHEN $6::boolean IS NOT NULL THEN now() ELSE last_full_reconcile_at END,
+        last_reconcile_clean = COALESCE($6, last_reconcile_clean),
         next_sync_due_at = now() + interval '1 minute',
         next_flag_scan_at = COALESCE(next_flag_scan_at, now() + interval '10 minutes'),
         next_reconcile_at = COALESCE(next_reconcile_at, now() + interval '6 hours')
       WHERE id = $1
       `,
-      [folderId, patch.uidValidity, patch.uidNext ?? null, patch.lastUid ?? null, patch.initialComplete ?? null]
+      [
+        folderId,
+        patch.uidValidity,
+        patch.uidNext ?? null,
+        patch.lastUid ?? null,
+        patch.initialComplete ?? null,
+        patch.reconcileClean ?? null
+      ]
     );
   }
 
-  async handleUidValidityReset(account: ImapAccount, folder: ImapFolder, newUidValidity: number): Promise<void> {
+  // Returns the post-reset `uidvalidity_reset_count`, scoped to a rolling
+  // 24h window (resets older than 24h don't count). Caller compares against
+  // MAX_UIDVALIDITY_RESETS_24H to decide whether to mark the account BROKEN.
+  async handleUidValidityReset(
+    account: ImapAccount,
+    folder: ImapFolder,
+    newUidValidity: number
+  ): Promise<{ resetCountIn24h: number }> {
     const client = await this.pool.connect();
     await client.query("BEGIN");
     try {
@@ -436,17 +520,25 @@ export class MirrorRepository {
         `,
         [account.id, folder.path]
       );
-      await client.query(
+      const folderRow = await client.query<{ uidvalidity_reset_count: number }>(
         `
         UPDATE public.imap_folders
         SET uidvalidity = $3,
             last_uid = NULL,
             initial_sync_complete = false,
+            initial_sync_target_max_uid = NULL,
+            initial_sync_oldest_uid_synced = NULL,
             status = 'NEEDS_FULL_RESYNC',
-            uidvalidity_reset_count = uidvalidity_reset_count + 1,
+            uidvalidity_reset_count = CASE
+              WHEN last_uidvalidity_reset_at IS NULL
+                OR last_uidvalidity_reset_at < now() - interval '24 hours'
+              THEN 1
+              ELSE uidvalidity_reset_count + 1
+            END,
             last_uidvalidity_reset_at = now()
         WHERE id = $1
           AND account_id = $2
+        RETURNING uidvalidity_reset_count
         `,
         [folder.id, account.id, newUidValidity]
       );
@@ -466,12 +558,30 @@ export class MirrorRepository {
         [account.id, folder.path, JSON.stringify({ reason: "UIDVALIDITY_RESET", newUidValidity })]
       );
       await client.query("COMMIT");
+      return { resetCountIn24h: folderRow.rows[0]?.uidvalidity_reset_count ?? 1 };
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
     } finally {
       client.release();
     }
+  }
+
+  async markAccountBroken(accountId: string, reason: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET
+        currently_syncing = false,
+        sync_started_by = NULL,
+        sync_state = 'BROKEN',
+        sync_state_reason = $2,
+        current_backoff_ms = 0,
+        backoff_until = NULL
+      WHERE id = $1
+      `,
+      [accountId, sanitizeErrorReason(reason)]
+    );
   }
 
   async upsertMessages(
@@ -643,7 +753,7 @@ export class MirrorRepository {
     uidValidity: number,
     liveUids: AsyncIterable<number>,
     options: { failIfEmpty?: boolean; emptyError?: string; batchSize?: number } = {}
-  ): Promise<{ markedCount: number; liveUidCount: number }> {
+  ): Promise<{ markedCount: number; liveUidCount: number; missingInDbUids: number[] }> {
     const batchSize = options.batchSize ?? 10_000;
     const client = await this.pool.connect();
     const batch: number[] = [];
@@ -676,7 +786,7 @@ export class MirrorRepository {
         throw new Error(options.emptyError ?? `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`);
       }
 
-      const result = await client.query<{ count: string }>(
+      const markedResult = await client.query<{ count: string }>(
         `
         WITH marked AS (
           UPDATE public.imap_messages m
@@ -700,10 +810,32 @@ export class MirrorRepository {
         [accountId, folder.path, uidValidity]
       );
 
+      // Spec §10.7 step 3: server has UIDs we don't have a live row for.
+      // Caller fetches metadata for these and upserts (closes the gap).
+      const missingResult = await client.query<{ uid: string }>(
+        `
+        SELECT live.uid::text AS uid
+        FROM supamail_live_uids live
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.imap_messages m
+          WHERE m.account_id = $1
+            AND m.folder_path = $2
+            AND m.uidvalidity = $3
+            AND m.uid = live.uid
+            AND m.deleted_in_provider = false
+        )
+        ORDER BY live.uid DESC
+        LIMIT 5000
+        `,
+        [accountId, folder.path, uidValidity]
+      );
+
       await client.query("COMMIT");
       return {
-        markedCount: Number(result.rows[0].count),
-        liveUidCount
+        markedCount: Number(markedResult.rows[0].count),
+        liveUidCount,
+        missingInDbUids: missingResult.rows.map((row) => Number(row.uid))
       };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);

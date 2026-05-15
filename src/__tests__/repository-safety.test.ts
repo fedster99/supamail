@@ -63,4 +63,51 @@ describe("repository safety", () => {
     expect(source).toContain("ON COMMIT DROP");
     expect(source).toContain("SELECT DISTINCT unnest($1::bigint[])");
   });
+
+  it("returns missing-in-DB UIDs from reconcile for backfill (spec §10.7 step 3)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("missingInDbUids: number[]");
+    expect(source).toContain("FROM supamail_live_uids live");
+    expect(source).toContain("WHERE NOT EXISTS");
+  });
+
+  it("treats PARTIAL_SUCCESS as a success for counter rules (spec §12.2)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    // PARTIAL block must increment successes, not failures.
+    expect(source).toMatch(/markAccountSyncPartial[\s\S]{0,800}consecutive_successes = consecutive_successes \+ 1/);
+    expect(source).not.toMatch(/markAccountSyncPartial[\s\S]{0,500}consecutive_failures = consecutive_failures \+ 1/);
+  });
+
+  it("short-circuits AUTH_ERROR to BROKEN without backoff (spec §13.1)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("markAccountSyncAuthFailed");
+    expect(source).toContain("AUTH_ERROR:");
+    expect(source).toContain("sync_state = 'BROKEN'");
+  });
+
+  it("scopes UIDVALIDITY reset counter to a rolling 24h window (spec §11)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("last_uidvalidity_reset_at < now() - interval '24 hours'");
+    expect(source).toContain("resetCountIn24h");
+  });
+
+  it("applies a folder-missing grace period before flipping to MISSING (spec §10.2)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("missing_since < now() - ($3 * interval '1 millisecond')");
+    expect(source).toContain("FOLDER_MISSING_GRACE_MS");
+  });
+
+  it("supports snapshot + watermark for initial sync (spec §10.4)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("setInitialSyncSnapshot");
+    expect(source).toContain("advanceInitialSyncWatermark");
+    expect(source).toContain("initial_sync_target_max_uid = $2");
+    expect(source).toContain("initial_sync_oldest_uid_synced = $3");
+  });
 });
