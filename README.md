@@ -85,6 +85,8 @@ Important: use a direct Supabase Postgres URL or session pooling. Do not use the
 
 See [docs/fly-supabase.md](docs/fly-supabase.md) for the full Fly.io + Supabase setup.
 
+See [docs/spec-conformance.md](docs/spec-conformance.md) for the public reliability matrix against the old Signal sync-engine spec that SupaMail was extracted from.
+
 ## Add a Mailbox
 
 ```bash
