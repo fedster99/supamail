@@ -1,5 +1,7 @@
 # SupaMail
 
+[![CI](https://github.com/fedster99/supamail/actions/workflows/ci.yml/badge.svg)](https://github.com/fedster99/supamail/actions/workflows/ci.yml)
+
 Reliable IMAP sync for Supabase.
 
 SupaMail turns any IMAP inbox into queryable Supabase tables. It runs a worker/API, connects to your mailboxes, and keeps folders, messages, flags, full MIME bodies, attachment metadata, and sync health up to date in Postgres.
@@ -229,8 +231,17 @@ See [docs/deployment-options.md](docs/deployment-options.md) for tradeoffs.
 pnpm install
 pnpm typecheck
 pnpm test
+pnpm test:db:live
 pnpm build
 ```
+
+Live DB reliability tests:
+
+```bash
+pnpm test:db:live
+```
+
+This starts a disposable `postgres:16-alpine` container on a random localhost port, applies the migration twice, runs the DB-backed sync engine suites, runs spec conformance, and removes the container. Set `KEEP_DB=1` to leave the container running for inspection.
 
 Local Supabase dry run:
 

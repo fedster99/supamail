@@ -19,7 +19,9 @@ export interface IntegrationHarness {
 
 export async function setupIntegration(suite: string, overrides: Partial<AppConfig> = {}): Promise<IntegrationHarness> {
   const pool = getPool();
-  await applyInitialMigration(pool);
+  if (process.env.SKIP_TEST_MIGRATION !== "1") {
+    await applyInitialMigration(pool);
+  }
   const config: AppConfig = {
     ...getConfig(),
     BODY_FETCH_POLICY: "lazy",

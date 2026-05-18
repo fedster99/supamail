@@ -28,6 +28,7 @@
     "start:api": "node dist/api.js",
     "migrate": "tsx src/cli.ts migrate",
     "test": "vitest run",
+    "test:db:live": "tsx scripts/test-db-live.ts",
     "test:watch": "vitest"
   },
   "dependencies": {

@@ -19,6 +19,13 @@ describe("provider profiles", () => {
     expect(profile.excludedReason("INBOX")).toBeNull();
   });
 
+  it("excludes All Mail by name and SPECIAL-USE", () => {
+    const profile = getProviderProfile("generic-imap");
+    expect(profile.excludedReason("All Mail")).toBe("excluded_all_mail");
+    expect(profile.excludedReason("[Gmail]/All Mail")).toBe("excluded_all_mail");
+    expect(profile.excludedReason("Archive", "\\All")).toBe("excluded_all_mail");
+  });
+
   it("lists supported profiles", () => {
     expect(listProviderProfiles().map((profile) => profile.id)).toContain("rackspace");
   });

@@ -1,8 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { normalizeFlags } from "../repository.js";
 
 describe("repository safety", () => {
+  it("normalizes IMAP flags for stable diffing", () => {
+    expect(normalizeFlags(["\\Seen", "\\Flagged", "\\seen", " "])).toEqual(["\\flagged", "\\seen"]);
+  });
+
   it("keeps external account responses on the sanitized summary shape", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
@@ -16,14 +21,19 @@ describe("repository safety", () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("currently_syncing = false");
-    expect(source).toContain("last_heartbeat_at <= now() - ($2 * interval '1 millisecond')");
-    expect(source).toContain("this.config.MAX_LOCK_HOLD_MS");
+    expect(source).toContain("last_heartbeat_at <= now() - ($2::bigint * interval '1 millisecond')");
+    expect(source).toContain("this.config.STALE_HEARTBEAT_MS");
   });
 
-  it("recovers unhealthy accounts after a successful sync", async () => {
+  it("does not mark incomplete initial sync as healthy", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    expect(source).toContain("sync_state = 'HEALTHY'");
+    expect(source).toContain("INITIAL_SYNC_IN_PROGRESS");
+    expect(source).toContain("incomplete_count > 0 THEN 'INITIAL_SYNC'");
+    expect(source).toContain("PRIORITY_RECONCILE_STALE");
+    expect(source).toContain("OVERALL_RECONCILE_STALE");
+    expect(source).toContain("PRIORITY_RECONCILE_HEALTHY_MAX_AGE_MS");
+    expect(source).toContain("ELSE 'HEALTHY'");
     expect(source).not.toContain("CASE WHEN sync_state = 'INITIAL_SYNC' THEN 'HEALTHY' ELSE sync_state END");
   });
 
@@ -39,6 +49,9 @@ describe("repository safety", () => {
 
     expect(source).toContain("pg_try_advisory_lock");
     expect(source).toContain("pg_advisory_unlock");
+    expect(source).toContain("runLockSelfTest");
+    expect(source).toContain("clearOrphanedLockForAccount");
+    expect(source).toContain("pg_terminate_backend");
     expect(source).not.toContain("pg_try_advisory_xact_lock");
     expect(source).not.toContain('client.query("BEGIN")');
   });
@@ -48,6 +61,28 @@ describe("repository safety", () => {
 
     expect(source).toContain("AND missing_since IS NOT NULL");
     expect(source).toContain("SET missing_since = now()");
+  });
+
+  it("tombstones folder messages after the missing grace expires", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("deleted_reason = 'FOLDER_MISSING'");
+    expect(source).toContain("\"FOLDER_MISSING\"");
+    expect(source).toContain("FOLDER_MISSING_GRACE_EXCEEDED");
+  });
+
+  it("does not schedule broken accounts", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("sync_state NOT IN ('PAUSED', 'BROKEN')");
+  });
+
+  it("enforces the account cap at create time and worker startup", async () => {
+    const repository = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const worker = await readFile(resolve(process.cwd(), "src/worker.ts"), "utf8");
+
+    expect(repository).toContain("SYNC_MAX_ACCOUNTS limit reached");
+    expect(worker).toContain("exceeds SYNC_MAX_ACCOUNTS");
   });
 
   it("limits reconciliation tombstones to the active sync window", async () => {
@@ -80,6 +115,14 @@ describe("repository safety", () => {
     expect(source).not.toMatch(/markAccountSyncPartial[\s\S]{0,500}consecutive_failures = consecutive_failures \+ 1/);
   });
 
+  it("uses jittered backoff and resets the stored backoff only after stable success", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("0.7 + random() * 0.6");
+    expect(source).toContain("current_backoff_ms = next_backoff.base_ms");
+    expect(source).toContain("consecutive_successes + 1 >= 3");
+  });
+
   it("short-circuits AUTH_ERROR to BROKEN without backoff (spec §13.1)", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
@@ -98,7 +141,7 @@ describe("repository safety", () => {
   it("applies a folder-missing grace period before flipping to MISSING (spec §10.2)", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    expect(source).toContain("missing_since < now() - ($3 * interval '1 millisecond')");
+    expect(source).toContain("missing_since < now() - ($3::bigint * interval '1 millisecond')");
     expect(source).toContain("FOLDER_MISSING_GRACE_MS");
   });
 
@@ -109,5 +152,37 @@ describe("repository safety", () => {
     expect(source).toContain("advanceInitialSyncWatermark");
     expect(source).toContain("initial_sync_target_max_uid = $2");
     expect(source).toContain("initial_sync_oldest_uid_synced = $3");
+  });
+
+  it("uses priority plus round-robin folder scheduling", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("MAX_PRIORITY_FOLDERS_PER_CYCLE");
+    expect(source).toContain("MAX_RR_FOLDERS_PER_CYCLE");
+    expect(source).toContain("folder_rr_cursor");
+  });
+
+  it("diffs flag scans and logs FLAGS_CHANGED instead of counting every refetch", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("applyFlagScan");
+    expect(source).toContain("normalizeFlags");
+    expect(source).toContain("FLAGS_CHANGED");
+    expect(source).toContain("previousFlags");
+    expect(source).toContain("nextFlags");
+    expect(source).toContain("knownMessages");
+  });
+
+  it("runs retention as expiry first, purge second", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const worker = await readFile(resolve(process.cwd(), "src/worker.ts"), "utf8");
+
+    expect(source).toContain("runExpiryJob");
+    expect(source).toContain("window_status = 'EXPIRED'");
+    expect(source).toContain("runPurgeJob");
+    expect(source).toContain("provider_deleted_at < now() - interval '30 days'");
+    expect(source).toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')");
+    expect(source).not.toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING', 'RECONCILE_MISSING')");
+    expect(worker).toContain("runRetentionJobs");
   });
 });

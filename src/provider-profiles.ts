@@ -17,6 +17,12 @@ const noisyFolderFragments = [
   "draft"
 ];
 
+function isAllMail(path: string, specialUse?: string | null): boolean {
+  const normalizedSpecialUse = normalizedPath(specialUse ?? "").trim();
+  const normalizedFolder = normalizedPath(path).replace(/\s+/g, " ").trim();
+  return normalizedSpecialUse === "all" || /(^|[/])all\s*mail$/.test(normalizedFolder);
+}
+
 export const genericImapProfile: ProviderProfile = {
   id: "generic-imap",
   displayName: "Generic IMAP",
@@ -27,6 +33,7 @@ export const genericImapProfile: ProviderProfile = {
     return 100;
   },
   excludedReason(path, specialUse) {
+    if (isAllMail(path, specialUse)) return "excluded_all_mail";
     const normalized = normalizedPath(`${specialUse || ""} ${path}`);
     for (const fragment of noisyFolderFragments) {
       if (normalized.includes(fragment)) return `excluded_${fragment}`;

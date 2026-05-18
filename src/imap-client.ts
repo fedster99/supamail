@@ -53,6 +53,7 @@ export interface MirrorImapClient {
   mailbox: MailboxStatus | false | null;
   usable?: boolean;
   connect?(): Promise<void>;
+  close?(): void;
   logout(): Promise<void>;
   list(): Promise<MailboxListItem[]>;
   getMailboxLock(path: string): Promise<MailboxLock>;
@@ -72,7 +73,11 @@ export interface MirrorImapClient {
 export class ThrottledImapClient implements MirrorImapClient {
   private readonly throttle: ImapThrottle;
 
-  constructor(private readonly client: ImapFlow, maxCommandsPerMinute: number) {
+  constructor(
+    private readonly client: ImapFlow,
+    maxCommandsPerMinute: number,
+    private readonly commandTimeoutMs: number
+  ) {
     this.throttle = new ImapThrottle(maxCommandsPerMinute);
   }
 
@@ -89,17 +94,21 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   async logout(): Promise<void> {
-    await this.client.logout();
+    await this.withCommandTimeout("logout", () => this.client.logout());
+  }
+
+  close(): void {
+    this.client.close();
   }
 
   async list(): Promise<MailboxListItem[]> {
     await this.throttle.acquire();
-    return (await this.client.list()) as MailboxListItem[];
+    return await this.withCommandTimeout("list", async () => (await this.client.list()) as MailboxListItem[]);
   }
 
   async getMailboxLock(path: string): Promise<MailboxLock> {
     await this.throttle.acquire();
-    return await this.client.getMailboxLock(path);
+    return await this.withCommandTimeout("getMailboxLock", () => this.client.getMailboxLock(path));
   }
 
   async *fetch(
@@ -108,7 +117,17 @@ export class ThrottledImapClient implements MirrorImapClient {
     options?: Record<string, unknown>
   ): AsyncIterable<FetchMessage> {
     await this.throttle.acquire();
-    yield* this.client.fetch(range as never, query as never, options as never) as AsyncIterable<FetchMessage>;
+    const iterator = (this.client.fetch(
+      range as never,
+      query as never,
+      options as never
+    ) as AsyncIterable<FetchMessage>)[Symbol.asyncIterator]();
+
+    while (true) {
+      const item = await this.withCommandTimeout("fetch", () => iterator.next());
+      if (item.done) break;
+      yield item.value;
+    }
   }
 
   async fetchOne(
@@ -117,12 +136,34 @@ export class ThrottledImapClient implements MirrorImapClient {
     options?: Record<string, unknown>
   ): Promise<FetchMessage | false | null> {
     await this.throttle.acquire();
-    return await this.client.fetchOne(range, query as never, options as never) as FetchMessage | false | null;
+    return await this.withCommandTimeout(
+      "fetchOne",
+      async () => await this.client.fetchOne(range, query as never, options as never) as FetchMessage | false | null
+    );
   }
 
   async download(range: string, part?: string, options?: Record<string, unknown>): Promise<DownloadResult> {
     await this.throttle.acquire();
-    return await this.client.download(range, part as never, options as never) as DownloadResult;
+    return await this.withCommandTimeout(
+      "download",
+      async () => await this.client.download(range, part as never, options as never) as DownloadResult
+    );
+  }
+
+  private async withCommandTimeout<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    let timeout: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        this.client.close();
+        reject(new Error(`IMAP_COMMAND_TIMEOUT_MS exceeded during ${operation}`));
+      }, this.commandTimeoutMs);
+    });
+
+    try {
+      return await Promise.race([run(), timeoutPromise]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   }
 }
 
@@ -150,7 +191,11 @@ export async function createImapClient(
   });
 
   await rawClient.connect();
-  return new ThrottledImapClient(rawClient, config.IMAP_MAX_COMMANDS_PER_MINUTE);
+  return new ThrottledImapClient(
+    rawClient,
+    config.IMAP_MAX_COMMANDS_PER_MINUTE,
+    config.IMAP_COMMAND_TIMEOUT_MS
+  );
 }
 
 function firstAddress(addresses: Array<{ address?: string; name?: string }> | undefined): {
@@ -222,6 +267,8 @@ export async function fetchMessageMetadata(
   for (let i = 0; i < uids.length; i += batchSize) {
     const batch = uids.slice(i, i + batchSize);
     if (batch.length === 0) continue;
+    const expected = new Set(batch);
+    const returned = new Set<number>();
 
     for await (const msg of client.fetch(batch, {
       uid: true,
@@ -242,7 +289,17 @@ export async function fetchMessageMetadata(
         "reply-to"
       ]
     }, { uid: true })) {
+      returned.add(msg.uid);
       messages.push(parseMessageMetadata(msg));
+    }
+
+    const missing = [...expected].filter((uid) => !returned.has(uid));
+    if (missing.length > 0) {
+      throw new Error(
+        `IMAP metadata fetch returned ${returned.size}/${expected.size} requested UIDs; missing ${missing
+          .slice(0, 10)
+          .join(",")}`
+      );
     }
   }
 

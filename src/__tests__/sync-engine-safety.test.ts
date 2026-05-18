@@ -10,13 +10,14 @@ describe("sync engine safety", () => {
     expect(source).toContain("markAccountSyncPartial");
   });
 
-  it("reconciles against all live provider UIDs", async () => {
+  it("reconciles only the active sync window", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    expect(source).toContain("iterateAllUids(client)");
+    expect(source).toContain("iterateAllUids(client, windowCutoff)");
     expect(source).toContain("markMissingMessagesFromLiveUidStream");
     expect(source).toContain("Reconcile returned no UIDs for non-empty mailbox");
     expect(source).not.toContain("searchAllUids(client, windowCutoff)");
+    expect(source).not.toContain("iterateAllUids(client),");
   });
 
   it("does not accept an empty folder discovery response as authoritative", async () => {
@@ -55,5 +56,34 @@ describe("sync engine safety", () => {
 
     expect(source).toContain("reconcile.missingInDbUids");
     expect(source).toContain("RECONCILE_BACKFILL");
+  });
+
+  it("budgets flag scans per cycle and only schedules them after an attempted scan", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(source).toContain("MAX_FLAG_SCANS_PER_CYCLE");
+    expect(source).toContain("allowFlagScan");
+    expect(source).toContain("flagScanAttempted");
+    expect(source).toContain("applyFlagScan");
+    expect(source).toContain("scan.flagsChanged");
+  });
+
+  it("closes the IMAP client when incremental total timeout fires", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(source).toContain("withIncrementalDeadline");
+    expect(source).toContain('"INCREMENTAL_TOTAL_TIMEOUT_MS"');
+    expect(source).toContain("withOperationDeadline");
+    expect(source).toContain("abortClient(client)");
+    expect(source).toContain("${timeoutName} exceeded during ${operation}");
+  });
+
+  it("puts total deadlines around flag scan and reconcile streams", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(source).toContain("FLAG_SCAN_TOTAL_TIMEOUT_MS");
+    expect(source).toContain("RECONCILE_TOTAL_TIMEOUT_MS");
+    expect(source).toContain("withAsyncIterableDeadline");
+    expect(source).toContain("reconcile UID stream");
   });
 });

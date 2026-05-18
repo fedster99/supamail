@@ -1,9 +1,12 @@
 import { getConfig } from "./config.js";
-import { closePool } from "./db.js";
+import { closePool, getPool } from "./db.js";
+import { clearOrphanedLocks, runLockSelfTest } from "./locks.js";
+import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 
 const config = getConfig();
 const engine = new MirrorEngine();
+const repository = new MirrorRepository(getPool(), config);
 const abort = new AbortController();
 let stopping = false;
 let wakeSleep: (() => void) | null = null;
@@ -67,6 +70,39 @@ async function loop(): Promise<void> {
   }
 }
 
+async function startup(): Promise<void> {
+  await runLockSelfTest(getPool());
+  console.log(JSON.stringify({ event: "worker.lock_self_test.passed" }));
+
+  const clearedLocks = await clearOrphanedLocks(getPool(), config.STALE_HEARTBEAT_MS);
+  if (clearedLocks > 0) {
+    console.warn(JSON.stringify({
+      event: "worker.orphaned_locks_cleared",
+      count: clearedLocks
+    }));
+  }
+
+  const accountCount = await getPool().query<{ count: string }>(
+    "SELECT count(*)::text AS count FROM public.imap_accounts"
+  );
+  const count = Number(accountCount.rows[0]?.count ?? 0);
+  if (count > config.SYNC_MAX_ACCOUNTS) {
+    throw new Error(`Account count ${count} exceeds SYNC_MAX_ACCOUNTS ${config.SYNC_MAX_ACCOUNTS}`);
+  }
+  console.log(JSON.stringify({
+    event: "worker.account_cap.checked",
+    count,
+    max: config.SYNC_MAX_ACCOUNTS
+  }));
+
+  const retention = await repository.runRetentionJobs();
+  console.log(JSON.stringify({
+    event: "worker.retention.completed",
+    expired: retention.expired,
+    purged: retention.purged
+  }));
+}
+
 function sleep(ms: number): Promise<void> {
   if (stopping) return Promise.resolve();
 
@@ -94,5 +130,17 @@ function shutdown(): void {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
+try {
+  await startup();
+} catch (error) {
+  console.error(JSON.stringify({
+    event: "worker.startup.failed",
+    error: error instanceof Error
+      ? { message: error.message, stack: error.stack }
+      : String(error)
+  }));
+  await closePool().catch(() => undefined);
+  process.exit(1);
+}
 await loop();
 await closePool();

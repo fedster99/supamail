@@ -17,12 +17,24 @@ import type {
   SyncTriggerType
 } from "./types.js";
 
-const BROKEN_FAILURE_THRESHOLD = 4;
-const BACKOFF_FLOOR_MS = 60_000;
-const BACKOFF_CEILING_MS = 3_600_000;
+const BROKEN_FAILURE_THRESHOLD = 10;
+const BACKOFF_FLOOR_MS = 1_000;
+const BACKOFF_CEILING_MS = 5 * 60_000;
 const ERROR_REASON_MAX_LEN = 1000;
 
 const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
+
+export function normalizeFlags(flags: readonly string[] | null | undefined): string[] {
+  return [...new Set((flags ?? []).map((flag) => flag.trim().toLowerCase()).filter(Boolean))]
+    .sort();
+}
+
+function flagsEqual(left: readonly string[] | null | undefined, right: readonly string[] | null | undefined): boolean {
+  const normalizedLeft = normalizeFlags(left);
+  const normalizedRight = normalizeFlags(right);
+  return normalizedLeft.length === normalizedRight.length
+    && normalizedLeft.every((flag, index) => flag === normalizedRight[index]);
+}
 
 export function sanitizeErrorReason(error: string): string {
   return error
@@ -65,6 +77,12 @@ export class MirrorRepository {
     await assertSafeImapTarget(input.host, input.port, secure, {
       allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
     });
+    const accountCount = await this.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_accounts"
+    );
+    if (Number(accountCount.rows[0]?.count ?? 0) >= this.config.SYNC_MAX_ACCOUNTS) {
+      throw new Error(`SYNC_MAX_ACCOUNTS limit reached (${this.config.SYNC_MAX_ACCOUNTS})`);
+    }
     const encrypted = await encryptPassword(this.pool, input.password, this.config.IMAP_ENCRYPTION_KEY);
     const result = await this.pool.query<AccountSummary>(
       `
@@ -111,21 +129,22 @@ export class MirrorRepository {
   }
 
   async getRunnableAccounts(limit = 25): Promise<ImapAccount[]> {
+    const effectiveLimit = Math.min(limit, this.config.SYNC_MAX_ACCOUNTS);
     const result = await this.pool.query<ImapAccount>(
       `
       SELECT *
       FROM public.imap_accounts
-      WHERE sync_state != 'PAUSED'
+      WHERE sync_state NOT IN ('PAUSED', 'BROKEN')
         AND (backoff_until IS NULL OR backoff_until <= now())
         AND (
           currently_syncing = false
           OR last_heartbeat_at IS NULL
-          OR last_heartbeat_at <= now() - ($2 * interval '1 millisecond')
+          OR last_heartbeat_at <= now() - ($2::bigint * interval '1 millisecond')
         )
       ORDER BY COALESCE(last_sync_finished_at, 'epoch'::timestamptz), created_at
       LIMIT $1
       `,
-      [limit, this.config.MAX_LOCK_HOLD_MS]
+      [effectiveLimit, this.config.STALE_HEARTBEAT_MS]
     );
     return result.rows;
   }
@@ -200,26 +219,108 @@ export class MirrorRepository {
   }
 
   async markAccountSyncSucceeded(accountId: string): Promise<void> {
-    // A clean run is the recovery signal — clobber DEGRADED/BROKEN/INITIAL_SYNC
-    // back to HEALTHY. PAUSED accounts never reach this method because
-    // getRunnableAccounts filters them out.
     await this.pool.query(
       `
+      WITH folder_health AS (
+        SELECT
+          count(*) FILTER (WHERE tracked = true AND status != 'MISSING') AS tracked_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND initial_sync_complete = false
+          ) AS incomplete_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND missing_since IS NOT NULL
+              AND missing_since < now() - ($2::bigint * interval '1 millisecond')
+          ) AS stale_missing_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND sync_priority <= $3
+              AND last_reconcile_clean = false
+          ) AS priority_reconcile_gap_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND sync_priority <= $3
+              AND (
+                last_reconcile_clean IS DISTINCT FROM true
+                OR last_full_reconcile_at IS NULL
+                OR last_full_reconcile_at < now() - ($6::bigint * interval '1 millisecond')
+              )
+          ) AS priority_reconcile_unhealthy_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND (
+                last_reconcile_clean IS DISTINCT FROM true
+                OR last_full_reconcile_at IS NULL
+                OR last_full_reconcile_at < now() - ($7::bigint * interval '1 millisecond')
+              )
+          ) AS overall_reconcile_unhealthy_count,
+          max(extract(epoch from (now() - last_synced_at))) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND sync_priority <= $3
+              AND last_synced_at IS NOT NULL
+          ) AS priority_lag_seconds,
+          max(extract(epoch from (now() - last_synced_at))) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND last_synced_at IS NOT NULL
+          ) AS overall_lag_seconds
+        FROM public.imap_folders
+        WHERE account_id = $1
+      )
       UPDATE public.imap_accounts
       SET
         currently_syncing = false,
         sync_started_by = NULL,
         last_sync_finished_at = now(),
         last_heartbeat_at = now(),
-        sync_state = 'HEALTHY',
-        sync_state_reason = NULL,
+        priority_sync_lag_seconds = ceil(folder_health.priority_lag_seconds)::int,
+        overall_sync_lag_seconds = ceil(folder_health.overall_lag_seconds)::int,
+        sync_state = CASE
+          WHEN folder_health.incomplete_count > 0 THEN 'INITIAL_SYNC'
+          WHEN folder_health.stale_missing_count > 0 THEN 'DEGRADED'
+          WHEN folder_health.priority_reconcile_gap_count > 0 THEN 'DEGRADED'
+          WHEN folder_health.priority_reconcile_unhealthy_count > 0 THEN 'DEGRADED'
+          WHEN folder_health.overall_reconcile_unhealthy_count > 0 THEN 'DEGRADED'
+          WHEN (folder_health.priority_lag_seconds * 1000) > $4 THEN 'DEGRADED'
+          WHEN (folder_health.overall_lag_seconds * 1000) > $5 THEN 'DEGRADED'
+          ELSE 'HEALTHY'
+        END,
+        sync_state_reason = CASE
+          WHEN folder_health.incomplete_count > 0 THEN 'INITIAL_SYNC_IN_PROGRESS'
+          WHEN folder_health.stale_missing_count > 0 THEN 'FOLDER_MISSING_GRACE_EXCEEDED'
+          WHEN folder_health.priority_reconcile_gap_count > 0 THEN 'RECONCILE_GAPS_FOUND'
+          WHEN folder_health.priority_reconcile_unhealthy_count > 0 THEN 'PRIORITY_RECONCILE_STALE'
+          WHEN folder_health.overall_reconcile_unhealthy_count > 0 THEN 'OVERALL_RECONCILE_STALE'
+          WHEN (folder_health.priority_lag_seconds * 1000) > $4 THEN 'PRIORITY_SYNC_LAG'
+          WHEN (folder_health.overall_lag_seconds * 1000) > $5 THEN 'OVERALL_SYNC_LAG'
+          ELSE NULL
+        END,
         consecutive_successes = consecutive_successes + 1,
         consecutive_failures = 0,
-        current_backoff_ms = 0,
+        current_backoff_ms = CASE
+          WHEN consecutive_successes + 1 >= 3 THEN 0
+          ELSE current_backoff_ms
+        END,
         backoff_until = NULL
+      FROM folder_health
       WHERE id = $1
       `,
-      [accountId]
+      [
+        accountId,
+        this.config.FOLDER_MISSING_GRACE_MS,
+        this.config.PRIORITY_CUTOFF,
+        this.config.PRIORITY_LAG_HEALTHY_THRESHOLD_MS,
+        this.config.OVERALL_LAG_HEALTHY_THRESHOLD_MS,
+        this.config.PRIORITY_RECONCILE_HEALTHY_MAX_AGE_MS,
+        this.config.OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS
+      ]
     );
   }
 
@@ -239,7 +340,12 @@ export class MirrorRepository {
         sync_state = 'DEGRADED',
         sync_state_reason = $2,
         consecutive_successes = consecutive_successes + 1,
-        consecutive_failures = 0
+        consecutive_failures = 0,
+        current_backoff_ms = CASE
+          WHEN consecutive_successes + 1 >= 3 THEN 0
+          ELSE current_backoff_ms
+        END,
+        backoff_until = NULL
       WHERE id = $1
       `,
       [accountId, sanitizeErrorReason(error)]
@@ -276,20 +382,29 @@ export class MirrorRepository {
     await this.pool.query(
       `
       WITH next_backoff AS (
-        SELECT LEAST(GREATEST(current_backoff_ms * 2, $4::int), $5::int) AS ms
-        FROM public.imap_accounts WHERE id = $1
+        SELECT
+          base_ms,
+          LEAST(
+            $5::int,
+            GREATEST($4::int, floor(base_ms * (0.7 + random() * 0.6))::int)
+          ) AS jittered_ms
+        FROM (
+          SELECT LEAST(GREATEST(current_backoff_ms * 2, $4::int), $5::int) AS base_ms
+          FROM public.imap_accounts
+          WHERE id = $1
+        ) base
       )
       UPDATE public.imap_accounts a
       SET
         currently_syncing = false,
         sync_started_by = NULL,
         last_sync_finished_at = now(),
-        sync_state = CASE WHEN consecutive_failures >= $3 THEN 'BROKEN' ELSE 'DEGRADED' END,
+        sync_state = CASE WHEN consecutive_failures + 1 >= $3 THEN 'BROKEN' ELSE 'DEGRADED' END,
         sync_state_reason = $2,
         consecutive_failures = consecutive_failures + 1,
         consecutive_successes = 0,
-        current_backoff_ms = next_backoff.ms,
-        backoff_until = now() + (next_backoff.ms * interval '1 millisecond')
+        current_backoff_ms = next_backoff.base_ms,
+        backoff_until = now() + (next_backoff.jittered_ms * interval '1 millisecond')
       FROM next_backoff
       WHERE a.id = $1
       `,
@@ -307,6 +422,37 @@ export class MirrorRepository {
     await this.pool.query("UPDATE public.imap_accounts SET last_heartbeat_at = now() WHERE id = $1", [
       accountId
     ]);
+  }
+
+  async runExpiryJob(): Promise<{ expired: number }> {
+    const result = await this.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET window_status = 'EXPIRED'
+      WHERE window_status = 'IN_WINDOW'
+        AND internal_date < now() - ($1::int * interval '1 day')
+      `,
+      [this.config.WINDOW_DAYS]
+    );
+    return { expired: result.rowCount ?? 0 };
+  }
+
+  async runPurgeJob(): Promise<{ purged: number }> {
+    const result = await this.pool.query(
+      `
+      DELETE FROM public.imap_messages
+      WHERE deleted_in_provider = true
+        AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+        AND provider_deleted_at < now() - interval '30 days'
+      `
+    );
+    return { purged: result.rowCount ?? 0 };
+  }
+
+  async runRetentionJobs(): Promise<{ expired: number; purged: number }> {
+    const { expired } = await this.runExpiryJob();
+    const { purged } = await this.runPurgeJob();
+    return { expired, purged };
   }
 
   async upsertDiscoveredFolders(
@@ -362,7 +508,7 @@ export class MirrorRepository {
     // Spec §10.2: folder-missing grace. Only flip to MISSING + untrack after
     // the folder has been absent for FOLDER_MISSING_GRACE_MS. A transient LIST
     // glitch (provider hiccup, lock contention) should not tombstone messages.
-    await this.pool.query(
+    const newlyMissing = await this.pool.query<{ path: string }>(
       `
       UPDATE public.imap_folders
       SET status = 'MISSING',
@@ -370,11 +516,31 @@ export class MirrorRepository {
       WHERE account_id = $1
         AND NOT (path = ANY($2::text[]))
         AND missing_since IS NOT NULL
-        AND missing_since < now() - ($3 * interval '1 millisecond')
+        AND missing_since < now() - ($3::bigint * interval '1 millisecond')
         AND status != 'MISSING'
+      RETURNING path
       `,
       [account.id, [...seen], this.config.FOLDER_MISSING_GRACE_MS]
     );
+
+    for (const row of newlyMissing.rows) {
+      await this.pool.query(
+        `
+        UPDATE public.imap_messages
+        SET deleted_in_provider = true,
+            provider_deleted_at = now(),
+            deleted_reason = 'FOLDER_MISSING'
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND deleted_in_provider = false
+          AND window_status = 'IN_WINDOW'
+        `,
+        [account.id, row.path]
+      );
+      await this.logEvent(account.id, null, null, row.path, null, "FOLDER_MISSING", {
+        reason: "FOLDER_MISSING_GRACE_EXCEEDED"
+      });
+    }
 
     await this.pool.query(
       `
@@ -392,7 +558,7 @@ export class MirrorRepository {
       `
       UPDATE public.imap_accounts
       SET last_folder_discovery_at = now(),
-          next_folder_discovery_at = now() + ($2 * interval '1 millisecond')
+          next_folder_discovery_at = now() + ($2::bigint * interval '1 millisecond')
       WHERE id = $1
       `,
       [account.id, this.config.FOLDER_DISCOVERY_INTERVAL_MS]
@@ -401,21 +567,51 @@ export class MirrorRepository {
     return rows;
   }
 
-  async getFoldersDueForSync(accountId: string, limit = 25): Promise<ImapFolder[]> {
-    const result = await this.pool.query<ImapFolder>(
+  async getFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
+    const priority = await this.pool.query<ImapFolder>(
       `
       SELECT *
       FROM public.imap_folders
       WHERE account_id = $1
         AND tracked = true
         AND status != 'MISSING'
+        AND sync_priority <= $2
         AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
-      ORDER BY sync_priority, COALESCE(last_synced_at, 'epoch'::timestamptz), path
-      LIMIT $2
+      ORDER BY sync_priority, path
+      LIMIT $3
       `,
-      [accountId, limit]
+      [accountId, this.config.PRIORITY_CUTOFF, this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE]
     );
-    return result.rows;
+
+    const account = await this.getAccount(accountId);
+    const cursor = account?.folder_rr_cursor ?? 0;
+    const rrCandidates = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND status != 'MISSING'
+        AND sync_priority > $2
+        AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
+      ORDER BY path
+      `,
+      [accountId, this.config.PRIORITY_CUTOFF]
+    );
+    const rrRows = rrCandidates.rows;
+    const rotated = rrRows.length === 0
+      ? []
+      : [...rrRows.slice(cursor % rrRows.length), ...rrRows.slice(0, cursor % rrRows.length)];
+    const rr = rotated.slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
+
+    if (rrRows.length > 0 && rr.length > 0) {
+      await this.pool.query(
+        "UPDATE public.imap_accounts SET folder_rr_cursor = $2 WHERE id = $1",
+        [accountId, (cursor + rr.length) % rrRows.length]
+      );
+    }
+
+    return [...priority.rows, ...rr];
   }
 
   async markFolderSyncStarted(folderId: string): Promise<void> {
@@ -468,6 +664,7 @@ export class MirrorRepository {
     lastUid?: number;
     initialComplete?: boolean;
     reconcileClean?: boolean;
+    flagScanCompleted?: boolean;
   }): Promise<void> {
     await this.pool.query(
       `
@@ -482,8 +679,22 @@ export class MirrorRepository {
         last_full_reconcile_at = CASE WHEN $6::boolean IS NOT NULL THEN now() ELSE last_full_reconcile_at END,
         last_reconcile_clean = COALESCE($6, last_reconcile_clean),
         next_sync_due_at = now() + interval '1 minute',
-        next_flag_scan_at = COALESCE(next_flag_scan_at, now() + interval '10 minutes'),
-        next_reconcile_at = COALESCE(next_reconcile_at, now() + interval '6 hours')
+        next_flag_scan_at = CASE
+          WHEN $7::boolean = true THEN now() + ((
+            CASE WHEN sync_priority <= $11::int THEN $8::bigint ELSE $9::bigint END
+          ) * interval '1 millisecond')
+          WHEN next_flag_scan_at IS NULL AND $5::boolean = true THEN now()
+          ELSE next_flag_scan_at
+        END,
+        next_reconcile_at = CASE
+          WHEN $6::boolean IS NOT NULL
+            THEN now()
+              + ($10::bigint * interval '1 millisecond')
+              + ((random() * 900000)::int * interval '1 millisecond')
+          WHEN $5::boolean = true AND next_reconcile_at IS NULL
+            THEN now() + ((random() * $10::double precision)::int * interval '1 millisecond')
+          ELSE COALESCE(next_reconcile_at, now() + ((random() * $10::double precision)::int * interval '1 millisecond'))
+        END
       WHERE id = $1
       `,
       [
@@ -492,7 +703,12 @@ export class MirrorRepository {
         patch.uidNext ?? null,
         patch.lastUid ?? null,
         patch.initialComplete ?? null,
-        patch.reconcileClean ?? null
+        patch.reconcileClean ?? null,
+        patch.flagScanCompleted ?? null,
+        this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS,
+        this.config.RR_FLAG_SCAN_INTERVAL_MS,
+        this.config.RECONCILE_INTERVAL_MS,
+        this.config.PRIORITY_CUTOFF
       ]
     );
   }
@@ -717,6 +933,63 @@ export class MirrorRepository {
     }
 
     return rows;
+  }
+
+  async applyFlagScan(
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    messages: MessageMetadata[],
+    windowCutoff: Date
+  ): Promise<{ messages: ImapMessage[]; flagsChanged: number }> {
+    if (messages.length === 0) return { messages: [], flagsChanged: 0 };
+
+    const uids = messages.map((message) => message.uid);
+    const existing = await this.pool.query<Pick<ImapMessage, "id" | "uid" | "flags">>(
+      `
+      SELECT id, uid, flags
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = $2
+        AND uidvalidity = $3
+        AND uid = ANY($4::bigint[])
+        AND deleted_in_provider = false
+      `,
+      [accountId, folder.path, uidValidity, uids]
+    );
+    const existingByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
+    const knownMessages = messages.filter((message) => existingByUid.has(message.uid));
+    const changed = messages
+      .map((message) => {
+        const row = existingByUid.get(message.uid);
+        if (!row || flagsEqual(row.flags, message.flags)) return null;
+        return {
+          row,
+          message,
+          previousFlags: normalizeFlags(row.flags),
+          nextFlags: normalizeFlags(message.flags)
+        };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+    const rows = await this.upsertMessages(accountId, folder, uidValidity, knownMessages, windowCutoff);
+
+    for (const change of changed) {
+      await this.logEvent(
+        accountId,
+        null,
+        change.row.id,
+        folder.path,
+        change.message.uid,
+        "FLAGS_CHANGED",
+        {
+          previousFlags: change.previousFlags,
+          nextFlags: change.nextFlags
+        }
+      );
+    }
+
+    return { messages: rows, flagsChanged: changed.length };
   }
 
   async markMissingMessages(accountId: string, folder: ImapFolder, uidValidity: number, liveUids: number[]): Promise<number> {
