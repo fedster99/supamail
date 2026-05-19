@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "status_values": ["not_started", "in_progress", "blocked", "passing"],
+  "rules": {
+    "work_in_progress_limit": 1,
+    "passing_requires_verification_evidence": true,
+    "source_of_truth": "GitHub issues plus this file",
+    "selection_policy": {
+      "if_in_progress_exists": "Continue the in_progress item unless the user redirects.",
+      "if_no_in_progress": "Do not self-start the highest-priority not_started item. Start only from an explicit user request, maintainer-selected PR scope, or a clear issue/task mapping.",
+      "if_mapping_unclear": "Ask for task selection or record the ambiguity before editing.",
+      "status_flow": "not_started -> in_progress -> blocked or passing"
+    }
+  },
+  "features": [
+    {
+      "id": "issue-2-historical-backfill",
+      "github_issue": 2,
+      "priority": 1,
+      "area": "sync-engine",
+      "title": "Add automatic historical backfill",
+      "user_visible_behavior": "A new account can eventually mirror older messages beyond WINDOW_DAYS without manual intervention while fresh mail stays current.",
+      "status": "not_started",
+      "dependencies": [],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build",
+        "pnpm test:db:live"
+      ],
+      "evidence": "",
+      "notes": "Backfill must be resumable, bounded, body-policy-aware, and safe around UIDVALIDITY resets and folder disappearance."
+    },
+    {
+      "id": "issue-3-provider-compatibility",
+      "github_issue": 3,
+      "priority": 2,
+      "area": "provider-profiles",
+      "title": "Build IMAP compatibility matrix and protocol validation",
+      "user_visible_behavior": "Docs and tests make generic IMAP support explicit, provider-by-provider, with known quirks isolated in provider profiles.",
+      "status": "not_started",
+      "dependencies": [],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build",
+        "pnpm smoke:greenmail when protocol behavior changes"
+      ],
+      "evidence": "",
+      "notes": "Do not claim works with all IMAP. Frame support as generic IMAP core validated provider by provider."
+    },
+    {
+      "id": "issue-4-mcp-server",
+      "github_issue": 4,
+      "priority": 3,
+      "area": "mcp",
+      "title": "Add MCP server for AI email tools",
+      "user_visible_behavior": "A local stdio MCP server can safely expose read-oriented mailbox tools against an existing SupaMail database.",
+      "status": "not_started",
+      "dependencies": [],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build"
+      ],
+      "evidence": "",
+      "notes": "Start local stdio first. Remote transport must be absent or explicitly bearer-token protected."
+    }
+  ]
+}
