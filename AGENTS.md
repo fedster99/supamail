@@ -26,7 +26,9 @@ Before writing code:
 
 ## Scope Boundaries
 
-SupaMail core owns email sync only. Do not add Signal CRM, identity/belief layers, dashboard code, Trigger.dev coupling, calendar, contacts, sending, scheduling, AI features, MCP, historical backfill, or provider compatibility work unless the selected task explicitly asks for it.
+SupaMail core owns email sync only. Do not add Signal CRM, CRM hydration, person/company identity resolution, handle mapping, belief layers, dashboard code, Trigger.dev coupling, calendar, contacts, sending, scheduling, AI features, MCP, historical backfill, or provider compatibility work unless the selected task explicitly asks for it.
+
+When docs mention message identity, they mean mailbox-row identity: `(account_id, folder_path, uidvalidity, uid)`. Do not interpret that as permission to add CRM identity hydration or person/company modeling.
 
 ## Working Rules
 

@@ -5,6 +5,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 ## Identity And Storage
 
 - Message identity is scoped by `(account_id, folder_path, uidvalidity, uid)`.
+- This is mailbox-row identity only. Do not add CRM identity hydration, person/company resolution, handle mapping, or activity construction to SupaMail core.
 - Never treat IMAP UID as globally unique.
 - Store raw and normalized Message-ID separately.
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.

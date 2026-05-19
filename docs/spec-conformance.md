@@ -15,6 +15,7 @@ SupaMail owns a conservative mailbox mirror:
 - Metadata, folder state, flags, body fetch state, sync events, and health are durable.
 - Full MIME bodies are fetched according to account policy and always behind the same account lock.
 - Multi-folder moves are normal. A message that leaves one folder may still appear elsewhere with a different folder-scoped UID identity.
+- Mailbox identity is not CRM identity. SupaMail does not resolve people, companies, handles, relationships, or hydrated activities.
 - The architecture is intentionally stateful and account-capped. Scaling beyond the default account cap requires a new architecture decision.
 
 ## Reliability Matrix
@@ -58,7 +59,7 @@ SupaMail owns a conservative mailbox mirror:
 
 ### Identity And Normalization
 
-The mirror stores both raw and normalized Message-ID values, but they are correlation helpers only. They must not replace the primary mirror identity of account, folder path, UIDVALIDITY, and UID. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
+The mirror stores both raw and normalized Message-ID values, but they are correlation helpers only. They must not replace the primary mirror identity of account, folder path, UIDVALIDITY, and UID. This is mailbox identity only; it must not grow into CRM identity hydration, person/company resolution, handle mapping, or activity construction inside SupaMail core. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
 
 ### Folder Discovery And Scheduling
 
@@ -92,7 +93,7 @@ These old-spec ideas are still useful, but they are not part of the current impl
 SupaMail keeps the Signal product layer out:
 
 - Relationship CRM tables and interactions.
-- Identity, belief, and epistemic architecture layers.
+- CRM hydration, identity resolution, handle/person/company mapping, belief, and epistemic architecture layers.
 - Signal dashboard/API routes.
 - Provider-specific live account tests in CI.
 
