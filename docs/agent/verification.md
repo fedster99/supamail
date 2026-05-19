@@ -42,6 +42,15 @@ Use it for any change that could alter:
 - retention or purge behavior
 - live Postgres query behavior
 
+## CI Merge Gate
+
+GitHub branch protection on `main` requires pull requests and these passing checks before merge:
+
+- `Quality`
+- `Live DB Reliability`
+
+`Quality` runs install, typecheck, `pnpm test`, and build. `Live DB Reliability` runs `pnpm test:db:live`. Required status checks are strict, so the PR branch must be up to date with `main` before merging.
+
 ## Evidence
 
 When completing work, record:

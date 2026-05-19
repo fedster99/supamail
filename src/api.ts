@@ -3,32 +3,33 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { getConfig } from "./config.js";
 import { applyInitialMigration, getPool } from "./db.js";
 import { HostValidationError } from "./host-validation.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
+import type { AccountSummary, ImapMessage, SyncResult } from "./types.js";
 
-const config = getConfig();
-const pool = getPool();
-const repository = new MirrorRepository(pool, config);
-const engine = new MirrorEngine({ pool, config, repository });
-const app = new Hono();
-
-if (!config.API_TOKEN) {
-  throw new Error("API_TOKEN is required to run the SupaMail API");
+interface ApiRepository {
+  listAccounts(): Promise<AccountSummary[]>;
+  createAccount(input: unknown): Promise<AccountSummary>;
+  getAccount(id: string): Promise<unknown | null>;
+  getMessage(id: string): Promise<ImapMessage | null>;
 }
 
-const API_TOKEN_BUFFER = Buffer.from(`Bearer ${config.API_TOKEN}`, "utf8");
-const ADMIN_TOKEN_BUFFER = config.ADMIN_TOKEN
-  ? Buffer.from(`Bearer ${config.ADMIN_TOKEN}`, "utf8")
-  : null;
+interface ApiEngine {
+  syncAccount(id: string, source: "api"): Promise<SyncResult>;
+  fetchBody(id: string, force?: boolean): Promise<boolean>;
+}
 
-function safeBearerEquals(received: string, expected: Buffer): boolean {
-  const buf = Buffer.from(received, "utf8");
-  if (buf.length !== expected.length) return false;
-  return timingSafeEqual(buf, expected);
+interface ApiAppOptions {
+  apiToken: string | undefined;
+  adminToken?: string | null;
+  repository: ApiRepository;
+  engine: ApiEngine;
+  applyMigration: () => Promise<void>;
 }
 
 const UUID_SCHEMA = z.string().uuid();
@@ -51,58 +52,6 @@ class NotFoundError extends Error {
   }
 }
 
-app.onError((err, c) => {
-  if (err instanceof HTTPException) return err.getResponse();
-  if (err instanceof HostValidationError) {
-    return c.json({ error: err.code, message: err.message }, 400);
-  }
-  if (err instanceof NotFoundError) {
-    return c.json({ error: "not_found", message: err.message }, 404);
-  }
-  if (err instanceof z.ZodError) {
-    return c.json({ error: "invalid_input", issues: err.issues }, 400);
-  }
-  const pgCode = (err as { code?: string }).code;
-  if (pgCode === "23505") {
-    return c.json({ error: "conflict", message: "Resource already exists" }, 409);
-  }
-  console.error(JSON.stringify({
-    event: "api.unhandled_error",
-    error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err)
-  }));
-  return c.json({ error: "internal_error" }, 500);
-});
-
-app.get("/health", (c) => c.json({ ok: true, service: "supamail" }));
-
-app.use("*", async (c, next) => {
-  if (c.req.path === "/health") return next();
-  const header = c.req.header("authorization") ?? "";
-
-  if (c.req.path === "/migrate") {
-    const expected = ADMIN_TOKEN_BUFFER ?? API_TOKEN_BUFFER;
-    if (!safeBearerEquals(header, expected)) {
-      return c.json({ error: "unauthorized" }, 401);
-    }
-    return next();
-  }
-
-  if (!safeBearerEquals(header, API_TOKEN_BUFFER)) {
-    return c.json({ error: "unauthorized" }, 401);
-  }
-  return next();
-});
-
-app.post("/migrate", async (c) => {
-  await applyInitialMigration(pool);
-  return c.json({ ok: true });
-});
-
-app.get("/accounts", async (c) => {
-  const accounts = await repository.listAccounts();
-  return c.json({ accounts });
-});
-
 async function parseJsonBody(c: Context): Promise<unknown> {
   try {
     return await c.req.json();
@@ -111,28 +60,118 @@ async function parseJsonBody(c: Context): Promise<unknown> {
   }
 }
 
-app.post("/accounts", async (c) => {
-  const raw = await parseJsonBody(c);
-  const input = CREATE_ACCOUNT_SCHEMA.parse(raw);
-  const account = await repository.createAccount(input);
-  return c.json({ account }, 201);
-});
+function safeBearerEquals(received: string, expected: Buffer): boolean {
+  const buf = Buffer.from(received, "utf8");
+  if (buf.length !== expected.length) return false;
+  return timingSafeEqual(buf, expected);
+}
 
-app.post("/accounts/:id/sync", async (c) => {
-  const id = UUID_SCHEMA.parse(c.req.param("id"));
-  const account = await repository.getAccount(id);
-  if (!account) throw new NotFoundError(`Account not found: ${id}`);
-  const result = await engine.syncAccount(id, "api");
-  return c.json({ result });
-});
+export function createApiApp(options: ApiAppOptions): Hono {
+  if (!options.apiToken) {
+    throw new Error("API_TOKEN is required to run the SupaMail API");
+  }
 
-app.post("/messages/:id/refetch-body", async (c) => {
-  const id = UUID_SCHEMA.parse(c.req.param("id"));
-  const message = await repository.getMessage(id);
-  if (!message) throw new NotFoundError(`Message not found: ${id}`);
-  const fetched = await engine.fetchBody(id, true);
-  return c.json({ fetched });
-});
+  const app = new Hono();
+  const apiTokenBuffer = Buffer.from(`Bearer ${options.apiToken}`, "utf8");
+  const adminTokenBuffer = options.adminToken
+    ? Buffer.from(`Bearer ${options.adminToken}`, "utf8")
+    : null;
 
-serve({ fetch: app.fetch, port: config.PORT });
-console.log(`SupaMail API listening on :${config.PORT}`);
+  app.onError((err, c) => {
+    if (err instanceof HTTPException) return err.getResponse();
+    if (err instanceof HostValidationError) {
+      return c.json({ error: err.code, message: err.message }, 400);
+    }
+    if (err instanceof NotFoundError) {
+      return c.json({ error: "not_found", message: err.message }, 404);
+    }
+    if (err instanceof z.ZodError) {
+      return c.json({ error: "invalid_input", issues: err.issues }, 400);
+    }
+    const pgCode = (err as { code?: string }).code;
+    if (pgCode === "23505") {
+      return c.json({ error: "conflict", message: "Resource already exists" }, 409);
+    }
+    console.error(JSON.stringify({
+      event: "api.unhandled_error",
+      error: err instanceof Error ? { message: err.message, stack: err.stack } : String(err)
+    }));
+    return c.json({ error: "internal_error" }, 500);
+  });
+
+  app.get("/health", (c) => c.json({ ok: true, service: "supamail" }));
+
+  app.use("*", async (c, next) => {
+    if (c.req.path === "/health") return next();
+    const header = c.req.header("authorization") ?? "";
+
+    if (c.req.path === "/migrate") {
+      const expected = adminTokenBuffer ?? apiTokenBuffer;
+      if (!safeBearerEquals(header, expected)) {
+        return c.json({ error: "unauthorized" }, 401);
+      }
+      return next();
+    }
+
+    if (!safeBearerEquals(header, apiTokenBuffer)) {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+    return next();
+  });
+
+  app.post("/migrate", async (c) => {
+    await options.applyMigration();
+    return c.json({ ok: true });
+  });
+
+  app.get("/accounts", async (c) => {
+    const accounts = await options.repository.listAccounts();
+    return c.json({ accounts });
+  });
+
+  app.post("/accounts", async (c) => {
+    const raw = await parseJsonBody(c);
+    const input = CREATE_ACCOUNT_SCHEMA.parse(raw);
+    const account = await options.repository.createAccount(input);
+    return c.json({ account }, 201);
+  });
+
+  app.post("/accounts/:id/sync", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const result = await options.engine.syncAccount(id, "api");
+    return c.json({ result });
+  });
+
+  app.post("/messages/:id/refetch-body", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const fetched = await options.engine.fetchBody(id, true);
+    return c.json({ fetched });
+  });
+
+  return app;
+}
+
+export function startApiServer(): void {
+  const config = getConfig();
+  const pool = getPool();
+  const repository = new MirrorRepository(pool, config);
+  const engine = new MirrorEngine({ pool, config, repository });
+  const app = createApiApp({
+    apiToken: config.API_TOKEN,
+    adminToken: config.ADMIN_TOKEN,
+    repository,
+    engine,
+    applyMigration: () => applyInitialMigration(pool)
+  });
+
+  serve({ fetch: app.fetch, port: config.PORT });
+  console.log(`SupaMail API listening on :${config.PORT}`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startApiServer();
+}

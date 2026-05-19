@@ -1,47 +1,194 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createApiApp } from "../api.js";
+import type { AccountSummary, SyncResult } from "../types.js";
+
+const accountId = "00000000-0000-4000-8000-000000000001";
+const messageId = "00000000-0000-4000-8000-000000000002";
+
+function makeAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
+  const now = new Date("2026-05-19T00:00:00.000Z");
+  return {
+    id: accountId,
+    email_address: "user@example.test",
+    provider_profile: "generic-imap",
+    body_fetch_policy: "lazy",
+    sync_state: "HEALTHY",
+    sync_state_reason: null,
+    last_sync_started_at: null,
+    last_sync_finished_at: null,
+    priority_sync_lag_seconds: null,
+    overall_sync_lag_seconds: null,
+    consecutive_failures: 0,
+    consecutive_successes: 1,
+    backoff_until: null,
+    last_folder_discovery_at: null,
+    next_folder_discovery_at: null,
+    last_heartbeat_at: null,
+    created_at: now,
+    updated_at: now,
+    ...overrides
+  };
+}
+
+function makeSyncResult(): SyncResult {
+  return {
+    runId: "sync-run-1",
+    outcome: "success",
+    foldersProcessed: 1,
+    messagesUpserted: 0,
+    bodiesFetched: 0,
+    flagsUpdated: 0,
+    reconcileGapsFound: 0,
+    errors: []
+  };
+}
+
+function buildApp(options: {
+  apiToken?: string;
+  adminToken?: string | null;
+  account?: AccountSummary | null;
+  createAccount?: (input: unknown) => Promise<AccountSummary>;
+  listAccounts?: () => Promise<AccountSummary[]>;
+  applyMigration?: () => Promise<void>;
+} = {}) {
+  const account = options.account === undefined ? makeAccount() : options.account;
+  const repository = {
+    listAccounts: vi.fn(options.listAccounts ?? (async () => account ? [account] : [])),
+    createAccount: vi.fn(options.createAccount ?? (async (input: unknown) => makeAccount({
+      email_address: (input as { emailAddress: string }).emailAddress
+    }))),
+    getAccount: vi.fn(async () => account),
+    getMessage: vi.fn(async () => ({ id: messageId }) as never)
+  };
+  const engine = {
+    syncAccount: vi.fn(async () => makeSyncResult()),
+    fetchBody: vi.fn(async () => true)
+  };
+  const applyMigration = vi.fn(options.applyMigration ?? (async () => undefined));
+  const app = createApiApp({
+    apiToken: options.apiToken ?? "api-token",
+    adminToken: "adminToken" in options ? options.adminToken : "admin-token",
+    repository,
+    engine,
+    applyMigration
+  });
+
+  return { app, repository, engine, applyMigration };
+}
+
+function auth(token = "api-token"): Record<string, string> {
+  return { authorization: `Bearer ${token}` };
+}
 
 describe("API safety", () => {
-  it("requires an API token while keeping health checks public", async () => {
-    const source = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
-
-    expect(source).toContain("API_TOKEN is required to run the SupaMail API");
-    expect(source).toContain('app.get("/health"');
-    expect(source).toContain('if (c.req.path === "/health") return next()');
-    expect(source).not.toContain("if (!config.API_TOKEN) return next()");
+  it("requires an API token at app construction", () => {
+    expect(() => buildApp({ apiToken: "" })).toThrow("API_TOKEN is required");
   });
 
-  it("compares bearer tokens with a constant-time primitive", async () => {
-    const source = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
+  it("keeps health public while protecting account routes", async () => {
+    const { app, repository } = buildApp();
 
-    expect(source).toContain("timingSafeEqual");
-    expect(source).not.toMatch(/header\s*!==\s*`Bearer/);
-  });
+    const health = await app.request("/health");
+    expect(health.status).toBe(200);
+    await expect(health.json()).resolves.toEqual({ ok: true, service: "supamail" });
 
-  it("validates POST /accounts input with zod", async () => {
-    const source = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
+    const unauthorized = await app.request("/accounts");
+    expect(unauthorized.status).toBe(401);
+    expect(repository.listAccounts).not.toHaveBeenCalled();
 
-    expect(source).toContain("CREATE_ACCOUNT_SCHEMA");
-    expect(source).toContain("z.string().email()");
-    expect(source).toContain("z.coerce.number().int().min(1).max(65535)");
-  });
-
-  it("installs a global onError that maps zod, host-validation, not-found, and unique-violation", async () => {
-    const source = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
-
-    expect(source).toContain("app.onError");
-    expect(source).toContain("HostValidationError");
-    expect(source).toContain("NotFoundError");
-    expect(source).toContain("23505");
-    expect(source).toContain("ZodError");
+    const authorized = await app.request("/accounts", { headers: auth() });
+    expect(authorized.status).toBe(200);
+    expect(repository.listAccounts).toHaveBeenCalledTimes(1);
   });
 
   it("gates POST /migrate behind ADMIN_TOKEN when set", async () => {
-    const source = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
+    const { app, applyMigration } = buildApp({ adminToken: "admin-token" });
 
-    expect(source).toContain("ADMIN_TOKEN_BUFFER");
-    expect(source).toContain('c.req.path === "/migrate"');
+    const apiTokenAttempt = await app.request("/migrate", {
+      method: "POST",
+      headers: auth("api-token")
+    });
+    expect(apiTokenAttempt.status).toBe(401);
+    expect(applyMigration).not.toHaveBeenCalled();
+
+    const adminAttempt = await app.request("/migrate", {
+      method: "POST",
+      headers: auth("admin-token")
+    });
+    expect(adminAttempt.status).toBe(200);
+    expect(applyMigration).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses API_TOKEN for POST /migrate when ADMIN_TOKEN is not set", async () => {
+    const { app, applyMigration } = buildApp({ adminToken: null });
+
+    const response = await app.request("/migrate", {
+      method: "POST",
+      headers: auth("api-token")
+    });
+    expect(response.status).toBe(200);
+    expect(applyMigration).toHaveBeenCalledTimes(1);
+  });
+
+  it("validates POST /accounts input with zod before creating an account", async () => {
+    const { app, repository } = buildApp();
+
+    const invalid = await app.request("/accounts", {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ emailAddress: "not-an-email", port: 993 })
+    });
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(repository.createAccount).not.toHaveBeenCalled();
+
+    const valid = await app.request("/accounts", {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        emailAddress: "created@example.test",
+        host: "imap.example.test",
+        port: "993",
+        username: "created@example.test",
+        password: "secret"
+      })
+    });
+    expect(valid.status).toBe(201);
+    expect(repository.createAccount).toHaveBeenCalledWith(expect.objectContaining({
+      emailAddress: "created@example.test",
+      port: 993
+    }));
+  });
+
+  it("maps not-found and unique-violation errors to API responses", async () => {
+    const notFound = buildApp({ account: null });
+    const missingSync = await notFound.app.request(`/accounts/${accountId}/sync`, {
+      method: "POST",
+      headers: auth()
+    });
+    expect(missingSync.status).toBe(404);
+    await expect(missingSync.json()).resolves.toMatchObject({ error: "not_found" });
+
+    const conflict = buildApp({
+      createAccount: async () => {
+        throw Object.assign(new Error("duplicate account"), { code: "23505" });
+      }
+    });
+    const response = await conflict.app.request("/accounts", {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        emailAddress: "dupe@example.test",
+        host: "imap.example.test",
+        port: 993,
+        username: "dupe@example.test",
+        password: "secret"
+      })
+    });
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ error: "conflict" });
   });
 
   it("uses the SupaMail CLI name", async () => {
