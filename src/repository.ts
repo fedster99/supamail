@@ -1015,6 +1015,24 @@ export class MirrorRepository {
     return Number(result.rows[0].count);
   }
 
+  async hasActiveWindowMessages(accountId: string, folder: ImapFolder, uidValidity: number): Promise<boolean> {
+    const result = await this.pool.query<{ exists: boolean }>(
+      `
+      SELECT EXISTS (
+        SELECT 1
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND uidvalidity = $3
+          AND deleted_in_provider = false
+          AND window_status = 'IN_WINDOW'
+      ) AS exists
+      `,
+      [accountId, folder.path, uidValidity]
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
   // Reconcile via a streamed temp table rather than a `bigint[]` parameter:
   // heavy mailboxes (e.g. Gmail "All Mail") routinely surface 100k+ UIDs,
   // which blows up array-parameter encoding and forces the entire UID set

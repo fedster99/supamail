@@ -295,6 +295,56 @@ liveDb("live DB reliability lane", () => {
     expect(event.rows[0]?.payload.backfilled).toBeGreaterThanOrEqual(1);
   });
 
+  it("reconcile treats archive-only folders as clean when the live window is empty", async () => {
+    const h = await setupIntegration("live-reconcile-archive-only", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const oldInternalDate = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000);
+    const folders: FixtureFolder[] = [{
+      path: "INBOX.Archive",
+      delimiter: "/",
+      specialUse: "\\Archive",
+      uidValidity: 52_001,
+      messages: [
+        makeTextMessage({
+          uid: 1,
+          subject: "old-archive",
+          from: "sender@example.test",
+          to: "user@example.test",
+          body: "old-archive",
+          internalDate: oldInternalDate
+        })
+      ]
+    }];
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+
+    const first = await engine.syncAccount(h.account.id, "manual");
+    expect(first.outcome).toBe("success");
+
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET next_sync_due_at = now() - interval '1 second',
+          next_reconcile_at = now() - interval '1 second'
+      WHERE account_id = $1 AND path = 'INBOX.Archive'
+      `,
+      [h.account.id]
+    );
+
+    const second = await engine.syncAccount(h.account.id, "manual");
+    expect(second.outcome).toBe("success");
+    expect(second.reconcileGapsFound).toBe(0);
+
+    const folder = await h.pool.query<{ last_reconcile_clean: boolean | null }>(
+      `
+      SELECT last_reconcile_clean
+      FROM public.imap_folders
+      WHERE account_id = $1 AND path = 'INBOX.Archive'
+      `,
+      [h.account.id]
+    );
+    expect(folder.rows[0]?.last_reconcile_clean).toBe(true);
+  });
+
   it("retention expires old in-window rows and purges only trapdoor delete reasons", async () => {
     const h = await setupIntegration("live-retention", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);

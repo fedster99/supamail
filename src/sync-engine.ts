@@ -418,6 +418,11 @@ export class MirrorEngine {
           "RECONCILE_TOTAL_TIMEOUT_MS",
           "reconcile UID stream"
         );
+        const shouldFailOnEmptyReconcile = await this.repository.hasActiveWindowMessages(
+          account.id,
+          folder,
+          uidValidity
+        );
         const reconcile = await this.repository.markMissingMessagesFromLiveUidStream(
           account.id,
           folder,
@@ -430,7 +435,7 @@ export class MirrorEngine {
             iterateAllUids(client, windowCutoff)
           ),
           {
-            failIfEmpty: (mailbox.exists ?? 0) > 0,
+            failIfEmpty: shouldFailOnEmptyReconcile,
             emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`
           }
         );
