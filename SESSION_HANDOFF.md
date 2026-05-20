@@ -8,8 +8,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 - Branch: `fedster99/supamail-v0.1`
 - PR: https://github.com/fedster99/supamail/pull/5
-- Latest pushed commit when last checked: `78767e0 Add harness impact reminder`
-- PR checks after `78767e0`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Harness reminder baseline: `78767e0 Add harness impact reminder`
+- Root handoff migration: `912989a Move session handoff to repo root`
+- PR checks after `78767e0`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed. Recheck PR status after newer pushes.
 
 ## Current Shape
 
@@ -26,7 +27,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - `node --check scripts/check-harness-impact.mjs` passed.
 - `git diff --check` and `git diff --cached --check` passed before commit `78767e0`.
 - CI after push passed `Quality` and `Live DB Reliability`.
-- Root handoff migration verification: `pnpm harness:check`, `git diff --check`, and a trailing-whitespace scan over the touched docs/scripts passed.
+- Root handoff migration verification: `INSTALL_CMD=true ./init.sh`, `pnpm harness:check`, `git diff --check`, and a trailing-whitespace scan over the touched docs/scripts passed.
 
 ## Durable Decisions
 
