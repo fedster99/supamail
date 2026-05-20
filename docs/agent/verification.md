@@ -76,7 +76,7 @@ When completing work, record:
 - skipped commands and why
 - known residual risks
 
-Use `.context/session-handoff.md` for local handoff and `docs/agent/feature-list.json` when feature state changes.
+Use `SESSION_HANDOFF.md` for tracked handoff, `.context/` for private/local notes, and `docs/agent/feature-list.json` when feature state changes.
 
 ## Bootstrap Shortcut
 

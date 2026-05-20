@@ -56,6 +56,7 @@ Account-level advisory locks keep sync operations serialized. Folder state track
 - `apps/api`: TypeScript/Node worker, API, CLI, tests, Supabase migration, Docker, and Fly configs.
 - `apps/web`: Next.js landing site.
 - `docs`: reliability contract, deployment notes, architecture decisions, and agent operating docs.
+- `SESSION_HANDOFF.md`: tracked restart notes for future coding agents.
 
 ## Quickstart: Supabase + Fly.io
 

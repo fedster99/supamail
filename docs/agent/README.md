@@ -7,7 +7,7 @@ This directory holds the agent-facing harness for SupaMail. It exists so coding 
 The harness follows the five-subsystem model from the `harness-creator` skill:
 
 - Instructions: `AGENTS.md` routes to these focused docs.
-- State: `docs/agent/feature-list.json` tracks feature scope; `.context/session-handoff.md` tracks local session state.
+- State: `docs/agent/feature-list.json` tracks feature scope; `SESSION_HANDOFF.md` tracks restart state; `.context/` holds private/local notes.
 - Verification: `docs/agent/verification.md` maps change types to commands.
 - Scope: WIP=1 and issue-driven task boundaries.
 - Lifecycle: startup and end-of-session routines in `AGENTS.md` plus local handoff.
@@ -59,7 +59,7 @@ Put durable project facts in tracked docs close to the relevant code or topic. P
 
 `pnpm harness:check` reminds local agents to review project docs and agent instructions for stale guidance. It is a reminder, not a proof that every doc sentence is correct.
 
-Here, "harness" means the agent-facing workflow docs and state surfaces that help future coding agents work correctly. This is intentionally broad rather than path-specific. If repo layout, scripts, CI, deployment, schema paths, startup flow, task boundaries, or verification lanes changed, update whatever docs became stale: `AGENTS.md`, this directory, architecture docs/ADRs, deployment docs, schema docs, README, or the public spec conformance doc. Use the PR template's Harness Impact section to record what you decided.
+Here, "harness" means the agent-facing workflow docs and state surfaces that help future coding agents work correctly. This is intentionally broad rather than path-specific. If repo layout, scripts, CI, deployment, schema paths, startup flow, task boundaries, or verification lanes changed, update whatever docs became stale: `AGENTS.md`, this directory, `SESSION_HANDOFF.md`, architecture docs/ADRs, deployment docs, schema docs, README, or the public spec conformance doc. Use the PR template's Harness Impact section to record what you decided.
 
 ## Task Selection
 

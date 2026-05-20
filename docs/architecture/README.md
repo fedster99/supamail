@@ -29,6 +29,7 @@ The worker and API share the same repository and account-locking model. Any IMAP
 - Public reliability contract: `docs/spec-conformance.md`
 - Schema overview: `docs/schema.md`
 - Deployment options: `docs/deployment-options.md`, `docs/fly-supabase.md`
+- Tracked session handoff: `SESSION_HANDOFF.md`
 - Agent operating guide: `docs/agent/README.md`
 - Reliability invariants: `docs/agent/reliability-invariants.md`
 - Architecture decisions: `docs/architecture/decisions/`

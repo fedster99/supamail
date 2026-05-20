@@ -15,11 +15,13 @@ Before writing code:
 5. Read `docs/spec-conformance.md`.
 6. Read `docs/agent/feature-list.json` and follow its task-selection policy.
 7. Check current git and PR state with `git status --short --branch` and, when on a PR branch, `gh pr view --json comments,reviews,statusCheckRollup`. If `gh` is unavailable or unauthenticated, record that gap and continue from local repository context.
-8. If present, read `.context/harness-assessment.md` and `.context/session-handoff.md` for local/private context.
+8. Read `SESSION_HANDOFF.md`.
+9. If present, read `.context/harness-assessment.md` and other relevant `.context/*.md` files for local/private context.
 
 ## Source Of Truth
 
 - Tracked code and docs are authoritative.
+- `SESSION_HANDOFF.md` is the tracked restart point for future agents.
 - `docs/spec-conformance.md` is the public reliability contract.
 - `.context/old-spec-used-to-build-original-signal-sync-engine.md` is private local context when present. Do not copy private-only content into tracked docs.
 - GitHub issues and PR comments define active follow-up scope, but durable decisions should be promoted into docs or ADRs.
@@ -87,6 +89,7 @@ A change is done only when:
 Before ending a substantial session:
 
 1. Update `docs/agent/feature-list.json` if task state changed.
-2. Update `.context/session-handoff.md` with current state, verification, blockers, and next action.
-3. Record any missing verification explicitly.
-4. Leave unrelated user changes untouched.
+2. Update `SESSION_HANDOFF.md` with current state, verification, blockers, and next action.
+3. Put private/local details only in `.context/`.
+4. Record any missing verification explicitly.
+5. Leave unrelated user changes untouched.
