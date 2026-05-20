@@ -1,8 +1,8 @@
 services:
   worker:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: apps/api/Dockerfile
     command: node dist/worker.js
     restart: unless-stopped
     env_file:
@@ -12,8 +12,8 @@ services:
     profiles:
       - api
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: apps/api/Dockerfile
     command: node dist/api.js
     restart: unless-stopped
     env_file:

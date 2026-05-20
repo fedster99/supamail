@@ -173,6 +173,13 @@ describe("repository safety", () => {
     expect(source).toContain("knownMessages");
   });
 
+  it("does not body-backfill messages from untracked folders", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("getBodyBacklog");
+    expect(source).toContain("AND f.tracked = true");
+  });
+
   it("runs retention as expiry first, purge second", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
     const worker = await readFile(resolve(process.cwd(), "src/worker.ts"), "utf8");

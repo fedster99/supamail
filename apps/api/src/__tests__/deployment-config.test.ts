@@ -1,10 +1,14 @@
 import { access, readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+
+const apiRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const repoRoot = resolve(apiRoot, "../..");
 
 describe("deployment configs", () => {
   it("keeps the default Fly worker profile inside the lowest-cost 256 MB machine", async () => {
-    const toml = await readFile(resolve(process.cwd(), "fly.worker.toml.example"), "utf8");
+    const toml = await readFile(resolve(apiRoot, "fly.worker.toml.example"), "utf8");
 
     expect(toml).toContain('memory = "256mb"');
     expect(toml).toContain('NODE_OPTIONS = "--max-old-space-size=160"');
@@ -15,14 +19,15 @@ describe("deployment configs", () => {
   });
 
   it("does not keep a competing Render deployment path", async () => {
-    await expect(access(resolve(process.cwd(), "render.yaml"))).rejects.toThrow();
-    await expect(access(resolve(process.cwd(), "docs/render-supabase.md"))).rejects.toThrow();
+    await expect(access(resolve(repoRoot, "render.yaml"))).rejects.toThrow();
+    await expect(access(resolve(repoRoot, "docs/render-supabase.md"))).rejects.toThrow();
+    await expect(access(resolve(apiRoot, "render.yaml"))).rejects.toThrow();
   });
 
   it("keeps Fly.io as the recommended hosted deployment path", async () => {
-    const readme = await readFile(resolve(process.cwd(), "README.md"), "utf8");
-    const deploymentOptions = await readFile(resolve(process.cwd(), "docs/deployment-options.md"), "utf8");
-    const flyGuide = await readFile(resolve(process.cwd(), "docs/fly-supabase.md"), "utf8");
+    const readme = await readFile(resolve(repoRoot, "README.md"), "utf8");
+    const deploymentOptions = await readFile(resolve(repoRoot, "docs/deployment-options.md"), "utf8");
+    const flyGuide = await readFile(resolve(repoRoot, "docs/fly-supabase.md"), "utf8");
 
     expect(readme).toContain("Quickstart: Supabase + Fly.io");
     expect(readme).toContain("docs/fly-supabase.md");
@@ -33,8 +38,8 @@ describe("deployment configs", () => {
   });
 
   it("documents single-machine Fly launch commands for the starter worker/API", async () => {
-    const workerToml = await readFile(resolve(process.cwd(), "fly.worker.toml.example"), "utf8");
-    const apiToml = await readFile(resolve(process.cwd(), "fly.api.toml.example"), "utf8");
+    const workerToml = await readFile(resolve(apiRoot, "fly.worker.toml.example"), "utf8");
+    const apiToml = await readFile(resolve(apiRoot, "fly.api.toml.example"), "utf8");
 
     expect(workerToml).toContain("fly launch --no-deploy --no-public-ips --ha=false");
     expect(workerToml).toContain("fly deploy --ha=false");

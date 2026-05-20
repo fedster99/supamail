@@ -457,7 +457,12 @@ export class MirrorRepository {
 
   async upsertDiscoveredFolders(
     account: ImapAccount,
-    folders: Array<{ path: string; delimiter?: string | null; specialUse?: string | null }>
+    folders: Array<{
+      path: string;
+      delimiter?: string | null;
+      specialUse?: string | null;
+      excludedReasonOverride?: string | null;
+    }>
   ): Promise<ImapFolder[]> {
     const profile = getProviderProfile(account.provider_profile);
     const rows: ImapFolder[] = [];
@@ -465,7 +470,8 @@ export class MirrorRepository {
 
     for (const folder of folders) {
       seen.add(folder.path);
-      const excludedReason = profile.excludedReason(folder.path, folder.specialUse);
+      const excludedReason = folder.excludedReasonOverride
+        ?? profile.excludedReason(folder.path, folder.specialUse);
       const result = await this.pool.query<ImapFolder>(
         `
         INSERT INTO public.imap_folders (
@@ -1215,6 +1221,7 @@ export class MirrorRepository {
       FROM public.imap_messages m
       JOIN public.imap_folders f ON f.account_id = m.account_id AND f.path = m.folder_path
       WHERE m.account_id = $1
+        AND f.tracked = true
         AND m.deleted_in_provider = false
         AND m.window_status = 'IN_WINDOW'
         AND m.body_fetched_at IS NULL

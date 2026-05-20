@@ -345,6 +345,121 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(row.tracked).toBe(false);
   });
 
+  it("excludes a Rackspace INBOX.INBOX alias only after metadata fingerprint verification", async () => {
+    const h = await setupIntegration("rackspace-alias-verified");
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET provider_profile = 'rackspace' WHERE id = $1", [h.account.id]);
+    const sharedMessages = [
+      makeTextMessage({ uid: 1, subject: "same-a", from: "a@x.test", to: "u@x.test", body: "a" }),
+      makeTextMessage({ uid: 2, subject: "same-b", from: "b@x.test", to: "u@x.test", body: "b" })
+    ];
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: ".",
+        specialUse: "\\Inbox",
+        uidValidity: 77_001,
+        messages: sharedMessages
+      },
+      {
+        path: "INBOX.INBOX",
+        delimiter: ".",
+        uidValidity: 77_001,
+        messages: sharedMessages
+      }
+    ];
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+
+    const folderRows = await h.pool.query<{ path: string; tracked: boolean; excluded_reason: string | null }>(
+      `
+      SELECT path, tracked, excluded_reason
+      FROM public.imap_folders
+      WHERE account_id = $1
+      ORDER BY path
+      `,
+      [h.account.id]
+    );
+    expect(folderRows.rows).toEqual([
+      { path: "INBOX", tracked: true, excluded_reason: null },
+      { path: "INBOX.INBOX", tracked: false, excluded_reason: "excluded_duplicate_alias:INBOX" }
+    ]);
+
+    const messageFolders = await h.pool.query<{ folder_path: string; count: string }>(
+      `
+      SELECT folder_path, count(*)::text AS count
+      FROM public.imap_messages
+      WHERE account_id = $1
+      GROUP BY folder_path
+      ORDER BY folder_path
+      `,
+      [h.account.id]
+    );
+    expect(messageFolders.rows).toEqual([{ folder_path: "INBOX", count: "2" }]);
+  });
+
+  it("keeps a Rackspace INBOX.INBOX folder when its metadata fingerprint differs", async () => {
+    const h = await setupIntegration("rackspace-alias-different");
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET provider_profile = 'rackspace' WHERE id = $1", [h.account.id]);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: ".",
+        specialUse: "\\Inbox",
+        uidValidity: 88_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "inbox-a", from: "a@x.test", to: "u@x.test", body: "a" }),
+          makeTextMessage({ uid: 2, subject: "inbox-b", from: "b@x.test", to: "u@x.test", body: "b" })
+        ]
+      },
+      {
+        path: "INBOX.INBOX",
+        delimiter: ".",
+        uidValidity: 88_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "nested-a", from: "a@x.test", to: "u@x.test", body: "a" }),
+          makeTextMessage({ uid: 2, subject: "nested-b", from: "b@x.test", to: "u@x.test", body: "b" })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+
+    const folderRows = await h.pool.query<{ path: string; tracked: boolean; excluded_reason: string | null }>(
+      `
+      SELECT path, tracked, excluded_reason
+      FROM public.imap_folders
+      WHERE account_id = $1
+      ORDER BY path
+      `,
+      [h.account.id]
+    );
+    expect(folderRows.rows).toEqual([
+      { path: "INBOX", tracked: true, excluded_reason: null },
+      { path: "INBOX.INBOX", tracked: true, excluded_reason: null }
+    ]);
+
+    const messageFolders = await h.pool.query<{ folder_path: string; count: string }>(
+      `
+      SELECT folder_path, count(*)::text AS count
+      FROM public.imap_messages
+      WHERE account_id = $1
+      GROUP BY folder_path
+      ORDER BY folder_path
+      `,
+      [h.account.id]
+    );
+    expect(messageFolders.rows).toEqual([
+      { folder_path: "INBOX", count: "2" },
+      { folder_path: "INBOX.INBOX", count: "2" }
+    ]);
+  });
+
   it("Scenario F — PARTIAL_SUCCESS counts as success (spec §12.2)", async () => {
     const h = await setupIntegration("F");
     activeAccountIds.push(h.account.id);

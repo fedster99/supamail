@@ -3,7 +3,7 @@ import { getConfig, getWindowCutoff } from "./config.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
 import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, searchUidsSince } from "./imap-client.js";
-import type { MirrorImapClient } from "./imap-client.js";
+import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import type {
@@ -32,6 +32,25 @@ const AUTH_ERROR_PATTERNS = [
   /\bNO LOGIN\b/i,
   /\b535\b/, // SMTP/IMAP auth fail code
 ];
+
+const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
+const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
+const FOLDER_ALIAS_SAMPLE_SIZE = 5;
+const FOLDER_ALIAS_SAMPLE_UID_WINDOW = 100;
+
+type DiscoveredFolder = {
+  path: string;
+  delimiter?: string | null;
+  specialUse?: string | null;
+  excludedReasonOverride?: string | null;
+};
+
+type FolderAliasFingerprint = {
+  uidValidity: string;
+  uidNext: number | null;
+  exists: number | null;
+  sample: string[];
+};
 
 export function isAuthError(message: string): boolean {
   return AUTH_ERROR_PATTERNS.some((p) => p.test(message));
@@ -231,8 +250,9 @@ export class MirrorEngine {
       throw new Error(`Provider returned no folders for ${account.email_address}`);
     }
 
-    const upserted = await this.repository.upsertDiscoveredFolders(
+    const discoveredFolders = await this.applyVerifiedFolderAliasExclusions(
       account,
+      client,
       folders.map((folder) => ({
         path: folder.path,
         delimiter: folder.delimiter ?? null,
@@ -240,9 +260,111 @@ export class MirrorEngine {
       }))
     );
 
+    const upserted = await this.repository.upsertDiscoveredFolders(
+      account,
+      discoveredFolders
+    );
+
     for (const folder of upserted) {
       await this.hooks.onFolderChanged?.(folder);
     }
+  }
+
+  private async applyVerifiedFolderAliasExclusions(
+    account: ImapAccount,
+    client: MirrorImapClient,
+    folders: DiscoveredFolder[]
+  ): Promise<DiscoveredFolder[]> {
+    if (account.provider_profile !== "rackspace") return folders;
+
+    const byPath = new Map(folders.map((folder) => [folder.path, folder]));
+    const canonical = byPath.get(RACKSPACE_INBOX_ALIAS_CANONICAL_PATH);
+    const alias = byPath.get(RACKSPACE_INBOX_ALIAS_PATH);
+    if (!canonical || !alias) return folders;
+
+    try {
+      const canonicalFingerprint = await this.fingerprintFolderAliasCandidate(client, canonical);
+      const aliasFingerprint = await this.fingerprintFolderAliasCandidate(client, alias);
+      if (!this.areVerifiedFolderAliases(canonicalFingerprint, aliasFingerprint)) return folders;
+
+      return folders.map((folder) => {
+        if (folder.path !== RACKSPACE_INBOX_ALIAS_PATH) return folder;
+        return {
+          ...folder,
+          excludedReasonOverride: `excluded_duplicate_alias:${RACKSPACE_INBOX_ALIAS_CANONICAL_PATH}`
+        };
+      });
+    } catch {
+      return folders;
+    }
+  }
+
+  private async fingerprintFolderAliasCandidate(
+    client: MirrorImapClient,
+    folder: Pick<MailboxListItem, "path">
+  ): Promise<FolderAliasFingerprint | null> {
+    const mailboxLock = await client.getMailboxLock(folder.path);
+    try {
+      const mailbox = client.mailbox;
+      if (!mailbox) return null;
+
+      const uidNext = mailbox.uidNext ?? null;
+      const exists = mailbox.exists ?? null;
+      const uidValidity = String(mailbox.uidValidity);
+      const rows: Array<{ uid: number; value: string }> = [];
+
+      if (uidNext !== null && uidNext > 1 && exists !== 0) {
+        const lastUid = uidNext - 1;
+        const firstUid = Math.max(1, lastUid - FOLDER_ALIAS_SAMPLE_UID_WINDOW + 1);
+
+        for await (const message of client.fetch(
+          { uid: `${firstUid}:${lastUid}` },
+          {
+            uid: true,
+            internalDate: true,
+            size: true,
+            envelope: true
+          },
+          { uid: true }
+        )) {
+          rows.push({
+            uid: message.uid,
+            value: [
+              message.uid,
+              message.envelope?.messageId ?? "",
+              message.internalDate?.toISOString() ?? "",
+              message.size ?? "",
+              message.envelope?.subject ?? ""
+            ].join("|")
+          });
+        }
+      }
+
+      return {
+        uidValidity,
+        uidNext,
+        exists,
+        sample: rows
+          .sort((left, right) => right.uid - left.uid)
+          .slice(0, FOLDER_ALIAS_SAMPLE_SIZE)
+          .map((row) => row.value)
+      };
+    } finally {
+      mailboxLock.release();
+    }
+  }
+
+  private areVerifiedFolderAliases(
+    left: FolderAliasFingerprint | null,
+    right: FolderAliasFingerprint | null
+  ): boolean {
+    if (!left || !right) return false;
+    if (left.uidValidity !== right.uidValidity) return false;
+    if (left.uidNext !== right.uidNext) return false;
+    if (left.exists !== right.exists) return false;
+    if (left.sample.length === 0 || right.sample.length === 0) return false;
+    if (left.sample.length !== right.sample.length) return false;
+    return left.sample.every((value, index) => value === right.sample[index]);
   }
 
   private async syncFolder(

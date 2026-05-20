@@ -1,53 +1,25 @@
 {
   "name": "supamail",
   "version": "0.1.0",
-  "description": "Supabase/Postgres-native IMAP mirror with metadata, flags, attachments, sync health, and full message bodies.",
-  "type": "module",
+  "private": true,
+  "description": "SupaMail monorepo — Supabase/Postgres-native IMAP mirror + landing site.",
   "license": "MIT",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "bin": {
-    "supamail": "dist/cli.js"
-  },
-  "files": [
-    "dist",
-    "supabase/migrations",
-    "README.md",
-    "LICENSE"
-  ],
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
-    "dev:worker": "tsx watch --clear-screen=false src/worker.ts",
-    "dev:api": "tsx watch --clear-screen=false src/api.ts",
-    "dry-run:local": "tsx scripts/local-dry-run.ts",
-    "spec-conformance": "tsx scripts/spec-conformance.ts",
-    "smoke:load": "tsx src/smoke/load-smoke.ts",
-    "smoke:greenmail": "tsx scripts/greenmail-smoke.ts",
-    "start:worker": "node dist/worker.js",
-    "start:api": "node dist/api.js",
-    "migrate": "tsx src/cli.ts migrate",
-    "test": "vitest run",
-    "test:db:live": "tsx scripts/test-db-live.ts",
-    "test:watch": "vitest"
-  },
-  "dependencies": {
-    "@hono/node-server": "^1.13.7",
-    "commander": "^12.1.0",
-    "dotenv": "^16.4.7",
-    "hono": "^4.10.8",
-    "imapflow": "^1.0.171",
-    "mailparser": "^3.7.4",
-    "pg": "^8.13.1",
-    "zod": "^3.24.1"
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "dev": "turbo run dev",
+    "dev:web": "turbo run dev --filter=@supamail/web",
+    "dev:worker": "pnpm --filter @supamail/api dev:worker",
+    "dev:api": "pnpm --filter @supamail/api dev:api",
+    "migrate": "pnpm --filter @supamail/api migrate",
+    "spec-conformance": "pnpm --filter @supamail/api spec-conformance",
+    "test:db:live": "pnpm --filter @supamail/api test:db:live",
+    "smoke:greenmail": "pnpm --filter @supamail/api smoke:greenmail",
+    "smoke:load": "pnpm --filter @supamail/api smoke:load"
   },
   "devDependencies": {
-    "@types/mailparser": "^3.4.6",
-    "@types/node": "^22.10.0",
-    "@types/pg": "^8.11.10",
-    "tsx": "^4.21.0",
-    "typescript": "^5.7.2",
-    "vitest": "^1.6.0"
+    "turbo": "^2.3.3"
   },
   "engines": {
     "node": ">=22",
