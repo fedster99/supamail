@@ -1,18 +1,19 @@
 # Architecture
 
-SupaMail is a small, stateful email mirror. IMAP is the provider; Postgres is the durable mirror; apps read from Supabase/Postgres tables.
+SupaMail is a small, stateful email mirror packaged as a monorepo. IMAP is the provider; Postgres is the durable mirror; apps read from Supabase/Postgres tables.
 
 ## Runtime Components
 
-- `src/worker.ts`: always-on poll loop, startup lock self-test, orphan lock recovery, retention, and scheduled account sync.
-- `src/api.ts`: optional Hono HTTP API for health, migration, account management, manual sync, and body refetch.
-- `src/cli.ts`: local operational commands such as migration and account creation.
-- `src/sync-engine.ts`: account/folder sync orchestration, initial sync, incremental sync, flag scan, reconcile, body backlog.
-- `src/repository.ts`: Postgres persistence and state transitions.
-- `src/locks.ts`: session-scoped advisory lock behavior and stale lock recovery.
-- `src/imap-client.ts`: ImapFlow adapter, throttling, metadata fetch, UID search, and full body fetch.
-- `src/mime.ts`: MIME parsing, normalized text, header extraction, and attachment metadata helpers.
-- `supabase/migrations/0001_imap_mirror.sql`: canonical schema.
+- `apps/api/src/worker.ts`: always-on poll loop, startup lock self-test, orphan lock recovery, retention, and scheduled account sync.
+- `apps/api/src/api.ts`: optional Hono HTTP API for health, migration, account management, manual sync, and body refetch.
+- `apps/api/src/cli.ts`: local operational commands such as migration and account creation.
+- `apps/api/src/sync-engine.ts`: account/folder sync orchestration, initial sync, incremental sync, flag scan, reconcile, body backlog.
+- `apps/api/src/repository.ts`: Postgres persistence and state transitions.
+- `apps/api/src/locks.ts`: session-scoped advisory lock behavior and stale lock recovery.
+- `apps/api/src/imap-client.ts`: ImapFlow adapter, throttling, metadata fetch, UID search, and full body fetch.
+- `apps/api/src/mime.ts`: MIME parsing, normalized text, header extraction, and attachment metadata helpers.
+- `apps/api/supabase/migrations/0001_imap_mirror.sql`: canonical schema.
+- `apps/web`: Next.js landing site. It is not the product dashboard or CRM surface.
 
 ## Data Flow
 
@@ -31,6 +32,7 @@ The worker and API share the same repository and account-locking model. Any IMAP
 - Agent operating guide: `docs/agent/README.md`
 - Reliability invariants: `docs/agent/reliability-invariants.md`
 - Architecture decisions: `docs/architecture/decisions/`
+- Docs / harness impact reminder: `scripts/check-harness-impact.mjs`
 
 ## ADR Policy
 

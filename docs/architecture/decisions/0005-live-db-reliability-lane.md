@@ -22,15 +22,15 @@ Normal `pnpm test` stays fast and does not require Docker or `DATABASE_URL`.
 
 ## Verification
 
-- `scripts/test-db-live.ts` provisions and tears down the disposable Postgres container.
+- `apps/api/scripts/test-db-live.ts` provisions and tears down the disposable Postgres container.
 - `package.json` exposes `pnpm test:db:live`.
 - `.github/workflows/ci.yml` runs a separate Live DB Reliability job.
 - `docs/agent/verification.md` maps reliability-sensitive changes to this gate.
 
 ## References
 
-- `scripts/test-db-live.ts`
-- `scripts/spec-conformance.ts`
+- `apps/api/scripts/test-db-live.ts`
+- `apps/api/scripts/spec-conformance.ts`
 - `.github/workflows/ci.yml`
 - `docs/agent/verification.md`
 - PR #5 owner comments.

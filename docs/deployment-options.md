@@ -20,6 +20,7 @@ Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cos
 Worker-only deploy:
 
 ```bash
+cd apps/api
 cp fly.worker.toml.example fly.toml
 fly launch --no-deploy --no-public-ips --ha=false
 fly secrets set \
@@ -51,6 +52,7 @@ fly secrets set \
 Optional API deploy:
 
 ```bash
+cd apps/api
 cp fly.api.toml.example fly.api.toml
 fly launch --config fly.api.toml --no-deploy --ha=false
 fly secrets set --config fly.api.toml \
@@ -64,18 +66,18 @@ Keep the API separate from the worker so a public HTTP service cannot accidental
 
 ## Coolify / VPS
 
-Coolify can deploy this repository as a Docker Compose service. The included `compose.yaml` keeps the worker private by default and exposes the API only when the `api` profile is enabled.
+Coolify can deploy this repository as a Docker Compose service. The included `apps/api/compose.yaml` keeps the worker private by default and exposes the API only when the `api` profile is enabled.
 
 Worker only:
 
 ```bash
-docker compose up -d worker
+docker compose -f apps/api/compose.yaml up -d worker
 ```
 
 Worker plus API:
 
 ```bash
-docker compose --profile api up -d
+docker compose -f apps/api/compose.yaml --profile api up -d
 ```
 
 In Coolify, add the repository as a Docker Compose app, set the required environment variables, and assign a domain only to the `api` service if you need remote control endpoints.

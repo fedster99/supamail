@@ -12,6 +12,7 @@
     "dev:web": "turbo run dev --filter=@supamail/web",
     "dev:worker": "pnpm --filter @supamail/api dev:worker",
     "dev:api": "pnpm --filter @supamail/api dev:api",
+    "harness:check": "node scripts/check-harness-impact.mjs",
     "migrate": "pnpm --filter @supamail/api migrate",
     "spec-conformance": "pnpm --filter @supamail/api spec-conformance",
     "test:db:live": "pnpm --filter @supamail/api test:db:live",

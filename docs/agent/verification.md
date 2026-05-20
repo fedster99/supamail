@@ -12,19 +12,35 @@ pnpm test
 pnpm build
 ```
 
+Root verification runs through Turborepo. Use package filters for fast local checks while editing, but run the root lane before claiming broad repo health.
+
+`pnpm harness:check` is the project-docs and harness impact reminder. It runs before typecheck in `./init.sh` so agents see it during normal pre-push verification.
+
+Useful package-scoped commands:
+
+```bash
+pnpm --filter @supamail/api typecheck
+pnpm --filter @supamail/api test
+pnpm --filter @supamail/api build
+pnpm --filter @supamail/web typecheck
+pnpm --filter @supamail/web build
+```
+
 ## Change-Type Matrix
 
 | Change area | Required verification |
 | --- | --- |
 | Docs only | `git diff --check`; for untracked new files, also run a trailing-whitespace check such as `rg -n "[ \t]+$" <new-files>` |
+| Repo layout, package scripts, CI, Docker/Fly/Compose, migration path, workspace config, startup flow, or task boundaries | Review project docs / harness, complete PR Harness Impact section, `pnpm harness:check`, `git diff --check`, then the affected build/test lane |
 | Type-only or helper-only TypeScript change | `pnpm typecheck`, targeted `pnpm test`, `pnpm build` |
 | API auth, input validation, sanitization, or response shape | `pnpm typecheck`, `pnpm test`, `pnpm build` |
 | MIME parsing, host validation, crypto, provider profiles | `pnpm typecheck`, `pnpm test`, `pnpm build` |
 | Sync engine, repository, locks, migrations, schema, reconcile, health, backoff, retention | `pnpm typecheck`, `pnpm test`, `pnpm build`, `pnpm test:db:live` |
+| Web landing UI | `pnpm --filter @supamail/web typecheck`, `pnpm --filter @supamail/web build`; use browser verification for visual/interaction changes |
 | Spec conformance behavior | `pnpm test:db:live` because it runs `pnpm spec-conformance` against live Postgres |
 | Deployment files or CI | `pnpm typecheck`, `pnpm test`, `pnpm build`, plus inspect the affected config |
 | GreenMail/protocol behavior | `pnpm smoke:greenmail` when Docker/local environment permits |
-| Local Supabase dry run behavior | `pnpm dry-run:local` when local Supabase is available |
+| Local Supabase dry run behavior | `pnpm --filter @supamail/api dry-run:local` when local Supabase is available |
 
 ## Heavy Reliability Gate
 

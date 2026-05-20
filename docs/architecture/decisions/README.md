@@ -10,6 +10,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0003-session-affine-postgres-advisory-locks.md`: Account serialization relies on session-scoped advisory locks.
 - `0004-temp-table-reconcile-uid-stream.md`: Reconcile streams provider UIDs through a Postgres temp table.
 - `0005-live-db-reliability-lane.md`: Live Postgres behavior is verified through a Docker-backed reliability gate.
+- `0006-use-harness-impact-reminder-before-pr-updates.md`: Pre-push verification reminds agents to review project docs and harness impact.
 
 ## Status Values
 

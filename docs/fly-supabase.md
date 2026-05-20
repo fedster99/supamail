@@ -13,6 +13,7 @@ Advisory locks are session-scoped. If Supabase pooler or PgBouncer is placed in 
 ## 2. Deploy Worker
 
 ```bash
+cd apps/api
 cp fly.worker.toml.example fly.toml
 
 fly launch --no-deploy --no-public-ips --ha=false
@@ -33,7 +34,7 @@ The worker profile is intentionally small:
 
 ## 3. Apply Schema
 
-Run migrations locally with the same `DATABASE_URL`:
+From the repository root, run migrations locally with the same `DATABASE_URL`:
 
 ```bash
 DATABASE_URL="$DATABASE_URL" \
@@ -44,17 +45,17 @@ pnpm migrate
 Or run the SQL directly:
 
 ```bash
-psql "$DATABASE_URL" -f supabase/migrations/0001_imap_mirror.sql
+psql "$DATABASE_URL" -f apps/api/supabase/migrations/0001_imap_mirror.sql
 ```
 
 ## 4. Create Accounts
 
-Create accounts locally through the CLI:
+From the repository root, create accounts locally through the CLI:
 
 ```bash
 DATABASE_URL="$DATABASE_URL" \
 IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY" \
-pnpm exec supamail create-account \
+pnpm --filter @supamail/api exec tsx src/cli.ts create-account \
   --email alice@example.com \
   --host imap.example.com \
   --port 993 \
@@ -70,6 +71,7 @@ The worker will pick up runnable accounts on its next tick.
 Only deploy the API if you need remote account creation, manual sync triggers, or body refetch endpoints.
 
 ```bash
+cd apps/api
 cp fly.api.toml.example fly.api.toml
 
 fly launch --config fly.api.toml --no-deploy --ha=false

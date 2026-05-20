@@ -23,14 +23,14 @@ Use session-scoped Postgres advisory locks as the account mutex, require direct/
 
 ## Verification
 
-- `src/db.ts` rejects pooler-looking URLs.
-- `src/locks.ts` implements `withAccountLock` and `runLockSelfTest`.
-- `src/worker.ts` runs the lock self-test on startup.
+- `apps/api/src/db.ts` rejects pooler-looking URLs.
+- `apps/api/src/locks.ts` implements `withAccountLock` and `runLockSelfTest`.
+- `apps/api/src/worker.ts` runs the lock self-test on startup.
 - `pnpm test:db:live` exercises advisory lock behavior against real Postgres.
 
 ## References
 
 - `docs/spec-conformance.md`
-- `src/db.ts`
-- `src/locks.ts`
-- `scripts/test-db-live.ts`
+- `apps/api/src/db.ts`
+- `apps/api/src/locks.ts`
+- `apps/api/scripts/test-db-live.ts`

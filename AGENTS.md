@@ -1,6 +1,6 @@
 # AGENTS.md
 
-SupaMail is a TypeScript/Node 22 IMAP mirror that syncs folders, messages, flags, MIME bodies, attachment metadata, sync health, and reliability events into Supabase/Postgres.
+SupaMail is a TypeScript/Node 22 monorepo. `apps/api` is the IMAP mirror that syncs folders, messages, flags, MIME bodies, attachment metadata, sync health, and reliability events into Supabase/Postgres. `apps/web` is the Next.js landing site.
 
 This file is a routing layer for coding agents. Keep detailed architecture and process rules in the linked docs instead of expanding this file.
 
@@ -24,6 +24,12 @@ Before writing code:
 - `.context/old-spec-used-to-build-original-signal-sync-engine.md` is private local context when present. Do not copy private-only content into tracked docs.
 - GitHub issues and PR comments define active follow-up scope, but durable decisions should be promoted into docs or ADRs.
 
+## Repository Layout
+
+- `apps/api`: SupaMail API, worker, CLI, tests, scripts, Docker/Fly configs, and Supabase migration.
+- `apps/web`: Next.js landing site. Do not turn it into a CRM/dashboard surface unless the selected task explicitly asks for that.
+- `docs`: architecture, reliability, deployment, and agent-harness documentation.
+
 ## Scope Boundaries
 
 SupaMail core owns email sync only. Do not add Signal CRM, CRM hydration, person/company identity resolution, handle mapping, belief layers, dashboard code, Trigger.dev coupling, calendar, contacts, sending, scheduling, AI features, MCP, historical backfill, or provider compatibility work unless the selected task explicitly asks for it.
@@ -36,6 +42,7 @@ When docs mention message identity, they mean mailbox-row identity: `(account_id
 - Do not self-start a `not_started` feature from `docs/agent/feature-list.json`. Start feature-list work only when the user asks for that issue/task or when a maintainer-selected PR scope clearly maps to it.
 - Prefer small, verified changes over broad refactors.
 - Do not weaken reliability semantics to make tests pass.
+- Before committing, pushing, or updating a PR, run `./init.sh` so the project docs / harness reminder appears before verification. If you intentionally run verification commands individually instead of `./init.sh`, run `pnpm harness:check` before `git commit` or `gh pr edit` and record that exception.
 - Keep architecture decisions in `docs/architecture/decisions/`.
 - Keep progress and task state updated before ending a substantial session.
 - Never claim completion from code inspection alone. Run the required verification from `docs/agent/verification.md`.
@@ -43,8 +50,9 @@ When docs mention message identity, they mean mailbox-row identity: `(account_id
 ## Task-Specific Reading
 
 - Sync engine, repository, locks, migrations, or health: read `docs/agent/reliability-invariants.md`.
-- Schema changes: read `docs/schema.md` and `supabase/migrations/0001_imap_mirror.sql`.
+- Schema changes: read `docs/schema.md` and `apps/api/supabase/migrations/0001_imap_mirror.sql`.
 - Deployment changes: read `docs/deployment-options.md` and `docs/fly-supabase.md`.
+- Web or landing-page changes: read `apps/web/app/page.tsx`, `apps/web/app/globals.css`, and `docs/architecture/README.md`.
 - Architecture decisions: read `docs/architecture/README.md` and the relevant ADRs.
 - Open issue work: read the issue body and acceptance criteria before editing.
 

@@ -26,6 +26,6 @@ Stream provider UIDs into a transaction-scoped Postgres temp table with `ON COMM
 
 ## References
 
-- `src/repository.ts`
-- `scripts/spec-conformance.ts`
-- `scripts/test-db-live.ts`
+- `apps/api/src/repository.ts`
+- `apps/api/scripts/spec-conformance.ts`
+- `apps/api/scripts/test-db-live.ts`

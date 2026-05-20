@@ -12,6 +12,13 @@ The harness follows the five-subsystem model from the `harness-creator` skill:
 - Scope: WIP=1 and issue-driven task boundaries.
 - Lifecycle: startup and end-of-session routines in `AGENTS.md` plus local handoff.
 
+## Monorepo Shape
+
+- `apps/api`: TypeScript/Node 22 IMAP mirror, worker, API, CLI, tests, Supabase migration, and deployment files.
+- `apps/web`: Next.js landing site.
+- Root package scripts call Turborepo or delegate into `@supamail/api`. Prefer root `pnpm typecheck`, `pnpm test`, and `pnpm build` for final verification.
+- Use package filters for narrow work, for example `pnpm --filter @supamail/api test` or `pnpm --filter @supamail/web build`.
+
 ## Skill Bootstrap
 
 This repo expects agents to have these skills installed:
@@ -47,6 +54,12 @@ For architecture work:
 ## Adding Knowledge
 
 Put durable project facts in tracked docs close to the relevant code or topic. Put private or temporary workspace notes in `.context/`. Do not add long one-off lessons to `AGENTS.md`; create or update a focused topic doc and link it.
+
+## Harness Impact Guard
+
+`pnpm harness:check` reminds local agents to review project docs and agent instructions for stale guidance. It is a reminder, not a proof that every doc sentence is correct.
+
+Here, "harness" means the agent-facing workflow docs and state surfaces that help future coding agents work correctly. This is intentionally broad rather than path-specific. If repo layout, scripts, CI, deployment, schema paths, startup flow, task boundaries, or verification lanes changed, update whatever docs became stale: `AGENTS.md`, this directory, architecture docs/ADRs, deployment docs, schema docs, README, or the public spec conformance doc. Use the PR template's Harness Impact section to record what you decided.
 
 ## Task Selection
 

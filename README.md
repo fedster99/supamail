@@ -51,11 +51,17 @@ SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Su
 
 Account-level advisory locks keep sync operations serialized. Folder state tracks UID cursors and UIDVALIDITY. Reconciliation catches gaps so missing messages do not silently become permanent.
 
+## Repository Layout
+
+- `apps/api`: TypeScript/Node worker, API, CLI, tests, Supabase migration, Docker, and Fly configs.
+- `apps/web`: Next.js landing site.
+- `docs`: reliability contract, deployment notes, architecture decisions, and agent operating docs.
+
 ## Quickstart: Supabase + Fly.io
 
 1. Create a Supabase project.
 2. Use the direct/session-affine Postgres connection string for `DATABASE_URL`.
-3. Deploy the worker with `fly.worker.toml.example`.
+3. Deploy the worker from `apps/api` with `fly.worker.toml.example`.
 4. Set environment variables.
 5. Run migrations.
 6. Add an IMAP account.
@@ -78,7 +84,7 @@ pnpm migrate
 or:
 
 ```bash
-psql "$DATABASE_URL" -f supabase/migrations/0001_imap_mirror.sql
+psql "$DATABASE_URL" -f apps/api/supabase/migrations/0001_imap_mirror.sql
 ```
 
 Important: use a direct Supabase Postgres URL or session pooling. Do not use the transaction pooler. SupaMail uses advisory locks, and advisory locks need session affinity.
@@ -93,7 +99,7 @@ See [docs/spec-conformance.md](docs/spec-conformance.md) for the public reliabil
 pnpm install
 pnpm migrate
 
-pnpm exec supamail create-account \
+pnpm --filter @supamail/api exec tsx src/cli.ts create-account \
   --email alice@example.com \
   --host imap.example.com \
   --port 993 \
@@ -106,13 +112,13 @@ Then start the worker:
 
 ```bash
 pnpm build
-pnpm start:worker
+pnpm --filter @supamail/api start:worker
 ```
 
 Or run the API:
 
 ```bash
-pnpm start:api
+pnpm --filter @supamail/api start:api
 ```
 
 ## Query Your Email
@@ -221,9 +227,9 @@ new MirrorEngine({
 
 ## Deployment Options
 
-- `fly.worker.toml.example`: low-cost Fly.io worker-only deployment
-- `fly.api.toml.example`: optional Fly.io API deployment
-- `compose.yaml`: Docker Compose / Coolify / VPS deployment
+- `apps/api/fly.worker.toml.example`: low-cost Fly.io worker-only deployment
+- `apps/api/fly.api.toml.example`: optional Fly.io API deployment
+- `apps/api/compose.yaml`: Docker Compose / Coolify / VPS deployment
 
 See [docs/deployment-options.md](docs/deployment-options.md) for tradeoffs.
 
@@ -253,7 +259,7 @@ supabase db reset --local
 
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
-pnpm dry-run:local
+pnpm --filter @supamail/api dry-run:local
 ```
 
 Protocol smoke test:
@@ -261,7 +267,7 @@ Protocol smoke test:
 ```bash
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
-pnpm smoke:greenmail
+pnpm --filter @supamail/api smoke:greenmail
 ```
 
 Load smoke test:
@@ -270,10 +276,10 @@ Load smoke test:
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
 NODE_OPTIONS=--max-old-space-size=160 \
-pnpm smoke:load
+pnpm --filter @supamail/api smoke:load
 ```
 
-`pnpm dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol.
+`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol.
 
 ## Project Status
 

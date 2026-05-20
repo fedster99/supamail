@@ -20,12 +20,12 @@ Encrypt IMAP passwords in Node using AES-256-GCM before persistence. Store only 
 
 ## Verification
 
-- `src/crypto.ts` owns password encryption/decryption.
-- `src/repository.ts` encrypts in `createAccount`.
-- `src/__tests__/crypto.test.ts` covers the round trip and failure cases.
+- `apps/api/src/crypto.ts` owns password encryption/decryption.
+- `apps/api/src/repository.ts` encrypts in `createAccount`.
+- `apps/api/src/__tests__/crypto.test.ts` covers the round trip and failure cases.
 
 ## References
 
-- `src/crypto.ts`
-- `src/repository.ts`
+- `apps/api/src/crypto.ts`
+- `apps/api/src/repository.ts`
 - PR #5 body notes.

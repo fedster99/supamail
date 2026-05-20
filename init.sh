@@ -10,6 +10,9 @@ echo "cwd: $(pwd)"
 echo "== Install dependencies =="
 bash -lc "$INSTALL_CMD"
 
+echo "== Harness impact check =="
+pnpm harness:check
+
 echo "== Typecheck =="
 pnpm typecheck
 
