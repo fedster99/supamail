@@ -37,7 +37,7 @@
         "pnpm test:db:live"
       ],
       "evidence": "",
-      "notes": "Backfill must be resumable, bounded, body-policy-aware, and safe around UIDVALIDITY resets and folder disappearance. Blocked by the reliability hardening sequence in docs/architecture/reliability-and-three-lanes.md."
+      "notes": "Backfill must be resumable, bounded, body-policy-aware, and safe around UIDVALIDITY resets and folder disappearance. Reliability hardening PRs 1-7 are complete on the working PR branch; PR-8 is the remaining feature implementation slice in docs/architecture/reliability-and-three-lanes.md."
     },
     {
       "id": "issue-3-provider-compatibility",

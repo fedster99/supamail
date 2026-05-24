@@ -5,7 +5,7 @@ import {
   type RuntimeTargetTask
 } from "../target-scheduler.js";
 
-const requiredSchemaVersion = "0004_account_lane_settings";
+const requiredSchemaVersion = "0005_progress_rollup";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

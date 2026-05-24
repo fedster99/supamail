@@ -12,6 +12,7 @@ const publicMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0
 const stuckDegradedMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0002_stuck_degraded_escalation.sql");
 const folderCapMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0003_folder_count_cap_pending_verification.sql");
 const accountSettingsMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0004_account_lane_settings.sql");
+const progressRollupMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0005_progress_rollup.sql");
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -91,14 +92,15 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0004_account_lane_settings");
+    expect(version).toBe("0005_progress_rollup");
     expect(manifest).toEqual({
-      schemaVersion: "0004_account_lane_settings",
+      schemaVersion: "0005_progress_rollup",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
         { id: "0003_folder_count_cap_pending_verification", file: "0003_folder_count_cap_pending_verification.sql" },
-        { id: "0004_account_lane_settings", file: "0004_account_lane_settings.sql" }
+        { id: "0004_account_lane_settings", file: "0004_account_lane_settings.sql" },
+        { id: "0005_progress_rollup", file: "0005_progress_rollup.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -107,6 +109,8 @@ describe("initial schema", () => {
     expect(sql).toContain("'PENDING_VERIFICATION'");
     expect(sql).toContain("live_window_days int NOT NULL DEFAULT 90");
     expect(sql).toContain("historical_backfill_mode text NOT NULL DEFAULT 'metadata_and_bodies'");
+    expect(sql).toContain("CREATE VIEW public.imap_account_progress");
+    expect(sql).toContain("headers_synced_count int NOT NULL DEFAULT 0");
   });
 
   it("adds stuck-degraded escalation state without control-plane tables", async () => {
@@ -143,6 +147,25 @@ describe("initial schema", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS archive_flag_sync boolean NOT NULL DEFAULT false");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS max_backfill_rate text NOT NULL DEFAULT 'normal'");
     expect(sql).toContain("CHECK (max_backfill_rate IN ('small', 'normal', 'aggressive'))");
+    expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
+  });
+
+  it("adds progress counters and a security-invoker roll-up view without control-plane tables", async () => {
+    const sql = await readFile(progressRollupMigrationPath, "utf8");
+
+    expect(sql).toContain("ADD COLUMN headers_synced_count int NOT NULL DEFAULT 0");
+    expect(sql).toContain("ADD COLUMN bodies_fetched_count int NOT NULL DEFAULT 0");
+    expect(sql).toContain("ADD COLUMN live_window_target_count int");
+    expect(sql).toContain("ADD COLUMN historical_target_count int");
+    expect(sql).toContain("DROP VIEW IF EXISTS public.imap_account_progress");
+    expect(sql).toContain("CREATE VIEW public.imap_account_progress");
+    expect(sql).toContain("WITH (security_invoker = true)");
+    expect(sql).toContain("live_headers_complete_pct");
+    expect(sql).toContain("priority_bodies_complete_pct");
+    expect(sql).toContain("historical_bodies_complete_pct");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM anon");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM authenticated");
     expect(sql).not.toContain("stripe");
     expect(sql).not.toContain("tenant");
   });

@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
-import type { AccountSummary, ImapFolder, SyncResult, UpdateAccountSettingsInput } from "../types.js";
+import type { AccountDetails, AccountSummary, ImapFolder, SyncResult, UpdateAccountSettingsInput } from "../types.js";
 
 const accountId = "00000000-0000-4000-8000-000000000001";
 const messageId = "00000000-0000-4000-8000-000000000002";
@@ -53,6 +53,30 @@ function makeSyncResult(): SyncResult {
   };
 }
 
+function makeAccountDetails(overrides: Partial<AccountDetails> = {}): AccountDetails {
+  return {
+    ...makeAccount(overrides),
+    live_headers_synced_count: 3,
+    live_headers_target_count: 3,
+    live_headers_complete_pct: 100,
+    priority_bodies_fetched_count: 2,
+    priority_bodies_target_count: 3,
+    priority_bodies_complete_pct: 67,
+    live_bodies_fetched_count: 2,
+    live_bodies_target_count: 3,
+    live_bodies_complete_pct: 67,
+    historical_headers_synced_count: 0,
+    historical_headers_target_count: 0,
+    historical_headers_complete_pct: 0,
+    historical_bodies_fetched_count: 0,
+    historical_bodies_target_count: 0,
+    historical_bodies_complete_pct: 0,
+    estimated_full_sync_at: null,
+    folders: [],
+    ...overrides
+  };
+}
+
 function makeFolder(overrides: Partial<ImapFolder> = {}): ImapFolder {
   const now = new Date("2026-05-19T00:00:00.000Z");
   return {
@@ -85,6 +109,10 @@ function makeFolder(overrides: Partial<ImapFolder> = {}): ImapFolder {
     last_reconcile_clean: null,
     uidvalidity_reset_count: 0,
     last_uidvalidity_reset_at: null,
+    headers_synced_count: 0,
+    bodies_fetched_count: 0,
+    live_window_target_count: null,
+    historical_target_count: null,
     backfill_in_progress: false,
     backfill_target_max_uid: null,
     backfill_oldest_uid_synced: null,
@@ -99,6 +127,7 @@ function buildApp(options: {
   apiToken?: string;
   adminToken?: string | null;
   account?: AccountSummary | null;
+  accountDetails?: AccountDetails | null;
   trackFolder?: (accountId: string, path: string) => Promise<ImapFolder | null>;
   updateAccountSettings?: (accountId: string, input: UpdateAccountSettingsInput) => Promise<AccountSummary | null>;
   createAccount?: (input: unknown) => Promise<AccountSummary>;
@@ -106,12 +135,16 @@ function buildApp(options: {
   applyMigration?: () => Promise<void>;
 } = {}) {
   const account = options.account === undefined ? makeAccount() : options.account;
+  const accountDetails = options.accountDetails === undefined
+    ? account ? makeAccountDetails(account) : null
+    : options.accountDetails;
   const repository = {
     listAccounts: vi.fn(options.listAccounts ?? (async () => account ? [account] : [])),
     createAccount: vi.fn(options.createAccount ?? (async (input: unknown) => makeAccount({
       email_address: (input as { emailAddress: string }).emailAddress
     }))),
     getAccount: vi.fn(async () => account),
+    getAccountDetails: vi.fn(async () => accountDetails),
     updateAccountSettings: vi.fn(options.updateAccountSettings ?? (async (_accountId, input) => makeAccount({
       historical_backfill_mode: input.historicalBackfillMode ?? "metadata_and_bodies",
       archive_refresh_interval: input.archiveRefreshInterval ?? "monthly",
@@ -248,6 +281,44 @@ describe("API safety", () => {
     });
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({ error: "conflict" });
+  });
+
+  it("returns account progress details from GET /accounts/:id", async () => {
+    const { app, repository } = buildApp({
+      accountDetails: makeAccountDetails({
+        live_headers_complete_pct: 100,
+        priority_bodies_complete_pct: 67,
+        live_bodies_complete_pct: 67,
+        folders: [{
+          id: "00000000-0000-4000-8000-000000000004",
+          path: "INBOX",
+          tracked: true,
+          status: "ACTIVE",
+          sync_priority: 1,
+          headers_synced_count: 3,
+          bodies_fetched_count: 2,
+          live_window_target_count: 3,
+          historical_target_count: null,
+          headers_pct: 100,
+          bodies_pct: 67,
+          historical_headers_pct: 0,
+          historical_bodies_pct: 0
+        }]
+      })
+    });
+
+    const response = await app.request(`/accounts/${accountId}`, { headers: auth() });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      account: {
+        id: accountId,
+        live_headers_complete_pct: 100,
+        priority_bodies_complete_pct: 67,
+        live_bodies_complete_pct: 67,
+        folders: [{ path: "INBOX", headers_pct: 100, bodies_pct: 67 }]
+      }
+    });
+    expect(repository.getAccountDetails).toHaveBeenCalledWith(accountId);
   });
 
   it("validates POST /accounts/:id/folders/track input before enabling a folder", async () => {

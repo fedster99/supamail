@@ -10,12 +10,20 @@ import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
 import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
-import type { AccountSummary, ImapFolder, ImapMessage, SyncResult, UpdateAccountSettingsInput } from "./types.js";
+import type {
+  AccountDetails,
+  AccountSummary,
+  ImapFolder,
+  ImapMessage,
+  SyncResult,
+  UpdateAccountSettingsInput
+} from "./types.js";
 
 interface ApiRepository {
   listAccounts(): Promise<AccountSummary[]>;
   createAccount(input: unknown): Promise<AccountSummary>;
   getAccount(id: string): Promise<unknown | null>;
+  getAccountDetails(id: string): Promise<AccountDetails | null>;
   updateAccountSettings(accountId: string, input: UpdateAccountSettingsInput): Promise<AccountSummary | null>;
   trackFolder(accountId: string, path: string): Promise<ImapFolder | null>;
   getMessage(id: string): Promise<ImapMessage | null>;
@@ -175,6 +183,13 @@ export function createApiApp(options: ApiAppOptions): Hono {
   app.get("/accounts", async (c) => {
     const accounts = await options.repository.listAccounts();
     return c.json({ accounts });
+  });
+
+  app.get("/accounts/:id", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccountDetails(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    return c.json({ account });
   });
 
   app.post("/accounts", async (c) => {

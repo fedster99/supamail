@@ -4,9 +4,12 @@ import type { PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import { getProviderProfile } from "./provider-profiles.js";
 import type {
+  AccountDetails,
+  AccountProgress,
   AccountSummary,
   BodyFetchPolicy,
   CreateAccountInput,
+  FolderProgress,
   ImapAccount,
   ImapFolder,
   ImapMessage,
@@ -86,6 +89,50 @@ const ACCOUNT_SUMMARY_COLUMNS = `
   updated_at
 `;
 
+const ACCOUNT_DETAILS_COLUMNS = `
+  a.id,
+  a.email_address,
+  a.provider_profile,
+  a.body_fetch_policy,
+  a.live_window_days,
+  a.historical_backfill_mode,
+  a.archive_refresh_interval,
+  a.archive_flag_sync,
+  a.max_backfill_rate,
+  a.sync_state,
+  a.sync_state_reason,
+  a.last_sync_started_at,
+  a.last_sync_finished_at,
+  a.last_priority_sync_succeeded_at,
+  a.priority_sync_lag_seconds,
+  a.overall_sync_lag_seconds,
+  a.consecutive_failures,
+  a.consecutive_successes,
+  a.backoff_until,
+  a.last_folder_discovery_at,
+  a.next_folder_discovery_at,
+  a.folder_count_cap_override,
+  a.last_heartbeat_at,
+  a.created_at,
+  a.updated_at,
+  p.live_headers_synced_count,
+  p.live_headers_target_count,
+  p.live_headers_complete_pct,
+  p.priority_bodies_fetched_count,
+  p.priority_bodies_target_count,
+  p.priority_bodies_complete_pct,
+  p.live_bodies_fetched_count,
+  p.live_bodies_target_count,
+  p.live_bodies_complete_pct,
+  p.historical_headers_synced_count,
+  p.historical_headers_target_count,
+  p.historical_headers_complete_pct,
+  p.historical_bodies_fetched_count,
+  p.historical_bodies_target_count,
+  p.historical_bodies_complete_pct,
+  p.estimated_full_sync_at
+`;
+
 export class MirrorRepository {
   constructor(
     private readonly pool: PgPool,
@@ -146,6 +193,68 @@ export class MirrorRepository {
       [id]
     );
     return result.rows[0] ?? null;
+  }
+
+  async getAccountDetails(id: string): Promise<AccountDetails | null> {
+    const accountResult = await this.pool.query<AccountSummary & Omit<AccountProgress, "account_id">>(
+      `
+      SELECT ${ACCOUNT_DETAILS_COLUMNS}
+      FROM public.imap_accounts a
+      JOIN public.imap_account_progress p ON p.account_id = a.id
+      WHERE a.id = $1
+      `,
+      [id]
+    );
+    const account = accountResult.rows[0];
+    if (!account) return null;
+
+    const folders = await this.pool.query<FolderProgress>(
+      `
+      SELECT
+        id,
+        path,
+        tracked,
+        status,
+        sync_priority,
+        headers_synced_count,
+        bodies_fetched_count,
+        live_window_target_count,
+        historical_target_count,
+        CASE
+          WHEN COALESCE(live_window_target_count, 0) > 0
+            THEN LEAST(100, round((LEAST(headers_synced_count, live_window_target_count)::numeric / live_window_target_count::numeric) * 100)::int)
+          WHEN live_window_target_count IS NOT NULL THEN 100
+          ELSE 0
+        END AS headers_pct,
+        CASE
+          WHEN COALESCE(live_window_target_count, 0) > 0
+            THEN LEAST(100, round((LEAST(bodies_fetched_count, live_window_target_count)::numeric / live_window_target_count::numeric) * 100)::int)
+          WHEN live_window_target_count IS NOT NULL THEN 100
+          ELSE 0
+        END AS bodies_pct,
+        CASE
+          WHEN COALESCE(historical_target_count, 0) > 0
+            THEN LEAST(100, round((GREATEST(headers_synced_count - COALESCE(live_window_target_count, 0), 0)::numeric / historical_target_count::numeric) * 100)::int)
+          WHEN historical_target_count IS NOT NULL THEN 100
+          ELSE 0
+        END AS historical_headers_pct,
+        CASE
+          WHEN COALESCE(historical_target_count, 0) > 0
+            THEN LEAST(100, round((GREATEST(bodies_fetched_count - COALESCE(live_window_target_count, 0), 0)::numeric / historical_target_count::numeric) * 100)::int)
+          WHEN historical_target_count IS NOT NULL THEN 100
+          ELSE 0
+        END AS historical_bodies_pct
+      FROM public.imap_folders
+      WHERE account_id = $1
+      ORDER BY sync_priority, path
+      `,
+      [id]
+    );
+
+    return {
+      ...account,
+      folders: folders.rows
+    };
   }
 
   async updateAccountSettings(accountId: string, input: UpdateAccountSettingsInput): Promise<AccountSummary | null> {
@@ -916,17 +1025,19 @@ export class MirrorRepository {
   async setInitialSyncSnapshot(
     folderId: string,
     targetMaxUid: number,
-    oldestUidSynced: number
+    oldestUidSynced: number,
+    targetCount: number
   ): Promise<void> {
     await this.pool.query(
       `
       UPDATE public.imap_folders
       SET initial_sync_target_max_uid = $2,
           initial_sync_oldest_uid_synced = $3,
+          live_window_target_count = $4,
           last_progress_at = now()
       WHERE id = $1
       `,
-      [folderId, targetMaxUid, oldestUidSynced]
+      [folderId, targetMaxUid, oldestUidSynced, targetCount]
     );
   }
 
@@ -1033,6 +1144,9 @@ export class MirrorRepository {
             initial_sync_complete = false,
             initial_sync_target_max_uid = NULL,
             initial_sync_oldest_uid_synced = NULL,
+            headers_synced_count = 0,
+            bodies_fetched_count = 0,
+            live_window_target_count = NULL,
             status = 'NEEDS_FULL_RESYNC',
             uidvalidity_reset_count = CASE
               WHEN last_uidvalidity_reset_at IS NULL
@@ -1105,6 +1219,21 @@ export class MirrorRepository {
     for (const message of messages) {
       await client.query("BEGIN");
       try {
+      const existing = await client.query<{ exists: boolean }>(
+        `
+        SELECT EXISTS (
+          SELECT 1
+          FROM public.imap_messages
+          WHERE account_id = $1
+            AND folder_path = $2
+            AND uidvalidity = $3
+            AND uid = $4
+        ) AS exists
+        `,
+        [accountId, folder.path, uidValidity, message.uid]
+      );
+      const isNewMessage = existing.rows[0]?.exists !== true;
+
       const result = await client.query<ImapMessage>(
         `
         INSERT INTO public.imap_messages (
@@ -1208,6 +1337,16 @@ export class MirrorRepository {
             attachment.contentId,
             attachment.disposition
           ]
+        );
+      }
+      if (isNewMessage) {
+        await client.query(
+          `
+          UPDATE public.imap_folders
+          SET headers_synced_count = headers_synced_count + 1
+          WHERE id = $1
+          `,
+          [folder.id]
         );
       }
       await client.query("COMMIT");
@@ -1431,9 +1570,28 @@ export class MirrorRepository {
   }
 
   async storeBody(body: MessageBodyInput): Promise<void> {
-    await this.pool.query(
-      `
-      WITH upsert AS (
+    const client = await this.pool.connect();
+    await client.query("BEGIN");
+
+    try {
+      const target = await client.query<{
+        account_id: string;
+        folder_path: string;
+        body_fetched_at: Date | null;
+      }>(
+        `
+        SELECT account_id, folder_path, body_fetched_at
+        FROM public.imap_messages
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [body.messageId]
+      );
+      const message = target.rows[0];
+      if (!message) throw new Error(`Message not found for body storage: ${body.messageId}`);
+
+      await client.query(
+        `
         INSERT INTO public.imap_message_bodies (
           message_id,
           raw_mime,
@@ -1467,27 +1625,51 @@ export class MirrorRepository {
           parser_warnings = EXCLUDED.parser_warnings,
           fetched_at = now(),
           updated_at = now()
-        RETURNING message_id
-      )
-      UPDATE public.imap_messages
-      SET body_fetched_at = now()
-      WHERE id IN (SELECT message_id FROM upsert)
-      `,
-      [
-        body.messageId,
-        body.rawMime,
-        body.rawBytes,
-        body.rawTruncated,
-        body.bodyText,
-        body.bodyHtml,
-        body.bodyPlain,
-        body.selectedTextPart,
-        body.selectedTextFormat,
-        JSON.stringify(body.headersJson),
-        JSON.stringify(body.mimeStructure ?? null),
-        body.parserWarnings
-      ]
-    );
+        `,
+        [
+          body.messageId,
+          body.rawMime,
+          body.rawBytes,
+          body.rawTruncated,
+          body.bodyText,
+          body.bodyHtml,
+          body.bodyPlain,
+          body.selectedTextPart,
+          body.selectedTextFormat,
+          JSON.stringify(body.headersJson),
+          JSON.stringify(body.mimeStructure ?? null),
+          body.parserWarnings
+        ]
+      );
+
+      await client.query(
+        `
+        UPDATE public.imap_messages
+        SET body_fetched_at = now()
+        WHERE id = $1
+        `,
+        [body.messageId]
+      );
+
+      if (!message.body_fetched_at) {
+        await client.query(
+          `
+          UPDATE public.imap_folders
+          SET bodies_fetched_count = bodies_fetched_count + 1
+          WHERE account_id = $1
+            AND path = $2
+          `,
+          [message.account_id, message.folder_path]
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async getBodyBacklog(account: ImapAccount, limit: number): Promise<ImapMessage[]> {

@@ -54,6 +54,7 @@ SupaMail owns a conservative mailbox mirror:
 | Retention must preserve recoverable reconcile tombstones. | Implemented | Expiry marks old rows `EXPIRED`; purge only removes strict trapdoor reasons, never `RECONCILE_MISSING`. |
 | Account count should be capped for this architecture. | Implemented | `SYNC_MAX_ACCOUNTS` enforced at account creation and worker startup. |
 | Body fetches should be lazy and lock-guarded. | Implemented | Body backlog/fetch uses the same account lock and stores full MIME/parser output separately from metadata. |
+| Body completeness should be observable because downstream search reliability depends on it. | Implemented | Folder progress counters and `imap_account_progress` expose live-header, priority-body, live-body, and historical completion percentages; spec-conformance Scenario M proves the roll-up. |
 | Attachment metadata belongs in the mirror, not necessarily attachment binaries. | Implemented | MIME `BODYSTRUCTURE` is parsed into attachment metadata during sync; binary attachment retrieval is outside the current core path. |
 | Worker shutdown should release held resources. | Implemented | SIGTERM/SIGINT abort the loop, wake sleep, and close the Postgres pool so advisory locks release with the session. |
 | Sync should emit durable observability events. | Implemented at mirror-event level | Sync runs, message/folder events, flag changes, reconcile backfills, and retention outcomes are stored or logged. Stable metrics/alert names remain an open operational layer. |

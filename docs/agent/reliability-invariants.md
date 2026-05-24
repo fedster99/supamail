@@ -11,6 +11,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.
 - Attachment metadata is stored during sync; binary attachment fetching is not part of the current core path.
 - Body backlog draining is capped per tick so recent-body work cannot consume the whole lock window forever.
+- Progress counters live on `imap_folders` and must be updated in the same write path as the underlying header/body state they summarize.
 
 ## Concurrency And Connections
 
@@ -41,6 +42,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Initial sync SEARCH/FETCH work is bounded by `INITIAL_SYNC_BATCH_TIMEOUT_MS`; a timeout aborts the IMAP client and must not advance the initial-sync watermark.
 - A failed initial sync batch must not advance watermarks.
 - `live_window_days` is immutable after account creation in v0.1; changing it requires a future window-status migration story.
+- `imap_account_progress` is a roll-up view over folder counters. It is a read model, not an independent source of truth.
 - Incremental sync only advances `last_uid` after all fetched metadata for the batch succeeds.
 - Partial metadata fetches are hard failures. Do not swallow per-message errors and advance cursors.
 - Flag scans are due-based and compare normalized flags.

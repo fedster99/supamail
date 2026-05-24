@@ -115,6 +115,31 @@ describe("repository safety", () => {
     expect(source).toContain("live_window_days");
   });
 
+  it("maintains progress counters at the write sites", async () => {
+    const repository = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const engine = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(repository).toContain("live_window_target_count = $4");
+    expect(repository).toContain("headers_synced_count = headers_synced_count + 1");
+    expect(repository).toContain("bodies_fetched_count = bodies_fetched_count + 1");
+    expect(repository).toContain("FOR UPDATE");
+    expect(repository).toContain("if (!message.body_fetched_at)");
+    expect(repository).toContain("headers_synced_count = 0");
+    expect(repository).toContain("bodies_fetched_count = 0");
+    expect(engine).toContain("setInitialSyncSnapshot(folder.id, targetMaxUid, oldestSynced, sortedTargets.length)");
+  });
+
+  it("exposes account details through the progress view", async () => {
+    const repository = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const api = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
+
+    expect(repository).toContain("getAccountDetails");
+    expect(repository).toContain("public.imap_account_progress");
+    expect(repository).toContain("headers_pct");
+    expect(api).toContain('app.get("/accounts/:id"');
+    expect(api).toContain("getAccountDetails");
+  });
+
   it("tombstones folder messages after the missing grace expires", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 

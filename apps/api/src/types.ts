@@ -75,6 +75,46 @@ export interface AccountSummary {
   updated_at: Date;
 }
 
+export interface AccountProgress {
+  account_id: string;
+  live_headers_synced_count: number;
+  live_headers_target_count: number;
+  live_headers_complete_pct: number;
+  priority_bodies_fetched_count: number;
+  priority_bodies_target_count: number;
+  priority_bodies_complete_pct: number;
+  live_bodies_fetched_count: number;
+  live_bodies_target_count: number;
+  live_bodies_complete_pct: number;
+  historical_headers_synced_count: number;
+  historical_headers_target_count: number;
+  historical_headers_complete_pct: number;
+  historical_bodies_fetched_count: number;
+  historical_bodies_target_count: number;
+  historical_bodies_complete_pct: number;
+  estimated_full_sync_at: Date | null;
+}
+
+export interface FolderProgress {
+  id: string;
+  path: string;
+  tracked: boolean;
+  status: FolderStatus;
+  sync_priority: number;
+  headers_synced_count: number;
+  bodies_fetched_count: number;
+  live_window_target_count: number | null;
+  historical_target_count: number | null;
+  headers_pct: number;
+  bodies_pct: number;
+  historical_headers_pct: number;
+  historical_bodies_pct: number;
+}
+
+export type AccountDetails = AccountSummary & Omit<AccountProgress, "account_id"> & {
+  folders: FolderProgress[];
+};
+
 export interface ImapFolder {
   id: string;
   account_id: string;
@@ -105,6 +145,10 @@ export interface ImapFolder {
   last_reconcile_clean: boolean | null;
   uidvalidity_reset_count: number;
   last_uidvalidity_reset_at: Date | null;
+  headers_synced_count: number;
+  bodies_fetched_count: number;
+  live_window_target_count: number | null;
+  historical_target_count: number | null;
   backfill_in_progress: boolean;
   backfill_target_max_uid: string | null;
   backfill_oldest_uid_synced: string | null;

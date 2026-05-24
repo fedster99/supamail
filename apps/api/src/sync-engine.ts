@@ -854,7 +854,7 @@ export class MirrorEngine {
 
       if (sortedTargets.length === 0) {
         // Empty folder in window — record the snapshot (target=0) and mark complete.
-        await this.repository.setInitialSyncSnapshot(folder.id, 0, 0);
+        await this.repository.setInitialSyncSnapshot(folder.id, 0, 0, 0);
         await this.repository.markFolderSynced(folder.id, {
           uidValidity,
           uidNext,
@@ -866,7 +866,7 @@ export class MirrorEngine {
 
       targetMaxUid = sortedTargets[sortedTargets.length - 1];
       oldestSynced = targetMaxUid + 1;
-      await this.repository.setInitialSyncSnapshot(folder.id, targetMaxUid, oldestSynced);
+      await this.repository.setInitialSyncSnapshot(folder.id, targetMaxUid, oldestSynced, sortedTargets.length);
     }
 
     // Re-search and bound by the snapshot. Any UIDs the provider has expunged

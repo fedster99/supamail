@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0004_account_lane_settings",
+  "schemaVersion": "0005_progress_rollup",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -16,6 +16,10 @@
     {
       "id": "0004_account_lane_settings",
       "file": "0004_account_lane_settings.sql"
+    },
+    {
+      "id": "0005_progress_rollup",
+      "file": "0005_progress_rollup.sql"
     }
   ]
 }

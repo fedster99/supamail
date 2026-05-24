@@ -9,8 +9,9 @@ The mirror owns these neutral tables in `public`:
 - `imap_attachments`
 - `imap_sync_runs`
 - `imap_sync_events`
+- `imap_account_progress` (view)
 
-RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked when those Supabase roles exist. The worker/API should use a direct Postgres connection string, not the browser-facing Supabase Data API.
+RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked when those Supabase roles exist. `imap_account_progress` is a `security_invoker` view and also revokes `anon`/`authenticated` access when those roles exist. The worker/API should use a direct Postgres connection string, not the browser-facing Supabase Data API.
 
 `imap_messages` stays metadata-oriented so list queries remain small. Full body data lives in `imap_message_bodies`.
 
@@ -25,6 +26,10 @@ Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY
 `POST /accounts/:id/folders/track` lets operators opt an existing non-provider-excluded folder back into sync past the folder-count cap. The opt-in is persisted on the folder so the next discovery pass does not reapply `folder_count_cap_exceeded` to that path.
 
 `imap_accounts` also stores the account-level lane settings that later historical-backfill work will consume: `live_window_days`, `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate`. The columns are type-safe Postgres fields with CHECK constraints and defaults. In v0.1, `live_window_days` is immutable after account creation; `PATCH /accounts/:id/settings` rejects attempts to change it and only updates the mutable historical/archive/backfill-rate settings.
+
+`imap_folders` stores incremental progress counters: `headers_synced_count`, `bodies_fetched_count`, `live_window_target_count`, and `historical_target_count`. Header counters advance when new mailbox rows are inserted, body counters advance only on the first successful body fetch for a message, and UIDVALIDITY resets clear the live progress for that folder.
+
+`imap_account_progress` rolls those folder counters up into account-level percentages for `GET /accounts/:id`: live headers, priority bodies, live bodies, historical headers, historical bodies, and a nullable `estimated_full_sync_at`. The estimate is currently null until a durable rate model exists.
 
 `imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a missing-mailbox verification pass. Missing-mailbox errors stamp `missing_since`, force `imap_accounts.next_folder_discovery_at = now()`, and move the folder into `PENDING_VERIFICATION`. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
 

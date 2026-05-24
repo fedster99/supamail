@@ -86,7 +86,7 @@ API surface:
 }
 ```
 
-`estimated_full_sync_at` is best-effort, computed from recent body-fetch rate and remaining work. It may move backward if the provider rate-limits us; document that.
+`estimated_full_sync_at` is best-effort and nullable. PR-7 exposes the field as `null`; a future rate model can compute it from recent body-fetch rate and remaining work. Once populated, it may move backward if the provider rate-limits us; document that.
 
 ### D5: `MAX_LOCK_HOLD_MS` enforcement via cooperative checkpoints
 
@@ -323,7 +323,7 @@ Each PR carries its own migration (if any), code, scenario, and doc update. Each
 4. **PR-4: Folder-count cap + PENDING_VERIFICATION state.** Migration: extend `imap_folders.status` CHECK to include `PENDING_VERIFICATION`, add `folder_count_cap_override` column to `imap_accounts`. Wire warn/enforce thresholds. Scenario J. Promotes D9, D10 (partial) to ADRs 0010, 0011. **Landed.**
 5. **PR-5: Reactive rediscovery.** Builds on PR-4. Missing-mailbox detection in `syncFolder`'s catch, set `next_folder_discovery_at = now()` and `status = PENDING_VERIFICATION`. New API endpoint `POST /accounts/:id/folders/track`. Scenario K. Completes ADR 0011. **Landed.**
 6. **PR-6: Per-account settings columns + defaults.** Migration: 5 new columns on `imap_accounts` with `CHECK` constraints. API `PATCH /accounts/:id/settings`. No engine behavior change yet — the columns exist, defaults apply, but the engine doesn't consume them. Sets up PR-8. **Landed.**
-7. **PR-7: Progress columns + per-account roll-up view.** Migration: new `imap_account_progress` view. Extend `GET /accounts/:id` to return progress fields. Scenario M.
+7. **PR-7: Progress columns + per-account roll-up view.** Migration: new `imap_account_progress` view. Extend `GET /accounts/:id` to return progress fields. Scenario M. **Landed.**
 8. **PR-8: Three-lane engine — history lane wiring.** Depends on PR-1 (budget), PR-6 (settings), PR-7 (progress). Adds `getHistoryBacklog`, history lane in `MirrorEngine.syncAccount`, archive refresh pass. Engine consumes `historical_backfill_mode`, `archive_refresh_interval`, `max_backfill_rate`. Scenario L. Promotes D2 to ADR 0012. This IS the historical-backfill feature (closes `issue-2-historical-backfill`).
 
 PRs 1–5 are the boring reliability hardening — the original four spec fixes plus the loop bug. They can land in any order among themselves (no inter-PR dependencies except PR-5 needs PR-4's `PENDING_VERIFICATION` state).

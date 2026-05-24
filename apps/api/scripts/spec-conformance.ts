@@ -1385,6 +1385,142 @@ async function scenarioPendingVerificationRediscovery() {
   }
 }
 
+async function scenarioProgressRollup() {
+  console.log("\nScenario M: progress counters roll up from folders into account progress");
+  const { pool, config, repository, account } = await setup("progress", {
+    INITIAL_SYNC_BATCH_SIZE: 50,
+    MAX_RR_FOLDERS_PER_CYCLE: 5
+  });
+  try {
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 71_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "inbox-1", from: "a@x.test", to: "u@x.test", body: "one" }),
+          makeTextMessage({ uid: 2, subject: "inbox-2", from: "a@x.test", to: "u@x.test", body: "two" }),
+          makeTextMessage({ uid: 3, subject: "inbox-3", from: "a@x.test", to: "u@x.test", body: "three" })
+        ]
+      },
+      {
+        path: "Archive",
+        delimiter: "/",
+        uidValidity: 71_002,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "archive-1", from: "b@x.test", to: "u@x.test", body: "four" }),
+          makeTextMessage({ uid: 2, subject: "archive-2", from: "b@x.test", to: "u@x.test", body: "five" })
+        ]
+      }
+    ];
+    const engine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new FixtureImapClient(folders)
+    });
+
+    const synced = await engine.syncAccount(account.id, "manual");
+    assert(synced.outcome === "success", "progress fixture sync succeeds", synced.errors.join("|"));
+
+    const messages = (
+      await pool.query<{ id: string; folder_path: string; uid: string }>(
+        `
+        SELECT id, folder_path, uid::text AS uid
+        FROM public.imap_messages
+        WHERE account_id = $1
+        ORDER BY folder_path, uid
+        `,
+        [account.id]
+      )
+    ).rows;
+
+    for (const message of messages.filter((row) => row.folder_path === "INBOX" || row.uid === "1")) {
+      const rawMime = Buffer.from(`Subject: progress ${message.uid}\r\n\r\nbody`);
+      await repository.storeBody({
+        messageId: message.id,
+        rawMime,
+        rawBytes: rawMime.length,
+        rawTruncated: false,
+        bodyText: "body",
+        bodyHtml: null,
+        bodyPlain: "body",
+        selectedTextPart: "1",
+        selectedTextFormat: "plain",
+        headersJson: {},
+        mimeStructure: null,
+        parserWarnings: []
+      });
+    }
+
+    const folderRows = (
+      await pool.query<{
+        path: string;
+        headers_synced_count: number;
+        bodies_fetched_count: number;
+        live_window_target_count: number | null;
+      }>(
+        `
+        SELECT path, headers_synced_count, bodies_fetched_count, live_window_target_count
+        FROM public.imap_folders
+        WHERE account_id = $1
+        ORDER BY path
+        `,
+        [account.id]
+      )
+    ).rows;
+    const inbox = folderRows.find((row) => row.path === "INBOX");
+    const archive = folderRows.find((row) => row.path === "Archive");
+    assert(
+      inbox?.headers_synced_count === 3 && inbox.bodies_fetched_count === 3 && inbox.live_window_target_count === 3,
+      "INBOX folder progress counters are complete",
+      `inbox=${JSON.stringify(inbox)}`
+    );
+    assert(
+      archive?.headers_synced_count === 2 && archive.bodies_fetched_count === 1 && archive.live_window_target_count === 2,
+      "Archive folder progress counters show partial bodies",
+      `archive=${JSON.stringify(archive)}`
+    );
+
+    const progress = (
+      await pool.query<{
+        live_headers_complete_pct: number;
+        priority_bodies_complete_pct: number;
+        live_bodies_complete_pct: number;
+        historical_headers_complete_pct: number;
+        historical_bodies_complete_pct: number;
+      }>(
+        `
+        SELECT
+          live_headers_complete_pct,
+          priority_bodies_complete_pct,
+          live_bodies_complete_pct,
+          historical_headers_complete_pct,
+          historical_bodies_complete_pct
+        FROM public.imap_account_progress
+        WHERE account_id = $1
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(progress.live_headers_complete_pct === 100, "live headers roll up to 100%", `progress=${JSON.stringify(progress)}`);
+    assert(progress.priority_bodies_complete_pct === 100, "priority bodies roll up to 100%", `progress=${JSON.stringify(progress)}`);
+    assert(progress.live_bodies_complete_pct === 80, "live bodies roll up to 80%", `progress=${JSON.stringify(progress)}`);
+    assert(progress.historical_headers_complete_pct === 0, "historical headers stay 0 before history lane", `progress=${JSON.stringify(progress)}`);
+    assert(progress.historical_bodies_complete_pct === 0, "historical bodies stay 0 before history lane", `progress=${JSON.stringify(progress)}`);
+
+    const details = await repository.getAccountDetails(account.id);
+    assert(
+      details?.folders.some((folder) => folder.path === "Archive" && folder.headers_pct === 100 && folder.bodies_pct === 50) === true,
+      "account details expose per-folder progress",
+      `folders=${JSON.stringify(details?.folders)}`
+    );
+  } finally {
+    await teardown(pool, account.id);
+  }
+}
+
 async function main(): Promise<void> {
   console.log("SupaMail Tier-1 spec conformance — exercising real Postgres + fixture IMAP\n");
   console.log(`DATABASE_URL=${process.env.DATABASE_URL?.replace(/:[^@:]*@/, ":***@")}`);
@@ -1399,6 +1535,7 @@ async function main(): Promise<void> {
   await scenarioStuckDegradedEscalation();
   await scenarioFolderCountCap();
   await scenarioPendingVerificationRediscovery();
+  await scenarioProgressRollup();
 
   const passed = results.filter((r) => r.passed).length;
   const failed = results.filter((r) => !r.passed).length;

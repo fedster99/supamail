@@ -39,6 +39,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 - Parsed text, HTML, normalized text, and parser metadata
 - Attachment and inline-part metadata
 - Sync runs, sync events, health, lag, retries, and backoff
+- Per-folder and per-account progress percentages for headers and body completeness
 - Folder-count safeguards for unusually large mailboxes
 - Reactive rediscovery when a provider reports a mailbox no longer exists
 - Provider profiles for generic IMAP and provider-specific quirks
@@ -179,6 +180,20 @@ select
 from imap_accounts;
 ```
 
+Progress roll-up:
+
+```sql
+select
+  a.email_address,
+  p.live_headers_complete_pct,
+  p.priority_bodies_complete_pct,
+  p.live_bodies_complete_pct,
+  p.historical_headers_complete_pct,
+  p.historical_bodies_complete_pct
+from imap_accounts a
+join imap_account_progress p on p.account_id = a.id;
+```
+
 ## Body Sync
 
 `BODY_FETCH_POLICY` controls when full bodies are fetched:
@@ -186,6 +201,8 @@ from imap_accounts;
 - `immediate`: fetch body rows for every in-window message during sync.
 - `lazy`: fetch bodies only when `refetch-body` or the API endpoint is called.
 - `priority_then_backfill`: fetch bodies for priority folders such as INBOX and Sent during normal sync. This is the default.
+
+IMAP headers arrive much faster than full MIME bodies. SupaMail exposes progress percentages so downstream search, agent, or UI consumers can decide how much body completeness they need before trusting deep search results.
 
 SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.
 
@@ -198,11 +215,14 @@ Attachment binaries are not downloaded by default. SupaMail stores attachment me
 - `GET /health`
 - `POST /migrate`
 - `GET /accounts`
+- `GET /accounts/:id`
 - `POST /accounts`
 - `POST /accounts/:id/sync`
+- `POST /accounts/:id/folders/track`
+- `PATCH /accounts/:id/settings`
 - `POST /messages/:id/refetch-body`
 
-Account responses intentionally omit encrypted passwords, lock IDs, and worker internals.
+Account responses intentionally omit encrypted passwords, lock IDs, and worker internals. `GET /accounts/:id` includes account progress percentages and per-folder progress rows.
 
 Example:
 
