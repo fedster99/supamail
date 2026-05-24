@@ -10,9 +10,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- Last pushed reliability PR-4 implementation commit: `2e438bb Enforce folder count cap`.
-- PR checks after `2e438bb`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
-- Reliability PR-4 folder-count cap plus `PENDING_VERIFICATION` schema/scheduler support is implemented, committed, and pushed.
+- Last local reliability PR-5 implementation commit: `3104533 Add reactive folder rediscovery`.
+- Reliability PR-5 reactive rediscovery plus folder opt-in endpoint is implemented and committed locally. Push and PR checks are the next handoff step.
 
 ## Current Shape
 
