@@ -10,9 +10,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- Last pushed reliability PR-3 handoff commit: `847c6d5 Refresh PR-3 handoff status`.
-- PR checks after `847c6d5`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
-- Reliability PR-4 folder-count cap plus `PENDING_VERIFICATION` schema/scheduler support is implemented in the current local changes; recheck PR status after commit/push.
+- Last pushed reliability PR-4 implementation commit: `2e438bb Enforce folder count cap`.
+- PR checks after `2e438bb`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Reliability PR-4 folder-count cap plus `PENDING_VERIFICATION` schema/scheduler support is implemented, committed, and pushed.
 
 ## Current Shape
 
@@ -32,7 +32,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR-1 of the reliability hardening sequence is implemented: `MAX_LOCK_HOLD_MS` is now enforced cooperatively at safe sync boundaries, `SyncResult.hitLockBudget` records budget hits, body backlog draining is capped by `MAX_BODY_BATCHES_PER_TICK`, and ADR 0008 documents the decision.
 - PR-2 of the reliability hardening sequence is implemented: `INITIAL_SYNC_BATCH_TIMEOUT_MS` bounds initial sync snapshot/search/fetch work, aborts IMAP on timeout, treats the cycle as a transient failure, and preserves the initial-sync watermark for retry.
 - PR-3 of the reliability hardening sequence is implemented: `imap_accounts.last_priority_sync_succeeded_at` records priority success, long-stuck `DEGRADED` accounts escalate to retryable `BROKEN` with `STUCK_DEGRADED_24H`, hourly retry uses `backoff_until`, seven-day terminal cutoff uses `STUCK_DEGRADED_TERMINAL`, and ADR 0009 documents the decision.
-- PR-4 of the reliability hardening sequence is implemented locally: `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, `FOLDER_COUNT_ENFORCE_THRESHOLD` tracks only priority folders and marks the account `DEGRADED` with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`, `folder_count_cap_override` lets operators raise the enforce threshold, and `PENDING_VERIFICATION` is now a scheduler-excluded folder state that discovery can revive.
+- PR-4 of the reliability hardening sequence is implemented: `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, `FOLDER_COUNT_ENFORCE_THRESHOLD` tracks only priority folders and marks the account `DEGRADED` with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`, `folder_count_cap_override` lets operators raise the enforce threshold, and `PENDING_VERIFICATION` is now a scheduler-excluded folder state that discovery can revive.
 - Ignored local env files were seeded for this workspace. Public handoff omits local project refs, generated tokens, API keys, and machine-specific env paths; see `.context/local-setup-handoff.md` when working in this workspace.
 - A workspace Supabase project was created and `apps/api/supabase` is linked through ignored `.temp` files. Public handoff intentionally omits project identifiers; local setup details live in `.context/local-setup-handoff.md`.
 
