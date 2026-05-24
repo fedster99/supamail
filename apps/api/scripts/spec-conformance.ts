@@ -1385,6 +1385,241 @@ async function scenarioPendingVerificationRediscovery() {
   }
 }
 
+async function scenarioThreeLaneHistory() {
+  console.log("\nScenario L: three-lane engine runs hot, body, then history");
+  const oldDate = new Date("2023-01-01T00:00:00Z");
+  const recentDate = new Date();
+  const { pool, config, repository, account } = await setup("three-lane", {
+    BODY_BACKFILL_BATCH_SIZE: 1,
+    INITIAL_SYNC_BATCH_SIZE: 10,
+    MAX_BODY_BATCHES_PER_TICK: 1,
+    MAX_RR_FOLDERS_PER_CYCLE: 5
+  });
+  try {
+    await pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          archive_refresh_interval = 'monthly',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [account.id]
+    );
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 81_001,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "old-inbox",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "old inbox",
+            internalDate: oldDate
+          }),
+          makeTextMessage({
+            uid: 10,
+            subject: "fresh",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "fresh",
+            internalDate: recentDate
+          })
+        ]
+      },
+      {
+        path: "Archive",
+        delimiter: "/",
+        uidValidity: 81_002,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "old",
+            from: "b@x.test",
+            to: "u@x.test",
+            body: "old",
+            internalDate: oldDate
+          })
+        ]
+      }
+    ];
+    const events: string[] = [];
+    const engine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new FixtureImapClient(folders),
+      hooks: {
+        onMessageUpsert(message) {
+          events.push(`${message.window_status === "HISTORICAL" ? "history" : "hot"}:${message.folder_path}:${message.uid}`);
+        },
+        onBodyFetched(message) {
+          events.push(`body:${message.window_status}:${message.folder_path}:${message.uid}`);
+        }
+      }
+    });
+
+    const result = await engine.syncAccount(account.id, "manual");
+    assert(result.outcome === "success", "three-lane sync succeeds", result.errors.join("|"));
+    assert(result.hitLockBudget === false, "three-lane sync does not hit budget when body is quick", `result=${JSON.stringify(result)}`);
+    assert(
+      events.indexOf("hot:INBOX:10") >= 0
+        && events.indexOf("body:IN_WINDOW:INBOX:10") > events.indexOf("hot:INBOX:10")
+        && events.indexOf("history:INBOX:1") > events.indexOf("body:IN_WINDOW:INBOX:10")
+        && events.indexOf("body:HISTORICAL:INBOX:1") > events.indexOf("history:INBOX:1"),
+      "lane order is hot headers, live body, history headers, history body",
+      `events=${events.join(",")}`
+    );
+
+    const archive = (
+      await pool.query<{
+        historical_target_count: number | null;
+        headers_synced_count: number;
+        bodies_fetched_count: number;
+        backfill_in_progress: boolean;
+        last_archive_refresh_at: Date | null;
+      }>(
+        `
+        SELECT
+          historical_target_count,
+          headers_synced_count,
+          bodies_fetched_count,
+          backfill_in_progress,
+          last_archive_refresh_at
+        FROM public.imap_folders
+        WHERE account_id = $1
+          AND path = 'INBOX'
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(
+      archive.historical_target_count === 1
+        && archive.headers_synced_count === 2
+        && archive.bodies_fetched_count === 2
+        && archive.backfill_in_progress === false
+        && archive.last_archive_refresh_at !== null,
+      "history lane records target, progress, and refresh completion",
+      `archive=${JSON.stringify(archive)}`
+    );
+  } finally {
+    await teardown(pool, account.id);
+  }
+
+  const blocked = await setup("three-lane-budget", {
+    BODY_BACKFILL_BATCH_SIZE: 1,
+    INITIAL_SYNC_BATCH_SIZE: 10,
+    MAX_BODY_BATCHES_PER_TICK: 1,
+    MAX_LOCK_HOLD_MS: 50,
+    MAX_RR_FOLDERS_PER_CYCLE: 5
+  });
+  try {
+    await blocked.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          max_backfill_rate = 'aggressive'
+      WHERE id = $1
+      `,
+      [blocked.account.id]
+    );
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 82_001,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "old-inbox",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "old inbox",
+            internalDate: oldDate
+          }),
+          makeTextMessage({
+            uid: 10,
+            subject: "fresh",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "fresh",
+            internalDate: recentDate
+          })
+        ]
+      },
+      {
+        path: "Archive",
+        delimiter: "/",
+        uidValidity: 82_002,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "old",
+            from: "b@x.test",
+            to: "u@x.test",
+            body: "old",
+            internalDate: oldDate
+          })
+        ]
+      }
+    ];
+    class SlowBodyClient extends FixtureImapClient {
+      override async fetchOne(range: string) {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        return await super.fetchOne(range);
+      }
+    }
+    const engine = new MirrorEngine({
+      pool: blocked.pool,
+      config: blocked.config,
+      repository: blocked.repository,
+      clientFactory: async () => new SlowBodyClient(folders) as unknown as MirrorImapClient
+    });
+    const result = await engine.syncAccount(blocked.account.id, "manual");
+    assert(result.hitLockBudget === true, "body lane can exhaust the shared lock budget", `result=${JSON.stringify(result)}`);
+
+    const skipped = (
+      await blocked.pool.query<{
+        historical_target_count: number | null;
+        historical_message_count: string;
+      }>(
+        `
+        SELECT
+          f.historical_target_count,
+          (
+            SELECT count(*)::text
+            FROM public.imap_messages m
+            WHERE m.account_id = f.account_id
+              AND m.folder_path = f.path
+              AND m.window_status = 'HISTORICAL'
+              AND m.deleted_in_provider = false
+          ) AS historical_message_count
+        FROM public.imap_folders f
+        WHERE f.account_id = $1
+          AND f.path = 'INBOX'
+        `,
+        [blocked.account.id]
+      )
+    ).rows[0];
+    assert(
+      skipped.historical_target_count === null && Number(skipped.historical_message_count) === 0,
+      "history lane is skipped when body lane exhausts the lock budget",
+      `skipped=${JSON.stringify(skipped)}`
+    );
+  } finally {
+    await teardown(blocked.pool, blocked.account.id);
+  }
+}
+
 async function scenarioProgressRollup() {
   console.log("\nScenario M: progress counters roll up from folders into account progress");
   const { pool, config, repository, account } = await setup("progress", {
@@ -1420,6 +1655,10 @@ async function scenarioProgressRollup() {
       repository,
       clientFactory: async () => new FixtureImapClient(folders)
     });
+    await pool.query(
+      "UPDATE public.imap_accounts SET historical_backfill_mode = 'off' WHERE id = $1",
+      [account.id]
+    );
 
     const synced = await engine.syncAccount(account.id, "manual");
     assert(synced.outcome === "success", "progress fixture sync succeeds", synced.errors.join("|"));
@@ -1535,6 +1774,7 @@ async function main(): Promise<void> {
   await scenarioStuckDegradedEscalation();
   await scenarioFolderCountCap();
   await scenarioPendingVerificationRediscovery();
+  await scenarioThreeLaneHistory();
   await scenarioProgressRollup();
 
   const passed = results.filter((r) => r.passed).length;

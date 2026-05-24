@@ -43,6 +43,10 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - A failed initial sync batch must not advance watermarks.
 - `live_window_days` is immutable after account creation in v0.1; changing it requires a future window-status migration story.
 - `imap_account_progress` is a roll-up view over folder counters. It is a read model, not an independent source of truth.
+- Account sync runs as three ordered lanes under one advisory lock: hot metadata/reconcile, capped live body backlog, then history.
+- History lane work must never run before hot sync or the live body lane, and it must stop when the cooperative lock budget is exhausted.
+- Historical backfill uses the folder `backfill_*` state and `last_archive_refresh_at`; it snapshots older-than-window UIDs and walks them newest-first in resumable batches.
+- `historical_backfill_mode = 'off'` disables history work. `metadata_only` mirrors historical headers only. `metadata_and_bodies` fetches historical bodies too.
 - Incremental sync only advances `last_uid` after all fetched metadata for the batch succeeds.
 - Partial metadata fetches are hard failures. Do not swallow per-message errors and advance cursors.
 - Flag scans are due-based and compare normalized flags.

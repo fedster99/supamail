@@ -29,7 +29,7 @@ To agents / contributors:
 
 Issue-2 holds locks longer and fetches in larger batches than the current hot-only engine. The four spec-listed reliability gaps (`MAX_LOCK_HOLD_MS` enforcement, initial-sync stall timeout, stuck-degraded escalation, folder-count cap / reactive rediscovery) ship before the history lane is wired.
 
-The historical backfill feature in `docs/agent/feature-list.json` (`issue-2-historical-backfill`) becomes blocked-by this reliability work. PRs land in the order in §PR Sequence below.
+The historical backfill feature in `docs/agent/feature-list.json` (`issue-2-historical-backfill`) was blocked by this reliability work until PRs 1-7 landed. PR-8 completes the feature implementation on top of that foundation.
 
 ### D2: One advisory lock, three priority-ordered lanes per acquisition
 
@@ -43,7 +43,7 @@ take advisory lock
 release advisory lock
 ```
 
-The lanes are conceptual scheduling phases, not separate state machines. Each phase reads its own due-state from the schema and writes its own progress. Lane state is mostly already present in `imap_folders` (the `backfill_*` columns were added in `0001_imap_mirror.sql` but never wired).
+The lanes are conceptual scheduling phases, not separate state machines. Each phase reads its own due-state from the schema and writes its own progress. Lane state lives in `imap_folders`: the existing `backfill_*` columns plus `last_archive_refresh_at` added by PR-8.
 
 ### D3: "Ready" means live-window headers complete
 
@@ -61,7 +61,7 @@ Per-folder counters live as **columns on `imap_folders`** — `headers_synced_co
 - `bodies_fetched_count` increments in `repository.storeBody`.
 - `live_window_target_count` is set in `setInitialSyncSnapshot` (size of the snapshot UID set).
 - `historical_target_count` is set when the history lane records its initial snapshot for the folder (PR-8).
-- On a UIDVALIDITY reset, `handleUidValidityReset` zeros the live counts and clears the target — the folder rebuilds from scratch.
+- On a UIDVALIDITY reset, `handleUidValidityReset` zeros the live counts and clears live/history targets — the folder rebuilds from scratch.
 
 The per-account roll-up is a Postgres **VIEW** (not a materialized view) that runs cheap `SUM()` aggregates across the folder rows. No refresh management. Costs one extra index-friendly scan per `GET /accounts/:id` call, which is acceptable for the request volume this surface sees.
 
@@ -240,7 +240,8 @@ ALTER TABLE public.imap_folders
   ADD COLUMN headers_synced_count int NOT NULL DEFAULT 0,
   ADD COLUMN bodies_fetched_count int NOT NULL DEFAULT 0,
   ADD COLUMN live_window_target_count int,
-  ADD COLUMN historical_target_count int;
+  ADD COLUMN historical_target_count int,
+  ADD COLUMN last_archive_refresh_at timestamptz;
 ```
 
 Counter update sites (all incremental, no full table scans):
@@ -248,7 +249,8 @@ Counter update sites (all incremental, no full table scans):
 - `storeBody` → `bodies_fetched_count += 1`.
 - `setInitialSyncSnapshot` → `live_window_target_count = <snapshot size>`.
 - History lane snapshot (PR-8) → `historical_target_count = <snapshot size>`.
-- `handleUidValidityReset` → zero `headers_synced_count`, `bodies_fetched_count`, and clear `live_window_target_count`.
+- History lane completion/refresh (PR-8) → `last_archive_refresh_at = now()`.
+- `handleUidValidityReset` → zero `headers_synced_count`, `bodies_fetched_count`, and clear live/history progress targets.
 
 **New view `imap_account_progress`** — per-account roll-up:
 
@@ -268,7 +270,7 @@ Computed columns: `live_headers_complete_pct`, `priority_bodies_complete_pct`, `
 By module, what changes:
 
 - **`apps/api/src/config.ts`** — `FOLDER_COUNT_WARN_THRESHOLD` (50) and `FOLDER_COUNT_ENFORCE_THRESHOLD` (200) are now wired. `INITIAL_SYNC_BATCH_TIMEOUT_MS`, `MAX_BODY_BATCHES_PER_TICK`, `MAX_LOCK_HOLD_MS`, and the stuck-degraded thresholds are also wired (see D5, D7, and D8).
-- **`apps/api/src/sync-engine.ts`** — thread `deadline` into hot/body/history phases with the two-tier semantics from D5. Add `isMissingMailboxError(err)` helper alongside `isAuthError`, preferring `err.serverResponseCode` over message regex. Wrap `runInitialSyncBatch` in `withOperationDeadline` (D8). Add missing-mailbox detection in `syncFolder`'s catch (D10). Add the history lane as a new method called after `fetchBodyBacklog`, sliced by `max_backfill_rate`. Thread `hitLockBudget` flag through `SyncResult`. `fetchBodyBacklog` becomes deadline-aware and capped at `MAX_BODY_BATCHES_PER_TICK`.
+- **`apps/api/src/sync-engine.ts`** — thread `deadline` into hot/body/history phases with the two-tier semantics from D5. Add `isMissingMailboxError(err)` helper alongside `isAuthError`, preferring `err.serverResponseCode` over message regex. Wrap `runInitialSyncBatch` in `withOperationDeadline` (D8). Add missing-mailbox detection in `syncFolder`'s catch (D10). Add the history lane as a new method called after `fetchBodyBacklog`, sliced by `max_backfill_rate`. Thread `hitLockBudget` flag through `SyncResult`. `fetchBodyBacklog` becomes deadline-aware and capped at `MAX_BODY_BATCHES_PER_TICK`. **Landed through PR-8.**
 - **`apps/api/src/repository.ts`** — update `markAccountSyncSucceeded`/`Partial` to write `last_priority_sync_succeeded_at`; update `markAccountSyncFailed` to add the `STUCK_DEGRADED_24H` / `STUCK_DEGRADED_TERMINAL` branches, including the `backoff_until = now() + interval '1 hour'` write on retryable escalation. Update `getRunnableAccounts`'s WHERE clause to allow `BROKEN` accounts whose reason is `STUCK_DEGRADED_24H` (composing with the existing `backoff_until` filter). Update `upsertDiscoveredFolders` and `markAccountSyncSucceeded` for folder-count cap thresholds (D9). Update `getFoldersDueForSync` to skip `PENDING_VERIFICATION` and discovery to revive it (D10 partial). Add `markFolderPendingVerification` and manual folder opt-in for PR-5. Later PRs update `upsertMessages`, `storeBody`, `setInitialSyncSnapshot`, `handleUidValidityReset`, add history backlog methods, and add archive refresh.
 - **`apps/api/src/api.ts`** — extend `GET /accounts/:id` to return the progress columns. Add `POST /accounts/:id/folders/track`. Add `PATCH /accounts/:id/settings` for the new tunables (rejecting `live_window_days`).
 - **`apps/api/src/types.ts`** — extend `ImapAccount`, `ImapFolder`, `SyncResult` with the new fields.
@@ -284,9 +286,9 @@ By module, what changes:
   - ADR 0009: Last-priority-success column for stuck-degraded escalation (landed)
   - ADR 0010: Folder-count cap with priority-only tracking (landed)
   - ADR 0011: PENDING_VERIFICATION state for missing-mailbox recovery (schema/scheduler support landed in PR-4; reactive handler landed in PR-5)
-  - ADR 0012: Three-lane engine architecture (lands with PR-8)
+  - ADR 0012: Three-lane engine architecture (landed)
 - **`README.md`** — update the "What You Get" section to mention progress columns. Update the body-fetch policy section to mention historical backfill.
-- **`docs/agent/feature-list.json`** — `issue-2-historical-backfill` becomes `blocked_by` PRs 1-7.
+- **`docs/agent/feature-list.json`** — `issue-2-historical-backfill` is marked passing once PR-8 verification lands.
 
 ## Test Plan
 
@@ -324,7 +326,7 @@ Each PR carries its own migration (if any), code, scenario, and doc update. Each
 5. **PR-5: Reactive rediscovery.** Builds on PR-4. Missing-mailbox detection in `syncFolder`'s catch, set `next_folder_discovery_at = now()` and `status = PENDING_VERIFICATION`. New API endpoint `POST /accounts/:id/folders/track`. Scenario K. Completes ADR 0011. **Landed.**
 6. **PR-6: Per-account settings columns + defaults.** Migration: 5 new columns on `imap_accounts` with `CHECK` constraints. API `PATCH /accounts/:id/settings`. No engine behavior change yet — the columns exist, defaults apply, but the engine doesn't consume them. Sets up PR-8. **Landed.**
 7. **PR-7: Progress columns + per-account roll-up view.** Migration: new `imap_account_progress` view. Extend `GET /accounts/:id` to return progress fields. Scenario M. **Landed.**
-8. **PR-8: Three-lane engine — history lane wiring.** Depends on PR-1 (budget), PR-6 (settings), PR-7 (progress). Adds `getHistoryBacklog`, history lane in `MirrorEngine.syncAccount`, archive refresh pass. Engine consumes `historical_backfill_mode`, `archive_refresh_interval`, `max_backfill_rate`. Scenario L. Promotes D2 to ADR 0012. This IS the historical-backfill feature (closes `issue-2-historical-backfill`).
+8. **PR-8: Three-lane engine — history lane wiring.** Depends on PR-1 (budget), PR-6 (settings), PR-7 (progress). Adds `0006_history_lane_state`, `getHistoryBacklog`, the history lane in `MirrorEngine.syncAccount`, and archive refresh completion tracking. Engine consumes `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate`. Scenario L. Promotes D2 to ADR 0012. This IS the historical-backfill feature (closes `issue-2-historical-backfill`). **Landed.**
 
 PRs 1–5 are the boring reliability hardening — the original four spec fixes plus the loop bug. They can land in any order among themselves (no inter-PR dependencies except PR-5 needs PR-4's `PENDING_VERIFICATION` state).
 
@@ -353,5 +355,5 @@ Things this plan does NOT solve. Each becomes a candidate for a follow-on issue.
 - `apps/api/src/repository.ts` — persistence layer to extend
 - `apps/api/src/locks.ts` — advisory lock and orphan recovery
 - `apps/api/scripts/spec-conformance.ts` — live conformance gate to extend with G-M
-- `docs/agent/feature-list.json` — `issue-2-historical-backfill` becomes blocked by PRs 1-7
+- `docs/agent/feature-list.json` — `issue-2-historical-backfill` records feature status and verification evidence
 - `docs/architecture/decisions/` — ADRs 0008-0012 will be promoted from this plan as PRs land

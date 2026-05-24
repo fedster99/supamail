@@ -104,4 +104,15 @@ describe("sync engine safety", () => {
     expect(source).toContain("withAsyncIterableDeadline");
     expect(source).toContain("reconcile UID stream");
   });
+
+  it("runs history after the hot and body lanes under the same lock budget", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(source.indexOf("getFoldersDueForSync")).toBeLessThan(source.indexOf("fetchBodyBacklog"));
+    expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
+    expect(source).toContain("account.max_backfill_rate");
+    expect(source).toContain("getHistoryBacklog(account, 1)");
+    expect(source).toContain("setHistoryBackfillSnapshot");
+    expect(source).toContain("advanceHistoryBackfillWatermark");
+  });
 });

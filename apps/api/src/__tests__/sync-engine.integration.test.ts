@@ -3,6 +3,7 @@ import { closePool, getPool } from "../db.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { MirrorImapClient } from "../imap-client.js";
 import { resetConfigForTests } from "../config.js";
+import { MirrorEngine } from "../sync-engine.js";
 import {
   backdateMissingSince,
   buildInboxAndSentFolders,
@@ -1339,6 +1340,203 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(active.missing_since).toBeNull();
   });
 
+  it("Scenario L — three-lane sync runs hot, body, then history under the lock budget", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("L-three-lane", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          archive_refresh_interval = 'monthly',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 81_001,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "old-inbox",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "old inbox",
+            internalDate: oldDate
+          }),
+          makeTextMessage({
+            uid: 10,
+            subject: "fresh",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "fresh",
+            internalDate: recentDate
+          })
+        ]
+      },
+      {
+        path: "Archive",
+        delimiter: "/",
+        uidValidity: 81_002,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "old",
+            from: "b@x.test",
+            to: "u@x.test",
+            body: "old",
+            internalDate: oldDate
+          })
+        ]
+      }
+    ];
+
+    const events: string[] = [];
+    const engine = new MirrorEngine({
+      pool: h.pool,
+      config: h.config,
+      repository: h.repository,
+      clientFactory: async () => new FixtureImapClient(folders),
+      hooks: {
+        onMessageUpsert(message) {
+          events.push(`${message.window_status === "HISTORICAL" ? "history" : "hot"}:${message.folder_path}:${message.uid}`);
+        },
+        onBodyFetched(message) {
+          events.push(`body:${message.window_status}:${message.folder_path}:${message.uid}`);
+        }
+      }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+    expect(result.hitLockBudget).toBe(false);
+    expect(events.indexOf("hot:INBOX:10")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("body:IN_WINDOW:INBOX:10")).toBeGreaterThan(events.indexOf("hot:INBOX:10"));
+    expect(events.indexOf("history:INBOX:1")).toBeGreaterThan(events.indexOf("body:IN_WINDOW:INBOX:10"));
+    expect(events.indexOf("body:HISTORICAL:INBOX:1")).toBeGreaterThan(events.indexOf("history:INBOX:1"));
+
+    const archive = (
+      await h.pool.query<{
+        historical_target_count: number | null;
+        headers_synced_count: number;
+        bodies_fetched_count: number;
+        backfill_in_progress: boolean;
+        last_archive_refresh_at: Date | null;
+      }>(
+        `
+        SELECT
+          historical_target_count,
+          headers_synced_count,
+          bodies_fetched_count,
+          backfill_in_progress,
+          last_archive_refresh_at
+        FROM public.imap_folders
+        WHERE account_id = $1
+          AND path = 'INBOX'
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(archive).toMatchObject({
+      historical_target_count: 1,
+      headers_synced_count: 2,
+      bodies_fetched_count: 2,
+      backfill_in_progress: false
+    });
+    expect(archive.last_archive_refresh_at).not.toBeNull();
+
+    const progress = (
+      await h.pool.query<{
+        historical_headers_complete_pct: number;
+        historical_bodies_complete_pct: number;
+      }>(
+        `
+        SELECT historical_headers_complete_pct, historical_bodies_complete_pct
+        FROM public.imap_account_progress
+        WHERE account_id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(progress).toEqual({
+      historical_headers_complete_pct: 100,
+      historical_bodies_complete_pct: 100
+    });
+
+    const blocked = await setupIntegration("L-budget-skip", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_LOCK_HOLD_MS: 50,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(blocked.account.id);
+    await blocked.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          max_backfill_rate = 'aggressive'
+      WHERE id = $1
+      `,
+      [blocked.account.id]
+    );
+
+    class SlowBodyClient extends FixtureImapClient {
+      override async fetchOne(range: string) {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        return await super.fetchOne(range);
+      }
+    }
+
+    const blockedEngine = blocked.buildEngine({
+      folders,
+      clientFactory: async () => new SlowBodyClient(folders) as unknown as MirrorImapClient
+    });
+    const blockedResult = await blockedEngine.syncAccount(blocked.account.id, "manual");
+    expect(blockedResult.outcome).toBe("success");
+    expect(blockedResult.hitLockBudget).toBe(true);
+
+    const skippedHistory = (
+      await blocked.pool.query<{
+        historical_target_count: number | null;
+        historical_message_count: string;
+      }>(
+        `
+        SELECT
+          f.historical_target_count,
+          (
+            SELECT count(*)::text
+            FROM public.imap_messages m
+            WHERE m.account_id = f.account_id
+              AND m.folder_path = f.path
+              AND m.window_status = 'HISTORICAL'
+              AND m.deleted_in_provider = false
+          ) AS historical_message_count
+        FROM public.imap_folders f
+        WHERE f.account_id = $1
+          AND f.path = 'INBOX'
+        `,
+        [blocked.account.id]
+      )
+    ).rows[0];
+    expect(skippedHistory.historical_target_count).toBeNull();
+    expect(Number(skippedHistory.historical_message_count)).toBe(0);
+  });
+
   it("Scenario M — progress counters roll up from folders into account progress", async () => {
     const h = await setupIntegration("M-progress", {
       INITIAL_SYNC_BATCH_SIZE: 50,
@@ -1370,6 +1568,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ];
 
     const engine = h.buildEngine({ folders });
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET historical_backfill_mode = 'off' WHERE id = $1",
+      [h.account.id]
+    );
     expect((await engine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
 
     const messages = (

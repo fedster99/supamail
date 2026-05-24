@@ -55,6 +55,7 @@ SupaMail owns a conservative mailbox mirror:
 | Account count should be capped for this architecture. | Implemented | `SYNC_MAX_ACCOUNTS` enforced at account creation and worker startup. |
 | Body fetches should be lazy and lock-guarded. | Implemented | Body backlog/fetch uses the same account lock and stores full MIME/parser output separately from metadata. |
 | Body completeness should be observable because downstream search reliability depends on it. | Implemented | Folder progress counters and `imap_account_progress` expose live-header, priority-body, live-body, and historical completion percentages; spec-conformance Scenario M proves the roll-up. |
+| Historical backfill should not starve fresh mail. | Implemented | The engine runs hot, body, then history lanes under one advisory lock; history is resumable through folder `backfill_*` state and skipped when the body lane exhausts the lock budget. Spec-conformance Scenario L proves ordering and budget behavior. |
 | Attachment metadata belongs in the mirror, not necessarily attachment binaries. | Implemented | MIME `BODYSTRUCTURE` is parsed into attachment metadata during sync; binary attachment retrieval is outside the current core path. |
 | Worker shutdown should release held resources. | Implemented | SIGTERM/SIGINT abort the loop, wake sleep, and close the Postgres pool so advisory locks release with the session. |
 | Sync should emit durable observability events. | Implemented at mirror-event level | Sync runs, message/folder events, flag changes, reconcile backfills, and retention outcomes are stored or logged. Stable metrics/alert names remain an open operational layer. |
@@ -71,6 +72,8 @@ The mirror stores both raw and normalized Message-ID values, but they are correl
 Folder discovery is due-based and persists provider seen/missing state. Sync cycles process priority folders first, then a bounded number of non-priority folders using a stable round-robin cursor. The cursor advances by attempted folders so one bad lower-priority folder cannot starve the rest.
 
 Flag scans and reconciles are also due-based and budgeted. Agents should not change this into "scan every folder every cycle" behavior; that is exactly the folder-explosion failure mode the old spec was trying to prevent.
+
+Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. It does not affect `sync_state` health; progress consumers should read `imap_account_progress` and per-folder progress rows.
 
 ### IMAP Connection And Lock Discipline
 

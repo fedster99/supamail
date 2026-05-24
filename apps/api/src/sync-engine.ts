@@ -2,7 +2,7 @@ import type { AppConfig } from "./config.js";
 import { getConfig, getWindowCutoff } from "./config.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
-import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, searchUidsSince } from "./imap-client.js";
+import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, searchUidsBefore, searchUidsSince } from "./imap-client.js";
 import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -10,6 +10,7 @@ import type {
   ImapAccount,
   ImapFolder,
   ImapMessage,
+  HistoryBacklogFolder,
   MirrorHooks,
   SyncResult,
   SyncTriggerType
@@ -67,6 +68,13 @@ type FolderSyncResult = {
   reconcileGapsFound: number;
   reconcileAttempted: boolean;
   flagScanAttempted: boolean;
+  hitLockBudget: boolean;
+};
+
+type HistoryBatchResult = {
+  messagesUpserted: number;
+  bodiesFetched: number;
+  processed: boolean;
   hitLockBudget: boolean;
 };
 
@@ -234,6 +242,16 @@ export class MirrorEngine {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
+        }
+
+        if (this.isLockBudgetExpired(lockDeadline)) {
+          result.hitLockBudget = true;
+        } else {
+          const historyResult = await this.runHistoryLane(account, client, lockDeadline);
+          result.messagesUpserted += historyResult.messagesUpserted;
+          result.bodiesFetched += historyResult.bodiesFetched;
+          result.errors.push(...historyResult.errors);
+          if (historyResult.hitLockBudget) result.hitLockBudget = true;
         }
 
         if (result.errors.length > 0) {
@@ -963,6 +981,259 @@ export class MirrorEngine {
     }
 
     return { messagesUpserted: messages.length };
+  }
+
+  private historyBatchLimit(account: ImapAccount): number {
+    switch (account.max_backfill_rate) {
+      case "small":
+        return 1;
+      case "normal":
+        return 3;
+      case "aggressive":
+        return Number.POSITIVE_INFINITY;
+      default:
+        return 3;
+    }
+  }
+
+  private async runHistoryLane(
+    account: ImapAccount,
+    client: MirrorImapClient,
+    lockDeadline: number
+  ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
+    if (account.historical_backfill_mode === "off") {
+      return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
+    }
+
+    let messagesUpserted = 0;
+    let bodiesFetched = 0;
+    let hitLockBudget = false;
+    const errors: string[] = [];
+    let batchesProcessed = 0;
+    const maxBatches = this.historyBatchLimit(account);
+
+    while (batchesProcessed < maxBatches) {
+      if (this.isLockBudgetExpired(lockDeadline)) {
+        hitLockBudget = true;
+        break;
+      }
+
+      const [folder] = await this.repository.getHistoryBacklog(account, 1);
+      if (!folder) break;
+
+      let batch: HistoryBatchResult;
+      try {
+        batch = await this.runHistoryBatch(account, folder, client, lockDeadline);
+      } catch (error) {
+        if (error instanceof AccountAlreadyFinalizedError) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        if (isMissingMailboxError(error)) {
+          await this.repository.markFolderPendingVerification(
+            account.id,
+            folder.id,
+            folder.path,
+            message
+          );
+        }
+        errors.push(sanitizeErrorReason(`${folder.path}: ${message}`));
+        break;
+      }
+      messagesUpserted += batch.messagesUpserted;
+      bodiesFetched += batch.bodiesFetched;
+      if (batch.hitLockBudget) {
+        hitLockBudget = true;
+        break;
+      }
+
+      batchesProcessed += 1;
+      await this.repository.heartbeat(account.id);
+
+      if (!batch.processed) {
+        continue;
+      }
+    }
+
+    return { messagesUpserted, bodiesFetched, hitLockBudget, errors };
+  }
+
+  private async runHistoryBatch(
+    account: ImapAccount,
+    folder: HistoryBacklogFolder,
+    client: MirrorImapClient,
+    lockDeadline: number
+  ): Promise<HistoryBatchResult> {
+    if (this.isLockBudgetExpired(lockDeadline)) {
+      return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
+    }
+
+    if (folder.history_backlog_reason === "body") {
+      return await this.fetchHistoricalBodyBatch(account, folder, client, lockDeadline);
+    }
+
+    const mailboxLock = await client.getMailboxLock(folder.path);
+
+    try {
+      const mailbox = client.mailbox;
+      if (!mailbox) throw new Error("Mailbox not available after lock");
+
+      const uidValidity = Number(mailbox.uidValidity);
+      const storedUidValidity = folder.uidvalidity ? Number(folder.uidvalidity) : null;
+      if (storedUidValidity && storedUidValidity !== uidValidity) {
+        const { resetCountIn24h } = await this.repository.handleUidValidityReset(
+          account,
+          folder,
+          uidValidity
+        );
+        if (resetCountIn24h > this.config.MAX_UIDVALIDITY_RESETS_24H) {
+          await this.repository.markAccountBroken(
+            account.id,
+            `UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${resetCountIn24h} resets in 24h on ${folder.path}`
+          );
+          throw new AccountAlreadyFinalizedError(
+            `UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${folder.path}`
+          );
+        }
+        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+      }
+
+      const windowCutoff = getWindowCutoff(this.config);
+      let targetMaxUid: number | null = folder.backfill_target_max_uid
+        ? Number(folder.backfill_target_max_uid)
+        : null;
+      let oldestSynced: number | null = folder.backfill_oldest_uid_synced
+        ? Number(folder.backfill_oldest_uid_synced)
+        : null;
+      const shouldStartSnapshot = folder.history_backlog_reason === "snapshot"
+        || folder.history_backlog_reason === "refresh"
+        || targetMaxUid === null
+        || oldestSynced === null;
+
+      if (shouldStartSnapshot) {
+        const snapshot = await searchUidsBefore(client, windowCutoff);
+        const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
+
+        if (sortedTargets.length === 0) {
+          await this.repository.setHistoryBackfillSnapshot(folder.id, 0, 0, 0, windowCutoff);
+          return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+        }
+
+        targetMaxUid = sortedTargets[sortedTargets.length - 1];
+        oldestSynced = targetMaxUid + 1;
+        await this.repository.setHistoryBackfillSnapshot(
+          folder.id,
+          targetMaxUid,
+          oldestSynced,
+          sortedTargets.length,
+          windowCutoff
+        );
+      }
+
+      if (this.isLockBudgetExpired(lockDeadline)) {
+        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
+      }
+
+      const candidates = await searchUidsBefore(client, windowCutoff);
+      const inSnapshot = [...new Set(candidates)]
+        .filter((uid) => uid <= targetMaxUid!)
+        .sort((a, b) => a - b);
+
+      if (inSnapshot.length === 0) {
+        await this.repository.markHistoryBackfillComplete(folder.id);
+        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+      }
+
+      const batchSize = this.config.BODY_BACKFILL_BATCH_SIZE;
+      const descending: number[] = [];
+      for (let i = inSnapshot.length - 1; i >= 0; i--) {
+        if (inSnapshot[i] < oldestSynced!) {
+          descending.push(inSnapshot[i]);
+          if (descending.length >= batchSize) break;
+        }
+      }
+
+      if (descending.length === 0) {
+        await this.repository.markHistoryBackfillComplete(folder.id);
+        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+      }
+
+      const batch = descending.slice().reverse();
+      const metadata = await fetchMessageMetadata(client, batch, batchSize);
+      const messages = await this.repository.upsertMessages(
+        account.id,
+        folder,
+        uidValidity,
+        metadata,
+        windowCutoff,
+        { preserveExistingFlags: !account.archive_flag_sync }
+      );
+      for (const message of messages) {
+        await this.hooks.onMessageUpsert?.(message);
+      }
+
+      let bodiesFetched = 0;
+      if (account.historical_backfill_mode === "metadata_and_bodies") {
+        for (const message of messages.filter((row) => !row.body_fetched_at)) {
+          if (this.isLockBudgetExpired(lockDeadline)) {
+            break;
+          }
+          await this.fetchAndStoreBody(client, message);
+          bodiesFetched += 1;
+        }
+      }
+
+      await this.repository.advanceHistoryBackfillWatermark(
+        folder.id,
+        batch[0],
+        batch[batch.length - 1]
+      );
+
+      const stillRemaining = inSnapshot.some((uid) => uid < batch[0]);
+      if (!stillRemaining) {
+        await this.repository.markHistoryBackfillComplete(folder.id);
+      }
+
+      return {
+        messagesUpserted: messages.length,
+        bodiesFetched,
+        processed: true,
+        hitLockBudget: this.isLockBudgetExpired(lockDeadline)
+      };
+    } finally {
+      mailboxLock.release();
+    }
+  }
+
+  private async fetchHistoricalBodyBatch(
+    account: ImapAccount,
+    folder: ImapFolder,
+    client: MirrorImapClient,
+    lockDeadline: number
+  ): Promise<HistoryBatchResult> {
+    const backlog = await this.repository.getHistoricalBodyBacklog(
+      account.id,
+      folder,
+      this.config.BODY_BACKFILL_BATCH_SIZE
+    );
+    if (backlog.length === 0) {
+      await this.repository.markHistoryBackfillComplete(folder.id);
+      return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+    }
+
+    let fetched = 0;
+    for (const message of backlog) {
+      if (this.isLockBudgetExpired(lockDeadline)) {
+        return { messagesUpserted: 0, bodiesFetched: fetched, processed: fetched > 0, hitLockBudget: true };
+      }
+      await this.fetchAndStoreBody(client, message);
+      fetched += 1;
+    }
+
+    return {
+      messagesUpserted: 0,
+      bodiesFetched: fetched,
+      processed: fetched > 0,
+      hitLockBudget: this.isLockBudgetExpired(lockDeadline)
+    };
   }
 
   private async fetchBodyBacklog(

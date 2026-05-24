@@ -10,6 +10,7 @@ import type {
   BodyFetchPolicy,
   CreateAccountInput,
   FolderProgress,
+  HistoryBacklogFolder,
   ImapAccount,
   ImapFolder,
   ImapMessage,
@@ -1147,6 +1148,12 @@ export class MirrorRepository {
             headers_synced_count = 0,
             bodies_fetched_count = 0,
             live_window_target_count = NULL,
+            historical_target_count = NULL,
+            backfill_in_progress = false,
+            backfill_target_max_uid = NULL,
+            backfill_oldest_uid_synced = NULL,
+            backfill_since_date = NULL,
+            last_archive_refresh_at = NULL,
             status = 'NEEDS_FULL_RESYNC',
             uidvalidity_reset_count = CASE
               WHEN last_uidvalidity_reset_at IS NULL
@@ -1208,7 +1215,8 @@ export class MirrorRepository {
     folder: ImapFolder,
     uidValidity: number,
     messages: MessageMetadata[],
-    windowCutoff: Date
+    windowCutoff: Date,
+    options: { preserveExistingFlags?: boolean } = {}
   ): Promise<ImapMessage[]> {
     if (messages.length === 0) return [];
 
@@ -1269,7 +1277,7 @@ export class MirrorRepository {
         )
         ON CONFLICT (account_id, folder_path, uidvalidity, uid)
         DO UPDATE SET
-          flags = EXCLUDED.flags,
+          flags = CASE WHEN $25::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
           headers_json = EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
           deleted_in_provider = false,
@@ -1301,7 +1309,8 @@ export class MirrorRepository {
           message.flags,
           JSON.stringify(message.headersJson),
           JSON.stringify(message.mimeStructure ?? null),
-          message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW"
+          message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW",
+          options.preserveExistingFlags === true
         ]
       );
 
@@ -1670,6 +1679,151 @@ export class MirrorRepository {
     } finally {
       client.release();
     }
+  }
+
+  async getHistoryBacklog(account: ImapAccount, limit: number): Promise<HistoryBacklogFolder[]> {
+    if (account.historical_backfill_mode === "off") return [];
+
+    const result = await this.pool.query<HistoryBacklogFolder>(
+      `
+      WITH candidates AS (
+        SELECT
+          f.*,
+          CASE
+            WHEN f.backfill_in_progress = true THEN 'metadata'
+            WHEN f.historical_target_count IS NULL THEN 'snapshot'
+            WHEN $2::text = 'metadata_and_bodies'
+              AND EXISTS (
+                SELECT 1
+                FROM public.imap_messages m
+                WHERE m.account_id = f.account_id
+                  AND m.folder_path = f.path
+                  AND m.deleted_in_provider = false
+                  AND m.window_status = 'HISTORICAL'
+                  AND m.body_fetched_at IS NULL
+              )
+            THEN 'body'
+            WHEN $3::text = 'weekly'
+              AND (
+                f.last_archive_refresh_at IS NULL
+                OR f.last_archive_refresh_at <= now() - interval '7 days'
+              )
+            THEN 'refresh'
+            WHEN $3::text = 'monthly'
+              AND (
+                f.last_archive_refresh_at IS NULL
+                OR f.last_archive_refresh_at <= now() - interval '30 days'
+              )
+            THEN 'refresh'
+            ELSE NULL
+          END AS history_backlog_reason
+        FROM public.imap_folders f
+        WHERE f.account_id = $1
+          AND f.tracked = true
+          AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+          AND f.initial_sync_complete = true
+      )
+      SELECT *
+      FROM candidates
+      WHERE history_backlog_reason IS NOT NULL
+      ORDER BY
+        CASE history_backlog_reason
+          WHEN 'metadata' THEN 0
+          WHEN 'snapshot' THEN 1
+          WHEN 'body' THEN 2
+          WHEN 'refresh' THEN 3
+          ELSE 4
+        END,
+        sync_priority,
+        path
+      LIMIT $4
+      `,
+      [
+        account.id,
+        account.historical_backfill_mode,
+        account.archive_refresh_interval,
+        limit
+      ]
+    );
+    return result.rows;
+  }
+
+  async getHistoricalBodyBacklog(
+    accountId: string,
+    folder: ImapFolder,
+    limit: number
+  ): Promise<ImapMessage[]> {
+    const result = await this.pool.query<ImapMessage>(
+      `
+      SELECT *
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = $2
+        AND deleted_in_provider = false
+        AND window_status = 'HISTORICAL'
+        AND body_fetched_at IS NULL
+      ORDER BY uid DESC
+      LIMIT $3
+      `,
+      [accountId, folder.path, limit]
+    );
+    return result.rows;
+  }
+
+  async setHistoryBackfillSnapshot(
+    folderId: string,
+    targetMaxUid: number,
+    oldestUidSynced: number,
+    targetCount: number,
+    cutoff: Date
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET backfill_in_progress = ($4::int > 0),
+          backfill_target_max_uid = $2,
+          backfill_oldest_uid_synced = $3,
+          backfill_since_date = $5,
+          historical_target_count = $4,
+          last_archive_refresh_at = CASE WHEN $4::int = 0 THEN now() ELSE last_archive_refresh_at END,
+          last_progress_at = now(),
+          last_progress_note = 'history_backfill_snapshot'
+      WHERE id = $1
+      `,
+      [folderId, targetMaxUid, oldestUidSynced, targetCount, cutoff]
+    );
+  }
+
+  async advanceHistoryBackfillWatermark(
+    folderId: string,
+    newOldestUidSynced: number,
+    lastProgressUid: number
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET backfill_oldest_uid_synced = $2,
+          last_progress_at = now(),
+          last_progress_uid = $3,
+          last_progress_note = 'history_backfill_metadata'
+      WHERE id = $1
+      `,
+      [folderId, newOldestUidSynced, lastProgressUid]
+    );
+  }
+
+  async markHistoryBackfillComplete(folderId: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET backfill_in_progress = false,
+          last_archive_refresh_at = now(),
+          last_progress_at = now(),
+          last_progress_note = 'history_backfill_complete'
+      WHERE id = $1
+      `,
+      [folderId]
+    );
   }
 
   async getBodyBacklog(account: ImapAccount, limit: number): Promise<ImapMessage[]> {

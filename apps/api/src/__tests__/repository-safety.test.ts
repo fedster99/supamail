@@ -126,7 +126,26 @@ describe("repository safety", () => {
     expect(repository).toContain("if (!message.body_fetched_at)");
     expect(repository).toContain("headers_synced_count = 0");
     expect(repository).toContain("bodies_fetched_count = 0");
+    expect(repository).toContain("historical_target_count = NULL");
     expect(engine).toContain("setInitialSyncSnapshot(folder.id, targetMaxUid, oldestSynced, sortedTargets.length)");
+  });
+
+  it("persists resumable history-lane state and backlog reasons", async () => {
+    const repository = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const engine = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(repository).toContain("getHistoryBacklog");
+    expect(repository).toContain("history_backlog_reason");
+    expect(repository).toContain("setHistoryBackfillSnapshot");
+    expect(repository).toContain("advanceHistoryBackfillWatermark");
+    expect(repository).toContain("markHistoryBackfillComplete");
+    expect(repository).toContain("getHistoricalBodyBacklog");
+    expect(repository).toContain("last_archive_refresh_at");
+    expect(repository).toContain("preserveExistingFlags");
+    expect(engine).toContain("runHistoryLane");
+    expect(engine).toContain("historyBatchLimit");
+    expect(engine).toContain("searchUidsBefore");
+    expect(engine).toContain("historical_backfill_mode === \"off\"");
   });
 
   it("exposes account details through the progress view", async () => {

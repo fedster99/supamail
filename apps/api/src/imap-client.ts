@@ -321,6 +321,21 @@ export async function searchUidsSince(
   return uids;
 }
 
+export async function searchUidsBefore(
+  client: MirrorImapClient,
+  before: Date,
+  uidRange?: string
+): Promise<number[]> {
+  const query: Record<string, unknown> = { before };
+  if (uidRange) query.uid = uidRange;
+
+  const uids: number[] = [];
+  for await (const msg of client.fetch(query, { uid: true }, { uid: true })) {
+    uids.push(msg.uid);
+  }
+  return uids;
+}
+
 export async function searchAllUids(client: MirrorImapClient, since?: Date): Promise<number[]> {
   const uids: number[] = [];
   for await (const uid of iterateAllUids(client, since)) {

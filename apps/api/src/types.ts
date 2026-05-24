@@ -153,9 +153,16 @@ export interface ImapFolder {
   backfill_target_max_uid: string | null;
   backfill_oldest_uid_synced: string | null;
   backfill_since_date: Date | null;
+  last_archive_refresh_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
+
+export type HistoryBacklogReason = "snapshot" | "metadata" | "body" | "refresh";
+
+export type HistoryBacklogFolder = ImapFolder & {
+  history_backlog_reason: HistoryBacklogReason;
+};
 
 export interface ImapMessage {
   id: string;

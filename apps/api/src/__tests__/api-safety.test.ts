@@ -117,6 +117,7 @@ function makeFolder(overrides: Partial<ImapFolder> = {}): ImapFolder {
     backfill_target_max_uid: null,
     backfill_oldest_uid_synced: null,
     backfill_since_date: null,
+    last_archive_refresh_at: null,
     created_at: now,
     updated_at: now,
     ...overrides

@@ -16,6 +16,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0009-stuck-degraded-escalation.md`: Long-stuck degraded accounts escalate to retryable, then terminal, broken states.
 - `0010-folder-count-cap-priority-tracking.md`: Large folder counts warn first, then enforce priority-only tracking with automatic recovery.
 - `0011-pending-verification-folder-state.md`: Missing-mailbox verification uses a scheduler-excluded folder state.
+- `0012-three-lane-history-engine.md`: Historical backfill runs after hot sync and live body fetch under the same account lock.
 
 ## Status Values
 

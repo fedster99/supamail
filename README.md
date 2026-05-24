@@ -202,6 +202,13 @@ join imap_account_progress p on p.account_id = a.id;
 - `lazy`: fetch bodies only when `refetch-body` or the API endpoint is called.
 - `priority_then_backfill`: fetch bodies for priority folders such as INBOX and Sent during normal sync. This is the default.
 
+Historical backfill is controlled per account through `PATCH /accounts/:id/settings`:
+
+- `historicalBackfillMode: "off"` keeps only the live window mirrored.
+- `historicalBackfillMode: "metadata_only"` mirrors older headers/envelopes without old bodies.
+- `historicalBackfillMode: "metadata_and_bodies"` mirrors older headers and fetches older bodies in the history lane.
+- `maxBackfillRate` controls history batches per sync tick: `small`, `normal`, or `aggressive`.
+
 IMAP headers arrive much faster than full MIME bodies. SupaMail exposes progress percentages so downstream search, agent, or UI consumers can decide how much body completeness they need before trusting deep search results.
 
 SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.

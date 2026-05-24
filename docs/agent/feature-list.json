@@ -20,7 +20,7 @@
       "area": "sync-engine",
       "title": "Add automatic historical backfill",
       "user_visible_behavior": "A new account can eventually mirror older messages beyond WINDOW_DAYS without manual intervention while fresh mail stays current.",
-      "status": "not_started",
+      "status": "passing",
       "dependencies": [
         "reliability-hardening-pr-1-lock-budget",
         "reliability-hardening-pr-2-initial-sync-stall-timeout",
@@ -36,8 +36,8 @@
         "pnpm build",
         "pnpm test:db:live"
       ],
-      "evidence": "",
-      "notes": "Backfill must be resumable, bounded, body-policy-aware, and safe around UIDVALIDITY resets and folder disappearance. Reliability hardening PRs 1-7 are complete on the working PR branch; PR-8 is the remaining feature implementation slice in docs/architecture/reliability-and-three-lanes.md."
+      "evidence": "PR-8 implemented three-lane history wiring on the working PR branch. Verified with pnpm --filter @supamail/api typecheck, targeted schema/repository/sync-engine/target-scheduler tests, Scenario L/M integration coverage, pnpm --filter @supamail/api spec-conformance (118 passed), and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh.",
+      "notes": "Historical backfill is resumable, bounded by the shared account lock budget, controlled by account settings, and observable through progress rollups. Reliability hardening PRs 1-8 are complete on the working PR branch."
     },
     {
       "id": "issue-3-provider-compatibility",

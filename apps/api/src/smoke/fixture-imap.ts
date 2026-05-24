@@ -106,6 +106,11 @@ export class FixtureImapClient implements MirrorImapClient {
         messages = messages.filter((message) => message.internalDate >= since);
       }
 
+      const before = range.before;
+      if (before instanceof Date) {
+        messages = messages.filter((message) => message.internalDate < before);
+      }
+
       if (range.uid && typeof range.uid === "string") {
         const [startRaw, endRaw] = range.uid.split(":");
         const start = Number(startRaw);
