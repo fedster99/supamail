@@ -6,21 +6,22 @@ Supabase hosts Postgres. Fly.io runs the sync worker as a small Docker Machine w
 
 ## 1. Create Supabase Database
 
-Use an existing Supabase project or create a new one. Copy the direct Postgres connection string. Do not use the transaction pooler URL.
+Use an existing Supabase project or create a new one. Copy the direct Postgres connection string when your runtime supports IPv6.
+
+Supabase direct Postgres uses IPv6. If the runtime cannot reach IPv6, use the Supavisor session pooler on port `5432`. Do not use the transaction pooler on port `6543`.
 
 Advisory locks are session-scoped. If Supabase pooler or PgBouncer is placed in transaction mode between the worker and Postgres, locks can silently lose their safety properties.
 
 ## 2. Deploy Worker
 
 ```bash
-cd apps/api
-cp fly.worker.toml.example fly.toml
+cp apps/api/fly.worker.toml.example apps/api/fly.worker.toml
 
-fly launch --no-deploy --no-public-ips --ha=false
-fly secrets set \
+fly launch --config apps/api/fly.worker.toml --no-deploy --no-db --no-public-ips --ha=false
+fly secrets set --config apps/api/fly.worker.toml \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY"
-fly deploy --ha=false
+fly deploy --config apps/api/fly.worker.toml --ha=false
 ```
 
 The worker profile is intentionally small:
@@ -45,7 +46,7 @@ pnpm migrate
 Or run the SQL directly:
 
 ```bash
-psql "$DATABASE_URL" -f apps/api/supabase/migrations/0001_imap_mirror.sql
+psql "$DATABASE_URL" -f apps/api/supabase/migrations/public/0001_imap_mirror.sql
 ```
 
 ## 4. Create Accounts
@@ -71,15 +72,14 @@ The worker will pick up runnable accounts on its next tick.
 Only deploy the API if you need remote account creation, manual sync triggers, or body refetch endpoints.
 
 ```bash
-cd apps/api
-cp fly.api.toml.example fly.api.toml
+cp apps/api/fly.api.toml.example apps/api/fly.api.toml
 
-fly launch --config fly.api.toml --no-deploy --ha=false
-fly secrets set --config fly.api.toml \
+fly launch --config apps/api/fly.api.toml --no-deploy --no-db --ha=false
+fly secrets set --config apps/api/fly.api.toml \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY" \
   API_TOKEN="$API_TOKEN"
-fly deploy --config fly.api.toml --ha=false
+fly deploy --config apps/api/fly.api.toml --ha=false
 ```
 
 The API refuses to start without `API_TOKEN`; only `/health` is public.

@@ -17,13 +17,14 @@ Use session-scoped Postgres advisory locks as the account mutex, require direct/
 ## Consequences
 
 - Supabase transaction pooler URLs are not supported.
+- Supabase session pooler URLs on port `5432` are acceptable when direct IPv6 connectivity is unavailable.
 - Lock-sensitive code must not switch to `pg_advisory_xact_lock`.
 - Worker startup fails fast if lock semantics are unsafe.
 - Live DB tests are required for lock behavior changes.
 
 ## Verification
 
-- `apps/api/src/db.ts` rejects pooler-looking URLs.
+- `apps/api/src/db.ts` rejects transaction-pooler URLs and allows direct/session-pooler URLs.
 - `apps/api/src/locks.ts` implements `withAccountLock` and `runLockSelfTest`.
 - `apps/api/src/worker.ts` runs the lock self-test on startup.
 - `pnpm test:db:live` exercises advisory lock behavior against real Postgres.

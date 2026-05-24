@@ -14,7 +14,7 @@ The harness follows the five-subsystem model from the `harness-creator` skill:
 
 ## Monorepo Shape
 
-- `apps/api`: TypeScript/Node 22 IMAP mirror, worker, API, CLI, tests, Supabase migration, and deployment files.
+- `apps/api`: TypeScript/Node 24 IMAP mirror, worker, API, CLI, tests, Supabase migration, and deployment files.
 - `apps/web`: Next.js landing site.
 - Root package scripts call Turborepo or delegate into `@supamail/api`. Prefer root `pnpm typecheck`, `pnpm test`, and `pnpm build` for final verification.
 - Use package filters for narrow work, for example `pnpm --filter @supamail/api test` or `pnpm --filter @supamail/web build`.

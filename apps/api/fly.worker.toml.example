@@ -1,8 +1,9 @@
-# Copy to fly.toml and replace app/region before deploying:
-#   cp fly.worker.toml.example fly.toml
-#   fly launch --no-deploy --no-public-ips --ha=false
-#   fly secrets set DATABASE_URL=... IMAP_ENCRYPTION_KEY=...
-#   fly deploy --ha=false
+# Deploy from the repository root so Docker can use the monorepo as build context.
+# Runtime Node version is pinned by apps/api/Dockerfile (node:24-slim).
+#   cp apps/api/fly.worker.toml.example apps/api/fly.worker.toml
+#   fly launch --config apps/api/fly.worker.toml --no-deploy --no-db --no-public-ips --ha=false
+#   fly secrets set --config apps/api/fly.worker.toml DATABASE_URL=... IMAP_ENCRYPTION_KEY=...
+#   fly deploy --config apps/api/fly.worker.toml --ha=false
 
 app = "supamail-worker"
 primary_region = "ord"
@@ -10,9 +11,10 @@ kill_signal = "SIGINT"
 kill_timeout = "30s"
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = "apps/api/Dockerfile"
 
 [env]
+  SUPAMAIL_MODE = "worker"
   NODE_OPTIONS = "--max-old-space-size=160"
   BODY_FETCH_POLICY = "priority_then_backfill"
   SYNC_INTERVAL_MS = "60000"
@@ -24,7 +26,7 @@ kill_timeout = "30s"
   IMAP_MAX_COMMANDS_PER_MINUTE = "120"
 
 [processes]
-  worker = "node dist/worker.js"
+  worker = "node dist/runtime.js"
 
 [[vm]]
   processes = ["worker"]

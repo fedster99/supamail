@@ -11,7 +11,7 @@
   },
   "files": [
     "dist",
-    "supabase/migrations",
+    "supabase/migrations/public",
     "README.md",
     "LICENSE"
   ],
@@ -26,6 +26,8 @@
     "smoke:greenmail": "tsx scripts/greenmail-smoke.ts",
     "start:worker": "node dist/worker.js",
     "start:api": "node dist/api.js",
+    "start:combined": "SUPAMAIL_MODE=combined node dist/runtime.js",
+    "start:runtime": "node dist/runtime.js",
     "migrate": "tsx src/cli.ts migrate",
     "test": "vitest run",
     "test:db:live": "tsx scripts/test-db-live.ts",
@@ -43,13 +45,13 @@
   },
   "devDependencies": {
     "@types/mailparser": "^3.4.6",
-    "@types/node": "^22.10.0",
+    "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
     "tsx": "^4.21.0",
     "typescript": "^5.7.2",
     "vitest": "^1.6.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": "24.x"
   }
 }

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "0001_imap_mirror",
+  "migrations": [
+    {
+      "id": "0001_imap_mirror",
+      "file": "0001_imap_mirror.sql"
+    }
+  ]
+}

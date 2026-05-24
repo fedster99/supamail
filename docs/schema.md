@@ -17,3 +17,9 @@ RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked
 `imap_message_bodies.raw_mime` stores RFC822/MIME bytes. Parsed fields store plain text, HTML, normalized text, parsed headers, selected text part, parser warnings, and MIME structure snapshots.
 
 Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY resets, or provider deletion indicate they are no longer visible.
+
+## Migration Boundaries
+
+Public mirror migrations live under `apps/api/supabase/migrations/public/` and are the only migrations that `pnpm migrate`, the CLI, and the API `/migrate` endpoint apply. The manifest in that directory records the ordered public migration ids and required public schema version for hosted deploy gates.
+
+Hosted control-plane migrations for users, tenants, billing, Stripe events, Supabase OAuth tokens, provisioning jobs, or entitlements must live outside this public core repository, in the private hosted-product repo. Customer BYO Supabase databases must receive only the public mirror migrations.

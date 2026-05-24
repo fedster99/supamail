@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { getConfig } from "./config.js";
-import { applyInitialMigration, closePool, getPool } from "./db.js";
+import { applyPublicMigrations, closePool, getPool } from "./db.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 
@@ -18,10 +18,10 @@ program
 
 program
   .command("migrate")
-  .description("Apply the initial Supabase/Postgres migration")
+  .description("Apply public SupaMail mirror migrations")
   .action(async () => {
-    await applyInitialMigration(pool);
-    console.log("Migration applied");
+    await applyPublicMigrations(pool);
+    console.log("Public migrations applied");
   });
 
 program

@@ -62,7 +62,7 @@ Account-level advisory locks keep sync operations serialized. Folder state track
 
 1. Create a Supabase project.
 2. Use the direct/session-affine Postgres connection string for `DATABASE_URL`.
-3. Deploy the worker from `apps/api` with `fly.worker.toml.example`.
+3. Deploy the worker from the repository root with `apps/api/fly.worker.toml.example`.
 4. Set environment variables.
 5. Run migrations.
 6. Add an IMAP account.
@@ -85,12 +85,18 @@ pnpm migrate
 or:
 
 ```bash
-psql "$DATABASE_URL" -f apps/api/supabase/migrations/0001_imap_mirror.sql
+psql "$DATABASE_URL" -f apps/api/supabase/migrations/public/0001_imap_mirror.sql
 ```
 
-Important: use a direct Supabase Postgres URL or session pooling. Do not use the transaction pooler. SupaMail uses advisory locks, and advisory locks need session affinity.
+Important: use a direct Supabase Postgres URL or the Supavisor session pooler on port `5432`. Do not use the transaction pooler on port `6543`. SupaMail uses advisory locks, and advisory locks need session affinity.
 
 See [docs/fly-supabase.md](docs/fly-supabase.md) for the full Fly.io + Supabase setup.
+
+See [docs/hosted-product-boundary.md](docs/hosted-product-boundary.md) for what belongs outside the open-source core.
+
+See [docs/hosted-cloud-contracts.md](docs/hosted-cloud-contracts.md) for the public contracts that the private hosted SaaS layer must consume.
+
+See [docs/imap-auth-v1.md](docs/imap-auth-v1.md) for the v1 IMAP authentication scope.
 
 See [docs/spec-conformance.md](docs/spec-conformance.md) for the public reliability matrix against the old Signal sync-engine spec that SupaMail was extracted from.
 
@@ -121,6 +127,8 @@ Or run the API:
 ```bash
 pnpm --filter @supamail/api start:api
 ```
+
+The Docker/runtime entrypoint also supports `SUPAMAIL_MODE=worker|api|combined`. `combined` runs the API and worker in one Node process for small deployments.
 
 ## Query Your Email
 
@@ -255,8 +263,11 @@ This starts a disposable `postgres:16-alpine` container on a random localhost po
 Local Supabase dry run:
 
 ```bash
-supabase db start
-supabase db reset --local
+supabase db start --workdir apps/api/supabase
+
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
+IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
+pnpm migrate
 
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \

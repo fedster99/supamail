@@ -1,5 +1,5 @@
 import { getConfig } from "../src/config.js";
-import { applyInitialMigration, closePool, getPool } from "../src/db.js";
+import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { MirrorRepository } from "../src/repository.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../src/smoke/fixture-imap.js";
 import { MirrorEngine } from "../src/sync-engine.js";
@@ -70,7 +70,7 @@ const folders: FixtureFolder[] = [
 
 async function main(): Promise<void> {
   const pool = getPool();
-  await applyInitialMigration(pool);
+  await applyPublicMigrations(pool);
   const config = {
     ...getConfig(),
     BODY_FETCH_POLICY: "immediate" as const,

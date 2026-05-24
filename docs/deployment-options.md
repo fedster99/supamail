@@ -2,6 +2,10 @@
 
 SupaMail is just Docker plus outbound network access to IMAP and Supabase Postgres. The key production requirement is a direct or session-affine `DATABASE_URL`, because advisory locks are session-scoped.
 
+For Supabase, direct Postgres uses IPv6. If the runtime cannot reach IPv6, use the Supavisor session pooler on port `5432`. Do not use the transaction pooler on port `6543`.
+
+The Docker image uses Node 24 (`node:24-slim`). Fly and Compose examples inherit that runtime from `apps/api/Dockerfile`.
+
 ## Recommendation
 
 Use Fly.io as the hosted path for SupaMail. It fits the shape of the product: one small always-on worker with no public IP, plus an optional separate API app only if remote control endpoints are needed.
@@ -20,13 +24,12 @@ Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cos
 Worker-only deploy:
 
 ```bash
-cd apps/api
-cp fly.worker.toml.example fly.toml
-fly launch --no-deploy --no-public-ips --ha=false
-fly secrets set \
+cp apps/api/fly.worker.toml.example apps/api/fly.worker.toml
+fly launch --config apps/api/fly.worker.toml --no-deploy --no-db --no-public-ips --ha=false
+fly secrets set --config apps/api/fly.worker.toml \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY"
-fly deploy --ha=false
+fly deploy --config apps/api/fly.worker.toml --ha=false
 ```
 
 `--ha=false` keeps the starter worker to one Machine. Fly otherwise creates spare/standby Machines by default for availability.
@@ -52,17 +55,18 @@ fly secrets set \
 Optional API deploy:
 
 ```bash
-cd apps/api
-cp fly.api.toml.example fly.api.toml
-fly launch --config fly.api.toml --no-deploy --ha=false
-fly secrets set --config fly.api.toml \
+cp apps/api/fly.api.toml.example apps/api/fly.api.toml
+fly launch --config apps/api/fly.api.toml --no-deploy --no-db --ha=false
+fly secrets set --config apps/api/fly.api.toml \
   DATABASE_URL="$DATABASE_URL" \
   IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY" \
   API_TOKEN="$API_TOKEN"
-fly deploy --config fly.api.toml --ha=false
+fly deploy --config apps/api/fly.api.toml --ha=false
 ```
 
 Keep the API separate from the worker so a public HTTP service cannot accidentally change the worker's uptime or cost profile.
+
+The same image also supports `SUPAMAIL_MODE=combined` for one-process API + worker deployments. That mode is intended for the private hosted SaaS runtime first; self-hosters should start with separate worker/API processes unless they specifically want one process.
 
 ## Coolify / VPS
 

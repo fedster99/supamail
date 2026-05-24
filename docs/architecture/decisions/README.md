@@ -11,6 +11,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0004-temp-table-reconcile-uid-stream.md`: Reconcile streams provider UIDs through a Postgres temp table.
 - `0005-live-db-reliability-lane.md`: Live Postgres behavior is verified through a Docker-backed reliability gate.
 - `0006-use-harness-impact-reminder-before-pr-updates.md`: Pre-push verification reminds agents to review project docs and harness impact.
+- `0007-public-core-hosted-cloud-contract.md`: Public core publishes the pinned image, public migrations, and runtime contracts consumed by private hosted cloud.
 - `0008-cooperative-account-lock-budget.md`: Account lock hold time is enforced cooperatively at safe sync boundaries.
 
 ## Status Values

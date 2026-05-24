@@ -1,8 +1,10 @@
 # Optional API app. Keep the always-on worker separate for the lowest bill.
-# Copy to fly.api.toml and deploy with:
-#   fly launch --config fly.api.toml --no-deploy --ha=false
-#   fly secrets set --config fly.api.toml DATABASE_URL=... IMAP_ENCRYPTION_KEY=... API_TOKEN=...
-#   fly deploy --config fly.api.toml --ha=false
+# Deploy from the repository root so Docker can use the monorepo as build context.
+# Runtime Node version is pinned by apps/api/Dockerfile (node:24-slim).
+#   cp apps/api/fly.api.toml.example apps/api/fly.api.toml
+#   fly launch --config apps/api/fly.api.toml --no-deploy --no-db --ha=false
+#   fly secrets set --config apps/api/fly.api.toml DATABASE_URL=... IMAP_ENCRYPTION_KEY=... API_TOKEN=...
+#   fly deploy --config apps/api/fly.api.toml --ha=false
 
 app = "supamail-api"
 primary_region = "iad"
@@ -10,14 +12,15 @@ kill_signal = "SIGINT"
 kill_timeout = "30s"
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = "apps/api/Dockerfile"
 
 [env]
+  SUPAMAIL_MODE = "api"
   BODY_FETCH_POLICY = "priority_then_backfill"
   PORT = "3000"
 
 [processes]
-  api = "node dist/api.js"
+  api = "node dist/runtime.js"
 
 [http_service]
   processes = ["api"]

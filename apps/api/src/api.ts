@@ -5,8 +5,8 @@ import { HTTPException } from "hono/http-exception";
 import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
-import { getConfig } from "./config.js";
-import { applyInitialMigration, getPool } from "./db.js";
+import { getConfig, type AppConfig } from "./config.js";
+import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
 import { HostValidationError } from "./host-validation.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
@@ -30,6 +30,13 @@ interface ApiAppOptions {
   repository: ApiRepository;
   engine: ApiEngine;
   applyMigration: () => Promise<void>;
+}
+
+interface StartApiServerOptions {
+  config?: AppConfig;
+  pool?: PgPool;
+  repository?: MirrorRepository;
+  engine?: MirrorEngine;
 }
 
 const UUID_SCHEMA = z.string().uuid();
@@ -155,21 +162,22 @@ export function createApiApp(options: ApiAppOptions): Hono {
   return app;
 }
 
-export function startApiServer(): void {
-  const config = getConfig();
-  const pool = getPool();
-  const repository = new MirrorRepository(pool, config);
-  const engine = new MirrorEngine({ pool, config, repository });
+export function startApiServer(options: StartApiServerOptions = {}): ReturnType<typeof serve> {
+  const config = options.config ?? getConfig();
+  const pool = options.pool ?? getPool();
+  const repository = options.repository ?? new MirrorRepository(pool, config);
+  const engine = options.engine ?? new MirrorEngine({ pool, config, repository });
   const app = createApiApp({
     apiToken: config.API_TOKEN,
     adminToken: config.ADMIN_TOKEN,
     repository,
     engine,
-    applyMigration: () => applyInitialMigration(pool)
+    applyMigration: () => applyPublicMigrations(pool)
   });
 
-  serve({ fetch: app.fetch, port: config.PORT });
+  const server = serve({ fetch: app.fetch, port: config.PORT });
   console.log(`SupaMail API listening on :${config.PORT}`);
+  return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

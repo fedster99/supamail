@@ -6,5 +6,8 @@ export * from "./locks.js";
 export * from "./mime.js";
 export * from "./provider-profiles.js";
 export * from "./repository.js";
+export * from "./runtime.js";
 export * from "./sync-engine.js";
+export * from "./target-scheduler.js";
 export * from "./types.js";
+export * from "./worker-runtime.js";

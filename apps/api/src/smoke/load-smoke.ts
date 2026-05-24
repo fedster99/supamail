@@ -1,5 +1,5 @@
 import { getConfig } from "../config.js";
-import { applyInitialMigration, closePool, getPool } from "../db.js";
+import { applyPublicMigrations, closePool, getPool } from "../db.js";
 import { MirrorRepository } from "../repository.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "./fixture-imap.js";
 import { MirrorEngine } from "../sync-engine.js";
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   const memoryLimitBytes = positiveIntEnv("SUPAMAIL_LOAD_MAX_RSS_BYTES", 220 * 1024 * 1024);
 
   const pool = getPool();
-  await applyInitialMigration(pool);
+  await applyPublicMigrations(pool);
 
   const config = {
     ...getConfig(),

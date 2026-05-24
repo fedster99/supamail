@@ -1,6 +1,6 @@
 # AGENTS.md
 
-SupaMail is a TypeScript/Node 22 monorepo. `apps/api` is the IMAP mirror that syncs folders, messages, flags, MIME bodies, attachment metadata, sync health, and reliability events into Supabase/Postgres. `apps/web` is the Next.js landing site.
+SupaMail is a TypeScript/Node 24 monorepo. `apps/api` is the IMAP mirror that syncs folders, messages, flags, MIME bodies, attachment metadata, sync health, and reliability events into Supabase/Postgres. `apps/web` is the Next.js landing site.
 
 This file is a routing layer for coding agents. Keep detailed architecture and process rules in the linked docs instead of expanding this file.
 
@@ -52,7 +52,7 @@ When docs mention message identity, they mean mailbox-row identity: `(account_id
 ## Task-Specific Reading
 
 - Sync engine, repository, locks, migrations, or health: read `docs/agent/reliability-invariants.md`.
-- Schema changes: read `docs/schema.md` and `apps/api/supabase/migrations/0001_imap_mirror.sql`.
+- Schema changes: read `docs/schema.md` and `apps/api/supabase/migrations/public/0001_imap_mirror.sql`.
 - Deployment changes: read `docs/deployment-options.md` and `docs/fly-supabase.md`.
 - Web or landing-page changes: read `apps/web/app/page.tsx`, `apps/web/app/globals.css`, and `docs/architecture/README.md`.
 - Architecture decisions: read `docs/architecture/README.md` and the relevant ADRs.

@@ -79,7 +79,7 @@ describe("repository safety", () => {
 
   it("enforces the account cap at create time and worker startup", async () => {
     const repository = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
-    const worker = await readFile(resolve(process.cwd(), "src/worker.ts"), "utf8");
+    const worker = await readFile(resolve(process.cwd(), "src/worker-runtime.ts"), "utf8");
 
     expect(repository).toContain("SYNC_MAX_ACCOUNTS limit reached");
     expect(worker).toContain("exceeds SYNC_MAX_ACCOUNTS");
@@ -183,7 +183,7 @@ describe("repository safety", () => {
 
   it("runs retention as expiry first, purge second", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
-    const worker = await readFile(resolve(process.cwd(), "src/worker.ts"), "utf8");
+    const worker = await readFile(resolve(process.cwd(), "src/worker-runtime.ts"), "utf8");
 
     expect(source).toContain("runExpiryJob");
     expect(source).toContain("window_status = 'EXPIRED'");

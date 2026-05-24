@@ -1,5 +1,5 @@
 import { getConfig, type AppConfig } from "../../config.js";
-import { applyInitialMigration, getPool, type PgPool } from "../../db.js";
+import { applyPublicMigrations, getPool, type PgPool } from "../../db.js";
 import { MirrorRepository } from "../../repository.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../../smoke/fixture-imap.js";
 import { MirrorEngine } from "../../sync-engine.js";
@@ -20,7 +20,7 @@ export interface IntegrationHarness {
 export async function setupIntegration(suite: string, overrides: Partial<AppConfig> = {}): Promise<IntegrationHarness> {
   const pool = getPool();
   if (process.env.SKIP_TEST_MIGRATION !== "1") {
-    await applyInitialMigration(pool);
+    await applyPublicMigrations(pool);
   }
   const config: AppConfig = {
     ...getConfig(),

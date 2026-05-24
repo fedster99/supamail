@@ -3,7 +3,7 @@ import { once } from "node:events";
 import net from "node:net";
 import { promisify } from "node:util";
 import { getConfig } from "../src/config.js";
-import { applyInitialMigration, closePool, getPool } from "../src/db.js";
+import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { MirrorRepository } from "../src/repository.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 
@@ -272,7 +272,7 @@ async function main(): Promise<void> {
   await sendSmtpMessageWithRetry(attachmentMessage());
 
   const pool = getPool();
-  await applyInitialMigration(pool);
+  await applyPublicMigrations(pool);
   const config = {
     ...getConfig(),
     BODY_FETCH_POLICY: "immediate" as const,

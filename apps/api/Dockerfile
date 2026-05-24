@@ -1,4 +1,4 @@
-FROM node:22-slim AS base
+FROM node:24-slim AS base
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
@@ -13,7 +13,7 @@ FROM deps AS build
 COPY . .
 RUN pnpm --filter @supamail/api build
 
-FROM node:22-slim AS runner
+FROM node:24-slim AS runner
 ENV NODE_ENV=production
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -25,4 +25,4 @@ RUN pnpm install --filter @supamail/api --prod --frozen-lockfile=false
 COPY --from=build /app/apps/api/dist ./apps/api/dist
 COPY --from=build /app/apps/api/supabase ./apps/api/supabase
 WORKDIR /app/apps/api
-CMD ["node", "dist/worker.js"]
+CMD ["node", "dist/runtime.js"]
