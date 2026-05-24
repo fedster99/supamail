@@ -29,4 +29,10 @@ describe("provider profiles", () => {
   it("lists supported profiles", () => {
     expect(listProviderProfiles().map((profile) => profile.id)).toContain("rackspace");
   });
+
+  it("keeps provider-specific quirks on the profile", () => {
+    const profile = getProviderProfile("rackspace");
+    expect(profile.compatibilityStatus).toBe("profiled");
+    expect(profile.knownQuirks.map((quirk) => quirk.id)).toContain("rackspace-inbox-inbox-alias");
+  });
 });

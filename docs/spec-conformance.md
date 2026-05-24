@@ -43,6 +43,7 @@ SupaMail owns a conservative mailbox mirror:
 | Flag scans must be budgeted. | Implemented | Priority and round-robin flag scan intervals are separate, and `MAX_FLAG_SCANS_PER_CYCLE` limits per-cycle work. |
 | Exclude folder explosions such as Spam/Trash/All Mail by default. | Implemented | Provider profiles exclude dangerous/system folders including SPECIAL-USE `\All` and `All Mail`. |
 | Archive-like folders are not excluded by default. | Implemented | Provider profile tests cover that archive folders stay trackable unless explicitly configured otherwise. |
+| Generic IMAP support must be validated provider by provider. | Implemented at compatibility-harness level | `docs/imap-compatibility.md` defines the minimum contract, provider matrix, and manual smoke checklist; `provider-compatibility.integration.test.ts` covers deterministic protocol fixtures. |
 | Folder-count explosions must not silently overload sync. | Implemented | `FOLDER_COUNT_WARN_THRESHOLD` adds `MANY_FOLDERS_PERFORMANCE_NOTE`; `FOLDER_COUNT_ENFORCE_THRESHOLD` keeps only priority folders tracked with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`; spec-conformance Scenario J proves warn, enforce, and auto-recovery. |
 | Missing folders get a grace period before tombstoning. | Implemented | Folder discovery stamps `missing_since`; past grace marks folder `MISSING` and tombstones in-window rows. |
 | Missing-mailbox folder operations should force rediscovery. | Implemented | Missing-mailbox errors move the folder to `PENDING_VERIFICATION`, stamp `missing_since`, set `next_folder_discovery_at = now()`, and pause normal scheduling until discovery resolves it; spec-conformance Scenario K proves the full path. |
@@ -90,7 +91,7 @@ Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge 
 These old-spec ideas are still useful, but they are not part of the current implemented contract:
 
 - Stable metrics and alerts: the worker logs structured events and writes sync records, but this repo does not yet define production metric names or alert thresholds as a public contract.
-- Provider-specific live account CI: the open-source project uses deterministic fixtures, GreenMail smoke tests, and disposable Postgres. Live provider compatibility is tracked separately as issue #3.
+- Provider-specific live account CI: the open-source project now has a compatibility matrix, deterministic provider-shape fixtures, GreenMail smoke tests, and disposable Postgres. Live provider accounts still require manual smoke runs unless a safe provider-specific CI account is added later.
 - UI fallback for body-fetch failures: SupaMail stores metadata and body state, but it does not own an end-user UI contract.
 - CRM interaction fallback: the old Signal interaction-resolution behavior is intentionally outside SupaMail core.
 

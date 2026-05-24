@@ -32,6 +32,7 @@ The worker and API share the same repository and account-locking model. Any IMAP
 - Hosted product boundary: `docs/hosted-product-boundary.md`
 - Hosted cloud contracts: `docs/hosted-cloud-contracts.md`
 - IMAP auth scope: `docs/imap-auth-v1.md`
+- IMAP compatibility: `docs/imap-compatibility.md`
 - Tracked session handoff: `SESSION_HANDOFF.md`
 - Agent operating guide: `docs/agent/README.md`
 - Reliability invariants: `docs/agent/reliability-invariants.md`

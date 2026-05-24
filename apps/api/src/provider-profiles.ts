@@ -1,8 +1,16 @@
 export interface ProviderProfile {
   id: string;
   displayName: string;
+  compatibilityStatus: "generic-core" | "profiled";
+  knownQuirks: ProviderQuirk[];
   priorityForFolder(path: string, specialUse?: string | null): number;
   excludedReason(path: string, specialUse?: string | null): string | null;
+}
+
+export interface ProviderQuirk {
+  id: string;
+  description: string;
+  handling: string;
 }
 
 function normalizedPath(path: string): string {
@@ -26,6 +34,8 @@ function isAllMail(path: string, specialUse?: string | null): boolean {
 export const genericImapProfile: ProviderProfile = {
   id: "generic-imap",
   displayName: "Generic IMAP",
+  compatibilityStatus: "generic-core",
+  knownQuirks: [],
   priorityForFolder(path, specialUse) {
     const normalized = normalizedPath(specialUse || path);
     if (normalized.includes("inbox")) return 1;
@@ -46,6 +56,14 @@ export const rackspaceProfile: ProviderProfile = {
   ...genericImapProfile,
   id: "rackspace",
   displayName: "Rackspace Email",
+  compatibilityStatus: "profiled",
+  knownQuirks: [
+    {
+      id: "rackspace-inbox-inbox-alias",
+      description: "Some Rackspace accounts expose INBOX.INBOX as a duplicate alias for INBOX.",
+      handling: "The sync engine excludes INBOX.INBOX only after mailbox metadata fingerprint verification."
+    }
+  ],
   priorityForFolder(path, specialUse) {
     const normalized = normalizedPath(specialUse || path);
     if (path === "INBOX" || normalized.includes("inbox")) return 1;

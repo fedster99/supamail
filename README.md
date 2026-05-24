@@ -103,6 +103,8 @@ See [docs/hosted-cloud-contracts.md](docs/hosted-cloud-contracts.md) for the pub
 
 See [docs/imap-auth-v1.md](docs/imap-auth-v1.md) for the v1 IMAP authentication scope.
 
+See [docs/imap-compatibility.md](docs/imap-compatibility.md) for the provider compatibility matrix, minimum IMAP contract, and manual smoke checklist.
+
 See [docs/spec-conformance.md](docs/spec-conformance.md) for the public reliability matrix against the old Signal sync-engine spec that SupaMail was extracted from.
 
 ## Add a Mailbox
@@ -322,7 +324,7 @@ NODE_OPTIONS=--max-old-space-size=160 \
 pnpm --filter @supamail/api smoke:load
 ```
 
-`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol.
+`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol. See [docs/imap-compatibility.md](docs/imap-compatibility.md) before claiming support for a specific provider.
 
 ## Project Status
 

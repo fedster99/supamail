@@ -71,14 +71,21 @@ export class FixtureImapClient implements MirrorImapClient {
     }
   }
 
-  async fetchOne(range: string): Promise<FetchMessage | false | null> {
+  async fetchOne(range: string, query: Record<string, unknown> = {}): Promise<FetchMessage | false | null> {
     const uid = Number(range);
     const message = this.messagesForCurrentMailbox().find((candidate) => candidate.uid === uid);
     if (!message) return false;
+    const maxLength = typeof query.source === "object"
+      && query.source !== null
+      && "maxLength" in query.source
+      && typeof query.source.maxLength === "number"
+      ? query.source.maxLength
+      : undefined;
+    const source = maxLength === undefined ? message.raw : message.raw.subarray(0, maxLength);
 
     return {
       ...this.toFetchMessage(message),
-      source: message.raw
+      source
     };
   }
 
