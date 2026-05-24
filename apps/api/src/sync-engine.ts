@@ -689,6 +689,21 @@ export class MirrorEngine {
     );
   }
 
+  private async withInitialSyncDeadline<T>(
+    client: MirrorImapClient,
+    deadline: number,
+    operation: string,
+    run: () => Promise<T>
+  ): Promise<T> {
+    return this.withOperationDeadline(
+      client,
+      deadline,
+      "INITIAL_SYNC_BATCH_TIMEOUT_MS",
+      operation,
+      run
+    );
+  }
+
   private async withOperationDeadline<T>(
     client: MirrorImapClient,
     deadline: number,
@@ -775,6 +790,7 @@ export class MirrorEngine {
     uidNext: number | undefined,
     windowCutoff: Date
   ): Promise<{ messagesUpserted: number }> {
+    const initialSyncDeadline = Date.now() + this.config.INITIAL_SYNC_BATCH_TIMEOUT_MS;
     let targetMaxUid: number | null = folder.initial_sync_target_max_uid
       ? Number(folder.initial_sync_target_max_uid)
       : null;
@@ -784,7 +800,12 @@ export class MirrorEngine {
 
     // First pass for this folder: take the snapshot.
     if (targetMaxUid === null || oldestSynced === null) {
-      const snapshot = await searchUidsSince(client, windowCutoff);
+      const snapshot = await this.withInitialSyncDeadline(
+        client,
+        initialSyncDeadline,
+        "initial sync snapshot SEARCH",
+        () => searchUidsSince(client, windowCutoff)
+      );
       const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
 
       if (sortedTargets.length === 0) {
@@ -806,7 +827,12 @@ export class MirrorEngine {
 
     // Re-search and bound by the snapshot. Any UIDs the provider has expunged
     // between cycles fall out naturally and we don't try to fetch them.
-    const candidates = await searchUidsSince(client, windowCutoff);
+    const candidates = await this.withInitialSyncDeadline(
+      client,
+      initialSyncDeadline,
+      "initial sync SEARCH",
+      () => searchUidsSince(client, windowCutoff)
+    );
     const inSnapshot = [...new Set(candidates)]
       .filter((uid) => uid <= targetMaxUid!)
       .sort((a, b) => a - b);
@@ -845,7 +871,18 @@ export class MirrorEngine {
     }
 
     const batch = descending.slice().reverse(); // ascending order for FETCH
-    const metadata = await fetchMessageMetadata(client, batch, batchSize);
+    const metadata = await this.withInitialSyncDeadline(
+      client,
+      initialSyncDeadline,
+      "initial sync FETCH",
+      () => fetchMessageMetadata(client, batch, batchSize)
+    );
+    this.assertDeadlineAvailable(
+      client,
+      initialSyncDeadline,
+      "INITIAL_SYNC_BATCH_TIMEOUT_MS",
+      "initial sync write"
+    );
     const messages = await this.repository.upsertMessages(
       account.id,
       folder,
@@ -858,6 +895,12 @@ export class MirrorEngine {
     }
 
     const newOldestSynced = batch[0];
+    this.assertDeadlineAvailable(
+      client,
+      initialSyncDeadline,
+      "INITIAL_SYNC_BATCH_TIMEOUT_MS",
+      "initial sync watermark"
+    );
     await this.repository.advanceInitialSyncWatermark(
       folder.id,
       newOldestSynced,

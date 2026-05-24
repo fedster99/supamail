@@ -10,9 +10,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- Latest pushed commit: `0a47cde Ignore local skill lock`.
-- PR checks after `0a47cde`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
-- Working tree was clean when this handoff section was refreshed.
+- Last green pushed baseline before reliability PR-2: `c932c1d Refresh session handoff state`.
+- PR checks after `c932c1d`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Reliability PR-2 initial-sync stall timeout was implemented after that baseline; recheck PR status after newer pushes.
 
 ## Current Shape
 
@@ -30,6 +30,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Public docs now include hosted cloud contracts and v1 IMAP auth scope. V1 hosted billing is documented as `$5/month` BYO Supabase subscription with a 7-day no-card trial and Stripe customer portal; Managed remains private beta/manual approval.
 - `.github/workflows/publish-core-image.yml` publishes the public core Docker image to GHCR after the CI workflow succeeds for a push to this repo's `main`; manual dispatch is restricted to the `main` ref.
 - PR-1 of the reliability hardening sequence is implemented: `MAX_LOCK_HOLD_MS` is now enforced cooperatively at safe sync boundaries, `SyncResult.hitLockBudget` records budget hits, body backlog draining is capped by `MAX_BODY_BATCHES_PER_TICK`, and ADR 0008 documents the decision.
+- PR-2 of the reliability hardening sequence is implemented: `INITIAL_SYNC_BATCH_TIMEOUT_MS` bounds initial sync snapshot/search/fetch work, aborts IMAP on timeout, treats the cycle as a transient failure, and preserves the initial-sync watermark for retry.
 - Ignored local env files were seeded for this workspace. Public handoff omits local project refs, generated tokens, API keys, and machine-specific env paths; see `.context/local-setup-handoff.md` when working in this workspace.
 - A workspace Supabase project was created and `apps/api/supabase` is linked through ignored `.temp` files. Public handoff intentionally omits project identifiers; local setup details live in `.context/local-setup-handoff.md`.
 
@@ -54,6 +55,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Reliability PR-1 verification: `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api exec vitest run src/__tests__/api-safety.test.ts src/__tests__/repository-safety.test.ts`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts`, `pnpm --filter @supamail/api test`, `git diff --check`, trailing-whitespace scan on `docs/architecture/decisions/0008-cooperative-account-lock-budget.md`, `pnpm typecheck`, `pnpm test`, `pnpm build`, `pnpm harness:check`, and `pnpm test:db:live` passed. The expected Node v26 engine warnings and Node DEP0205 warnings appeared.
 - OSS web page rewrite verification on 2026-05-23: commit `bc2fbcf` simplified the public web app into a compact OSS/docs page. `npx -y -p node@24 -p pnpm@10.0.0 pnpm --filter @supamail/web typecheck`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm --filter @supamail/web test`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm --filter @supamail/web build`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm harness:check`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm typecheck`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm test`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm build`, and `git diff --check` passed. Local dev render at `http://localhost:3001` passed desktop and mobile screenshot smoke; screenshots are ignored in `.context/`. PR #5 checks after push passed `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments`. Turbo replayed older cached API logs that contained the known local Node v26 engine warning; GitHub CI still emits the Node 20 action deprecation annotation until the public workflow action versions are upgraded.
 - Public CI action runtime cleanup on 2026-05-24: upgraded `actions/checkout`, `actions/setup-node`, and `pnpm/action-setup` from `v4` to `v6`; upgraded `docker/login-action` from `v3` to `v4` in the GHCR publish workflow. Each upgraded action declares `node24` in `action.yml`.
+- Reliability PR-2 verification on 2026-05-24: `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts --testNamePattern "Scenario H"`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts`, `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api spec-conformance`, and `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed. The expected local Node v26 engine warnings and Node DEP0205 warnings appeared.
 
 ## Durable Decisions
 
@@ -70,7 +72,6 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Open Risks
 
-- The old spec's `INITIAL_BATCH_STALL_TIMEOUT_MS` is not present.
 - Stuck `DEGRADED` for 24h with no successful priority sync is not implemented.
 - Folder-count explosion cap and reactive rediscovery on missing-mailbox errors remain open deltas in `docs/spec-conformance.md`.
 - Private `supamail-cloud` repo/app creation and first Vercel web deploy are done outside this public workspace. Supabase Auth setup, Stripe product/webhook setup, Supabase OAuth BYO onboarding, and hosted Fly deploy are still pending there.
@@ -81,4 +82,5 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
+- Next reliability hardening slice: PR-3 stuck `DEGRADED` escalation with `last_priority_sync_succeeded_at` and retryable `STUCK_DEGRADED_24H` behavior.
 - Next hosted setup step: continue in private `supamail-cloud` with Supabase Auth + Stripe Checkout/webhook using the public contracts in `docs/hosted-cloud-contracts.md`.

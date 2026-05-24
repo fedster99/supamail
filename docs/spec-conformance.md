@@ -33,6 +33,7 @@ SupaMail owns a conservative mailbox mirror:
 | Mailbox operations must avoid mailbox switching races. | Implemented | Folder sync and body fetch use ImapFlow mailbox locks before folder-specific operations. |
 | Sync scheduling uses priority folders plus bounded round-robin. | Implemented | `PRIORITY_CUTOFF`, `MAX_PRIORITY_FOLDERS_PER_CYCLE`, `MAX_RR_FOLDERS_PER_CYCLE`, and `folder_rr_cursor` prevent lower-priority folder starvation. |
 | Initial sync must be resumable and gap-safe. | Implemented | Snapshot + newest-first watermark; spec-conformance runs three-cycle initial sync proof. |
+| Initial sync batches must not stall forever. | Implemented | `INITIAL_SYNC_BATCH_TIMEOUT_MS` bounds initial snapshot/search/fetch work, aborts the IMAP client on timeout, and does not advance the watermark; spec-conformance Scenario H proves retry resumes from the same watermark. |
 | Do not reconcile unfinished initial sync folders. | Implemented | Reconcile runs only after initial sync completion; health remains `INITIAL_SYNC` while any tracked folder is incomplete. |
 | Incremental sync must not advance through partial metadata fetches. | Implemented | Metadata fetch fails if any requested UID is missing; unit coverage pins partial-batch behavior. |
 | Incremental sync must respect a hard operation deadline. | Implemented | `INCREMENTAL_TOTAL_TIMEOUT_MS` aborts IMAP work, treats the cycle as transient failure, and does not advance `last_uid`. |

@@ -750,6 +750,120 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     expect(Number(bodyCount.rows[0].count)).toBe(4);
   });
+
+  it("Scenario H — initial sync timeout aborts IMAP without advancing the watermark", async () => {
+    const h = await setupIntegration("H-initial-timeout", {
+      INITIAL_SYNC_BATCH_SIZE: 2,
+      INITIAL_SYNC_BATCH_TIMEOUT_MS: 100,
+      MAX_LOCK_HOLD_MS: 600_000
+    });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 500,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "old", from: "a@x.test", to: "u@x.test", body: "old" }),
+          makeTextMessage({ uid: 2, subject: "middle", from: "a@x.test", to: "u@x.test", body: "middle" }),
+          makeTextMessage({ uid: 3, subject: "new", from: "a@x.test", to: "u@x.test", body: "new" })
+        ]
+      }
+    ];
+    let closeCalls = 0;
+
+    class StallingInitialFetchClient extends FixtureImapClient {
+      close(): void {
+        closeCalls += 1;
+      }
+
+      async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (Array.isArray(range)) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        for await (const message of super.fetch(range, query)) {
+          yield message;
+        }
+      }
+    }
+
+    const stallingEngine = h.buildEngine({
+      folders,
+      clientFactory: async () => new StallingInitialFetchClient(folders) as unknown as MirrorImapClient
+    });
+    const timedOut = await stallingEngine.syncAccount(h.account.id, "manual");
+
+    expect(timedOut.outcome).toBe("failed");
+    expect(timedOut.errors[0]).toContain("INITIAL_SYNC_BATCH_TIMEOUT_MS exceeded during initial sync FETCH");
+    expect(closeCalls).toBeGreaterThan(0);
+
+    const afterTimeout = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        initial_sync_complete: boolean;
+        initial_sync_target_max_uid: string | null;
+        initial_sync_oldest_uid_synced: string | null;
+        message_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          f.initial_sync_complete,
+          f.initial_sync_target_max_uid,
+          f.initial_sync_oldest_uid_synced,
+          count(m.id)::text AS message_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id AND f.path = 'INBOX'
+        LEFT JOIN public.imap_messages m ON m.account_id = a.id AND m.folder_path = f.path
+        WHERE a.id = $1
+        GROUP BY a.id, f.id
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(afterTimeout.sync_state).toBe("DEGRADED");
+    expect(afterTimeout.sync_state_reason).toContain("INITIAL_SYNC_BATCH_TIMEOUT_MS exceeded during initial sync FETCH");
+    expect(afterTimeout.initial_sync_complete).toBe(false);
+    expect(Number(afterTimeout.initial_sync_target_max_uid)).toBe(3);
+    expect(Number(afterTimeout.initial_sync_oldest_uid_synced)).toBe(4);
+    expect(Number(afterTimeout.message_count)).toBe(0);
+
+    await dueAllFolders(h.pool, h.account.id);
+    const retryEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_TIMEOUT_MS: 600_000 }
+    });
+    const retry = await retryEngine.syncAccount(h.account.id, "manual");
+
+    expect(retry.outcome).toBe("success");
+    expect(retry.messagesUpserted).toBe(2);
+
+    const afterRetry = (
+      await h.pool.query<{
+        initial_sync_complete: boolean;
+        initial_sync_oldest_uid_synced: string | null;
+        uid: string;
+      }>(
+        `
+        SELECT f.initial_sync_complete, f.initial_sync_oldest_uid_synced, m.uid::text AS uid
+        FROM public.imap_folders f
+        JOIN public.imap_messages m ON m.account_id = f.account_id AND m.folder_path = f.path
+        WHERE f.account_id = $1 AND f.path = 'INBOX'
+        ORDER BY m.uid
+        `,
+        [h.account.id]
+      )
+    ).rows;
+    expect(afterRetry.map((row) => Number(row.uid))).toEqual([2, 3]);
+    expect(afterRetry[0].initial_sync_complete).toBe(false);
+    expect(Number(afterRetry[0].initial_sync_oldest_uid_synced)).toBe(2);
+  });
 });
 
 // Helpful diagnostic when the suite is silently skipped.

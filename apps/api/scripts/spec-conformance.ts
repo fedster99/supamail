@@ -652,6 +652,144 @@ async function scenarioPartialCounterRule() {
   }
 }
 
+async function scenarioInitialSyncStallTimeout() {
+  console.log("\nScenario H: initial-sync stall timeout preserves the initial-sync watermark");
+  const { pool, config, repository, account } = await setup("initial-timeout");
+  try {
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 500,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "old", from: "a@x.test", to: "u@x.test", body: "old" }),
+          makeTextMessage({ uid: 2, subject: "middle", from: "a@x.test", to: "u@x.test", body: "middle" }),
+          makeTextMessage({ uid: 3, subject: "new", from: "a@x.test", to: "u@x.test", body: "new" })
+        ]
+      }
+    ];
+    let closeCalls = 0;
+
+    class StallingInitialFetchClient extends FixtureImapClient {
+      close(): void {
+        closeCalls += 1;
+      }
+
+      async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (Array.isArray(range)) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        for await (const message of super.fetch(range, query)) {
+          yield message;
+        }
+      }
+    }
+
+    const stallingEngine = new MirrorEngine({
+      pool,
+      config: {
+        ...config,
+        INITIAL_SYNC_BATCH_SIZE: 2,
+        INITIAL_SYNC_BATCH_TIMEOUT_MS: 100,
+        MAX_LOCK_HOLD_MS: 600_000
+      },
+      repository,
+      clientFactory: async () => new StallingInitialFetchClient(folders) as unknown as MirrorImapClient
+    });
+    const timedOut = await stallingEngine.syncAccount(account.id, "manual");
+
+    assert(
+      timedOut.outcome === "failed",
+      "timeout cycle fails transiently",
+      `outcome=${timedOut.outcome} errors=${timedOut.errors.join("|")}`
+    );
+    assert(
+      timedOut.errors.some((error) => error.includes("INITIAL_SYNC_BATCH_TIMEOUT_MS exceeded during initial sync FETCH")),
+      "timeout reason names INITIAL_SYNC_BATCH_TIMEOUT_MS",
+      timedOut.errors.join("|")
+    );
+    assert(closeCalls > 0, "timeout aborts IMAP client", `closeCalls=${closeCalls}`);
+
+    const afterTimeout = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        initial_sync_complete: boolean;
+        initial_sync_target_max_uid: string | null;
+        initial_sync_oldest_uid_synced: string | null;
+        message_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          f.initial_sync_complete,
+          f.initial_sync_target_max_uid,
+          f.initial_sync_oldest_uid_synced,
+          count(m.id)::text AS message_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id AND f.path = 'INBOX'
+        LEFT JOIN public.imap_messages m ON m.account_id = a.id AND m.folder_path = f.path
+        WHERE a.id = $1
+        GROUP BY a.id, f.id
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(afterTimeout.sync_state === "DEGRADED", "timeout marks account DEGRADED", `state=${afterTimeout.sync_state}`);
+    assert(afterTimeout.initial_sync_complete === false, "initial sync remains incomplete", `complete=${afterTimeout.initial_sync_complete}`);
+    assert(
+      Number(afterTimeout.initial_sync_target_max_uid) === 3,
+      "snapshot target is retained",
+      `target=${afterTimeout.initial_sync_target_max_uid}`
+    );
+    assert(
+      Number(afterTimeout.initial_sync_oldest_uid_synced) === 4,
+      "watermark remains at snapshot sentinel",
+      `oldest=${afterTimeout.initial_sync_oldest_uid_synced}`
+    );
+    assert(Number(afterTimeout.message_count) === 0, "no message rows written for timed-out batch", `count=${afterTimeout.message_count}`);
+
+    await dueAllFolders(pool, account.id);
+    const retryEngine = new MirrorEngine({
+      pool,
+      config: { ...config, INITIAL_SYNC_BATCH_SIZE: 2, INITIAL_SYNC_BATCH_TIMEOUT_MS: 600_000 },
+      repository,
+      clientFactory: async () => new FixtureImapClient(folders)
+    });
+    const retry = await retryEngine.syncAccount(account.id, "manual");
+    const retryRows = (
+      await pool.query<{ initial_sync_complete: boolean; initial_sync_oldest_uid_synced: string | null; uid: string }>(
+        `
+        SELECT f.initial_sync_complete, f.initial_sync_oldest_uid_synced, m.uid::text AS uid
+        FROM public.imap_folders f
+        JOIN public.imap_messages m ON m.account_id = f.account_id AND m.folder_path = f.path
+        WHERE f.account_id = $1 AND f.path = 'INBOX'
+        ORDER BY m.uid
+        `,
+        [account.id]
+      )
+    ).rows;
+    assert(retry.outcome === "success", "retry cycle succeeds", `outcome=${retry.outcome} errors=${retry.errors.join("|")}`);
+    assert(
+      retryRows.map((row) => Number(row.uid)).join(",") === "2,3",
+      "retry resumes from the unchanged watermark",
+      `uids=${retryRows.map((row) => row.uid).join(",")}`
+    );
+    assert(
+      Number(retryRows[0]?.initial_sync_oldest_uid_synced) === 2,
+      "retry advances watermark only after successful fetch",
+      `oldest=${retryRows[0]?.initial_sync_oldest_uid_synced}`
+    );
+  } finally {
+    await teardown(pool, account.id);
+  }
+}
+
 async function main(): Promise<void> {
   console.log("SupaMail Tier-1 spec conformance — exercising real Postgres + fixture IMAP\n");
   console.log(`DATABASE_URL=${process.env.DATABASE_URL?.replace(/:[^@:]*@/, ":***@")}`);
@@ -662,6 +800,7 @@ async function main(): Promise<void> {
   await scenarioUidValidityCap();
   await scenarioFolderMissingGrace();
   await scenarioPartialCounterRule();
+  await scenarioInitialSyncStallTimeout();
 
   const passed = results.filter((r) => r.passed).length;
   const failed = results.filter((r) => !r.passed).length;
