@@ -23,6 +23,7 @@ describe("provider profiles", () => {
     const profile = getProviderProfile("generic-imap");
     expect(profile.excludedReason("All Mail")).toBe("excluded_all_mail");
     expect(profile.excludedReason("[Gmail]/All Mail")).toBe("excluded_all_mail");
+    expect(profile.excludedReason("[Gmail].All Mail")).toBe("excluded_all_mail");
     expect(profile.excludedReason("Archive", "\\All")).toBe("excluded_all_mail");
   });
 

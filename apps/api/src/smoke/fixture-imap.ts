@@ -71,7 +71,12 @@ export class FixtureImapClient implements MirrorImapClient {
     }
   }
 
-  async fetchOne(range: string, query: Record<string, unknown> = {}): Promise<FetchMessage | false | null> {
+  async fetchOne(
+    range: string,
+    query: Record<string, unknown> = {},
+    options?: Record<string, unknown>
+  ): Promise<FetchMessage | false | null> {
+    void options;
     const uid = Number(range);
     const message = this.messagesForCurrentMailbox().find((candidate) => candidate.uid === uid);
     if (!message) return false;
@@ -89,14 +94,17 @@ export class FixtureImapClient implements MirrorImapClient {
     };
   }
 
-  async download(range: string): Promise<DownloadResult> {
+  async download(range: string, part?: string, options: Record<string, unknown> = {}): Promise<DownloadResult> {
+    void part;
     const uid = Number(range);
     const message = this.messagesForCurrentMailbox().find((candidate) => candidate.uid === uid);
     if (!message) throw new Error(`Fixture message not found: ${range}`);
+    const maxBytes = typeof options.maxBytes === "number" ? options.maxBytes : undefined;
+    const raw = maxBytes === undefined ? message.raw : message.raw.subarray(0, maxBytes);
 
     return {
       content: (async function* stream() {
-        yield message.raw;
+        yield raw;
       })()
     };
   }

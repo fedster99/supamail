@@ -28,7 +28,7 @@ const noisyFolderFragments = [
 function isAllMail(path: string, specialUse?: string | null): boolean {
   const normalizedSpecialUse = normalizedPath(specialUse ?? "").trim();
   const normalizedFolder = normalizedPath(path).replace(/\s+/g, " ").trim();
-  return normalizedSpecialUse === "all" || /(^|[/])all\s*mail$/.test(normalizedFolder);
+  return normalizedSpecialUse === "all" || /(^|[/.])all\s*mail$/.test(normalizedFolder);
 }
 
 export const genericImapProfile: ProviderProfile = {

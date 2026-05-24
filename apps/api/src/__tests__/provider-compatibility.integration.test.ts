@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { closePool, getPool } from "../db.js";
-import type { MailboxLock } from "../imap-client.js";
+import type { FetchMessage, MailboxLock } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import { resetConfigForTests } from "../config.js";
 import { forceFolderDiscovery, setupIntegration, teardownIntegration } from "./helpers/integration-harness.js";
@@ -18,6 +18,18 @@ class DisconnectingFixtureImapClient extends FixtureImapClient {
       throw new Error("provider transient disconnect during SELECT");
     }
     return super.getMailboxLock(path);
+  }
+}
+
+class NoSourceFixtureImapClient extends FixtureImapClient {
+  async fetchOne(
+    range: string,
+    query: Record<string, unknown> = {},
+    options?: Record<string, unknown>
+  ): Promise<FetchMessage | false | null> {
+    const fetched = await super.fetchOne(range, query, options);
+    if (!fetched) return fetched;
+    return { ...fetched, source: undefined };
   }
 }
 
@@ -240,6 +252,55 @@ integration("provider compatibility fixtures (real Postgres + fixture IMAP)", ()
         BODY_BACKFILL_BATCH_SIZE: 10,
         INITIAL_SYNC_BATCH_SIZE: 50
       }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(1);
+
+    const body = (
+      await h.pool.query<{ raw_bytes: string; raw_truncated: boolean; raw_mime_length: string }>(
+        `
+        SELECT b.raw_bytes::text, b.raw_truncated, octet_length(b.raw_mime)::text AS raw_mime_length
+        FROM public.imap_message_bodies b
+        JOIN public.imap_messages m ON m.id = b.message_id
+        WHERE m.account_id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(body).toEqual({ raw_bytes: "256", raw_truncated: true, raw_mime_length: "256" });
+  });
+
+  it("caps fallback raw MIME downloads when fetchOne returns no source", async () => {
+    const h = await setupIntegration("compat-large-body-download-fallback");
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 74_101,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "large fallback",
+            from: "a@example.test",
+            to: "u@example.test",
+            body: "x".repeat(4096)
+          })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({
+      folders,
+      overrides: {
+        BODY_RAW_MAX_BYTES: 256,
+        BODY_BACKFILL_BATCH_SIZE: 10,
+        INITIAL_SYNC_BATCH_SIZE: 50
+      },
+      clientFactory: async () => new NoSourceFixtureImapClient(folders)
     });
 
     const result = await engine.syncAccount(h.account.id, "manual");
