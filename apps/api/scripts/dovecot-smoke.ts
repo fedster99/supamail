@@ -1,0 +1,340 @@
+import { execFile } from "node:child_process";
+import { once } from "node:events";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { getConfig } from "../src/config.js";
+import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
+import { MirrorRepository } from "../src/repository.js";
+import { MirrorEngine } from "../src/sync-engine.js";
+
+const execFileAsync = promisify(execFile);
+
+const image = process.env.DOVECOT_IMAGE ?? "dovecot/dovecot:2.4.1";
+const containerName = process.env.DOVECOT_CONTAINER ?? "supamail-dovecot-smoke";
+const mailbox = process.env.DOVECOT_MAILBOX ?? "supamail-dovecot@example.test";
+const password = process.env.DOVECOT_PASSWORD ?? "supamail-dovecot-password";
+const containerImapPort = 31_143;
+
+async function docker(args: string[], allowFailure = false): Promise<string> {
+  try {
+    const { stdout, stderr } = await execFileAsync("docker", args, { maxBuffer: 1024 * 1024 });
+    return `${stdout}${stderr}`.trim();
+  } catch (error) {
+    if (allowFailure) return "";
+    throw error;
+  }
+}
+
+async function connectSocket(port: number): Promise<net.Socket> {
+  const socket = net.createConnection({ host: "127.0.0.1", port });
+  try {
+    await Promise.race([
+      once(socket, "connect"),
+      once(socket, "error").then(([error]) => {
+        throw error instanceof Error ? error : new Error(String(error));
+      })
+    ]);
+    return socket;
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
+}
+
+async function waitForPort(port: number, timeoutMs = 30_000): Promise<void> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const socket = await connectSocket(port);
+      socket.end();
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  throw new Error(`Timed out waiting for 127.0.0.1:${port}`);
+}
+
+async function waitForImapReady(port: number, timeoutMs = 30_000): Promise<void> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const socket = await connectSocket(port);
+    try {
+      const banner = await Promise.race([
+        once(socket, "data").then(([data]) => data.toString("utf8")),
+        new Promise<string>((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for IMAP banner")), 2_000))
+      ]);
+      if (banner.includes("Dovecot ready")) return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      socket.end();
+    }
+  }
+
+  throw new Error(`Timed out waiting for Dovecot IMAP banner on 127.0.0.1:${port}`);
+}
+
+async function mappedPort(name: string): Promise<number> {
+  const output = await docker(["port", name, `${containerImapPort}/tcp`]);
+  const match = output.match(/(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]):(\d+)/) ?? output.match(/:(\d+)/);
+  if (!match) throw new Error(`Could not parse mapped Dovecot IMAP port from: ${output}`);
+  return Number(match[1]);
+}
+
+function dovecotConfig(): string {
+  return [
+    "dovecot_config_version = 2.4.1",
+    "dovecot_storage_version = 2.4.1",
+    "protocols = imap",
+    "listen = 0.0.0.0",
+    "ssl = no",
+    "auth_allow_cleartext = yes",
+    "auth_mechanisms = plain",
+    "default_internal_user = vmail",
+    "default_internal_group = vmail",
+    "default_login_user = vmail",
+    "mail_driver = maildir",
+    "mail_home = /srv/vmail/%{user | lower}",
+    "mail_path = ~/mail",
+    "mail_uid = vmail",
+    "mail_gid = vmail",
+    "namespace inbox {",
+    "  inbox = yes",
+    "  separator = /",
+    "}",
+    "passdb static {",
+    `  password = ${password}`,
+    "}",
+    "service imap-login {",
+    "  inet_listener imap {",
+    `    port = ${containerImapPort}`,
+    "  }",
+    "}"
+  ].join("\n");
+}
+
+async function createMaildir(root: string, folder: string): Promise<string> {
+  const folderRoot = folder === "INBOX" ? root : path.join(root, `.${folder}`);
+  await Promise.all([
+    mkdir(path.join(folderRoot, "cur"), { recursive: true }),
+    mkdir(path.join(folderRoot, "new"), { recursive: true }),
+    mkdir(path.join(folderRoot, "tmp"), { recursive: true })
+  ]);
+  return folderRoot;
+}
+
+function plainMessage(id: string, subject: string, body: string, from = "sender@example.test", to = mailbox): string {
+  return [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `Message-ID: <dovecot-smoke-${id}@example.test>`,
+    `Date: ${new Date(Date.now() - Number(id.replace(/\D/g, "") || 0) * 60_000).toUTCString()}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    body
+  ].join("\r\n");
+}
+
+function attachmentMessage(): string {
+  const boundary = "supamail-dovecot-boundary";
+  return [
+    "From: archive-sender@example.test",
+    `To: ${mailbox}`,
+    "Subject: Dovecot smoke attachment",
+    "Message-ID: <dovecot-smoke-attachment@example.test>",
+    `Date: ${new Date().toUTCString()}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "Dovecot smoke archive message with an attachment.",
+    `--${boundary}`,
+    "Content-Type: text/plain",
+    "Content-Disposition: attachment; filename=\"dovecot-fixture.txt\"",
+    "Content-Transfer-Encoding: base64",
+    "",
+    "RG92ZWNvdCBmaXh0dXJlIGF0dGFjaG1lbnQK",
+    `--${boundary}--`
+  ].join("\r\n");
+}
+
+async function seedMaildir(vmailRoot: string): Promise<void> {
+  const accountRoot = path.join(vmailRoot, mailbox, "mail");
+  const inbox = await createMaildir(accountRoot, "INBOX");
+  const sent = await createMaildir(accountRoot, "Sent");
+  const archive = await createMaildir(accountRoot, "Archive");
+  const trash = await createMaildir(accountRoot, "Trash");
+
+  await Promise.all([
+    writeFile(path.join(inbox, "new", "1.eml"), plainMessage("1", "Dovecot smoke 1", "Dovecot INBOX message 1.")),
+    writeFile(path.join(inbox, "new", "2.eml"), plainMessage("2", "Dovecot smoke 2", "Dovecot INBOX message 2.")),
+    writeFile(
+      path.join(sent, "new", "1.eml"),
+      plainMessage("sent", "Dovecot smoke sent", "Dovecot Sent message.", mailbox, "sender@example.test")
+    ),
+    writeFile(path.join(archive, "new", "1.eml"), attachmentMessage()),
+    writeFile(path.join(trash, "new", "1.eml"), plainMessage("trash", "Dovecot smoke trash", "This folder must stay excluded."))
+  ]);
+
+  await chmod(vmailRoot, 0o777);
+  await execFileAsync("chmod", ["-R", "777", vmailRoot]);
+}
+
+async function startDovecot(tempDir: string): Promise<number> {
+  const configPath = path.join(tempDir, "dovecot.conf");
+  const vmailRoot = path.join(tempDir, "vmail");
+  await writeFile(configPath, dovecotConfig());
+  await seedMaildir(vmailRoot);
+
+  await docker(["rm", "-f", containerName], true);
+  await docker([
+    "run",
+    "-d",
+    "--name",
+    containerName,
+    "--rm",
+    "-p",
+    `127.0.0.1::${containerImapPort}`,
+    "-v",
+    `${configPath}:/etc/dovecot/dovecot.conf:ro`,
+    "-v",
+    `${vmailRoot}:/srv/vmail`,
+    image
+  ]);
+
+  const port = await mappedPort(containerName);
+  await waitForPort(port);
+  await waitForImapReady(port);
+  return port;
+}
+
+async function countRows(accountId: string): Promise<{
+  folders: number;
+  messages: number;
+  bodies: number;
+  attachments: number;
+  deletedMessages: number;
+  trackedArchive: boolean;
+  excludedTrash: boolean;
+}> {
+  const result = await getPool().query<{
+    folders: string;
+    messages: string;
+    bodies: string;
+    attachments: string;
+    deleted_messages: string;
+    tracked_archive: boolean;
+    excluded_trash: boolean;
+  }>(
+    `
+    SELECT
+      (SELECT count(*)::text FROM public.imap_folders WHERE account_id = $1) AS folders,
+      (SELECT count(*)::text FROM public.imap_messages WHERE account_id = $1) AS messages,
+      (SELECT count(*)::text FROM public.imap_message_bodies b JOIN public.imap_messages m ON m.id = b.message_id WHERE m.account_id = $1) AS bodies,
+      (SELECT count(*)::text FROM public.imap_attachments a JOIN public.imap_messages m ON m.id = a.message_id WHERE m.account_id = $1) AS attachments,
+      (SELECT count(*)::text FROM public.imap_messages WHERE account_id = $1 AND deleted_in_provider = true) AS deleted_messages,
+      EXISTS (SELECT 1 FROM public.imap_folders WHERE account_id = $1 AND path = 'Archive' AND excluded_reason IS NULL AND tracked = true) AS tracked_archive,
+      EXISTS (SELECT 1 FROM public.imap_folders WHERE account_id = $1 AND path = 'Trash' AND excluded_reason = 'excluded_trash' AND tracked = false) AS excluded_trash
+    `,
+    [accountId]
+  );
+  const row = result.rows[0];
+
+  return {
+    folders: Number(row.folders),
+    messages: Number(row.messages),
+    bodies: Number(row.bodies),
+    attachments: Number(row.attachments),
+    deletedMessages: Number(row.deleted_messages),
+    trackedArchive: row.tracked_archive,
+    excludedTrash: row.excluded_trash
+  };
+}
+
+async function main(): Promise<void> {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "supamail-dovecot-smoke-"));
+  const pool = getPool();
+  let accountId: string | null = null;
+
+  try {
+    const imapPort = await startDovecot(tempDir);
+    await applyPublicMigrations(pool);
+    const config = {
+      ...getConfig(),
+      BODY_FETCH_POLICY: "immediate" as const,
+      BODY_BACKFILL_BATCH_SIZE: 10,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      INCREMENTAL_SYNC_BATCH_SIZE: 10,
+      MAX_RR_FOLDERS_PER_CYCLE: 10,
+      CONNECT_TIMEOUT_MS: 10_000,
+      IMAP_COMMAND_TIMEOUT_MS: 10_000,
+      IMAP_ALLOW_PRIVATE_HOSTS: true
+    };
+    const repository = new MirrorRepository(pool, config);
+    const account = await repository.createAccount({
+      emailAddress: mailbox,
+      host: "127.0.0.1",
+      port: imapPort,
+      secure: false,
+      username: mailbox,
+      password,
+      providerProfile: "generic-imap",
+      bodyFetchPolicy: "immediate"
+    });
+    accountId = account.id;
+
+    const engine = new MirrorEngine({ pool, config, repository });
+    const result = await engine.syncAccount(account.id, "manual");
+    const counts = await countRows(account.id);
+    const assertions: Array<[string, boolean]> = [
+      ["sync succeeded", result.outcome === "success"],
+      ["discovered Dovecot folders", counts.folders >= 4],
+      ["mirrored non-excluded messages", counts.messages === 4],
+      ["stored raw/parsed bodies", counts.bodies === 4],
+      ["stored attachment metadata", counts.attachments >= 1],
+      ["kept Archive trackable", counts.trackedArchive],
+      ["excluded Trash by provider profile", counts.excludedTrash],
+      ["no false provider deletes", counts.deletedMessages === 0]
+    ];
+    const failed = assertions.filter(([, passed]) => !passed);
+    if (failed.length > 0) {
+      throw new Error(`Dovecot smoke failed: ${failed.map(([name]) => name).join(", ")}`);
+    }
+
+    console.log(JSON.stringify({
+      ok: true,
+      image,
+      mailbox,
+      imapPort,
+      result,
+      counts
+    }, null, 2));
+  } finally {
+    const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";
+    if (!keepData && accountId) {
+      await pool.query("DELETE FROM public.imap_accounts WHERE id = $1", [accountId]);
+    }
+    if (process.env.SUPAMAIL_DOVECOT_KEEP_CONTAINER !== "true") {
+      await docker(["rm", "-f", containerName], true);
+    }
+    if (!keepData) {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+}
+
+try {
+  await main();
+} finally {
+  await closePool();
+}

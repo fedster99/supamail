@@ -313,6 +313,10 @@ Protocol smoke test:
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
 pnpm --filter @supamail/api smoke:greenmail
+
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
+IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
+pnpm --filter @supamail/api smoke:dovecot
 ```
 
 Load smoke test:
@@ -324,7 +328,7 @@ NODE_OPTIONS=--max-old-space-size=160 \
 pnpm --filter @supamail/api smoke:load
 ```
 
-`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol. See [docs/imap-compatibility.md](docs/imap-compatibility.md) before claiming support for a specific provider.
+`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol. `pnpm --filter @supamail/api smoke:dovecot` starts a disposable `dovecot/dovecot` Docker IMAP server with seeded Maildir data to validate the generic-hosting shape. See [docs/imap-compatibility.md](docs/imap-compatibility.md) before claiming support for a specific provider.
 
 ## Project Status
 

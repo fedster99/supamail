@@ -24,6 +24,7 @@
     "spec-conformance": "tsx scripts/spec-conformance.ts",
     "smoke:load": "tsx src/smoke/load-smoke.ts",
     "smoke:greenmail": "tsx scripts/greenmail-smoke.ts",
+    "smoke:dovecot": "tsx scripts/dovecot-smoke.ts",
     "start:worker": "node dist/worker.js",
     "start:api": "node dist/api.js",
     "start:combined": "SUPAMAIL_MODE=combined node dist/runtime.js",

@@ -17,6 +17,7 @@
     "spec-conformance": "pnpm --filter @supamail/api spec-conformance",
     "test:db:live": "pnpm --filter @supamail/api test:db:live",
     "smoke:greenmail": "pnpm --filter @supamail/api smoke:greenmail",
+    "smoke:dovecot": "pnpm --filter @supamail/api smoke:dovecot",
     "smoke:load": "pnpm --filter @supamail/api smoke:load"
   },
   "devDependencies": {

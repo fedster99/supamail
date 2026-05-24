@@ -23,7 +23,8 @@ If a server lacks one of these behaviors, support needs either a provider profil
 | --- | --- | --- | --- |
 | Generic IMAP core | Supported contract | Unit and integration fixtures cover folder discovery, UID searches, metadata fetches, body fetches, reconcile, and health. | This is a protocol contract, not a promise about every provider. |
 | GreenMail | Automated smoke | `pnpm smoke:greenmail` runs against `greenmail/standalone` through real IMAP/SMTP. | Smoke is Docker/local because it starts a server container. |
-| Dovecot/cPanel-style IMAP | Fixture validated | `provider-compatibility.integration.test.ts` covers no `SPECIAL-USE` flags, slash delimiters, and name-based noisy-folder exclusion. | Use `generic-imap` profile unless a live provider proves a quirk. |
+| Dovecot | Automated smoke | `pnpm smoke:dovecot` runs against `dovecot/dovecot` through the real IMAP protocol with seeded Maildir folders. | Smoke is Docker/local because it starts a server container. |
+| Dovecot/cPanel-style IMAP | Automated smoke + fixture validated | `pnpm smoke:dovecot` covers real Dovecot folder listing, UID search, body fetch, attachment metadata, Archive tracking, and Trash exclusion. `provider-compatibility.integration.test.ts` covers no `SPECIAL-USE` flags, slash delimiters, and name-based noisy-folder exclusion. | Use `generic-imap` profile unless a live provider proves a quirk. |
 | Cyrus/Rackspace-style IMAP | Fixture validated | `provider-compatibility.integration.test.ts` covers dot delimiters and the Rackspace `INBOX.INBOX` alias path. | `rackspace` profile excludes `INBOX.INBOX` only after metadata fingerprint verification. |
 | Rackspace Email | Profiled, live smoke pending | Profile and alias tests exist. | Use app password/IMAP password. Live smoke should verify folder aliases and UID search behavior before claiming full support. |
 | Fastmail | Manual smoke pending | None yet. | Expected to use `generic-imap`; verify special-use folders and archive behavior. |
@@ -39,7 +40,8 @@ The compatibility gate is split by cost:
 
 - `pnpm test` runs unit compatibility checks, including provider profile quirk metadata and UID search edge cases.
 - `pnpm test:db:live` runs `provider-compatibility.integration.test.ts` against disposable Postgres with deterministic IMAP fixtures.
-- `pnpm smoke:greenmail` starts a real GreenMail container and syncs through the real IMAP protocol.
+- `pnpm smoke:greenmail` starts a real GreenMail container and syncs through the real IMAP/SMTP protocol.
+- `pnpm smoke:dovecot` starts a real Dovecot container and syncs through the real IMAP protocol against seeded Maildir data.
 
 The live DB fixture suite currently covers:
 
@@ -48,6 +50,13 @@ The live DB fixture suite currently covers:
 - empty folder-list failures that must not tombstone mail
 - large raw MIME body byte caps
 - transient disconnects becoming visible health state
+
+The real-server smoke suite currently covers:
+
+- GreenMail SMTP delivery into IMAP followed by mirror sync
+- Dovecot Maildir folder discovery without `SPECIAL-USE`
+- Dovecot slash delimiters, UID search, raw body fetch, and attachment metadata
+- Dovecot Archive folders staying trackable while Trash stays provider-excluded
 
 ## Manual Smoke Checklist
 

@@ -40,6 +40,7 @@ pnpm --filter @supamail/web build
 | Spec conformance behavior | `pnpm test:db:live` because it runs `pnpm spec-conformance` against live Postgres |
 | Deployment files or CI | `pnpm typecheck`, `pnpm test`, `pnpm build`, plus inspect the affected config |
 | GreenMail/protocol behavior | `pnpm smoke:greenmail` when Docker/local environment permits |
+| Dovecot/generic-hosting protocol behavior | `pnpm smoke:dovecot` when Docker/local environment permits |
 | Local Supabase dry run behavior | `pnpm --filter @supamail/api dry-run:local` when local Supabase is available |
 
 ## Heavy Reliability Gate

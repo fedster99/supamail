@@ -46,16 +46,17 @@
       "area": "provider-profiles",
       "title": "Build IMAP compatibility matrix and protocol validation",
       "user_visible_behavior": "Docs and tests make generic IMAP support explicit, provider-by-provider, with known quirks isolated in provider profiles.",
-      "status": "in_progress",
+      "status": "passing",
       "dependencies": [],
       "verification": [
         "pnpm typecheck",
         "pnpm test",
         "pnpm build",
-        "pnpm smoke:greenmail when protocol behavior changes"
+        "pnpm smoke:greenmail when protocol behavior changes",
+        "pnpm smoke:dovecot when protocol behavior changes"
       ],
-      "evidence": "Issue #3 provider compatibility slice added docs/imap-compatibility.md, ADR 0013, provider-profile quirk metadata, deterministic provider compatibility integration fixtures, UID search edge tests, and GreenMail smoke verification. Follow-up review fixes cover dot-delimiter All Mail exclusion and fallback raw MIME download byte caps. Verified with pnpm --filter @supamail/api typecheck, targeted provider-profile/imap-client tests, pnpm --filter @supamail/api test:db:live, pnpm --filter @supamail/api smoke:greenmail against throwaway Postgres, and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh with 31 live integration tests and 118 spec checks.",
-      "notes": "Generic IMAP support is framed as a minimum contract validated by provider shape. Still needs either a second real IMAP server implementation in automated smoke coverage or recorded live provider smoke results before this should be marked passing."
+      "evidence": "Issue #3 provider compatibility slice added docs/imap-compatibility.md, ADR 0013, provider-profile quirk metadata, deterministic provider compatibility integration fixtures, UID search edge tests, GreenMail smoke verification, and Dovecot smoke verification. Follow-up review fixes cover dot-delimiter All Mail exclusion and fallback raw MIME download byte caps. Verified with pnpm --filter @supamail/api typecheck, targeted provider-profile/imap-client tests, pnpm --filter @supamail/api test:db:live, pnpm --filter @supamail/api smoke:greenmail, pnpm --filter @supamail/api smoke:dovecot, and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh with 31 live integration tests and 118 spec checks.",
+      "notes": "Generic IMAP support is framed as a minimum contract validated by provider shape, deterministic fixtures, and two real-server smokes: GreenMail and Dovecot. Live provider account results remain manual matrix entries until safe provider-specific CI accounts exist."
     },
     {
       "id": "issue-4-mcp-server",
