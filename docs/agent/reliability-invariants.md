@@ -40,6 +40,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Initial sync is folder-level, snapshot-based, newest-first, and resumable.
 - Initial sync SEARCH/FETCH work is bounded by `INITIAL_SYNC_BATCH_TIMEOUT_MS`; a timeout aborts the IMAP client and must not advance the initial-sync watermark.
 - A failed initial sync batch must not advance watermarks.
+- `live_window_days` is immutable after account creation in v0.1; changing it requires a future window-status migration story.
 - Incremental sync only advances `last_uid` after all fetched metadata for the batch succeeds.
 - Partial metadata fetches are hard failures. Do not swallow per-message errors and advance cursors.
 - Flag scans are due-based and compare normalized flags.

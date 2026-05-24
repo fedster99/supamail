@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0003_folder_count_cap_pending_verification",
+  "schemaVersion": "0004_account_lane_settings",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -12,6 +12,10 @@
     {
       "id": "0003_folder_count_cap_pending_verification",
       "file": "0003_folder_count_cap_pending_verification.sql"
+    },
+    {
+      "id": "0004_account_lane_settings",
+      "file": "0004_account_lane_settings.sql"
     }
   ]
 }

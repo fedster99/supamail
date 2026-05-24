@@ -24,6 +24,8 @@ Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY
 
 `POST /accounts/:id/folders/track` lets operators opt an existing non-provider-excluded folder back into sync past the folder-count cap. The opt-in is persisted on the folder so the next discovery pass does not reapply `folder_count_cap_exceeded` to that path.
 
+`imap_accounts` also stores the account-level lane settings that later historical-backfill work will consume: `live_window_days`, `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate`. The columns are type-safe Postgres fields with CHECK constraints and defaults. In v0.1, `live_window_days` is immutable after account creation; `PATCH /accounts/:id/settings` rejects attempts to change it and only updates the mutable historical/archive/backfill-rate settings.
+
 `imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a missing-mailbox verification pass. Missing-mailbox errors stamp `missing_since`, force `imap_accounts.next_folder_discovery_at = now()`, and move the folder into `PENDING_VERIFICATION`. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
 
 ## Migration Boundaries

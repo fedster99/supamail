@@ -14,7 +14,8 @@ import type {
   MessageMetadata,
   SyncResult,
   SyncRunStatus,
-  SyncTriggerType
+  SyncTriggerType,
+  UpdateAccountSettingsInput
 } from "./types.js";
 
 const BROKEN_FAILURE_THRESHOLD = 10;
@@ -62,6 +63,11 @@ const ACCOUNT_SUMMARY_COLUMNS = `
   email_address,
   provider_profile,
   body_fetch_policy,
+  live_window_days,
+  historical_backfill_mode,
+  archive_refresh_interval,
+  archive_flag_sync,
+  max_backfill_rate,
   sync_state,
   sync_state_reason,
   last_sync_started_at,
@@ -138,6 +144,42 @@ export class MirrorRepository {
     const result = await this.pool.query<ImapAccount>(
       "SELECT * FROM public.imap_accounts WHERE id = $1",
       [id]
+    );
+    return result.rows[0] ?? null;
+  }
+
+  async updateAccountSettings(accountId: string, input: UpdateAccountSettingsInput): Promise<AccountSummary | null> {
+    if (
+      input.historicalBackfillMode === undefined
+      && input.archiveRefreshInterval === undefined
+      && input.archiveFlagSync === undefined
+      && input.maxBackfillRate === undefined
+    ) {
+      const existing = await this.pool.query<AccountSummary>(
+        `SELECT ${ACCOUNT_SUMMARY_COLUMNS} FROM public.imap_accounts WHERE id = $1`,
+        [accountId]
+      );
+      return existing.rows[0] ?? null;
+    }
+
+    const result = await this.pool.query<AccountSummary>(
+      `
+      UPDATE public.imap_accounts
+      SET
+        historical_backfill_mode = COALESCE($2::text, historical_backfill_mode),
+        archive_refresh_interval = COALESCE($3::text, archive_refresh_interval),
+        archive_flag_sync = COALESCE($4::boolean, archive_flag_sync),
+        max_backfill_rate = COALESCE($5::text, max_backfill_rate)
+      WHERE id = $1
+      RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
+      `,
+      [
+        accountId,
+        input.historicalBackfillMode ?? null,
+        input.archiveRefreshInterval ?? null,
+        input.archiveFlagSync ?? null,
+        input.maxBackfillRate ?? null
+      ]
     );
     return result.rows[0] ?? null;
   }

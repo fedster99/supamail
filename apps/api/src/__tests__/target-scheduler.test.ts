@@ -5,7 +5,7 @@ import {
   type RuntimeTargetTask
 } from "../target-scheduler.js";
 
-const requiredSchemaVersion = "0003_folder_count_cap_pending_verification";
+const requiredSchemaVersion = "0004_account_lane_settings";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

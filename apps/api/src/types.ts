@@ -1,4 +1,8 @@
 export type BodyFetchPolicy = "immediate" | "lazy" | "priority_then_backfill";
+export type LiveWindowDays = 30 | 90 | 180;
+export type HistoricalBackfillMode = "off" | "metadata_only" | "metadata_and_bodies";
+export type ArchiveRefreshInterval = "never" | "monthly" | "weekly";
+export type MaxBackfillRate = "small" | "normal" | "aggressive";
 export type SyncState = "INITIAL_SYNC" | "HEALTHY" | "DEGRADED" | "BROKEN" | "PAUSED";
 export type FolderStatus = "PENDING" | "SYNCING" | "ACTIVE" | "NEEDS_FULL_RESYNC" | "MISSING" | "PENDING_VERIFICATION";
 export type WindowStatus = "IN_WINDOW" | "EXPIRED" | "HISTORICAL";
@@ -15,6 +19,11 @@ export interface ImapAccount {
   username: string;
   encrypted_password: Buffer;
   body_fetch_policy: BodyFetchPolicy;
+  live_window_days: LiveWindowDays;
+  historical_backfill_mode: HistoricalBackfillMode;
+  archive_refresh_interval: ArchiveRefreshInterval;
+  archive_flag_sync: boolean;
+  max_backfill_rate: MaxBackfillRate;
   sync_state: SyncState;
   sync_state_reason: string | null;
   last_sync_started_at: Date | null;
@@ -43,6 +52,11 @@ export interface AccountSummary {
   email_address: string;
   provider_profile: string;
   body_fetch_policy: BodyFetchPolicy;
+  live_window_days: LiveWindowDays;
+  historical_backfill_mode: HistoricalBackfillMode;
+  archive_refresh_interval: ArchiveRefreshInterval;
+  archive_flag_sync: boolean;
+  max_backfill_rate: MaxBackfillRate;
   sync_state: SyncState;
   sync_state_reason: string | null;
   last_sync_started_at: Date | null;
@@ -209,4 +223,11 @@ export interface CreateAccountInput {
   password: string;
   providerProfile?: string;
   bodyFetchPolicy?: BodyFetchPolicy;
+}
+
+export interface UpdateAccountSettingsInput {
+  historicalBackfillMode?: HistoricalBackfillMode;
+  archiveRefreshInterval?: ArchiveRefreshInterval;
+  archiveFlagSync?: boolean;
+  maxBackfillRate?: MaxBackfillRate;
 }

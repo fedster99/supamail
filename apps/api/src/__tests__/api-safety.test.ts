@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
-import type { AccountSummary, ImapFolder, SyncResult } from "../types.js";
+import type { AccountSummary, ImapFolder, SyncResult, UpdateAccountSettingsInput } from "../types.js";
 
 const accountId = "00000000-0000-4000-8000-000000000001";
 const messageId = "00000000-0000-4000-8000-000000000002";
@@ -14,6 +14,11 @@ function makeAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
     email_address: "user@example.test",
     provider_profile: "generic-imap",
     body_fetch_policy: "lazy",
+    live_window_days: 90,
+    historical_backfill_mode: "metadata_and_bodies",
+    archive_refresh_interval: "monthly",
+    archive_flag_sync: false,
+    max_backfill_rate: "normal",
     sync_state: "HEALTHY",
     sync_state_reason: null,
     last_sync_started_at: null,
@@ -95,6 +100,7 @@ function buildApp(options: {
   adminToken?: string | null;
   account?: AccountSummary | null;
   trackFolder?: (accountId: string, path: string) => Promise<ImapFolder | null>;
+  updateAccountSettings?: (accountId: string, input: UpdateAccountSettingsInput) => Promise<AccountSummary | null>;
   createAccount?: (input: unknown) => Promise<AccountSummary>;
   listAccounts?: () => Promise<AccountSummary[]>;
   applyMigration?: () => Promise<void>;
@@ -106,6 +112,12 @@ function buildApp(options: {
       email_address: (input as { emailAddress: string }).emailAddress
     }))),
     getAccount: vi.fn(async () => account),
+    updateAccountSettings: vi.fn(options.updateAccountSettings ?? (async (_accountId, input) => makeAccount({
+      historical_backfill_mode: input.historicalBackfillMode ?? "metadata_and_bodies",
+      archive_refresh_interval: input.archiveRefreshInterval ?? "monthly",
+      archive_flag_sync: input.archiveFlagSync ?? false,
+      max_backfill_rate: input.maxBackfillRate ?? "normal"
+    }))),
     trackFolder: vi.fn(options.trackFolder ?? (async (_accountId: string, path: string) => makeFolder({ path }))),
     getMessage: vi.fn(async () => ({ id: messageId }) as never)
   };
@@ -258,6 +270,54 @@ describe("API safety", () => {
     expect(valid.status).toBe(200);
     await expect(valid.json()).resolves.toMatchObject({ folder: { path: "Archive", tracked: true } });
     expect(repository.trackFolder).toHaveBeenCalledWith(accountId, "Archive");
+  });
+
+  it("validates PATCH /accounts/:id/settings and keeps live window immutable", async () => {
+    const { app, repository } = buildApp();
+
+    const immutable = await app.request(`/accounts/${accountId}/settings`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ liveWindowDays: 180 })
+    });
+    expect(immutable.status).toBe(400);
+    await expect(immutable.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(repository.updateAccountSettings).not.toHaveBeenCalled();
+
+    const invalid = await app.request(`/accounts/${accountId}/settings`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ maxBackfillRate: "fast" })
+    });
+    expect(invalid.status).toBe(400);
+    expect(repository.updateAccountSettings).not.toHaveBeenCalled();
+
+    const valid = await app.request(`/accounts/${accountId}/settings`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        historicalBackfillMode: "metadata_only",
+        archiveRefreshInterval: "weekly",
+        archiveFlagSync: true,
+        maxBackfillRate: "aggressive"
+      })
+    });
+    expect(valid.status).toBe(200);
+    await expect(valid.json()).resolves.toMatchObject({
+      account: {
+        historical_backfill_mode: "metadata_only",
+        archive_refresh_interval: "weekly",
+        archive_flag_sync: true,
+        max_backfill_rate: "aggressive",
+        live_window_days: 90
+      }
+    });
+    expect(repository.updateAccountSettings).toHaveBeenCalledWith(accountId, {
+      historicalBackfillMode: "metadata_only",
+      archiveRefreshInterval: "weekly",
+      archiveFlagSync: true,
+      maxBackfillRate: "aggressive"
+    });
   });
 
   it("uses the SupaMail CLI name", async () => {

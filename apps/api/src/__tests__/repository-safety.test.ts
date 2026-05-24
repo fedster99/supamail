@@ -96,6 +96,25 @@ describe("repository safety", () => {
     expect(source).toContain("!manuallyTracked");
   });
 
+  it("updates only mutable account lane settings", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("updateAccountSettings");
+    expect(source).toContain("historical_backfill_mode = COALESCE($2::text, historical_backfill_mode)");
+    expect(source).toContain("archive_refresh_interval = COALESCE($3::text, archive_refresh_interval)");
+    expect(source).toContain("archive_flag_sync = COALESCE($4::boolean, archive_flag_sync)");
+    expect(source).toContain("max_backfill_rate = COALESCE($5::text, max_backfill_rate)");
+    expect(source).not.toContain("live_window_days =");
+  });
+
+  it("rejects account settings patches that try to mutate live_window_days", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/api.ts"), "utf8");
+
+    expect(source).toContain("live_window_days is immutable after account creation");
+    expect(source).toContain("liveWindowDays");
+    expect(source).toContain("live_window_days");
+  });
+
   it("tombstones folder messages after the missing grace expires", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 

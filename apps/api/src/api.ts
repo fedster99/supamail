@@ -10,12 +10,13 @@ import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
 import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
-import type { AccountSummary, ImapFolder, ImapMessage, SyncResult } from "./types.js";
+import type { AccountSummary, ImapFolder, ImapMessage, SyncResult, UpdateAccountSettingsInput } from "./types.js";
 
 interface ApiRepository {
   listAccounts(): Promise<AccountSummary[]>;
   createAccount(input: unknown): Promise<AccountSummary>;
   getAccount(id: string): Promise<unknown | null>;
+  updateAccountSettings(accountId: string, input: UpdateAccountSettingsInput): Promise<AccountSummary | null>;
   trackFolder(accountId: string, path: string): Promise<ImapFolder | null>;
   getMessage(id: string): Promise<ImapMessage | null>;
 }
@@ -55,6 +56,38 @@ const CREATE_ACCOUNT_SCHEMA = z.object({
 
 const TRACK_FOLDER_SCHEMA = z.object({
   path: z.string().min(1).max(1024)
+});
+
+const MUTABLE_ACCOUNT_SETTING_KEYS = [
+  "historicalBackfillMode",
+  "archiveRefreshInterval",
+  "archiveFlagSync",
+  "maxBackfillRate"
+] as const;
+
+const ACCOUNT_SETTINGS_SCHEMA = z.object({
+  historicalBackfillMode: z.enum(["off", "metadata_only", "metadata_and_bodies"]).optional(),
+  archiveRefreshInterval: z.enum(["never", "monthly", "weekly"]).optional(),
+  archiveFlagSync: z.boolean().optional(),
+  maxBackfillRate: z.enum(["small", "normal", "aggressive"]).optional(),
+  liveWindowDays: z.unknown().optional(),
+  live_window_days: z.unknown().optional()
+}).strict().superRefine((input, ctx) => {
+  const immutablePath = "liveWindowDays" in input ? "liveWindowDays" : "live_window_days" in input ? "live_window_days" : null;
+  if (immutablePath) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [immutablePath],
+      message: "live_window_days is immutable after account creation"
+    });
+  }
+
+  if (!MUTABLE_ACCOUNT_SETTING_KEYS.some((key) => input[key] !== undefined)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "At least one mutable account setting is required"
+    });
+  }
 });
 
 class NotFoundError extends Error {
@@ -168,6 +201,23 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const folder = await options.repository.trackFolder(id, input.path);
     if (!folder) throw new NotFoundError(`Folder not found: ${input.path}`);
     return c.json({ folder });
+  });
+
+  app.patch("/accounts/:id/settings", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const raw = await parseJsonBody(c);
+    const parsed = ACCOUNT_SETTINGS_SCHEMA.parse(raw);
+    const input: UpdateAccountSettingsInput = {
+      historicalBackfillMode: parsed.historicalBackfillMode,
+      archiveRefreshInterval: parsed.archiveRefreshInterval,
+      archiveFlagSync: parsed.archiveFlagSync,
+      maxBackfillRate: parsed.maxBackfillRate
+    };
+    const updated = await options.repository.updateAccountSettings(id, input);
+    if (!updated) throw new NotFoundError(`Account not found: ${id}`);
+    return c.json({ account: updated });
   });
 
   app.post("/messages/:id/refetch-body", async (c) => {
