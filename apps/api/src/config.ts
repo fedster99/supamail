@@ -19,6 +19,7 @@ const envSchema = z.object({
     .default("priority_then_backfill"),
   BODY_RAW_MAX_BYTES: z.coerce.number().int().positive().default(25 * 1024 * 1024),
   BODY_BACKFILL_BATCH_SIZE: z.coerce.number().int().positive().default(25),
+  MAX_BODY_BATCHES_PER_TICK: z.coerce.number().int().positive().default(4),
   INITIAL_SYNC_BATCH_SIZE: z.coerce.number().int().positive().default(50),
   INCREMENTAL_SYNC_BATCH_SIZE: z.coerce.number().int().positive().default(50),
   INCREMENTAL_TOTAL_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),

@@ -184,6 +184,7 @@ export interface SyncResult {
   bodiesFetched: number;
   flagsUpdated: number;
   reconcileGapsFound: number;
+  hitLockBudget: boolean;
   errors: string[];
 }
 

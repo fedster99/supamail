@@ -10,6 +10,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Store raw and normalized Message-ID separately.
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.
 - Attachment metadata is stored during sync; binary attachment fetching is not part of the current core path.
+- Body backlog draining is capped per tick so recent-body work cannot consume the whole lock window forever.
 
 ## Concurrency And Connections
 
@@ -18,6 +19,9 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - `DATABASE_URL` must be direct or session-affine. Transaction poolers are unsafe for this architecture.
 - Worker startup must fail if advisory lock self-test fails.
 - Stale lock recovery must be heartbeat-based and conservative.
+- `MAX_LOCK_HOLD_MS` is a cooperative fairness budget. It is checked at safe boundaries, not by killing in-flight IMAP commands.
+- Priority folders may finish past the lock budget; non-priority folders and body batches stop at the next safe boundary.
+- A `hitLockBudget` cycle is normal completion and must not reset backoff counters.
 
 ## Folder And UID Semantics
 

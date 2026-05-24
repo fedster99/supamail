@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { closePool, getPool } from "../db.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { MirrorImapClient } from "../imap-client.js";
@@ -524,6 +524,231 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(after.consecutive_successes).toBe(before.consecutive_successes + 1);
     expect(after.consecutive_failures).toBe(0);
     expect(after.sync_state).toBe("DEGRADED");
+  });
+
+  it("Scenario G.1 — lock budget still allows priority folders and skips lower priority work", async () => {
+    const h = await setupIntegration("G-priority-budget", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      MAX_LOCK_HOLD_MS: 1
+    });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 100,
+        messages: [makeTextMessage({ uid: 1, subject: "priority", from: "a@x.test", to: "u@x.test", body: "priority" })]
+      },
+      {
+        path: "Project-Charlie",
+        delimiter: "/",
+        uidValidity: 200,
+        messages: [makeTextMessage({ uid: 1, subject: "rr", from: "b@x.test", to: "u@x.test", body: "rr" })]
+      }
+    ];
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+
+    class BudgetExpiredAfterListClient extends FixtureImapClient {
+      async list() {
+        const listed = await super.list();
+        now += 10;
+        return listed;
+      }
+    }
+
+    try {
+      const engine = h.buildEngine({
+        folders,
+        clientFactory: async () => new BudgetExpiredAfterListClient(folders) as unknown as MirrorImapClient
+      });
+      const result = await engine.syncAccount(h.account.id, "manual");
+
+      expect(result.outcome).toBe("success");
+      expect(result.hitLockBudget).toBe(true);
+      expect(result.foldersProcessed).toBe(1);
+      expect(result.bodiesFetched).toBe(0);
+
+      const rows = await h.pool.query<{ folder_path: string; count: string }>(
+        `
+        SELECT folder_path, count(*)::text AS count
+        FROM public.imap_messages
+        WHERE account_id = $1
+        GROUP BY folder_path
+        ORDER BY folder_path
+        `,
+        [h.account.id]
+      );
+      expect(rows.rows).toEqual([{ folder_path: "INBOX", count: "1" }]);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("Scenario G.2/G.3 — non-priority sync exits at batch boundaries without resetting backoff", async () => {
+    const h = await setupIntegration("G-rr-budget", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      INCREMENTAL_SYNC_BATCH_SIZE: 1,
+      MAX_LOCK_HOLD_MS: 5
+    });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "Project-Delta",
+        delimiter: "/",
+        uidValidity: 300,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "seed-1", from: "a@x.test", to: "u@x.test", body: "seed-1" }),
+          makeTextMessage({ uid: 2, subject: "seed-2", from: "a@x.test", to: "u@x.test", body: "seed-2" }),
+          makeTextMessage({ uid: 3, subject: "seed-3", from: "a@x.test", to: "u@x.test", body: "seed-3" })
+        ]
+      }
+    ];
+    const seedEngine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_LOCK_HOLD_MS: 600_000 } });
+    await seedEngine.syncAccount(h.account.id, "manual");
+    const seeded = await h.pool.query<{
+      initial_sync_complete: boolean;
+      last_uid: string | null;
+      count: string;
+    }>(
+      `
+      SELECT f.initial_sync_complete, f.last_uid, count(m.id)::text AS count
+      FROM public.imap_folders f
+      LEFT JOIN public.imap_messages m ON m.account_id = f.account_id AND m.folder_path = f.path
+      WHERE f.account_id = $1 AND f.path = 'Project-Delta'
+      GROUP BY f.id
+      `,
+      [h.account.id]
+    );
+    expect(seeded.rows[0]).toMatchObject({
+      initial_sync_complete: true,
+      last_uid: "3",
+      count: "3"
+    });
+
+    folders[0].messages.push(
+      makeTextMessage({ uid: 4, subject: "new-4", from: "a@x.test", to: "u@x.test", body: "new-4" }),
+      makeTextMessage({ uid: 5, subject: "new-5", from: "a@x.test", to: "u@x.test", body: "new-5" }),
+      makeTextMessage({ uid: 6, subject: "new-6", from: "a@x.test", to: "u@x.test", body: "new-6" })
+    );
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET consecutive_successes = 7,
+          consecutive_failures = 2,
+          current_backoff_ms = 1234,
+          backoff_until = now() - interval '1 second'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    await dueAllFolders(h.pool, h.account.id);
+
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+
+    class BudgetExpiredAfterMetadataFetchClient extends FixtureImapClient {
+      async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        for await (const message of super.fetch(range, query)) {
+          yield message;
+        }
+        if (Array.isArray(range)) now += 10;
+      }
+    }
+
+    try {
+      const engine = h.buildEngine({
+        folders,
+        clientFactory: async () => new BudgetExpiredAfterMetadataFetchClient(folders) as unknown as MirrorImapClient
+      });
+      const result = await engine.syncAccount(h.account.id, "manual");
+
+      expect(result.outcome).toBe("success");
+      expect(result.hitLockBudget).toBe(true);
+      expect(result.messagesUpserted).toBe(1);
+
+      const folder = await h.pool.query<{ last_uid: string | null }>(
+        "SELECT last_uid FROM public.imap_folders WHERE account_id = $1 AND path = 'Project-Delta'",
+        [h.account.id]
+      );
+      expect(Number(folder.rows[0].last_uid)).toBe(4);
+
+      const uids = await h.pool.query<{ uid: string }>(
+        `
+        SELECT uid::text AS uid
+        FROM public.imap_messages
+        WHERE account_id = $1 AND folder_path = 'Project-Delta'
+        ORDER BY uid
+        `,
+        [h.account.id]
+      );
+      expect(uids.rows.map((row) => Number(row.uid))).toEqual([1, 2, 3, 4]);
+
+      const account = await h.pool.query<{
+        consecutive_successes: number;
+        consecutive_failures: number;
+        current_backoff_ms: number;
+        backoff_until: Date | null;
+      }>(
+        `
+        SELECT consecutive_successes, consecutive_failures, current_backoff_ms, backoff_until
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [h.account.id]
+      );
+      expect(account.rows[0].consecutive_successes).toBe(7);
+      expect(account.rows[0].consecutive_failures).toBe(2);
+      expect(account.rows[0].current_backoff_ms).toBe(1234);
+      expect(account.rows[0].backoff_until).not.toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("caps body backlog batches per tick", async () => {
+    const h = await setupIntegration("G-body-cap", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 2,
+      MAX_BODY_BATCHES_PER_TICK: 2
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 400,
+        messages: Array.from({ length: 7 }, (_, index) => makeTextMessage({
+          uid: index + 1,
+          subject: `body-${index + 1}`,
+          from: "a@x.test",
+          to: "u@x.test",
+          body: `body-${index + 1}`
+        }))
+      }
+    ];
+
+    const engine = h.buildEngine({ folders });
+    const result = await engine.syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(4);
+
+    const bodyCount = await h.pool.query<{ count: string }>(
+      `
+      SELECT count(*)::text AS count
+      FROM public.imap_messages
+      WHERE account_id = $1 AND body_fetched_at IS NOT NULL
+      `,
+      [h.account.id]
+    );
+    expect(Number(bodyCount.rows[0].count)).toBe(4);
   });
 });
 

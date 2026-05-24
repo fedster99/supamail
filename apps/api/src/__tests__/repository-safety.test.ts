@@ -41,7 +41,7 @@ describe("repository safety", () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("const sanitizedErrors = result.errors.map(sanitizeErrorReason)");
-    expect(source).toContain("JSON.stringify({ errors: sanitizedErrors })");
+    expect(source).toContain("JSON.stringify({ errors: sanitizedErrors, hitLockBudget: result.hitLockBudget })");
   });
 
   it("does not hold account locks with idle transactions", async () => {
@@ -110,8 +110,9 @@ describe("repository safety", () => {
   it("treats PARTIAL_SUCCESS as a success for counter rules (spec §12.2)", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    // PARTIAL block must increment successes, not failures.
-    expect(source).toMatch(/markAccountSyncPartial[\s\S]{0,800}consecutive_successes = consecutive_successes \+ 1/);
+    // PARTIAL block must increment successes, not failures, unless the cycle
+    // hit the cooperative lock budget and should stay neutral for backoff.
+    expect(source).toMatch(/markAccountSyncPartial[\s\S]{0,1000}WHEN \$3::boolean THEN consecutive_successes \+ 1/);
     expect(source).not.toMatch(/markAccountSyncPartial[\s\S]{0,500}consecutive_failures = consecutive_failures \+ 1/);
   });
 

@@ -41,6 +41,7 @@ function makeSyncResult(): SyncResult {
     bodiesFetched: 0,
     flagsUpdated: 0,
     reconcileGapsFound: 0,
+    hitLockBudget: false,
     errors: []
   };
 }

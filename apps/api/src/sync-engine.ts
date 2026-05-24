@@ -52,6 +52,15 @@ type FolderAliasFingerprint = {
   sample: string[];
 };
 
+type FolderSyncResult = {
+  messagesUpserted: number;
+  flagsUpdated: number;
+  reconcileGapsFound: number;
+  reconcileAttempted: boolean;
+  flagScanAttempted: boolean;
+  hitLockBudget: boolean;
+};
+
 export function isAuthError(message: string): boolean {
   return AUTH_ERROR_PATTERNS.some((p) => p.test(message));
 }
@@ -118,10 +127,12 @@ export class MirrorEngine {
       bodiesFetched: 0,
       flagsUpdated: 0,
       reconcileGapsFound: 0,
+      hitLockBudget: false,
       errors: []
     };
 
     const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async () => {
+      const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
       await this.repository.markAccountSyncStarted(account.id, `supamail:${process.pid}`);
       let client: MirrorImapClient | null = null;
 
@@ -137,15 +148,26 @@ export class MirrorEngine {
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
         for (const folder of folders) {
+          const isPriorityFolder = folder.sync_priority <= this.config.PRIORITY_CUTOFF;
+          if (this.isLockBudgetExpired(lockDeadline) && !isPriorityFolder) {
+            result.hitLockBudget = true;
+            break;
+          }
+
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
               allowReconcile: remainingReconciles > 0,
-              allowFlagScan: remainingFlagScans > 0
+              allowFlagScan: remainingFlagScans > 0,
+              enforceLockDeadline: !isPriorityFolder,
+              lockDeadline
             });
             result.foldersProcessed += 1;
             result.messagesUpserted += folderResult.messagesUpserted;
             result.flagsUpdated += folderResult.flagsUpdated;
             result.reconcileGapsFound += folderResult.reconcileGapsFound;
+            if (folderResult.hitLockBudget || this.isLockBudgetExpired(lockDeadline)) {
+              result.hitLockBudget = true;
+            }
             if (folderResult.reconcileAttempted) remainingReconciles -= 1;
             if (folderResult.flagScanAttempted) remainingFlagScans -= 1;
             await this.repository.heartbeat(account.id);
@@ -162,7 +184,13 @@ export class MirrorEngine {
           }
         }
 
-        result.bodiesFetched += await this.fetchBodyBacklog(account, client);
+        if (this.isLockBudgetExpired(lockDeadline)) {
+          result.hitLockBudget = true;
+        } else {
+          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
+          result.bodiesFetched += bodyResult.fetched;
+          if (bodyResult.hitLockBudget) result.hitLockBudget = true;
+        }
 
         if (result.errors.length > 0) {
           result.outcome = priorityFolderFailed ? "failed" : "partial_success";
@@ -171,9 +199,13 @@ export class MirrorEngine {
         if (result.outcome === "failed") {
           await this.repository.markAccountSyncFailed(account.id, result.errors.join("; "));
         } else if (result.outcome === "partial_success") {
-          await this.repository.markAccountSyncPartial(account.id, result.errors.join("; "));
+          await this.repository.markAccountSyncPartial(account.id, result.errors.join("; "), {
+            countsTowardBackoff: !result.hitLockBudget
+          });
         } else {
-          await this.repository.markAccountSyncSucceeded(account.id);
+          await this.repository.markAccountSyncSucceeded(account.id, {
+            countsTowardBackoff: !result.hitLockBudget
+          });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -371,14 +403,13 @@ export class MirrorEngine {
     account: ImapAccount,
     folder: ImapFolder,
     client: MirrorImapClient,
-    options: { allowReconcile: boolean; allowFlagScan: boolean }
-  ): Promise<{
-    messagesUpserted: number;
-    flagsUpdated: number;
-    reconcileGapsFound: number;
-    reconcileAttempted: boolean;
-    flagScanAttempted: boolean;
-  }> {
+    options: {
+      allowReconcile: boolean;
+      allowFlagScan: boolean;
+      enforceLockDeadline: boolean;
+      lockDeadline: number;
+    }
+  ): Promise<FolderSyncResult> {
     await this.repository.markFolderSyncStarted(folder.id);
     const mailboxLock = await client.getMailboxLock(folder.path);
 
@@ -410,7 +441,8 @@ export class MirrorEngine {
           flagsUpdated: 0,
           reconcileGapsFound: 0,
           reconcileAttempted: false,
-          flagScanAttempted: false
+          flagScanAttempted: false,
+          hitLockBudget: false
         };
       }
 
@@ -420,6 +452,7 @@ export class MirrorEngine {
       let reconcileGapsFound = 0;
       let reconcileAttempted = false;
       let flagScanAttempted = false;
+      let hitLockBudget = false;
 
       // Spec §10.4: initial sync is snapshot-based and newest-first, with a
       // watermark (`initial_sync_oldest_uid_synced`) so a crash mid-backfill
@@ -438,7 +471,8 @@ export class MirrorEngine {
           flagsUpdated: 0,
           reconcileGapsFound: 0,
           reconcileAttempted: false,
-          flagScanAttempted: false
+          flagScanAttempted: false,
+          hitLockBudget: this.folderHitLockBudget(options)
         };
       }
 
@@ -459,6 +493,7 @@ export class MirrorEngine {
       ].sort((a, b) => a - b);
 
       const incrementalBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+      let lastProcessedUid: number | undefined;
       for (let i = 0; i < incomingUids.length; i += incrementalBatchSize) {
         const batchUids = incomingUids.slice(i, i + incrementalBatchSize);
         const metadata = await this.withIncrementalDeadline(
@@ -478,10 +513,16 @@ export class MirrorEngine {
         for (const message of messages) {
           await this.hooks.onMessageUpsert?.(message);
         }
+        lastProcessedUid = batchUids[batchUids.length - 1];
+        if (this.folderHitLockBudget(options)) {
+          hitLockBudget = true;
+          break;
+        }
       }
 
       const flagScanDue = !folder.next_flag_scan_at || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
-      if (flagScanDue && options.allowFlagScan) {
+      if (this.folderHitLockBudget(options)) hitLockBudget = true;
+      if (!hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
         const flagScanDeadline = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
         const flagCutoff = new Date();
@@ -523,12 +564,13 @@ export class MirrorEngine {
         }
       }
 
+      if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
       const reconcileDue = !folder.last_full_reconcile_at
         || !folder.next_reconcile_at
         || new Date(folder.next_reconcile_at).getTime() <= Date.now();
       let backfilled = 0;
-      if (options.allowReconcile && reconcileDue) {
+      if (!hitLockBudget && options.allowReconcile && reconcileDue) {
         reconcileAttempted = true;
         const reconcileDeadline = Date.now() + this.config.RECONCILE_TOTAL_TIMEOUT_MS;
         // Spec §10.7: only reconcile once initial sync is complete and only
@@ -591,6 +633,10 @@ export class MirrorEngine {
             for (const message of messages) {
               await this.hooks.onMessageUpsert?.(message);
             }
+            if (this.folderHitLockBudget(options)) {
+              hitLockBudget = true;
+              break;
+            }
           }
           await this.repository.logEvent(
             account.id,
@@ -609,7 +655,7 @@ export class MirrorEngine {
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
-        lastUid: incomingUids.length > 0 ? incomingUids[incomingUids.length - 1] : undefined,
+        lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,
         flagScanCompleted: flagScanAttempted ? true : undefined
@@ -620,7 +666,8 @@ export class MirrorEngine {
         flagsUpdated,
         reconcileGapsFound,
         reconcileAttempted,
-        flagScanAttempted
+        flagScanAttempted,
+        hitLockBudget
       };
     } finally {
       mailboxLock.release();
@@ -707,6 +754,14 @@ export class MirrorEngine {
       return;
     }
     void client.logout().catch(() => undefined);
+  }
+
+  private isLockBudgetExpired(deadline: number): boolean {
+    return Date.now() >= deadline;
+  }
+
+  private folderHitLockBudget(options: { enforceLockDeadline: boolean; lockDeadline: number }): boolean {
+    return options.enforceLockDeadline && this.isLockBudgetExpired(options.lockDeadline);
   }
 
   // Spec §10.4: process ONE batch per cycle, newest-first, advancing the
@@ -823,16 +878,36 @@ export class MirrorEngine {
     return { messagesUpserted: messages.length };
   }
 
-  private async fetchBodyBacklog(account: ImapAccount, client: MirrorImapClient): Promise<number> {
-    const backlog = await this.repository.getBodyBacklog(account, this.config.BODY_BACKFILL_BATCH_SIZE);
+  private async fetchBodyBacklog(
+    account: ImapAccount,
+    client: MirrorImapClient,
+    lockDeadline: number
+  ): Promise<{ fetched: number; hitLockBudget: boolean }> {
     let fetched = 0;
+    let hitLockBudget = false;
 
-    for (const message of backlog) {
-      await this.fetchAndStoreBody(client, message);
-      fetched += 1;
+    for (let batch = 0; batch < this.config.MAX_BODY_BATCHES_PER_TICK; batch += 1) {
+      if (this.isLockBudgetExpired(lockDeadline)) {
+        hitLockBudget = true;
+        break;
+      }
+
+      const backlog = await this.repository.getBodyBacklog(account, this.config.BODY_BACKFILL_BATCH_SIZE);
+      if (backlog.length === 0) break;
+
+      for (const message of backlog) {
+        await this.fetchAndStoreBody(client, message);
+        fetched += 1;
+      }
+
+      if (backlog.length < this.config.BODY_BACKFILL_BATCH_SIZE) break;
+      if (this.isLockBudgetExpired(lockDeadline)) {
+        hitLockBudget = true;
+        break;
+      }
     }
 
-    return fetched;
+    return { fetched, hitLockBudget };
   }
 
   private async fetchAndStoreBody(client: MirrorImapClient, message: ImapMessage): Promise<void> {

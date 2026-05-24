@@ -187,7 +187,7 @@ export class MirrorRepository {
         result.flagsUpdated,
         result.reconcileGapsFound,
         sanitizedErrors[0] ?? null,
-        JSON.stringify({ errors: sanitizedErrors })
+        JSON.stringify({ errors: sanitizedErrors, hitLockBudget: result.hitLockBudget })
       ]
     );
   }
@@ -218,7 +218,11 @@ export class MirrorRepository {
     );
   }
 
-  async markAccountSyncSucceeded(accountId: string): Promise<void> {
+  async markAccountSyncSucceeded(
+    accountId: string,
+    options: { countsTowardBackoff?: boolean } = {}
+  ): Promise<void> {
+    const countsTowardBackoff = options.countsTowardBackoff ?? true;
     await this.pool.query(
       `
       WITH folder_health AS (
@@ -302,13 +306,22 @@ export class MirrorRepository {
           WHEN (folder_health.overall_lag_seconds * 1000) > $5 THEN 'OVERALL_SYNC_LAG'
           ELSE NULL
         END,
-        consecutive_successes = consecutive_successes + 1,
-        consecutive_failures = 0,
+        consecutive_successes = CASE
+          WHEN $8::boolean THEN consecutive_successes + 1
+          ELSE consecutive_successes
+        END,
+        consecutive_failures = CASE
+          WHEN $8::boolean THEN 0
+          ELSE consecutive_failures
+        END,
         current_backoff_ms = CASE
-          WHEN consecutive_successes + 1 >= 3 THEN 0
+          WHEN $8::boolean AND consecutive_successes + 1 >= 3 THEN 0
           ELSE current_backoff_ms
         END,
-        backoff_until = NULL
+        backoff_until = CASE
+          WHEN $8::boolean THEN NULL
+          ELSE backoff_until
+        END
       FROM folder_health
       WHERE id = $1
       `,
@@ -319,7 +332,8 @@ export class MirrorRepository {
         this.config.PRIORITY_LAG_HEALTHY_THRESHOLD_MS,
         this.config.OVERALL_LAG_HEALTHY_THRESHOLD_MS,
         this.config.PRIORITY_RECONCILE_HEALTHY_MAX_AGE_MS,
-        this.config.OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS
+        this.config.OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS,
+        countsTowardBackoff
       ]
     );
   }
@@ -328,7 +342,12 @@ export class MirrorRepository {
   // round-robin folders didn't. Counters increment as if it were SUCCESS
   // (consecutive_successes++, failures=0); sync_state stays DEGRADED until
   // round-robin folders catch up.
-  async markAccountSyncPartial(accountId: string, error: string): Promise<void> {
+  async markAccountSyncPartial(
+    accountId: string,
+    error: string,
+    options: { countsTowardBackoff?: boolean } = {}
+  ): Promise<void> {
+    const countsTowardBackoff = options.countsTowardBackoff ?? true;
     await this.pool.query(
       `
       UPDATE public.imap_accounts
@@ -339,16 +358,25 @@ export class MirrorRepository {
         last_heartbeat_at = now(),
         sync_state = 'DEGRADED',
         sync_state_reason = $2,
-        consecutive_successes = consecutive_successes + 1,
-        consecutive_failures = 0,
+        consecutive_successes = CASE
+          WHEN $3::boolean THEN consecutive_successes + 1
+          ELSE consecutive_successes
+        END,
+        consecutive_failures = CASE
+          WHEN $3::boolean THEN 0
+          ELSE consecutive_failures
+        END,
         current_backoff_ms = CASE
-          WHEN consecutive_successes + 1 >= 3 THEN 0
+          WHEN $3::boolean AND consecutive_successes + 1 >= 3 THEN 0
           ELSE current_backoff_ms
         END,
-        backoff_until = NULL
+        backoff_until = CASE
+          WHEN $3::boolean THEN NULL
+          ELSE backoff_until
+        END
       WHERE id = $1
       `,
-      [accountId, sanitizeErrorReason(error)]
+      [accountId, sanitizeErrorReason(error), countsTowardBackoff]
     );
   }
 

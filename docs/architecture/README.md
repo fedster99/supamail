@@ -32,6 +32,7 @@ The worker and API share the same repository and account-locking model. Any IMAP
 - Tracked session handoff: `SESSION_HANDOFF.md`
 - Agent operating guide: `docs/agent/README.md`
 - Reliability invariants: `docs/agent/reliability-invariants.md`
+- Reliability hardening plan: `docs/architecture/reliability-and-three-lanes.md`
 - Architecture decisions: `docs/architecture/decisions/`
 - Docs / harness impact reminder: `scripts/check-harness-impact.mjs`
 
