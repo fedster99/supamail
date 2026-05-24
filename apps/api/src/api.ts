@@ -8,14 +8,15 @@ import { z } from "zod";
 import { getConfig, type AppConfig } from "./config.js";
 import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
 import { HostValidationError } from "./host-validation.js";
-import { MirrorRepository } from "./repository.js";
+import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
-import type { AccountSummary, ImapMessage, SyncResult } from "./types.js";
+import type { AccountSummary, ImapFolder, ImapMessage, SyncResult } from "./types.js";
 
 interface ApiRepository {
   listAccounts(): Promise<AccountSummary[]>;
   createAccount(input: unknown): Promise<AccountSummary>;
   getAccount(id: string): Promise<unknown | null>;
+  trackFolder(accountId: string, path: string): Promise<ImapFolder | null>;
   getMessage(id: string): Promise<ImapMessage | null>;
 }
 
@@ -50,6 +51,10 @@ const CREATE_ACCOUNT_SCHEMA = z.object({
   password: z.string().min(1).max(1024),
   providerProfile: z.string().min(1).max(64).optional(),
   bodyFetchPolicy: z.enum(["immediate", "lazy", "priority_then_backfill"]).optional()
+});
+
+const TRACK_FOLDER_SCHEMA = z.object({
+  path: z.string().min(1).max(1024)
 });
 
 class NotFoundError extends Error {
@@ -91,6 +96,9 @@ export function createApiApp(options: ApiAppOptions): Hono {
     }
     if (err instanceof NotFoundError) {
       return c.json({ error: "not_found", message: err.message }, 404);
+    }
+    if (err instanceof FolderTrackingRejectedError) {
+      return c.json({ error: err.code, message: err.message }, 400);
     }
     if (err instanceof z.ZodError) {
       return c.json({ error: "invalid_input", issues: err.issues }, 400);
@@ -149,6 +157,17 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
     const result = await options.engine.syncAccount(id, "api");
     return c.json({ result });
+  });
+
+  app.post("/accounts/:id/folders/track", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const raw = await parseJsonBody(c);
+    const input = TRACK_FOLDER_SCHEMA.parse(raw);
+    const folder = await options.repository.trackFolder(id, input.path);
+    if (!folder) throw new NotFoundError(`Folder not found: ${input.path}`);
+    return c.json({ folder });
   });
 
   app.post("/messages/:id/refetch-body", async (c) => {

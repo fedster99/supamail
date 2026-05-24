@@ -1143,6 +1143,55 @@ async function scenarioFolderCountCap() {
       `reason=${enforced.sync_state_reason}`
     );
 
+    const optedIn = await repository.trackFolder(account.id, "Archive-003");
+    assert(optedIn?.tracked === true, "operator can opt in one capped folder", `tracked=${optedIn?.tracked}`);
+    assert(optedIn?.excluded_reason === null, "opted-in folder clears cap exclusion", `excluded=${optedIn?.excluded_reason}`);
+    await pool.query("UPDATE public.imap_accounts SET next_folder_discovery_at = now() - interval '1 second' WHERE id = $1", [
+      account.id
+    ]);
+    const optedInCycle = await enforcedEngine.syncAccount(account.id, "manual");
+    const optedInAfterDiscovery = (
+      await pool.query<{
+        tracked: boolean;
+        excluded_reason: string | null;
+        cap_excluded_current_count: string;
+      }>(
+        `
+        SELECT
+          f.tracked,
+          f.excluded_reason,
+          (
+            SELECT count(*)::text
+            FROM public.imap_folders capped
+            WHERE capped.account_id = f.account_id
+              AND capped.status != 'MISSING'
+              AND capped.missing_since IS NULL
+              AND capped.excluded_reason = 'folder_count_cap_exceeded'
+          ) AS cap_excluded_current_count
+        FROM public.imap_folders f
+        WHERE f.account_id = $1
+          AND f.path = 'Archive-003'
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(optedInCycle.outcome === "success", "opt-in rediscovery cycle succeeds", optedInCycle.errors.join("|"));
+    assert(
+      optedInAfterDiscovery.tracked === true,
+      "opted-in folder stays tracked after rediscovery",
+      `tracked=${optedInAfterDiscovery.tracked}`
+    );
+    assert(
+      optedInAfterDiscovery.excluded_reason === null,
+      "opted-in folder stays non-excluded after rediscovery",
+      `excluded=${optedInAfterDiscovery.excluded_reason}`
+    );
+    assert(
+      Number(optedInAfterDiscovery.cap_excluded_current_count) === 247,
+      "opt-in keeps only one extra non-priority folder tracked",
+      `excluded=${optedInAfterDiscovery.cap_excluded_current_count}`
+    );
+
     const recoveredFolders = makeEmptyFolders(45);
     const recoveredEngine = new MirrorEngine({
       pool,
@@ -1193,6 +1242,149 @@ async function scenarioFolderCountCap() {
   }
 }
 
+async function scenarioPendingVerificationRediscovery() {
+  console.log("\nScenario K: missing-mailbox errors pause folder sync and force rediscovery");
+  const { pool, config, repository, account } = await setup("pending-verification", {
+    INITIAL_SYNC_BATCH_SIZE: 50,
+    MAX_RR_FOLDERS_PER_CYCLE: 5
+  });
+  try {
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 61_001,
+        messages: [makeTextMessage({ uid: 1, subject: "inbox", from: "a@x.test", to: "u@x.test", body: "inbox" })]
+      },
+      {
+        path: "Project-Alpha",
+        delimiter: "/",
+        uidValidity: 61_002,
+        messages: [makeTextMessage({ uid: 1, subject: "project", from: "b@x.test", to: "u@x.test", body: "project" })]
+      }
+    ];
+    const initialEngine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new FixtureImapClient(folders)
+    });
+    const initial = await initialEngine.syncAccount(account.id, "manual");
+    assert(initial.outcome === "success", "initial two-folder cycle succeeds", initial.errors.join("|"));
+
+    class MissingProjectClient extends FixtureImapClient {
+      async getMailboxLock(path: string) {
+        if (path === "Project-Alpha") {
+          throw Object.assign(new Error("NO [NONEXISTENT] Mailbox doesn't exist"), {
+            serverResponseCode: "NONEXISTENT"
+          });
+        }
+        return super.getMailboxLock(path);
+      }
+    }
+
+    const missingEngine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new MissingProjectClient(folders) as unknown as MirrorImapClient
+    });
+    await dueAllFolders(pool, account.id);
+    const missing = await missingEngine.syncAccount(account.id, "manual");
+    assert(
+      missing.outcome === "partial_success",
+      "missing non-priority mailbox yields partial_success",
+      `outcome=${missing.outcome} errors=${missing.errors.join("|")}`
+    );
+    assert(
+      missing.errors.some((error) => error.includes("Project-Alpha")),
+      "missing-mailbox error names the folder",
+      missing.errors.join("|")
+    );
+
+    const pending = (
+      await pool.query<{
+        status: string;
+        missing_since: Date | null;
+        next_folder_discovery_is_due: boolean;
+        event_count: string;
+      }>(
+        `
+        SELECT
+          f.status,
+          f.missing_since,
+          a.next_folder_discovery_at <= now() + interval '5 seconds' AS next_folder_discovery_is_due,
+          (
+            SELECT count(*)::text
+            FROM public.imap_sync_events e
+            WHERE e.account_id = a.id
+              AND e.folder_path = f.path
+              AND e.event_type = 'FOLDER_PENDING_VERIFICATION'
+          ) AS event_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+          AND f.path = 'Project-Alpha'
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(
+      pending.status === "PENDING_VERIFICATION",
+      "missing mailbox moves folder to PENDING_VERIFICATION",
+      `status=${pending.status}`
+    );
+    assert(pending.missing_since !== null, "missing mailbox stamps missing_since", `missing_since=${pending.missing_since}`);
+    assert(
+      pending.next_folder_discovery_is_due === true,
+      "missing mailbox forces near-term folder discovery",
+      `due=${pending.next_folder_discovery_is_due}`
+    );
+    assert(Number(pending.event_count) === 1, "pending-verification event is logged", `events=${pending.event_count}`);
+
+    const dueWhilePending = await repository.getFoldersDueForSync(account.id);
+    assert(
+      !dueWhilePending.some((folder) => folder.path === "Project-Alpha"),
+      "PENDING_VERIFICATION folder is skipped by scheduler",
+      `due=${dueWhilePending.map((folder) => folder.path).join(",")}`
+    );
+
+    const freshAccount = await repository.getAccount(account.id);
+    if (!freshAccount) throw new Error("missing account during Scenario K");
+    await repository.upsertDiscoveredFolders(
+      freshAccount,
+      folders.map((folder) => ({
+        path: folder.path,
+        delimiter: folder.delimiter,
+        specialUse: folder.specialUse
+      }))
+    );
+    const revived = (
+      await pool.query<{ status: string; missing_since: Date | null }>(
+        `SELECT status, missing_since FROM public.imap_folders WHERE account_id = $1 AND path = 'Project-Alpha'`,
+        [account.id]
+      )
+    ).rows[0];
+    assert(revived.status === "PENDING", "rediscovery revives folder to PENDING", `status=${revived.status}`);
+    assert(revived.missing_since === null, "rediscovery clears missing_since", `missing_since=${revived.missing_since}`);
+
+    await dueAllFolders(pool, account.id);
+    const recovered = await initialEngine.syncAccount(account.id, "manual");
+    const active = (
+      await pool.query<{ status: string; missing_since: Date | null }>(
+        `SELECT status, missing_since FROM public.imap_folders WHERE account_id = $1 AND path = 'Project-Alpha'`,
+        [account.id]
+      )
+    ).rows[0];
+    assert(recovered.outcome === "success", "recovered folder sync succeeds", recovered.errors.join("|"));
+    assert(active.status === "ACTIVE", "recovered folder returns to ACTIVE", `status=${active.status}`);
+    assert(active.missing_since === null, "recovered folder stays non-missing", `missing_since=${active.missing_since}`);
+  } finally {
+    await teardown(pool, account.id);
+  }
+}
+
 async function main(): Promise<void> {
   console.log("SupaMail Tier-1 spec conformance — exercising real Postgres + fixture IMAP\n");
   console.log(`DATABASE_URL=${process.env.DATABASE_URL?.replace(/:[^@:]*@/, ":***@")}`);
@@ -1206,6 +1398,7 @@ async function main(): Promise<void> {
   await scenarioInitialSyncStallTimeout();
   await scenarioStuckDegradedEscalation();
   await scenarioFolderCountCap();
+  await scenarioPendingVerificationRediscovery();
 
   const passed = results.filter((r) => r.passed).length;
   const failed = results.filter((r) => !r.passed).length;

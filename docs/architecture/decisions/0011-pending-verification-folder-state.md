@@ -16,19 +16,19 @@ Add `PENDING_VERIFICATION` to `imap_folders.status`.
 
 `getFoldersDueForSync` excludes `PENDING_VERIFICATION` so normal sync does not keep selecting that folder. `upsertDiscoveredFolders` moves a reappeared `PENDING_VERIFICATION` folder back to `PENDING`, allowing the next sync cycle to rehydrate it naturally.
 
-PR-4 lands the schema and scheduler support. PR-5 will wire missing-mailbox error detection in `syncFolder`, set `next_folder_discovery_at = now()`, and transition affected folders into `PENDING_VERIFICATION`.
+PR-4 landed the schema and scheduler support. PR-5 wires missing-mailbox error detection in `syncFolder`, sets `next_folder_discovery_at = now()`, and transitions affected folders into `PENDING_VERIFICATION`.
 
 ## Consequences
 
 - The schema can represent "needs rediscovery before more sync attempts" without abusing `MISSING`.
-- Normal folder scheduling is safe before the reactive missing-mailbox handler lands.
+- Normal folder scheduling pauses affected folders until discovery verifies them.
 - Reappeared folders recover through the existing discovery/upsert path.
 
 ## Verification
 
 - Schema tests prove the public migration extends the status constraint.
 - Repository safety tests prove `PENDING_VERIFICATION` is excluded from normal scheduling and discovery can move it back to `PENDING`.
-- PR-5 will add Scenario K for the full missing-mailbox path.
+- Scenario K proves the full missing-mailbox path: error detection, forced discovery, scheduler exclusion, rediscovery revival, and return to `ACTIVE`.
 
 ## References
 

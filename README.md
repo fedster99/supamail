@@ -40,6 +40,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 - Attachment and inline-part metadata
 - Sync runs, sync events, health, lag, retries, and backoff
 - Folder-count safeguards for unusually large mailboxes
+- Reactive rediscovery when a provider reports a mailbox no longer exists
 - Provider profiles for generic IMAP and provider-specific quirks
 
 ## How It Works

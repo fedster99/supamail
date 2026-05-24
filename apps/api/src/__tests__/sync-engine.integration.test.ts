@@ -1151,6 +1151,41 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(enforced.sync_state).toBe("DEGRADED");
     expect(enforced.sync_state_reason).toBe("TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG");
 
+    const optedIn = await h.repository.trackFolder(h.account.id, "Archive-003");
+    expect(optedIn?.tracked).toBe(true);
+    expect(optedIn?.excluded_reason).toBeNull();
+    await forceFolderDiscovery(h.pool, h.account.id);
+    expect((await enforcedEngine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+
+    const optedInAfterDiscovery = (
+      await h.pool.query<{
+        tracked: boolean;
+        excluded_reason: string | null;
+        cap_excluded_current_count: string;
+      }>(
+        `
+        SELECT
+          f.tracked,
+          f.excluded_reason,
+          (
+            SELECT count(*)::text
+            FROM public.imap_folders capped
+            WHERE capped.account_id = f.account_id
+              AND capped.status != 'MISSING'
+              AND capped.missing_since IS NULL
+              AND capped.excluded_reason = 'folder_count_cap_exceeded'
+          ) AS cap_excluded_current_count
+        FROM public.imap_folders f
+        WHERE f.account_id = $1
+          AND f.path = 'Archive-003'
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(optedInAfterDiscovery.tracked).toBe(true);
+    expect(optedInAfterDiscovery.excluded_reason).toBeNull();
+    expect(Number(optedInAfterDiscovery.cap_excluded_current_count)).toBe(247);
+
     const recoveredFolders = buildEmptyFolders(45);
     const recoveredEngine = h.buildEngine({ folders: recoveredFolders });
     await forceFolderDiscovery(h.pool, h.account.id);
@@ -1189,6 +1224,119 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(recovered.cap_excluded_current_count)).toBe(0);
     expect(recovered.sync_state).toBe("HEALTHY");
     expect(recovered.sync_state_reason).toBeNull();
+  });
+
+  it("Scenario K — missing-mailbox errors force rediscovery and pause folder sync", async () => {
+    const h = await setupIntegration("K-pending-verification", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 61_001,
+        messages: [makeTextMessage({ uid: 1, subject: "inbox", from: "a@x.test", to: "u@x.test", body: "inbox" })]
+      },
+      {
+        path: "Project-Alpha",
+        delimiter: "/",
+        uidValidity: 61_002,
+        messages: [makeTextMessage({ uid: 1, subject: "project", from: "b@x.test", to: "u@x.test", body: "project" })]
+      }
+    ];
+
+    const initialEngine = h.buildEngine({ folders });
+    expect((await initialEngine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+
+    class MissingProjectClient extends FixtureImapClient {
+      async getMailboxLock(path: string) {
+        if (path === "Project-Alpha") {
+          throw Object.assign(new Error("NO [NONEXISTENT] Mailbox doesn't exist"), {
+            serverResponseCode: "NONEXISTENT"
+          });
+        }
+        return super.getMailboxLock(path);
+      }
+    }
+
+    const missingEngine = h.buildEngine({
+      folders,
+      clientFactory: async () => new MissingProjectClient(folders) as unknown as MirrorImapClient
+    });
+    await dueAllFolders(h.pool, h.account.id);
+    const missing = await missingEngine.syncAccount(h.account.id, "manual");
+    expect(missing.outcome).toBe("partial_success");
+    expect(missing.errors.join("|")).toContain("Project-Alpha");
+
+    const pending = (
+      await h.pool.query<{
+        status: string;
+        missing_since: Date | null;
+        next_folder_discovery_is_due: boolean;
+        event_count: string;
+      }>(
+        `
+        SELECT
+          f.status,
+          f.missing_since,
+          a.next_folder_discovery_at <= now() + interval '5 seconds' AS next_folder_discovery_is_due,
+          (
+            SELECT count(*)::text
+            FROM public.imap_sync_events e
+            WHERE e.account_id = a.id
+              AND e.folder_path = f.path
+              AND e.event_type = 'FOLDER_PENDING_VERIFICATION'
+          ) AS event_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+          AND f.path = 'Project-Alpha'
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(pending.status).toBe("PENDING_VERIFICATION");
+    expect(pending.missing_since).not.toBeNull();
+    expect(pending.next_folder_discovery_is_due).toBe(true);
+    expect(Number(pending.event_count)).toBe(1);
+
+    const dueWhilePending = await h.repository.getFoldersDueForSync(h.account.id);
+    expect(dueWhilePending.map((folder) => folder.path)).not.toContain("Project-Alpha");
+
+    const account = await h.repository.getAccount(h.account.id);
+    expect(account).not.toBeNull();
+    await h.repository.upsertDiscoveredFolders(
+      account!,
+      folders.map((folder) => ({
+        path: folder.path,
+        delimiter: folder.delimiter,
+        specialUse: folder.specialUse
+      }))
+    );
+    const revived = (
+      await h.pool.query<{ status: string; missing_since: Date | null }>(
+        `SELECT status, missing_since FROM public.imap_folders WHERE account_id = $1 AND path = 'Project-Alpha'`,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(revived.status).toBe("PENDING");
+    expect(revived.missing_since).toBeNull();
+
+    await dueAllFolders(h.pool, h.account.id);
+    const recovered = await initialEngine.syncAccount(h.account.id, "manual");
+    expect(recovered.outcome).toBe("success");
+    const active = (
+      await h.pool.query<{ status: string; missing_since: Date | null }>(
+        `SELECT status, missing_since FROM public.imap_folders WHERE account_id = $1 AND path = 'Project-Alpha'`,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(active.status).toBe("ACTIVE");
+    expect(active.missing_since).toBeNull();
   });
 });
 

@@ -81,6 +81,19 @@ describe("repository safety", () => {
     expect(source).toContain("PENDING_VERIFICATION");
     expect(source).toContain("status NOT IN ('MISSING', 'PENDING_VERIFICATION')");
     expect(source).toContain("public.imap_folders.status IN ('MISSING', 'PENDING_VERIFICATION')");
+    expect(source).toContain("markFolderPendingVerification");
+    expect(source).toContain("next_folder_discovery_at = now()");
+    expect(source).toContain("FOLDER_PENDING_VERIFICATION");
+  });
+
+  it("persists manual folder opt-ins across folder-count cap rediscovery", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("MANUAL_TRACK_OVERRIDE_NOTE");
+    expect(source).toContain("manual_track_override");
+    expect(source).toContain("trackFolder");
+    expect(source).toContain("last_progress_note = $3");
+    expect(source).toContain("!manuallyTracked");
   });
 
   it("tombstones folder messages after the missing grace expires", async () => {

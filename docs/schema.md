@@ -22,7 +22,9 @@ Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY
 
 `imap_accounts.folder_count_cap_override` lets operators raise the folder-count enforce threshold for known-large accounts. Without an override, `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, and `FOLDER_COUNT_ENFORCE_THRESHOLD` records `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG` while tracking only priority folders such as INBOX and Sent.
 
-`imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a future missing-mailbox verification pass. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
+`POST /accounts/:id/folders/track` lets operators opt an existing non-provider-excluded folder back into sync past the folder-count cap. The opt-in is persisted on the folder so the next discovery pass does not reapply `folder_count_cap_exceeded` to that path.
+
+`imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a missing-mailbox verification pass. Missing-mailbox errors stamp `missing_since`, force `imap_accounts.next_folder_discovery_at = now()`, and move the folder into `PENDING_VERIFICATION`. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
 
 ## Migration Boundaries
 

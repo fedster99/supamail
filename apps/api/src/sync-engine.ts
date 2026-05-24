@@ -33,6 +33,15 @@ const AUTH_ERROR_PATTERNS = [
   /\b535\b/, // SMTP/IMAP auth fail code
 ];
 
+const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
+const MISSING_MAILBOX_PATTERNS = [
+  /\bNONEXISTENT\b/i,
+  /\bTRYCREATE\b/i,
+  /does not exist/i,
+  /no such mailbox/i,
+  /mailbox not found/i
+];
+
 const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
 const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
 const FOLDER_ALIAS_SAMPLE_SIZE = 5;
@@ -63,6 +72,33 @@ type FolderSyncResult = {
 
 export function isAuthError(message: string): boolean {
   return AUTH_ERROR_PATTERNS.some((p) => p.test(message));
+}
+
+export function isMissingMailboxError(error: unknown): boolean {
+  const responseCode = extractImapResponseCode(error);
+  if (responseCode) {
+    return MISSING_MAILBOX_RESPONSE_CODES.has(responseCode);
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return MISSING_MAILBOX_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+function extractImapResponseCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = error as {
+    serverResponseCode?: unknown;
+    responseCode?: unknown;
+    responseStatus?: unknown;
+  };
+  for (const raw of [
+    candidate.serverResponseCode,
+    candidate.responseCode,
+    candidate.responseStatus
+  ]) {
+    if (typeof raw === "string" && raw.trim()) return raw.trim().toUpperCase();
+  }
+  return null;
 }
 
 // Thrown when the engine has already persisted the account's terminal state
@@ -179,6 +215,14 @@ export class MirrorEngine {
             if (error instanceof AccountAlreadyFinalizedError) throw error;
             const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
             const message = error instanceof Error ? error.message : String(error);
+            if (isMissingMailboxError(error)) {
+              await this.repository.markFolderPendingVerification(
+                account.id,
+                folder.id,
+                folder.path,
+                message
+              );
+            }
             if (folder.sync_priority <= this.config.PRIORITY_CUTOFF) priorityFolderFailed = true;
             result.errors.push(sanitizeErrorReason(`${sanitizedPath}: ${message}`));
           }

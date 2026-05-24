@@ -30,6 +30,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Exclude dangerous/system folders such as Spam/Junk, Trash/Deleted, Drafts, and All Mail by default.
 - Do not exclude Archive by default.
 - Folder-count caps warn at the configured threshold and enforce by tracking only priority folders; current provider count is based on the latest successful LIST, so accounts recover automatically when the provider folder count drops.
+- Missing-mailbox errors must move the folder to `PENDING_VERIFICATION`, stamp `missing_since`, and set `next_folder_discovery_at = now()` on the account.
 - `PENDING_VERIFICATION` folders are not scheduled for normal sync; rediscovery can move them back to `PENDING` when they reappear.
 - UIDVALIDITY changes invalidate prior UID references for that folder.
 - UIDVALIDITY reset must soft-delete old in-window rows, reset folder sync state, and eventually mark pathological accounts `BROKEN`.

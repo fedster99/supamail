@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
-import type { AccountSummary, SyncResult } from "../types.js";
+import type { AccountSummary, ImapFolder, SyncResult } from "../types.js";
 
 const accountId = "00000000-0000-4000-8000-000000000001";
 const messageId = "00000000-0000-4000-8000-000000000002";
@@ -48,10 +48,53 @@ function makeSyncResult(): SyncResult {
   };
 }
 
+function makeFolder(overrides: Partial<ImapFolder> = {}): ImapFolder {
+  const now = new Date("2026-05-19T00:00:00.000Z");
+  return {
+    id: "00000000-0000-4000-8000-000000000003",
+    account_id: accountId,
+    path: "Archive",
+    delimiter: "/",
+    special_use: null,
+    last_seen_in_provider_at: now,
+    missing_since: null,
+    tracked: true,
+    excluded_reason: null,
+    sync_priority: 100,
+    status: "PENDING",
+    uidvalidity: null,
+    uid_next: null,
+    highest_modseq: null,
+    last_uid: null,
+    last_synced_at: null,
+    initial_sync_complete: false,
+    initial_sync_target_max_uid: null,
+    initial_sync_oldest_uid_synced: null,
+    last_progress_at: null,
+    last_progress_uid: null,
+    last_progress_note: null,
+    next_sync_due_at: null,
+    next_flag_scan_at: null,
+    next_reconcile_at: null,
+    last_full_reconcile_at: null,
+    last_reconcile_clean: null,
+    uidvalidity_reset_count: 0,
+    last_uidvalidity_reset_at: null,
+    backfill_in_progress: false,
+    backfill_target_max_uid: null,
+    backfill_oldest_uid_synced: null,
+    backfill_since_date: null,
+    created_at: now,
+    updated_at: now,
+    ...overrides
+  };
+}
+
 function buildApp(options: {
   apiToken?: string;
   adminToken?: string | null;
   account?: AccountSummary | null;
+  trackFolder?: (accountId: string, path: string) => Promise<ImapFolder | null>;
   createAccount?: (input: unknown) => Promise<AccountSummary>;
   listAccounts?: () => Promise<AccountSummary[]>;
   applyMigration?: () => Promise<void>;
@@ -63,6 +106,7 @@ function buildApp(options: {
       email_address: (input as { emailAddress: string }).emailAddress
     }))),
     getAccount: vi.fn(async () => account),
+    trackFolder: vi.fn(options.trackFolder ?? (async (_accountId: string, path: string) => makeFolder({ path }))),
     getMessage: vi.fn(async () => ({ id: messageId }) as never)
   };
   const engine = {
@@ -192,6 +236,28 @@ describe("API safety", () => {
     });
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({ error: "conflict" });
+  });
+
+  it("validates POST /accounts/:id/folders/track input before enabling a folder", async () => {
+    const { app, repository } = buildApp();
+
+    const invalid = await app.request(`/accounts/${accountId}/folders/track`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ path: "" })
+    });
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(repository.trackFolder).not.toHaveBeenCalled();
+
+    const valid = await app.request(`/accounts/${accountId}/folders/track`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ path: "Archive" })
+    });
+    expect(valid.status).toBe(200);
+    await expect(valid.json()).resolves.toMatchObject({ folder: { path: "Archive", tracked: true } });
+    expect(repository.trackFolder).toHaveBeenCalledWith(accountId, "Archive");
   });
 
   it("uses the SupaMail CLI name", async () => {

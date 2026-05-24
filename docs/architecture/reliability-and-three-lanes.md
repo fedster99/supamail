@@ -182,7 +182,7 @@ Two thresholds:
 
 Per-account override: `folder_count_cap_override int NULL` lets operators raise the enforce threshold for known-large accounts.
 
-New API endpoint, deferred to PR-5: `POST /accounts/:id/folders/track` with `{ path: string }` explicitly opts in a single folder past the cap.
+New API endpoint, landed in PR-5: `POST /accounts/:id/folders/track` with `{ path: string }` explicitly opts in a single existing folder past the cap.
 
 **Auto-recovery.** If the current provider folder count drops back below the threshold on a future discovery (user pruned folders provider-side), the `sync_state_reason` clears and the account can return to HEALTHY. No manual unsticking required.
 
@@ -202,7 +202,7 @@ Detection is centralized in a helper (`isMissingMailboxError(err)`) alongside `i
 
 **Related bug fix:** Today, when LIST omits a folder, it stamps `missing_since` but leaves `tracked = true` and `status != 'MISSING'` until the 7-day grace expires. `getFoldersDueForSync` keeps returning the folder, and `syncFolder` keeps hitting "mailbox doesn't exist" once per 60s tick, for 7 days. ~10,000 failing IMAP commands per orphaned folder per grace period.
 
-Fix: add `PENDING_VERIFICATION` to the `imap_folders.status` CHECK constraint. PR-4 lands the schema support, makes `getFoldersDueForSync` exclude `PENDING_VERIFICATION`, and lets `upsertDiscoveredFolders` transition `PENDING_VERIFICATION → PENDING` when the folder reappears. PR-5 wires the missing-mailbox catch handler to set the state and force near-term discovery.
+Fix: add `PENDING_VERIFICATION` to the `imap_folders.status` CHECK constraint. PR-4 landed the schema support, made `getFoldersDueForSync` exclude `PENDING_VERIFICATION`, and let `upsertDiscoveredFolders` transition `PENDING_VERIFICATION → PENDING` when the folder reappears. PR-5 wired the missing-mailbox catch handler to set the state and force near-term discovery.
 
 ## Schema Changes Summary
 
@@ -269,7 +269,7 @@ By module, what changes:
 
 - **`apps/api/src/config.ts`** — `FOLDER_COUNT_WARN_THRESHOLD` (50) and `FOLDER_COUNT_ENFORCE_THRESHOLD` (200) are now wired. `INITIAL_SYNC_BATCH_TIMEOUT_MS`, `MAX_BODY_BATCHES_PER_TICK`, `MAX_LOCK_HOLD_MS`, and the stuck-degraded thresholds are also wired (see D5, D7, and D8).
 - **`apps/api/src/sync-engine.ts`** — thread `deadline` into hot/body/history phases with the two-tier semantics from D5. Add `isMissingMailboxError(err)` helper alongside `isAuthError`, preferring `err.serverResponseCode` over message regex. Wrap `runInitialSyncBatch` in `withOperationDeadline` (D8). Add missing-mailbox detection in `syncFolder`'s catch (D10). Add the history lane as a new method called after `fetchBodyBacklog`, sliced by `max_backfill_rate`. Thread `hitLockBudget` flag through `SyncResult`. `fetchBodyBacklog` becomes deadline-aware and capped at `MAX_BODY_BATCHES_PER_TICK`.
-- **`apps/api/src/repository.ts`** — update `markAccountSyncSucceeded`/`Partial` to write `last_priority_sync_succeeded_at`; update `markAccountSyncFailed` to add the `STUCK_DEGRADED_24H` / `STUCK_DEGRADED_TERMINAL` branches, including the `backoff_until = now() + interval '1 hour'` write on retryable escalation. Update `getRunnableAccounts`'s WHERE clause to allow `BROKEN` accounts whose reason is `STUCK_DEGRADED_24H` (composing with the existing `backoff_until` filter). Update `upsertDiscoveredFolders` and `markAccountSyncSucceeded` for folder-count cap thresholds (D9). Update `getFoldersDueForSync` to skip `PENDING_VERIFICATION` and discovery to revive it (D10 partial). Later PRs update `upsertMessages`, `storeBody`, `setInitialSyncSnapshot`, `handleUidValidityReset`, add `markFolderPendingVerification`, add history backlog methods, and add archive refresh.
+- **`apps/api/src/repository.ts`** — update `markAccountSyncSucceeded`/`Partial` to write `last_priority_sync_succeeded_at`; update `markAccountSyncFailed` to add the `STUCK_DEGRADED_24H` / `STUCK_DEGRADED_TERMINAL` branches, including the `backoff_until = now() + interval '1 hour'` write on retryable escalation. Update `getRunnableAccounts`'s WHERE clause to allow `BROKEN` accounts whose reason is `STUCK_DEGRADED_24H` (composing with the existing `backoff_until` filter). Update `upsertDiscoveredFolders` and `markAccountSyncSucceeded` for folder-count cap thresholds (D9). Update `getFoldersDueForSync` to skip `PENDING_VERIFICATION` and discovery to revive it (D10 partial). Add `markFolderPendingVerification` and manual folder opt-in for PR-5. Later PRs update `upsertMessages`, `storeBody`, `setInitialSyncSnapshot`, `handleUidValidityReset`, add history backlog methods, and add archive refresh.
 - **`apps/api/src/api.ts`** — extend `GET /accounts/:id` to return the progress columns. Add `POST /accounts/:id/folders/track`. Add `PATCH /accounts/:id/settings` for the new tunables (rejecting `live_window_days`).
 - **`apps/api/src/types.ts`** — extend `ImapAccount`, `ImapFolder`, `SyncResult` with the new fields.
 - **`apps/api/scripts/spec-conformance.ts`** — add scenarios G-M (see §Test Plan).
@@ -283,7 +283,7 @@ By module, what changes:
   - ADR 0008: Cooperative lock budget enforcement
   - ADR 0009: Last-priority-success column for stuck-degraded escalation (landed)
   - ADR 0010: Folder-count cap with priority-only tracking (landed)
-  - ADR 0011: PENDING_VERIFICATION state for missing-mailbox recovery (schema/scheduler support landed; reactive handler in PR-5)
+  - ADR 0011: PENDING_VERIFICATION state for missing-mailbox recovery (schema/scheduler support landed in PR-4; reactive handler landed in PR-5)
   - ADR 0012: Three-lane engine architecture (lands with PR-8)
 - **`README.md`** — update the "What You Get" section to mention progress columns. Update the body-fetch policy section to mention historical backfill.
 - **`docs/agent/feature-list.json`** — `issue-2-historical-backfill` becomes `blocked_by` PRs 1-7.
@@ -321,7 +321,7 @@ Each PR carries its own migration (if any), code, scenario, and doc update. Each
 2. **PR-2: Initial-sync stall timeout.** Add `INITIAL_SYNC_BATCH_TIMEOUT_MS`, wrap `runInitialSyncBatch`. Scenario H. Updates `reliability-invariants.md`. **No migration.**
 3. **PR-3: Stuck-degraded escalation.** Migration: add `last_priority_sync_succeeded_at` column. Wire it in `markAccountSync*`, add the `STUCK_DEGRADED_24H` branch, update `getRunnableAccounts` for retryable BROKEN. Scenario I. Promotes D7 to ADR 0009.
 4. **PR-4: Folder-count cap + PENDING_VERIFICATION state.** Migration: extend `imap_folders.status` CHECK to include `PENDING_VERIFICATION`, add `folder_count_cap_override` column to `imap_accounts`. Wire warn/enforce thresholds. Scenario J. Promotes D9, D10 (partial) to ADRs 0010, 0011. **Landed.**
-5. **PR-5: Reactive rediscovery.** Builds on PR-4. Missing-mailbox detection in `syncFolder`'s catch, set `next_folder_discovery_at = now()` and `status = PENDING_VERIFICATION`. New API endpoint `POST /accounts/:id/folders/track`. Scenario K. Completes ADR 0011.
+5. **PR-5: Reactive rediscovery.** Builds on PR-4. Missing-mailbox detection in `syncFolder`'s catch, set `next_folder_discovery_at = now()` and `status = PENDING_VERIFICATION`. New API endpoint `POST /accounts/:id/folders/track`. Scenario K. Completes ADR 0011. **Landed.**
 6. **PR-6: Per-account settings columns + defaults.** Migration: 5 new columns on `imap_accounts` with `CHECK` constraints. API `PATCH /accounts/:id/settings`. No engine behavior change yet — the columns exist, defaults apply, but the engine doesn't consume them. Sets up PR-8.
 7. **PR-7: Progress columns + per-account roll-up view.** Migration: new `imap_account_progress` view. Extend `GET /accounts/:id` to return progress fields. Scenario M.
 8. **PR-8: Three-lane engine — history lane wiring.** Depends on PR-1 (budget), PR-6 (settings), PR-7 (progress). Adds `getHistoryBacklog`, history lane in `MirrorEngine.syncAccount`, archive refresh pass. Engine consumes `historical_backfill_mode`, `archive_refresh_interval`, `max_backfill_rate`. Scenario L. Promotes D2 to ADR 0012. This IS the historical-backfill feature (closes `issue-2-historical-backfill`).

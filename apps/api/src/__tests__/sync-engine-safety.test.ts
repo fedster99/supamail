@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { isMissingMailboxError } from "../sync-engine.js";
 
 describe("sync engine safety", () => {
   it("does not treat partial folder failures as healthy account syncs", async () => {
@@ -31,6 +32,23 @@ describe("sync engine safety", () => {
 
     expect(source).toContain("isAuthError(message)");
     expect(source).toContain("markAccountSyncAuthFailed");
+  });
+
+  it("detects missing-mailbox errors before forcing folder rediscovery", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(isMissingMailboxError(Object.assign(new Error("Mailbox is gone"), {
+      serverResponseCode: "NONEXISTENT"
+    }))).toBe(true);
+    expect(isMissingMailboxError(Object.assign(new Error("Create it first"), {
+      responseCode: "TRYCREATE"
+    }))).toBe(true);
+    expect(isMissingMailboxError(new Error("No such mailbox: Archive"))).toBe(true);
+    expect(isMissingMailboxError(Object.assign(new Error("No such mailbox"), {
+      serverResponseCode: "OVERQUOTA"
+    }))).toBe(false);
+    expect(source).toContain("isMissingMailboxError(error)");
+    expect(source).toContain("markFolderPendingVerification");
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {

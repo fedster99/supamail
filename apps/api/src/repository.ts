@@ -21,6 +21,8 @@ const BROKEN_FAILURE_THRESHOLD = 10;
 const BACKOFF_FLOOR_MS = 1_000;
 const BACKOFF_CEILING_MS = 5 * 60_000;
 const ERROR_REASON_MAX_LEN = 1000;
+const MANUAL_TRACK_OVERRIDE_NOTE = "manual_track_override";
+const MISSING_MAILBOX_VERIFICATION_NOTE = "missing_mailbox_pending_verification";
 
 const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
 
@@ -43,6 +45,16 @@ export function sanitizeErrorReason(error: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, ERROR_REASON_MAX_LEN);
+}
+
+export class FolderTrackingRejectedError extends Error {
+  constructor(
+    readonly code: "provider_excluded_folder",
+    message: string
+  ) {
+    super(message);
+    this.name = "FolderTrackingRejectedError";
+  }
 }
 
 const ACCOUNT_SUMMARY_COLUMNS = `
@@ -564,15 +576,27 @@ export class MirrorRepository {
     const profile = getProviderProfile(account.provider_profile);
     const rows: ImapFolder[] = [];
     const seen = new Set<string>();
+    const manualOverrides = await this.pool.query<{ path: string }>(
+      `
+      SELECT path
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND last_progress_note = $2
+      `,
+      [account.id, MANUAL_TRACK_OVERRIDE_NOTE]
+    );
+    const manualOverridePaths = new Set(manualOverrides.rows.map((row) => row.path));
     const enforceThreshold = account.folder_count_cap_override ?? this.config.FOLDER_COUNT_ENFORCE_THRESHOLD;
     const enforceFolderCap = folders.length >= enforceThreshold;
 
     for (const folder of folders) {
       seen.add(folder.path);
       const syncPriority = profile.priorityForFolder(folder.path, folder.specialUse);
+      const manuallyTracked = manualOverridePaths.has(folder.path);
       const providerExcludedReason = folder.excludedReasonOverride
         ?? profile.excludedReason(folder.path, folder.specialUse);
-      const capExcludedReason = enforceFolderCap && syncPriority > this.config.PRIORITY_CUTOFF
+      const capExcludedReason = enforceFolderCap && !manuallyTracked && syncPriority > this.config.PRIORITY_CUTOFF
         ? "folder_count_cap_exceeded"
         : null;
       const excludedReason = providerExcludedReason ?? capExcludedReason;
@@ -678,6 +702,116 @@ export class MirrorRepository {
     );
 
     return rows;
+  }
+
+  async markFolderPendingVerification(
+    accountId: string,
+    folderId: string,
+    folderPath: string,
+    reason: string
+  ): Promise<void> {
+    const sanitizedReason = sanitizeErrorReason(reason);
+    const client = await this.pool.connect();
+    await client.query("BEGIN");
+    try {
+      await client.query(
+        `
+        UPDATE public.imap_folders
+        SET status = 'PENDING_VERIFICATION',
+            missing_since = COALESCE(missing_since, now()),
+            last_progress_at = now(),
+            last_progress_note = $3,
+            next_sync_due_at = NULL
+        WHERE account_id = $1
+          AND id = $2
+          AND status != 'MISSING'
+        `,
+        [accountId, folderId, MISSING_MAILBOX_VERIFICATION_NOTE]
+      );
+      await client.query(
+        `
+        UPDATE public.imap_accounts
+        SET next_folder_discovery_at = now()
+        WHERE id = $1
+        `,
+        [accountId]
+      );
+      await client.query(
+        `
+        INSERT INTO public.imap_sync_events (
+          account_id,
+          sync_run_id,
+          message_id,
+          folder_path,
+          provider_uid,
+          event_type,
+          payload
+        )
+        VALUES ($1, NULL, NULL, $2, NULL, 'FOLDER_PENDING_VERIFICATION', $3)
+        `,
+        [
+          accountId,
+          folderPath,
+          JSON.stringify({ reason: sanitizedReason })
+        ]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async trackFolder(accountId: string, path: string): Promise<ImapFolder | null> {
+    const account = await this.getAccount(accountId);
+    if (!account) return null;
+
+    const existing = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND path = $2
+      `,
+      [accountId, path]
+    );
+    const folder = existing.rows[0];
+    if (!folder) return null;
+
+    const providerExcludedReason = getProviderProfile(account.provider_profile).excludedReason(
+      folder.path,
+      folder.special_use
+    );
+    if (providerExcludedReason) {
+      throw new FolderTrackingRejectedError(
+        "provider_excluded_folder",
+        `Folder is excluded by provider profile: ${providerExcludedReason}`
+      );
+    }
+
+    const result = await this.pool.query<ImapFolder>(
+      `
+      UPDATE public.imap_folders
+      SET tracked = true,
+          excluded_reason = NULL,
+          missing_since = NULL,
+          status = CASE
+            WHEN initial_sync_complete = false
+              OR status IN ('MISSING', 'PENDING_VERIFICATION')
+            THEN 'PENDING'
+            ELSE status
+          END,
+          last_progress_note = $3,
+          next_sync_due_at = now()
+      WHERE account_id = $1
+        AND path = $2
+      RETURNING *
+      `,
+      [accountId, path, MANUAL_TRACK_OVERRIDE_NOTE]
+    );
+    return result.rows[0] ?? null;
   }
 
   async getFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
