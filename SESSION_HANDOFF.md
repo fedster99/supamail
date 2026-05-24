@@ -10,8 +10,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- PR checks after `78767e0`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed. Recheck PR status after newer pushes.
-- Working tree has uncommitted public-core hosted-prerequisite changes plus review fixes. Do not assume the PR checks include the current workspace state until pushed.
+- Latest pushed commit: `0a47cde Ignore local skill lock`.
+- PR checks after `0a47cde`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Working tree was clean when this handoff section was refreshed.
 
 ## Current Shape
 
