@@ -10,6 +10,7 @@ import {
 
 const publicMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0001_imap_mirror.sql");
 const stuckDegradedMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0002_stuck_degraded_escalation.sql");
+const folderCapMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0003_folder_count_cap_pending_verification.sql");
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -89,16 +90,19 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0002_stuck_degraded_escalation");
+    expect(version).toBe("0003_folder_count_cap_pending_verification");
     expect(manifest).toEqual({
-      schemaVersion: "0002_stuck_degraded_escalation",
+      schemaVersion: "0003_folder_count_cap_pending_verification",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
-        { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" }
+        { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
+        { id: "0003_folder_count_cap_pending_verification", file: "0003_folder_count_cap_pending_verification.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
     expect(sql).toContain("last_priority_sync_succeeded_at timestamptz");
+    expect(sql).toContain("folder_count_cap_override integer");
+    expect(sql).toContain("'PENDING_VERIFICATION'");
   });
 
   it("adds stuck-degraded escalation state without control-plane tables", async () => {
@@ -106,6 +110,18 @@ describe("initial schema", () => {
 
     expect(sql).toContain("ALTER TABLE public.imap_accounts");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_priority_sync_succeeded_at timestamptz");
+    expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
+  });
+
+  it("adds folder-count cap override and pending verification state without control-plane tables", async () => {
+    const sql = await readFile(folderCapMigrationPath, "utf8");
+
+    expect(sql).toContain("ALTER TABLE public.imap_accounts");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS folder_count_cap_override integer");
+    expect(sql).toContain("DROP CONSTRAINT IF EXISTS imap_folders_status_check");
+    expect(sql).toContain("ADD CONSTRAINT imap_folders_status_check");
+    expect(sql).toContain("'PENDING_VERIFICATION'");
     expect(sql).not.toContain("stripe");
     expect(sql).not.toContain("tenant");
   });

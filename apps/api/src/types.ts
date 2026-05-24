@@ -1,6 +1,6 @@
 export type BodyFetchPolicy = "immediate" | "lazy" | "priority_then_backfill";
 export type SyncState = "INITIAL_SYNC" | "HEALTHY" | "DEGRADED" | "BROKEN" | "PAUSED";
-export type FolderStatus = "PENDING" | "SYNCING" | "ACTIVE" | "NEEDS_FULL_RESYNC" | "MISSING";
+export type FolderStatus = "PENDING" | "SYNCING" | "ACTIVE" | "NEEDS_FULL_RESYNC" | "MISSING" | "PENDING_VERIFICATION";
 export type WindowStatus = "IN_WINDOW" | "EXPIRED" | "HISTORICAL";
 export type SyncRunStatus = "running" | "success" | "partial_success" | "failed";
 export type SyncTriggerType = "scheduled" | "manual" | "api" | "backfill";
@@ -32,6 +32,7 @@ export interface ImapAccount {
   folder_rr_cursor: number;
   last_folder_discovery_at: Date | null;
   next_folder_discovery_at: Date | null;
+  folder_count_cap_override: number | null;
   last_heartbeat_at: Date | null;
   created_at: Date;
   updated_at: Date;
@@ -54,6 +55,7 @@ export interface AccountSummary {
   backoff_until: Date | null;
   last_folder_discovery_at: Date | null;
   next_folder_discovery_at: Date | null;
+  folder_count_cap_override: number | null;
   last_heartbeat_at: Date | null;
   created_at: Date;
   updated_at: Date;

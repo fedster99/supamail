@@ -10,9 +10,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- Last pushed reliability PR-3 implementation commit: `9239f8f Escalate stuck degraded accounts`.
-- PR checks after `9239f8f`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
-- Reliability PR-3 stuck-degraded escalation is implemented, committed, and pushed.
+- Last pushed reliability PR-3 handoff commit: `847c6d5 Refresh PR-3 handoff status`.
+- PR checks after `847c6d5`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Reliability PR-4 folder-count cap plus `PENDING_VERIFICATION` schema/scheduler support is implemented in the current local changes; recheck PR status after commit/push.
 
 ## Current Shape
 
@@ -31,7 +31,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - `.github/workflows/publish-core-image.yml` publishes the public core Docker image to GHCR after the CI workflow succeeds for a push to this repo's `main`; manual dispatch is restricted to the `main` ref.
 - PR-1 of the reliability hardening sequence is implemented: `MAX_LOCK_HOLD_MS` is now enforced cooperatively at safe sync boundaries, `SyncResult.hitLockBudget` records budget hits, body backlog draining is capped by `MAX_BODY_BATCHES_PER_TICK`, and ADR 0008 documents the decision.
 - PR-2 of the reliability hardening sequence is implemented: `INITIAL_SYNC_BATCH_TIMEOUT_MS` bounds initial sync snapshot/search/fetch work, aborts IMAP on timeout, treats the cycle as a transient failure, and preserves the initial-sync watermark for retry.
-- PR-3 of the reliability hardening sequence is implemented locally: `imap_accounts.last_priority_sync_succeeded_at` records priority success, long-stuck `DEGRADED` accounts escalate to retryable `BROKEN` with `STUCK_DEGRADED_24H`, hourly retry uses `backoff_until`, seven-day terminal cutoff uses `STUCK_DEGRADED_TERMINAL`, and ADR 0009 documents the decision.
+- PR-3 of the reliability hardening sequence is implemented: `imap_accounts.last_priority_sync_succeeded_at` records priority success, long-stuck `DEGRADED` accounts escalate to retryable `BROKEN` with `STUCK_DEGRADED_24H`, hourly retry uses `backoff_until`, seven-day terminal cutoff uses `STUCK_DEGRADED_TERMINAL`, and ADR 0009 documents the decision.
+- PR-4 of the reliability hardening sequence is implemented locally: `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, `FOLDER_COUNT_ENFORCE_THRESHOLD` tracks only priority folders and marks the account `DEGRADED` with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`, `folder_count_cap_override` lets operators raise the enforce threshold, and `PENDING_VERIFICATION` is now a scheduler-excluded folder state that discovery can revive.
 - Ignored local env files were seeded for this workspace. Public handoff omits local project refs, generated tokens, API keys, and machine-specific env paths; see `.context/local-setup-handoff.md` when working in this workspace.
 - A workspace Supabase project was created and `apps/api/supabase` is linked through ignored `.temp` files. Public handoff intentionally omits project identifiers; local setup details live in `.context/local-setup-handoff.md`.
 
@@ -58,6 +59,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Public CI action runtime cleanup on 2026-05-24: upgraded `actions/checkout`, `actions/setup-node`, and `pnpm/action-setup` from `v4` to `v6`; upgraded `docker/login-action` from `v3` to `v4` in the GHCR publish workflow. Each upgraded action declares `node24` in `action.yml`.
 - Reliability PR-2 verification on 2026-05-24: `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts --testNamePattern "Scenario H"`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts`, `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api spec-conformance`, and `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed. The expected local Node v26 engine warnings and Node DEP0205 warnings appeared.
 - Reliability PR-3 verification on 2026-05-24: `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts --testNamePattern "Scenario I"`, `pnpm --filter @supamail/api exec vitest run src/__tests__/repository-safety.test.ts src/__tests__/schema.test.ts src/__tests__/target-scheduler.test.ts`, `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api spec-conformance`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts`, and `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed. The live gate applied public migrations twice, ran live DB integration, and finished spec conformance with 67 passes. The expected local Node v26 engine warnings and Node DEP0205 warnings appeared.
+- Reliability PR-4 verification on 2026-05-24: `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts --testNamePattern "Scenario J"`, `pnpm --filter @supamail/api exec vitest run src/__tests__/repository-safety.test.ts src/__tests__/schema.test.ts src/__tests__/target-scheduler.test.ts src/__tests__/api-safety.test.ts`, `pnpm --filter @supamail/api spec-conformance`, and `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed. The live gate applied public migrations twice, ran live DB integration, and finished spec conformance with 84 passes. The expected local Node v26 engine warnings and Node DEP0205 warnings appeared.
 
 ## Durable Decisions
 
@@ -66,6 +68,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Session-affine Postgres is required for advisory locks.
 - `MAX_LOCK_HOLD_MS` is a cooperative account-lock fairness budget: priority folders may complete past the deadline, non-priority/body work stops at safe boundaries, and budget-hit cycles are neutral for backoff counters.
 - Stuck-degraded escalation is driven by `imap_accounts.last_priority_sync_succeeded_at`: priority success refreshes it, retryable `STUCK_DEGRADED_24H` probes hourly without compounding exponential backoff, and `STUCK_DEGRADED_TERMINAL` stops automatic scheduling until operator action.
+- Folder-count caps warn first, then enforce by tracking only priority folders; the cap uses the latest provider LIST count so provider-side pruning recovers automatically.
+- `PENDING_VERIFICATION` is reserved for missing-mailbox verification and is excluded from normal folder scheduling.
 - Hosted cloud must consume a pinned public core image digest/SHA and apply only public mirror migrations to customer BYO databases.
 - Supabase OAuth refresh tokens and generated DB passwords must be encrypted before storage; plaintext secrets must not live in the control-plane DB, logs, tracked env examples, or PRs.
 - V1 IMAP auth is username/password or provider app-password only. Gmail OAuth and Microsoft OAuth are deferred.
@@ -75,7 +79,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Open Risks
 
-- Folder-count explosion cap and reactive rediscovery on missing-mailbox errors remain open deltas in `docs/spec-conformance.md`.
+- Reactive rediscovery on missing-mailbox errors remains an open delta in `docs/spec-conformance.md`; PR-4 only added the `PENDING_VERIFICATION` state and scheduler support.
 - Private `supamail-cloud` repo/app creation and first Vercel web deploy are done outside this public workspace. Supabase Auth setup, Stripe product/webhook setup, Supabase OAuth BYO onboarding, and hosted Fly deploy are still pending there.
 - The public `apps/web` page is now a compact OSS/docs page. Keep richer hosted signup and SaaS copy in `supamail-cloud`.
 
@@ -84,5 +88,5 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
-- Next reliability hardening slice: PR-4 folder-count cap plus `PENDING_VERIFICATION` schema support, per `docs/architecture/reliability-and-three-lanes.md`.
+- Next reliability hardening slice: PR-5 reactive rediscovery with missing-mailbox detection, `PENDING_VERIFICATION` transitions, forced discovery, and folder opt-in endpoint, per `docs/architecture/reliability-and-three-lanes.md`.
 - Next hosted setup step: continue in private `supamail-cloud` with Supabase Auth + Stripe Checkout/webhook using the public contracts in `docs/hosted-cloud-contracts.md`.

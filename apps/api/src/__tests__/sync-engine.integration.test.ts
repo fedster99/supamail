@@ -18,6 +18,57 @@ const DB_AVAILABLE = Boolean(process.env.DATABASE_URL);
 // demand. Without a DB the unit suite still runs — these scenarios just skip.
 const integration = DB_AVAILABLE ? describe : describe.skip;
 
+function buildEmptyFolders(count: number): FixtureFolder[] {
+  const folders: FixtureFolder[] = [
+    {
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 50_001,
+      messages: []
+    },
+    {
+      path: "Sent",
+      delimiter: "/",
+      specialUse: "\\Sent",
+      uidValidity: 50_002,
+      messages: []
+    }
+  ];
+
+  for (let i = folders.length; i < count; i += 1) {
+    folders.push({
+      path: `Archive-${String(i + 1).padStart(3, "0")}`,
+      delimiter: "/",
+      uidValidity: 50_000 + i + 1,
+      messages: []
+    });
+  }
+
+  return folders;
+}
+
+async function markCurrentTrackedFoldersClean(h: { pool: ReturnType<typeof getPool>; repository: { markAccountSyncSucceeded(accountId: string): Promise<void> }; account: { id: string } }): Promise<void> {
+  await h.pool.query(
+    `
+    UPDATE public.imap_folders
+    SET status = 'ACTIVE',
+        uidvalidity = COALESCE(uidvalidity, 1),
+        last_uid = COALESCE(last_uid, 0),
+        initial_sync_complete = true,
+        last_synced_at = now(),
+        last_full_reconcile_at = now(),
+        last_reconcile_clean = true,
+        next_sync_due_at = now() + interval '1 minute'
+    WHERE account_id = $1
+      AND tracked = true
+      AND missing_since IS NULL
+    `,
+    [h.account.id]
+  );
+  await h.repository.markAccountSyncSucceeded(h.account.id);
+}
+
 integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   const activeAccountIds: string[] = [];
 
@@ -1019,6 +1070,125 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     const manuallyClearedRunnable = await h.repository.getRunnableAccounts(10);
     expect(manuallyClearedRunnable.map((account) => account.id)).toContain(h.account.id);
+  });
+
+  it("Scenario J — folder-count cap warns, enforces INBOX/Sent-only tracking, then auto-recovers", async () => {
+    const h = await setupIntegration("J-folder-count-cap", {
+      FOLDER_COUNT_WARN_THRESHOLD: 50,
+      FOLDER_COUNT_ENFORCE_THRESHOLD: 200,
+      MAX_PRIORITY_FOLDERS_PER_CYCLE: 10,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+
+    const warningFolders = buildEmptyFolders(60);
+    const warningEngine = h.buildEngine({ folders: warningFolders });
+    expect((await warningEngine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+    await markCurrentTrackedFoldersClean(h);
+
+    let warning = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        current_count: string;
+        tracked_current_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL)::text AS current_count,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL AND f.tracked = true)::text AS tracked_current_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(Number(warning.current_count)).toBe(60);
+    expect(Number(warning.tracked_current_count)).toBe(60);
+    expect(warning.sync_state).toBe("HEALTHY");
+    expect(warning.sync_state_reason).toBe("MANY_FOLDERS_PERFORMANCE_NOTE");
+
+    const largeFolders = buildEmptyFolders(250);
+    const enforcedEngine = h.buildEngine({ folders: largeFolders });
+    await forceFolderDiscovery(h.pool, h.account.id);
+    expect((await enforcedEngine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+    await markCurrentTrackedFoldersClean(h);
+
+    const enforced = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        current_count: string;
+        tracked_current_count: string;
+        cap_excluded_current_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL)::text AS current_count,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL AND f.tracked = true)::text AS tracked_current_count,
+          count(f.*) FILTER (
+            WHERE f.status != 'MISSING'
+              AND f.missing_since IS NULL
+              AND f.excluded_reason = 'folder_count_cap_exceeded'
+          )::text AS cap_excluded_current_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(Number(enforced.current_count)).toBe(250);
+    expect(Number(enforced.tracked_current_count)).toBe(2);
+    expect(Number(enforced.cap_excluded_current_count)).toBe(248);
+    expect(enforced.sync_state).toBe("DEGRADED");
+    expect(enforced.sync_state_reason).toBe("TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG");
+
+    const recoveredFolders = buildEmptyFolders(45);
+    const recoveredEngine = h.buildEngine({ folders: recoveredFolders });
+    await forceFolderDiscovery(h.pool, h.account.id);
+    expect((await recoveredEngine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+    await markCurrentTrackedFoldersClean(h);
+
+    const recovered = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        current_count: string;
+        tracked_current_count: string;
+        cap_excluded_current_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL)::text AS current_count,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL AND f.tracked = true)::text AS tracked_current_count,
+          count(f.*) FILTER (
+            WHERE f.status != 'MISSING'
+              AND f.missing_since IS NULL
+              AND f.excluded_reason = 'folder_count_cap_exceeded'
+          )::text AS cap_excluded_current_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(Number(recovered.current_count)).toBe(45);
+    expect(Number(recovered.tracked_current_count)).toBe(45);
+    expect(Number(recovered.cap_excluded_current_count)).toBe(0);
+    expect(recovered.sync_state).toBe("HEALTHY");
+    expect(recovered.sync_state_reason).toBeNull();
   });
 });
 

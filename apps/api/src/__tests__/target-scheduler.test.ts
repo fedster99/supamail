@@ -5,7 +5,7 @@ import {
   type RuntimeTargetTask
 } from "../target-scheduler.js";
 
-const requiredSchemaVersion = "0002_stuck_degraded_escalation";
+const requiredSchemaVersion = "0003_folder_count_cap_pending_verification";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -20,6 +20,10 @@ Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY
 
 `imap_accounts.last_priority_sync_succeeded_at` records the last sync cycle where priority folders succeeded. It powers stuck-degraded escalation: after the configured 24h threshold, a degraded account becomes retryable `BROKEN` with reason `STUCK_DEGRADED_24H`; after the terminal threshold, it becomes `STUCK_DEGRADED_TERMINAL`.
 
+`imap_accounts.folder_count_cap_override` lets operators raise the folder-count enforce threshold for known-large accounts. Without an override, `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, and `FOLDER_COUNT_ENFORCE_THRESHOLD` records `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG` while tracking only priority folders such as INBOX and Sent.
+
+`imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a future missing-mailbox verification pass. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
+
 ## Migration Boundaries
 
 Public mirror migrations live under `apps/api/supabase/migrations/public/` and are the only migrations that `pnpm migrate`, the CLI, and the API `/migrate` endpoint apply. The manifest in that directory records the ordered public migration ids and required public schema version for hosted deploy gates.

@@ -26,6 +26,7 @@ function makeAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
     backoff_until: null,
     last_folder_discovery_at: null,
     next_folder_discovery_at: null,
+    folder_count_cap_override: null,
     last_heartbeat_at: null,
     created_at: now,
     updated_at: now,

@@ -14,6 +14,8 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0007-public-core-hosted-cloud-contract.md`: Public core publishes the pinned image, public migrations, and runtime contracts consumed by private hosted cloud.
 - `0008-cooperative-account-lock-budget.md`: Account lock hold time is enforced cooperatively at safe sync boundaries.
 - `0009-stuck-degraded-escalation.md`: Long-stuck degraded accounts escalate to retryable, then terminal, broken states.
+- `0010-folder-count-cap-priority-tracking.md`: Large folder counts warn first, then enforce priority-only tracking with automatic recovery.
+- `0011-pending-verification-folder-state.md`: Missing-mailbox verification uses a scheduler-excluded folder state.
 
 ## Status Values
 

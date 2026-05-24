@@ -43,6 +43,7 @@ SupaMail owns a conservative mailbox mirror:
 | Flag scans must be budgeted. | Implemented | Priority and round-robin flag scan intervals are separate, and `MAX_FLAG_SCANS_PER_CYCLE` limits per-cycle work. |
 | Exclude folder explosions such as Spam/Trash/All Mail by default. | Implemented | Provider profiles exclude dangerous/system folders including SPECIAL-USE `\All` and `All Mail`. |
 | Archive-like folders are not excluded by default. | Implemented | Provider profile tests cover that archive folders stay trackable unless explicitly configured otherwise. |
+| Folder-count explosions must not silently overload sync. | Implemented | `FOLDER_COUNT_WARN_THRESHOLD` adds `MANY_FOLDERS_PERFORMANCE_NOTE`; `FOLDER_COUNT_ENFORCE_THRESHOLD` keeps only priority folders tracked with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`; spec-conformance Scenario J proves warn, enforce, and auto-recovery. |
 | Missing folders get a grace period before tombstoning. | Implemented | Folder discovery stamps `missing_since`; past grace marks folder `MISSING` and tombstones in-window rows. |
 | UIDVALIDITY resets trigger controlled resync and a rolling reset cap. | Implemented | Reset handler tombstones old rows, resets folder state, and marks account `BROKEN` after the configured 24h cap. |
 | Health must not lie. | Implemented | Account health stays `INITIAL_SYNC`/`DEGRADED` until tracked folders, lag, and reconcile state are actually clean. |
@@ -83,7 +84,6 @@ Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge 
 
 These old-spec ideas are still useful, but they are not part of the current implemented contract:
 
-- Folder-count explosion cap: SupaMail excludes dangerous folders and caps accounts, but does not yet enforce a `MAX_TRACKED_FOLDERS_PER_ACCOUNT` policy that degrades the account and requires manual folder configuration.
 - Reactive folder rediscovery: SupaMail has due-based discovery and missing-folder grace, but does not yet force immediate rediscovery when a folder operation fails with a missing-mailbox error.
 - Stable metrics and alerts: the worker logs structured events and writes sync records, but this repo does not yet define production metric names or alert thresholds as a public contract.
 - Provider-specific live account CI: the open-source project uses deterministic fixtures, GreenMail smoke tests, and disposable Postgres. Live provider compatibility is tracked separately as issue #3.

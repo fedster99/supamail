@@ -39,6 +39,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 - Parsed text, HTML, normalized text, and parser metadata
 - Attachment and inline-part metadata
 - Sync runs, sync events, health, lag, retries, and backoff
+- Folder-count safeguards for unusually large mailboxes
 - Provider profiles for generic IMAP and provider-specific quirks
 
 ## How It Works

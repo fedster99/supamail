@@ -8,7 +8,7 @@
  * Usage: DATABASE_URL=… IMAP_ENCRYPTION_KEY=… IMAP_ALLOW_PRIVATE_HOSTS=true \
  *        pnpm tsx scripts/spec-conformance.ts
  */
-import { getConfig } from "../src/config.js";
+import { getConfig, type AppConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { MirrorRepository } from "../src/repository.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../src/smoke/fixture-imap.js";
@@ -65,7 +65,37 @@ function makeFolders(): FixtureFolder[] {
   ];
 }
 
-async function setup(suite: string) {
+function makeEmptyFolders(count: number): FixtureFolder[] {
+  const folders: FixtureFolder[] = [
+    {
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 50_001,
+      messages: []
+    },
+    {
+      path: "Sent",
+      delimiter: "/",
+      specialUse: "\\Sent",
+      uidValidity: 50_002,
+      messages: []
+    }
+  ];
+
+  for (let i = folders.length; i < count; i += 1) {
+    folders.push({
+      path: `Archive-${String(i + 1).padStart(3, "0")}`,
+      delimiter: "/",
+      uidValidity: 50_000 + i + 1,
+      messages: []
+    });
+  }
+
+  return folders;
+}
+
+async function setup(suite: string, overrides: Partial<AppConfig> = {}) {
   const pool = getPool();
   await applyPublicMigrations(pool);
   const config = {
@@ -74,7 +104,8 @@ async function setup(suite: string) {
     BODY_BACKFILL_BATCH_SIZE: 5,
     INITIAL_SYNC_BATCH_SIZE: 2,
     INCREMENTAL_SYNC_BATCH_SIZE: 5,
-    IMAP_ALLOW_PRIVATE_HOSTS: true
+    IMAP_ALLOW_PRIVATE_HOSTS: true,
+    ...overrides
   };
   const email = `spec-conformance-${suite}-${Date.now()}@example.test`;
   const repository = new MirrorRepository(pool, config);
@@ -102,6 +133,31 @@ async function dueAllFolders(pool: Awaited<ReturnType<typeof setup>>["pool"], ac
      WHERE account_id = $1`,
     [accountId]
   );
+}
+
+async function markCurrentTrackedFoldersClean(
+  pool: Awaited<ReturnType<typeof setup>>["pool"],
+  repository: MirrorRepository,
+  accountId: string
+) {
+  await pool.query(
+    `
+    UPDATE public.imap_folders
+    SET status = 'ACTIVE',
+        uidvalidity = COALESCE(uidvalidity, 1),
+        last_uid = COALESCE(last_uid, 0),
+        initial_sync_complete = true,
+        last_synced_at = now(),
+        last_full_reconcile_at = now(),
+        last_reconcile_clean = true,
+        next_sync_due_at = now() + interval '1 minute'
+    WHERE account_id = $1
+      AND tracked = true
+      AND missing_since IS NULL
+    `,
+    [accountId]
+  );
+  await repository.markAccountSyncSucceeded(accountId);
 }
 
 async function scenarioInitialSyncWatermark() {
@@ -988,6 +1044,155 @@ async function scenarioStuckDegradedEscalation() {
   }
 }
 
+async function scenarioFolderCountCap() {
+  console.log("\nScenario J: folder-count cap warns, enforces INBOX/Sent-only tracking, then auto-recovers");
+  const { pool, config, repository, account } = await setup("folder-count-cap", {
+    FOLDER_COUNT_WARN_THRESHOLD: 50,
+    FOLDER_COUNT_ENFORCE_THRESHOLD: 200,
+    MAX_PRIORITY_FOLDERS_PER_CYCLE: 10,
+    MAX_RR_FOLDERS_PER_CYCLE: 5
+  });
+  try {
+    const warningFolders = makeEmptyFolders(60);
+    const warningEngine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new FixtureImapClient(warningFolders)
+    });
+    const warningInitial = await warningEngine.syncAccount(account.id, "manual");
+    await markCurrentTrackedFoldersClean(pool, repository, account.id);
+    const warning = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        current_count: string;
+        tracked_current_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL)::text AS current_count,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL AND f.tracked = true)::text AS tracked_current_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(warningInitial.outcome === "success", "60-folder initial cycle succeeds", warningInitial.errors.join("|"));
+    assert(Number(warning.current_count) === 60, "60-folder provider count is current", `count=${warning.current_count}`);
+    assert(Number(warning.tracked_current_count) === 60, "60-folder warning keeps all folders tracked", `tracked=${warning.tracked_current_count}`);
+    assert(warning.sync_state === "HEALTHY", "60-folder warning remains HEALTHY-eligible", `state=${warning.sync_state}`);
+    assert(
+      warning.sync_state_reason === "MANY_FOLDERS_PERFORMANCE_NOTE",
+      "60-folder warning records performance note",
+      `reason=${warning.sync_state_reason}`
+    );
+
+    const largeFolders = makeEmptyFolders(250);
+    const enforcedEngine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new FixtureImapClient(largeFolders)
+    });
+    await pool.query("UPDATE public.imap_accounts SET next_folder_discovery_at = now() - interval '1 second' WHERE id = $1", [
+      account.id
+    ]);
+    const enforcedInitial = await enforcedEngine.syncAccount(account.id, "manual");
+    await markCurrentTrackedFoldersClean(pool, repository, account.id);
+    const enforced = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        current_count: string;
+        tracked_current_count: string;
+        cap_excluded_current_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL)::text AS current_count,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL AND f.tracked = true)::text AS tracked_current_count,
+          count(f.*) FILTER (
+            WHERE f.status != 'MISSING'
+              AND f.missing_since IS NULL
+              AND f.excluded_reason = 'folder_count_cap_exceeded'
+          )::text AS cap_excluded_current_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(enforcedInitial.outcome === "success", "250-folder initial cycle succeeds", enforcedInitial.errors.join("|"));
+    assert(Number(enforced.current_count) === 250, "250-folder provider count is current", `count=${enforced.current_count}`);
+    assert(Number(enforced.tracked_current_count) === 2, "250-folder cap tracks only INBOX and Sent", `tracked=${enforced.tracked_current_count}`);
+    assert(Number(enforced.cap_excluded_current_count) === 248, "250-folder cap excludes the rest", `excluded=${enforced.cap_excluded_current_count}`);
+    assert(enforced.sync_state === "DEGRADED", "250-folder cap degrades the account", `state=${enforced.sync_state}`);
+    assert(
+      enforced.sync_state_reason === "TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG",
+      "250-folder cap records manual-config reason",
+      `reason=${enforced.sync_state_reason}`
+    );
+
+    const recoveredFolders = makeEmptyFolders(45);
+    const recoveredEngine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => new FixtureImapClient(recoveredFolders)
+    });
+    await pool.query("UPDATE public.imap_accounts SET next_folder_discovery_at = now() - interval '1 second' WHERE id = $1", [
+      account.id
+    ]);
+    const recoveredInitial = await recoveredEngine.syncAccount(account.id, "manual");
+    await markCurrentTrackedFoldersClean(pool, repository, account.id);
+    const recovered = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        current_count: string;
+        tracked_current_count: string;
+        cap_excluded_current_count: string;
+      }>(
+        `
+        SELECT
+          a.sync_state,
+          a.sync_state_reason,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL)::text AS current_count,
+          count(f.*) FILTER (WHERE f.status != 'MISSING' AND f.missing_since IS NULL AND f.tracked = true)::text AS tracked_current_count,
+          count(f.*) FILTER (
+            WHERE f.status != 'MISSING'
+              AND f.missing_since IS NULL
+              AND f.excluded_reason = 'folder_count_cap_exceeded'
+          )::text AS cap_excluded_current_count
+        FROM public.imap_accounts a
+        JOIN public.imap_folders f ON f.account_id = a.id
+        WHERE a.id = $1
+        GROUP BY a.id
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(recoveredInitial.outcome === "success", "45-folder initial cycle succeeds", recoveredInitial.errors.join("|"));
+    assert(Number(recovered.current_count) === 45, "45-folder provider count is current", `count=${recovered.current_count}`);
+    assert(Number(recovered.tracked_current_count) === 45, "45-folder recovery re-tracks current folders", `tracked=${recovered.tracked_current_count}`);
+    assert(Number(recovered.cap_excluded_current_count) === 0, "45-folder recovery clears current cap exclusions", `excluded=${recovered.cap_excluded_current_count}`);
+    assert(recovered.sync_state === "HEALTHY", "45-folder recovery becomes HEALTHY", `state=${recovered.sync_state}`);
+    assert(recovered.sync_state_reason === null, "45-folder recovery clears cap reason", `reason=${recovered.sync_state_reason}`);
+  } finally {
+    await teardown(pool, account.id);
+  }
+}
+
 async function main(): Promise<void> {
   console.log("SupaMail Tier-1 spec conformance — exercising real Postgres + fixture IMAP\n");
   console.log(`DATABASE_URL=${process.env.DATABASE_URL?.replace(/:[^@:]*@/, ":***@")}`);
@@ -1000,6 +1205,7 @@ async function main(): Promise<void> {
   await scenarioPartialCounterRule();
   await scenarioInitialSyncStallTimeout();
   await scenarioStuckDegradedEscalation();
+  await scenarioFolderCountCap();
 
   const passed = results.filter((r) => r.passed).length;
   const failed = results.filter((r) => !r.passed).length;

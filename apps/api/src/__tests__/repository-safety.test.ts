@@ -63,6 +63,26 @@ describe("repository safety", () => {
     expect(source).toContain("SET missing_since = now()");
   });
 
+  it("enforces folder-count caps without hiding automatic recovery", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("FOLDER_COUNT_WARN_THRESHOLD");
+    expect(source).toContain("FOLDER_COUNT_ENFORCE_THRESHOLD");
+    expect(source).toContain("folder_count_cap_override");
+    expect(source).toContain("folder_count_cap_exceeded");
+    expect(source).toContain("MANY_FOLDERS_PERFORMANCE_NOTE");
+    expect(source).toContain("TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG");
+    expect(source).toContain("missing_since IS NULL");
+  });
+
+  it("does not schedule folders pending missing-mailbox verification", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("PENDING_VERIFICATION");
+    expect(source).toContain("status NOT IN ('MISSING', 'PENDING_VERIFICATION')");
+    expect(source).toContain("public.imap_folders.status IN ('MISSING', 'PENDING_VERIFICATION')");
+  });
+
   it("tombstones folder messages after the missing grace expires", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 

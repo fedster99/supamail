@@ -44,6 +44,8 @@ const envSchema = z.object({
   STUCK_DEGRADED_BROKEN_THRESHOLD_MS: z.coerce.number().int().positive().default(24 * 60 * 60_000),
   STUCK_DEGRADED_TERMINAL_THRESHOLD_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),
   STUCK_DEGRADED_RETRY_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
+  FOLDER_COUNT_WARN_THRESHOLD: z.coerce.number().int().positive().default(50),
+  FOLDER_COUNT_ENFORCE_THRESHOLD: z.coerce.number().int().positive().default(200),
   PRIORITY_CUTOFF: z.coerce.number().int().positive().default(10),
   MAX_PRIORITY_FOLDERS_PER_CYCLE: z.coerce.number().int().positive().default(10),
   MAX_RR_FOLDERS_PER_CYCLE: z.coerce.number().int().positive().default(5),

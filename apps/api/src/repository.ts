@@ -62,6 +62,7 @@ const ACCOUNT_SUMMARY_COLUMNS = `
   backoff_until,
   last_folder_discovery_at,
   next_folder_discovery_at,
+  folder_count_cap_override,
   last_heartbeat_at,
   created_at,
   updated_at
@@ -281,6 +282,19 @@ export class MirrorRepository {
           ) AS overall_lag_seconds
         FROM public.imap_folders
         WHERE account_id = $1
+      ),
+      folder_cap AS (
+        SELECT
+          count(*) FILTER (
+            WHERE status != 'MISSING'
+              AND missing_since IS NULL
+          ) AS current_provider_folder_count,
+          COALESCE(
+            (SELECT folder_count_cap_override FROM public.imap_accounts WHERE id = $1),
+            $10::int
+          ) AS enforce_threshold
+        FROM public.imap_folders
+        WHERE account_id = $1
       )
       UPDATE public.imap_accounts
       SET
@@ -299,6 +313,7 @@ export class MirrorRepository {
           WHEN folder_health.overall_reconcile_unhealthy_count > 0 THEN 'DEGRADED'
           WHEN (folder_health.priority_lag_seconds * 1000) > $4 THEN 'DEGRADED'
           WHEN (folder_health.overall_lag_seconds * 1000) > $5 THEN 'DEGRADED'
+          WHEN folder_cap.current_provider_folder_count >= folder_cap.enforce_threshold THEN 'DEGRADED'
           ELSE 'HEALTHY'
         END,
         sync_state_reason = CASE
@@ -309,6 +324,8 @@ export class MirrorRepository {
           WHEN folder_health.overall_reconcile_unhealthy_count > 0 THEN 'OVERALL_RECONCILE_STALE'
           WHEN (folder_health.priority_lag_seconds * 1000) > $4 THEN 'PRIORITY_SYNC_LAG'
           WHEN (folder_health.overall_lag_seconds * 1000) > $5 THEN 'OVERALL_SYNC_LAG'
+          WHEN folder_cap.current_provider_folder_count >= folder_cap.enforce_threshold THEN 'TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG'
+          WHEN folder_cap.current_provider_folder_count >= $9::int THEN 'MANY_FOLDERS_PERFORMANCE_NOTE'
           ELSE NULL
         END,
         consecutive_successes = CASE
@@ -327,7 +344,7 @@ export class MirrorRepository {
           WHEN $8::boolean THEN NULL
           ELSE backoff_until
         END
-      FROM folder_health
+      FROM folder_health, folder_cap
       WHERE id = $1
       `,
       [
@@ -338,7 +355,9 @@ export class MirrorRepository {
         this.config.OVERALL_LAG_HEALTHY_THRESHOLD_MS,
         this.config.PRIORITY_RECONCILE_HEALTHY_MAX_AGE_MS,
         this.config.OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS,
-        countsTowardBackoff
+        countsTowardBackoff,
+        this.config.FOLDER_COUNT_WARN_THRESHOLD,
+        this.config.FOLDER_COUNT_ENFORCE_THRESHOLD
       ]
     );
   }
@@ -545,11 +564,18 @@ export class MirrorRepository {
     const profile = getProviderProfile(account.provider_profile);
     const rows: ImapFolder[] = [];
     const seen = new Set<string>();
+    const enforceThreshold = account.folder_count_cap_override ?? this.config.FOLDER_COUNT_ENFORCE_THRESHOLD;
+    const enforceFolderCap = folders.length >= enforceThreshold;
 
     for (const folder of folders) {
       seen.add(folder.path);
-      const excludedReason = folder.excludedReasonOverride
+      const syncPriority = profile.priorityForFolder(folder.path, folder.specialUse);
+      const providerExcludedReason = folder.excludedReasonOverride
         ?? profile.excludedReason(folder.path, folder.specialUse);
+      const capExcludedReason = enforceFolderCap && syncPriority > this.config.PRIORITY_CUTOFF
+        ? "folder_count_cap_exceeded"
+        : null;
+      const excludedReason = providerExcludedReason ?? capExcludedReason;
       const result = await this.pool.query<ImapFolder>(
         `
         INSERT INTO public.imap_folders (
@@ -573,7 +599,10 @@ export class MirrorRepository {
           tracked = EXCLUDED.tracked,
           excluded_reason = EXCLUDED.excluded_reason,
           sync_priority = EXCLUDED.sync_priority,
-          status = CASE WHEN public.imap_folders.status = 'MISSING' THEN 'PENDING' ELSE public.imap_folders.status END
+          status = CASE
+            WHEN public.imap_folders.status IN ('MISSING', 'PENDING_VERIFICATION') THEN 'PENDING'
+            ELSE public.imap_folders.status
+          END
         RETURNING *
         `,
         [
@@ -583,7 +612,7 @@ export class MirrorRepository {
           folder.specialUse ?? null,
           excludedReason === null,
           excludedReason,
-          profile.priorityForFolder(folder.path, folder.specialUse)
+          syncPriority
         ]
       );
       rows.push(result.rows[0]);
@@ -658,7 +687,7 @@ export class MirrorRepository {
       FROM public.imap_folders
       WHERE account_id = $1
         AND tracked = true
-        AND status != 'MISSING'
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND sync_priority <= $2
         AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
       ORDER BY sync_priority, path
@@ -675,7 +704,7 @@ export class MirrorRepository {
       FROM public.imap_folders
       WHERE account_id = $1
         AND tracked = true
-        AND status != 'MISSING'
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND sync_priority > $2
         AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
       ORDER BY path
