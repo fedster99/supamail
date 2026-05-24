@@ -10,9 +10,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- Last green pushed baseline before reliability PR-3: `662d4f1 Enforce initial sync stall timeout`.
-- PR checks after `662d4f1`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
-- Reliability PR-3 stuck-degraded escalation is implemented in the current local changes; recheck PR status after commit/push.
+- Last pushed reliability PR-3 implementation commit: `9239f8f Escalate stuck degraded accounts`.
+- PR checks after `9239f8f`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Reliability PR-3 stuck-degraded escalation is implemented, committed, and pushed.
 
 ## Current Shape
 
