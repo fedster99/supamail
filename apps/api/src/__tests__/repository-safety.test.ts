@@ -71,10 +71,11 @@ describe("repository safety", () => {
     expect(source).toContain("FOLDER_MISSING_GRACE_EXCEEDED");
   });
 
-  it("does not schedule broken accounts", async () => {
+  it("only schedules retryable stuck-degraded broken accounts", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("sync_state NOT IN ('PAUSED', 'BROKEN')");
+    expect(source).toContain("sync_state = 'BROKEN' AND sync_state_reason = 'STUCK_DEGRADED_24H'");
   });
 
   it("enforces the account cap at create time and worker startup", async () => {
@@ -120,8 +121,19 @@ describe("repository safety", () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("0.7 + random() * 0.6");
-    expect(source).toContain("current_backoff_ms = next_backoff.base_ms");
+    expect(source).toContain("ELSE next_backoff.base_ms");
     expect(source).toContain("consecutive_successes + 1 >= 3");
+  });
+
+  it("escalates long-stuck DEGRADED accounts without compounding exponential backoff", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("last_priority_sync_succeeded_at = now()");
+    expect(source).toContain("STUCK_DEGRADED_24H");
+    expect(source).toContain("STUCK_DEGRADED_TERMINAL");
+    expect(source).toContain("STUCK_DEGRADED_RETRY_INTERVAL_MS");
+    expect(source).toContain("WHEN stuck_state.is_stuck_degraded THEN a.consecutive_failures");
+    expect(source).toContain("WHEN stuck_state.is_stuck_degraded THEN a.current_backoff_ms");
   });
 
   it("short-circuits AUTH_ERROR to BROKEN without backoff (spec §13.1)", async () => {

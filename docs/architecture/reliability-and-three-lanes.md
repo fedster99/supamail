@@ -140,11 +140,11 @@ No daily token-bucket counter. The natural rate limit is the IMAP throttle + loc
 
 ### D7: Stuck-degraded escalation — new column, retryable BROKEN
 
-The spec's "stuck DEGRADED for 24h → BROKEN" transition is implemented around a new column `last_priority_sync_succeeded_at`.
+The spec's "stuck DEGRADED for 24h → BROKEN" transition is implemented around `last_priority_sync_succeeded_at` (ADR 0009).
 
 - `markAccountSyncSucceeded` and `markAccountSyncPartial` update it to `now()` (both mean priority folders succeeded).
 - `markAccountSyncFailed` and `markAccountSyncAuthFailed` leave it unchanged.
-- The SQL CASE in `markAccountSyncSucceeded`/`markAccountSyncPartial`/`markAccountSyncFailed` adds a branch: if the resulting `sync_state` would be `DEGRADED` AND `last_priority_sync_succeeded_at < now() - interval '24 hours'`, land at `BROKEN` with reason `STUCK_DEGRADED_24H`.
+- `markAccountSyncFailed` checks current `DEGRADED` accounts, plus retryable `BROKEN` accounts with reason `STUCK_DEGRADED_24H`; if `last_priority_sync_succeeded_at < now() - interval '24 hours'`, it lands at `BROKEN` with reason `STUCK_DEGRADED_24H`.
 - New config constant: `STUCK_DEGRADED_BROKEN_THRESHOLD_MS = 24 * 60 * 60_000`.
 
 **Retryable BROKEN — composition with `getRunnableAccounts` and `backoff_until`:**
@@ -166,7 +166,7 @@ The spec's "stuck DEGRADED for 24h → BROKEN" transition is implemented around 
 
 - The SQL CASE for `STUCK_DEGRADED_24H` includes a sub-branch: if `last_priority_sync_succeeded_at < now() - interval '7 days'`, set `sync_state_reason = 'STUCK_DEGRADED_TERMINAL'` and clear `backoff_until`.
 - `STUCK_DEGRADED_TERMINAL` is NOT in the retryable-BROKEN exception above, so `getRunnableAccounts` stops returning the account.
-- Operator intervention required: `PATCH /accounts/:id` (admin scope) clears `sync_state_reason` and `sync_state` back to a non-terminal state, restoring scheduling.
+- Operator intervention required: clear `sync_state_reason` and move `sync_state` back to a non-terminal state through an admin/tooling path, restoring scheduling.
 - Configurable: `STUCK_DEGRADED_TERMINAL_THRESHOLD_MS` default `7 * 24 * 60 * 60_000`.
 
 ### D8: Initial-sync stall timeout — mirrors incremental
@@ -267,9 +267,9 @@ Computed columns: `live_headers_complete_pct`, `priority_bodies_complete_pct`, `
 
 By module, what changes:
 
-- **`apps/api/src/config.ts`** — add `STUCK_DEGRADED_BROKEN_THRESHOLD_MS` (24h), `STUCK_DEGRADED_TERMINAL_THRESHOLD_MS` (7d), `STUCK_DEGRADED_RETRY_INTERVAL_MS` (1h), `FOLDER_COUNT_WARN_THRESHOLD` (50), `FOLDER_COUNT_ENFORCE_THRESHOLD` (200). `INITIAL_SYNC_BATCH_TIMEOUT_MS`, `MAX_BODY_BATCHES_PER_TICK`, and `MAX_LOCK_HOLD_MS` are now wired (see D5 and D8).
+- **`apps/api/src/config.ts`** — add `FOLDER_COUNT_WARN_THRESHOLD` (50), `FOLDER_COUNT_ENFORCE_THRESHOLD` (200). `INITIAL_SYNC_BATCH_TIMEOUT_MS`, `MAX_BODY_BATCHES_PER_TICK`, `MAX_LOCK_HOLD_MS`, and the stuck-degraded thresholds are now wired (see D5, D7, and D8).
 - **`apps/api/src/sync-engine.ts`** — thread `deadline` into hot/body/history phases with the two-tier semantics from D5. Add `isMissingMailboxError(err)` helper alongside `isAuthError`, preferring `err.serverResponseCode` over message regex. Wrap `runInitialSyncBatch` in `withOperationDeadline` (D8). Add missing-mailbox detection in `syncFolder`'s catch (D10). Add the history lane as a new method called after `fetchBodyBacklog`, sliced by `max_backfill_rate`. Thread `hitLockBudget` flag through `SyncResult`. `fetchBodyBacklog` becomes deadline-aware and capped at `MAX_BODY_BATCHES_PER_TICK`.
-- **`apps/api/src/repository.ts`** — update `markAccountSyncSucceeded`/`Partial`/`Failed` to write `last_priority_sync_succeeded_at` and add the `STUCK_DEGRADED_24H` / `STUCK_DEGRADED_TERMINAL` branches in the SQL CASE (D7), including the `backoff_until = now() + interval '1 hour'` write on escalation. Update `getRunnableAccounts`'s WHERE clause to allow `BROKEN` accounts whose reason is `STUCK_DEGRADED_24H` (composing with the existing `backoff_until` filter). Update `upsertMessages` to increment `headers_synced_count` only on new inserts (D4). Update `storeBody` to increment `bodies_fetched_count` (D4). Update `setInitialSyncSnapshot` to record `live_window_target_count` (D4). Update `handleUidValidityReset` to zero per-folder counters (D4). Update `upsertDiscoveredFolders` for folder-count cap thresholds (D9). Add `markFolderPendingVerification` (D10). Add `getHistoryBacklog` and `advanceBackfillWatermark` for the history lane. Add `runArchiveRefresh` (cheap reconcile-like pass on historical folders per `archive_refresh_interval`).
+- **`apps/api/src/repository.ts`** — update `markAccountSyncSucceeded`/`Partial` to write `last_priority_sync_succeeded_at`; update `markAccountSyncFailed` to add the `STUCK_DEGRADED_24H` / `STUCK_DEGRADED_TERMINAL` branches, including the `backoff_until = now() + interval '1 hour'` write on retryable escalation. Update `getRunnableAccounts`'s WHERE clause to allow `BROKEN` accounts whose reason is `STUCK_DEGRADED_24H` (composing with the existing `backoff_until` filter). Update `upsertMessages` to increment `headers_synced_count` only on new inserts (D4). Update `storeBody` to increment `bodies_fetched_count` (D4). Update `setInitialSyncSnapshot` to record `live_window_target_count` (D4). Update `handleUidValidityReset` to zero per-folder counters (D4). Update `upsertDiscoveredFolders` for folder-count cap thresholds (D9). Add `markFolderPendingVerification` (D10). Add `getHistoryBacklog` and `advanceBackfillWatermark` for the history lane. Add `runArchiveRefresh` (cheap reconcile-like pass on historical folders per `archive_refresh_interval`).
 - **`apps/api/src/api.ts`** — extend `GET /accounts/:id` to return the progress columns. Add `POST /accounts/:id/folders/track`. Add `PATCH /accounts/:id/settings` for the new tunables (rejecting `live_window_days`).
 - **`apps/api/src/types.ts`** — extend `ImapAccount`, `ImapFolder`, `SyncResult` with the new fields.
 - **`apps/api/scripts/spec-conformance.ts`** — add scenarios G-M (see §Test Plan).
@@ -281,7 +281,7 @@ By module, what changes:
 - **`docs/schema.md`** — document the new `imap_accounts` columns, the extended `imap_folders.status` CHECK, and the new `imap_account_progress` view.
 - **`docs/architecture/decisions/`** — promote each of D5, D7, D8, D9, D10 to an ADR when the corresponding PR lands. Specifically:
   - ADR 0008: Cooperative lock budget enforcement
-  - ADR 0009: Last-priority-success column for stuck-degraded escalation
+  - ADR 0009: Last-priority-success column for stuck-degraded escalation (landed)
   - ADR 0010: Folder-count cap with track-all-degrade
   - ADR 0011: PENDING_VERIFICATION state for missing-mailbox recovery
   - ADR 0012: Three-lane engine architecture (lands with PR-8)

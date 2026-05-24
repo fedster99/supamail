@@ -9,6 +9,7 @@ import {
 } from "../db.js";
 
 const publicMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0001_imap_mirror.sql");
+const stuckDegradedMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0002_stuck_degraded_escalation.sql");
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -88,12 +89,25 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0001_imap_mirror");
+    expect(version).toBe("0002_stuck_degraded_escalation");
     expect(manifest).toEqual({
-      schemaVersion: "0001_imap_mirror",
-      migrations: [{ id: "0001_imap_mirror", file: "0001_imap_mirror.sql" }]
+      schemaVersion: "0002_stuck_degraded_escalation",
+      migrations: [
+        { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
+        { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" }
+      ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
+    expect(sql).toContain("last_priority_sync_succeeded_at timestamptz");
+  });
+
+  it("adds stuck-degraded escalation state without control-plane tables", async () => {
+    const sql = await readFile(stuckDegradedMigrationPath, "utf8");
+
+    expect(sql).toContain("ALTER TABLE public.imap_accounts");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_priority_sync_succeeded_at timestamptz");
+    expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
   });
 
   it("keeps control-plane migrations out of the public core package path", async () => {

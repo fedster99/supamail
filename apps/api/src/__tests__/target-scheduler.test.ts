@@ -5,7 +5,7 @@ import {
   type RuntimeTargetTask
 } from "../target-scheduler.js";
 
-const requiredSchemaVersion = "0001_imap_mirror";
+const requiredSchemaVersion = "0002_stuck_degraded_escalation";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -864,6 +864,162 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(afterRetry[0].initial_sync_complete).toBe(false);
     expect(Number(afterRetry[0].initial_sync_oldest_uid_synced)).toBe(2);
   });
+
+  it("Scenario I — stuck DEGRADED escalates to retryable BROKEN, recovers, then becomes terminal", async () => {
+    const h = await setupIntegration("I-stuck-degraded", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET sync_state = 'DEGRADED',
+          sync_state_reason = 'PRIORITY_SYNC_LAG',
+          last_priority_sync_succeeded_at = now() - interval '25 hours',
+          consecutive_failures = 4,
+          consecutive_successes = 0,
+          current_backoff_ms = 1234,
+          backoff_until = NULL
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+
+    const failingEngine = h.buildEngine({
+      folders: [],
+      clientFactory: async () => {
+        throw new Error("provider temporarily unavailable");
+      }
+    });
+    const escalated = await failingEngine.syncAccount(h.account.id, "manual");
+
+    expect(escalated.outcome).toBe("failed");
+    const retryable = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        consecutive_failures: number;
+        current_backoff_ms: number;
+        retry_ms: number | null;
+      }>(
+        `
+        SELECT
+          sync_state,
+          sync_state_reason,
+          consecutive_failures,
+          current_backoff_ms,
+          ceil(extract(epoch from (backoff_until - now())) * 1000)::int AS retry_ms
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(retryable.sync_state).toBe("BROKEN");
+    expect(retryable.sync_state_reason).toBe("STUCK_DEGRADED_24H");
+    expect(retryable.consecutive_failures).toBe(4);
+    expect(retryable.current_backoff_ms).toBe(1234);
+    expect(retryable.retry_ms).toBeGreaterThan(50 * 60_000);
+    expect(retryable.retry_ms).toBeLessThanOrEqual(60 * 60_000);
+
+    await h.pool.query("UPDATE public.imap_accounts SET backoff_until = now() - interval '1 second' WHERE id = $1", [
+      h.account.id
+    ]);
+    const runnable = await h.repository.getRunnableAccounts(10);
+    expect(runnable.map((account) => account.id)).toContain(h.account.id);
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 600,
+        messages: [makeTextMessage({ uid: 1, subject: "recovered", from: "a@x.test", to: "u@x.test", body: "ok" })]
+      }
+    ];
+    const recoveryEngine = h.buildEngine({ folders });
+    const recovered = await recoveryEngine.syncAccount(h.account.id, "manual");
+
+    expect(recovered.outcome).toBe("success");
+    const recoveredAccount = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        last_priority_age_ms: number | null;
+        backoff_until: Date | null;
+      }>(
+        `
+        SELECT
+          sync_state,
+          sync_state_reason,
+          ceil(extract(epoch from (now() - last_priority_sync_succeeded_at)) * 1000)::int AS last_priority_age_ms,
+          backoff_until
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(recoveredAccount.sync_state).not.toBe("BROKEN");
+    expect(recoveredAccount.sync_state_reason).not.toBe("STUCK_DEGRADED_24H");
+    expect(recoveredAccount.sync_state_reason).not.toBe("STUCK_DEGRADED_TERMINAL");
+    expect(recoveredAccount.last_priority_age_ms).toBeLessThan(10_000);
+    expect(recoveredAccount.backoff_until).toBeNull();
+
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET sync_state = 'BROKEN',
+          sync_state_reason = 'STUCK_DEGRADED_24H',
+          last_priority_sync_succeeded_at = now() - interval '8 days',
+          consecutive_failures = 5,
+          current_backoff_ms = 2222,
+          backoff_until = now() - interval '1 second'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const terminal = await failingEngine.syncAccount(h.account.id, "manual");
+
+    expect(terminal.outcome).toBe("failed");
+    const terminalAccount = (
+      await h.pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        consecutive_failures: number;
+        current_backoff_ms: number;
+        backoff_until: Date | null;
+      }>(
+        `
+        SELECT sync_state, sync_state_reason, consecutive_failures, current_backoff_ms, backoff_until
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(terminalAccount.sync_state).toBe("BROKEN");
+    expect(terminalAccount.sync_state_reason).toBe("STUCK_DEGRADED_TERMINAL");
+    expect(terminalAccount.consecutive_failures).toBe(5);
+    expect(terminalAccount.current_backoff_ms).toBe(2222);
+    expect(terminalAccount.backoff_until).toBeNull();
+
+    const terminalRunnable = await h.repository.getRunnableAccounts(10);
+    expect(terminalRunnable.map((account) => account.id)).not.toContain(h.account.id);
+
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET sync_state = 'DEGRADED',
+          sync_state_reason = NULL
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const manuallyClearedRunnable = await h.repository.getRunnableAccounts(10);
+    expect(manuallyClearedRunnable.map((account) => account.id)).toContain(h.account.id);
+  });
 });
 
 // Helpful diagnostic when the suite is silently skipped.

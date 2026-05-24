@@ -19,6 +19,7 @@ export interface ImapAccount {
   sync_state_reason: string | null;
   last_sync_started_at: Date | null;
   last_sync_finished_at: Date | null;
+  last_priority_sync_succeeded_at: Date | null;
   priority_sync_lag_seconds: number | null;
   overall_sync_lag_seconds: number | null;
   consecutive_failures: number;
@@ -45,6 +46,7 @@ export interface AccountSummary {
   sync_state_reason: string | null;
   last_sync_started_at: Date | null;
   last_sync_finished_at: Date | null;
+  last_priority_sync_succeeded_at: Date | null;
   priority_sync_lag_seconds: number | null;
   overall_sync_lag_seconds: number | null;
   consecutive_failures: number;

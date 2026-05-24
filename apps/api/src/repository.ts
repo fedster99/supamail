@@ -54,6 +54,7 @@ const ACCOUNT_SUMMARY_COLUMNS = `
   sync_state_reason,
   last_sync_started_at,
   last_sync_finished_at,
+  last_priority_sync_succeeded_at,
   priority_sync_lag_seconds,
   overall_sync_lag_seconds,
   consecutive_failures,
@@ -134,7 +135,10 @@ export class MirrorRepository {
       `
       SELECT *
       FROM public.imap_accounts
-      WHERE sync_state NOT IN ('PAUSED', 'BROKEN')
+      WHERE (
+          sync_state NOT IN ('PAUSED', 'BROKEN')
+          OR (sync_state = 'BROKEN' AND sync_state_reason = 'STUCK_DEGRADED_24H')
+        )
         AND (backoff_until IS NULL OR backoff_until <= now())
         AND (
           currently_syncing = false
@@ -284,6 +288,7 @@ export class MirrorRepository {
         sync_started_by = NULL,
         last_sync_finished_at = now(),
         last_heartbeat_at = now(),
+        last_priority_sync_succeeded_at = now(),
         priority_sync_lag_seconds = ceil(folder_health.priority_lag_seconds)::int,
         overall_sync_lag_seconds = ceil(folder_health.overall_lag_seconds)::int,
         sync_state = CASE
@@ -356,6 +361,7 @@ export class MirrorRepository {
         sync_started_by = NULL,
         last_sync_finished_at = now(),
         last_heartbeat_at = now(),
+        last_priority_sync_succeeded_at = now(),
         sync_state = 'DEGRADED',
         sync_state_reason = $2,
         consecutive_successes = CASE
@@ -409,7 +415,30 @@ export class MirrorRepository {
     // expression has to be duplicated and would drift on tuning changes.
     await this.pool.query(
       `
-      WITH next_backoff AS (
+      WITH account_state AS (
+        SELECT
+          current_backoff_ms,
+          consecutive_failures,
+          sync_state,
+          sync_state_reason,
+          COALESCE(last_priority_sync_succeeded_at, created_at) AS priority_success_anchor,
+          (
+            sync_state = 'DEGRADED'
+            OR (sync_state = 'BROKEN' AND sync_state_reason = 'STUCK_DEGRADED_24H')
+          ) AS stuck_degraded_eligible
+        FROM public.imap_accounts
+        WHERE id = $1
+      ),
+      stuck_state AS (
+        SELECT
+          *,
+          stuck_degraded_eligible
+            AND priority_success_anchor < now() - ($6::bigint * interval '1 millisecond') AS is_stuck_degraded,
+          stuck_degraded_eligible
+            AND priority_success_anchor < now() - ($7::bigint * interval '1 millisecond') AS is_terminal_stuck_degraded
+        FROM account_state
+      ),
+      next_backoff AS (
         SELECT
           base_ms,
           LEAST(
@@ -418,8 +447,7 @@ export class MirrorRepository {
           ) AS jittered_ms
         FROM (
           SELECT LEAST(GREATEST(current_backoff_ms * 2, $4::int), $5::int) AS base_ms
-          FROM public.imap_accounts
-          WHERE id = $1
+          FROM stuck_state
         ) base
       )
       UPDATE public.imap_accounts a
@@ -427,13 +455,32 @@ export class MirrorRepository {
         currently_syncing = false,
         sync_started_by = NULL,
         last_sync_finished_at = now(),
-        sync_state = CASE WHEN consecutive_failures + 1 >= $3 THEN 'BROKEN' ELSE 'DEGRADED' END,
-        sync_state_reason = $2,
-        consecutive_failures = consecutive_failures + 1,
+        sync_state = CASE
+          WHEN stuck_state.is_terminal_stuck_degraded THEN 'BROKEN'
+          WHEN stuck_state.is_stuck_degraded THEN 'BROKEN'
+          WHEN a.consecutive_failures + 1 >= $3 THEN 'BROKEN'
+          ELSE 'DEGRADED'
+        END,
+        sync_state_reason = CASE
+          WHEN stuck_state.is_terminal_stuck_degraded THEN 'STUCK_DEGRADED_TERMINAL'
+          WHEN stuck_state.is_stuck_degraded THEN 'STUCK_DEGRADED_24H'
+          ELSE $2
+        END,
+        consecutive_failures = CASE
+          WHEN stuck_state.is_stuck_degraded THEN a.consecutive_failures
+          ELSE a.consecutive_failures + 1
+        END,
         consecutive_successes = 0,
-        current_backoff_ms = next_backoff.base_ms,
-        backoff_until = now() + (next_backoff.jittered_ms * interval '1 millisecond')
-      FROM next_backoff
+        current_backoff_ms = CASE
+          WHEN stuck_state.is_stuck_degraded THEN a.current_backoff_ms
+          ELSE next_backoff.base_ms
+        END,
+        backoff_until = CASE
+          WHEN stuck_state.is_terminal_stuck_degraded THEN NULL
+          WHEN stuck_state.is_stuck_degraded THEN now() + ($8::bigint * interval '1 millisecond')
+          ELSE now() + (next_backoff.jittered_ms * interval '1 millisecond')
+        END
+      FROM stuck_state, next_backoff
       WHERE a.id = $1
       `,
       [
@@ -441,7 +488,10 @@ export class MirrorRepository {
         sanitizeErrorReason(error),
         BROKEN_FAILURE_THRESHOLD,
         BACKOFF_FLOOR_MS,
-        BACKOFF_CEILING_MS
+        BACKOFF_CEILING_MS,
+        this.config.STUCK_DEGRADED_BROKEN_THRESHOLD_MS,
+        this.config.STUCK_DEGRADED_TERMINAL_THRESHOLD_MS,
+        this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS
       ]
     );
   }

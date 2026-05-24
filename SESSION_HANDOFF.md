@@ -10,9 +10,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR: https://github.com/fedster99/supamail/pull/5
 - Harness reminder baseline: `78767e0 Add harness impact reminder`
 - Root handoff migration: `912989a Move session handoff to repo root`
-- Last green pushed baseline before reliability PR-2: `c932c1d Refresh session handoff state`.
-- PR checks after `c932c1d`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
-- Reliability PR-2 initial-sync stall timeout was implemented after that baseline; recheck PR status after newer pushes.
+- Last green pushed baseline before reliability PR-3: `662d4f1 Enforce initial sync stall timeout`.
+- PR checks after `662d4f1`: `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments` passed.
+- Reliability PR-3 stuck-degraded escalation is implemented in the current local changes; recheck PR status after commit/push.
 
 ## Current Shape
 
@@ -31,6 +31,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - `.github/workflows/publish-core-image.yml` publishes the public core Docker image to GHCR after the CI workflow succeeds for a push to this repo's `main`; manual dispatch is restricted to the `main` ref.
 - PR-1 of the reliability hardening sequence is implemented: `MAX_LOCK_HOLD_MS` is now enforced cooperatively at safe sync boundaries, `SyncResult.hitLockBudget` records budget hits, body backlog draining is capped by `MAX_BODY_BATCHES_PER_TICK`, and ADR 0008 documents the decision.
 - PR-2 of the reliability hardening sequence is implemented: `INITIAL_SYNC_BATCH_TIMEOUT_MS` bounds initial sync snapshot/search/fetch work, aborts IMAP on timeout, treats the cycle as a transient failure, and preserves the initial-sync watermark for retry.
+- PR-3 of the reliability hardening sequence is implemented locally: `imap_accounts.last_priority_sync_succeeded_at` records priority success, long-stuck `DEGRADED` accounts escalate to retryable `BROKEN` with `STUCK_DEGRADED_24H`, hourly retry uses `backoff_until`, seven-day terminal cutoff uses `STUCK_DEGRADED_TERMINAL`, and ADR 0009 documents the decision.
 - Ignored local env files were seeded for this workspace. Public handoff omits local project refs, generated tokens, API keys, and machine-specific env paths; see `.context/local-setup-handoff.md` when working in this workspace.
 - A workspace Supabase project was created and `apps/api/supabase` is linked through ignored `.temp` files. Public handoff intentionally omits project identifiers; local setup details live in `.context/local-setup-handoff.md`.
 
@@ -56,6 +57,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - OSS web page rewrite verification on 2026-05-23: commit `bc2fbcf` simplified the public web app into a compact OSS/docs page. `npx -y -p node@24 -p pnpm@10.0.0 pnpm --filter @supamail/web typecheck`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm --filter @supamail/web test`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm --filter @supamail/web build`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm harness:check`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm typecheck`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm test`, `npx -y -p node@24 -p pnpm@10.0.0 pnpm build`, and `git diff --check` passed. Local dev render at `http://localhost:3001` passed desktop and mobile screenshot smoke; screenshots are ignored in `.context/`. PR #5 checks after push passed `Quality`, `Live DB Reliability`, `Vercel`, and `Vercel Preview Comments`. Turbo replayed older cached API logs that contained the known local Node v26 engine warning; GitHub CI still emits the Node 20 action deprecation annotation until the public workflow action versions are upgraded.
 - Public CI action runtime cleanup on 2026-05-24: upgraded `actions/checkout`, `actions/setup-node`, and `pnpm/action-setup` from `v4` to `v6`; upgraded `docker/login-action` from `v3` to `v4` in the GHCR publish workflow. Each upgraded action declares `node24` in `action.yml`.
 - Reliability PR-2 verification on 2026-05-24: `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts --testNamePattern "Scenario H"`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts`, `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api spec-conformance`, and `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed. The expected local Node v26 engine warnings and Node DEP0205 warnings appeared.
+- Reliability PR-3 verification on 2026-05-24: `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts --testNamePattern "Scenario I"`, `pnpm --filter @supamail/api exec vitest run src/__tests__/repository-safety.test.ts src/__tests__/schema.test.ts src/__tests__/target-scheduler.test.ts`, `pnpm --filter @supamail/api typecheck`, `pnpm --filter @supamail/api spec-conformance`, `pnpm --filter @supamail/api exec vitest run src/__tests__/sync-engine.integration.test.ts`, and `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed. The live gate applied public migrations twice, ran live DB integration, and finished spec conformance with 67 passes. The expected local Node v26 engine warnings and Node DEP0205 warnings appeared.
 
 ## Durable Decisions
 
@@ -63,6 +65,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Message identity means mailbox-row identity: `(account_id, folder_path, uidvalidity, uid)`.
 - Session-affine Postgres is required for advisory locks.
 - `MAX_LOCK_HOLD_MS` is a cooperative account-lock fairness budget: priority folders may complete past the deadline, non-priority/body work stops at safe boundaries, and budget-hit cycles are neutral for backoff counters.
+- Stuck-degraded escalation is driven by `imap_accounts.last_priority_sync_succeeded_at`: priority success refreshes it, retryable `STUCK_DEGRADED_24H` probes hourly without compounding exponential backoff, and `STUCK_DEGRADED_TERMINAL` stops automatic scheduling until operator action.
 - Hosted cloud must consume a pinned public core image digest/SHA and apply only public mirror migrations to customer BYO databases.
 - Supabase OAuth refresh tokens and generated DB passwords must be encrypted before storage; plaintext secrets must not live in the control-plane DB, logs, tracked env examples, or PRs.
 - V1 IMAP auth is username/password or provider app-password only. Gmail OAuth and Microsoft OAuth are deferred.
@@ -72,7 +75,6 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Open Risks
 
-- Stuck `DEGRADED` for 24h with no successful priority sync is not implemented.
 - Folder-count explosion cap and reactive rediscovery on missing-mailbox errors remain open deltas in `docs/spec-conformance.md`.
 - Private `supamail-cloud` repo/app creation and first Vercel web deploy are done outside this public workspace. Supabase Auth setup, Stripe product/webhook setup, Supabase OAuth BYO onboarding, and hosted Fly deploy are still pending there.
 - The public `apps/web` page is now a compact OSS/docs page. Keep richer hosted signup and SaaS copy in `supamail-cloud`.
@@ -82,5 +84,5 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
-- Next reliability hardening slice: PR-3 stuck `DEGRADED` escalation with `last_priority_sync_succeeded_at` and retryable `STUCK_DEGRADED_24H` behavior.
+- Next reliability hardening slice: PR-4 folder-count cap plus `PENDING_VERIFICATION` schema support, per `docs/architecture/reliability-and-three-lanes.md`.
 - Next hosted setup step: continue in private `supamail-cloud` with Supabase Auth + Stripe Checkout/webhook using the public contracts in `docs/hosted-cloud-contracts.md`.

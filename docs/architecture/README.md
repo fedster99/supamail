@@ -12,7 +12,7 @@ SupaMail is a small, stateful email mirror packaged as a monorepo. IMAP is the p
 - `apps/api/src/locks.ts`: session-scoped advisory lock behavior and stale lock recovery.
 - `apps/api/src/imap-client.ts`: ImapFlow adapter, throttling, metadata fetch, UID search, and full body fetch.
 - `apps/api/src/mime.ts`: MIME parsing, normalized text, header extraction, and attachment metadata helpers.
-- `apps/api/supabase/migrations/public/0001_imap_mirror.sql`: canonical public mirror schema.
+- `apps/api/supabase/migrations/public/`: ordered public mirror migrations and manifest.
 - `apps/web`: Next.js landing site. It is not the product dashboard or CRM surface.
 
 ## Data Flow

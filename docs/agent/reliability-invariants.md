@@ -48,6 +48,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Health must not lie.
 - Accounts remain `INITIAL_SYNC` while tracked folders are incomplete.
 - Accounts remain or become `DEGRADED` when priority lag, reconcile drift, folder missing, UIDVALIDITY reset, or timeout semantics require it.
+- Long-stuck `DEGRADED` accounts with no priority success escalate to retryable `BROKEN` (`STUCK_DEGRADED_24H`) and then terminal `BROKEN` (`STUCK_DEGRADED_TERMINAL`) if recovery keeps failing.
 - `AUTH_ERROR` is non-retryable and pins the account `BROKEN`.
 - `PARTIAL_SUCCESS` increments success counters only when priority folders succeeded and round-robin folders failed.
 - Backoff must be conservative, jittered, and reset only after stable success.

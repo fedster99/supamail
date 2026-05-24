@@ -43,10 +43,12 @@ IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY" \
 pnpm migrate
 ```
 
-Or run the SQL directly:
+Or, if you need to run SQL manually, apply the public migration files in manifest order:
 
 ```bash
-psql "$DATABASE_URL" -f apps/api/supabase/migrations/public/0001_imap_mirror.sql
+for file in apps/api/supabase/migrations/public/*.sql; do
+  psql "$DATABASE_URL" -f "$file"
+done
 ```
 
 ## 4. Create Accounts

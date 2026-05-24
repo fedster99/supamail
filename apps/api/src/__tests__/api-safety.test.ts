@@ -18,6 +18,7 @@ function makeAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
     sync_state_reason: null,
     last_sync_started_at: null,
     last_sync_finished_at: null,
+    last_priority_sync_succeeded_at: null,
     priority_sync_lag_seconds: null,
     overall_sync_lag_seconds: null,
     consecutive_failures: 0,

@@ -790,6 +790,204 @@ async function scenarioInitialSyncStallTimeout() {
   }
 }
 
+async function scenarioStuckDegradedEscalation() {
+  console.log("\nScenario I: stuck DEGRADED escalates to retryable BROKEN, then terminal BROKEN");
+  const { pool, config, repository, account } = await setup("stuck-degraded");
+  try {
+    await pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET sync_state = 'DEGRADED',
+          sync_state_reason = 'PRIORITY_SYNC_LAG',
+          last_priority_sync_succeeded_at = now() - interval '25 hours',
+          consecutive_failures = 4,
+          current_backoff_ms = 1234,
+          backoff_until = NULL
+      WHERE id = $1
+      `,
+      [account.id]
+    );
+
+    const failingEngine = new MirrorEngine({
+      pool,
+      config,
+      repository,
+      clientFactory: async () => {
+        throw new Error("provider temporarily unavailable");
+      }
+    });
+    const escalated = await failingEngine.syncAccount(account.id, "manual");
+    const retryable = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        consecutive_failures: number;
+        current_backoff_ms: number;
+        retry_ms: number | null;
+      }>(
+        `
+        SELECT
+          sync_state,
+          sync_state_reason,
+          consecutive_failures,
+          current_backoff_ms,
+          ceil(extract(epoch from (backoff_until - now())) * 1000)::int AS retry_ms
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(escalated.outcome === "failed", "stuck-degraded failure is transiently failed", `outcome=${escalated.outcome}`);
+    assert(retryable.sync_state === "BROKEN", "25h stuck DEGRADED becomes BROKEN", `state=${retryable.sync_state}`);
+    assert(
+      retryable.sync_state_reason === "STUCK_DEGRADED_24H",
+      "retryable reason is STUCK_DEGRADED_24H",
+      `reason=${retryable.sync_state_reason}`
+    );
+    assert(
+      retryable.consecutive_failures === 4,
+      "stuck-degraded escalation does not increment exponential failure count",
+      `failures=${retryable.consecutive_failures}`
+    );
+    assert(
+      retryable.current_backoff_ms === 1234,
+      "stuck-degraded escalation preserves stored exponential backoff",
+      `backoff=${retryable.current_backoff_ms}`
+    );
+    assert(
+      retryable.retry_ms !== null && retryable.retry_ms > 50 * 60_000 && retryable.retry_ms <= 60 * 60_000,
+      "retryable stuck-degraded schedules approximately one-hour retry",
+      `retry_ms=${retryable.retry_ms}`
+    );
+
+    await pool.query("UPDATE public.imap_accounts SET backoff_until = now() - interval '1 second' WHERE id = $1", [
+      account.id
+    ]);
+    let runnable = await repository.getRunnableAccounts(10);
+    assert(
+      runnable.some((candidate) => candidate.id === account.id),
+      "retryable STUCK_DEGRADED_24H is runnable after backoff elapses",
+      `ids=${runnable.map((candidate) => candidate.id).join(",")}`
+    );
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 600,
+        messages: [makeTextMessage({ uid: 1, subject: "recovered", from: "a@x.test", to: "u@x.test", body: "ok" })]
+      }
+    ];
+    const recoveryEngine = new MirrorEngine({
+      pool,
+      config: { ...config, INITIAL_SYNC_BATCH_SIZE: 50 },
+      repository,
+      clientFactory: async () => new FixtureImapClient(folders)
+    });
+    const recovered = await recoveryEngine.syncAccount(account.id, "manual");
+    const recoveredRow = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        last_priority_age_ms: number | null;
+        backoff_until: Date | null;
+      }>(
+        `
+        SELECT
+          sync_state,
+          sync_state_reason,
+          ceil(extract(epoch from (now() - last_priority_sync_succeeded_at)) * 1000)::int AS last_priority_age_ms,
+          backoff_until
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(recovered.outcome === "success", "successful priority retry completes", `outcome=${recovered.outcome}`);
+    assert(recoveredRow.sync_state !== "BROKEN", "successful priority retry exits BROKEN", `state=${recoveredRow.sync_state}`);
+    assert(
+      recoveredRow.sync_state_reason !== "STUCK_DEGRADED_24H"
+        && recoveredRow.sync_state_reason !== "STUCK_DEGRADED_TERMINAL",
+      "successful priority retry clears stuck-degraded reason",
+      `reason=${recoveredRow.sync_state_reason}`
+    );
+    assert(
+      recoveredRow.last_priority_age_ms !== null && recoveredRow.last_priority_age_ms < 10_000,
+      "successful priority retry refreshes last_priority_sync_succeeded_at",
+      `age_ms=${recoveredRow.last_priority_age_ms}`
+    );
+    assert(recoveredRow.backoff_until === null, "successful priority retry clears backoff_until", `until=${recoveredRow.backoff_until}`);
+
+    await pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET sync_state = 'BROKEN',
+          sync_state_reason = 'STUCK_DEGRADED_24H',
+          last_priority_sync_succeeded_at = now() - interval '8 days',
+          consecutive_failures = 5,
+          current_backoff_ms = 2222,
+          backoff_until = now() - interval '1 second'
+      WHERE id = $1
+      `,
+      [account.id]
+    );
+    await failingEngine.syncAccount(account.id, "manual");
+    const terminal = (
+      await pool.query<{
+        sync_state: string;
+        sync_state_reason: string | null;
+        consecutive_failures: number;
+        current_backoff_ms: number;
+        backoff_until: Date | null;
+      }>(
+        `
+        SELECT sync_state, sync_state_reason, consecutive_failures, current_backoff_ms, backoff_until
+        FROM public.imap_accounts
+        WHERE id = $1
+        `,
+        [account.id]
+      )
+    ).rows[0];
+    assert(terminal.sync_state === "BROKEN", "8d stuck account remains BROKEN", `state=${terminal.sync_state}`);
+    assert(
+      terminal.sync_state_reason === "STUCK_DEGRADED_TERMINAL",
+      "8d stuck account becomes terminal",
+      `reason=${terminal.sync_state_reason}`
+    );
+    assert(terminal.consecutive_failures === 5, "terminal cutoff does not increment failure count", `failures=${terminal.consecutive_failures}`);
+    assert(terminal.current_backoff_ms === 2222, "terminal cutoff preserves stored backoff", `backoff=${terminal.current_backoff_ms}`);
+    assert(terminal.backoff_until === null, "terminal cutoff clears retry scheduling", `until=${terminal.backoff_until}`);
+
+    runnable = await repository.getRunnableAccounts(10);
+    assert(
+      !runnable.some((candidate) => candidate.id === account.id),
+      "terminal stuck-degraded account is not runnable",
+      `ids=${runnable.map((candidate) => candidate.id).join(",")}`
+    );
+
+    await pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET sync_state = 'DEGRADED',
+          sync_state_reason = NULL
+      WHERE id = $1
+      `,
+      [account.id]
+    );
+    runnable = await repository.getRunnableAccounts(10);
+    assert(
+      runnable.some((candidate) => candidate.id === account.id),
+      "manual operator clear restores scheduling",
+      `ids=${runnable.map((candidate) => candidate.id).join(",")}`
+    );
+  } finally {
+    await teardown(pool, account.id);
+  }
+}
+
 async function main(): Promise<void> {
   console.log("SupaMail Tier-1 spec conformance — exercising real Postgres + fixture IMAP\n");
   console.log(`DATABASE_URL=${process.env.DATABASE_URL?.replace(/:[^@:]*@/, ":***@")}`);
@@ -801,6 +999,7 @@ async function main(): Promise<void> {
   await scenarioFolderMissingGrace();
   await scenarioPartialCounterRule();
   await scenarioInitialSyncStallTimeout();
+  await scenarioStuckDegradedEscalation();
 
   const passed = results.filter((r) => r.passed).length;
   const failed = results.filter((r) => !r.passed).length;

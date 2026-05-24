@@ -1,9 +1,13 @@
 {
-  "schemaVersion": "0001_imap_mirror",
+  "schemaVersion": "0002_stuck_degraded_escalation",
   "migrations": [
     {
       "id": "0001_imap_mirror",
       "file": "0001_imap_mirror.sql"
+    },
+    {
+      "id": "0002_stuck_degraded_escalation",
+      "file": "0002_stuck_degraded_escalation.sql"
     }
   ]
 }

@@ -13,6 +13,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0006-use-harness-impact-reminder-before-pr-updates.md`: Pre-push verification reminds agents to review project docs and harness impact.
 - `0007-public-core-hosted-cloud-contract.md`: Public core publishes the pinned image, public migrations, and runtime contracts consumed by private hosted cloud.
 - `0008-cooperative-account-lock-budget.md`: Account lock hold time is enforced cooperatively at safe sync boundaries.
+- `0009-stuck-degraded-escalation.md`: Long-stuck degraded accounts escalate to retryable, then terminal, broken states.
 
 ## Status Values
 

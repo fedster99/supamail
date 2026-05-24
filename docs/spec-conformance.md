@@ -46,6 +46,7 @@ SupaMail owns a conservative mailbox mirror:
 | Missing folders get a grace period before tombstoning. | Implemented | Folder discovery stamps `missing_since`; past grace marks folder `MISSING` and tombstones in-window rows. |
 | UIDVALIDITY resets trigger controlled resync and a rolling reset cap. | Implemented | Reset handler tombstones old rows, resets folder state, and marks account `BROKEN` after the configured 24h cap. |
 | Health must not lie. | Implemented | Account health stays `INITIAL_SYNC`/`DEGRADED` until tracked folders, lag, and reconcile state are actually clean. |
+| Stuck `DEGRADED` must escalate without hiding recovery forever. | Implemented | `last_priority_sync_succeeded_at` drives retryable `STUCK_DEGRADED_24H`, hourly retry via `backoff_until`, terminal `STUCK_DEGRADED_TERMINAL`, and recovery on successful priority sync; spec-conformance Scenario I proves it. |
 | Partial success is not a hard failure when priority folders succeed. | Implemented | Priority failure makes sync failed; round-robin-only failure is `partial_success` and increments success counters. |
 | Backoff should be conservative and jittered. | Implemented | Transient failures use jittered exponential backoff; stored backoff resets only after stable success. |
 | Retention must preserve recoverable reconcile tombstones. | Implemented | Expiry marks old rows `EXPIRED`; purge only removes strict trapdoor reasons, never `RECONCILE_MISSING`. |

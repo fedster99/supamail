@@ -82,10 +82,12 @@ Apply the schema:
 pnpm migrate
 ```
 
-or:
+or, if you need to run SQL manually, apply the public migration files in manifest order:
 
 ```bash
-psql "$DATABASE_URL" -f apps/api/supabase/migrations/public/0001_imap_mirror.sql
+for file in apps/api/supabase/migrations/public/*.sql; do
+  psql "$DATABASE_URL" -f "$file"
+done
 ```
 
 Important: use a direct Supabase Postgres URL or the Supavisor session pooler on port `5432`. Do not use the transaction pooler on port `6543`. SupaMail uses advisory locks, and advisory locks need session affinity.
