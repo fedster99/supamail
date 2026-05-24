@@ -7,6 +7,7 @@ dist
 .env.local
 .env*.local
 .agents/
+skills-lock.json
 apps/api/fly.toml
 apps/api/fly.worker.toml
 apps/api/fly.api.toml
