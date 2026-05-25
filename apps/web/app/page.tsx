@@ -6,21 +6,22 @@ pnpm migrate
 pnpm dev`;
 
 const tables = [
-  ["imap_accounts", "mailbox configuration, encrypted IMAP credentials, sync health"],
-  ["imap_folders", "folder paths, UIDVALIDITY, cursors, discovery state"],
-  ["imap_messages", "folder-scoped message rows, flags, headers, provider state"],
-  ["imap_message_bodies", "raw RFC822, parsed text/html, MIME parser output"],
-  ["imap_attachments", "attachment metadata from message structure"],
-  ["sync_runs", "durable sync attempts, errors, timing, and outcomes"]
+  ["imap_accounts", "credentials, policy, and health"],
+  ["imap_folders", "folder state, cursors, and UIDVALIDITY"],
+  ["imap_messages", "headers, flags, provider state, and metadata"],
+  ["imap_message_bodies", "raw MIME plus parsed text and HTML"],
+  ["imap_attachments", "attachment and inline-part metadata"],
+  ["imap_sync_runs", "sync attempts, timing, and outcomes"],
+  ["imap_sync_events", "folder, message, reconcile, and health events"]
 ];
 
 const guarantees = [
-  "Folder-scoped identity: account, folder path, UIDVALIDITY, UID",
-  "Session-affine Postgres advisory locks for account work",
-  "UIDVALIDITY reset handling and resumable initial sync",
-  "Due-based reconcile and flag scans with bounded per-cycle work",
-  "Full MIME body fetch behind the same account lock",
-  "Sync health stored in Postgres, not hidden in process memory"
+  "Folder-scoped message identity",
+  "Session-affine advisory locks",
+  "Resumable initial sync",
+  "Budgeted reconcile and flag scans",
+  "MIME bodies behind account locks",
+  "Durable sync health"
 ];
 
 export default function HomePage() {
@@ -45,16 +46,15 @@ export default function HomePage() {
             <p className="eyebrow">open-source IMAP mirror for Postgres</p>
             <h1>Sync mailboxes into your Supabase database.</h1>
             <p className="lede">
-              SupaMail is the public core: a Node worker and API that mirrors IMAP folders,
-              messages, flags, MIME bodies, attachment metadata, sync runs, and health into
-              Postgres tables you own.
+              Self-host a Node worker and API that mirrors folders, messages, flags, MIME bodies,
+              attachments, sync runs, and health into Postgres.
             </p>
             <div className="actions">
               <a className="button primary" href="#quickstart">
                 Start self-hosting
               </a>
-              <a className="button secondary" href="https://supamail-cloud.vercel.app">
-                Hosted BYO Supabase
+              <a className="button secondary" href="https://github.com/fedster99/supamail">
+                View GitHub
               </a>
             </div>
           </div>
@@ -81,13 +81,12 @@ health: healthy`}</pre>
       <section className="band">
         <div className="wrap split">
           <div>
-            <p className="eyebrow">what this repo owns</p>
-            <h2>Mailbox mirror core. Not the hosted SaaS.</h2>
+            <p className="eyebrow">where it fits</p>
+            <h2>IMAP sync, already handled.</h2>
           </div>
           <p>
-            This repository stays focused on sync reliability and self-hosting. Billing, signup,
-            dashboards, Supabase OAuth onboarding, and managed cloud operations live outside the
-            public core.
+            SupaMail handles cursors, UIDVALIDITY resets, provider deletes, MIME parsing, retries,
+            and health. Your app reads ordinary tables.
           </p>
         </div>
       </section>
@@ -95,10 +94,9 @@ health: healthy`}</pre>
       <section id="quickstart" className="wrap section">
         <div className="section-head">
           <p className="eyebrow">quickstart</p>
-          <h2>Bring Postgres, Supabase, and IMAP credentials.</h2>
+          <h2>Bring Postgres and IMAP credentials.</h2>
           <p>
-            SupaMail runs as a worker, API, or combined process. Point it at a session-affine
-            Postgres connection, apply the public migrations, and configure a mailbox.
+            Use a session-affine Postgres connection, apply the migrations, and add a mailbox.
           </p>
         </div>
 
@@ -112,8 +110,8 @@ health: healthy`}</pre>
           <p className="eyebrow">public schema</p>
           <h2>Email becomes queryable rows.</h2>
           <p>
-            The public migration installs only mirror tables. Hosted control-plane tables never
-            belong in a customer database.
+            Migrations create mirror tables for accounts, folders, messages, bodies, attachments,
+            runs, events, and progress.
           </p>
         </div>
 
@@ -132,8 +130,7 @@ health: healthy`}</pre>
           <p className="eyebrow">reliability contract</p>
           <h2>Built around the parts of IMAP that usually break.</h2>
           <p>
-            The sync engine treats Postgres as the source of truth for mirrored state and keeps IMAP
-            provider work serialized per account.
+            Postgres is the source of truth. IMAP work is serialized per account.
           </p>
         </div>
 
@@ -149,19 +146,22 @@ health: healthy`}</pre>
 
       <section className="wrap section cta">
         <div>
-          <p className="eyebrow">deployment paths</p>
-          <h2>Self-host the core, or use the hosted wrapper.</h2>
+          <p className="eyebrow">deployment</p>
+          <h2>Deploy with session-affine Postgres.</h2>
           <p>
-            The same public sync engine powers both. Self-hosters own their infra. Hosted BYO
-            Supabase users bring a mirror target and let SupaMail Cloud run sync/API/MCP around it.
+            Use Supabase and Fly.io, or any Node 24 host with a long-lived worker. Avoid
+            transaction poolers; advisory locks need session affinity.
           </p>
         </div>
         <div className="cta-actions">
           <a className="button primary" href="https://github.com/fedster99/supamail">
             View GitHub
           </a>
-          <a className="button secondary" href="https://supamail-cloud.vercel.app">
-            Open hosted site
+          <a
+            className="button secondary"
+            href="https://github.com/fedster99/supamail/blob/main/docs/fly-supabase.md"
+          >
+            Read deploy docs
           </a>
         </div>
       </section>
