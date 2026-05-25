@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "status_values": ["not_started", "in_progress", "blocked", "passing"],
+  "rules": {
+    "work_in_progress_limit": 1,
+    "passing_requires_verification_evidence": true,
+    "source_of_truth": "GitHub issues plus this file",
+    "selection_policy": {
+      "if_in_progress_exists": "Continue the in_progress item unless the user redirects.",
+      "if_no_in_progress": "Do not self-start the highest-priority not_started item. Start only from an explicit user request, maintainer-selected PR scope, or a clear issue/task mapping.",
+      "if_mapping_unclear": "Ask for task selection or record the ambiguity before editing.",
+      "status_flow": "not_started -> in_progress -> blocked or passing"
+    }
+  },
+  "features": [
+    {
+      "id": "issue-2-historical-backfill",
+      "github_issue": 2,
+      "priority": 1,
+      "area": "sync-engine",
+      "title": "Add automatic historical backfill",
+      "user_visible_behavior": "A new account can eventually mirror older messages beyond WINDOW_DAYS without manual intervention while fresh mail stays current.",
+      "status": "passing",
+      "dependencies": [
+        "reliability-hardening-pr-1-lock-budget",
+        "reliability-hardening-pr-2-initial-sync-stall-timeout",
+        "reliability-hardening-pr-3-stuck-degraded-escalation",
+        "reliability-hardening-pr-4-folder-count-cap",
+        "reliability-hardening-pr-5-reactive-rediscovery",
+        "reliability-hardening-pr-6-account-lane-settings",
+        "reliability-hardening-pr-7-progress-rollup"
+      ],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build",
+        "pnpm test:db:live"
+      ],
+      "evidence": "PR-8 implemented three-lane history wiring on the working PR branch. Verified with pnpm --filter @supamail/api typecheck, targeted schema/repository/sync-engine/target-scheduler tests, Scenario L/M integration coverage, pnpm --filter @supamail/api spec-conformance (118 passed), and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh.",
+      "notes": "Historical backfill is resumable, bounded by the shared account lock budget, controlled by account settings, and observable through progress rollups. Reliability hardening PRs 1-8 are complete on the working PR branch."
+    },
+    {
+      "id": "issue-3-provider-compatibility",
+      "github_issue": 3,
+      "priority": 2,
+      "area": "provider-profiles",
+      "title": "Build IMAP compatibility matrix and protocol validation",
+      "user_visible_behavior": "Docs and tests make generic IMAP support explicit, provider-by-provider, with known quirks isolated in provider profiles.",
+      "status": "passing",
+      "dependencies": [],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build",
+        "pnpm smoke:greenmail when protocol behavior changes",
+        "pnpm smoke:dovecot when protocol behavior changes"
+      ],
+      "evidence": "Issue #3 provider compatibility slice added docs/imap-compatibility.md, ADR 0013, provider-profile quirk metadata, deterministic provider compatibility integration fixtures, UID search edge tests, GreenMail smoke verification, and Dovecot smoke verification. Follow-up review fixes cover dot-delimiter All Mail exclusion and fallback raw MIME download byte caps. Verified with pnpm --filter @supamail/api typecheck, targeted provider-profile/imap-client tests, pnpm --filter @supamail/api test:db:live, pnpm --filter @supamail/api smoke:greenmail, pnpm --filter @supamail/api smoke:dovecot, and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh with 31 live integration tests and 118 spec checks.",
+      "notes": "Generic IMAP support is framed as a minimum contract validated by provider shape, deterministic fixtures, and two real-server smokes: GreenMail and Dovecot. Live provider account results remain manual matrix entries until safe provider-specific CI accounts exist."
+    },
+    {
+      "id": "issue-4-mcp-server",
+      "github_issue": 4,
+      "priority": 3,
+      "area": "mcp",
+      "title": "Add MCP server for AI email tools",
+      "user_visible_behavior": "A local stdio MCP server can safely expose read-oriented mailbox tools against an existing SupaMail database.",
+      "status": "not_started",
+      "dependencies": [],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build"
+      ],
+      "evidence": "",
+      "notes": "Start local stdio first. Remote transport must be absent or explicitly bearer-token protected."
+    }
+  ]
+}

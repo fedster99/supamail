@@ -1,0 +1,86 @@
+export interface ProviderProfile {
+  id: string;
+  displayName: string;
+  compatibilityStatus: "generic-core" | "profiled";
+  knownQuirks: ProviderQuirk[];
+  priorityForFolder(path: string, specialUse?: string | null): number;
+  excludedReason(path: string, specialUse?: string | null): string | null;
+}
+
+export interface ProviderQuirk {
+  id: string;
+  description: string;
+  handling: string;
+}
+
+function normalizedPath(path: string): string {
+  return path.toLowerCase().replace(/^\\+/, "");
+}
+
+const noisyFolderFragments = [
+  "spam",
+  "junk",
+  "trash",
+  "deleted",
+  "draft"
+];
+
+function isAllMail(path: string, specialUse?: string | null): boolean {
+  const normalizedSpecialUse = normalizedPath(specialUse ?? "").trim();
+  const normalizedFolder = normalizedPath(path).replace(/\s+/g, " ").trim();
+  return normalizedSpecialUse === "all" || /(^|[/.])all\s*mail$/.test(normalizedFolder);
+}
+
+export const genericImapProfile: ProviderProfile = {
+  id: "generic-imap",
+  displayName: "Generic IMAP",
+  compatibilityStatus: "generic-core",
+  knownQuirks: [],
+  priorityForFolder(path, specialUse) {
+    const normalized = normalizedPath(specialUse || path);
+    if (normalized.includes("inbox")) return 1;
+    if (normalized.includes("sent")) return 5;
+    return 100;
+  },
+  excludedReason(path, specialUse) {
+    if (isAllMail(path, specialUse)) return "excluded_all_mail";
+    const normalized = normalizedPath(`${specialUse || ""} ${path}`);
+    for (const fragment of noisyFolderFragments) {
+      if (normalized.includes(fragment)) return `excluded_${fragment}`;
+    }
+    return null;
+  }
+};
+
+export const rackspaceProfile: ProviderProfile = {
+  ...genericImapProfile,
+  id: "rackspace",
+  displayName: "Rackspace Email",
+  compatibilityStatus: "profiled",
+  knownQuirks: [
+    {
+      id: "rackspace-inbox-inbox-alias",
+      description: "Some Rackspace accounts expose INBOX.INBOX as a duplicate alias for INBOX.",
+      handling: "The sync engine excludes INBOX.INBOX only after mailbox metadata fingerprint verification."
+    }
+  ],
+  priorityForFolder(path, specialUse) {
+    const normalized = normalizedPath(specialUse || path);
+    if (path === "INBOX" || normalized.includes("inbox")) return 1;
+    if (normalized.includes("sent")) return 5;
+    return 100;
+  }
+};
+
+const profiles = new Map<string, ProviderProfile>([
+  [genericImapProfile.id, genericImapProfile],
+  [rackspaceProfile.id, rackspaceProfile]
+]);
+
+export function getProviderProfile(id: string | null | undefined): ProviderProfile {
+  return profiles.get(id || "") ?? genericImapProfile;
+}
+
+export function listProviderProfiles(): ProviderProfile[] {
+  return [...profiles.values()];
+}

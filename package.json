@@ -1,0 +1,31 @@
+{
+  "name": "supamail",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SupaMail monorepo — Supabase/Postgres-native IMAP mirror + landing site.",
+  "license": "MIT",
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "dev": "turbo run dev",
+    "dev:web": "turbo run dev --filter=@supamail/web",
+    "dev:worker": "pnpm --filter @supamail/api dev:worker",
+    "dev:api": "pnpm --filter @supamail/api dev:api",
+    "harness:check": "node scripts/check-harness-impact.mjs",
+    "migrate": "pnpm --filter @supamail/api migrate",
+    "spec-conformance": "pnpm --filter @supamail/api spec-conformance",
+    "test:db:live": "pnpm --filter @supamail/api test:db:live",
+    "smoke:greenmail": "pnpm --filter @supamail/api smoke:greenmail",
+    "smoke:dovecot": "pnpm --filter @supamail/api smoke:dovecot",
+    "smoke:load": "pnpm --filter @supamail/api smoke:load"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.3"
+  },
+  "engines": {
+    "node": "24.x",
+    "pnpm": ">=10"
+  },
+  "packageManager": "pnpm@10.0.0"
+}

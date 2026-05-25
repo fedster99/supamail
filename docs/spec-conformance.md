@@ -1,0 +1,118 @@
+# Spec Conformance
+
+SupaMail was extracted from an older Rackspace IMAP sync design that was used to build the original Signal sync engine. This document is the public, sanitized conformance map: it records which reliability mechanics were imported, how SupaMail implements them, and what proves they work.
+
+The private source context is kept outside the public repo in `.context/old-spec-used-to-build-original-signal-sync-engine.md`.
+
+This file is not a full copy of the old spec. It keeps the portable mailbox-mirror contract and omits private Signal product behavior.
+
+## Operating Contract
+
+SupaMail owns a conservative mailbox mirror:
+
+- Postgres is the source of truth for mirrored state; IMAP is the provider being observed.
+- The hot mirror window is based on IMAP `INTERNALDATE`, not the RFC `Date` header.
+- Metadata, folder state, flags, body fetch state, sync events, and health are durable.
+- Full MIME bodies are fetched according to account policy and always behind the same account lock.
+- Multi-folder moves are normal. A message that leaves one folder may still appear elsewhere with a different folder-scoped UID identity.
+- Mailbox identity is not CRM identity. SupaMail does not resolve people, companies, handles, relationships, or hydrated activities.
+- The architecture is intentionally stateful and account-capped. Scaling beyond the default account cap requires a new architecture decision.
+
+## Reliability Matrix
+
+| Old spec requirement | SupaMail status | Implementation / proof |
+| --- | --- | --- |
+| UIDs are scoped by folder and UIDVALIDITY, never globally unique. | Implemented | Message uniqueness is `(account_id, folder_path, uidvalidity, uid)`; `pnpm spec-conformance` covers UIDVALIDITY behavior. |
+| Message-ID is useful but not authoritative identity. | Implemented | Raw and normalized Message-ID are stored for lookup and correlation, but uniqueness is still folder/UIDVALIDITY/UID-scoped. |
+| Credentials must not be stored or logged in plaintext. | Implemented with deliberate divergence | SupaMail encrypts IMAP passwords in Node with AES-256-GCM instead of old SQL crypto examples; see ADR 0002. |
+| Do not run concurrent IMAP operations for the same account. | Implemented | Session advisory locks in `withAccountLock`; live DB tests verify concurrent sync serialization. |
+| Advisory locks require session-affine Postgres connections. | Implemented | Worker startup self-test fails fast when session lock semantics are broken; deployment docs require direct/session-affine DB access. |
+| Detect broken advisory lock/session assumptions. | Implemented | Worker lock self-test verifies session-scoped lock behavior at startup. |
+| Recover stale/orphaned account locks. | Implemented | Stale heartbeat recovery scans `pg_locks` and terminates stale backends; live DB tests exercise real `pg_locks`. |
+| IMAP commands should be bounded and provider-friendly. | Implemented | IMAP operations use command timeouts and a per-connection token bucket controlled by `IMAP_MAX_COMMANDS_PER_MINUTE`. |
+| Mailbox operations must avoid mailbox switching races. | Implemented | Folder sync and body fetch use ImapFlow mailbox locks before folder-specific operations. |
+| Sync scheduling uses priority folders plus bounded round-robin. | Implemented | `PRIORITY_CUTOFF`, `MAX_PRIORITY_FOLDERS_PER_CYCLE`, `MAX_RR_FOLDERS_PER_CYCLE`, and `folder_rr_cursor` prevent lower-priority folder starvation. |
+| Initial sync must be resumable and gap-safe. | Implemented | Snapshot + newest-first watermark; spec-conformance runs three-cycle initial sync proof. |
+| Initial sync batches must not stall forever. | Implemented | `INITIAL_SYNC_BATCH_TIMEOUT_MS` bounds initial snapshot/search/fetch work, aborts the IMAP client on timeout, and does not advance the watermark; spec-conformance Scenario H proves retry resumes from the same watermark. |
+| Do not reconcile unfinished initial sync folders. | Implemented | Reconcile runs only after initial sync completion; health remains `INITIAL_SYNC` while any tracked folder is incomplete. |
+| Incremental sync must not advance through partial metadata fetches. | Implemented | Metadata fetch fails if any requested UID is missing; unit coverage pins partial-batch behavior. |
+| Incremental sync must respect a hard operation deadline. | Implemented | `INCREMENTAL_TOTAL_TIMEOUT_MS` aborts IMAP work, treats the cycle as transient failure, and does not advance `last_uid`. |
+| Reconcile provider deletes and missing-in-DB rows. | Implemented | Temp-table UID stream finds missing local rows and provider-only rows; live DB tests verify `RECONCILE_BACKFILL`. |
+| Reconcile must be staggered and budgeted. | Implemented | `next_reconcile_at`, `RECONCILE_INTERVAL_MS`, and `MAX_RECONCILES_PER_CYCLE` keep reconciliation due-based instead of every-folder/every-cycle. |
+| Flag scans are due-based and diff actual flag changes. | Implemented | `applyFlagScan` compares normalized old/new flags, logs `FLAGS_CHANGED`, and does not backfill unknown UIDs. |
+| Flag scans must be budgeted. | Implemented | Priority and round-robin flag scan intervals are separate, and `MAX_FLAG_SCANS_PER_CYCLE` limits per-cycle work. |
+| Exclude folder explosions such as Spam/Trash/All Mail by default. | Implemented | Provider profiles exclude dangerous/system folders including SPECIAL-USE `\All` and `All Mail`. |
+| Archive-like folders are not excluded by default. | Implemented | Provider profile tests cover that archive folders stay trackable unless explicitly configured otherwise. |
+| Generic IMAP support must be validated provider by provider. | Implemented | `docs/imap-compatibility.md` defines the minimum contract, provider matrix, and manual smoke checklist; `provider-compatibility.integration.test.ts` covers deterministic protocol fixtures; GreenMail and Dovecot smokes cover two real IMAP server implementations. |
+| Folder-count explosions must not silently overload sync. | Implemented | `FOLDER_COUNT_WARN_THRESHOLD` adds `MANY_FOLDERS_PERFORMANCE_NOTE`; `FOLDER_COUNT_ENFORCE_THRESHOLD` keeps only priority folders tracked with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`; spec-conformance Scenario J proves warn, enforce, and auto-recovery. |
+| Missing folders get a grace period before tombstoning. | Implemented | Folder discovery stamps `missing_since`; past grace marks folder `MISSING` and tombstones in-window rows. |
+| Missing-mailbox folder operations should force rediscovery. | Implemented | Missing-mailbox errors move the folder to `PENDING_VERIFICATION`, stamp `missing_since`, set `next_folder_discovery_at = now()`, and pause normal scheduling until discovery resolves it; spec-conformance Scenario K proves the full path. |
+| UIDVALIDITY resets trigger controlled resync and a rolling reset cap. | Implemented | Reset handler tombstones old rows, resets folder state, and marks account `BROKEN` after the configured 24h cap. |
+| Health must not lie. | Implemented | Account health stays `INITIAL_SYNC`/`DEGRADED` until tracked folders, lag, and reconcile state are actually clean. |
+| Stuck `DEGRADED` must escalate without hiding recovery forever. | Implemented | `last_priority_sync_succeeded_at` drives retryable `STUCK_DEGRADED_24H`, hourly retry via `backoff_until`, terminal `STUCK_DEGRADED_TERMINAL`, and recovery on successful priority sync; spec-conformance Scenario I proves it. |
+| Partial success is not a hard failure when priority folders succeed. | Implemented | Priority failure makes sync failed; round-robin-only failure is `partial_success` and increments success counters. |
+| Backoff should be conservative and jittered. | Implemented | Transient failures use jittered exponential backoff; stored backoff resets only after stable success. |
+| Retention must preserve recoverable reconcile tombstones. | Implemented | Expiry marks old rows `EXPIRED`; purge only removes strict trapdoor reasons, never `RECONCILE_MISSING`. |
+| Account count should be capped for this architecture. | Implemented | `SYNC_MAX_ACCOUNTS` enforced at account creation and worker startup. |
+| Body fetches should be lazy and lock-guarded. | Implemented | Body backlog/fetch uses the same account lock and stores full MIME/parser output separately from metadata. |
+| Body completeness should be observable because downstream search reliability depends on it. | Implemented | Folder progress counters and `imap_account_progress` expose live-header, priority-body, live-body, and historical completion percentages; spec-conformance Scenario M proves the roll-up. |
+| Historical backfill should not starve fresh mail. | Implemented | The engine runs hot, body, then history lanes under one advisory lock; history is resumable through folder `backfill_*` state and skipped when the body lane exhausts the lock budget. Spec-conformance Scenario L proves ordering and budget behavior. |
+| Attachment metadata belongs in the mirror, not necessarily attachment binaries. | Implemented | MIME `BODYSTRUCTURE` is parsed into attachment metadata during sync; binary attachment retrieval is outside the current core path. |
+| Worker shutdown should release held resources. | Implemented | SIGTERM/SIGINT abort the loop, wake sleep, and close the Postgres pool so advisory locks release with the session. |
+| Sync should emit durable observability events. | Implemented at mirror-event level | Sync runs, message/folder events, flag changes, reconcile backfills, and retention outcomes are stored or logged. Stable metrics/alert names remain an open operational layer. |
+| CI must prove DB behavior against real Postgres. | Implemented | `pnpm test:db:live` starts disposable Postgres, migrates twice, runs live DB integration tests, then runs spec conformance. |
+
+## Imported Detailed Semantics
+
+### Identity And Normalization
+
+The mirror stores both raw and normalized Message-ID values, but they are correlation helpers only. They must not replace the primary mirror identity of account, folder path, UIDVALIDITY, and UID. This is mailbox identity only; it must not grow into CRM identity hydration, person/company resolution, handle mapping, or activity construction inside SupaMail core. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
+
+### Folder Discovery And Scheduling
+
+Folder discovery is due-based and persists provider seen/missing state. Sync cycles process priority folders first, then a bounded number of non-priority folders using a stable round-robin cursor. The cursor advances by attempted folders so one bad lower-priority folder cannot starve the rest.
+
+Flag scans and reconciles are also due-based and budgeted. Agents should not change this into "scan every folder every cycle" behavior; that is exactly the folder-explosion failure mode the old spec was trying to prevent.
+
+Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. It does not affect `sync_state` health; progress consumers should read `imap_account_progress` and per-folder progress rows.
+
+### IMAP Connection And Lock Discipline
+
+All account-scoped IMAP work goes through the account advisory lock. Folder-specific work takes an ImapFlow mailbox lock before reading UIDVALIDITY, syncing metadata, scanning flags, reconciling, or fetching a body. IMAP commands are throttled and timeout-bounded; failed or timed-out operations must not advance sync cursors.
+
+### Health, Backoff, And Retention
+
+Health is a reliability statement, not a cosmetic status. `HEALTHY` requires completed initial sync, fresh priority folders, acceptable overall lag, and recent clean reconciles. `DEGRADED` is the correct state for drift, priority lag, missing folders, UIDVALIDITY resync, or incremental timeout. `BROKEN` is for non-retryable auth failure and pathological repeated failures.
+
+Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge is limited to strict trapdoor reasons and must not purge `RECONCILE_MISSING` rows.
+
+## Open Deltas From The Old Spec
+
+These old-spec ideas are still useful, but they are not part of the current implemented contract:
+
+- Stable metrics and alerts: the worker logs structured events and writes sync records, but this repo does not yet define production metric names or alert thresholds as a public contract.
+- Provider-specific live account CI: the open-source project now has a compatibility matrix, deterministic provider-shape fixtures, GreenMail and Dovecot smoke tests, and disposable Postgres. Live provider accounts still require manual smoke runs unless a safe provider-specific CI account is added later.
+- UI fallback for body-fetch failures: SupaMail stores metadata and body state, but it does not own an end-user UI contract.
+- CRM interaction fallback: the old Signal interaction-resolution behavior is intentionally outside SupaMail core.
+
+## Intentionally Out Of Scope
+
+SupaMail keeps the Signal product layer out:
+
+- Relationship CRM tables and interactions.
+- CRM hydration, identity resolution, handle/person/company mapping, belief, and epistemic architecture layers.
+- Signal dashboard/API routes.
+- Provider-specific live account tests in CI.
+
+The open-source project owns the mailbox mirror: durable metadata, flags, bodies, folders, sync events, health, and reliability semantics.
+
+## Verification Commands
+
+```bash
+pnpm test
+pnpm test:db:live
+pnpm typecheck
+pnpm build
+```
+
+`pnpm test:db:live` runs the serious DB reliability gate: disposable Docker Postgres, migration idempotence, live DB integration tests, and spec conformance.

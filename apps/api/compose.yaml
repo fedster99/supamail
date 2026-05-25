@@ -1,0 +1,26 @@
+services:
+  worker:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    command: node dist/runtime.js
+    environment:
+      SUPAMAIL_MODE: worker
+    restart: unless-stopped
+    env_file:
+      - .env
+
+  api:
+    profiles:
+      - api
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    command: node dist/runtime.js
+    environment:
+      SUPAMAIL_MODE: api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "0006_history_lane_state",
+  "migrations": [
+    {
+      "id": "0001_imap_mirror",
+      "file": "0001_imap_mirror.sql"
+    },
+    {
+      "id": "0002_stuck_degraded_escalation",
+      "file": "0002_stuck_degraded_escalation.sql"
+    },
+    {
+      "id": "0003_folder_count_cap_pending_verification",
+      "file": "0003_folder_count_cap_pending_verification.sql"
+    },
+    {
+      "id": "0004_account_lane_settings",
+      "file": "0004_account_lane_settings.sql"
+    },
+    {
+      "id": "0005_progress_rollup",
+      "file": "0005_progress_rollup.sql"
+    },
+    {
+      "id": "0006_history_lane_state",
+      "file": "0006_history_lane_state.sql"
+    }
+  ]
+}

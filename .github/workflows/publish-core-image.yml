@@ -1,0 +1,74 @@
+name: Publish Core Image
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-core-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and publish GHCR image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: >-
+      ${{
+        (
+          github.event_name == 'workflow_dispatch' &&
+          github.ref == 'refs/heads/main'
+        ) ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set image tag
+        run: |
+          set -euo pipefail
+          core_sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "IMAGE=ghcr.io/${{ github.repository_owner }}/supamail-api:sha-$core_sha" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: docker build -f apps/api/Dockerfile -t "$IMAGE" .
+
+      - name: Smoke runtime modes
+        run: |
+          set -euo pipefail
+          for mode in worker api combined; do
+            docker run --rm \
+              -e SUPAMAIL_MODE="$mode" \
+              -e SUPAMAIL_RUNTIME_CHECK=1 \
+              "$IMAGE"
+          done
+
+      - run: docker push "$IMAGE"
+
+      - name: Record image digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "Published $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: $digest" >> "$GITHUB_STEP_SUMMARY"
