@@ -20,7 +20,7 @@
       "area": "sync-engine",
       "title": "Add automatic historical backfill",
       "user_visible_behavior": "A new account can eventually mirror older messages beyond WINDOW_DAYS without manual intervention while fresh mail stays current.",
-      "status": "passing",
+      "status": "not_started",
       "dependencies": [
         "reliability-hardening-pr-1-lock-budget",
         "reliability-hardening-pr-2-initial-sync-stall-timeout",
@@ -36,8 +36,8 @@
         "pnpm build",
         "pnpm test:db:live"
       ],
-      "evidence": "PR-8 implemented three-lane history wiring on the working PR branch. Verified with pnpm --filter @supamail/api typecheck, targeted schema/repository/sync-engine/target-scheduler tests, Scenario L/M integration coverage, pnpm --filter @supamail/api spec-conformance (118 passed), and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh.",
-      "notes": "Historical backfill is resumable, bounded by the shared account lock budget, controlled by account settings, and observable through progress rollups. Reliability hardening PRs 1-8 are complete on the working PR branch."
+      "evidence": "",
+      "notes": "Maintainer clarified on 2026-05-29 that this issue should not be treated as done. Earlier history-lane implementation and verification may exist in the codebase, but future work must re-read issue #2, revalidate the acceptance criteria, and record fresh completion evidence before marking passing."
     },
     {
       "id": "issue-3-provider-compatibility",
@@ -46,7 +46,7 @@
       "area": "provider-profiles",
       "title": "Build IMAP compatibility matrix and protocol validation",
       "user_visible_behavior": "Docs and tests make generic IMAP support explicit, provider-by-provider, with known quirks isolated in provider profiles.",
-      "status": "passing",
+      "status": "not_started",
       "dependencies": [],
       "verification": [
         "pnpm typecheck",
@@ -55,8 +55,8 @@
         "pnpm smoke:greenmail when protocol behavior changes",
         "pnpm smoke:dovecot when protocol behavior changes"
       ],
-      "evidence": "Issue #3 provider compatibility slice added docs/imap-compatibility.md, ADR 0013, provider-profile quirk metadata, deterministic provider compatibility integration fixtures, UID search edge tests, GreenMail smoke verification, and Dovecot smoke verification. Follow-up review fixes cover dot-delimiter All Mail exclusion and fallback raw MIME download byte caps. Verified with pnpm --filter @supamail/api typecheck, targeted provider-profile/imap-client tests, pnpm --filter @supamail/api test:db:live, pnpm --filter @supamail/api smoke:greenmail, pnpm --filter @supamail/api smoke:dovecot, and INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh with 31 live integration tests and 118 spec checks.",
-      "notes": "Generic IMAP support is framed as a minimum contract validated by provider shape, deterministic fixtures, and two real-server smokes: GreenMail and Dovecot. Live provider account results remain manual matrix entries until safe provider-specific CI accounts exist."
+      "evidence": "",
+      "notes": "Maintainer clarified on 2026-05-29 that this issue should not be treated as done. Existing compatibility docs, fixtures, and smokes may be useful partial work, but future work must re-read issue #3, revalidate the provider matrix/protocol acceptance criteria, and record fresh completion evidence before marking passing."
     },
     {
       "id": "issue-4-mcp-server",
@@ -74,6 +74,23 @@
       ],
       "evidence": "",
       "notes": "Start local stdio first. Remote transport must be absent or explicitly bearer-token protected."
+    },
+    {
+      "id": "issue-7-agent-email-cli",
+      "github_issue": 7,
+      "priority": 4,
+      "area": "agent-cli",
+      "title": "Build an agent-first email CLI",
+      "user_visible_behavior": "A local coding agent can inspect mirrored email through stable CLI commands with deterministic, machine-readable output and clear sync trust signals.",
+      "status": "not_started",
+      "dependencies": [],
+      "verification": [
+        "pnpm typecheck",
+        "pnpm test",
+        "pnpm build"
+      ],
+      "evidence": "",
+      "notes": "Future roadmap item requested by the maintainer. Keep the first pass read-oriented against the existing mirror; sending, scheduling, contacts, calendar, CRM hydration, and AI summarization stay out of scope unless a later issue/ADR explicitly adds them. This should complement issue #4 MCP and may share the same read-tool contract."
     }
   ]
 }

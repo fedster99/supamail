@@ -38,6 +38,19 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 
 ## Sync Semantics
 
+- Current default sync edges:
+  - Live sync window is `WINDOW_DAYS=90` days.
+  - New mail is polling-based and usually detected in about 1-2 minutes.
+  - Folder discovery runs every 15 minutes.
+  - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder.
+  - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
+  - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
+  - Body fetch is capped at up to 100 live bodies per worker tick.
+  - Raw MIME fetch is capped at 25 MB per message.
+  - Account lock budget is 10 minutes.
+  - Default architecture cap is 20 accounts.
+- The real active cutoff currently comes from global `WINDOW_DAYS`; do not claim per-account `live_window_days` changes the sync cutoff until that path is implemented.
+- Treat historical/deep-archive backfill as separate from the live-window health path. Issue #2 is open, so do not describe deep archive completeness as done without revalidating the issue acceptance criteria.
 - Initial sync is folder-level, snapshot-based, newest-first, and resumable.
 - Initial sync SEARCH/FETCH work is bounded by `INITIAL_SYNC_BATCH_TIMEOUT_MS`; a timeout aborts the IMAP client and must not advance the initial-sync watermark.
 - A failed initial sync batch must not advance watermarks.

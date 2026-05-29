@@ -54,6 +54,24 @@ SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Su
 
 Account-level advisory locks keep sync operations serialized. Folder state tracks UID cursors and UIDVALIDITY. Reconciliation catches gaps so missing messages do not silently become permanent.
 
+## Default Sync Edges
+
+These are the current defaults, tuned for a small always-on worker:
+
+- Live sync window: 90 days
+- New mail detection: about 1-2 minutes
+- Folder discovery: every 15 minutes
+- Message delete/move detection: about 6 hours per folder
+- Folder deletion grace period: 7 days
+- Priority folders per cycle: 10
+- Non-priority folders per cycle: 5
+- Body fetch cap: up to 100 bodies per worker tick
+- Max raw MIME body: 25 MB
+- Account lock budget: 10 minutes
+- Default account cap: 20 accounts
+
+Historical/deep-archive backfill is separate from the live-window health path. Treat live health as the fresh-mail reliability signal, not proof that every older message has already been mirrored.
+
 ## Repository Layout
 
 - `apps/api`: TypeScript/Node worker, API, CLI, tests, Supabase migration, Docker, and Fly configs.
