@@ -44,6 +44,8 @@ The 256 MB worker profile intentionally uses conservative runtime settings:
 
 This keeps sync metadata and body parsing bounded. If a mailbox regularly has large MIME bodies or the machine OOMs, first increase `BODY_RAW_MAX_BYTES` only if needed; otherwise move the worker to `512mb`.
 
+`DATABASE_POOL_MAX` (default 10) sets the Postgres connection pool size for the process. Raise it when one worker drives many accounts/folders concurrently and the database can afford the connections; keep it at or below what a connection-capped Postgres (for example a Supavisor session pooler) allows. It does not change advisory-lock semantics — each pooled connection is its own session.
+
 If your Signal repo already has the Fly and database env vars loaded locally, you can reuse them:
 
 ```bash

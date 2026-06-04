@@ -18,8 +18,10 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - One IMAP operation per account at a time across worker and API.
 - Use session-scoped Postgres advisory locks, not transaction locks.
 - `DATABASE_URL` must be direct or session-affine. Transaction poolers are unsafe for this architecture.
+- `DATABASE_POOL_MAX` (default 10) caps Postgres connections per process. It does not change advisory-lock semantics: each pooled connection is its own session. Raise it for many concurrent accounts; keep it within a connection-capped pooler's limit.
 - Worker startup must fail if advisory lock self-test fails.
 - Stale lock recovery must be heartbeat-based and conservative.
+- Stale lock recovery also closes the dead worker's open `imap_sync_runs` row (`status='failed'`, reaped error note) so it stops reading as a perpetually running sync. It must only touch stale accounts; a live account with a fresh heartbeat is left running.
 - `MAX_LOCK_HOLD_MS` is a cooperative fairness budget. It is checked at safe boundaries, not by killing in-flight IMAP commands.
 - Priority folders may finish past the lock budget; non-priority folders and body batches stop at the next safe boundary.
 - A `hitLockBudget` cycle is normal completion and must not reset backoff counters.

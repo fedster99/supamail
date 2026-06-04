@@ -28,7 +28,7 @@ SupaMail owns a conservative mailbox mirror:
 | Do not run concurrent IMAP operations for the same account. | Implemented | Session advisory locks in `withAccountLock`; live DB tests verify concurrent sync serialization. |
 | Advisory locks require session-affine Postgres connections. | Implemented | Worker startup self-test fails fast when session lock semantics are broken; deployment docs require direct/session-affine DB access. |
 | Detect broken advisory lock/session assumptions. | Implemented | Worker lock self-test verifies session-scoped lock behavior at startup. |
-| Recover stale/orphaned account locks. | Implemented | Stale heartbeat recovery scans `pg_locks` and terminates stale backends; live DB tests exercise real `pg_locks`. |
+| Recover stale/orphaned account locks. | Implemented | Stale heartbeat recovery scans `pg_locks`, terminates stale backends, and closes the orphaned `imap_sync_runs` rows a dead worker left `running`; live DB tests cover both the held-lock path (real `pg_locks`) and the SIGKILL/OOM path (no lock to terminate), asserting the reaped run is marked `failed` while a live account's run is left untouched. |
 | IMAP commands should be bounded and provider-friendly. | Implemented | IMAP operations use command timeouts and a per-connection token bucket controlled by `IMAP_MAX_COMMANDS_PER_MINUTE`. |
 | Mailbox operations must avoid mailbox switching races. | Implemented | Folder sync and body fetch use ImapFlow mailbox locks before folder-specific operations. |
 | Sync scheduling uses priority folders plus bounded round-robin. | Implemented | `PRIORITY_CUTOFF`, `MAX_PRIORITY_FOLDERS_PER_CYCLE`, `MAX_RR_FOLDERS_PER_CYCLE`, and `folder_rr_cursor` prevent lower-priority folder starvation. |
