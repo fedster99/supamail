@@ -1,8 +1,16 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { fetchMessageMetadata, searchAllUids, searchUidsBefore, searchUidsSince } from "../imap-client.js";
+import type { AppConfig } from "../config.js";
+import {
+  fetchFullMessageBody,
+  fetchMessageMetadata,
+  searchAllUids,
+  searchUidsBefore,
+  searchUidsSince
+} from "../imap-client.js";
 import { FixtureImapClient, makeTextMessage } from "../smoke/fixture-imap.js";
+import type { ImapMessage } from "../types.js";
 
 describe("fetchMessageMetadata", () => {
   it("fails instead of advancing past a partial UID batch", async () => {
@@ -77,5 +85,82 @@ describe("fetchMessageMetadata", () => {
     } finally {
       lock.release();
     }
+  });
+});
+
+describe("fetchFullMessageBody mailbox locking", () => {
+  const bodyConfig = { BODY_RAW_MAX_BYTES: 25 * 1024 * 1024 } as unknown as AppConfig;
+  const notesMessage = {
+    id: "m1",
+    account_id: "a1",
+    uid: 1273,
+    folder_path: "INBOX.Notes",
+    uidvalidity: 1,
+    mime_structure: null,
+    headers_json: {}
+  } as unknown as ImapMessage;
+
+  const notesClient = () =>
+    new FixtureImapClient([
+      {
+        path: "INBOX.Notes",
+        delimiter: ".",
+        specialUse: undefined,
+        uidValidity: 1,
+        messages: [
+          makeTextMessage({ uid: 1273, subject: "Open AI", from: "a@example.test", to: "b@example.test", body: "note" })
+        ]
+      }
+    ]);
+
+  const countLocks = (client: FixtureImapClient) => {
+    let calls = 0;
+    const original = client.getMailboxLock.bind(client);
+    client.getMailboxLock = async (path: string) => {
+      calls += 1;
+      return original(path);
+    };
+    return () => calls;
+  };
+
+  it("acquires the mailbox lock by default", async () => {
+    const client = notesClient();
+    const locks = countLocks(client);
+    const body = await fetchFullMessageBody(client, bodyConfig, notesMessage);
+    expect(locks()).toBe(1);
+    expect(body.rawBytes).toBeGreaterThan(0);
+  });
+
+  it("reuses the selected mailbox without re-locking when skipMailboxLock is set (no nested-lock deadlock)", async () => {
+    const client = notesClient();
+    await client.getMailboxLock("INBOX.Notes"); // caller already holds the lock
+    const locks = countLocks(client);
+    const body = await fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true });
+    expect(locks()).toBe(0);
+    expect(body.messageId).toBe("m1");
+    expect(body.rawBytes).toBeGreaterThan(0);
+  });
+
+  it("throws when skipMailboxLock is set but the wrong folder is selected", async () => {
+    const client = new FixtureImapClient([
+      {
+        path: "INBOX",
+        delimiter: ".",
+        specialUse: "\\Inbox",
+        uidValidity: 1,
+        messages: [makeTextMessage({ uid: 1, subject: "x", from: "a@example.test", to: "b@example.test", body: "x" })]
+      },
+      {
+        path: "INBOX.Notes",
+        delimiter: ".",
+        specialUse: undefined,
+        uidValidity: 1,
+        messages: [makeTextMessage({ uid: 1273, subject: "n", from: "a@example.test", to: "b@example.test", body: "n" })]
+      }
+    ]);
+    await client.getMailboxLock("INBOX"); // wrong folder selected
+    await expect(
+      fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true })
+    ).rejects.toThrow(/expected INBOX\.Notes to be selected/);
   });
 });
