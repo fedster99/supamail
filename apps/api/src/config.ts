@@ -4,6 +4,10 @@ import type { BodyFetchPolicy } from "./types.js";
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
+  // Max connections in the pg pool. Defaults to 10 (the prior hardcoded value). Raise
+  // it when one process drives many accounts/folders concurrently against a Postgres
+  // that can afford the connections; keep it modest against connection-capped servers.
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().default(10),
   IMAP_ENCRYPTION_KEY: z.string().min(16),
   API_TOKEN: z.string().optional(),
   ADMIN_TOKEN: z.string().optional(),
