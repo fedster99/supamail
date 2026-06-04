@@ -203,7 +203,9 @@ export async function clearOrphanedLockForAccount(
       [lockId]
     );
     // Close the sync run the killed process left open, so it stops reading as
-    // perpetually 'running' (previously only the account lock was reaped).
+    // perpetually 'running' (previously only the account lock was reaped). The
+    // started_at guard ensures a run a concurrent worker just opened (before it
+    // refreshed the heartbeat) is not mistaken for the dead worker's orphan.
     await pool.query(
       `
       UPDATE public.imap_sync_runs r
@@ -215,8 +217,9 @@ export async function clearOrphanedLockForAccount(
         AND a.lock_id = $1
         AND r.status = 'running'
         AND r.finished_at IS NULL
+        AND r.started_at < now() - ($2::bigint * interval '1 millisecond')
       `,
-      [lockId]
+      [lockId, staleThresholdMs]
     );
     return true;
   } catch {
@@ -224,7 +227,19 @@ export async function clearOrphanedLockForAccount(
   }
 }
 
-export async function clearOrphanedLocks(pool: PgPool, staleThresholdMs: number): Promise<number> {
+export interface OrphanedLockSweep {
+  /** Stale advisory-lock backends terminated via pg_terminate_backend. */
+  terminatedBackends: number;
+  /** Accounts whose currently_syncing flag was reset. */
+  accountsReset: number;
+  /** Open imap_sync_runs rows force-closed as failed (reaped). */
+  runsClosed: number;
+}
+
+export async function clearOrphanedLocks(
+  pool: PgPool,
+  staleThresholdMs: number
+): Promise<OrphanedLockSweep> {
   try {
     const result = await pool.query<{ pid: number }>(
       `
@@ -248,7 +263,7 @@ export async function clearOrphanedLocks(pool: PgPool, staleThresholdMs: number)
       await pool.query("SELECT pg_terminate_backend($1)", [row.pid]).catch(() => undefined);
     }
 
-    await pool.query(
+    const reset = await pool.query(
       `
       UPDATE public.imap_accounts
       SET currently_syncing = false,
@@ -264,8 +279,10 @@ export async function clearOrphanedLocks(pool: PgPool, staleThresholdMs: number)
 
     // Close the sync runs those reaped accounts left open. A SIGKILL/OOM leaves the
     // run row at status='running' forever (only the account lock was reaped before),
-    // so any sync_runs-based UI/metrics show a phantom perpetually-active run.
-    await pool.query(
+    // so any sync_runs-based UI/metrics show a phantom perpetually-active run. The
+    // started_at guard ensures a run a concurrent worker just opened (before it
+    // refreshed the heartbeat) is not mistaken for a dead worker's orphan.
+    const closed = await pool.query(
       `
       UPDATE public.imap_sync_runs r
       SET status = 'failed',
@@ -275,6 +292,7 @@ export async function clearOrphanedLocks(pool: PgPool, staleThresholdMs: number)
       WHERE r.account_id = a.id
         AND r.status = 'running'
         AND r.finished_at IS NULL
+        AND r.started_at < now() - ($1::bigint * interval '1 millisecond')
         AND (
           a.last_heartbeat_at IS NULL
           OR a.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
@@ -283,8 +301,12 @@ export async function clearOrphanedLocks(pool: PgPool, staleThresholdMs: number)
       [staleThresholdMs]
     );
 
-    return result.rows.length;
+    return {
+      terminatedBackends: result.rows.length,
+      accountsReset: reset.rowCount ?? 0,
+      runsClosed: closed.rowCount ?? 0
+    };
   } catch {
-    return 0;
+    return { terminatedBackends: 0, accountsReset: 0, runsClosed: 0 };
   }
 }

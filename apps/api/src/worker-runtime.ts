@@ -126,11 +126,13 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   await runLockSelfTest(pool);
   console.log(JSON.stringify({ event: "worker.lock_self_test.passed" }));
 
-  const clearedLocks = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
-  if (clearedLocks > 0) {
+  const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
+  if (sweep.terminatedBackends > 0 || sweep.accountsReset > 0 || sweep.runsClosed > 0) {
     console.warn(JSON.stringify({
       event: "worker.orphaned_locks_cleared",
-      count: clearedLocks
+      terminatedBackends: sweep.terminatedBackends,
+      accountsReset: sweep.accountsReset,
+      runsClosed: sweep.runsClosed
     }));
   }
 
