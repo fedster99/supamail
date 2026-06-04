@@ -73,7 +73,7 @@
         "pnpm build"
       ],
       "evidence": "",
-      "notes": "Start local stdio first. Remote transport must be absent or explicitly bearer-token protected."
+      "notes": "Per ADR 0014, the MCP server is built in this core repo as a read-only surface; cloud only hosts it. Core owns the server implementation, the read-tool contract, and the local stdio binding; the remote transport, bearer/tenant auth, and MCP token secrets live in supamail-cloud. Build the server with an injected database connection and a transport boundary so the same tool logic runs locally (stdio) and hosted (remote-authed). Start local stdio first; remote transport must be absent from the public package. V1 is read-only."
     },
     {
       "id": "issue-7-agent-email-cli",
@@ -90,7 +90,7 @@
         "pnpm build"
       ],
       "evidence": "",
-      "notes": "Future roadmap item requested by the maintainer. Keep the first pass read-oriented against the existing mirror; sending, scheduling, contacts, calendar, CRM hydration, and AI summarization stay out of scope unless a later issue/ADR explicitly adds them. This should complement issue #4 MCP and may share the same read-tool contract."
+      "notes": "Per ADR 0014, the agent CLI is built in this core repo as a read-only surface; cloud only hosts it (build location is not run location). Core owns the CLI commands and their deterministic, machine-readable output with clear sync-trust signals; cloud handles per-tenant routing and auth. Keep the first pass read-oriented against the existing mirror; sending, scheduling, contacts, calendar, CRM hydration, and AI summarization stay out of scope unless a later ADR explicitly adds them. This complements issue #4 MCP and should share the same read-tool contract."
     }
   ]
 }
