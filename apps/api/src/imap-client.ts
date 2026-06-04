@@ -362,12 +362,23 @@ async function streamToBuffer(stream: AsyncIterable<Buffer | Uint8Array | string
 export async function fetchFullMessageBody(
   client: MirrorImapClient,
   config: AppConfig,
-  message: ImapMessage
+  message: ImapMessage,
+  options: { skipMailboxLock?: boolean } = {}
 ): Promise<MessageBodyInput> {
-  const lock = await client.getMailboxLock(message.folder_path);
+  // When the caller already holds the mailbox lock for this message's folder (the
+  // history-backfill snapshot loop does), re-acquiring it here would DEADLOCK —
+  // imapflow's mailbox lock is a non-reentrant per-connection mutex — and the command
+  // timeout would then close the whole connection. Such callers pass skipMailboxLock,
+  // and we reuse the already-selected mailbox after asserting it is the expected folder.
+  const lock = options.skipMailboxLock ? null : await client.getMailboxLock(message.folder_path);
 
   try {
     const mailbox = client.mailbox;
+    if (options.skipMailboxLock && (!mailbox || mailbox.path !== message.folder_path)) {
+      throw new Error(
+        `fetchFullMessageBody: expected ${message.folder_path} to be selected when skipping the mailbox lock`
+      );
+    }
     if (mailbox) {
       const serverUidValidity = Number(mailbox.uidValidity);
       const storedUidValidity = Number(message.uidvalidity);
@@ -412,6 +423,6 @@ export async function fetchFullMessageBody(
       parserWarnings: parsed.parserWarnings
     };
   } finally {
-    lock.release();
+    lock?.release();
   }
 }

@@ -153,10 +153,14 @@ async function main(): Promise<void> {
     await run(pnpm, ["migrate"], env);
 
     console.log("[test:db:live] running live DB integration suites");
+    // These files share one Postgres and some exercise global recovery scans
+    // (pg_locks, clearOrphanedLocks). Run files sequentially so cross-file
+    // shared-state cannot cause order-dependent flakes.
     await run(pnpm, [
       "exec",
       "vitest",
       "run",
+      "--no-file-parallelism",
       "src/__tests__/provider-compatibility.integration.test.ts",
       "src/__tests__/sync-engine.integration.test.ts",
       "src/__tests__/sync-engine.live-db.test.ts"
