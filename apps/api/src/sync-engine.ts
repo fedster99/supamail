@@ -1176,7 +1176,9 @@ export class MirrorEngine {
           if (this.isLockBudgetExpired(lockDeadline)) {
             break;
           }
-          await this.fetchAndStoreBody(client, message);
+          // We already hold the mailbox lock for `folder` here; skip re-locking inside
+          // fetchFullMessageBody so it doesn't deadlock on imapflow's non-reentrant lock.
+          await this.fetchAndStoreBody(client, message, true);
           bodiesFetched += 1;
         }
       }
@@ -1268,8 +1270,12 @@ export class MirrorEngine {
     return { fetched, hitLockBudget };
   }
 
-  private async fetchAndStoreBody(client: MirrorImapClient, message: ImapMessage): Promise<void> {
-    const body = await fetchFullMessageBody(client, this.config, message);
+  private async fetchAndStoreBody(
+    client: MirrorImapClient,
+    message: ImapMessage,
+    skipMailboxLock = false
+  ): Promise<void> {
+    const body = await fetchFullMessageBody(client, this.config, message, { skipMailboxLock });
     await this.repository.storeBody(body);
     await this.hooks.onBodyFetched?.(message, body);
   }
