@@ -136,7 +136,12 @@ liveDb("live DB reliability lane", () => {
     );
     // The dead worker also left its sync run open at status='running'. Reaping the
     // stale lock must close it, or it reads as a phantom perpetually-active sync.
+    // The run started before the worker died, so it predates the stale window.
     const orphanRunId = await h.repository.startSyncRun(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_sync_runs SET started_at = now() - interval '10 minutes' WHERE id = $1`,
+      [orphanRunId]
+    );
 
     try {
       const engine = h.buildEngine({ folders: oneFolder(), overrides: { STALE_HEARTBEAT_MS: 1_000 } });
@@ -191,6 +196,10 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
     const orphanRunId = await h.repository.startSyncRun(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_sync_runs SET started_at = now() - interval '10 minutes' WHERE id = $1`,
+      [orphanRunId]
+    );
 
     // A second account is genuinely live: flagged syncing with a fresh heartbeat
     // and its own open run. Stale-lock recovery must be conservative and leave it
@@ -219,7 +228,13 @@ liveDb("live DB reliability lane", () => {
     );
     const liveRunId = await h.repository.startSyncRun(liveAccount.id, "manual");
 
-    await clearOrphanedLocks(h.pool, 1_000);
+    const sweep = await clearOrphanedLocks(h.pool, 1_000);
+
+    // The sweep reports what it reaped, so a SIGKILL/OOM (no pg_locks PID to
+    // terminate) is still observable at startup rather than silent.
+    expect(sweep.terminatedBackends).toBe(0);
+    expect(sweep.accountsReset).toBe(1);
+    expect(sweep.runsClosed).toBe(1);
 
     // Stale account is reaped: flag cleared, run closed as failed (reaped).
     const accountRow = await h.pool.query<{ currently_syncing: boolean }>(
@@ -253,6 +268,38 @@ liveDb("live DB reliability lane", () => {
     );
     expect(liveRun.rows[0].status).toBe("running");
     expect(liveRun.rows[0].finished_at).toBeNull();
+  });
+
+  it("does not reap a freshly-started run when the account heartbeat is still stale", async () => {
+    const h = await setupIntegration("live-fresh-run-stale-heartbeat", { STALE_HEARTBEAT_MS: 60_000 });
+    activeAccountIds.push(h.account.id);
+
+    // The race window: a new sync calls startSyncRun (run opens at status='running')
+    // before markAccountSyncStarted refreshes the heartbeat. For a brand-new account
+    // the heartbeat is NULL, so the account looks stale to the reaper — but the run
+    // just started, so closing it would fail a legitimately-active sync.
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET currently_syncing = true,
+          last_heartbeat_at = NULL
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const freshRunId = await h.repository.startSyncRun(h.account.id, "manual");
+
+    const sweep = await clearOrphanedLocks(h.pool, 60_000);
+
+    // The run started just now, so the started_at guard must leave it open even
+    // though the account heartbeat qualifies as stale.
+    expect(sweep.runsClosed).toBe(0);
+    const freshRun = await h.pool.query<{ status: string; finished_at: Date | null }>(
+      `SELECT status, finished_at FROM public.imap_sync_runs WHERE id = $1`,
+      [freshRunId]
+    );
+    expect(freshRun.rows[0].status).toBe("running");
+    expect(freshRun.rows[0].finished_at).toBeNull();
   });
 
   it("selects due folders by priority and round-robin cursor", async () => {
