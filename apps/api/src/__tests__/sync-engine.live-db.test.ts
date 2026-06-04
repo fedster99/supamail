@@ -171,14 +171,15 @@ liveDb("live DB reliability lane", () => {
     }
   });
 
-  it("closes orphaned sync runs for stale accounts when reaping at startup", async () => {
+  it("closes orphaned sync runs for stale accounts but leaves live accounts running", async () => {
     const h = await setupIntegration("live-orphan-run-startup", { STALE_HEARTBEAT_MS: 1_000 });
     activeAccountIds.push(h.account.id);
 
-    // Model a SIGKILL/OOM: the worker died, so its advisory-lock session already
-    // ended (no pg_locks row to terminate), but it left the account flagged
-    // syncing with a stale heartbeat and its run row stuck at status='running'.
-    // clearOrphanedLocks runs once at worker startup and must close that run.
+    // Model a SIGKILL/OOM on this account: the worker died, so its advisory-lock
+    // session already ended (no pg_locks row to terminate), but it left the
+    // account flagged syncing with a stale heartbeat and its run row stuck at
+    // status='running'. clearOrphanedLocks runs once at worker startup and must
+    // close that run.
     await h.pool.query(
       `
       UPDATE public.imap_accounts
@@ -191,8 +192,36 @@ liveDb("live DB reliability lane", () => {
     );
     const orphanRunId = await h.repository.startSyncRun(h.account.id, "manual");
 
+    // A second account is genuinely live: flagged syncing with a fresh heartbeat
+    // and its own open run. Stale-lock recovery must be conservative and leave it
+    // untouched, or it would fail a legitimately running sync.
+    const liveEmail = `integration-live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@example.test`;
+    const liveAccount = await h.repository.createAccount({
+      emailAddress: liveEmail,
+      host: "fake.imap.local",
+      port: 993,
+      secure: true,
+      username: liveEmail,
+      password: "not-used",
+      providerProfile: "generic-imap",
+      bodyFetchPolicy: "lazy"
+    });
+    activeAccountIds.push(liveAccount.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET currently_syncing = true,
+          sync_started_by = 'live-worker',
+          last_heartbeat_at = now()
+      WHERE id = $1
+      `,
+      [liveAccount.id]
+    );
+    const liveRunId = await h.repository.startSyncRun(liveAccount.id, "manual");
+
     await clearOrphanedLocks(h.pool, 1_000);
 
+    // Stale account is reaped: flag cleared, run closed as failed (reaped).
     const accountRow = await h.pool.query<{ currently_syncing: boolean }>(
       `SELECT currently_syncing FROM public.imap_accounts WHERE id = $1`,
       [h.account.id]
@@ -210,6 +239,20 @@ liveDb("live DB reliability lane", () => {
     expect(orphanRun.rows[0].status).toBe("failed");
     expect(orphanRun.rows[0].finished_at).not.toBeNull();
     expect(orphanRun.rows[0].error).toMatch(/reaped/);
+
+    // Live account is untouched: still syncing, run still open.
+    const liveAccountRow = await h.pool.query<{ currently_syncing: boolean }>(
+      `SELECT currently_syncing FROM public.imap_accounts WHERE id = $1`,
+      [liveAccount.id]
+    );
+    expect(liveAccountRow.rows[0].currently_syncing).toBe(true);
+
+    const liveRun = await h.pool.query<{ status: string; finished_at: Date | null }>(
+      `SELECT status, finished_at FROM public.imap_sync_runs WHERE id = $1`,
+      [liveRunId]
+    );
+    expect(liveRun.rows[0].status).toBe("running");
+    expect(liveRun.rows[0].finished_at).toBeNull();
   });
 
   it("selects due folders by priority and round-robin cursor", async () => {
