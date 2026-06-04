@@ -38,11 +38,14 @@ export function assertSessionConnectionUrl(databaseUrl: string): void {
   }
 }
 
-export function createPool(config: Pick<AppConfig, "DATABASE_URL"> = getConfig()): PgPool {
+export function createPool(
+  config: Pick<AppConfig, "DATABASE_URL"> & Partial<Pick<AppConfig, "DATABASE_POOL_MAX">> = getConfig()
+): PgPool {
   assertSessionConnectionUrl(config.DATABASE_URL);
   return new Pool({
     connectionString: config.DATABASE_URL,
-    max: 10,
+    // Backward-compatible: callers passing only { DATABASE_URL } still get the old max of 10.
+    max: config.DATABASE_POOL_MAX ?? 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000
   });
