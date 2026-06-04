@@ -202,6 +202,22 @@ export async function clearOrphanedLockForAccount(
       `,
       [lockId]
     );
+    // Close the sync run the killed process left open, so it stops reading as
+    // perpetually 'running' (previously only the account lock was reaped).
+    await pool.query(
+      `
+      UPDATE public.imap_sync_runs r
+      SET status = 'failed',
+          finished_at = now(),
+          error = COALESCE(r.error, 'reaped: worker stopped without finishing the run')
+      FROM public.imap_accounts a
+      WHERE r.account_id = a.id
+        AND a.lock_id = $1
+        AND r.status = 'running'
+        AND r.finished_at IS NULL
+      `,
+      [lockId]
+    );
     return true;
   } catch {
     return false;
@@ -241,6 +257,27 @@ export async function clearOrphanedLocks(pool: PgPool, staleThresholdMs: number)
         AND (
           last_heartbeat_at IS NULL
           OR last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
+        )
+      `,
+      [staleThresholdMs]
+    );
+
+    // Close the sync runs those reaped accounts left open. A SIGKILL/OOM leaves the
+    // run row at status='running' forever (only the account lock was reaped before),
+    // so any sync_runs-based UI/metrics show a phantom perpetually-active run.
+    await pool.query(
+      `
+      UPDATE public.imap_sync_runs r
+      SET status = 'failed',
+          finished_at = now(),
+          error = COALESCE(r.error, 'reaped: worker stopped without finishing the run')
+      FROM public.imap_accounts a
+      WHERE r.account_id = a.id
+        AND r.status = 'running'
+        AND r.finished_at IS NULL
+        AND (
+          a.last_heartbeat_at IS NULL
+          OR a.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
         )
       `,
       [staleThresholdMs]
