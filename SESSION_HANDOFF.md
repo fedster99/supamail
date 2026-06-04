@@ -1,16 +1,14 @@
 # Session Handoff
 
-Last updated: 2026-05-29
+Last updated: 2026-06-04
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 
 ## Current Branch
 
-- Branch: `fedster99/database-choice`
-- PR: none for this branch as of 2026-05-28 (`gh pr view --json comments,reviews,statusCheckRollup` reported no pull request).
-- Harness reminder baseline: `78767e0 Add harness impact reminder`
-- Root handoff migration: `912989a Move session handoff to repo root`
-- Last completed pushed reliability PR-7 implementation commit: `32b7261 Add progress rollup view`; PR checks passed at that head.
+- Integration branch is `main`. As of 2026-06-04 it is at `769da42` with no active feature branch; everything below is merged, CI-green, and republished the GHCR core image on each merge.
+- Recently merged: `#9` configurable `DATABASE_POOL_MAX`; `#10` reap orphaned `imap_sync_runs` on stale-lock recovery; `#12` nested mailbox-lock deadlock fix in history-backfill body fetch; `#13` live-DB proof of run reaping + `DATABASE_POOL_MAX` docs; `#15` reaper `started_at` race guard + reported reap counts; `#11` ADR 0014 (agent email access as a core read surface).
+- Stale PR `#1` (`codex/oss-worker-core`) was closed as superseded by `#5`.
 - Issue #2 historical backfill and issue #3 provider compatibility are open and should not be treated as done. The codebase has partial implementation/verification history, but the maintainer clarified on 2026-05-29 that both issues need revalidation against their GitHub acceptance criteria before they can be marked passing.
 
 ## Current Shape
@@ -41,6 +39,10 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Issue #7 tracks the future agent-first email CLI roadmap. It is intentionally separate from issue #4 MCP and should start read-oriented against the existing mirror with deterministic machine-readable output and clear sync trust signals.
 - Ignored local env files were seeded for this workspace. Public handoff omits local project refs, generated tokens, API keys, and machine-specific env paths; see `.context/local-setup-handoff.md` when working in this workspace.
 - A workspace Supabase project was created and `apps/api/supabase` is linked through ignored `.temp` files. Public handoff intentionally omits project identifiers; local setup details live in `.context/local-setup-handoff.md`.
+- `DATABASE_POOL_MAX` (default 10) makes the Postgres pool size configurable per process; it does not change advisory-lock semantics, since each pooled connection is its own session. Documented in `.env.example`, `docs/deployment-options.md`, and `docs/agent/reliability-invariants.md`.
+- Stale advisory-lock recovery (`clearOrphanedLocks` / `clearOrphanedLockForAccount`) now also closes the dead worker's open `imap_sync_runs` row as `failed` (reaped), guarded by an `r.started_at < now() - STALE_HEARTBEAT_MS` recency check so a freshly-started run is never mistaken for an orphan. `clearOrphanedLocks` returns `{ terminatedBackends, accountsReset, runsClosed }` and the worker logs them at startup so SIGKILL/OOM reaps are observable. Covered by live-DB tests in `apps/api/src/__tests__/sync-engine.live-db.test.ts`.
+- `fetchFullMessageBody` takes `{ skipMailboxLock }`: the history-backfill snapshot body loop reuses the already-held mailbox selection (asserting it is the expected folder) instead of nesting a second `getMailboxLock`, which deadlocked on a live provider. Every other body-fetch caller still locks per message.
+- ADR 0014 makes the MCP server (issue #4) and agent CLI (issue #7) a read-only core surface; see the Durable Decisions entry. The implementation itself is not started.
 
 ## Verification To Date
 
@@ -74,7 +76,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Issue #7 roadmap update on 2026-05-28: created https://github.com/fedster99/supamail/issues/7 and added it to `docs/agent/feature-list.json` as `not_started`. Verified with `jq . docs/agent/feature-list.json >/dev/null`, `pnpm harness:check`, `git diff --check`, and a trailing-whitespace scan over the touched files. The trailing-whitespace scan had no matches, so `rg` exited 1. The expected local Node v26 engine warning appeared during `pnpm harness:check`.
 - Issue #2/#3 tracker correction on 2026-05-29: maintainer clarified that both issues are not done. Updated `docs/agent/feature-list.json` to mark both as `not_started` with notes requiring future revalidation against GitHub acceptance criteria before any `passing` state.
 - Default sync edges documentation on 2026-05-29: added a concise public section to `README.md` and an agent-facing default edge list to `docs/agent/reliability-invariants.md`. Verification was docs-only: `pnpm harness:check`, `git diff --check`, and a trailing-whitespace scan over touched docs.
-- Agent-access charter decision on 2026-06-04: recorded ADR 0014 establishing the MCP server (#4) and agent CLI (#7) as a read-only core surface that cloud only hosts (core builds the artifact and read-tool contract; cloud adds remote transport and auth). Amended the durable scope decision, added the ADR to the decisions index, and tightened the `feature-list.json` notes for #4/#7. No code changed; the MCP/CLI implementation remains a separately selected future task. Verification was docs-only: `jq . docs/agent/feature-list.json`, `pnpm harness:check`, `git diff --check`, and a trailing-whitespace scan over touched files.
+- Agent-access charter decision on 2026-06-04: recorded ADR 0014 establishing the MCP server (#4) and agent CLI (#7) as a read-only core surface that cloud only hosts (core builds the artifact and read-tool contract; cloud adds remote transport and auth). Amended the durable scope decision, added the ADR to the decisions index, and tightened the `feature-list.json` notes for #4/#7. No code changed; the MCP/CLI implementation remains a separately selected future task. Verification was docs-only: `jq . docs/agent/feature-list.json`, `pnpm harness:check`, `git diff --check`, and a trailing-whitespace scan over touched files. Merged as `#11`.
+- Reaper conformance + hardening on 2026-06-04: `#13` added the missing live-DB proof that stale-lock recovery closes orphaned `imap_sync_runs`, plus `DATABASE_POOL_MAX` docs and review-driven test hardening (run files sequentially in the live gate via `--no-file-parallelism`, and a live-account-untouched assertion). `#15` added the `started_at` race guard and the reaped-count reporting. Both verified red/green (the new tests fail against the pre-fix code) and with `pnpm test:db:live` (118 spec passes, 10 live-DB tests). `#9` configurable pool size, `#10` orphaned-run reaping, and `#12` history-backfill body-fetch deadlock fix also landed on `main`. Each merge passed CI (`Quality`, `Live DB Reliability`) and republished the GHCR core image.
 
 ## Durable Decisions
 
@@ -107,5 +110,5 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
-- GitHub issues #2, #3, #4, and #7 are all open. Do not close or mark #2/#3 passing from historical verification notes alone; re-read their issue bodies and revalidate acceptance criteria when the maintainer selects the next task. Issue #7 agent-first email CLI remains a future roadmap item after, or coordinated with, the MCP read-tool contract.
+- GitHub issues #2, #3, #4, and #7 are all open. Do not close or mark #2/#3 passing from historical verification notes alone; re-read their issue bodies and revalidate acceptance criteria when the maintainer selects the next task. Issues #4 (MCP) and #7 (agent CLI) are scoped by ADR 0014 as core-built, read-only surfaces that cloud only hosts; #7 remains a future roadmap item after, or coordinated with, the #4 MCP read-tool contract.
 - Next hosted setup step: continue in private `supamail-cloud` with Supabase Auth + Stripe Checkout/webhook using the public contracts in `docs/hosted-cloud-contracts.md`.
