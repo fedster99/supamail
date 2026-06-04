@@ -289,6 +289,11 @@ export async function fetchMessageMetadata(
         "reply-to"
       ]
     }, { uid: true })) {
+      // Skip unsolicited / partial FETCH responses that arrive without a UID (e.g. a
+      // server-pushed flag update mid-command). Pushing them would upsert a NULL uid and
+      // violate imap_messages.uid NOT NULL; the `missing` check below still verifies every
+      // requested UID actually came back, so a real message is never silently dropped.
+      if (!Number.isInteger(msg.uid)) continue;
       returned.add(msg.uid);
       messages.push(parseMessageMetadata(msg));
     }

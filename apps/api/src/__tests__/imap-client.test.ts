@@ -7,7 +7,9 @@ import {
   fetchMessageMetadata,
   searchAllUids,
   searchUidsBefore,
-  searchUidsSince
+  searchUidsSince,
+  type FetchMessage,
+  type MirrorImapClient
 } from "../imap-client.js";
 import { FixtureImapClient, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { ImapMessage } from "../types.js";
@@ -162,5 +164,41 @@ describe("fetchFullMessageBody mailbox locking", () => {
     await expect(
       fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true })
     ).rejects.toThrow(/expected INBOX\.Notes to be selected/);
+  });
+});
+
+describe("fetchMessageMetadata uid guard", () => {
+  // Minimal client that yields a controlled fetch sequence (FixtureImapClient can't
+  // inject a UID-less message). Only `fetch` is exercised by fetchMessageMetadata.
+  const metadataStub = (yielded: Array<Partial<FetchMessage>>): MirrorImapClient =>
+    ({
+      mailbox: { path: "INBOX", uidValidity: 1 },
+      async *fetch() {
+        for (const msg of yielded) yield msg as FetchMessage;
+      }
+    }) as unknown as MirrorImapClient;
+
+  const real = (uid: number): Partial<FetchMessage> => ({
+    uid,
+    flags: new Set<string>(),
+    internalDate: new Date("2026-01-01T00:00:00.000Z"),
+    size: 10,
+    envelope: {},
+    headers: Buffer.alloc(0)
+  });
+
+  it("skips an unsolicited FETCH response with no UID without dropping the requested ones", async () => {
+    const client = metadataStub([
+      real(100),
+      { flags: new Set(["\\Seen"]), envelope: {} }, // unsolicited push, no uid
+      real(101)
+    ]);
+    const result = await fetchMessageMetadata(client, [100, 101], 50);
+    expect(result.map((m) => m.uid)).toEqual([100, 101]);
+  });
+
+  it("still throws when a requested UID is genuinely missing", async () => {
+    const client = metadataStub([real(100)]);
+    await expect(fetchMessageMetadata(client, [100, 101], 50)).rejects.toThrow(/missing 101/);
   });
 });
