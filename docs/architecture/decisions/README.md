@@ -18,6 +18,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0011-pending-verification-folder-state.md`: Missing-mailbox verification uses a scheduler-excluded folder state.
 - `0012-three-lane-history-engine.md`: Historical backfill runs after hot sync and live body fetch under the same account lock.
 - `0013-imap-compatibility-contract.md`: Generic IMAP support is a stated contract validated by provider-shape fixtures, real-server smokes, and manual matrix entries.
+- `0014-agent-email-access-core-surface.md`: The MCP server and agent CLI are built in core as a read-only surface; cloud only adds remote transport and auth.
 
 ## Status Values
 
