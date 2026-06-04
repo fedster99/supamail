@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { resetConfigForTests } from "../config.js";
 import { closePool, getPool, type PgClient } from "../db.js";
+import { clearOrphanedLocks } from "../locks.js";
 import type { MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import {
@@ -111,7 +112,7 @@ liveDb("live DB reliability lane", () => {
     expect(firstResult.outcome).toBe("success");
   });
 
-  it("reclaims stale advisory locks from pg_locks and then syncs", async () => {
+  it("reclaims stale advisory locks from pg_locks, closes the orphaned run, and then syncs", async () => {
     const h = await setupIntegration("live-orphan-lock", {
       INITIAL_SYNC_BATCH_SIZE: 50,
       STALE_HEARTBEAT_MS: 1_000
@@ -133,6 +134,9 @@ liveDb("live DB reliability lane", () => {
       `,
       [h.account.id]
     );
+    // The dead worker also left its sync run open at status='running'. Reaping the
+    // stale lock must close it, or it reads as a phantom perpetually-active sync.
+    const orphanRunId = await h.repository.startSyncRun(h.account.id, "manual");
 
     try {
       const engine = h.buildEngine({ folders: oneFolder(), overrides: { STALE_HEARTBEAT_MS: 1_000 } });
@@ -150,9 +154,62 @@ liveDb("live DB reliability lane", () => {
         [account.lock_id]
       );
       expect(Number(locks.rows[0].count)).toBe(0);
+
+      const orphanRun = await h.pool.query<{
+        status: string;
+        finished_at: Date | null;
+        error: string | null;
+      }>(
+        `SELECT status, finished_at, error FROM public.imap_sync_runs WHERE id = $1`,
+        [orphanRunId]
+      );
+      expect(orphanRun.rows[0].status).toBe("failed");
+      expect(orphanRun.rows[0].finished_at).not.toBeNull();
+      expect(orphanRun.rows[0].error).toMatch(/reaped/);
     } finally {
       await releaseKilledClient(locker);
     }
+  });
+
+  it("closes orphaned sync runs for stale accounts when reaping at startup", async () => {
+    const h = await setupIntegration("live-orphan-run-startup", { STALE_HEARTBEAT_MS: 1_000 });
+    activeAccountIds.push(h.account.id);
+
+    // Model a SIGKILL/OOM: the worker died, so its advisory-lock session already
+    // ended (no pg_locks row to terminate), but it left the account flagged
+    // syncing with a stale heartbeat and its run row stuck at status='running'.
+    // clearOrphanedLocks runs once at worker startup and must close that run.
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET currently_syncing = true,
+          sync_started_by = 'dead-worker',
+          last_heartbeat_at = now() - interval '10 minutes'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const orphanRunId = await h.repository.startSyncRun(h.account.id, "manual");
+
+    await clearOrphanedLocks(h.pool, 1_000);
+
+    const accountRow = await h.pool.query<{ currently_syncing: boolean }>(
+      `SELECT currently_syncing FROM public.imap_accounts WHERE id = $1`,
+      [h.account.id]
+    );
+    expect(accountRow.rows[0].currently_syncing).toBe(false);
+
+    const orphanRun = await h.pool.query<{
+      status: string;
+      finished_at: Date | null;
+      error: string | null;
+    }>(
+      `SELECT status, finished_at, error FROM public.imap_sync_runs WHERE id = $1`,
+      [orphanRunId]
+    );
+    expect(orphanRun.rows[0].status).toBe("failed");
+    expect(orphanRun.rows[0].finished_at).not.toBeNull();
+    expect(orphanRun.rows[0].error).toMatch(/reaped/);
   });
 
   it("selects due folders by priority and round-robin cursor", async () => {
