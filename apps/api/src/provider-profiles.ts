@@ -17,12 +17,14 @@ function normalizedPath(path: string): string {
   return path.toLowerCase().replace(/^\\+/, "");
 }
 
+// Folders not mirrored by default: spam/junk/trash/deleted are noisy + transient.
+// Drafts ARE mirrored (they are real user-authored mail), so "draft" is intentionally
+// not in this list.
 const noisyFolderFragments = [
   "spam",
   "junk",
   "trash",
-  "deleted",
-  "draft"
+  "deleted"
 ];
 
 function isAllMail(path: string, specialUse?: string | null): boolean {

@@ -12,11 +12,15 @@ describe("provider profiles", () => {
     expect(profile.priorityForFolder("Sent Items")).toBeLessThan(profile.priorityForFolder("Archive"));
   });
 
-  it("excludes noisy folders", () => {
+  it("excludes noisy folders but mirrors Drafts", () => {
     const profile = getProviderProfile("generic-imap");
     expect(profile.excludedReason("Trash")).toBe("excluded_trash");
+    expect(profile.excludedReason("Junk", "\\Junk")).toBe("excluded_junk");
     expect(profile.excludedReason("Archive")).toBeNull();
     expect(profile.excludedReason("INBOX")).toBeNull();
+    // Drafts are real user mail and ARE mirrored (not excluded).
+    expect(profile.excludedReason("Drafts", "\\Drafts")).toBeNull();
+    expect(profile.excludedReason("INBOX.Drafts")).toBeNull();
   });
 
   it("excludes All Mail by name and SPECIAL-USE", () => {
