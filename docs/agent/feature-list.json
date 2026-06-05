@@ -20,7 +20,7 @@
       "area": "sync-engine",
       "title": "Add automatic historical backfill",
       "user_visible_behavior": "A new account can eventually mirror older messages beyond WINDOW_DAYS without manual intervention while fresh mail stays current.",
-      "status": "not_started",
+      "status": "passing",
       "dependencies": [
         "reliability-hardening-pr-1-lock-budget",
         "reliability-hardening-pr-2-initial-sync-stall-timeout",
@@ -36,8 +36,8 @@
         "pnpm build",
         "pnpm test:db:live"
       ],
-      "evidence": "",
-      "notes": "Maintainer clarified on 2026-05-29 that this issue should not be treated as done. Earlier history-lane implementation and verification may exist in the codebase, but future work must re-read issue #2, revalidate the acceptance criteria, and record fresh completion evidence before marking passing."
+      "evidence": "Revalidated all 7 acceptance criteria against the code on 2026-06-05 (adversarial multi-agent pass). The three-lane engine (ADR 0012) already met criteria 1-5: backfill is on by the schema default historical_backfill_mode='metadata_and_bodies', the hot->body->history lane order keeps fresh mail ahead, historical messages use the same imap_messages/_bodies/_attachments path, and reconcile is window-guarded (window_status='IN_WINDOW') so out-of-window rows are never tombstoned as provider-deleted. The remaining gap was criterion 6 (test coverage) plus a criterion 7 doc nit, both closed in PR #20: integration Scenarios N (multi-cycle batching + resume-from-watermark, no re-snapshot), O (idempotency: re-walking mirrored UIDs upserts with no duplicate rows), P (UIDVALIDITY reset mid-backfill tombstones old-validity rows, clears the stale watermark, and re-mirrors 3/3 cleanly under the new validity), and Q (a fresh account backfills on default settings with no manual config). Verified by pnpm test:db:live (118 spec passes, 4 new scenarios green), pnpm typecheck, pnpm test, pnpm build.",
+      "notes": "Revalidated and completed on 2026-06-05; closed as passing with fresh evidence (PR #20), satisfying the 2026-05-29 maintainer requirement to revalidate rather than infer completion from historical notes. Caveat recorded for future work: criterion 1's 'without manual intervention' holds under normal IMAP conditions; a pathological run of UIDVALIDITY resets (> MAX_UIDVALIDITY_RESETS_24H) still escalates an account to BROKEN like any sync, requiring operator action. Possible future follow-up (not blocking): the history lane currently surfaces its errors into the sync run outcome (can mark an otherwise-healthy account partial_success/DEGRADED); a maintainer decision could isolate history-lane errors from account health to match the 'history completeness does not gate health' intent."
     },
     {
       "id": "issue-3-provider-compatibility",
