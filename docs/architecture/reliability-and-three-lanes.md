@@ -21,7 +21,7 @@ To the user / API consumer:
 
 To agents / contributors:
 
-> One Postgres advisory lock per account. Inside that lock, three priority-ordered lanes: hot (fresh metadata) → body (recent bodies) → history (older mail). Hot lane completion gates HEALTHY. Body lane completion gates search reliability. History lane never determines health.
+> One Postgres advisory lock per account. Inside that lock, three priority-ordered lanes: hot (fresh metadata) → body (recent bodies) → history (older mail). Hot lane completion gates HEALTHY. Body lane completion gates search reliability. History lane completeness never determines health (an incomplete backfill is not DEGRADED), though history-lane errors still surface in the sync run outcome.
 
 ## Decisions
 
@@ -49,7 +49,7 @@ The lanes are conceptual scheduling phases, not separate state machines. Each ph
 
 A new account is considered "onboarded" when live-window metadata (headers + envelopes + flags + folder state) is complete. Bodies and history fill in progressively. This commits to honest framing in product copy and in the API contract.
 
-- `sync_state = 'HEALTHY'` requires: live-window headers complete, priority-folder bodies current, reconcile clean. History lane state does NOT affect `sync_state`.
+- `sync_state = 'HEALTHY'` requires: live-window headers complete, priority-folder bodies current, reconcile clean. History lane *completeness* does not affect `sync_state` (an account is not DEGRADED for incomplete backfill); a history-lane *error*, like any lane error, still counts toward the run outcome.
 - Search lives downstream of SupaMail. SupaMail's job is to surface completeness clearly so search consumers can degrade gracefully. SupaMail does not implement search.
 - `live_window_days` is immutable after account creation in v0.1. Changing it requires a migration story we haven't built.
 
