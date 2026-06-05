@@ -1537,6 +1537,342 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(skippedHistory.historical_message_count)).toBe(0);
   });
 
+  it("Scenario N — history backfill batches across cycles and resumes from the watermark", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("N-history-resume", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          archive_refresh_interval = 'monthly',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+
+    // One in-window message plus three out-of-window ones. With max_backfill_rate
+    // 'small' (one history batch per cycle) and BODY_BACKFILL_BATCH_SIZE=1, the
+    // three historical UIDs cannot import in a single syncAccount call — they must
+    // span multiple cycles, and each cycle must resume from the persisted watermark.
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 83_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "old-1", from: "a@x.test", to: "u@x.test", body: "old 1", internalDate: oldDate }),
+          makeTextMessage({ uid: 2, subject: "old-2", from: "a@x.test", to: "u@x.test", body: "old 2", internalDate: oldDate }),
+          makeTextMessage({ uid: 3, subject: "old-3", from: "a@x.test", to: "u@x.test", body: "old 3", internalDate: oldDate }),
+          makeTextMessage({ uid: 10, subject: "fresh", from: "a@x.test", to: "u@x.test", body: "fresh", internalDate: recentDate })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders });
+
+    const historyState = async () =>
+      (
+        await h.pool.query<{
+          historical_target_count: number | null;
+          backfill_in_progress: boolean;
+          backfill_oldest_uid_synced: string | null;
+        }>(
+          `SELECT historical_target_count, backfill_in_progress, backfill_oldest_uid_synced
+           FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+          [h.account.id]
+        )
+      ).rows[0];
+    const historicalCount = async () =>
+      Number(
+        (
+          await h.pool.query<{ c: string }>(
+            `SELECT count(*)::text AS c FROM public.imap_messages
+             WHERE account_id = $1 AND folder_path = 'INBOX'
+               AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+            [h.account.id]
+          )
+        ).rows[0].c
+      );
+
+    // Cycle 1: the hot lane mirrors the fresh message; the history lane snapshots
+    // (target = 3) and imports only part of the backlog (batching, not all-at-once).
+    await engine.syncAccount(h.account.id, "manual");
+    const after1 = await historyState();
+    expect(after1.historical_target_count).toBe(3);
+    expect(after1.backfill_in_progress).toBe(true);
+    const count1 = await historicalCount();
+    expect(count1).toBeGreaterThanOrEqual(1);
+    expect(count1).toBeLessThan(3);
+    const watermark1 = Number(after1.backfill_oldest_uid_synced);
+
+    // Cycle 2: resumes from the persisted watermark — it does NOT re-snapshot
+    // (target unchanged), the watermark descends, and more history is imported.
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "manual");
+    const after2 = await historyState();
+    expect(after2.historical_target_count).toBe(3);
+    expect(Number(after2.backfill_oldest_uid_synced)).toBeLessThan(watermark1);
+    expect(await historicalCount()).toBeGreaterThan(count1);
+
+    // Remaining cycles drain the backlog; backfill completes with all three.
+    for (let i = 0; i < 5 && (await historyState()).backfill_in_progress; i += 1) {
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+    }
+    expect((await historyState()).backfill_in_progress).toBe(false);
+    expect(await historicalCount()).toBe(3);
+  });
+
+  it("Scenario O — re-running history backfill over mirrored UIDs is idempotent", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("O-history-idempotent", {
+      BODY_BACKFILL_BATCH_SIZE: 5,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          archive_refresh_interval = 'monthly',
+          max_backfill_rate = 'aggressive'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 84_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "old-1", from: "a@x.test", to: "u@x.test", body: "old 1", internalDate: oldDate }),
+          makeTextMessage({ uid: 2, subject: "old-2", from: "a@x.test", to: "u@x.test", body: "old 2", internalDate: oldDate }),
+          makeTextMessage({ uid: 10, subject: "fresh", from: "a@x.test", to: "u@x.test", body: "fresh", internalDate: recentDate })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders });
+
+    const historicalCount = async () =>
+      Number(
+        (
+          await h.pool.query<{ c: string }>(
+            `SELECT count(*)::text AS c FROM public.imap_messages
+             WHERE account_id = $1 AND folder_path = 'INBOX'
+               AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+            [h.account.id]
+          )
+        ).rows[0].c
+      );
+
+    // First pass: aggressive rate completes the two-message backfill.
+    await engine.syncAccount(h.account.id, "manual");
+    expect(await historicalCount()).toBe(2);
+
+    // Clear the watermark so the next run re-snapshots and re-walks the SAME
+    // historical UIDs from scratch — the idempotency case.
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET historical_target_count = NULL,
+          backfill_in_progress = false,
+          backfill_target_max_uid = NULL,
+          backfill_oldest_uid_synced = NULL,
+          backfill_since_date = NULL
+      WHERE account_id = $1 AND path = 'INBOX'
+      `,
+      [h.account.id]
+    );
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "manual");
+
+    // Re-walking the same UIDs upserts; it must not duplicate rows.
+    expect(await historicalCount()).toBe(2);
+    const reSnapshot = (
+      await h.pool.query<{ historical_target_count: number | null }>(
+        `SELECT historical_target_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(reSnapshot.historical_target_count).toBe(2);
+    const dupes = await h.pool.query<{ uid: number }>(
+      `SELECT uid FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX'
+       GROUP BY uid HAVING count(*) > 1`,
+      [h.account.id]
+    );
+    expect(dupes.rows).toHaveLength(0);
+  });
+
+  it("Scenario P — UIDVALIDITY reset mid-backfill clears history state and re-mirrors cleanly", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("P-history-uidvalidity-reset", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          archive_refresh_interval = 'monthly',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 85_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "old-1", from: "a@x.test", to: "u@x.test", body: "old 1", internalDate: oldDate }),
+          makeTextMessage({ uid: 2, subject: "old-2", from: "a@x.test", to: "u@x.test", body: "old 2", internalDate: oldDate }),
+          makeTextMessage({ uid: 3, subject: "old-3", from: "a@x.test", to: "u@x.test", body: "old 3", internalDate: oldDate }),
+          makeTextMessage({ uid: 10, subject: "fresh", from: "a@x.test", to: "u@x.test", body: "fresh", internalDate: recentDate })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders });
+
+    const liveHistoricalUnder = async (uidvalidity: number) =>
+      Number(
+        (
+          await h.pool.query<{ c: string }>(
+            `SELECT count(*)::text AS c FROM public.imap_messages
+             WHERE account_id = $1 AND folder_path = 'INBOX'
+               AND window_status = 'HISTORICAL' AND deleted_in_provider = false
+               AND uidvalidity = $2`,
+            [h.account.id, uidvalidity]
+          )
+        ).rows[0].c
+      );
+
+    // One cycle leaves the backfill in progress (snapshot taken, partially walked).
+    await engine.syncAccount(h.account.id, "manual");
+    const mid = (
+      await h.pool.query<{ historical_target_count: number | null; backfill_in_progress: boolean }>(
+        `SELECT historical_target_count, backfill_in_progress FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(mid.historical_target_count).toBe(3);
+    expect(mid.backfill_in_progress).toBe(true);
+
+    // The provider reports a new UIDVALIDITY mid-backfill.
+    folders[0].uidValidity = 85_999;
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "manual");
+
+    // The reset tombstones the old-validity rows and clears the stale backfill
+    // watermark, so backfill cannot resume against a snapshot from the old validity.
+    const tombstoned = Number(
+      (
+        await h.pool.query<{ c: string }>(
+          `SELECT count(*)::text AS c FROM public.imap_messages
+           WHERE account_id = $1 AND folder_path = 'INBOX' AND deleted_reason = 'UIDVALIDITY_RESET'`,
+          [h.account.id]
+        )
+      ).rows[0].c
+    );
+    expect(tombstoned).toBeGreaterThanOrEqual(1);
+    const folderUidv = (
+      await h.pool.query<{ uidvalidity: string }>(
+        `SELECT uidvalidity FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(Number(folderUidv.uidvalidity)).toBe(85_999);
+
+    // Driving the account forward re-does initial sync and re-snapshots history
+    // under the NEW validity: the historical messages are re-mirrored, not orphaned.
+    for (let i = 0; i < 8; i += 1) {
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      if ((await liveHistoricalUnder(85_999)) === 3) break;
+    }
+    expect(await liveHistoricalUnder(85_999)).toBe(3);
+  });
+
+  it("Scenario Q — a new account backfills history on default settings (no manual config)", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    // Deliberately NO UPDATE to imap_accounts — backfill must work on the schema
+    // defaults that createAccount applies.
+    const h = await setupIntegration("Q-history-default", {
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+
+    // The enabling default comes from the DB, not a test override.
+    const settings = (
+      await h.pool.query<{ historical_backfill_mode: string }>(
+        `SELECT historical_backfill_mode FROM public.imap_accounts WHERE id = $1`,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(settings.historical_backfill_mode).toBe("metadata_and_bodies");
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 86_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "old-1", from: "a@x.test", to: "u@x.test", body: "old 1", internalDate: oldDate }),
+          makeTextMessage({ uid: 2, subject: "old-2", from: "a@x.test", to: "u@x.test", body: "old 2", internalDate: oldDate }),
+          makeTextMessage({ uid: 10, subject: "fresh", from: "a@x.test", to: "u@x.test", body: "fresh", internalDate: recentDate })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders });
+
+    for (let i = 0; i < 5; i += 1) {
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      const state = (
+        await h.pool.query<{ backfill_in_progress: boolean; historical_target_count: number | null }>(
+          `SELECT backfill_in_progress, historical_target_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+          [h.account.id]
+        )
+      ).rows[0];
+      if (state.historical_target_count !== null && !state.backfill_in_progress) break;
+    }
+    const historical = Number(
+      (
+        await h.pool.query<{ c: string }>(
+          `SELECT count(*)::text AS c FROM public.imap_messages
+           WHERE account_id = $1 AND folder_path = 'INBOX'
+             AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+          [h.account.id]
+        )
+      ).rows[0].c
+    );
+    expect(historical).toBe(2);
+  });
+
   it("Scenario M — progress counters roll up from folders into account progress", async () => {
     const h = await setupIntegration("M-progress", {
       INITIAL_SYNC_BATCH_SIZE: 50,

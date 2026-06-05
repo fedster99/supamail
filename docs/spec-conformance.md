@@ -74,7 +74,7 @@ Folder discovery is due-based and persists provider seen/missing state. Sync cyc
 
 Flag scans and reconciles are also due-based and budgeted. Agents should not change this into "scan every folder every cycle" behavior; that is exactly the folder-explosion failure mode the old spec was trying to prevent.
 
-Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. It does not affect `sync_state` health; progress consumers should read `imap_account_progress` and per-folder progress rows.
+Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. Backfill *completeness* does not gate `sync_state` health (an account is not DEGRADED for incomplete history), though a history-lane *error* surfaces in the sync run outcome like other lane errors. Progress consumers should read `imap_account_progress` and per-folder progress rows.
 
 ### IMAP Connection And Lock Discipline
 
