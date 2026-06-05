@@ -8,7 +8,7 @@ Date: 2026-05-24
 
 Large IMAP accounts can expose hundreds of folders. Syncing every folder by default turns normal scheduling into a folder-explosion problem and can hide fresh priority mail behind low-value archive work.
 
-Provider profiles already exclude dangerous folders such as Spam, Trash, Drafts, and All Mail. That is not enough for accounts with many legitimate archive-like folders.
+Provider profiles already exclude dangerous folders such as Spam, Trash, and All Mail. That is not enough for accounts with many legitimate archive-like folders.
 
 ## Decision
 

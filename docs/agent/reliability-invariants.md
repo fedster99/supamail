@@ -30,7 +30,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 
 - Folder discovery must not treat one empty or missing `LIST` result as authoritative deletion.
 - Missing folders get a grace period before being marked `MISSING` and tombstoning in-window rows.
-- Exclude dangerous/system folders such as Spam/Junk, Trash/Deleted, Drafts, and All Mail by default.
+- Exclude dangerous/system folders such as Spam/Junk, Trash/Deleted, and All Mail by default. Drafts are mirrored (real user-authored mail), not excluded.
 - Do not exclude Archive by default.
 - Folder-count caps warn at the configured threshold and enforce by tracking only priority folders; current provider count is based on the latest successful LIST, so accounts recover automatically when the provider folder count drops.
 - Missing-mailbox errors must move the folder to `PENDING_VERIFICATION`, stamp `missing_since`, and set `next_folder_discovery_at = now()` on the account.
