@@ -95,6 +95,13 @@ export interface SearchRequest {
   snippet?: boolean;
   includeBody?: boolean;
   explain?: boolean;
+  /**
+   * Opt in to the semantic (Tier 2) retrieval branch. No-op today — the pure
+   * core ships without an embedding model — so this is accepted and ignored
+   * until the gated pgvector tier lands. Declared here to match the MCP/CLI
+   * contract that already exposes it.
+   */
+  semantic?: boolean;
 }
 
 export interface SearchResultIdentity {

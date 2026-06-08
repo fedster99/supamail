@@ -1,0 +1,105 @@
+# Search Evaluation & Improvement Goal
+
+This is how we measure whether SupaMail search is good, and the concrete goal for
+making it **much** better. "Good" is not a vibe here — it is a number, produced by
+a reproducible harness, and gated in CI.
+
+## The harness
+
+- **Corpus + judged queries:** `apps/api/src/eval/corpus.ts` — a deterministic
+  synthetic mailbox (25 messages across invoices, reports, meetings, travel,
+  security, project, contracts, recruiting, newsletters, personal, plus a large
+  message) and 28 queries, each tagged with a category and the message ids that
+  *should* be retrieved (ground truth). Operator queries derive their ground
+  truth from the corpus so they stay correct as it grows.
+- **Metrics:** `apps/api/src/eval/metrics.ts` — standard IR metrics
+  (precision@k, recall@k, MRR, nDCG@k, success@k), unit-tested with no database.
+- **Runner:** `apps/api/src/eval/run.ts` (`evaluateSearch`) seeds the corpus into
+  an isolated account, runs every query through the real `searchMessages`, scores
+  it, and deletes the account. Side-effect free.
+- **CLI:** `pnpm --filter @supamail/api eval:search` spins a disposable Postgres
+  (or uses `DATABASE_URL`), applies the migrations, and prints a scorecard — a
+  human summary to stderr and the full JSON scorecard to stdout.
+- **Regression gate:** `apps/api/src/__tests__/search-quality.live-db.test.ts`
+  runs in the `Live DB Reliability` CI gate and fails if the strong categories
+  slip. Typo and semantic are intentionally not gated — they are what the goal
+  raises.
+
+Run it:
+
+```bash
+pnpm --filter @supamail/api eval:search
+```
+
+## Baseline (2026-06-07, Tier 0/1 pure-Postgres engine)
+
+**Headline: nDCG@10 = 0.692, Recall@10 = 0.685, MRR = 0.714.**
+
+| Category | queries | nDCG@10 | Recall@10 | notes |
+|---|---|---|---|---|
+| operator | 8 | **1.00** | **1.00** | `from: is: has: filename: filetype: larger: before:` — provably exact |
+| ranking | 3 | **1.00** | **1.00** | recency / weight puts the right hit first |
+| phrase | 2 | **1.00** | **1.00** | `"project alpha"`, `"new login"` |
+| lexical | 7 | 0.91 | 0.88 | keyword hits in subject/body |
+| **typo** | 4 | **0.00** | **0.00** | `invioce`, `secuirty`, `candiate`, `metrcs` — nothing found |
+| **semantic** | 4 | **0.00** | **0.00** | `vacation`, `hiring`, `breach`, `expense` — nothing found |
+
+**Diagnosis.** The pure-Postgres engine is excellent where the query words match
+(20 of 28 queries average ~0.96 nDCG@10, operators are exact). The entire deficit
+is two categories that score a flat **zero**:
+
+- **Typo queries fail** because the free-text path only feeds
+  `websearch_to_tsquery` over the FTS columns. The `pg_trgm` indexes that *could*
+  catch `invioce`→`invoice` exist, but today they are only used by structured
+  operators (`from:`, `subject:`…), never by free text.
+- **Semantic queries fail** because there is no embedding tier yet — `vacation`
+  cannot match "flight/hotel/booking" by keywords alone. The gated
+  `imap_message_embeddings` table exists but is unpopulated and unused.
+
+Both are dragging the headline down by ~27 points, and both are fixable.
+
+## The goal
+
+> **Raise headline nDCG@10 from 0.69 to ≥ 0.90 and Recall@10 from 0.69 to ≥ 0.90
+> by closing the two zero-scoring categories — with zero regression in the four
+> categories already at 0.91–1.00.**
+
+Concrete, independently measurable targets (re-run `eval:search` after each):
+
+| Lever | Metric | From | To |
+|---|---|---|---|
+| Typo tolerance | typo recall@10 | 0.00 | ≥ 0.75 |
+| Semantic recall | semantic recall@10 | 0.00 | ≥ 0.70 |
+| Lexical recall | lexical recall@10 | 0.88 | ≥ 0.95 |
+| Operators (hold) | operator recall@10 | 1.00 | 1.00 |
+| Ranking/phrase (hold) | nDCG@10 | 1.00 | ≥ 0.95 |
+| **Overall** | **nDCG@10** | **0.69** | **≥ 0.90** |
+
+## Roadmap
+
+### Phase 1 — Tier 1.5: trigram fuzzy fallback (pure Postgres, no new deps)
+Add a trigram retrieval branch to the **free-text** path: when a term yields few or
+no FTS hits, match it with `word_similarity` / `%` over subject + sender (and
+optionally body) using the existing `pg_trgm` GINs, and fuse the FTS and trigram
+candidate lists with **Reciprocal Rank Fusion** before ranking. Set
+`pg_trgm.word_similarity_threshold` via `SET LOCAL` in the read-only transaction.
+- Expected: typo 0.00 → ~0.80; lexical recall up; headline ~0.78–0.82.
+- Still deterministic, still zero external services.
+
+### Phase 2 — Tier 2: opt-in semantic (gated pgvector)
+Stand up the out-of-core embedding job that populates `imap_message_embeddings`
+(already in `0007`), add a vector retrieval branch fused via RRF, and measure with
+`evaluateSearch({ semantic: true })`. Gated three ways (extension present, table
+populated, per-account flag); absent it, search is unchanged.
+- Expected: semantic 0.00 → ~0.70–0.80; headline ≥ 0.90.
+
+### Phase 3 — Ranking & corpus depth
+- Soften multi-term free text from strict AND to "AND-preferred, OR-fallback" so
+  `candidate interview` also surfaces strong single-term hits (the L7 miss).
+- Add email-signal ranking polish (sender importance, thread grouping) and grade
+  the judgments (3/2/1) for sharper nDCG.
+- Grow the corpus toward real anonymized mail; add per-query latency to the
+  scorecard and a latency budget to the gate; track the headline over time.
+
+Every phase is shippable on its own and verified by the same harness, so progress
+is always a number, not a claim.
