@@ -51,12 +51,20 @@ harness** that lives in core at `apps/api/src/search-eval/`.
    history must not surface the reply.
 
 4. **A measurable GOAL gates CI; the semantic tier is tracked, not gated.** The graded
-   (lexical/fuzzy) tier must meet nDCG@10 ≥ 0.80, recall@20 ≥ 0.85, MRR ≥ 0.80, and a
-   100% assertion pass rate. The semantic-paraphrase tier is reported but not gated,
-   because a pure-lexical baseline is not expected to satisfy it — that is the job of
-   the opt-in vector arm. "Improving search toward the evals" means advancing the engine
+   (lexical/fuzzy) tier must meet aggregate nDCG@10 ≥ 0.80, recall@20 ≥ 0.85, MRR ≥ 0.80,
+   and a 100% assertion pass rate — AND per-case floors (nDCG ≥ 0.70, recall ≥ 0.80,
+   precision@R ≥ 0.50) so the mean cannot mask a single collapsed case. The
+   semantic-paraphrase and multilingual tiers are reported but not gated, because a
+   pure-lexical baseline is not expected to satisfy them — that is the job of the opt-in
+   vector arm + PGroonga. "Improving search toward the evals" means advancing the engine
    configuration (`BASELINE_OPTIONS` → `IMPROVED_OPTIONS` and beyond) until the goal is
    met, then ratcheting.
+
+   The gate is defended against gaming: tests assert a firehose (returns-everything),
+   null (returns-nothing), and the naive baseline engine all FAIL the goal; scores must
+   be deterministic across runs; and every gated multi-relevant case must carry an
+   ordering assertion, graded gains, or an explicit `order_agnostic` flag, so labels
+   cannot be silently reduced to permutation-invariant recall checks.
 
 The harness is read-only and side-effect-free. It introduces **no migration, no schema
 change, and no required dependency** (zod is already a core dependency).

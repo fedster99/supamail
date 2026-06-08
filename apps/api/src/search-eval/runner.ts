@@ -16,6 +16,7 @@ export interface CaseResult {
   k: number;
   recall: number;
   precision: number;
+  precisionAtR: number;
   mrr: number;
   ndcg: number;
   assertions: AssertionResult[];
@@ -42,7 +43,9 @@ export interface EvalReport {
 }
 
 function mean(values: number[]): number {
-  if (values.length === 0) return 1;
+  // NaN (not 1.0) on an empty set, so a misconfiguration that yields zero cases is
+  // loud rather than a silent perfect score.
+  if (values.length === 0) return Number.NaN;
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
@@ -81,6 +84,7 @@ export async function runEval(
       k,
       recall: recallAtK(rankedIds, relevant, testCase.k ?? DEFAULT_RECALL_K),
       precision: precisionAtK(rankedIds, relevant, k),
+      precisionAtR: precisionAtK(rankedIds, relevant, Math.max(1, relevant.size)),
       mrr: reciprocalRank(rankedIds, relevant),
       ndcg: ndcgAtK(rankedIds, relevant, k, testCase.graded),
       assertions,
@@ -91,12 +95,20 @@ export async function runEval(
 
   const nonSemantic = results.filter((r) => r.tier !== "semantic");
   const semantic = results.filter((r) => r.tier === "semantic");
-
-  const byCapability: Partial<Record<Capability, AggregateMetrics>> = {};
-  for (const r of results) {
-    const group = results.filter((x) => x.capability === r.capability);
-    byCapability[r.capability] = aggregate(group);
+  if (nonSemantic.length === 0) {
+    throw new Error("eval suite has zero gated cases — refusing to report a vacuous pass");
   }
+
+  // Group once (O(n)) and report per-capability over the GATED set only, so semantic
+  // and gated tiers are never blended in one capability row.
+  const byCapability: Partial<Record<Capability, AggregateMetrics>> = {};
+  const groups = new Map<Capability, CaseResult[]>();
+  for (const r of nonSemantic) {
+    const g = groups.get(r.capability) ?? [];
+    g.push(r);
+    groups.set(r.capability, g);
+  }
+  for (const [cap, group] of groups) byCapability[cap] = aggregate(group);
 
   const overall = aggregate(nonSemantic);
   const failures: string[] = [];
@@ -114,6 +126,8 @@ export async function runEval(
       failures.push(`case "${c.id}" nDCG ${c.ndcg.toFixed(3)} < per-case floor ${GOAL.perCaseNdcg}`);
     if (c.recall < GOAL.perCaseRecall)
       failures.push(`case "${c.id}" recall ${c.recall.toFixed(3)} < per-case floor ${GOAL.perCaseRecall}`);
+    if (c.precisionAtR < GOAL.perCasePrecisionAtR)
+      failures.push(`case "${c.id}" precision@R ${c.precisionAtR.toFixed(3)} < per-case floor ${GOAL.perCasePrecisionAtR}`);
   }
 
   return {

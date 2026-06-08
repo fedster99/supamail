@@ -13,7 +13,8 @@
         "m-budget-1",
         "m-budget-3",
         "ranking-sec-vip"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "field-to-client",
@@ -26,6 +27,13 @@
       "relevant_ids": [
         "m-sent",
         "ranking-prop-sentnew"
+      ],
+      "assertions": [
+        {
+          "type": "rank_above",
+          "higher": "ranking-prop-sentnew",
+          "lower": "m-sent"
+        }
       ]
     },
     {
@@ -53,7 +61,8 @@
         "adv-news-dup-1",
         "adv-news-dup-2",
         "adv-savings-personal"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "flag-unread-roadmap",
@@ -84,6 +93,13 @@
       "relevant_ids": [
         "m-sent",
         "ranking-prop-sentnew"
+      ],
+      "assertions": [
+        {
+          "type": "rank_above",
+          "higher": "ranking-prop-sentnew",
+          "lower": "m-sent"
+        }
       ]
     },
     {
@@ -105,7 +121,8 @@
         "operators-multiattach-boundary",
         "operators-multiattach-large",
         "threading-msa-1"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "filename-pdf",
@@ -122,7 +139,8 @@
         "operators-billing-unflagged",
         "operators-billing-old",
         "threading-msa-1"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "date-after-standup",
@@ -161,7 +179,8 @@
       ],
       "must_not_return": [
         "m-invoice"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "phrase-vacation-policy",
@@ -174,7 +193,8 @@
       "relevant_ids": [
         "m-cross-1",
         "m-cross-2"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "or-invoice-contract",
@@ -194,7 +214,8 @@
         "operators-billing-unflagged",
         "operators-billing-old",
         "operators-billing-noattach"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "not-reminder",
@@ -264,7 +285,8 @@
         "adv-news-dup-1",
         "adv-news-dup-2"
       ],
-      "tier": "fuzzy"
+      "tier": "fuzzy",
+      "order_agnostic": true
     },
     {
       "id": "quoted-exclusion-pelican",
@@ -361,7 +383,8 @@
       "relevant_ids": [
         "m-cross-1",
         "m-cross-2"
-      ]
+      ],
+      "order_agnostic": true
     },
     {
       "id": "semantic-bill",
@@ -840,7 +863,8 @@
         }
       ],
       "tier": "lexical",
-      "requires_engine_improvement": null
+      "requires_engine_improvement": null,
+      "order_agnostic": true
     },
     {
       "id": "operators-size-larger-boundary",
@@ -870,7 +894,8 @@
         }
       ],
       "tier": "lexical",
-      "requires_engine_improvement": null
+      "requires_engine_improvement": null,
+      "order_agnostic": true
     },
     {
       "id": "operators-filename-xlsx-glob",
@@ -899,7 +924,8 @@
         }
       ],
       "tier": "lexical",
-      "requires_engine_improvement": null
+      "requires_engine_improvement": null,
+      "order_agnostic": true
     },
     {
       "id": "operators-date-boundary-after-inclusive",
@@ -930,7 +956,8 @@
         }
       ],
       "tier": "lexical",
-      "requires_engine_improvement": null
+      "requires_engine_improvement": null,
+      "order_agnostic": true
     },
     {
       "id": "operators-folder-union-archive-drafts",
@@ -962,7 +989,8 @@
         }
       ],
       "tier": "lexical",
-      "requires_engine_improvement": null
+      "requires_engine_improvement": null,
+      "order_agnostic": true
     },
     {
       "id": "fuzzy-typo-schroeder",
@@ -1152,7 +1180,8 @@
         "threading-refund-3"
       ],
       "tier": "lexical",
-      "requires_engine_improvement": null
+      "requires_engine_improvement": null,
+      "order_agnostic": true
     },
     {
       "id": "threading-latest-in-refund",
@@ -1269,6 +1298,137 @@
       ],
       "tier": "semantic",
       "requires_engine_improvement": "vector/semantic recall (contract~agreement/msa)"
+    },
+    {
+      "id": "field-cc-bob",
+      "capability": "field-cc",
+      "description": "CC-scoped: mail where bob is a CC recipient",
+      "dsl": "cc:bob@corp.com",
+      "query": {
+        "cc": "bob@corp.com"
+      },
+      "relevant_ids": [
+        "cc-msg-a"
+      ]
+    },
+    {
+      "id": "to-not-cc-alice",
+      "capability": "field-to",
+      "description": "to: must match a To recipient, NOT a CC-only one",
+      "dsl": "to:alice@corp.com",
+      "query": {
+        "to": "alice@corp.com"
+      },
+      "relevant_ids": [
+        "cc-msg-a"
+      ],
+      "must_not_return": [
+        "cc-msg-b"
+      ]
+    },
+    {
+      "id": "from-me-sent",
+      "capability": "field-from",
+      "description": "Mail I sent (from me, in Sent)",
+      "dsl": "in:Sent from:me@corp.com",
+      "query": {
+        "in": [
+          "Sent"
+        ],
+        "from": "me@corp.com"
+      },
+      "relevant_ids": [
+        "m-budget-2",
+        "m-sent",
+        "adv-q-reply",
+        "ranking-prop-sentnew",
+        "threading-msa-2"
+      ],
+      "order_agnostic": true
+    },
+    {
+      "id": "multi-term-coverage",
+      "capability": "multi-term",
+      "description": "A doc covering all query terms outranks one matching a single (even high-frequency) term",
+      "dsl": "zephyr quasar lumen",
+      "query": {
+        "text": "zephyr quasar lumen"
+      },
+      "relevant_ids": [
+        "mt-full"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "mt-full"
+        },
+        {
+          "type": "rank_above",
+          "higher": "mt-full",
+          "lower": "mt-part1"
+        }
+      ]
+    },
+    {
+      "id": "lunch-footer-noise",
+      "capability": "field-body",
+      "description": "A short personal line buried under a long confidentiality footer is still found by its real content",
+      "dsl": "lunch account:acct-2",
+      "query": {
+        "text": "lunch",
+        "accounts": [
+          "acct-2"
+        ]
+      },
+      "relevant_ids": [
+        "adv-footer-lunch"
+      ]
+    },
+    {
+      "id": "cjk-ja-minutes",
+      "capability": "multilingual",
+      "description": "Japanese query: the [^a-z0-9] tokenizer drops CJK so the term-less query degrades to recency — tracked gap (production uses PGroonga n-gram).",
+      "dsl": "議事録 account:acct-2",
+      "query": {
+        "text": "議事録",
+        "accounts": [
+          "acct-2"
+        ]
+      },
+      "relevant_ids": [
+        "cjk-msg"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "cjk-msg"
+        }
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "CJK tokenization (PGroonga n-gram / mecab); the lexical [^a-z0-9] tokenizer cannot index CJK."
+    },
+    {
+      "id": "rtl-ar-report",
+      "capability": "multilingual",
+      "description": "Arabic (RTL) query: same tokenizer gap — tracked, not gated.",
+      "dsl": "التقرير account:acct-2",
+      "query": {
+        "text": "التقرير",
+        "accounts": [
+          "acct-2"
+        ]
+      },
+      "relevant_ids": [
+        "rtl-msg"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "rtl-msg"
+        }
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "RTL/Arabic tokenization; the lexical tokenizer drops non-Latin scripts."
     }
   ]
 }

@@ -74,7 +74,6 @@ interface IndexedDoc {
   msg: EvalMessage;
   fields: { subject: string[]; participants: string[]; body: string[] };
   tokenSet: Set<string>;
-  indexedText: string; // normalized concatenation for phrase matching
 }
 
 function stripDiacritics(s: string): string {
@@ -127,8 +126,7 @@ export class ReferenceEngine implements SearchEngine {
       const body = bodyParts.flatMap((p) => this.tokenize(p));
 
       const tokenSet = new Set<string>([...subject, ...participants, ...body]);
-      const indexedText = [...subject, ...participants, ...body].join(" ");
-      this.docs.push({ msg, fields: { subject, participants, body }, tokenSet, indexedText });
+      this.docs.push({ msg, fields: { subject, participants, body }, tokenSet });
       this.docCount += 1;
       for (const tok of tokenSet) this.df.set(tok, (this.df.get(tok) ?? 0) + 1);
     }
@@ -158,15 +156,25 @@ export class ReferenceEngine implements SearchEngine {
   }
 
   private nearestVocab(token: string): string | undefined {
+    const md = this.opts.fuzzy.maxEditDistance;
+    // Don't let a typo collapse to a corpus-wide stopword (e.g. "form" -> "for"): cap the
+    // document frequency of an acceptable correction.
+    const maxDf = Math.max(1, Math.floor(this.docCount * 0.3));
     let best: string | undefined;
-    let bestDist = this.opts.fuzzy.maxEditDistance + 1;
+    let bestDist = md + 1;
+    let bestDf = -1;
     for (const cand of this.vocab) {
-      if (Math.abs(cand.length - token.length) > this.opts.fuzzy.maxEditDistance) continue;
-      const d = levenshtein(token, cand, bestDist);
-      if (d < bestDist) {
+      if (Math.abs(cand.length - token.length) > md) continue;
+      const df = this.df.get(cand) ?? 0;
+      if (df > maxDf) continue;
+      const d = levenshtein(token, cand, md);
+      if (d > md) continue;
+      // Order-independent tie-break: nearest distance, then higher df, then lexicographically
+      // smaller — so the correction never depends on fixture ordering.
+      if (d < bestDist || (d === bestDist && (df > bestDf || (df === bestDf && (best === undefined || cand < best))))) {
         bestDist = d;
         best = cand;
-        if (d === 0) break;
+        bestDf = df;
       }
     }
     return best;
@@ -191,17 +199,18 @@ export class ReferenceEngine implements SearchEngine {
     const subjectTerms = this.tokenize(req.subject);
     const bodyTerms = this.tokenize(req.body);
     const orTerms = (req.or ?? []).flatMap((t) => this.tokenize(t));
-    const phrase = req.phrase ? this.norm(req.phrase) : undefined;
+    const phraseTokens = req.phrase ? this.tokenize(req.phrase) : undefined;
     const hasRelevance =
       textTerms.length > 0 ||
       subjectTerms.length > 0 ||
       bodyTerms.length > 0 ||
       orTerms.length > 0 ||
-      Boolean(phrase);
+      Boolean(phraseTokens && phraseTokens.length > 0);
 
     const hits: SearchHit[] = [];
     for (const doc of filtered) {
-      if (phrase && !doc.indexedText.includes(phrase)) continue;
+      const phraseField = phraseTokens && phraseTokens.length > 0 ? this.phraseInDoc(doc, phraseTokens) : null;
+      if (phraseTokens && phraseTokens.length > 0 && !phraseField) continue;
       if (subjectTerms.length > 0 && !this.fieldHasAll(doc.fields.subject, subjectTerms)) continue;
       if (bodyTerms.length > 0 && !this.fieldHasAll(doc.fields.body, bodyTerms)) continue;
       if (orTerms.length > 0 && !orTerms.some((t) => this.resolveTerms(t).some((r) => doc.tokenSet.has(r.token))))
@@ -210,25 +219,30 @@ export class ReferenceEngine implements SearchEngine {
       let score = 0;
       const matchedIn = new Set<string>();
       if (textTerms.length > 0) {
-        let matchedAny = false;
+        let matchedTermCount = 0;
         for (const term of textTerms) {
+          let termMatched = false;
           for (const { token, weight } of this.resolveTerms(term)) {
             const c = this.fieldScore(doc, token, matchedIn);
             if (c > 0) {
-              matchedAny = true;
+              termMatched = true;
               score += c * weight;
             }
           }
+          if (termMatched) matchedTermCount += 1;
         }
-        if (!matchedAny) continue; // free-text query with zero matches ⇒ not a candidate
+        if (matchedTermCount === 0) continue; // free-text query with zero matches ⇒ not a candidate
+        // Term-coverage: a doc covering more of the query's distinct terms outranks one
+        // covering fewer, so a single rare term can't beat a full multi-term match.
+        if (textTerms.length > 1) score *= matchedTermCount / textTerms.length;
       }
       for (const term of subjectTerms) score += this.fieldScore(doc, term, matchedIn, "subject");
       for (const term of bodyTerms) score += this.fieldScore(doc, term, matchedIn, "body");
       for (const term of orTerms)
         for (const { token, weight } of this.resolveTerms(term)) score += this.fieldScore(doc, token, matchedIn) * weight;
-      if (phrase) {
+      if (phraseField) {
         score += 5;
-        matchedIn.add(doc.fields.subject.join(" ").includes(phrase) ? "subject" : "body");
+        matchedIn.add(phraseField === "participants" ? "from" : phraseField);
       }
 
       if (!hasRelevance) {
@@ -333,26 +347,53 @@ export class ReferenceEngine implements SearchEngine {
       );
       if (!matches) return false;
     }
-    if (req.from && !this.matchesAddress(m.from_email, m.from_name, req.from)) return false;
-    if (req.to) {
-      const recipients = [...m.to_emails, ...(m.to_names ?? []), ...(m.cc_emails ?? [])].join(" ");
-      if (!this.norm(recipients).includes(this.norm(req.to))) return false;
-    }
+    if (req.from && !this.matchesAddress([m.from_email, m.from_name], req.from)) return false;
+    // `to:` matches only To recipients (NOT cc) — a cc-only recipient must not satisfy to:.
+    if (req.to && !this.matchesAddress([...m.to_emails, ...(m.to_names ?? [])], req.to)) return false;
+    if (req.cc && !this.matchesAddress([...(m.cc_emails ?? [])], req.cc)) return false;
     if (req.after && Date.parse(m.internal_date) < Date.parse(req.after)) return false;
     if (req.before && Date.parse(m.internal_date) > Date.parse(req.before)) return false;
     if (typeof req.larger === "number" && (m.size_bytes ?? 0) <= req.larger) return false;
     if (typeof req.smaller === "number" && (m.size_bytes ?? Infinity) >= req.smaller) return false;
     if (req.not && req.not.length > 0) {
       for (const term of req.not) {
-        if (doc.indexedText.includes(this.norm(term))) return false;
+        // Token membership, not substring: -cation must NOT drop "vacation".
+        const toks = this.tokenize(term);
+        if (toks.length > 0 && toks.every((t) => doc.tokenSet.has(t))) return false;
       }
     }
     return true;
   }
 
-  private matchesAddress(email: string, name: string | null | undefined, query: string): boolean {
-    const hay = this.norm(`${email} ${name ?? ""}`);
-    return hay.includes(this.norm(query));
+  private phraseInField(fieldTokens: string[], phraseTokens: string[]): boolean {
+    if (phraseTokens.length === 0) return true;
+    for (let i = 0; i + phraseTokens.length <= fieldTokens.length; i += 1) {
+      let ok = true;
+      for (let j = 0; j < phraseTokens.length; j += 1) {
+        if (fieldTokens[i + j] !== phraseTokens[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+
+  /** A phrase must appear contiguously within a SINGLE field, never across field boundaries. */
+  private phraseInDoc(doc: IndexedDoc, phraseTokens: string[]): "subject" | "participants" | "body" | null {
+    if (this.phraseInField(doc.fields.subject, phraseTokens)) return "subject";
+    if (this.phraseInField(doc.fields.participants, phraseTokens)) return "participants";
+    if (this.phraseInField(doc.fields.body, phraseTokens)) return "body";
+    return null;
+  }
+
+  /** Tokenized address match: every query token must be a token of some address field. */
+  private matchesAddress(values: Array<string | null | undefined>, query: string): boolean {
+    const fieldTokens = new Set<string>();
+    for (const v of values) for (const t of this.tokenize(v)) fieldTokens.add(t);
+    const queryTokens = this.tokenize(query);
+    return queryTokens.length > 0 && queryTokens.every((t) => fieldTokens.has(t));
   }
 
   private isAmbiguous(req: SearchRequest): boolean {

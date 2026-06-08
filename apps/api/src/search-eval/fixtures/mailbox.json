@@ -1069,6 +1069,133 @@
         "\\Answered"
       ],
       "body_clean": "Reviewed the agreement, one redline on the liability clause."
+    },
+    {
+      "to_emails": [
+        "alice@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "cc-msg-a",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-cc-a",
+      "internal_date": "2026-05-27T10:00:00Z",
+      "subject": "Kickoff invite",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "cc_emails": [
+        "bob@corp.com"
+      ],
+      "body_clean": "Pulling alice and bob into the kickoff."
+    },
+    {
+      "to_emails": [
+        "carol@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "cc-msg-b",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-cc-b",
+      "internal_date": "2026-05-28T10:00:00Z",
+      "subject": "Carol onboarding",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "cc_emails": [
+        "alice@corp.com"
+      ],
+      "body_clean": "Welcome carol to the team."
+    },
+    {
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "mt-full",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-mt-full",
+      "internal_date": "2026-05-29T10:00:00Z",
+      "subject": "Zephyr quasar lumen review",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "body_clean": "The zephyr quasar lumen review is ready for sign-off."
+    },
+    {
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "mt-part1",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-mt-p1",
+      "internal_date": "2026-06-02T10:00:00Z",
+      "subject": "Zephyr update",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "body_clean": "Zephyr zephyr zephyr planning continues."
+    },
+    {
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "mt-part2",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-mt-p2",
+      "internal_date": "2026-06-03T10:00:00Z",
+      "subject": "Quasar lumen notes",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "body_clean": "Quasar lumen notes from today."
+    },
+    {
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "cjk-msg",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-cjk",
+      "internal_date": "2026-05-30T10:00:00Z",
+      "subject": "会議の議事録 2026",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "lang": "ja",
+      "body_clean": "プロジェクトの最新状況を共有します。"
+    },
+    {
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "id": "rtl-msg",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-rtl",
+      "internal_date": "2026-05-31T10:00:00Z",
+      "subject": "ملخص الاجتماع",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "lang": "ar",
+      "body_clean": "مرفق التقرير الشهري للمراجعة."
     }
   ]
 }

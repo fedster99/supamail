@@ -82,8 +82,33 @@ export function validateReferences(messages: EvalMessage[], cases: EvalCase[]): 
  * cases that can pass on recall alone with no behavioral assertion (candidates for an
  * ordering/exclusion assertion or a distractor so they actually discriminate ranking).
  */
+const ORDERING_ASSERTIONS = new Set(["top_is", "rank_above", "recency_order", "ordered_prefix"]);
+
+/**
+ * Gated, multi-relevant cases that are permutation-invariant and therefore CANNOT catch a
+ * within-set ranking regression: ≥2 relevant ids, no ordering assertion, no graded gains,
+ * and not explicitly marked `order_agnostic`. Such a case must either gain an ordering
+ * contract or be declared `order_agnostic` (a true unordered set like has:attachment).
+ */
+export function nonDiscriminatingCases(cases: EvalCase[]): string[] {
+  return cases
+    .filter((c) => c.tier !== "semantic")
+    .filter((c) => c.relevant_ids.length >= 2)
+    .filter((c) => c.order_agnostic !== true)
+    .filter((c) => !c.graded || Object.keys(c.graded).length === 0)
+    .filter((c) => !(c.assertions ?? []).some((a) => ORDERING_ASSERTIONS.has(a.type)))
+    .map((c) => c.id);
+}
+
 export function auditCases(messages: EvalMessage[], cases: EvalCase[]): string[] {
   const warnings: string[] = [];
+
+  const nonDiscriminating = nonDiscriminatingCases(cases);
+  if (nonDiscriminating.length > 0) {
+    warnings.push(
+      `${nonDiscriminating.length} gated multi-relevant case(s) are non-discriminating (no ordering assertion / graded / order_agnostic): ${nonDiscriminating.join(", ")}`
+    );
+  }
   const referenced = new Set<string>();
   for (const c of cases) {
     for (const id of c.relevant_ids) referenced.add(id);
@@ -101,6 +126,18 @@ export function auditCases(messages: EvalMessage[], cases: EvalCase[]): string[]
   const unused = messages.filter((m) => !referenced.has(m.id)).map((m) => m.id);
   if (unused.length > 0) {
     warnings.push(`${unused.length} fixture message(s) are never referenced by any case (distractors or dead weight): ${unused.join(", ")}`);
+  }
+
+  // The reference engine tokenizes on [^a-z0-9], so CJK/RTL/non-Latin bodies index to
+  // nothing. Flag fixtures whose body is non-empty but yields zero ASCII tokens — they
+  // must be covered ONLY by tracked-not-gated (semantic) cases, never the lexical gate.
+  const asciiTokenCount = (s: string | null | undefined): number =>
+    s ? s.toLowerCase().split(/[^a-z0-9]+/i).filter(Boolean).length : 0;
+  const untokenizable = messages
+    .filter((m) => (m.body_clean ?? "").length > 0 && asciiTokenCount(m.body_clean) === 0)
+    .map((m) => m.id);
+  if (untokenizable.length > 0) {
+    warnings.push(`${untokenizable.length} fixture(s) have a non-Latin body the lexical tokenizer drops entirely (cover only via tracked semantic cases): ${untokenizable.join(", ")}`);
   }
   return warnings;
 }

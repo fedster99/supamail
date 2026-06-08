@@ -25,6 +25,12 @@ export interface GoalThresholds {
   perCaseNdcg: number;
   /** Per-case floor on recall@K for every gated case. */
   perCaseRecall: number;
+  /**
+   * Per-case floor on precision@R (R = #relevant) for every gated case. Scale-free
+   * over-retrieval guard: catches noise appended after the relevant docs (which
+   * recall/nDCG/MRR keep pinned at 1.0) without punishing low-prevalence queries.
+   */
+  perCasePrecisionAtR: number;
   /** Aspirational mean recall@K over semantic-tier cases (tracked, not gated). */
   semanticRecallTarget: number;
 }
@@ -38,6 +44,7 @@ export const GOAL: GoalThresholds = {
   // floors ensure no individual gated case collapses while the average stays high.
   perCaseNdcg: 0.7,
   perCaseRecall: 0.8,
+  perCasePrecisionAtR: 0.5,
   semanticRecallTarget: 0.7
 };
 

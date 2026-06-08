@@ -84,8 +84,11 @@ export type SearchRequest = z.infer<typeof SearchRequestSchema>;
 export const CAPABILITIES = [
   "field-from",
   "field-to",
+  "field-cc",
   "field-subject",
   "field-body",
+  "multi-term",
+  "multilingual",
   "flag-state",
   "folder-scope",
   "attachment",
@@ -140,6 +143,14 @@ export const EvalCaseSchema = z
     assertions: z.array(EvalAssertionSchema).optional(),
     k: z.number().int().positive().optional(), // cutoff; defaults per suite config
     tier: z.enum(["lexical", "fuzzy", "semantic"]).default("lexical"),
+    /**
+     * Set `true` for a multi-relevant case where the relevant docs form an unordered SET
+     * (e.g. has:attachment) so result order genuinely does not matter. Any other gated
+     * multi-relevant case MUST carry an ordering assertion or graded gains, else it is
+     * non-discriminating (recall/nDCG are permutation-invariant on binary gains). The
+     * audit enforces this.
+     */
+    order_agnostic: z.boolean().optional(),
     // Provenance: when a tracked (semantic-tier) case fails because the reference engine
     // lacks a capability (VIP prior, from-me de-prioritization, language stemming, true
     // vector recall), name it here so the gap is documented rather than silently tiered away.

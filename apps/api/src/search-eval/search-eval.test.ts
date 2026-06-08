@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auditCases, loadCases, loadCorpus, validateReferences } from "./corpus.js";
+import { auditCases, loadCases, loadCorpus, nonDiscriminatingCases, validateReferences } from "./corpus.js";
 import { ndcgAtK, precisionAtK, recallAtK, reciprocalRank } from "./metrics.js";
 import { BASELINE_OPTIONS, IMPROVED_OPTIONS, ReferenceEngine } from "./reference-engine.js";
 import { summarize } from "./report.js";
@@ -58,12 +58,26 @@ describe("metrics", () => {
     expect(recallAtK(["x"], new Set(), 5)).toBe(1);
     expect(ndcgAtK(["x"], new Set(), 5)).toBe(1);
   });
+
+  it("never exceeds 1.0 even when graded omits some relevant ids", () => {
+    // Regression: a `graded` map that doesn't list every relevant id used to give an
+    // iDCG smaller than the achievable DCG, letting nDCG climb above 1.
+    const rel = new Set(["a", "b", "c"]);
+    expect(ndcgAtK(["x", "a", "b"], rel, 3, { x: 3 })).toBeLessThanOrEqual(1 + 1e-9);
+    expect(ndcgAtK(["a", "b", "c"], rel, 3, { a: 3, b: 2, c: 1 })).toBeLessThanOrEqual(1 + 1e-9);
+  });
 });
 
 describe("eval corpus integrity", () => {
   it("has no dangling message references", () => {
     const problems = validateReferences(loadCorpus(), loadCases());
     expect(problems).toEqual([]);
+  });
+
+  it("has no non-discriminating gated cases", () => {
+    // Every gated multi-relevant case must carry an ordering assertion / graded gains,
+    // or be explicitly marked order_agnostic — otherwise it can't catch a ranking regression.
+    expect(nonDiscriminatingCases(loadCases())).toEqual([]);
   });
 });
 

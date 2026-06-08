@@ -47,9 +47,12 @@ export function ndcgAtK(
     if (g > 0) dcg += g / Math.log2(i + 2);
   });
 
-  const idealGains = graded
-    ? Object.values(graded).filter((g) => g > 0)
-    : Array.from(relevant, () => 1);
+  // Ideal DCG must use the SAME gain function over the union of relevant ids + graded
+  // keys; otherwise a `graded` map that omits some relevant_ids yields an iDCG smaller
+  // than the achievable DCG and nDCG can exceed 1.0.
+  const idealGains = [...new Set([...relevant, ...Object.keys(graded ?? {})])]
+    .map((id) => gainOf(id))
+    .filter((g) => g > 0);
   idealGains.sort((a, b) => b - a);
   let idcg = 0;
   idealGains.slice(0, k).forEach((g, i) => {
