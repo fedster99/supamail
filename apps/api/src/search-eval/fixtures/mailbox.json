@@ -1,5 +1,5 @@
 {
-  "_comment": "Fixture mailbox for the email-search eval suite. Two accounts (acct-1 personal, acct-2 work). Crafted so a naive lexical baseline fails email-specific cases (quoted-reply pollution, typos, accents, recency, newsletter noise, paraphrase) while an email-aware engine passes them. corpusNow = newest internal_date (2026-06-05).",
+  "_comment": "Fixture mailbox for the email-search eval suite. Two accounts (acct-1 personal, acct-2 work). Crafted so a naive lexical baseline fails email-specific cases (quoted-reply pollution, typos, accents, recency, newsletter noise, paraphrase) while an email-aware engine passes them. corpusNow = newest internal_date (2026-06-05). (hardened pass: +adversarial/negative, threading, ranking-prior, fuzzy/multilingual, semantic cases)",
   "messages": [
     {
       "id": "m-budget-1",
@@ -10,8 +10,12 @@
       "subject": "FY26 budget review",
       "from_email": "cfo@corp.com",
       "from_name": "Wanda Cole",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Here is the FY26 budget review draft. Budget owners need to sign off on the pelican migration timeline budget."
     },
     {
@@ -23,8 +27,13 @@
       "subject": "Re: FY26 budget review",
       "from_email": "me@corp.com",
       "from_name": "Me",
-      "to_emails": ["cfo@corp.com"],
-      "flags": ["\\Seen", "\\Answered"],
+      "to_emails": [
+        "cfo@corp.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Answered"
+      ],
       "body_clean": "Sounds good, approved.",
       "body_quoted": "On May 10 Wanda Cole wrote: Here is the FY26 budget review draft. The pelican migration timeline needs sign-off."
     },
@@ -37,8 +46,12 @@
       "subject": "Re: FY26 budget review",
       "from_email": "cfo@corp.com",
       "from_name": "Wanda Cole",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Thanks, I will circulate the final budget numbers."
     },
     {
@@ -50,8 +63,12 @@
       "subject": "Alpha Alpha planning",
       "from_email": "pat@corp.com",
       "from_name": "Pat Ng",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Project alpha planning notes."
     },
     {
@@ -63,8 +80,12 @@
       "subject": "Alpha",
       "from_email": "pat@corp.com",
       "from_name": "Pat Ng",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Project alpha status."
     },
     {
@@ -76,7 +97,9 @@
       "subject": "Quarterly Report: Big Savings Report",
       "from_email": "deals@shopmart.com",
       "from_name": "ShopMart Deals",
-      "to_emails": ["me@home.com"],
+      "to_emails": [
+        "me@home.com"
+      ],
       "flags": [],
       "is_listish": true,
       "body_clean": "Our quarterly report shows huge savings. Report now and save on every campaign. Report report."
@@ -90,8 +113,12 @@
       "subject": "Q3 report draft",
       "from_email": "lee@corp.com",
       "from_name": "Lee Park",
-      "to_emails": ["me@home.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Attaching the Q3 report draft for your review."
     },
     {
@@ -103,11 +130,19 @@
       "subject": "Invoice INV-2024-0042",
       "from_email": "billing@cloudhost.com",
       "from_name": "CloudHost Billing",
-      "to_emails": ["me@home.com"],
+      "to_emails": [
+        "me@home.com"
+      ],
       "flags": [],
       "size_bytes": 15000,
       "body_clean": "Your invoice INV-2024-0042 is attached. Amount due 42 dollars.",
-      "attachments": [{ "filename": "INV-2024-0042.pdf", "mime_type": "application/pdf", "size_bytes": 12000 }]
+      "attachments": [
+        {
+          "filename": "INV-2024-0042.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 12000
+        }
+      ]
     },
     {
       "id": "m-contract",
@@ -118,11 +153,21 @@
       "subject": "Signed contract for Q3",
       "from_email": "lee@corp.com",
       "from_name": "Lee Park",
-      "to_emails": ["me@home.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "size_bytes": 60000,
       "body_clean": "Please find the signed contract attached. Did you receive the previous draft?",
-      "attachments": [{ "filename": "Q3-contract.pdf", "mime_type": "application/pdf", "size_bytes": 50000 }]
+      "attachments": [
+        {
+          "filename": "Q3-contract.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 50000
+        }
+      ]
     },
     {
       "id": "m-standup-apr",
@@ -133,8 +178,12 @@
       "subject": "Daily standup notes",
       "from_email": "team@corp.com",
       "from_name": "Team Bot",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "is_listish": true,
       "body_clean": "Standup: alpha on track."
     },
@@ -147,8 +196,12 @@
       "subject": "Daily standup notes",
       "from_email": "team@corp.com",
       "from_name": "Team Bot",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "is_listish": true,
       "body_clean": "Standup: shipping this week."
     },
@@ -161,7 +214,9 @@
       "subject": "Sync about roadmap",
       "from_email": "jin@corp.com",
       "from_name": "Jin Lee",
-      "to_emails": ["me@corp.com"],
+      "to_emails": [
+        "me@corp.com"
+      ],
       "flags": [],
       "body_clean": "Can we set up a call about the roadmap?"
     },
@@ -174,8 +229,12 @@
       "subject": "Your itinerary for SFO-JFK",
       "from_email": "noreply@airline.com",
       "from_name": "SkyAir",
-      "to_emails": ["me@home.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "is_listish": true,
       "body_clean": "Your itinerary is confirmed. Booking ref ABC123."
     },
@@ -188,8 +247,12 @@
       "subject": "Vacation policy update",
       "from_email": "ally@corp.com",
       "from_name": "Ally Brooks",
-      "to_emails": ["me@home.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "The new vacation policy starts in July."
     },
     {
@@ -201,8 +264,12 @@
       "subject": "Vacation policy reminder",
       "from_email": "hr@corp.com",
       "from_name": "HR Team",
-      "to_emails": ["me@corp.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Reminder: vacation policy changes apply now."
     },
     {
@@ -214,8 +281,13 @@
       "subject": "Proposal sent",
       "from_email": "me@corp.com",
       "from_name": "Me",
-      "to_emails": ["client@biz.com"],
-      "flags": ["\\Seen", "\\Answered"],
+      "to_emails": [
+        "client@biz.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Answered"
+      ],
       "body_clean": "Sending over the proposal as discussed."
     },
     {
@@ -227,9 +299,776 @@
       "subject": "Café notes",
       "from_email": "jgarcia@corp.com",
       "from_name": "José García",
-      "to_emails": ["me@home.com"],
-      "flags": ["\\Seen"],
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
       "body_clean": "Notes from the café visit."
+    },
+    {
+      "id": "adv-news-dup-1",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-news-dup-1",
+      "internal_date": "2026-05-22T06:00:00Z",
+      "subject": "Quarterly Report: Big Savings Report",
+      "from_email": "deals@shopmart.com",
+      "from_name": "ShopMart Deals",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [],
+      "is_listish": true,
+      "body_clean": "Our quarterly report shows huge savings. Report now and save on every campaign. Report report. Savings savings savings."
+    },
+    {
+      "id": "adv-news-dup-2",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-news-dup-2",
+      "internal_date": "2026-05-24T06:00:00Z",
+      "subject": "Quarterly Report: Big Savings Report (last chance)",
+      "from_email": "deals@shopmart.com",
+      "from_name": "ShopMart Deals",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [],
+      "is_listish": true,
+      "body_clean": "Our quarterly report shows huge savings. Report now and save on every campaign. Report report. Savings savings savings savings."
+    },
+    {
+      "id": "adv-savings-personal",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-savings-personal",
+      "internal_date": "2026-05-23T13:00:00Z",
+      "subject": "Our household savings plan",
+      "from_email": "robin@home.com",
+      "from_name": "Robin Diaz",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "I moved our savings into the new account this week."
+    },
+    {
+      "id": "adv-sig-heavy",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-sig-heavy",
+      "internal_date": "2026-05-26T10:00:00Z",
+      "subject": "Quick note",
+      "from_email": "marco@corp.com",
+      "from_name": "Marco Vidal",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Confirmed. -- Marco Vidal, VP Operations, Globex Corp. CONFIDENTIALITY NOTICE: This email and any attachments are confidential and intended solely for the addressee. If you have received this email in error please notify the sender and delete it. Globex Corp does not accept liability for any errors or omissions. Please consider the environment before printing this email. To unsubscribe from these notifications, visit globex.example/unsubscribe."
+    },
+    {
+      "id": "adv-ops-genuine",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-ops",
+      "internal_date": "2026-05-28T11:00:00Z",
+      "subject": "Operations handover plan",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Sharing the operations handover plan. Operations coverage starts Monday."
+    },
+    {
+      "id": "adv-footer-lunch",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-footer-lunch",
+      "internal_date": "2026-05-25T12:00:00Z",
+      "subject": "Lunch on Friday?",
+      "from_email": "dana@corp.com",
+      "from_name": "Dana Kim",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Are you free for lunch on Friday? -- Dana Kim, Globex Corp. CONFIDENTIALITY NOTICE: This email and any attachments are confidential and intended solely for the addressee. If you have received this email in error please notify the sender and delete it. Globex Corp does not accept liability for any errors or omissions. Please consider the environment before printing this email. To unsubscribe from these notifications, visit globex.example/unsubscribe."
+    },
+    {
+      "id": "adv-q-original",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-falcon",
+      "internal_date": "2026-05-29T08:00:00Z",
+      "subject": "Falcon datacenter cutover",
+      "from_email": "priya@corp.com",
+      "from_name": "Priya Shah",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "The falcon datacenter cutover is scheduled for the weekend. The kestrel rollback plan is attached. Please confirm the maintenance window."
+    },
+    {
+      "id": "adv-q-reply",
+      "account_id": "acct-2",
+      "folder_path": "Sent",
+      "thread_key": "thr-falcon",
+      "internal_date": "2026-06-04T17:00:00Z",
+      "subject": "Re: Falcon datacenter cutover",
+      "from_email": "me@corp.com",
+      "from_name": "Me",
+      "to_emails": [
+        "priya@corp.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Answered"
+      ],
+      "body_clean": "Thanks, confirmed.",
+      "body_quoted": "On May 29 Priya Shah wrote: The falcon datacenter cutover is scheduled for the weekend. The kestrel rollback plan is attached. Please confirm the maintenance window."
+    },
+    {
+      "id": "adv-statement-spam",
+      "account_id": "acct-1",
+      "folder_path": "Spam",
+      "thread_key": "thr-stmt-spam",
+      "internal_date": "2026-05-30T06:00:00Z",
+      "subject": "Make a bold statement this season",
+      "from_email": "style@fashionblast.com",
+      "from_name": "FashionBlast",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [],
+      "is_listish": true,
+      "body_clean": "Make a statement with our new collection. A statement piece for every occasion. Statement statement statement."
+    },
+    {
+      "id": "adv-statement-real",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-stmt-real",
+      "internal_date": "2026-05-31T07:00:00Z",
+      "subject": "Your March account statement",
+      "from_email": "statements@bigbank.com",
+      "from_name": "BigBank",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Your monthly account statement is ready to view in online banking."
+    },
+    {
+      "id": "ranking-sec-vip",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-sec-vip",
+      "internal_date": "2026-05-25T09:00:00Z",
+      "subject": "Security review for the launch",
+      "from_email": "cfo@corp.com",
+      "from_name": "Wanda Cole",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Before we launch can you walk me through the security posture? I want one human owner accountable for security sign-off on the security review.",
+      "is_listish": false
+    },
+    {
+      "id": "ranking-sec-bulk",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-sec-bulk",
+      "internal_date": "2026-06-03T06:00:00Z",
+      "subject": "Security Weekly newsletter",
+      "from_email": "newsletter@securitydaily.com",
+      "from_name": "Security Daily",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [],
+      "is_listish": true,
+      "body_clean": "This week in security: best practices, training, and tooling. Improve your security today."
+    },
+    {
+      "id": "ranking-webinar-old",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-webinar-old",
+      "internal_date": "2026-03-20T08:00:00Z",
+      "subject": "Webinar replay: the ultimate webinar",
+      "from_email": "events@martechpro.com",
+      "from_name": "MarTech Pro",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "is_listish": false,
+      "body_clean": "Catch the webinar replay. This webinar covers everything. Our webinar series webinar archive has every past webinar."
+    },
+    {
+      "id": "ranking-webinar-new",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-webinar-new",
+      "internal_date": "2026-06-02T08:00:00Z",
+      "subject": "Your webinar starts tomorrow",
+      "from_email": "lee@corp.com",
+      "from_name": "Lee Park",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [],
+      "is_listish": false,
+      "body_clean": "Reminder that the webinar is tomorrow at 10am. Looking forward to the webinar, see you there."
+    },
+    {
+      "id": "ranking-outage-vip",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-outage-vip",
+      "internal_date": "2026-05-26T09:00:00Z",
+      "subject": "Customer outage - need your call",
+      "from_email": "jin@corp.com",
+      "from_name": "Jin Lee",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [],
+      "is_listish": false,
+      "body_clean": "A key customer hit an outage this morning and is asking for you specifically. Can you jump on the outage bridge?"
+    },
+    {
+      "id": "ranking-outage-bulk",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-outage-bulk",
+      "internal_date": "2026-06-04T06:00:00Z",
+      "subject": "[StatusPage] Outage notification",
+      "from_email": "status@statuspage.io",
+      "from_name": "StatusPage Automated",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [],
+      "is_listish": true,
+      "body_clean": "Automated outage notification. An outage was detected. Outage started. Outage ongoing. Outage update will follow. This is an automated outage message."
+    },
+    {
+      "id": "ranking-prop-reply",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-prop",
+      "internal_date": "2026-06-02T09:00:00Z",
+      "subject": "Re: Proposal",
+      "from_email": "client@biz.com",
+      "from_name": "Dana Reyes",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [],
+      "is_listish": false,
+      "body_clean": "Thanks for the proposal - we have a few questions before we can sign off on the proposal.",
+      "body_quoted": "On May 22 you wrote: Sending over the proposal as discussed."
+    },
+    {
+      "id": "ranking-prop-sentnew",
+      "account_id": "acct-2",
+      "folder_path": "Sent",
+      "thread_key": "thr-prop",
+      "internal_date": "2026-06-03T17:00:00Z",
+      "subject": "Re: Proposal",
+      "from_email": "me@corp.com",
+      "from_name": "Me",
+      "to_emails": [
+        "client@biz.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Answered"
+      ],
+      "is_listish": false,
+      "body_clean": "Following up on the proposal - happy to walk through the proposal whenever works.",
+      "body_quoted": "On Jun 2 Dana Reyes wrote: Thanks for the proposal - we have a few questions before we can sign off on the proposal."
+    },
+    {
+      "id": "operators-billing-flagged",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-billing",
+      "internal_date": "2026-05-25T09:00:00Z",
+      "subject": "Invoice INV-2026-0317 due",
+      "from_email": "billing@cloudhost.com",
+      "from_name": "CloudHost Billing",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Flagged"
+      ],
+      "size_bytes": 48000,
+      "body_clean": "Your invoice INV-2026-0317 is attached and is now due. Please remit payment.",
+      "attachments": [
+        {
+          "filename": "INV-2026-0317.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 41000
+        }
+      ]
+    },
+    {
+      "id": "operators-billing-unflagged",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-billing2",
+      "internal_date": "2026-05-26T09:00:00Z",
+      "subject": "Invoice INV-2026-0318 due",
+      "from_email": "billing@cloudhost.com",
+      "from_name": "CloudHost Billing",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 47000,
+      "body_clean": "Your invoice INV-2026-0318 is attached and is now due.",
+      "attachments": [
+        {
+          "filename": "INV-2026-0318.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 40000
+        }
+      ]
+    },
+    {
+      "id": "operators-billing-old",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-billing3",
+      "internal_date": "2026-04-10T09:00:00Z",
+      "subject": "Invoice INV-2026-0099 due",
+      "from_email": "billing@cloudhost.com",
+      "from_name": "CloudHost Billing",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Flagged"
+      ],
+      "size_bytes": 46000,
+      "body_clean": "Your invoice INV-2026-0099 is attached and is now due.",
+      "attachments": [
+        {
+          "filename": "INV-2026-0099.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 39000
+        }
+      ]
+    },
+    {
+      "id": "operators-billing-noattach",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-billing4",
+      "internal_date": "2026-05-27T09:00:00Z",
+      "subject": "Invoice INV-2026-0320 reminder",
+      "from_email": "billing@cloudhost.com",
+      "from_name": "CloudHost Billing",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Flagged"
+      ],
+      "size_bytes": 5000,
+      "body_clean": "Reminder that invoice INV-2026-0320 is due. No attachment in this reminder."
+    },
+    {
+      "id": "operators-spam-invoice",
+      "account_id": "acct-1",
+      "folder_path": "Spam",
+      "thread_key": "thr-op-spam",
+      "internal_date": "2026-05-28T09:00:00Z",
+      "subject": "URGENT invoice payment overdue",
+      "from_email": "billing@cloudhost.com",
+      "from_name": "CloudHost Billing",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Flagged"
+      ],
+      "is_listish": true,
+      "size_bytes": 9000,
+      "body_clean": "Your invoice is overdue. Pay now to avoid suspension. Click here.",
+      "attachments": [
+        {
+          "filename": "overdue-invoice.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 8000
+        }
+      ]
+    },
+    {
+      "id": "operators-report-archive",
+      "account_id": "acct-2",
+      "folder_path": "Archive",
+      "thread_key": "thr-op-archive",
+      "internal_date": "2026-03-15T10:00:00Z",
+      "subject": "Q1 report archived",
+      "from_email": "lee@corp.com",
+      "from_name": "Lee Park",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 20000,
+      "body_clean": "Archiving the Q1 report for reference."
+    },
+    {
+      "id": "operators-report-inbox",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-rinbox",
+      "internal_date": "2026-05-30T10:00:00Z",
+      "subject": "Q2 report follow-up",
+      "from_email": "lee@corp.com",
+      "from_name": "Lee Park",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 21000,
+      "body_clean": "Following up on the Q2 report numbers."
+    },
+    {
+      "id": "operators-draft-report",
+      "account_id": "acct-2",
+      "folder_path": "Drafts",
+      "thread_key": "thr-op-draft",
+      "internal_date": "2026-06-02T11:00:00Z",
+      "subject": "Draft: report to the board",
+      "from_email": "me@corp.com",
+      "from_name": "Me",
+      "to_emails": [
+        "board@corp.com"
+      ],
+      "flags": [],
+      "size_bytes": 3000,
+      "body_clean": "Draft body: still writing the report summary for the board."
+    },
+    {
+      "id": "operators-multiattach-boundary",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-multi",
+      "internal_date": "2026-05-09T10:00:00Z",
+      "subject": "Deck and spreadsheet for review",
+      "from_email": "pat@corp.com",
+      "from_name": "Pat Ng",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 50000,
+      "body_clean": "Attaching the quarterly deck and the financial model spreadsheet.",
+      "attachments": [
+        {
+          "filename": "Q2-deck.pptx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          "size_bytes": 30000
+        },
+        {
+          "filename": "financial-model.xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "size_bytes": 18000
+        }
+      ]
+    },
+    {
+      "id": "operators-multiattach-large",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-op-multi2",
+      "internal_date": "2026-05-29T10:00:00Z",
+      "subject": "Updated deck and spreadsheet",
+      "from_email": "pat@corp.com",
+      "from_name": "Pat Ng",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 50001,
+      "body_clean": "Updated deck plus the revised financial model spreadsheet, larger this time.",
+      "attachments": [
+        {
+          "filename": "Q2-deck-v2.pptx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          "size_bytes": 32000
+        },
+        {
+          "filename": "financial-model-v2.xlsx",
+          "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "size_bytes": 18001
+        }
+      ]
+    },
+    {
+      "id": "fuzzy-m-jeremy",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-jeremy",
+      "internal_date": "2026-05-16T09:00:00Z",
+      "subject": "Order DE-99AKO confirmed",
+      "from_email": "jeremy.schroder@parcelship.de",
+      "from_name": "Jeremy Schröder",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 9000,
+      "body_clean": "Hallo, your order DE-99AKO-7 shipped. Tracking 1Z999AA10123456784. Call +1 (415) 555-0142 if delayed. Reach me at j.schroder@parcelship.de.",
+      "lang": "en"
+    },
+    {
+      "id": "fuzzy-m-factura",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-factura",
+      "internal_date": "2026-05-17T08:00:00Z",
+      "subject": "Factura pendiente de pago",
+      "from_email": "facturacion@nubehost.es",
+      "from_name": "Nube Host Facturación",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [],
+      "size_bytes": 7000,
+      "body_clean": "Estimado cliente, su factura está pendiente de pago. Las facturas vencen el día quince. Gracias por su atención.",
+      "lang": "es"
+    },
+    {
+      "id": "fuzzy-m-munchen",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-munchen",
+      "internal_date": "2026-05-09T08:00:00Z",
+      "subject": "Reise nach München im Juni",
+      "from_email": "reisen@bahn.de",
+      "from_name": "Deutsche Reise",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 6000,
+      "body_clean": "Ihre Reise nach München ist gebucht. Die Unterkunft in München ist bestätigt.",
+      "lang": "de"
+    },
+    {
+      "id": "fuzzy-m-order-orig",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-orderq",
+      "internal_date": "2026-05-13T10:00:00Z",
+      "subject": "Your order ORD-77310",
+      "from_email": "support@parcelship.de",
+      "from_name": "ParcelShip Support",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "size_bytes": 5000,
+      "body_clean": "Your order ORD-77310 is on the way and should arrive Friday.",
+      "lang": "en"
+    },
+    {
+      "id": "fuzzy-m-order-reply",
+      "account_id": "acct-1",
+      "folder_path": "Sent",
+      "thread_key": "thr-orderq",
+      "internal_date": "2026-05-14T10:00:00Z",
+      "subject": "Re: thanks for the update",
+      "from_email": "me@home.com",
+      "from_name": "Me",
+      "to_emails": [
+        "support@parcelship.de"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Answered"
+      ],
+      "size_bytes": 5200,
+      "body_clean": "Great, thanks for the update.",
+      "body_quoted": "On May 13 ParcelShip Support wrote: Your order ORD-77310 is on the way and should arrive Friday.",
+      "lang": "en"
+    },
+    {
+      "id": "threading-refund-1",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-refund",
+      "internal_date": "2026-05-25T09:00:00Z",
+      "subject": "Reimbursement request for cancelled order",
+      "from_email": "me@home.com",
+      "from_name": "Me",
+      "to_emails": [
+        "support@shopmart.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "I cancelled order 7781 and would like a reimbursement. Please process the reimbursement to my original card."
+    },
+    {
+      "id": "threading-refund-2",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-refund",
+      "internal_date": "2026-05-26T10:30:00Z",
+      "subject": "Re: Reimbursement request for cancelled order",
+      "from_email": "support@shopmart.com",
+      "from_name": "ShopMart Support",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "We have approved your reimbursement and issued a store credit.",
+      "body_quoted": "On May 25 you wrote: I cancelled order 7781 and would like a reimbursement to my original card."
+    },
+    {
+      "id": "threading-refund-3",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-refund",
+      "internal_date": "2026-05-27T14:00:00Z",
+      "subject": "Re: Reimbursement request for cancelled order",
+      "from_email": "support@shopmart.com",
+      "from_name": "ShopMart Support",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [],
+      "body_clean": "Update: your reimbursement has now settled to your bank.",
+      "body_quoted": "We have approved the reimbursement and issued a store credit."
+    },
+    {
+      "id": "threading-hotel-1",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-hotel",
+      "internal_date": "2026-05-30T08:00:00Z",
+      "subject": "Your reservation at Bayview Inn",
+      "from_email": "stays@bayview.com",
+      "from_name": "Bayview Inn",
+      "to_emails": [
+        "me@home.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "is_listish": true,
+      "body_clean": "Your reservation is confirmed for two nights. Confirmation BVN-5521."
+    },
+    {
+      "id": "threading-hotel-2",
+      "account_id": "acct-1",
+      "folder_path": "INBOX",
+      "thread_key": "thr-hotel",
+      "internal_date": "2026-06-02T11:00:00Z",
+      "subject": "Re: Your reservation at Bayview Inn",
+      "from_email": "me@home.com",
+      "from_name": "Me",
+      "to_emails": [
+        "stays@bayview.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Can I change my reservation booking to a king room?"
+    },
+    {
+      "id": "threading-msa-1",
+      "account_id": "acct-2",
+      "folder_path": "INBOX",
+      "thread_key": "thr-msa",
+      "internal_date": "2026-05-23T09:00:00Z",
+      "subject": "Master agreement for review",
+      "from_email": "legal@corp.com",
+      "from_name": "Dana Reye",
+      "to_emails": [
+        "me@corp.com"
+      ],
+      "flags": [
+        "\\Seen"
+      ],
+      "body_clean": "Attaching the master service agreement (MSA) for your legal review.",
+      "attachments": [
+        {
+          "filename": "MSA-2026.pdf",
+          "mime_type": "application/pdf",
+          "size_bytes": 40000
+        }
+      ]
+    },
+    {
+      "id": "threading-msa-2",
+      "account_id": "acct-2",
+      "folder_path": "Sent",
+      "thread_key": "thr-msa",
+      "internal_date": "2026-05-24T16:00:00Z",
+      "subject": "Re: Master agreement for review",
+      "from_email": "me@corp.com",
+      "from_name": "Me",
+      "to_emails": [
+        "legal@corp.com"
+      ],
+      "flags": [
+        "\\Seen",
+        "\\Answered"
+      ],
+      "body_clean": "Reviewed the agreement, one redline on the liability clause."
     }
   ]
 }

@@ -26,7 +26,12 @@ export interface ReferenceEngineOptions {
   newsletterDownweight: { enabled: boolean; factor: number };
   /** Expand query terms via a small synonym map (lexical stand-in for vector recall). */
   semanticSynonyms: boolean;
+  /** Exclude Spam/Trash/Junk from results unless the query explicitly scopes to them via `in:`. */
+  excludeSpamTrashByDefault: boolean;
 }
+
+/** Folders excluded from unscoped search by default (an email-search norm). */
+const SPAMMY_FOLDERS = new Set(["spam", "trash", "junk"]);
 
 export const BASELINE_OPTIONS: ReferenceEngineOptions = {
   stripQuoted: false,
@@ -35,7 +40,8 @@ export const BASELINE_OPTIONS: ReferenceEngineOptions = {
   recency: { enabled: false, halfLifeDays: 30, floor: 0.4 },
   fuzzy: { enabled: false, maxEditDistance: 2, penalty: 0.6 },
   newsletterDownweight: { enabled: false, factor: 0.5 },
-  semanticSynonyms: false
+  semanticSynonyms: false,
+  excludeSpamTrashByDefault: false
 };
 
 export const IMPROVED_OPTIONS: ReferenceEngineOptions = {
@@ -45,7 +51,8 @@ export const IMPROVED_OPTIONS: ReferenceEngineOptions = {
   recency: { enabled: true, halfLifeDays: 30, floor: 0.4 },
   fuzzy: { enabled: true, maxEditDistance: 2, penalty: 0.6 },
   newsletterDownweight: { enabled: true, factor: 0.45 },
-  semanticSynonyms: true
+  semanticSynonyms: true,
+  excludeSpamTrashByDefault: true
 };
 
 /** Small, hand-curated synonym map: stand-in for the production vector/semantic arm. */
@@ -299,8 +306,15 @@ export class ReferenceEngine implements SearchEngine {
   private passesFilters(doc: IndexedDoc, req: SearchRequest): boolean {
     const m = doc.msg;
     if (req.accounts && req.accounts.length > 0 && !req.accounts.includes(m.account_id)) return false;
-    if (req.in && req.in.length > 0 && !req.in.some((f) => f.toLowerCase() === m.folder_path.toLowerCase()))
-      return false;
+    const scopedFolders = new Set((req.in ?? []).map((f) => f.toLowerCase()));
+    if (req.in && req.in.length > 0 && !scopedFolders.has(m.folder_path.toLowerCase())) return false;
+    if (
+      this.opts.excludeSpamTrashByDefault &&
+      SPAMMY_FOLDERS.has(m.folder_path.toLowerCase()) &&
+      !scopedFolders.has(m.folder_path.toLowerCase())
+    ) {
+      return false; // Spam/Trash hidden unless the query explicitly asks for that folder
+    }
     if (req.thread && m.thread_key !== req.thread) return false;
     if (req.is) {
       const seen = m.flags.includes("\\Seen");

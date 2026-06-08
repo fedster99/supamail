@@ -44,11 +44,26 @@ expected to satisfy it; that's the job of the opt-in Tier-2 vector arm (see
 
 Field/flag/folder/attachment/filename/date/size operators · phrase · boolean OR/NOT ·
 fuzzy-typo · unicode-accent · identifier-exact · **quoted-reply exclusion** ·
-**thread-collapse** · **recency-prior** · **newsletter-downweight** · cross-account ·
-semantic-paraphrase (tracked).
+**thread-collapse** · **recency-prior** · **newsletter-downweight** · **sender-importance** ·
+**Spam/Trash default-exclusion** · cross-account · semantic-paraphrase (tracked).
 
-Known coverage gap (tracked for follow-up): `sender-importance` / VIP priors are not yet
-modeled by the reference engine, so no gated case asserts them.
+The suite is intentionally adversarial: quoted-only terms must surface the original not
+the reply; signature/footer boilerplate must not drive relevance; near-duplicate
+newsletter blasts must not dominate; an unscoped search hides Spam/Trash unless `in:` asks
+for it.
+
+## Tracked engine gaps (semantic-tier, not gated)
+
+Some cases are deliberately tracked-not-gated and carry a `requires_engine_improvement`
+note — they document where the lexical reference engine falls short and the production
+engine must do better:
+
+- **VIP / contact-frequency sender-importance prior** — rank a known human correspondent
+  above automated/bulk mail even when newsletter down-weight is disabled by a folder scope.
+- **from-me / Sent de-prioritization** — an inbound reply should outrank my own newer Sent
+  follow-up on the same thread.
+- **Language-aware stemming** (e.g. Spanish `vencimiento`↔`vencen`) and **true vector
+  recall** beyond the small synonym stand-in.
 
 ## Adding an engine (e.g. the production Postgres/pgvector engine)
 

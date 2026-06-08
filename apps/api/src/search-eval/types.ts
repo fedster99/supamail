@@ -139,7 +139,11 @@ export const EvalCaseSchema = z
     must_not_return: z.array(z.string()).optional(),
     assertions: z.array(EvalAssertionSchema).optional(),
     k: z.number().int().positive().optional(), // cutoff; defaults per suite config
-    tier: z.enum(["lexical", "fuzzy", "semantic"]).default("lexical")
+    tier: z.enum(["lexical", "fuzzy", "semantic"]).default("lexical"),
+    // Provenance: when a tracked (semantic-tier) case fails because the reference engine
+    // lacks a capability (VIP prior, from-me de-prioritization, language stemming, true
+    // vector recall), name it here so the gap is documented rather than silently tiered away.
+    requires_engine_improvement: z.string().nullable().optional()
   })
   .strict();
 export type EvalCase = z.infer<typeof EvalCaseSchema>;

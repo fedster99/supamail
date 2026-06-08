@@ -6,131 +6,249 @@
       "capability": "field-from",
       "description": "Sender-scoped: emails from Wanda Cole",
       "dsl": "from:wanda",
-      "query": { "from": "wanda" },
-      "relevant_ids": ["m-budget-1", "m-budget-3"]
+      "query": {
+        "from": "wanda"
+      },
+      "relevant_ids": [
+        "m-budget-1",
+        "m-budget-3",
+        "ranking-sec-vip"
+      ]
     },
     {
       "id": "field-to-client",
       "capability": "field-to",
       "description": "Recipient-scoped: emails to client@biz.com",
       "dsl": "to:client@biz.com",
-      "query": { "to": "client@biz.com" },
-      "relevant_ids": ["m-sent"]
+      "query": {
+        "to": "client@biz.com"
+      },
+      "relevant_ids": [
+        "m-sent",
+        "ranking-prop-sentnew"
+      ]
     },
     {
       "id": "field-subject-itinerary",
       "capability": "field-subject",
       "description": "Subject-scoped term",
       "dsl": "subject:itinerary",
-      "query": { "subject": "itinerary" },
-      "relevant_ids": ["m-flight"]
+      "query": {
+        "subject": "itinerary"
+      },
+      "relevant_ids": [
+        "m-flight"
+      ]
     },
     {
       "id": "field-body-savings",
       "capability": "field-body",
       "description": "Body-scoped term not present in any subject",
       "dsl": "body:savings",
-      "query": { "body": "savings" },
-      "relevant_ids": ["m-news"]
+      "query": {
+        "body": "savings"
+      },
+      "relevant_ids": [
+        "m-news",
+        "adv-news-dup-1",
+        "adv-news-dup-2",
+        "adv-savings-personal"
+      ]
     },
     {
       "id": "flag-unread-roadmap",
       "capability": "flag-state",
       "description": "Unread mail about the roadmap",
       "dsl": "is:unread roadmap",
-      "query": { "is": ["unread"], "text": "roadmap" },
-      "relevant_ids": ["m-meeting"]
+      "query": {
+        "is": [
+          "unread"
+        ],
+        "text": "roadmap"
+      },
+      "relevant_ids": [
+        "m-meeting"
+      ]
     },
     {
       "id": "folder-sent-proposal",
       "capability": "folder-scope",
       "description": "Restrict to the Sent folder",
       "dsl": "in:Sent proposal",
-      "query": { "in": ["Sent"], "text": "proposal" },
-      "relevant_ids": ["m-sent"]
+      "query": {
+        "in": [
+          "Sent"
+        ],
+        "text": "proposal"
+      },
+      "relevant_ids": [
+        "m-sent",
+        "ranking-prop-sentnew"
+      ]
     },
     {
       "id": "has-attachment",
       "capability": "attachment",
       "description": "All mail with attachments",
       "dsl": "has:attachment",
-      "query": { "has": ["attachment"] },
-      "relevant_ids": ["m-invoice", "m-contract"]
+      "query": {
+        "has": [
+          "attachment"
+        ]
+      },
+      "relevant_ids": [
+        "m-invoice",
+        "m-contract",
+        "operators-billing-flagged",
+        "operators-billing-unflagged",
+        "operators-billing-old",
+        "operators-multiattach-boundary",
+        "operators-multiattach-large",
+        "threading-msa-1"
+      ]
     },
     {
       "id": "filename-pdf",
       "capability": "filename",
       "description": "Attachments matching a filename glob",
       "dsl": "filename:*.pdf",
-      "query": { "filename": "*.pdf" },
-      "relevant_ids": ["m-invoice", "m-contract"]
+      "query": {
+        "filename": "*.pdf"
+      },
+      "relevant_ids": [
+        "m-invoice",
+        "m-contract",
+        "operators-billing-flagged",
+        "operators-billing-unflagged",
+        "operators-billing-old",
+        "threading-msa-1"
+      ]
     },
     {
       "id": "date-after-standup",
       "capability": "date-range",
       "description": "Standup notes after May 1 (April one must not match)",
       "dsl": "standup after:2026-05-01",
-      "query": { "text": "standup", "after": "2026-05-01T00:00:00Z" },
-      "relevant_ids": ["m-standup-may"],
-      "must_not_return": ["m-standup-apr"]
+      "query": {
+        "text": "standup",
+        "after": "2026-05-01T00:00:00Z"
+      },
+      "relevant_ids": [
+        "m-standup-may"
+      ],
+      "must_not_return": [
+        "m-standup-apr"
+      ]
     },
     {
       "id": "size-larger-with-attachment",
       "capability": "size",
       "description": "Large messages with attachments",
       "dsl": "has:attachment larger:30000",
-      "query": { "has": ["attachment"], "larger": 30000 },
-      "relevant_ids": ["m-contract"],
-      "must_not_return": ["m-invoice"]
+      "query": {
+        "has": [
+          "attachment"
+        ],
+        "larger": 30000
+      },
+      "relevant_ids": [
+        "m-contract",
+        "operators-billing-flagged",
+        "operators-billing-unflagged",
+        "operators-billing-old",
+        "operators-multiattach-boundary",
+        "operators-multiattach-large"
+      ],
+      "must_not_return": [
+        "m-invoice"
+      ]
     },
     {
       "id": "phrase-vacation-policy",
       "capability": "phrase",
       "description": "Exact phrase match",
       "dsl": "\"vacation policy\"",
-      "query": { "phrase": "vacation policy" },
-      "relevant_ids": ["m-cross-1", "m-cross-2"]
+      "query": {
+        "phrase": "vacation policy"
+      },
+      "relevant_ids": [
+        "m-cross-1",
+        "m-cross-2"
+      ]
     },
     {
       "id": "or-invoice-contract",
       "capability": "boolean-or",
       "description": "Either of two terms",
       "dsl": "invoice OR contract",
-      "query": { "or": ["invoice", "contract"] },
-      "relevant_ids": ["m-invoice", "m-contract"]
+      "query": {
+        "or": [
+          "invoice",
+          "contract"
+        ]
+      },
+      "relevant_ids": [
+        "m-invoice",
+        "m-contract",
+        "operators-billing-flagged",
+        "operators-billing-unflagged",
+        "operators-billing-old",
+        "operators-billing-noattach"
+      ]
     },
     {
       "id": "not-reminder",
       "capability": "boolean-not",
       "description": "Policy mail excluding reminders",
       "dsl": "policy -reminder",
-      "query": { "text": "policy", "not": ["reminder"] },
-      "relevant_ids": ["m-cross-1"],
-      "must_not_return": ["m-cross-2"]
+      "query": {
+        "text": "policy",
+        "not": [
+          "reminder"
+        ]
+      },
+      "relevant_ids": [
+        "m-cross-1"
+      ],
+      "must_not_return": [
+        "m-cross-2"
+      ]
     },
     {
       "id": "identifier-exact",
       "capability": "identifier-exact",
       "description": "Exact invoice/order identifier",
       "dsl": "INV-2024-0042",
-      "query": { "text": "INV-2024-0042" },
-      "relevant_ids": ["m-invoice"]
+      "query": {
+        "text": "INV-2024-0042"
+      },
+      "relevant_ids": [
+        "m-invoice"
+      ]
     },
     {
       "id": "unicode-accent-from",
       "capability": "unicode-accent",
       "description": "Accent-insensitive sender match (jose ≈ José)",
       "dsl": "from:jose",
-      "query": { "from": "jose" },
-      "relevant_ids": ["m-jose"]
+      "query": {
+        "from": "jose"
+      },
+      "relevant_ids": [
+        "m-jose"
+      ]
     },
     {
       "id": "fuzzy-recieve",
       "capability": "fuzzy-typo",
       "description": "Typo tolerance (recieve → receive)",
       "dsl": "recieve",
-      "query": { "text": "recieve" },
-      "relevant_ids": ["m-contract"],
+      "query": {
+        "text": "recieve"
+      },
+      "relevant_ids": [
+        "m-contract"
+      ],
       "tier": "fuzzy"
     },
     {
@@ -138,8 +256,14 @@
       "capability": "false-empty-avoidance",
       "description": "A misspelled but real query must not return empty",
       "dsl": "campain",
-      "query": { "text": "campain" },
-      "relevant_ids": ["m-news"],
+      "query": {
+        "text": "campain"
+      },
+      "relevant_ids": [
+        "m-news",
+        "adv-news-dup-1",
+        "adv-news-dup-2"
+      ],
       "tier": "fuzzy"
     },
     {
@@ -147,52 +271,109 @@
       "capability": "quoted-exclusion",
       "description": "A term only in quoted reply history must surface the original, not the reply",
       "dsl": "pelican",
-      "query": { "text": "pelican" },
-      "relevant_ids": ["m-budget-1"],
-      "must_not_return": ["m-budget-2"]
+      "query": {
+        "text": "pelican"
+      },
+      "relevant_ids": [
+        "m-budget-1"
+      ],
+      "must_not_return": [
+        "m-budget-2"
+      ]
     },
     {
       "id": "thread-collapse-budget",
       "capability": "thread-collapse",
       "description": "Thread-granularity search returns one hit per thread",
       "dsl": "budget account:acct-2 (thread view)",
-      "query": { "text": "budget", "accounts": ["acct-2"], "granularity": "thread" },
-      "relevant_ids": ["m-budget-1"],
-      "assertions": [{ "type": "thread_collapsed" }]
+      "query": {
+        "text": "budget",
+        "accounts": [
+          "acct-2"
+        ],
+        "granularity": "thread"
+      },
+      "relevant_ids": [
+        "m-budget-1"
+      ],
+      "assertions": [
+        {
+          "type": "thread_collapsed"
+        }
+      ]
     },
     {
       "id": "recency-prior-alpha",
       "capability": "recency-prior",
       "description": "Among equally-on-topic mail, the newer one should rank first",
       "dsl": "alpha",
-      "query": { "text": "alpha" },
-      "relevant_ids": ["m-alpha-old", "m-alpha-new"],
-      "assertions": [{ "type": "top_is", "id": "m-alpha-new" }]
+      "query": {
+        "text": "alpha"
+      },
+      "relevant_ids": [
+        "m-alpha-old",
+        "m-alpha-new"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "m-alpha-new"
+        }
+      ]
     },
     {
       "id": "newsletter-downweight-report",
       "capability": "newsletter-downweight",
       "description": "A personal mail should outrank a keyword-stuffed newsletter",
       "dsl": "report",
-      "query": { "text": "report" },
-      "relevant_ids": ["m-personal", "m-news"],
-      "assertions": [{ "type": "rank_above", "higher": "m-personal", "lower": "m-news" }]
+      "query": {
+        "text": "report"
+      },
+      "relevant_ids": [
+        "m-news",
+        "m-personal",
+        "adv-news-dup-1",
+        "adv-news-dup-2",
+        "operators-report-archive",
+        "operators-report-inbox",
+        "operators-draft-report"
+      ],
+      "assertions": [
+        {
+          "type": "rank_above",
+          "higher": "m-personal",
+          "lower": "m-news"
+        }
+      ]
     },
     {
       "id": "cross-account-vacation",
       "capability": "cross-account",
       "description": "One query spanning two accounts",
       "dsl": "vacation account:acct-1 account:acct-2",
-      "query": { "text": "vacation", "accounts": ["acct-1", "acct-2"] },
-      "relevant_ids": ["m-cross-1", "m-cross-2"]
+      "query": {
+        "text": "vacation",
+        "accounts": [
+          "acct-1",
+          "acct-2"
+        ]
+      },
+      "relevant_ids": [
+        "m-cross-1",
+        "m-cross-2"
+      ]
     },
     {
       "id": "semantic-bill",
       "capability": "semantic-paraphrase",
       "description": "Paraphrase: 'bill' should find the invoice",
       "dsl": "bill",
-      "query": { "text": "bill" },
-      "relevant_ids": ["m-invoice"],
+      "query": {
+        "text": "bill"
+      },
+      "relevant_ids": [
+        "m-invoice"
+      ],
       "tier": "semantic"
     },
     {
@@ -200,8 +381,12 @@
       "capability": "semantic-paraphrase",
       "description": "Paraphrase: 'meeting' should find the call/sync",
       "dsl": "meeting",
-      "query": { "text": "meeting" },
-      "relevant_ids": ["m-meeting"],
+      "query": {
+        "text": "meeting"
+      },
+      "relevant_ids": [
+        "m-meeting"
+      ],
       "tier": "semantic"
     },
     {
@@ -209,9 +394,881 @@
       "capability": "semantic-paraphrase",
       "description": "Paraphrase: 'flight' should find the itinerary/booking",
       "dsl": "flight",
-      "query": { "text": "flight" },
-      "relevant_ids": ["m-flight"],
+      "query": {
+        "text": "flight"
+      },
+      "relevant_ids": [
+        "m-flight"
+      ],
       "tier": "semantic"
+    },
+    {
+      "id": "adv-newsletter-dup-savings",
+      "capability": "newsletter-downweight",
+      "description": "Near-duplicate newsletter blasts must not dominate: one genuine personal mail about savings should outrank three repeated 'Big Savings' marketing blasts for the ambiguous query 'savings'.",
+      "dsl": "savings",
+      "query": {
+        "text": "savings"
+      },
+      "relevant_ids": [
+        "adv-savings-personal",
+        "m-news",
+        "adv-news-dup-1",
+        "adv-news-dup-2"
+      ],
+      "graded": {
+        "adv-savings-personal": 3,
+        "m-news": 1,
+        "adv-news-dup-1": 1,
+        "adv-news-dup-2": 1
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "adv-savings-personal"
+        },
+        {
+          "type": "rank_above",
+          "higher": "adv-savings-personal",
+          "lower": "adv-news-dup-1"
+        },
+        {
+          "type": "rank_above",
+          "higher": "adv-savings-personal",
+          "lower": "adv-news-dup-2"
+        },
+        {
+          "type": "rank_above",
+          "higher": "adv-savings-personal",
+          "lower": "m-news"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "adv-quoted-only-kestrel",
+      "capability": "quoted-exclusion",
+      "description": "A term ('kestrel') appearing ONLY in the original's clean body and in the reply's QUOTED history must surface the original and never the one-line 'Thanks, confirmed' reply.",
+      "dsl": "kestrel",
+      "query": {
+        "text": "kestrel"
+      },
+      "relevant_ids": [
+        "adv-q-original"
+      ],
+      "must_not_return": [
+        "adv-q-reply"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "adv-q-original"
+        },
+        {
+          "type": "must_not_return",
+          "ids": [
+            "adv-q-reply"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "adv-quoted-recency-falcon",
+      "capability": "quoted-exclusion",
+      "description": "Recency trap on quoted history: a much-newer one-line reply legitimately carries 'falcon' in its 'Re:' subject, but the substantive older original must still rank first. A naive engine that indexes quoted body and over-weights recency fails.",
+      "dsl": "falcon",
+      "query": {
+        "text": "falcon"
+      },
+      "relevant_ids": [
+        "adv-q-original",
+        "adv-q-reply"
+      ],
+      "graded": {
+        "adv-q-original": 3,
+        "adv-q-reply": 1
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "adv-q-original"
+        },
+        {
+          "type": "rank_above",
+          "higher": "adv-q-original",
+          "lower": "adv-q-reply"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "adv-signature-boilerplate-ops",
+      "capability": "field-body",
+      "description": "Signature/footer boilerplate must not drive relevance: a genuine 'Operations handover plan' email (term in subject + body) must outrank a signature-heavy mail whose only 'operations' occurrence is a 'VP Operations' signature title.",
+      "dsl": "operations",
+      "query": {
+        "text": "operations"
+      },
+      "relevant_ids": [
+        "adv-ops-genuine"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "adv-ops-genuine"
+        },
+        {
+          "type": "rank_above",
+          "higher": "adv-ops-genuine",
+          "lower": "adv-sig-heavy"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "adv-homonym-statement-scoped",
+      "capability": "folder-scope",
+      "description": "Homonym trap with hard scoping: a keyword-stuffed fashion 'make a statement' blast in Spam must never surface for a bank 'statement' query scoped to INBOX.",
+      "dsl": "statement in:INBOX",
+      "query": {
+        "text": "statement",
+        "in": [
+          "INBOX"
+        ]
+      },
+      "relevant_ids": [
+        "adv-statement-real"
+      ],
+      "must_not_return": [
+        "adv-statement-spam"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "adv-statement-real"
+        },
+        {
+          "type": "must_not_return",
+          "ids": [
+            "adv-statement-spam"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "adv-homonym-statement-unscoped",
+      "capability": "newsletter-downweight",
+      "description": "Unscoped homonym precision: with no folder scope, a genuine bank 'account statement' must rank above a keyword-stuffed 'make a statement' fashion blast. The blast is is_listish so it is down-weighted; a naive tf-idf engine ranks the spam first.",
+      "dsl": "statement",
+      "query": {
+        "text": "statement"
+      },
+      "relevant_ids": [
+        "adv-statement-real"
+      ],
+      "graded": {
+        "adv-statement-real": 3,
+        "adv-statement-spam": 0
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "adv-statement-real"
+        },
+        {
+          "type": "rank_above",
+          "higher": "adv-statement-real",
+          "lower": "adv-statement-spam"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "ranking-recency-vs-relevance-webinar",
+      "capability": "recency-prior",
+      "description": "Recency-vs-relevance tradeoff: an OLD keyword-stuffed marketing mail wins on raw tf-idf, but a NEWER, lightly-on-topic personal mail should rank first once the clamped 30-day recency prior is applied.",
+      "dsl": "webinar",
+      "query": {
+        "text": "webinar",
+        "sort": "relevance"
+      },
+      "relevant_ids": [
+        "ranking-webinar-new",
+        "ranking-webinar-old"
+      ],
+      "graded": {
+        "ranking-webinar-new": 3,
+        "ranking-webinar-old": 1
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "ranking-webinar-new"
+        },
+        {
+          "type": "rank_above",
+          "higher": "ranking-webinar-new",
+          "lower": "ranking-webinar-old"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "ranking-vip-human-beats-bulk-security",
+      "capability": "sender-importance",
+      "description": "VIP-human-vs-bulk on the same term. On an AMBIGUOUS 'security' query a keyword-stuffed newsletter out-scores a human's security request on raw tf-idf+recency, but the newsletter down-weight demotes it so the human mail ranks above the bulk one.",
+      "dsl": "security",
+      "query": {
+        "text": "security",
+        "sort": "relevance"
+      },
+      "relevant_ids": [
+        "ranking-sec-vip",
+        "ranking-sec-bulk"
+      ],
+      "graded": {
+        "ranking-sec-vip": 3,
+        "ranking-sec-bulk": 1
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "ranking-sec-vip"
+        },
+        {
+          "type": "rank_above",
+          "higher": "ranking-sec-vip",
+          "lower": "ranking-sec-bulk"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "ranking-vip-prior-needed-outage",
+      "capability": "sender-importance",
+      "description": "TRUE sender-importance gap: a FOLDER-SCOPED query (in:INBOX) disables the ambiguous-query newsletter down-weight, so an automated status-page outage blast out-scores a personal outage request. Ranking the human above the bot REQUIRES a VIP/contact-frequency prior the engine lacks.",
+      "dsl": "in:INBOX outage",
+      "query": {
+        "text": "outage",
+        "in": [
+          "INBOX"
+        ],
+        "sort": "relevance"
+      },
+      "relevant_ids": [
+        "ranking-outage-vip",
+        "ranking-outage-bulk"
+      ],
+      "graded": {
+        "ranking-outage-vip": 3,
+        "ranking-outage-bulk": 1
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "ranking-outage-vip"
+        },
+        {
+          "type": "rank_above",
+          "higher": "ranking-outage-vip",
+          "lower": "ranking-outage-bulk"
+        }
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "VIP / contact-frequency sender-importance prior (rank mail from humans you correspond with above automated/bulk senders even when newsletter-downweight is disabled by an explicit folder/flag scope)"
+    },
+    {
+      "id": "ranking-from-me-deprioritize-proposal",
+      "capability": "sender-importance",
+      "description": "From-me / Sent de-prioritization gap: on a 'proposal' query the engine ranks my own newer Sent follow-up just above the counterparty's inbound reply because it has no from-me penalty. A good email engine de-prioritizes self-authored Sent mail.",
+      "dsl": "proposal",
+      "query": {
+        "text": "proposal",
+        "sort": "relevance"
+      },
+      "relevant_ids": [
+        "ranking-prop-reply",
+        "ranking-prop-sentnew",
+        "m-sent"
+      ],
+      "graded": {
+        "ranking-prop-reply": 3,
+        "ranking-prop-sentnew": 1,
+        "m-sent": 1
+      },
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "ranking-prop-reply"
+        },
+        {
+          "type": "rank_above",
+          "higher": "ranking-prop-reply",
+          "lower": "ranking-prop-sentnew"
+        },
+        {
+          "type": "rank_above",
+          "higher": "ranking-prop-reply",
+          "lower": "m-sent"
+        }
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "from-me / Sent-folder de-prioritization prior (down-weight self-authored mail so an inbound counterparty reply outranks my own newer Sent follow-up)"
+    },
+    {
+      "id": "ranking-newsletter-downweight-scoped-off-security",
+      "capability": "newsletter-downweight",
+      "description": "Scoping trap / false-empty-avoidance: when the user EXPLICITLY scopes to unread (is:unread security), the newsletter is the only unread match and must still be returned. Down-weight is for ambiguous queries only.",
+      "dsl": "is:unread security",
+      "query": {
+        "text": "security",
+        "is": [
+          "unread"
+        ],
+        "sort": "relevance"
+      },
+      "relevant_ids": [
+        "ranking-sec-bulk"
+      ],
+      "graded": {
+        "ranking-sec-bulk": 3
+      },
+      "must_not_return": [
+        "ranking-sec-vip"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "ranking-sec-bulk"
+        },
+        {
+          "type": "must_not_return",
+          "ids": [
+            "ranking-sec-vip"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "operators-combined-flagged-attach-after",
+      "capability": "flag-state",
+      "description": "Combined operators: flagged invoices from billing@cloudhost with an attachment, in INBOX, after 2026-05-01. Must isolate the one flagged+attached+recent message and reject the same-sender near-misses.",
+      "dsl": "from:billing@cloudhost.com has:attachment is:flagged in:INBOX after:2026-05-01",
+      "query": {
+        "from": "billing@cloudhost.com",
+        "has": [
+          "attachment"
+        ],
+        "is": [
+          "flagged"
+        ],
+        "in": [
+          "INBOX"
+        ],
+        "after": "2026-05-01T00:00:00Z"
+      },
+      "relevant_ids": [
+        "operators-billing-flagged"
+      ],
+      "must_not_return": [
+        "operators-billing-unflagged",
+        "operators-billing-old",
+        "operators-billing-noattach",
+        "operators-spam-invoice",
+        "m-invoice"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "operators-billing-flagged"
+        },
+        {
+          "type": "must_not_return",
+          "ids": [
+            "operators-billing-unflagged",
+            "operators-billing-old",
+            "operators-billing-noattach",
+            "operators-spam-invoice",
+            "m-invoice"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "operators-folder-scope-inbox-not-spam",
+      "capability": "folder-scope",
+      "description": "Folder scoping trap: invoices restricted to INBOX must exclude the keyword-stuffed Spam copy from the same sender.",
+      "dsl": "invoice in:INBOX",
+      "query": {
+        "text": "invoice",
+        "in": [
+          "INBOX"
+        ]
+      },
+      "relevant_ids": [
+        "operators-billing-flagged",
+        "operators-billing-unflagged",
+        "operators-billing-old",
+        "operators-billing-noattach",
+        "m-invoice"
+      ],
+      "must_not_return": [
+        "operators-spam-invoice",
+        "operators-draft-report",
+        "operators-report-archive"
+      ],
+      "assertions": [
+        {
+          "type": "must_not_return",
+          "ids": [
+            "operators-spam-invoice"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "operators-size-larger-boundary",
+      "capability": "size",
+      "description": "Strict size boundary: larger:50000 with attachments. The message sized exactly 50000 must be excluded (strict >); only the 50001-byte message qualifies. Tests off-by-one handling.",
+      "dsl": "has:attachment larger:50000",
+      "query": {
+        "has": [
+          "attachment"
+        ],
+        "larger": 50000
+      },
+      "relevant_ids": [
+        "operators-multiattach-large",
+        "m-contract"
+      ],
+      "must_not_return": [
+        "operators-multiattach-boundary",
+        "m-invoice"
+      ],
+      "assertions": [
+        {
+          "type": "must_not_return",
+          "ids": [
+            "operators-multiattach-boundary"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "operators-filename-xlsx-glob",
+      "capability": "filename",
+      "description": "Filename glob over multi-attachment messages: *.xlsx must match messages whose spreadsheet attachment ends in .xlsx while ignoring .pptx-only or .pdf attachments. Confirms per-attachment matching.",
+      "dsl": "filename:*.xlsx",
+      "query": {
+        "filename": "*.xlsx"
+      },
+      "relevant_ids": [
+        "operators-multiattach-boundary",
+        "operators-multiattach-large"
+      ],
+      "must_not_return": [
+        "m-invoice",
+        "m-contract",
+        "operators-billing-flagged"
+      ],
+      "assertions": [
+        {
+          "type": "must_not_return",
+          "ids": [
+            "m-invoice",
+            "m-contract"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "operators-date-boundary-after-inclusive",
+      "capability": "date-range",
+      "description": "Date boundary inclusivity: after:2026-05-25T09:00:00Z is inclusive of the message at exactly that timestamp, while the invoice from before is excluded.",
+      "dsl": "invoice from:billing after:2026-05-25T09:00:00Z",
+      "query": {
+        "from": "billing",
+        "text": "invoice",
+        "after": "2026-05-25T09:00:00Z"
+      },
+      "relevant_ids": [
+        "operators-billing-flagged",
+        "operators-billing-unflagged",
+        "operators-billing-noattach"
+      ],
+      "must_not_return": [
+        "operators-billing-old",
+        "m-invoice"
+      ],
+      "assertions": [
+        {
+          "type": "must_not_return",
+          "ids": [
+            "operators-billing-old",
+            "m-invoice"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "operators-folder-union-archive-drafts",
+      "capability": "folder-scope",
+      "description": "Multi-folder scoping: report mail across Archive OR Drafts only. Confirms folder OR-union and that INBOX/Spam report copies are excluded by scope.",
+      "dsl": "report in:Archive in:Drafts",
+      "query": {
+        "text": "report",
+        "in": [
+          "Archive",
+          "Drafts"
+        ]
+      },
+      "relevant_ids": [
+        "operators-report-archive",
+        "operators-draft-report"
+      ],
+      "must_not_return": [
+        "operators-report-inbox",
+        "m-news"
+      ],
+      "assertions": [
+        {
+          "type": "must_not_return",
+          "ids": [
+            "operators-report-inbox",
+            "m-news"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-typo-schroeder",
+      "capability": "fuzzy-typo",
+      "description": "Transliterated/misspelled accented surname: query 'schroeder' (oe for o-umlaut) must recover Jeremy Schroder (unaccented). Edit distance 1; a naive engine returns empty.",
+      "dsl": "schroeder",
+      "query": {
+        "text": "schroeder"
+      },
+      "relevant_ids": [
+        "fuzzy-m-jeremy"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "fuzzy-m-jeremy"
+        }
+      ],
+      "tier": "fuzzy",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-unaccent-munich",
+      "capability": "unicode-accent",
+      "description": "German umlaut transliteration: query 'muenchen' (ue for u-umlaut) must find Muenchen/Munchen. Subject/body unaccents to 'munchen', so fuzzy (edit distance 1) bridges the ue->u gap. Exercises unaccent + fuzzy together.",
+      "dsl": "muenchen",
+      "query": {
+        "text": "muenchen"
+      },
+      "relevant_ids": [
+        "fuzzy-m-munchen"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "fuzzy-m-munchen"
+        }
+      ],
+      "tier": "fuzzy",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-identifier-tracking",
+      "capability": "identifier-exact",
+      "description": "Exact carrier tracking number. The mixed alphanumeric '1Z999AA10123456784' tokenizes to one distinctive token; only the shipping mail contains it.",
+      "dsl": "1Z999AA10123456784",
+      "query": {
+        "text": "1Z999AA10123456784"
+      },
+      "relevant_ids": [
+        "fuzzy-m-jeremy"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "fuzzy-m-jeremy"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-identifier-order-quoted",
+      "capability": "identifier-exact",
+      "description": "Order identifier ORD-77310 appears in the original support mail (subject + body) and ONLY in the quoted reply history of the reply. Searching the id must surface the original and NOT the reply.",
+      "dsl": "ORD-77310",
+      "query": {
+        "text": "ORD-77310"
+      },
+      "relevant_ids": [
+        "fuzzy-m-order-orig"
+      ],
+      "must_not_return": [
+        "fuzzy-m-order-reply"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "fuzzy-m-order-orig"
+        },
+        {
+          "type": "must_not_return",
+          "ids": [
+            "fuzzy-m-order-reply"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-from-email-address",
+      "capability": "field-from",
+      "description": "Email-address matching: filtering by the full sender address (incl. an uncommon ccTLD) returns exactly the messages from that mailbox. Free-text on the address would be polluted by the common 'de' token; the structured from-field is correct.",
+      "dsl": "from:jeremy.schroder@parcelship.de",
+      "query": {
+        "from": "jeremy.schroder@parcelship.de"
+      },
+      "relevant_ids": [
+        "fuzzy-m-jeremy"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "fuzzy-m-jeremy"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-false-empty-traking",
+      "capability": "false-empty-avoidance",
+      "description": "Misspelled-but-real query must not return empty: 'traking' (edit distance 1 from 'tracking' in the shipping mail) must still retrieve it. A baseline lexical engine returns empty; the fuzzy engine recovers it.",
+      "dsl": "traking",
+      "query": {
+        "text": "traking"
+      },
+      "relevant_ids": [
+        "fuzzy-m-jeremy"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "fuzzy-m-jeremy"
+        }
+      ],
+      "tier": "fuzzy",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "fuzzy-semantic-vencimiento",
+      "capability": "semantic-paraphrase",
+      "description": "Spanish lemmatization: query 'vencimiento' should find the invoice whose body says facturas 'vencen el dia quince'. The shared lemma is unreachable by fuzzy (edit distance 5); needs Spanish stemming.",
+      "dsl": "vencimiento",
+      "query": {
+        "text": "vencimiento"
+      },
+      "relevant_ids": [
+        "fuzzy-m-factura"
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "language-aware (Spanish) lemmatization / stemming so 'vencimiento' matches the inflected 'vencen'"
+    },
+    {
+      "id": "threading-collapse-refund-thread",
+      "capability": "thread-collapse",
+      "description": "Thread-granularity over the multi-message reimbursement thread returns exactly one hit, and the representative is the highest-scoring message (the original request). A naive engine picks the latest reply.",
+      "dsl": "reimbursement account:acct-1 (thread view)",
+      "query": {
+        "text": "reimbursement",
+        "accounts": [
+          "acct-1"
+        ],
+        "granularity": "thread"
+      },
+      "relevant_ids": [
+        "threading-refund-1"
+      ],
+      "assertions": [
+        {
+          "type": "thread_collapsed"
+        },
+        {
+          "type": "top_is",
+          "id": "threading-refund-1"
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "threading-granularity-message-vs-thread",
+      "capability": "thread-collapse",
+      "description": "Reply-chain granularity: the SAME query at message granularity surfaces all three members of the reimbursement thread. Asserts the engine does NOT collapse when message granularity is requested.",
+      "dsl": "reimbursement account:acct-1 (message view)",
+      "query": {
+        "text": "reimbursement",
+        "accounts": [
+          "acct-1"
+        ],
+        "granularity": "message"
+      },
+      "relevant_ids": [
+        "threading-refund-1",
+        "threading-refund-2",
+        "threading-refund-3"
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "threading-latest-in-refund",
+      "capability": "thread-collapse",
+      "description": "Latest-in-thread: scoping to thread thr-refund and sorting by recency must order the three messages newest-first.",
+      "dsl": "thread:thr-refund sort:recent",
+      "query": {
+        "thread": "thr-refund",
+        "sort": "recent"
+      },
+      "relevant_ids": [
+        "threading-refund-1",
+        "threading-refund-2",
+        "threading-refund-3"
+      ],
+      "assertions": [
+        {
+          "type": "recency_order",
+          "ids": [
+            "threading-refund-3",
+            "threading-refund-2",
+            "threading-refund-1"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "threading-quoted-exclusion-refund-reply",
+      "capability": "quoted-exclusion",
+      "description": "Trap: the phrase 'original card' appears as PERSONAL text in the original request and as QUOTED history in the reply. The phrase must surface the original and NOT the reply that merely quotes it.",
+      "dsl": "\"original card\"",
+      "query": {
+        "phrase": "original card"
+      },
+      "relevant_ids": [
+        "threading-refund-1"
+      ],
+      "must_not_return": [
+        "threading-refund-2"
+      ],
+      "assertions": [
+        {
+          "type": "top_is",
+          "id": "threading-refund-1"
+        },
+        {
+          "type": "must_not_return",
+          "ids": [
+            "threading-refund-2"
+          ]
+        }
+      ],
+      "tier": "lexical",
+      "requires_engine_improvement": null
+    },
+    {
+      "id": "threading-semantic-refund-recall",
+      "capability": "semantic-paraphrase",
+      "description": "Semantic-paraphrase: query 'refund' when no message literally says 'refund' (bodies say reimbursement / credit). Must recall the whole reimbursement thread. A naive lexical engine returns empty.",
+      "dsl": "refund account:acct-1",
+      "query": {
+        "text": "refund",
+        "accounts": [
+          "acct-1"
+        ]
+      },
+      "relevant_ids": [
+        "threading-refund-1",
+        "threading-refund-2",
+        "threading-refund-3"
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "vector/semantic recall (refund~reimbursement/credit)"
+    },
+    {
+      "id": "threading-semantic-hotel-reservation",
+      "capability": "semantic-paraphrase",
+      "description": "Semantic-paraphrase: 'hotel' must retrieve the reservation/booking thread (no message literally contains 'hotel'). A naive lexical engine returns empty.",
+      "dsl": "hotel account:acct-1",
+      "query": {
+        "text": "hotel",
+        "accounts": [
+          "acct-1"
+        ]
+      },
+      "relevant_ids": [
+        "threading-hotel-1",
+        "threading-hotel-2"
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "vector/semantic recall (hotel~reservation/booking)"
+    },
+    {
+      "id": "threading-semantic-contract-agreement-collapse",
+      "capability": "semantic-paraphrase",
+      "description": "Semantic-paraphrase + collapse: 'contract' (synonym of agreement/msa) collapses the master-agreement thread to a single representative at thread granularity. A naive engine returns empty.",
+      "dsl": "contract account:acct-2 (thread view)",
+      "query": {
+        "text": "contract",
+        "accounts": [
+          "acct-2"
+        ],
+        "granularity": "thread"
+      },
+      "relevant_ids": [
+        "threading-msa-1"
+      ],
+      "assertions": [
+        {
+          "type": "thread_collapsed"
+        }
+      ],
+      "tier": "semantic",
+      "requires_engine_improvement": "vector/semantic recall (contract~agreement/msa)"
     }
   ]
 }
