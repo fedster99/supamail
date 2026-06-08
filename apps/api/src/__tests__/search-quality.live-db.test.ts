@@ -52,6 +52,17 @@ liveDb("search quality gate", () => {
     expect(category("lexical").metrics.ndcg_at_10).toBeGreaterThanOrEqual(0.8);
   });
 
+  it("groups conversations and demotes bulk (email-intent)", () => {
+    const ei = category("email-intent");
+    // Thread grouping: no conversation appears as duplicate hits.
+    expect(ei.distinct_thread_ratio).toBeCloseTo(1, 5);
+    expect(ei.metrics.ndcg_at_10).toBeGreaterThanOrEqual(0.95);
+    // Bulk demotion + grouping: the expected human / canonical result leads.
+    for (const q of scorecard.queries.filter((x) => x.category === "email-intent")) {
+      expect(q.top_first_ok, `${q.id} top_first`).not.toBe(false);
+    }
+  });
+
   it("does not regress the headline below the recorded baseline", () => {
     // Baseline 2026-06-07: nDCG@10 0.692, recall@10 0.685. Gate a little under.
     expect(scorecard.headline.ndcg_at_10).toBeGreaterThanOrEqual(0.6);

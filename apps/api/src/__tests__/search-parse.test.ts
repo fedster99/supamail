@@ -19,7 +19,8 @@ const baseCompileOptions: CompileOptions = {
   limit: 25,
   offset: 0,
   snippet: true,
-  includeBody: false
+  includeBody: false,
+  groupByThread: true
 };
 
 describe("tokenize", () => {

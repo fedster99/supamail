@@ -19,6 +19,7 @@ interface ResultRow {
   window_status: WindowStatus;
   internal_date: Date;
   provider_thread_id: string | null;
+  thread_count: number | null;
   body_fetched_at: Date | null;
   text_rel: number | string | null;
   recency: number | string | null;
@@ -72,7 +73,7 @@ function mapRow(row: ResultRow, explain: boolean): SearchResult {
           final: score
         }
       : null,
-    thread: { provider_thread_id: row.provider_thread_id },
+    thread: { provider_thread_id: row.provider_thread_id, message_count: row.thread_count ?? 1 },
     attachments: { count: row.attachment_count ?? 0 },
     body: row.body ?? null
   };
@@ -141,7 +142,8 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
         limit,
         offset,
         snippet: request.snippet ?? true,
-        includeBody: request.includeBody ?? false
+        includeBody: request.includeBody ?? false,
+        groupByThread: request.groupByThread ?? true
       });
       const result = await client.query<ResultRow>(compiled.text, compiled.values);
       rows = result.rows;

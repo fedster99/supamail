@@ -72,7 +72,10 @@ function printScorecard(scorecard: Scorecard): void {
   console.error(line);
   console.error("BY CATEGORY");
   for (const category of scorecard.by_category) {
-    console.error("  " + metricRow(`${category.category} (${category.query_count})`, category.metrics));
+    console.error(
+      "  " + metricRow(`${category.category} (${category.query_count})`, category.metrics) +
+      `  threads ${pct(category.distinct_thread_ratio)}`
+    );
   }
   console.error(line);
   console.error("WEAK QUERIES (recall@10 < 100%)");

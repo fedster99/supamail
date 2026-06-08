@@ -27,9 +27,20 @@ export interface EvalMessage {
   attachments: EvalAttachment[];
   /** Explicit size; defaults to the body length when omitted. */
   sizeBytes?: number;
+  /** Conversation id shared by every message in a thread (null = standalone). */
+  providerThreadId: string | null;
+  /** Parsed headers; list-id / list-unsubscribe here mark a message as bulk. */
+  headersJson: Record<string, unknown>;
 }
 
-export type QueryCategory = "lexical" | "ranking" | "operator" | "phrase" | "typo" | "semantic";
+export type QueryCategory =
+  | "lexical"
+  | "ranking"
+  | "operator"
+  | "phrase"
+  | "typo"
+  | "semantic"
+  | "email-intent";
 
 export interface EvalQuery {
   id: string;
@@ -52,9 +63,14 @@ function m(message: Partial<EvalMessage> & Pick<EvalMessage, "id" | "subject" | 
     toEmails: ["me@example.test"],
     flags: SEEN,
     attachments: [],
+    providerThreadId: null,
+    headersJson: {},
     ...message
   };
 }
+
+/** Headers that mark a message as a bulk mailing-list send (RFC 2369/2919). */
+const LIST_HEADERS = { "list-id": "bulk", "list-unsubscribe": "<mailto:unsub@example.test>" };
 
 export const messages: EvalMessage[] = [
   // --- Invoices / billing (from billing@acme.com) ---
@@ -114,10 +130,10 @@ export const messages: EvalMessage[] = [
       body: "Attaching the new logo assets for the brand refresh.",
       attachments: [{ filename: "logo.png", mimeType: "image/png" }, { filename: "logo-dark.png", mimeType: "image/png" }] }),
 
-  // --- Newsletters (bulk distractors) ---
-  m({ id: "news-1", subject: "Tech Weekly: 10 tools you need", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 2,
+  // --- Newsletters (bulk; carry list headers so the ranker can demote them) ---
+  m({ id: "news-1", subject: "Tech Weekly: 10 tools you need", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 2, headersJson: LIST_HEADERS,
       body: "This week's roundup of developer tools. Unsubscribe at the bottom of this email." }),
-  m({ id: "news-2", subject: "Tech Weekly: the AI edition", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 9,
+  m({ id: "news-2", subject: "Tech Weekly: the AI edition", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 9, headersJson: LIST_HEADERS,
       body: "Everything about artificial intelligence this week. Unsubscribe link below." }),
 
   // --- Recruiting (from talent@workable.com) ---
@@ -134,7 +150,27 @@ export const messages: EvalMessage[] = [
   // --- Large message ---
   m({ id: "big-1", subject: "Huge dataset export", fromEmail: "exports@data.io", fromName: "Data Exports", ageDays: 10,
       body: "Attached is the full dataset export you requested.",
-      attachments: [{ filename: "export.csv", mimeType: "text/csv" }], sizeBytes: 6_000_000 })
+      attachments: [{ filename: "export.csv", mimeType: "text/csv" }], sizeBytes: 6_000_000 }),
+
+  // --- A real conversation: one thread, 4 quoted replies. The phrase "budget
+  //     proposal" repeats down the quoted bodies, which inflates keyword matches
+  //     and produces near-duplicate hits unless results are grouped by thread. ---
+  m({ id: "thr-1", subject: "Q2 budget proposal", fromEmail: "pm@projecthub.io", fromName: "Priya", ageDays: 6, providerThreadId: "thread-budget",
+      body: "Here is the Q2 budget proposal for review. Let me know your thoughts." }),
+  m({ id: "thr-2", subject: "Re: Q2 budget proposal", fromEmail: "sarah@contractor.com", fromName: "Sarah", ageDays: 5, providerThreadId: "thread-budget",
+      body: "Thanks for the Q2 budget proposal. I have a couple of questions.\n> Here is the Q2 budget proposal for review. Let me know your thoughts." }),
+  m({ id: "thr-3", subject: "Re: Q2 budget proposal", fromEmail: "pm@projecthub.io", fromName: "Priya", ageDays: 4, providerThreadId: "thread-budget",
+      body: "Good questions on the budget proposal. Answers inline.\n> Thanks for the Q2 budget proposal. I have a couple of questions.\n>> Here is the Q2 budget proposal for review." }),
+  m({ id: "thr-4", subject: "Re: Q2 budget proposal", fromEmail: "sarah@contractor.com", fromName: "Sarah", ageDays: 3, providerThreadId: "thread-budget",
+      body: "The Q2 budget proposal looks good to me now. Approved.\n> Good questions on the budget proposal. Answers inline.\n>> Thanks for the Q2 budget proposal." }),
+
+  // --- Human-vs-bulk: a person's question and a newsletter both about "tools".
+  //     The newsletter is keyword-richer and more recent, so it out-ranks the
+  //     human mail until the ranker demotes bulk. ---
+  m({ id: "hum-tools", subject: "question about our tooling", fromEmail: "dave@projecthub.io", fromName: "Dave", ageDays: 1,
+      body: "Quick question — which of our internal tools should I use for the report?" }),
+  m({ id: "news-tools", subject: "The 15 best developer tools this week", fromEmail: "newsletter@devtools.io", fromName: "DevTools Digest", ageDays: 0, headersJson: LIST_HEADERS,
+      body: "Our roundup of the best developer tools and productivity tools. Unsubscribe anytime." })
 ];
 
 const byId = new Map(messages.map((msg) => [msg.id, msg]));
@@ -184,7 +220,20 @@ export const queries: EvalQuery[] = [
   { id: "S1", category: "semantic", q: "vacation", relevant: ["trav-1", "trav-2"], note: "no 'vacation' token in travel mail" },
   { id: "S2", category: "semantic", q: "hiring", relevant: ["rec-1", "rec-2"], note: "no 'hiring' token in recruiting mail" },
   { id: "S3", category: "semantic", q: "breach", relevant: ["sec-1"], note: "no 'breach' token in the security alert" },
-  { id: "S4", category: "semantic", q: "expense", relevant: ["inv-1", "inv-2", "inv-4"], note: "no 'expense' token in billing mail" }
+  { id: "S4", category: "semantic", q: "expense", relevant: ["inv-1", "inv-2", "inv-4"], note: "no 'expense' token in billing mail" },
+
+  // --- Email intent: the things that make email search EMAIL search. Ground
+  //     truth is conversation-level (the canonical / latest message of a thread),
+  //     so recall stays meaningful under grouping; the duplicate-collapse benefit
+  //     shows up in the scorecard's distinct_thread_ratio. ---
+  { id: "EI1", category: "email-intent", q: "budget proposal", relevant: ["thr-4"], topFirst: "thr-4",
+    note: "one conversation; should return one grouped result, not 4 quoted-reply dupes" },
+  { id: "EI2", category: "email-intent", q: "tools", relevant: ["hum-tools"], topFirst: "hum-tools",
+    note: "the human question should outrank the keyword-rich, more-recent newsletter" },
+  { id: "EI3", category: "email-intent", q: "sarah", relevant: ["meet-2", "thr-4"],
+    note: "people-centric: mail from Sarah, conversation-deduplicated" },
+  { id: "EI4", category: "email-intent", q: "unsubscribe", relevant: ["news-1", "news-2", "news-tools"],
+    note: "reverse-bulk guardrail: demoted newsletters must still be findable when sought" }
 ];
 
 export function messageById(id: string): EvalMessage | undefined {

@@ -12,6 +12,9 @@ export interface QueryScore {
   metrics: QueryMetrics;
   /** null when the query has no topFirst expectation. */
   top_first_ok: boolean | null;
+  /** Distinct conversations / results in the top 10. 1.0 = no duplicate-thread
+   *  hits; lower means the same conversation appears multiple times. */
+  distinct_thread_ratio: number;
   /** Relevant synthetic ids that did not make the top 10. */
   missing: string[];
 }
@@ -20,6 +23,7 @@ export interface CategoryScore {
   category: QueryCategory;
   query_count: number;
   metrics: QueryMetrics;
+  distinct_thread_ratio: number;
 }
 
 export interface Scorecard {
@@ -68,10 +72,11 @@ export async function evaluateSearch(pool: PgPool, options: EvaluateOptions = {}
         `INSERT INTO public.imap_messages (
            account_id, folder_path, uidvalidity, uid, internal_date,
            subject, from_email, from_name, to_emails, flags,
+           provider_thread_id, headers_json,
            deleted_in_provider, window_status, size_bytes
          )
          VALUES ($1, $2, $3, $4, now() - ($5 * interval '1 day'),
-           $6, $7, $8, $9, $10, false, 'IN_WINDOW', $11)
+           $6, $7, $8, $9, $10, $11, $12, false, 'IN_WINDOW', $13)
          RETURNING id`,
         [
           accountId,
@@ -84,6 +89,8 @@ export async function evaluateSearch(pool: PgPool, options: EvaluateOptions = {}
           message.fromName,
           message.toEmails,
           message.flags,
+          message.providerThreadId,
+          JSON.stringify(message.headersJson),
           message.sizeBytes ?? message.body.length
         ]
       );
@@ -131,6 +138,10 @@ export async function evaluateSearch(pool: PgPool, options: EvaluateOptions = {}
       const missing = query.relevant.filter((sid) => !top10.has(resolve(sid)));
       const topFirstOk = query.topFirst ? resultUuids[0] === resolve(query.topFirst) : null;
 
+      const topResults = response.results.slice(0, 10);
+      const threadKeys = new Set(topResults.map((r) => r.thread.provider_thread_id ?? r.identity.id));
+      const distinctThreadRatio = topResults.length === 0 ? 1 : threadKeys.size / topResults.length;
+
       perQuery.push({
         id: query.id,
         category: query.category,
@@ -139,6 +150,7 @@ export async function evaluateSearch(pool: PgPool, options: EvaluateOptions = {}
         returned_count: resultUuids.length,
         metrics,
         top_first_ok: topFirstOk,
+        distinct_thread_ratio: distinctThreadRatio,
         missing
       });
     }
@@ -150,7 +162,9 @@ export async function evaluateSearch(pool: PgPool, options: EvaluateOptions = {}
       return {
         category,
         query_count: subset.length,
-        metrics: meanMetrics(subset.map((s) => s.metrics))
+        metrics: meanMetrics(subset.map((s) => s.metrics)),
+        distinct_thread_ratio:
+          subset.length === 0 ? 1 : subset.reduce((sum, s) => sum + s.distinct_thread_ratio, 0) / subset.length
       };
     });
 

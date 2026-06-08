@@ -58,7 +58,42 @@ is two categories that score a flat **zero**:
 
 Both are dragging the headline down by ~27 points, and both are fixable.
 
+## Is this good search, or good *email* search?
+
+Generic IR metrics can be high while the search is still bad at *email*, because
+they don't measure what makes email search special: conversations as the unit,
+and human mail outranking bulk. So the harness gained an **email-intent** category
+(now 32 queries over 31 messages, including a 4-message quoted-reply thread and a
+human-vs-newsletter pair) plus a **`distinct_thread_ratio`** metric — distinct
+conversations / results in the top 10 (1.0 = no duplicate-thread hits).
+
+It immediately exposed two email-specific failures the generic metrics missed:
+
+- **Conversations weren't grouped.** "budget proposal" returned all 4 quoted
+  replies of one thread → `distinct_thread_ratio` 0.25.
+- **Bulk wasn't demoted.** "tools" ranked a keyword-rich, recent newsletter above
+  a person's actual question (EI2 ranking miss).
+
+**Shipped (this layer):**
+
+- **Thread grouping** (`groupByThread`, default on): the ranker collapses each
+  conversation (`coalesce(provider_thread_id, id)`) to its single best message via
+  `DISTINCT ON`, and reports `thread.message_count`. Set `groupByThread: false`
+  for raw messages.
+- **Bulk demotion**: a `list-id` / `list-unsubscribe` (RFC 2369/2919) or bulk-sender
+  signal multiplies the email prior down (`-0.7`, clamped), so newsletters sink
+  below human correspondence — but stay fully retrievable (`unsubscribe` still
+  finds them).
+
+**Result — email-intent category, before → after:** nDCG@10 0.91 → **1.00**,
+MRR 0.875 → **1.00**, `distinct_thread_ratio` **0.73 → 1.00**, EI2 ranking miss
+fixed. **Zero regression** in operator / ranking / phrase / lexical. Locked in by
+the quality gate.
+
 ## The goal
+
+The email-intelligence layer above is shipped. The remaining headline gap is the
+two generic categories still at zero:
 
 > **Raise headline nDCG@10 from 0.69 to ≥ 0.90 and Recall@10 from 0.69 to ≥ 0.90
 > by closing the two zero-scoring categories — with zero regression in the four
@@ -76,6 +111,12 @@ Concrete, independently measurable targets (re-run `eval:search` after each):
 | **Overall** | **nDCG@10** | **0.69** | **≥ 0.90** |
 
 ## Roadmap
+
+### Phase 0 — Email intelligence (shipped ✓)
+Thread grouping + bulk demotion (see the section above). email-intent category to
+1.00, `distinct_thread_ratio` to 1.00, no regression. Next email-specific wins:
+correspondence weighting (rank people you actually reply to), quoted-reply /
+signature stripping before indexing, and sent/needs-reply intent.
 
 ### Phase 1 — Tier 1.5: trigram fuzzy fallback (pure Postgres, no new deps)
 Add a trigram retrieval branch to the **free-text** path: when a term yields few or
@@ -96,8 +137,8 @@ populated, per-account flag); absent it, search is unchanged.
 ### Phase 3 — Ranking & corpus depth
 - Soften multi-term free text from strict AND to "AND-preferred, OR-fallback" so
   `candidate interview` also surfaces strong single-term hits (the L7 miss).
-- Add email-signal ranking polish (sender importance, thread grouping) and grade
-  the judgments (3/2/1) for sharper nDCG.
+- Add email-signal ranking polish (sender importance / correspondence weighting)
+  and grade the judgments (3/2/1) for sharper nDCG.
 - Grow the corpus toward real anonymized mail; add per-query latency to the
   scorecard and a latency budget to the gate; track the headline over time.
 

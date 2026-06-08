@@ -96,6 +96,12 @@ export interface SearchRequest {
   includeBody?: boolean;
   explain?: boolean;
   /**
+   * Collapse each conversation to its single best message. Defaults to true —
+   * email search returns conversations, not duplicate quoted-reply hits. Set
+   * false to get every individual message.
+   */
+  groupByThread?: boolean;
+  /**
    * Opt in to the semantic (Tier 2) retrieval branch. No-op today — the pure
    * core ships without an embedding model — so this is accepted and ignored
    * until the gated pgvector tier lands. Declared here to match the MCP/CLI
@@ -131,7 +137,9 @@ export interface SearchResult {
   snippet: string | null;
   score: number;
   score_breakdown: ScoreBreakdown | null;
-  thread: { provider_thread_id: string | null };
+  /** The conversation this result represents; message_count is how many of its
+   *  messages matched (the collapsed duplicates when grouped by thread). */
+  thread: { provider_thread_id: string | null; message_count: number };
   attachments: { count: number };
   body: string | null;
 }

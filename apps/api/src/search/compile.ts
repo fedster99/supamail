@@ -22,6 +22,8 @@ export interface CompileOptions {
   offset: number;
   snippet: boolean;
   includeBody: boolean;
+  /** Collapse each conversation to its single best message (email-search default). */
+  groupByThread: boolean;
 }
 
 export interface CompiledQuery {
@@ -241,12 +243,31 @@ export function compileSearch(
     ? "coalesce(b2.body_text, b2.body_plain, b2.selected_text_part)"
     : "NULL";
 
+  // Bulk / mailing-list signal: RFC 2369/2919 list headers, or a clear bulk
+  // sender. Used to demote newsletters below human correspondence (but never to
+  // hide them — they remain fully retrievable).
+  const isListish =
+    `(jsonb_exists(m.headers_json, 'list-unsubscribe') ` +
+    `OR jsonb_exists(m.headers_json, 'list-id') ` +
+    `OR lower(coalesce(m.from_email,'')) ~ '^(newsletter|marketing|mailer)@')`;
+
+  const groupedCte = opts.groupByThread
+    ? `,
+grouped AS (
+  SELECT DISTINCT ON (r.thread_key) r.*
+  FROM ranked r
+  ORDER BY r.thread_key, r.score DESC, r.internal_date DESC, r.id DESC
+)`
+    : "";
+  const pageSource = opts.groupByThread ? "grouped" : "ranked";
+
   const text = `
 WITH cand AS (
   SELECT
     m.id, m.account_id, m.folder_path, m.uidvalidity, m.uid,
     m.subject, m.from_email, m.from_name, m.to_emails, m.flags,
     m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
+    ${isListish} AS is_listish,
     ${lexHeader} AS lex_header,
     ${lexBody} AS lex_body
   FROM public.imap_messages m
@@ -261,19 +282,28 @@ scored AS (
     greatest(0.2, least(4.0, 1
       + 0.5 * (CASE WHEN coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Flagged']::text[] THEN 1 ELSE 0 END)
       + 0.3 * (CASE WHEN NOT (coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Seen']::text[]) THEN 1 ELSE 0 END)
-    )) AS email_prior
+      - 0.7 * (CASE WHEN c.is_listish THEN 1 ELSE 0 END)
+    )) AS email_prior,
+    count(*) OVER (PARTITION BY coalesce(c.provider_thread_id, c.id::text))::int AS thread_count
   FROM cand c
 ),
-page AS (
-  SELECT s.*, (s.text_rel * s.recency * s.email_prior) AS score
+ranked AS (
+  SELECT
+    s.*,
+    (s.text_rel * s.recency * s.email_prior) AS score,
+    coalesce(s.provider_thread_id, s.id::text) AS thread_key
   FROM scored s
-  ORDER BY ${orderClause(opts.sort, hasText, "s")}
+)${groupedCte},
+page AS (
+  SELECT * FROM ${pageSource} p
+  ORDER BY ${orderClause(opts.sort, hasText, "p")}
   LIMIT ${limitParam} OFFSET ${offsetParam}
 )
 SELECT
   page.id, page.account_id, page.folder_path, page.uidvalidity, page.uid,
   page.subject, page.from_email, page.from_name, page.to_emails, page.flags,
   page.window_status, page.internal_date, page.provider_thread_id, page.body_fetched_at,
+  page.thread_count::int AS thread_count,
   page.text_rel::float8 AS text_rel, page.recency::float8 AS recency,
   page.email_prior::float8 AS email_prior, page.score::float8 AS score,
   (SELECT count(*) FROM public.imap_attachments a

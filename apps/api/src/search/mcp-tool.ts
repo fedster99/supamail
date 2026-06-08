@@ -47,7 +47,9 @@ export const searchRequestSchema = z
     offset: z.number().int().min(0).optional(),
     snippet: z.boolean().optional(),
     includeBody: z.boolean().optional(),
-    explain: z.boolean().optional()
+    explain: z.boolean().optional(),
+    groupByThread: z.boolean().optional(),
+    semantic: z.boolean().optional()
   })
   .strict()
   .refine((value) => value.q !== undefined || value.filters !== undefined, {
@@ -102,7 +104,9 @@ export const searchEmailToolDefinition = {
       offset: { type: "integer", minimum: 0, default: 0 },
       snippet: { type: "boolean", default: true },
       includeBody: { type: "boolean", default: false },
-      explain: { type: "boolean", default: false }
+      explain: { type: "boolean", default: false },
+      groupByThread: { type: "boolean", default: true, description: "Collapse each conversation to its best message." },
+      semantic: { type: "boolean", default: false, description: "Opt in to the semantic tier (no-op until it ships)." }
     }
   }
 } as const;
