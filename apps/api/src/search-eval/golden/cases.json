@@ -1,0 +1,217 @@
+{
+  "_comment": "Golden email-search eval cases. Each is tagged with the email-search capability it exercises so the scorecard breaks down per capability — this is what makes it an EMAIL-search eval, not a generic text-search eval. tier: lexical|fuzzy are CI-gated; semantic is tracked-but-not-gated (the production Tier-2 vector arm is what satisfies it).",
+  "cases": [
+    {
+      "id": "field-from-wanda",
+      "capability": "field-from",
+      "description": "Sender-scoped: emails from Wanda Cole",
+      "dsl": "from:wanda",
+      "query": { "from": "wanda" },
+      "relevant_ids": ["m-budget-1", "m-budget-3"]
+    },
+    {
+      "id": "field-to-client",
+      "capability": "field-to",
+      "description": "Recipient-scoped: emails to client@biz.com",
+      "dsl": "to:client@biz.com",
+      "query": { "to": "client@biz.com" },
+      "relevant_ids": ["m-sent"]
+    },
+    {
+      "id": "field-subject-itinerary",
+      "capability": "field-subject",
+      "description": "Subject-scoped term",
+      "dsl": "subject:itinerary",
+      "query": { "subject": "itinerary" },
+      "relevant_ids": ["m-flight"]
+    },
+    {
+      "id": "field-body-savings",
+      "capability": "field-body",
+      "description": "Body-scoped term not present in any subject",
+      "dsl": "body:savings",
+      "query": { "body": "savings" },
+      "relevant_ids": ["m-news"]
+    },
+    {
+      "id": "flag-unread-roadmap",
+      "capability": "flag-state",
+      "description": "Unread mail about the roadmap",
+      "dsl": "is:unread roadmap",
+      "query": { "is": ["unread"], "text": "roadmap" },
+      "relevant_ids": ["m-meeting"]
+    },
+    {
+      "id": "folder-sent-proposal",
+      "capability": "folder-scope",
+      "description": "Restrict to the Sent folder",
+      "dsl": "in:Sent proposal",
+      "query": { "in": ["Sent"], "text": "proposal" },
+      "relevant_ids": ["m-sent"]
+    },
+    {
+      "id": "has-attachment",
+      "capability": "attachment",
+      "description": "All mail with attachments",
+      "dsl": "has:attachment",
+      "query": { "has": ["attachment"] },
+      "relevant_ids": ["m-invoice", "m-contract"]
+    },
+    {
+      "id": "filename-pdf",
+      "capability": "filename",
+      "description": "Attachments matching a filename glob",
+      "dsl": "filename:*.pdf",
+      "query": { "filename": "*.pdf" },
+      "relevant_ids": ["m-invoice", "m-contract"]
+    },
+    {
+      "id": "date-after-standup",
+      "capability": "date-range",
+      "description": "Standup notes after May 1 (April one must not match)",
+      "dsl": "standup after:2026-05-01",
+      "query": { "text": "standup", "after": "2026-05-01T00:00:00Z" },
+      "relevant_ids": ["m-standup-may"],
+      "must_not_return": ["m-standup-apr"]
+    },
+    {
+      "id": "size-larger-with-attachment",
+      "capability": "size",
+      "description": "Large messages with attachments",
+      "dsl": "has:attachment larger:30000",
+      "query": { "has": ["attachment"], "larger": 30000 },
+      "relevant_ids": ["m-contract"],
+      "must_not_return": ["m-invoice"]
+    },
+    {
+      "id": "phrase-vacation-policy",
+      "capability": "phrase",
+      "description": "Exact phrase match",
+      "dsl": "\"vacation policy\"",
+      "query": { "phrase": "vacation policy" },
+      "relevant_ids": ["m-cross-1", "m-cross-2"]
+    },
+    {
+      "id": "or-invoice-contract",
+      "capability": "boolean-or",
+      "description": "Either of two terms",
+      "dsl": "invoice OR contract",
+      "query": { "or": ["invoice", "contract"] },
+      "relevant_ids": ["m-invoice", "m-contract"]
+    },
+    {
+      "id": "not-reminder",
+      "capability": "boolean-not",
+      "description": "Policy mail excluding reminders",
+      "dsl": "policy -reminder",
+      "query": { "text": "policy", "not": ["reminder"] },
+      "relevant_ids": ["m-cross-1"],
+      "must_not_return": ["m-cross-2"]
+    },
+    {
+      "id": "identifier-exact",
+      "capability": "identifier-exact",
+      "description": "Exact invoice/order identifier",
+      "dsl": "INV-2024-0042",
+      "query": { "text": "INV-2024-0042" },
+      "relevant_ids": ["m-invoice"]
+    },
+    {
+      "id": "unicode-accent-from",
+      "capability": "unicode-accent",
+      "description": "Accent-insensitive sender match (jose ≈ José)",
+      "dsl": "from:jose",
+      "query": { "from": "jose" },
+      "relevant_ids": ["m-jose"]
+    },
+    {
+      "id": "fuzzy-recieve",
+      "capability": "fuzzy-typo",
+      "description": "Typo tolerance (recieve → receive)",
+      "dsl": "recieve",
+      "query": { "text": "recieve" },
+      "relevant_ids": ["m-contract"],
+      "tier": "fuzzy"
+    },
+    {
+      "id": "false-empty-campain",
+      "capability": "false-empty-avoidance",
+      "description": "A misspelled but real query must not return empty",
+      "dsl": "campain",
+      "query": { "text": "campain" },
+      "relevant_ids": ["m-news"],
+      "tier": "fuzzy"
+    },
+    {
+      "id": "quoted-exclusion-pelican",
+      "capability": "quoted-exclusion",
+      "description": "A term only in quoted reply history must surface the original, not the reply",
+      "dsl": "pelican",
+      "query": { "text": "pelican" },
+      "relevant_ids": ["m-budget-1"],
+      "must_not_return": ["m-budget-2"]
+    },
+    {
+      "id": "thread-collapse-budget",
+      "capability": "thread-collapse",
+      "description": "Thread-granularity search returns one hit per thread",
+      "dsl": "budget account:acct-2 (thread view)",
+      "query": { "text": "budget", "accounts": ["acct-2"], "granularity": "thread" },
+      "relevant_ids": ["m-budget-1"],
+      "assertions": [{ "type": "thread_collapsed" }]
+    },
+    {
+      "id": "recency-prior-alpha",
+      "capability": "recency-prior",
+      "description": "Among equally-on-topic mail, the newer one should rank first",
+      "dsl": "alpha",
+      "query": { "text": "alpha" },
+      "relevant_ids": ["m-alpha-old", "m-alpha-new"],
+      "assertions": [{ "type": "top_is", "id": "m-alpha-new" }]
+    },
+    {
+      "id": "newsletter-downweight-report",
+      "capability": "newsletter-downweight",
+      "description": "A personal mail should outrank a keyword-stuffed newsletter",
+      "dsl": "report",
+      "query": { "text": "report" },
+      "relevant_ids": ["m-personal", "m-news"],
+      "assertions": [{ "type": "rank_above", "higher": "m-personal", "lower": "m-news" }]
+    },
+    {
+      "id": "cross-account-vacation",
+      "capability": "cross-account",
+      "description": "One query spanning two accounts",
+      "dsl": "vacation account:acct-1 account:acct-2",
+      "query": { "text": "vacation", "accounts": ["acct-1", "acct-2"] },
+      "relevant_ids": ["m-cross-1", "m-cross-2"]
+    },
+    {
+      "id": "semantic-bill",
+      "capability": "semantic-paraphrase",
+      "description": "Paraphrase: 'bill' should find the invoice",
+      "dsl": "bill",
+      "query": { "text": "bill" },
+      "relevant_ids": ["m-invoice"],
+      "tier": "semantic"
+    },
+    {
+      "id": "semantic-meeting",
+      "capability": "semantic-paraphrase",
+      "description": "Paraphrase: 'meeting' should find the call/sync",
+      "dsl": "meeting",
+      "query": { "text": "meeting" },
+      "relevant_ids": ["m-meeting"],
+      "tier": "semantic"
+    },
+    {
+      "id": "semantic-flight",
+      "capability": "semantic-paraphrase",
+      "description": "Paraphrase: 'flight' should find the itinerary/booking",
+      "dsl": "flight",
+      "query": { "text": "flight" },
+      "relevant_ids": ["m-flight"],
+      "tier": "semantic"
+    }
+  ]
+}

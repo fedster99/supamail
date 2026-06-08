@@ -19,6 +19,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0012-three-lane-history-engine.md`: Historical backfill runs after hot sync and live body fetch under the same account lock.
 - `0013-imap-compatibility-contract.md`: Generic IMAP support is a stated contract validated by provider-shape fixtures, real-server smokes, and manual matrix entries.
 - `0014-agent-email-access-core-surface.md`: The MCP server and agent CLI are built in core as a read-only surface; cloud only adds remote transport and auth.
+- `0015-email-search-evaluation-harness.md`: Email search is eval-driven behind an engine-agnostic harness; a CI-gated goal over email-specific capabilities, with the semantic tier tracked but not gated.
 
 ## Status Values
 

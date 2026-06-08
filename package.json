@@ -15,6 +15,7 @@
     "harness:check": "node scripts/check-harness-impact.mjs",
     "migrate": "pnpm --filter @supamail/api migrate",
     "spec-conformance": "pnpm --filter @supamail/api spec-conformance",
+    "eval:search": "pnpm --filter @supamail/api eval:search",
     "test:db:live": "pnpm --filter @supamail/api test:db:live",
     "smoke:greenmail": "pnpm --filter @supamail/api smoke:greenmail",
     "smoke:dovecot": "pnpm --filter @supamail/api smoke:dovecot",

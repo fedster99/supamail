@@ -22,6 +22,7 @@
     "dev:api": "tsx watch --clear-screen=false src/api.ts",
     "dry-run:local": "tsx scripts/local-dry-run.ts",
     "spec-conformance": "tsx scripts/spec-conformance.ts",
+    "eval:search": "tsx src/search-eval/cli.ts",
     "smoke:load": "tsx src/smoke/load-smoke.ts",
     "smoke:greenmail": "tsx scripts/greenmail-smoke.ts",
     "smoke:dovecot": "tsx scripts/dovecot-smoke.ts",
