@@ -11,6 +11,7 @@ function aggLine(label: string, m: AggregateMetrics): string {
     `nDCG@${DEFAULT_K} ${pct(m.ndcg)}%  ` +
     `recall@${DEFAULT_RECALL_K} ${pct(m.recall)}%  ` +
     `MRR ${pct(m.mrr)}%  ` +
+    `prec@${DEFAULT_K} ${pct(m.precision)}%  ` +
     `assert ${pct(m.assertionPassRate)}%  ` +
     `(n=${m.count})`
   );
@@ -77,6 +78,7 @@ export function summarize(report: EvalReport): Record<string, unknown> {
       ndcg: round(report.overall.ndcg),
       recall: round(report.overall.recall),
       mrr: round(report.overall.mrr),
+      precision: round(report.overall.precision),
       assertionPassRate: round(report.overall.assertionPassRate)
     },
     semantic: {

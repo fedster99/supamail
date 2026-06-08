@@ -21,6 +21,10 @@ export interface GoalThresholds {
   mrr: number;
   /** Minimum email-specific assertion pass rate over non-semantic cases (1 = all). */
   assertionPassRate: number;
+  /** Per-case floor on nDCG@k for every gated case — stops easy cases masking one bad case. */
+  perCaseNdcg: number;
+  /** Per-case floor on recall@K for every gated case. */
+  perCaseRecall: number;
   /** Aspirational mean recall@K over semantic-tier cases (tracked, not gated). */
   semanticRecallTarget: number;
 }
@@ -30,6 +34,10 @@ export const GOAL: GoalThresholds = {
   recall: 0.85,
   mrr: 0.8,
   assertionPassRate: 1,
+  // The aggregate is a mean, so it can hide a single catastrophic case. The per-case
+  // floors ensure no individual gated case collapses while the average stays high.
+  perCaseNdcg: 0.7,
+  perCaseRecall: 0.8,
   semanticRecallTarget: 0.7
 };
 

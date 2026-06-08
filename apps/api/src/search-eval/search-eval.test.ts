@@ -1,8 +1,34 @@
 import { describe, expect, it } from "vitest";
-import { loadCases, loadCorpus, validateReferences } from "./corpus.js";
+import { auditCases, loadCases, loadCorpus, validateReferences } from "./corpus.js";
 import { ndcgAtK, precisionAtK, recallAtK, reciprocalRank } from "./metrics.js";
 import { BASELINE_OPTIONS, IMPROVED_OPTIONS, ReferenceEngine } from "./reference-engine.js";
+import { summarize } from "./report.js";
 import { runEval } from "./runner.js";
+import type { EvalMessage, SearchEngine, SearchResponse } from "./types.js";
+
+/** Returns every non-deleted message, recency-sorted, for any query. */
+class FirehoseEngine implements SearchEngine {
+  readonly name = "firehose";
+  private msgs: EvalMessage[] = [];
+  index(messages: EvalMessage[]): void {
+    this.msgs = messages.filter((m) => !m.deleted_in_provider);
+  }
+  search(): SearchResponse {
+    const hits = [...this.msgs]
+      .sort((a, b) => Date.parse(b.internal_date) - Date.parse(a.internal_date))
+      .map((m) => ({ id: m.id, score: 1, thread_key: m.thread_key }));
+    return { hits };
+  }
+}
+
+/** Returns nothing for any query. */
+class NullEngine implements SearchEngine {
+  readonly name = "null";
+  index(): void {}
+  search(): SearchResponse {
+    return { hits: [] };
+  }
+}
 
 describe("metrics", () => {
   const rel = new Set(["a", "c"]);
@@ -67,5 +93,43 @@ describe("email-search eval suite", () => {
     for (const cap of ["quoted-exclusion", "thread-collapse", "recency-prior", "newsletter-downweight"]) {
       expect(covered.has(cap as never)).toBe(true);
     }
+  });
+});
+
+describe("anti-gaming guards (the gate must have teeth)", () => {
+  const corpus = loadCorpus();
+  const cases = loadCases();
+
+  it("a firehose engine that returns everything FAILS the goal", async () => {
+    const report = await runEval(new FirehoseEngine(), corpus, cases);
+    expect(report.goal.met).toBe(false);
+  });
+
+  it("a null engine that returns nothing FAILS the goal", async () => {
+    const report = await runEval(new NullEngine(), corpus, cases);
+    expect(report.goal.met).toBe(false);
+  });
+
+  it("the naive baseline FAILS the goal (so passing is not trivial)", async () => {
+    const report = await runEval(new ReferenceEngine(BASELINE_OPTIONS, "baseline"), corpus, cases);
+    expect(report.goal.met).toBe(false);
+  });
+});
+
+describe("determinism", () => {
+  it("produces identical scores across runs", async () => {
+    const corpus = loadCorpus();
+    const cases = loadCases();
+    const a = summarize(await runEval(new ReferenceEngine(IMPROVED_OPTIONS, "i"), corpus, cases));
+    const b = summarize(await runEval(new ReferenceEngine(IMPROVED_OPTIONS, "i"), corpus, cases));
+    expect(a).toEqual(b);
+  });
+
+  it("the case audit surfaces only intended distractors", () => {
+    // auditCases is a non-fatal quality signal; keep the distractor set small and intentional.
+    const warnings = auditCases(loadCorpus(), loadCases());
+    const unusedLine = warnings.find((w) => w.includes("never referenced")) ?? "";
+    const count = Number(unusedLine.match(/^(\d+) fixture/)?.[1] ?? 0);
+    expect(count).toBeLessThanOrEqual(4);
   });
 });

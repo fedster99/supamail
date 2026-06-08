@@ -108,6 +108,13 @@ export async function runEval(
     failures.push(
       `assertion pass rate ${overall.assertionPassRate.toFixed(3)} < goal ${GOAL.assertionPassRate}`
     );
+  // Per-case floors: a single collapsed case fails the gate even if the mean stays high.
+  for (const c of nonSemantic) {
+    if (c.ndcg < GOAL.perCaseNdcg)
+      failures.push(`case "${c.id}" nDCG ${c.ndcg.toFixed(3)} < per-case floor ${GOAL.perCaseNdcg}`);
+    if (c.recall < GOAL.perCaseRecall)
+      failures.push(`case "${c.id}" recall ${c.recall.toFixed(3)} < per-case floor ${GOAL.perCaseRecall}`);
+  }
 
   return {
     engine: engine.name,
