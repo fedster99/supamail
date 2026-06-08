@@ -4,6 +4,10 @@ This is how we measure whether SupaMail search is good, and the concrete goal fo
 making it **much** better. "Good" is not a vibe here — it is a number, produced by
 a reproducible harness, and gated in CI.
 
+> The harness itself is not yet trustworthy enough to drive ship/no-ship — it is
+> self-authored, tiny, binary, and has no significance testing or latency axis.
+> The goal for fixing *that* is [`search-eval-roadmap.md`](search-eval-roadmap.md).
+
 ## The harness
 
 - **Corpus + judged queries:** `apps/api/src/eval/corpus.ts` — a deterministic
