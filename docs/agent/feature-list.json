@@ -73,7 +73,7 @@
         "pnpm build"
       ],
       "evidence": "",
-      "notes": "Per ADR 0014, the MCP server is built in this core repo as a read-only surface; cloud only hosts it. Core owns the server implementation, the read-tool contract, and the local stdio binding; the remote transport, bearer/tenant auth, and MCP token secrets live in supamail-cloud. Build the server with an injected database connection and a transport boundary so the same tool logic runs locally (stdio) and hosted (remote-authed). Start local stdio first; remote transport must be absent from the public package. V1 is read-only."
+      "notes": "Per ADR 0014, the MCP server is built in this core repo as a read-only surface; cloud only hosts it. Core owns the server implementation, the read-tool contract, and the local stdio binding; the remote transport, bearer/tenant auth, and MCP token secrets live in supamail-cloud. Build the server with an injected database connection and a transport boundary so the same tool logic runs locally (stdio) and hosted (remote-authed). Start local stdio first; remote transport must be absent from the public package. V1 is read-only. PARTIAL: the read-tool contract for the flagship search tool already exists on branch fedster99/search-layer (ADR 0015) as `search_email` -- apps/api/src/search/mcp-tool.ts exports searchEmailToolDefinition (name/description/inputSchema/readOnlyHint annotations) and runSearchTool(pool, args), both wrapping the same injected-connection searchMessages as the CLI. Remaining for #4: the stdio MCP server process that registers this tool and binds the transport. Do not self-start; this stays not_started until selected."
     },
     {
       "id": "issue-7-agent-email-cli",
@@ -82,15 +82,16 @@
       "area": "agent-cli",
       "title": "Build an agent-first email CLI",
       "user_visible_behavior": "A local coding agent can inspect mirrored email through stable CLI commands with deterministic, machine-readable output and clear sync trust signals.",
-      "status": "not_started",
+      "status": "in_progress",
       "dependencies": [],
       "verification": [
         "pnpm typecheck",
         "pnpm test",
-        "pnpm build"
+        "pnpm build",
+        "pnpm test:db:live"
       ],
-      "evidence": "",
-      "notes": "Per ADR 0014, the agent CLI is built in this core repo as a read-only surface; cloud only hosts it (build location is not run location). Core owns the CLI commands and their deterministic, machine-readable output with clear sync-trust signals; cloud handles per-tenant routing and auth. Keep the first pass read-oriented against the existing mirror; sending, scheduling, contacts, calendar, CRM hydration, and AI summarization stay out of scope unless a later ADR explicitly adds them. This complements issue #4 MCP and should share the same read-tool contract."
+      "evidence": "Search read layer landed on branch fedster99/search-layer (ADR 0015), the flagship read tool for this CLI. 0007_search_layer.sql adds weighted FTS generated columns + pg_trgm + structured b-tree indexes; apps/api/src/search/ exposes the injected-connection searchMessages function (parser -> SQL compiler -> read-only transaction), a deterministic machine-readable SearchResponse, and a sync_trust block (the sync-trust signal). The `supamail search` CLI command wraps it with JSON output and the full operator/flag surface. Verified 2026-06-07: pnpm typecheck, pnpm test (160 passed incl. 15 parser/compiler unit tests), pnpm build, pnpm test:db:live (migration applied twice for idempotence + src/__tests__/search.live-db.test.ts proving generated columns populate, soft-deletes never leak, a >128KB body does not error, ranking order, and is:/from: operators; 118/118 spec-conformance).",
+      "notes": "Per ADR 0014, the agent CLI is built in this core repo as a read-only surface; cloud only hosts it (build location is not run location). The search command is the first read command and shares the read-tool contract with issue #4. Remaining for #7: additional read commands (e.g. get-message, thread view) and a non-JSON pretty mode. Sending, scheduling, contacts, calendar, CRM hydration, and AI summarization stay out of scope unless a later ADR explicitly adds them. WIP=1: do not start a second feature while this is in_progress."
     }
   ]
 }
