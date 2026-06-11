@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
-import type { BodyFetchPolicy } from "./types.js";
+import type { BodyFetchPolicy, BodyStorageMode } from "./types.js";
 
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
@@ -21,6 +21,10 @@ const envSchema = z.object({
   BODY_FETCH_POLICY: z
     .enum(["immediate", "lazy", "priority_then_backfill"])
     .default("priority_then_backfill"),
+  // raw_mime keeps the original RFC822/MIME blob in imap_message_bodies.raw_mime.
+  // parsed_only fetches and parses bodies normally but stores NULL raw_mime, for
+  // deployments where raw blob retention dominates database size.
+  BODY_STORAGE_MODE: z.enum(["raw_mime", "parsed_only"]).default("raw_mime"),
   BODY_RAW_MAX_BYTES: z.coerce.number().int().positive().default(25 * 1024 * 1024),
   BODY_BACKFILL_BATCH_SIZE: z.coerce.number().int().positive().default(25),
   MAX_BODY_BATCHES_PER_TICK: z.coerce.number().int().positive().default(4),
@@ -63,6 +67,7 @@ const envSchema = z.object({
 
 export type AppConfig = z.infer<typeof envSchema> & {
   BODY_FETCH_POLICY: BodyFetchPolicy;
+  BODY_STORAGE_MODE: BodyStorageMode;
 };
 
 let cachedConfig: AppConfig | null = null;

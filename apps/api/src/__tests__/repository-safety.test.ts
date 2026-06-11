@@ -44,6 +44,12 @@ describe("repository safety", () => {
     expect(source).toContain("JSON.stringify({ errors: sanitizedErrors, hitLockBudget: result.hitLockBudget })");
   });
 
+  it("stores NULL raw_mime when BODY_STORAGE_MODE is parsed_only", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain('this.config.BODY_STORAGE_MODE === "parsed_only" ? null : body.rawMime');
+  });
+
   it("does not hold account locks with idle transactions", async () => {
     const source = await readFile(resolve(process.cwd(), "src/locks.ts"), "utf8");
 
