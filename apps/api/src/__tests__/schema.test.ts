@@ -14,6 +14,7 @@ const folderCapMigrationPath = resolve(process.cwd(), "supabase/migrations/publi
 const accountSettingsMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0004_account_lane_settings.sql");
 const progressRollupMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0005_progress_rollup.sql");
 const historyLaneMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0006_history_lane_state.sql");
+const optionalRawMimeMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0007_optional_raw_mime.sql");
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -93,16 +94,17 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0006_history_lane_state");
+    expect(version).toBe("0007_optional_raw_mime");
     expect(manifest).toEqual({
-      schemaVersion: "0006_history_lane_state",
+      schemaVersion: "0007_optional_raw_mime",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
         { id: "0003_folder_count_cap_pending_verification", file: "0003_folder_count_cap_pending_verification.sql" },
         { id: "0004_account_lane_settings", file: "0004_account_lane_settings.sql" },
         { id: "0005_progress_rollup", file: "0005_progress_rollup.sql" },
-        { id: "0006_history_lane_state", file: "0006_history_lane_state.sql" }
+        { id: "0006_history_lane_state", file: "0006_history_lane_state.sql" },
+        { id: "0007_optional_raw_mime", file: "0007_optional_raw_mime.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -114,6 +116,7 @@ describe("initial schema", () => {
     expect(sql).toContain("CREATE VIEW public.imap_account_progress");
     expect(sql).toContain("headers_synced_count int NOT NULL DEFAULT 0");
     expect(sql).toContain("last_archive_refresh_at timestamptz");
+    expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
   });
 
   it("adds stuck-degraded escalation state without control-plane tables", async () => {
@@ -178,6 +181,15 @@ describe("initial schema", () => {
 
     expect(sql).toContain("ALTER TABLE public.imap_folders");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_archive_refresh_at timestamptz");
+    expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
+  });
+
+  it("makes raw_mime optional for parsed-only body storage without control-plane tables", async () => {
+    const sql = await readFile(optionalRawMimeMigrationPath, "utf8");
+
+    expect(sql).toContain("ALTER TABLE public.imap_message_bodies");
+    expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
     expect(sql).not.toContain("stripe");
     expect(sql).not.toContain("tenant");
   });

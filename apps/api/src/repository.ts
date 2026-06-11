@@ -1637,7 +1637,7 @@ export class MirrorRepository {
         `,
         [
           body.messageId,
-          body.rawMime,
+          this.config.BODY_STORAGE_MODE === "parsed_only" ? null : body.rawMime,
           body.rawBytes,
           body.rawTruncated,
           body.bodyText,

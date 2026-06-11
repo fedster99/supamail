@@ -1,4 +1,5 @@
 export type BodyFetchPolicy = "immediate" | "lazy" | "priority_then_backfill";
+export type BodyStorageMode = "raw_mime" | "parsed_only";
 export type LiveWindowDays = 30 | 90 | 180;
 export type HistoricalBackfillMode = "off" | "metadata_only" | "metadata_and_bodies";
 export type ArchiveRefreshInterval = "never" | "monthly" | "weekly";

@@ -66,7 +66,7 @@ Use this checklist before moving a provider from "manual smoke pending" to "vali
 2. Add the account with the narrowest profile that matches the provider, usually `generic-imap`.
 3. Run one manual sync and confirm folder discovery records the provider delimiter, noisy folders are excluded, and Archive-like folders remain trackable.
 4. Confirm initial sync stores headers for expected folders and does not mirror excluded folders.
-5. Enable immediate body fetch for the test account and confirm raw MIME, parsed body text, HTML/plain fields, and attachment metadata are stored.
+5. Enable immediate body fetch for the test account and confirm raw MIME (with the default `BODY_STORAGE_MODE=raw_mime`), parsed body text, HTML/plain fields, and attachment metadata are stored.
 6. Trigger a second sync after adding and deleting test messages provider-side; confirm incremental sync, flag changes, and reconcile results are visible.
 7. Force or simulate a transient provider failure if practical; confirm account/folder health records the failure.
 8. Record the result in this matrix and add a provider-profile quirk only if code needs provider-specific behavior.

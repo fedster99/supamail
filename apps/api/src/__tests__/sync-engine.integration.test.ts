@@ -803,6 +803,51 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(bodyCount.rows[0].count)).toBe(4);
   });
 
+  it("stores parsed bodies without raw MIME when BODY_STORAGE_MODE is parsed_only", async () => {
+    const h = await setupIntegration("G-parsed-only-bodies", { BODY_STORAGE_MODE: "parsed_only" });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 410,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "parsed", from: "a@x.test", to: "u@x.test", body: "parsed-only body" })
+        ]
+      }
+    ];
+
+    const engine = h.buildEngine({ folders });
+    const result = await engine.syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(1);
+
+    const body = (
+      await h.pool.query<{
+        raw_mime: Buffer | null;
+        raw_bytes: string;
+        raw_truncated: boolean;
+        body_text: string | null;
+        body_plain: string | null;
+      }>(
+        `
+        SELECT b.raw_mime, b.raw_bytes::text, b.raw_truncated, b.body_text, b.body_plain
+        FROM public.imap_message_bodies b
+        JOIN public.imap_messages m ON m.id = b.message_id
+        WHERE m.account_id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(body.raw_mime).toBeNull();
+    expect(Number(body.raw_bytes)).toBeGreaterThan(0);
+    expect(body.raw_truncated).toBe(false);
+    expect(`${body.body_text ?? ""}${body.body_plain ?? ""}`).toContain("parsed-only body");
+  });
+
   it("Scenario H — initial sync timeout aborts IMAP without advancing the watermark", async () => {
     const h = await setupIntegration("H-initial-timeout", {
       INITIAL_SYNC_BATCH_SIZE: 2,

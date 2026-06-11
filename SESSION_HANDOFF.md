@@ -1,6 +1,6 @@
 # Session Handoff
 
-Last updated: 2026-06-07
+Last updated: 2026-06-10
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 
@@ -8,6 +8,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 - Integration branch is `main`. As of 2026-06-07 it is at `d3140c1` with no active feature branch; everything below is merged, CI-green, and republished the GHCR core image on each merge.
 - Recently merged: `#9` configurable `DATABASE_POOL_MAX`; `#10` reap orphaned `imap_sync_runs` on stale-lock recovery; `#12` nested mailbox-lock deadlock fix in history-backfill body fetch; `#13` live-DB proof of run reaping + `DATABASE_POOL_MAX` docs; `#15` reaper `started_at` race guard + reported reap counts; `#11` ADR 0014 (agent email access as a core read surface); `#17` UID-less FETCH guard; `#18` mirror Drafts folders; `#19` Drafts docs follow-up; `#20` historical-backfill acceptance coverage; `#21` issue #2 tracker update.
+- Active feature branch `fedster99/body-storage-mode` (2026-06-10): adds `BODY_STORAGE_MODE=raw_mime|parsed_only` (default `raw_mime`, unchanged behavior) and public migration `0007_optional_raw_mime` making `imap_message_bodies.raw_mime` nullable. `parsed_only` fetches/parses bodies normally but stores NULL `raw_mime` (raw blobs dominate database size). Maintainer-directed from the hosted product's DB-size investigation; the engine stays single-tenant.
 - Stale PR `#1` (`codex/oss-worker-core`) was closed as superseded by `#5`.
 - Issue #2 historical backfill is now `passing` after fresh acceptance revalidation in `#20` and the tracker update in `#21`. Issue #3 provider compatibility, issue #4 MCP server, and issue #7 agent email CLI remain open and should not be treated as done.
 
@@ -43,9 +44,11 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Stale advisory-lock recovery (`clearOrphanedLocks` / `clearOrphanedLockForAccount`) now also closes the dead worker's open `imap_sync_runs` row as `failed` (reaped), guarded by an `r.started_at < now() - STALE_HEARTBEAT_MS` recency check so a freshly-started run is never mistaken for an orphan. `clearOrphanedLocks` returns `{ terminatedBackends, accountsReset, runsClosed }` and the worker logs them at startup so SIGKILL/OOM reaps are observable. Covered by live-DB tests in `apps/api/src/__tests__/sync-engine.live-db.test.ts`.
 - `fetchFullMessageBody` takes `{ skipMailboxLock }`: the history-backfill snapshot body loop reuses the already-held mailbox selection (asserting it is the expected folder) instead of nesting a second `getMailboxLock`, which deadlocked on a live provider. Every other body-fetch caller still locks per message.
 - ADR 0014 makes the MCP server (issue #4) and agent CLI (issue #7) a read-only core surface; see the Durable Decisions entry. The implementation itself is not started.
+- `BODY_STORAGE_MODE=raw_mime|parsed_only` (config enum, default `raw_mime`) controls raw blob retention: `parsed_only` stores NULL `raw_mime` while keeping parsed columns and `raw_bytes`/`raw_truncated` source metadata. Migration `0007_optional_raw_mime` drops the `raw_mime` NOT NULL; apply migrations before enabling `parsed_only`. Re-fetches while `parsed_only` is active also NULL previously stored blobs, and flipping back does not backfill them. Documented in README "Body Sync", `docs/schema.md`, and `.env.example`.
 
 ## Verification To Date
 
+- Body storage mode (2026-06-10): `pnpm typecheck`, `pnpm test` (149 unit tests incl. new config/schema/repository-safety coverage), `pnpm test:db:live` twice (38 integration tests incl. a new parsed_only end-to-end fixture sync proving NULL `raw_mime` + intact parsed text, full migration set applied repeatedly for idempotency, 118 spec-conformance scenario checks), and `INSTALL_CMD=true ./init.sh` all passed under the local Node 26 shell (expected engine warnings; repo pins Node 24).
 - `./init.sh` passed after adding the docs / harness impact reminder.
 - `pnpm harness:check` prints the pre-git docs / harness reminder.
 - `node --check scripts/check-harness-impact.mjs` passed.

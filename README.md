@@ -35,7 +35,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 - UIDVALIDITY reset handling
 - Reconciliation for provider deletes and missing messages
 - Flags, headers, threading headers, and MIME structure
-- Raw RFC822/MIME bodies
+- Raw RFC822/MIME bodies (retention configurable via `BODY_STORAGE_MODE`)
 - Parsed text, HTML, normalized text, and parser metadata
 - Attachment and inline-part metadata
 - Sync runs, sync events, health, lag, retries, and backoff
@@ -232,6 +232,13 @@ Historical backfill is controlled per account through `PATCH /accounts/:id/setti
 IMAP headers arrive much faster than full MIME bodies. SupaMail exposes progress percentages so downstream search, agent, or UI consumers can decide how much body completeness they need before trusting deep search results.
 
 SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.
+
+`BODY_STORAGE_MODE` controls whether the raw blob is retained:
+
+- `raw_mime`: store the original RFC822/MIME bytes in `imap_message_bodies.raw_mime`. This is the default.
+- `parsed_only`: fetch and parse bodies normally but store `raw_mime` as NULL. Raw blobs usually dominate database size, so use this when you only need parsed/searchable content. `raw_bytes` and `raw_truncated` still describe the fetched source, but raw MIME cannot be re-read later for re-parsing or attachment extraction.
+
+Before enabling `parsed_only`, apply the public migrations (`pnpm migrate`) so `raw_mime` is nullable; on an un-migrated database every body store fails. While `parsed_only` is active, any re-fetch of an already-stored message (for example `POST /messages/:id/refetch-body` or a UIDVALIDITY-reset re-walk) also overwrites that row's previously stored `raw_mime` with NULL. Switching back to `raw_mime` does not backfill raw blobs for mail synced while `parsed_only` was active.
 
 Attachment binaries are not downloaded by default. SupaMail stores attachment metadata, MIME part numbers, content IDs, and optional future storage keys.
 
