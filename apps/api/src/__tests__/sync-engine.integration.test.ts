@@ -803,6 +803,54 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(bodyCount.rows[0].count)).toBe(4);
   });
 
+  it("collapses a lost IMAP connection into one error instead of failing every remaining folder", async () => {
+    const h = await setupIntegration("G-connection-lost");
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 420,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "in", from: "a@x.test", to: "u@x.test", body: "in" })
+        ]
+      },
+      { path: "Sent", delimiter: "/", specialUse: "\\Sent", uidValidity: 421, messages: [] },
+      { path: "Notes", delimiter: "/", uidValidity: 422, messages: [] }
+    ];
+
+    // Dies after INBOX: every later getMailboxLock sees imapflow's NoConnection.
+    class ConnectionLostFixtureImapClient extends FixtureImapClient {
+      async getMailboxLock(path: string) {
+        if (path !== "INBOX") {
+          throw Object.assign(new Error("Connection not available"), { code: "NoConnection" });
+        }
+        return super.getMailboxLock(path);
+      }
+    }
+
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => new ConnectionLostFixtureImapClient(folders)
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
+
+    // "Sent" is a priority folder, but the connection died — the run must not
+    // count it as a priority failure, and "Notes" must not add a third error.
+    expect(result.outcome).toBe("partial_success");
+    expect(result.foldersProcessed).toBe(1);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("Sent: Connection not available");
+    expect(result.errors[0]).toContain("connection lost");
+
+    const account = await h.pool.query<{ consecutive_failures: number; sync_state: string }>(
+      "SELECT consecutive_failures, sync_state FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(account.rows[0].consecutive_failures).toBe(0);
+  });
+
   it("stores parsed bodies without raw MIME when BODY_STORAGE_MODE is parsed_only", async () => {
     const h = await setupIntegration("G-parsed-only-bodies", { BODY_STORAGE_MODE: "parsed_only" });
     activeAccountIds.push(h.account.id);

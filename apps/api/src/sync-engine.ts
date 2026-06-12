@@ -92,6 +92,17 @@ export function isMissingMailboxError(error: unknown): boolean {
   return MISSING_MAILBOX_PATTERNS.some((pattern) => pattern.test(message));
 }
 
+// imapflow error codes for a closed/unusable IMAP connection ("Connection not
+// available" / "Connection closed"). Once one of these surfaces, every later
+// command on the same client fails identically.
+const CONNECTION_LOST_CODES = new Set(["NoConnection", "EConnectionClosed"]);
+
+export function isConnectionLostError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && CONNECTION_LOST_CODES.has(code);
+}
+
 function extractImapResponseCode(error: unknown): string | null {
   if (!error || typeof error !== "object") return null;
   const candidate = error as {
@@ -189,6 +200,7 @@ export class MirrorEngine {
 
         const folders = await this.repository.getFoldersDueForSync(account.id);
         let priorityFolderFailed = false;
+        let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
         for (const folder of folders) {
@@ -223,6 +235,20 @@ export class MirrorEngine {
             if (error instanceof AccountAlreadyFinalizedError) throw error;
             const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
             const message = error instanceof Error ? error.message : String(error);
+            if (isConnectionLostError(error)) {
+              // The IMAP connection is gone (an engine timeout closed it or the
+              // server dropped it) — every remaining folder would fail with the
+              // same error. Record one line, skip the rest of this pass, and let
+              // the next scheduled run reconnect. Deliberately does not count as
+              // a priority-folder failure: the folder didn't fail, the
+              // connection did, and the real cause was recorded by the folder
+              // that hit it.
+              result.errors.push(
+                sanitizeErrorReason(`${sanitizedPath}: ${message}; connection lost, remaining sync deferred to next run`)
+              );
+              connectionLost = true;
+              break;
+            }
             if (isMissingMailboxError(error)) {
               await this.repository.markFolderPendingVerification(
                 account.id,
@@ -238,7 +264,7 @@ export class MirrorEngine {
 
         if (this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else {
+        } else if (!connectionLost) {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
@@ -246,7 +272,7 @@ export class MirrorEngine {
 
         if (this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else {
+        } else if (!connectionLost) {
           const historyResult = await this.runHistoryLane(account, client, lockDeadline);
           result.messagesUpserted += historyResult.messagesUpserted;
           result.bodiesFetched += historyResult.bodiesFetched;
