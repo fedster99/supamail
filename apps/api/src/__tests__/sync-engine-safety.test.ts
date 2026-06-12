@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { isMissingMailboxError } from "../sync-engine.js";
+import { isConnectionLostError, isMissingMailboxError } from "../sync-engine.js";
 
 describe("sync engine safety", () => {
   it("does not treat partial folder failures as healthy account syncs", async () => {
@@ -49,6 +49,26 @@ describe("sync engine safety", () => {
     }))).toBe(false);
     expect(source).toContain("isMissingMailboxError(error)");
     expect(source).toContain("markFolderPendingVerification");
+  });
+
+  it("stops the folder loop on a lost IMAP connection instead of cascading per-folder errors", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(isConnectionLostError(Object.assign(new Error("Connection not available"), {
+      code: "NoConnection"
+    }))).toBe(true);
+    expect(isConnectionLostError(Object.assign(new Error("Connection closed"), {
+      code: "EConnectionClosed"
+    }))).toBe(true);
+    // The message alone is not enough — only imapflow's codes identify a dead client.
+    expect(isConnectionLostError(new Error("Connection not available"))).toBe(false);
+    expect(isConnectionLostError(Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }))).toBe(false);
+    expect(isConnectionLostError("Connection not available")).toBe(false);
+
+    expect(source).toContain("isConnectionLostError(error)");
+    expect(source).toContain("connectionLost = true");
+    // Both the body backlog and the history lane are skipped once the client is dead.
+    expect(source.match(/} else if \(!connectionLost\) \{/g)).toHaveLength(2);
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {
