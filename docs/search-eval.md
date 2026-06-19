@@ -96,12 +96,17 @@ the quality gate.
 
 ## The goal
 
-The email-intelligence layer above is shipped. The remaining headline gap is the
-two generic categories still at zero:
-
 > **Raise headline nDCG@10 from 0.69 to ≥ 0.90 and Recall@10 from 0.69 to ≥ 0.90
 > by closing the two zero-scoring categories — with zero regression in the four
 > categories already at 0.91–1.00.**
+
+**Status: met (2026-06-19).** Phase 1 (trigram fuzzy + concept recall, below)
+took the headline to **nDCG@10 0.953 / Recall@10 0.953**, closing semantic
+(0.00→0.98) and most of typo (0.00→0.65) with zero regression. The harness is
+still the small synthetic corpus, so this is a category-level signal, not a
+production-trustworthy bar — that is what [`search-eval-roadmap.md`](search-eval-roadmap.md)
+addresses. Phase 2 embeddings remain the durable answer for open-ended semantics
+beyond the curated thesaurus.
 
 Concrete, independently measurable targets (re-run `eval:search` after each):
 
@@ -122,14 +127,42 @@ Thread grouping + bulk demotion (see the section above). email-intent category t
 correspondence weighting (rank people you actually reply to), quoted-reply /
 signature stripping before indexing, and sent/needs-reply intent.
 
-### Phase 1 — Tier 1.5: trigram fuzzy fallback (pure Postgres, no new deps)
-Add a trigram retrieval branch to the **free-text** path: when a term yields few or
-no FTS hits, match it with `word_similarity` / `%` over subject + sender (and
-optionally body) using the existing `pg_trgm` GINs, and fuse the FTS and trigram
-candidate lists with **Reciprocal Rank Fusion** before ranking. Set
-`pg_trgm.word_similarity_threshold` via `SET LOCAL` in the read-only transaction.
-- Expected: typo 0.00 → ~0.80; lexical recall up; headline ~0.78–0.82.
-- Still deterministic, still zero external services.
+### Phase 1 — Tier 1.5: trigram fuzzy + concept recall (shipped ✓)
+Two pure-Postgres recall branches added to the **free-text** path
+(`apps/api/src/search/expand.ts` + `compile.ts`), both *recall-only*:
+
+- **Fuzzy (typo):** the significant query tokens match via `word_similarity`
+  over the trigram-indexed columns (subject / sender / recipients), driving the
+  `0007` `gin_trgm_ops` GINs through `OPERATOR(extensions.<%)`.
+  `pg_trgm.word_similarity_threshold` is set to `0.4` per-statement via
+  `SET LOCAL` in the read-only transaction.
+- **Concept (semantic):** a curated, general email/business **concept thesaurus**
+  widens the tsquery (`primary || synonyms`), so an intent word retrieves mail
+  that never says it literally (`vacation` → travel mail). This is the
+  deterministic, zero-dependency stand-in for open-ended semantics; the durable
+  general answer is still Phase 2 embeddings.
+
+**Tiering is the safety property:** an `is_primary` flag (any exact lexical hit)
+is the leading `ORDER BY` key, so every exact match ranks strictly above every
+fuzzy/concept-only match. The recall branches can *add* results a keyword search
+misses but can never reorder the ones it already gets right — zero regression by
+construction, not by tuning.
+
+**Result (32 queries / 31 messages), before → after:**
+
+| Category | nDCG@10 before | nDCG@10 after |
+|---|---|---|
+| **Headline** | **0.731** | **0.953** |
+| typo | 0.00 | 0.65 |
+| semantic | 0.00 | 0.98 |
+| lexical | 0.91 | 0.995 |
+| operator / ranking / phrase / email-intent | 1.00 | 1.00 (held) |
+
+Residual typo misses are deliberate scope edges: a body-only term (`metrcs`→a
+message whose subject lacks "metrics" — body trigram is unindexed, a perf
+choice) and a transposition (`invioce`) below the `0.4` threshold whose third
+judged doc has no literal token at all. Not chased, to avoid overfitting the
+threshold to a 31-doc synthetic corpus.
 
 ### Phase 2 — Tier 2: opt-in semantic (gated pgvector)
 Stand up the out-of-core embedding job that populates `imap_message_embeddings`

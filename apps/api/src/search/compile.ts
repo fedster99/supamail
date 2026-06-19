@@ -24,6 +24,12 @@ export interface CompileOptions {
   includeBody: boolean;
   /** Collapse each conversation to its single best message (email-search default). */
   groupByThread: boolean;
+  /** Significant query tokens (operators stripped) for the trigram fuzzy branch.
+   *  Empty disables fuzzy retrieval. */
+  terms: string[];
+  /** Curated concept synonyms for the OR-widened semantic branch. Empty disables
+   *  concept retrieval. */
+  synonyms: string[];
 }
 
 export interface CompiledQuery {
@@ -176,12 +182,14 @@ function orderClause(sort: SearchSort, hasText: boolean, alias: string): string 
   const a = alias;
   switch (sort) {
     case "smart":
+      // is_primary first: every exact (lexical) match ranks above any fuzzy/
+      // concept-only match, so the recall branches never reorder exact results.
       return hasText
-        ? `(${a}.text_rel * ${a}.recency * ${a}.email_prior) DESC, ${a}.internal_date DESC, ${a}.id DESC`
+        ? `${a}.is_primary DESC, (${a}.text_rel * ${a}.recency * ${a}.email_prior) DESC, ${a}.internal_date DESC, ${a}.id DESC`
         : `${a}.internal_date DESC, ${a}.id DESC`;
     case "relevance":
       return hasText
-        ? `(${a}.text_rel * ${a}.email_prior) DESC, ${a}.internal_date DESC, ${a}.id DESC`
+        ? `${a}.is_primary DESC, (${a}.text_rel * ${a}.email_prior) DESC, ${a}.internal_date DESC, ${a}.id DESC`
         : `${a}.internal_date DESC, ${a}.id DESC`;
     case "recent":
       return `${a}.internal_date DESC, ${a}.id DESC`;
@@ -218,6 +226,40 @@ export function compileSearch(
     ? `(CASE WHEN b.body_fts IS NOT NULL THEN ts_rank_cd(b.body_fts, ${tsq}, 2) ELSE 0 END)`
     : "0";
 
+  // ── Recall branches (RECALL ONLY; ranked strictly below exact matches) ───────
+  // Fuzzy (typo): pg_trgm word-similarity over the trigram-indexed columns, so a
+  // misspelled query word still retrieves. OPERATOR(extensions.<%) drives the
+  // 0007 gin_trgm_ops indexes; the per-statement threshold is set in search.ts.
+  // Concept (semantic): an OR-widened tsquery (primary || curated synonyms), so
+  // an intent word ("vacation") retrieves mail that never says it literally.
+  const fuzzyTerms = hasText && opts.terms.length > 0 ? opts.terms : [];
+  const termsP = fuzzyTerms.length > 0 ? pb.add(fuzzyTerms) : null;
+  const recipientsText =
+    `lower(public.f_array_to_text(coalesce(m.to_emails,'{}'::text[]) || coalesce(m.cc_emails,'{}'::text[])))`;
+  const fuzzyGate = termsP
+    ? `EXISTS (SELECT 1 FROM unnest(${termsP}::text[]) qt WHERE ` +
+      `qt OPERATOR(extensions.<%) lower(coalesce(m.subject,'')) ` +
+      `OR qt OPERATOR(extensions.<%) lower(coalesce(m.from_name,'')) ` +
+      `OR qt OPERATOR(extensions.<%) lower(coalesce(m.from_email,'')) ` +
+      `OR qt OPERATOR(extensions.<%) ${recipientsText})`
+    : null;
+  const fuzzSim = termsP
+    ? `(SELECT coalesce(max(greatest(` +
+      `extensions.word_similarity(qt, lower(coalesce(m.subject,''))), ` +
+      `extensions.word_similarity(qt, lower(coalesce(m.from_name,''))))), 0) ` +
+      `FROM unnest(${termsP}::text[]) qt)`
+    : "0";
+
+  const synonyms = hasText && tsq && opts.synonyms.length > 0 ? opts.synonyms : [];
+  const expandedTsq = tsq && synonyms.length > 0
+    ? `(${tsq}${synonyms.map((s) => ` || websearch_to_tsquery('english', public.f_unaccent(${pb.add(s)}))`).join("")})`
+    : null;
+  const semHeader = expandedTsq ? `ts_rank_cd(m.header_fts, ${expandedTsq})` : "0";
+  const semBody = expandedTsq
+    ? `(CASE WHEN b.body_fts IS NOT NULL THEN ts_rank_cd(b.body_fts, ${expandedTsq}, 2) ELSE 0 END)`
+    : "0";
+  const semGate = expandedTsq ? `(m.header_fts @@ ${expandedTsq} OR b.body_fts @@ ${expandedTsq})` : null;
+
   const where: string[] = [];
   where.push(opts.includeDeleted ? "TRUE" : "m.deleted_in_provider = false");
   if (opts.accountIds && opts.accountIds.length > 0) {
@@ -227,7 +269,10 @@ export function compileSearch(
     where.push(`m.window_status = ANY(${pb.add(opts.windowStatus)}::text[])`);
   }
   if (tsq) {
-    where.push(`(m.header_fts @@ ${tsq} OR b.body_fts @@ ${tsq})`);
+    const recall = [`(m.header_fts @@ ${tsq} OR b.body_fts @@ ${tsq})`];
+    if (fuzzyGate) recall.push(fuzzyGate);
+    if (semGate) recall.push(semGate);
+    where.push(recall.length > 1 ? `(${recall.join("\n         OR ")})` : recall[0]);
   }
   for (const filter of filters) {
     where.push(filterPredicate(filter, pb));
@@ -256,7 +301,7 @@ export function compileSearch(
 grouped AS (
   SELECT DISTINCT ON (r.thread_key) r.*
   FROM ranked r
-  ORDER BY r.thread_key, r.score DESC, r.internal_date DESC, r.id DESC
+  ORDER BY r.thread_key, r.is_primary DESC, r.score DESC, r.internal_date DESC, r.id DESC
 )`
     : "";
   const pageSource = opts.groupByThread ? "grouped" : "ranked";
@@ -269,7 +314,10 @@ WITH cand AS (
     m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
     ${isListish} AS is_listish,
     ${lexHeader} AS lex_header,
-    ${lexBody} AS lex_body
+    ${lexBody} AS lex_body,
+    ${fuzzSim} AS fuzz_sim,
+    ${semHeader} AS sem_header,
+    ${semBody} AS sem_body
   FROM public.imap_messages m
   LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
   WHERE ${where.join("\n    AND ")}
@@ -277,7 +325,14 @@ WITH cand AS (
 scored AS (
   SELECT
     c.*,
-    (0.6 * c.lex_header + 0.2 * c.lex_body) AS text_rel,
+    (c.lex_header > 0 OR c.lex_body > 0) AS is_primary,
+    -- Tiered relevance: an exact (primary) lexical match scores on the lexical
+    -- weights; a fuzzy/concept-only match scores on its recall signal. is_primary
+    -- (the leading ORDER BY key) keeps the two tiers from ever interleaving.
+    (CASE WHEN (c.lex_header > 0 OR c.lex_body > 0)
+          THEN (0.6 * c.lex_header + 0.2 * c.lex_body)
+          ELSE (0.3 * c.fuzz_sim + 0.2 * (0.6 * c.sem_header + 0.2 * c.sem_body))
+     END) AS text_rel,
     exp(-0.0231049 * (extract(epoch FROM (now() - c.internal_date)) / 86400.0)) AS recency,
     greatest(0.2, least(4.0, 1
       + 0.5 * (CASE WHEN coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Flagged']::text[] THEN 1 ELSE 0 END)

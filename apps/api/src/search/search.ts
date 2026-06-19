@@ -1,6 +1,7 @@
 import type { PgPool } from "../db.js";
 import type { WindowStatus } from "../types.js";
 import { compileSearch } from "./compile.js";
+import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
@@ -103,6 +104,10 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
   const offset = Math.max(0, request.offset ?? 0);
   const freeText = parsed.freeText;
   const hasText = freeText.trim() !== "";
+  // Recall branches: fuzzy matches the (possibly misspelled) significant tokens;
+  // concept widens the tsquery with curated synonyms. Both no-op when empty.
+  const terms = hasText ? significantTerms(freeText) : [];
+  const synonyms = terms.length > 0 ? expandConcepts(terms) : [];
 
   const requestedIds = request.accounts && request.accounts !== "all" ? request.accounts : null;
 
@@ -111,6 +116,9 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
     await client.query("BEGIN");
     await client.query("SET LOCAL transaction_read_only = on");
     await client.query("SET LOCAL statement_timeout = '15s'");
+    // Fuzzy recall trips the trigram index via OPERATOR(<%); relax the default
+    // word-similarity threshold so a transposed/misspelled term still matches.
+    if (terms.length > 0) await client.query("SET LOCAL pg_trgm.word_similarity_threshold = 0.4");
 
     let accountFilterIds: string[] | null = null;
     if (parsed.accounts.length > 0) {
@@ -143,7 +151,9 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
         offset,
         snippet: request.snippet ?? true,
         includeBody: request.includeBody ?? false,
-        groupByThread: request.groupByThread ?? true
+        groupByThread: request.groupByThread ?? true,
+        terms,
+        synonyms
       });
       const result = await client.query<ResultRow>(compiled.text, compiled.values);
       rows = result.rows;
