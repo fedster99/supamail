@@ -16,18 +16,27 @@ a reproducible harness, and gated in CI.
   message) and 28 queries, each tagged with a category and the message ids that
   *should* be retrieved (ground truth). Operator queries derive their ground
   truth from the corpus so they stay correct as it grows.
-- **Metrics:** `apps/api/src/eval/metrics.ts` — standard IR metrics
-  (precision@k, recall@k, MRR, nDCG@k, success@k), unit-tested with no database.
+- **Metrics:** `apps/api/src/eval/metrics.ts` — IR metrics (precision@k, recall@k,
+  MRR, **nDCG@3/@10 with exponential graded gain `2^g−1`**, success@1/@10),
+  unit-tested with no database. **Significance** (`significance.ts`): paired
+  permutation test + bootstrap 95% CI, fixed-seed (deterministic).
 - **Runner:** `apps/api/src/eval/run.ts` (`evaluateSearch`) seeds the corpus into
-  an isolated account, runs every query through the real `searchMessages`, scores
-  it, and deletes the account. Side-effect free.
+  an isolated account against a **frozen clock** (`EVAL_NOW`) with **deterministic
+  message UUIDs**, runs every query through the real `searchMessages`, scores it
+  with graded judgments, runs the **anti-regression guard** sentinels, and deletes
+  the account. Byte-reproducible run-to-run. `compareSearch` A/Bs the recall
+  branches against the lexical-only baseline on identical data.
 - **CLI:** `pnpm --filter @supamail/api eval:search` spins a disposable Postgres
-  (or uses `DATABASE_URL`), applies the migrations, and prints a scorecard — a
-  human summary to stderr and the full JSON scorecard to stdout.
+  (or uses `DATABASE_URL`), applies migrations, and prints a scorecard (human
+  summary to stderr, JSON to stdout). `eval:search --compare` prints the A/B
+  significance table (Δ, CI, p-value per category).
 - **Regression gate:** `apps/api/src/__tests__/search-quality.live-db.test.ts`
-  runs in the `Live DB Reliability` CI gate and fails if the strong categories
-  slip. Typo and semantic are intentionally not gated — they are what the goal
-  raises.
+  runs in the `Live DB Reliability` CI gate. Beyond the absolute smoke floors it
+  now asserts (a) the guard sentinels return nothing, and (b) **no category is
+  significantly worse than the lexical baseline** (paired permutation test) — so a
+  real move is told from noise rather than read off a small-n mean. Typo/semantic
+  stay out of the floor (the goal raises them); the guard is the precision
+  backstop.
 
 Run it:
 
@@ -101,12 +110,16 @@ the quality gate.
 > categories already at 0.91–1.00.**
 
 **Status: met (2026-06-19).** Phase 1 (trigram fuzzy + concept recall, below)
-took the headline to **nDCG@10 0.953 / Recall@10 0.953**, closing semantic
-(0.00→0.98) and most of typo (0.00→0.65) with zero regression. The harness is
-still the small synthetic corpus, so this is a category-level signal, not a
-production-trustworthy bar — that is what [`search-eval-roadmap.md`](search-eval-roadmap.md)
-addresses. Phase 2 embeddings remain the durable answer for open-ended semantics
-beyond the curated thesaurus.
+closed semantic (0.00→0.98) and most of typo (0.00→0.65) with zero regression.
+Under the now-graded, frozen-clock eval the headline is **nDCG@10 0.944 /
+Recall@10 0.953**, and the A/B significance run (`eval:search --compare`) shows
+the recall branches add **+21.2 nDCG@10 points, 95% CI [8.9, 35.4], p=0.004**
+over the lexical-only baseline with no category significantly worse. The harness
+is still the small synthetic corpus, so even this is a category-level signal, not
+a production bar — the trustworthiness upgrades that got us here (graded relevance,
+reproducibility, significance, guards) are tracked in
+[`search-eval-roadmap.md`](search-eval-roadmap.md). Phase 2 embeddings remain the
+durable answer for open-ended semantics beyond the curated thesaurus.
 
 Concrete, independently measurable targets (re-run `eval:search` after each):
 

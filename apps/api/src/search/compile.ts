@@ -30,6 +30,9 @@ export interface CompileOptions {
   /** Curated concept synonyms for the OR-widened semantic branch. Empty disables
    *  concept retrieval. */
   synonyms: string[];
+  /** Frozen clock for recency + relative-date filters (ISO timestamp). null uses
+   *  SQL `now()` (production); the eval pins it so scorecards are reproducible. */
+  now: string | null;
 }
 
 export interface CompiledQuery {
@@ -50,13 +53,14 @@ function escapeLike(value: string): string {
 }
 
 /** Resolve a date filter value to a SQL timestamp expression. Relative values
- * (`7d`) become `now() - (n * interval '1 day')` so the parser stays clock-free;
- * absolute values are bound and cast. */
-function dateExpr(value: string, pb: Params): string {
+ * (`7d`) become `<now> - (n * interval '1 day')` so the parser stays clock-free;
+ * absolute values are bound and cast. `nowExpr` is `now()` in production and a
+ * frozen instant under the eval, so relative-date filters are reproducible too. */
+function dateExpr(value: string, pb: Params, nowExpr: string): string {
   if (isRelativeDate(value)) {
     const amount = Number.parseInt(value.slice(0, -1), 10);
     const unit = RELATIVE_UNIT[value.slice(-1)] ?? "1 day";
-    return `(now() - (${pb.add(amount)} * interval '${unit}'))`;
+    return `(${nowExpr} - (${pb.add(amount)} * interval '${unit}'))`;
   }
   return `${pb.add(value)}::timestamptz`;
 }
@@ -90,7 +94,7 @@ function filetypePredicate(value: string, pb: Params): string {
   }
 }
 
-function filterPredicate(filter: SearchFilter, pb: Params): string {
+function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): string {
   const negate = (expr: string): string => (("negated" in filter && filter.negated) ? `NOT (${expr})` : expr);
 
   switch (filter.kind) {
@@ -161,7 +165,7 @@ function filterPredicate(filter: SearchFilter, pb: Params): string {
     }
     case "date": {
       const op = filter.op === "after" ? ">=" : "<";
-      return negate(`m.internal_date ${op} ${dateExpr(filter.value, pb)}`);
+      return negate(`m.internal_date ${op} ${dateExpr(filter.value, pb, nowExpr)}`);
     }
     case "size": {
       const op = filter.op === "larger" ? ">" : "<";
@@ -217,6 +221,9 @@ export function compileSearch(
   opts: CompileOptions
 ): CompiledQuery {
   const pb = new Params();
+  // Frozen clock: production passes null → SQL now(); the eval pins an instant so
+  // recency and relative-date filters are byte-reproducible run-to-run.
+  const nowExpr = opts.now ? `${pb.add(opts.now)}::timestamptz` : "now()";
   const hasText = opts.hasText && freeText.trim() !== "";
   const qParam = hasText ? pb.add(freeText) : null;
   const tsq = qParam ? `websearch_to_tsquery('english', public.f_unaccent(${qParam}))` : null;
@@ -275,7 +282,7 @@ export function compileSearch(
     where.push(recall.length > 1 ? `(${recall.join("\n         OR ")})` : recall[0]);
   }
   for (const filter of filters) {
-    where.push(filterPredicate(filter, pb));
+    where.push(filterPredicate(filter, pb, nowExpr));
   }
 
   const limitParam = pb.add(opts.limit + 1);
@@ -333,7 +340,7 @@ scored AS (
           THEN (0.6 * c.lex_header + 0.2 * c.lex_body)
           ELSE (0.3 * c.fuzz_sim + 0.2 * (0.6 * c.sem_header + 0.2 * c.sem_body))
      END) AS text_rel,
-    exp(-0.0231049 * (extract(epoch FROM (now() - c.internal_date)) / 86400.0)) AS recency,
+    exp(-0.0231049 * (extract(epoch FROM (${nowExpr} - c.internal_date)) / 86400.0)) AS recency,
     greatest(0.2, least(4.0, 1
       + 0.5 * (CASE WHEN coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Flagged']::text[] THEN 1 ELSE 0 END)
       + 0.3 * (CASE WHEN NOT (coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Seen']::text[]) THEN 1 ELSE 0 END)

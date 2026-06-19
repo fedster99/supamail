@@ -110,6 +110,15 @@ treated as a stable number.
 Ordered by **credibility impact ÷ effort**. Each phase is independently shippable
 and self-verifying. Phases 0–2 are pure-deterministic and need no new infra.
 
+> **Status (2026-06-19): Phases 0–2 shipped.** The eval is now reproducible
+> (frozen `EVAL_NOW` + deterministic message UUIDs → byte-identical scorecards),
+> graded (exponential-gain nDCG with a 0–3 rubric), guarded (junk-return
+> sentinels), and **significance-gated** (paired permutation test + bootstrap 95%
+> CI; `pnpm eval:search --compare`). The CI gate now asserts "no category
+> significantly worse than the lexical baseline" rather than an absolute floor.
+> Phases 3–6 (latency-at-scale, agent-payload, `sync_trust` assertions, trend
+> ledger, LLM judge, 10k–100k corpus) remain open.
+
 ### Phase 0 — Stop lying about the headline (hours; do immediately)
 - **Freeze the clock.** Introduce an `EVAL_NOW` constant; seed `internal_date`
   relative to it and compute recency against the same frozen instant instead of

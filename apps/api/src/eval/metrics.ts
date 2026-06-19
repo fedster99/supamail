@@ -41,13 +41,19 @@ export function reciprocalRank(results: string[], relevant: Judgments): number {
   return 0;
 }
 
-/** Discounted cumulative gain over the top-k, using graded relevance. */
+/** Exponential relevance gain `2^g - 1`. Rewards a grade-3 doc 7×, a grade-2 doc
+ *  3×, a grade-1 doc 1× — so swapping two relevant docs of *different* grade moves
+ *  nDCG (linear gain barely does). gain(1)=1, so an all-grade-1 corpus is unchanged. */
+function gain(grade: number): number {
+  return grade > 0 ? Math.pow(2, grade) - 1 : 0;
+}
+
+/** Discounted cumulative gain over the top-k, using exponential graded relevance. */
 export function dcgAtK(results: string[], relevant: Judgments, k: number): number {
   let dcg = 0;
   const topK = results.slice(0, k);
   for (let i = 0; i < topK.length; i += 1) {
-    const grade = relevant.get(topK[i]) ?? 0;
-    if (grade > 0) dcg += grade / Math.log2(i + 2);
+    dcg += gain(relevant.get(topK[i]) ?? 0) / Math.log2(i + 2);
   }
   return dcg;
 }
@@ -56,7 +62,7 @@ export function dcgAtK(results: string[], relevant: Judgments, k: number): numbe
 export function ndcgAtK(results: string[], relevant: Judgments, k: number): number {
   const ideal = [...relevant.values()].sort((a, b) => b - a).slice(0, k);
   let idcg = 0;
-  for (let i = 0; i < ideal.length; i += 1) idcg += ideal[i] / Math.log2(i + 2);
+  for (let i = 0; i < ideal.length; i += 1) idcg += gain(ideal[i]) / Math.log2(i + 2);
   if (idcg === 0) return 0;
   return dcgAtK(results, relevant, k) / idcg;
 }
@@ -72,7 +78,12 @@ export interface QueryMetrics {
   precision_at_10: number;
   recall_at_10: number;
   reciprocal_rank: number;
+  /** nDCG at a small cutoff — on a 31-doc index, @3 actually exercises ordering
+   *  among the relevant docs where @10 saturates. */
+  ndcg_at_3: number;
   ndcg_at_10: number;
+  /** Did the single best answer come first? The agent's top-1 is what matters. */
+  success_at_1: number;
   success_at_10: number;
 }
 
@@ -83,7 +94,9 @@ export function scoreQuery(results: string[], relevant: Judgments): QueryMetrics
     precision_at_10: precisionAtK(results, relevant, 10),
     recall_at_10: recallAtK(results, relevant, 10),
     reciprocal_rank: reciprocalRank(results, relevant),
+    ndcg_at_3: ndcgAtK(results, relevant, 3),
     ndcg_at_10: ndcgAtK(results, relevant, 10),
+    success_at_1: successAtK(results, relevant, 1),
     success_at_10: successAtK(results, relevant, 10)
   };
 }
@@ -95,7 +108,9 @@ export function meanMetrics(all: QueryMetrics[]): QueryMetrics {
     "precision_at_10",
     "recall_at_10",
     "reciprocal_rank",
+    "ndcg_at_3",
     "ndcg_at_10",
+    "success_at_1",
     "success_at_10"
   ];
   const out = {} as QueryMetrics;

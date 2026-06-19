@@ -106,7 +106,9 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
   const hasText = freeText.trim() !== "";
   // Recall branches: fuzzy matches the (possibly misspelled) significant tokens;
   // concept widens the tsquery with curated synonyms. Both no-op when empty.
-  const terms = hasText ? significantTerms(freeText) : [];
+  // `recall: false` (the A/B baseline) forces the lexical-only path.
+  const recallEnabled = request.recall ?? true;
+  const terms = recallEnabled && hasText ? significantTerms(freeText) : [];
   const synonyms = terms.length > 0 ? expandConcepts(terms) : [];
 
   const requestedIds = request.accounts && request.accounts !== "all" ? request.accounts : null;
@@ -153,7 +155,8 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
         includeBody: request.includeBody ?? false,
         groupByThread: request.groupByThread ?? true,
         terms,
-        synonyms
+        synonyms,
+        now: request.now ?? null
       });
       const result = await client.query<ResultRow>(compiled.text, compiled.values);
       rows = result.rows;

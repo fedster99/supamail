@@ -22,7 +22,8 @@ const baseCompileOptions: CompileOptions = {
   includeBody: false,
   groupByThread: true,
   terms: [],
-  synonyms: []
+  synonyms: [],
+  now: null
 };
 
 describe("tokenize", () => {

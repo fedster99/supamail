@@ -63,7 +63,8 @@ const baseOptions: CompileOptions = {
   includeBody: false,
   groupByThread: true,
   terms: [],
-  synonyms: []
+  synonyms: [],
+  now: null
 };
 
 describe("compileSearch recall branches", () => {

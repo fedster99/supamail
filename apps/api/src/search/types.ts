@@ -108,6 +108,18 @@ export interface SearchRequest {
    * contract that already exposes it.
    */
   semantic?: boolean;
+  /**
+   * Frozen clock (ISO timestamp) for recency scoring and relative-date filters.
+   * Omitted in production (uses SQL `now()`); the eval pins it so scorecards are
+   * reproducible and ranking ties are deterministic.
+   */
+  now?: string;
+  /**
+   * Enable the trigram-fuzzy + concept recall branches. Defaults to true. Set
+   * false for the lexical-only baseline in an A/B eval (the candidate runs with
+   * it true), so the recall branches' effect is measured on identical data.
+   */
+  recall?: boolean;
 }
 
 export interface SearchResultIdentity {
