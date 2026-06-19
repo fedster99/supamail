@@ -15,6 +15,7 @@ const accountSettingsMigrationPath = resolve(process.cwd(), "supabase/migrations
 const progressRollupMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0005_progress_rollup.sql");
 const historyLaneMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0006_history_lane_state.sql");
 const optionalRawMimeMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0007_optional_raw_mime.sql");
+const searchLayerMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0008_search_layer.sql");
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -94,9 +95,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0007_optional_raw_mime");
+    expect(version).toBe("0008_search_layer");
     expect(manifest).toEqual({
-      schemaVersion: "0007_optional_raw_mime",
+      schemaVersion: "0008_search_layer",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -104,7 +105,8 @@ describe("initial schema", () => {
         { id: "0004_account_lane_settings", file: "0004_account_lane_settings.sql" },
         { id: "0005_progress_rollup", file: "0005_progress_rollup.sql" },
         { id: "0006_history_lane_state", file: "0006_history_lane_state.sql" },
-        { id: "0007_optional_raw_mime", file: "0007_optional_raw_mime.sql" }
+        { id: "0007_optional_raw_mime", file: "0007_optional_raw_mime.sql" },
+        { id: "0008_search_layer", file: "0008_search_layer.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -191,6 +193,60 @@ describe("initial schema", () => {
     expect(sql).toContain("ALTER TABLE public.imap_message_bodies");
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
     expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
+  });
+
+  it("adds the search layer as an additive, idempotent, pure-core migration", async () => {
+    const sql = await readFile(searchLayerMigrationPath, "utf8");
+
+    // Extensions land in the extensions schema, matching the 0001 convention.
+    expect(sql).toContain("CREATE EXTENSION IF NOT EXISTS unaccent  WITH SCHEMA extensions");
+    expect(sql).toContain("CREATE EXTENSION IF NOT EXISTS pg_trgm   WITH SCHEMA extensions");
+    expect(sql).toContain("CREATE EXTENSION IF NOT EXISTS btree_gin WITH SCHEMA extensions");
+
+    // IMMUTABLE wrappers are required: unaccent() and array_to_string() are not
+    // IMMUTABLE and cannot otherwise live in a generated column / expression index.
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.f_unaccent(text)");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.f_array_to_text(text[])");
+
+    // Two STORED generated tsvector columns (header on messages, body on bodies),
+    // never a cross-table trigger.
+    expect(sql).toContain("header_fts tsvector");
+    expect(sql).toContain("body_fts tsvector");
+    expect(sql).toContain("GENERATED ALWAYS AS");
+    expect(sql).toContain("STORED");
+    expect(sql).not.toContain("CREATE TRIGGER");
+
+    // Account-scoped, soft-delete-partial FTS GIN via btree_gin.
+    expect(sql).toContain("USING gin (account_id, header_fts)");
+    expect(sql).toContain("WHERE deleted_in_provider = false");
+
+    // BLOCKER FIX: the body source is capped at 128KB, not 1,000,000 chars, so a
+    // pathological body cannot overflow the output tsvector and ERROR storeBody.
+    expect(sql).toContain("131072");
+    expect(sql).not.toContain("1000000");
+
+    // BLOCKER FIX: emails are stored verbatim, so raw email-array GINs would
+    // silently miss mixed-case addresses. They must not exist; recipient matching
+    // goes through lowercased trigram + EXISTS(unnest ...). Only the flags array
+    // GIN (case-exact tokens) is legitimate.
+    expect(sql).toContain("USING gin (flags)");
+    expect(sql).not.toContain("USING gin (to_emails)");
+    expect(sql).not.toContain("USING gin (cc_emails)");
+
+    // Tier 2 (pgvector) is opt-in and self-gated: it must no-op when vector is
+    // absent and must never install the extension itself.
+    expect(sql).toContain("IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_message_embeddings");
+    expect(sql).not.toContain("CREATE EXTENSION IF NOT EXISTS vector");
+
+    // Transaction-safe: the whole public set runs in one implicit transaction, so
+    // no index may be built CONCURRENTLY (illegal in a transaction block).
+    expect(sql).not.toMatch(/CREATE\s+INDEX\s+CONCURRENTLY/i);
+    expect(sql).not.toMatch(/REFRESH\s+MATERIALIZED\s+VIEW\s+CONCURRENTLY/i);
+
+    // Pure core: no control-plane coupling.
+    expect(sql).not.toMatch(/stripe/i);
     expect(sql).not.toContain("tenant");
   });
 

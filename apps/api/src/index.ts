@@ -7,6 +7,7 @@ export * from "./mime.js";
 export * from "./provider-profiles.js";
 export * from "./repository.js";
 export * from "./runtime.js";
+export * from "./search/index.js";
 export * from "./sync-engine.js";
 export * from "./target-scheduler.js";
 export * from "./types.js";
