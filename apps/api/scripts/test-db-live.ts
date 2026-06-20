@@ -165,7 +165,11 @@ async function main(): Promise<void> {
       "src/__tests__/sync-engine.integration.test.ts",
       "src/__tests__/sync-engine.live-db.test.ts",
       "src/__tests__/search.live-db.test.ts",
-      "src/__tests__/search-quality.live-db.test.ts"
+      "src/__tests__/search-quality.live-db.test.ts",
+      "src/mcp/tools/read-message.live-db.test.ts",
+      "src/mcp/tools/read-thread.live-db.test.ts",
+      "src/mcp/tools/list-folders.live-db.test.ts",
+      "src/mcp/tools/draft-reply.live-db.test.ts"
     ], env);
 
     console.log("[test:db:live] running spec conformance");

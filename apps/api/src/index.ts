@@ -3,6 +3,7 @@ export * from "./crypto.js";
 export * from "./db.js";
 export * from "./imap-client.js";
 export * from "./locks.js";
+export * from "./mcp/index.js";
 export * from "./mime.js";
 export * from "./provider-profiles.js";
 export * from "./repository.js";

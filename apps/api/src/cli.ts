@@ -6,6 +6,7 @@ import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { searchMessages } from "./search/index.js";
 import type { SearchRequest, SearchSort } from "./search/index.js";
+import { runDraftReply, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
 import type { WindowStatus } from "./types.js";
 
 const program = new Command();
@@ -151,6 +152,66 @@ program
 
     const response = await searchMessages(pool, request);
     console.log(JSON.stringify(response, null, 2));
+  });
+
+program
+  .command("message <messageId>")
+  .description("Read one mirrored message (read-only, JSON output)")
+  .option("--headers", "Include parsed select headers")
+  .option("--include-quoted", "Keep the quoted reply tail + signature")
+  .action(async (messageId: string, options) => {
+    const result = await runReadMessage(pool, {
+      message_id: messageId,
+      include_headers: Boolean(options.headers),
+      include_quoted: Boolean(options.includeQuoted)
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("thread [messageId]")
+  .description("Read a full email thread, seeded from a message id (read-only, JSON output)")
+  .option("--thread-id <id>", "Select the thread directly by provider_thread_id")
+  .option("--account <id>", "Scope the thread to one account UUID")
+  .option("--include-quoted", "Keep quoted reply tails + signatures in each body")
+  .option("--max-messages <n>", "Max messages to return, newest kept when over the cap")
+  .action(async (messageId: string | undefined, options) => {
+    if (!messageId && !options.threadId) {
+      process.stderr.write("thread requires a messageId argument or --thread-id <id>.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await runReadThread(pool, {
+      message_id: messageId ?? undefined,
+      thread_id: options.threadId,
+      account: options.account,
+      include_quoted: Boolean(options.includeQuoted),
+      max_messages: options.maxMessages === undefined ? undefined : Number(options.maxMessages)
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("folders")
+  .description("List mailbox folders with live counts (read-only, JSON output)")
+  .option("--account <id>", "Scope to one account UUID")
+  .action(async (options) => {
+    const result = await runListFolders(pool, { account: options.account });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("draft-reply <sourceMessageId>")
+  .description("Produce a reply draft from a source message (produce-only, never sends)")
+  .requiredOption("--body <text>", "The reply text the agent wrote")
+  .option("--reply-all", "Include the original To+Cc (minus self) as Cc")
+  .action(async (sourceMessageId: string, options) => {
+    const result = await runDraftReply(pool, {
+      source_message_id: sourceMessageId,
+      body: options.body,
+      reply_all: Boolean(options.replyAll)
+    });
+    console.log(JSON.stringify(result, null, 2));
   });
 
 try {
