@@ -68,9 +68,13 @@ const baseOptions: CompileOptions = {
 };
 
 describe("compileSearch recall branches", () => {
-  it("emits the fuzzy trigram branch and is_primary tiering when terms are present", () => {
+  it("emits the index-using fuzzy trigram branch and is_primary tiering when terms are present", () => {
     const compiled = compileSearch("invioce", [], { ...baseOptions, terms: ["invioce"] });
-    expect(compiled.text).toContain("OPERATOR(extensions.<%)");
+    // per-term `lower(col) %> term` (constant) so the gin_trgm_ops index is used;
+    // candidates are collected per-index via UNION, not a cross-table OR.
+    expect(compiled.text).toContain("OPERATOR(extensions.%>)");
+    expect(compiled.text).toContain("cand_ids AS (");
+    expect(compiled.text).toContain("UNION");
     expect(compiled.text).toContain("word_similarity");
     expect(compiled.text).toContain("is_primary");
     expect(compiled.values).toContain("invioce");
@@ -88,9 +92,12 @@ describe("compileSearch recall branches", () => {
     expect(compiled.values).toContain("hotel");
   });
 
-  it("stays on the plain lexical path (no recall branches) when terms/synonyms are empty", () => {
+  it("uses the header∪body UNION but no fuzzy/concept branch when terms/synonyms are empty", () => {
     const compiled = compileSearch("invoice", [], baseOptions);
-    expect(compiled.text).not.toContain("OPERATOR(extensions.<%)");
+    // any free-text query collects candidates per-index via UNION...
+    expect(compiled.text).toContain("cand_ids AS (");
+    // ...but with no terms there is no trigram-fuzzy branch.
+    expect(compiled.text).not.toContain("OPERATOR(extensions.%>)");
     // is_primary is always projected so the order clause is stable.
     expect(compiled.text).toContain("is_primary");
   });
