@@ -243,17 +243,26 @@ export function compileSearch(
   const termsP = fuzzyTerms.length > 0 ? pb.add(fuzzyTerms) : null;
   const recipientsText =
     `lower(public.f_array_to_text(coalesce(m.to_emails,'{}'::text[]) || coalesce(m.cc_emails,'{}'::text[])))`;
-  const fuzzyGate = termsP
-    ? `EXISTS (SELECT 1 FROM unnest(${termsP}::text[]) qt WHERE ` +
-      `qt OPERATOR(extensions.<%) lower(coalesce(m.subject,'')) ` +
-      `OR qt OPERATOR(extensions.<%) lower(coalesce(m.from_name,'')) ` +
-      `OR qt OPERATOR(extensions.<%) lower(coalesce(m.from_email,'')) ` +
-      `OR qt OPERATOR(extensions.<%) ${recipientsText})`
+  // Fuzzy candidate gate: ONE predicate per term as a bound CONSTANT, so each
+  // `lower(col) %> term` can use the 0007 gin_trgm_ops index. An unnest()/EXISTS
+  // form forces a seq scan (the term isn't a constant the planner can probe with).
+  // Columns match the index expressions exactly: lower(subject)/from_name/from_email
+  // and the recipients f_array_to_text expression.
+  const fuzzyIdGate = fuzzyTerms.length > 0
+    ? "(" + fuzzyTerms.map((t) => {
+        const p = pb.add(t);
+        return `lower(m.subject) OPERATOR(extensions.%>) ${p} ` +
+          `OR lower(m.from_name) OPERATOR(extensions.%>) ${p} ` +
+          `OR lower(m.from_email) OPERATOR(extensions.%>) ${p} ` +
+          `OR ${recipientsText} OPERATOR(extensions.%>) ${p}`;
+      }).join("\n    OR ") + ")"
     : null;
+  // Fuzzy score for ranking — computed over the BOUNDED candidate set, so unnest is
+  // fine here (no index needed).
   const fuzzSim = termsP
     ? `(SELECT coalesce(max(greatest(` +
-      `extensions.word_similarity(qt, lower(coalesce(m.subject,''))), ` +
-      `extensions.word_similarity(qt, lower(coalesce(m.from_name,''))))), 0) ` +
+      `extensions.word_similarity(qt, lower(m.subject)), ` +
+      `extensions.word_similarity(qt, lower(m.from_name)))), 0) ` +
       `FROM unnest(${termsP}::text[]) qt)`
     : "0";
 
@@ -265,25 +274,22 @@ export function compileSearch(
   const semBody = expandedTsq
     ? `(CASE WHEN b.body_fts IS NOT NULL THEN ts_rank_cd(b.body_fts, ${expandedTsq}, 2) ELSE 0 END)`
     : "0";
-  const semGate = expandedTsq ? `(m.header_fts @@ ${expandedTsq} OR b.body_fts @@ ${expandedTsq})` : null;
 
-  const where: string[] = [];
-  where.push(opts.includeDeleted ? "TRUE" : "m.deleted_in_provider = false");
+  // Non-FTS scoping, applied in EVERY candidate branch so the partial FTS/trigram
+  // indexes (which require deleted_in_provider = false) stay usable.
+  const scope: string[] = [];
+  scope.push(opts.includeDeleted ? "TRUE" : "m.deleted_in_provider = false");
   if (opts.accountIds && opts.accountIds.length > 0) {
-    where.push(`m.account_id = ANY(${pb.add(opts.accountIds)}::uuid[])`);
+    scope.push(`m.account_id = ANY(${pb.add(opts.accountIds)}::uuid[])`);
   }
   if (opts.windowStatus && opts.windowStatus.length > 0) {
-    where.push(`m.window_status = ANY(${pb.add(opts.windowStatus)}::text[])`);
+    scope.push(`m.window_status = ANY(${pb.add(opts.windowStatus)}::text[])`);
   }
-  if (tsq) {
-    const recall = [`(m.header_fts @@ ${tsq} OR b.body_fts @@ ${tsq})`];
-    if (fuzzyGate) recall.push(fuzzyGate);
-    if (semGate) recall.push(semGate);
-    where.push(recall.length > 1 ? `(${recall.join("\n         OR ")})` : recall[0]);
-  }
-  for (const filter of filters) {
-    where.push(filterPredicate(filter, pb, nowExpr));
-  }
+  const scopeSql = scope.join("\n      AND ");
+  // Structured operator predicates (from:/folder:/has:/date:…) — applied once over
+  // the bounded candidate set (they reference m, the joined body b, or self-contained
+  // attachment EXISTS subqueries).
+  const structured = filters.map((filter) => filterPredicate(filter, pb, nowExpr));
 
   const limitParam = pb.add(opts.limit + 1);
   const offsetParam = pb.add(opts.offset);
@@ -313,9 +319,7 @@ grouped AS (
     : "";
   const pageSource = opts.groupByThread ? "grouped" : "ranked";
 
-  const text = `
-WITH cand AS (
-  SELECT
+  const candProjection = `SELECT
     m.id, m.account_id, m.folder_path, m.uidvalidity, m.uid,
     m.subject, m.from_email, m.from_name, m.to_emails, m.flags,
     m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
@@ -324,11 +328,54 @@ WITH cand AS (
     ${lexBody} AS lex_body,
     ${fuzzSim} AS fuzz_sim,
     ${semHeader} AS sem_header,
-    ${semBody} AS sem_body
+    ${semBody} AS sem_body`;
+
+  // Candidate retrieval. A single OR across imap_messages.header_fts and
+  // imap_message_bodies.body_fts cannot use either GIN — the planner seq-scans BOTH
+  // tables (~23s at 22k rows). Instead collect candidate ids per-index via UNION
+  // (header GIN ∪ body GIN ∪ trigram ∪ concept), then hydrate + score the bounded
+  // set. With no free text, keep a plain scan: structured predicates use their own
+  // b-tree indexes and there is no cross-table FTS OR.
+  let candCte: string;
+  if (tsq) {
+    // Cap each branch's candidate pool by recency. The scorer (ts_rank_cd over
+    // body_fts, fuzz_sim, etc.) runs per candidate, so a common/short term that
+    // matches thousands of rows would be slow to score even though retrieval is
+    // index-fast. A bounded most-recent pool keeps scoring interactive; exact
+    // matches are usually few (under the cap) so they are unaffected.
+    const cap = (sel: string): string => `(${sel}\n     ORDER BY m.internal_date DESC LIMIT 400)`;
+    const idBranches: string[] = [
+      cap(`SELECT m.id FROM public.imap_messages m WHERE ${scopeSql} AND m.header_fts @@ ${tsq}`),
+      cap(`SELECT bb.message_id AS id FROM public.imap_message_bodies bb JOIN public.imap_messages m ON m.id = bb.message_id WHERE ${scopeSql} AND bb.body_fts @@ ${tsq}`)
+    ];
+    if (fuzzyIdGate) {
+      idBranches.push(cap(`SELECT m.id FROM public.imap_messages m WHERE ${scopeSql} AND ${fuzzyIdGate}`));
+    }
+    if (expandedTsq) {
+      idBranches.push(cap(`SELECT m.id FROM public.imap_messages m WHERE ${scopeSql} AND m.header_fts @@ ${expandedTsq}`));
+      idBranches.push(cap(`SELECT bb.message_id AS id FROM public.imap_message_bodies bb JOIN public.imap_messages m ON m.id = bb.message_id WHERE ${scopeSql} AND bb.body_fts @@ ${expandedTsq}`));
+    }
+    const candWhere = structured.length > 0 ? `\n  WHERE ${structured.join("\n    AND ")}` : "";
+    candCte = `cand_ids AS (
+  ${idBranches.join("\n  UNION\n  ")}
+),
+cand AS (
+  ${candProjection}
+  FROM public.imap_messages m
+  JOIN cand_ids ci ON ci.id = m.id
+  LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id${candWhere}
+)`;
+  } else {
+    candCte = `cand AS (
+  ${candProjection}
   FROM public.imap_messages m
   LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-  WHERE ${where.join("\n    AND ")}
-),
+  WHERE ${[...scope, ...structured].join("\n    AND ")}
+)`;
+  }
+
+  const text = `
+WITH ${candCte},
 scored AS (
   SELECT
     c.*,
