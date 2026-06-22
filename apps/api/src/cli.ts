@@ -127,18 +127,24 @@ program
   .description("Search mirrored email (read-only, JSON output)")
   .option("--account <id>", "Scope to account UUID (repeatable)", collect, [])
   .option("--from <addr>", "Sender contains (use @domain for the sender domain)")
-  .option("--to <addr>", "Recipient (to/cc) contains")
+  .option("--to <addr>", "To-recipient contains (cc/bcc excluded)")
+  .option("--cc <addr>", "Cc-recipient contains")
+  .option("--bcc <addr>", "Bcc-recipient contains (only on mail this mailbox sent)")
+  .option("--any-email <addr>", "Any address field contains (from/to/cc/bcc)")
   .option("--subject <text>", "Subject contains")
   .option("--body <text>", "Body full-text match")
-  .option("--folder <path>", "Folder path (in:)")
+  .option("--folder <path>", "Folder path (in:; trailing /* matches the subtree)")
   .option("--thread <id>", "Provider thread id")
   .option("--filename <glob>", "Attachment filename glob (e.g. *.pdf)")
   .option("--filetype <class>", "Attachment class (pdf,image,video,audio,doc,sheet,zip,text)")
-  .option("--is <flag>", "Flag state read|unread|flagged|answered|draft (repeatable)", collect, [])
+  .option("--is <flag>", "Flag state read|unread|flagged|starred|answered|draft (repeatable)", collect, [])
+  .option("--unread", "Only unread messages (shortcut for --is unread)")
+  .option("--starred", "Only starred/flagged messages (shortcut for --is starred)")
   .option("--has-attachment", "Only messages with an attachment")
   .option("--without-attachment", "Only messages without an attachment")
-  .option("--after <when>", "After date (ISO like 2026-01-01 or relative like 7d)")
-  .option("--before <when>", "Before date (ISO or relative)")
+  .option("--after <when>", "Received on/after (ISO like 2026-01-01 or relative like 7d)")
+  .option("--since <when>", "Alias for --after")
+  .option("--before <when>", "Received before (ISO or relative)")
   .option("--larger <size>", "Larger than (e.g. 2mb, 500kb)")
   .option("--smaller <size>", "Smaller than")
   .option("--window <lane>", "Lane IN_WINDOW|EXPIRED|HISTORICAL (repeatable)", collect, [])
@@ -159,17 +165,22 @@ program
     };
     addOp("from", options.from);
     addOp("to", options.to);
+    addOp("cc", options.cc);
+    addOp("bcc", options.bcc);
+    addOp("anyemail", options.anyEmail);
     addOp("subject", options.subject);
     addOp("body", options.body);
     addOp("in", options.folder);
     addOp("thread", options.thread);
     addOp("filename", options.filename);
     addOp("filetype", options.filetype);
-    addOp("after", options.after);
+    addOp("after", options.after ?? options.since);
     addOp("before", options.before);
     addOp("larger", options.larger);
     addOp("smaller", options.smaller);
     for (const flag of (options.is as string[]) ?? []) qParts.push(`is:${flag}`);
+    if (options.unread) qParts.push("is:unread");
+    if (options.starred) qParts.push("is:starred");
     if (options.hasAttachment) qParts.push("has:attachment");
     if (options.withoutAttachment) qParts.push("-has:attachment");
 

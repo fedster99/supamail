@@ -5,7 +5,8 @@ import type { WindowStatus } from "../types.js";
 /** Operator fields we recognize. A `field:value` token whose field is NOT here
  * (e.g. a bare URL like `http://x`) is treated as free text, not an operator. */
 const KNOWN_OPERATORS = new Set([
-  "from", "to", "cc", "recipient", "participant", "with",
+  "from", "to", "cc", "bcc", "recipient", "participant", "with",
+  "anyemail", "any_email", "any", "email", "address",
   "subject", "subj", "body",
   "in", "folder", "label",
   "thread", "msgid", "message-id",
@@ -142,11 +143,25 @@ export function parseQuery(input: string): ParsedQuery {
         break;
       }
       case "to":
+        filters.push({ kind: "to", value: rawValue.toLowerCase(), negated, raw });
+        break;
       case "cc":
+        filters.push({ kind: "cc", value: rawValue.toLowerCase(), negated, raw });
+        break;
+      case "bcc":
+        filters.push({ kind: "bcc", value: rawValue.toLowerCase(), negated, raw });
+        break;
       case "recipient":
       case "participant":
       case "with":
         filters.push({ kind: "recipient", value: rawValue.toLowerCase(), negated, raw });
+        break;
+      case "anyemail":
+      case "any_email":
+      case "any":
+      case "email":
+      case "address":
+        filters.push({ kind: "anyEmail", value: rawValue.toLowerCase(), negated, raw });
         break;
       case "subject":
       case "subj":
@@ -286,7 +301,10 @@ export function filtersFromStructured(structured: StructuredFilters): SearchFilt
   if (structured.fromDomain) {
     push({ kind: "fromDomain", value: structured.fromDomain.toLowerCase().replace(/^@/, ""), negated: false, raw: `from:@${structured.fromDomain}` });
   }
-  if (structured.to) push({ kind: "recipient", value: structured.to.toLowerCase(), negated: false, raw: `to:${structured.to}` });
+  if (structured.to) push({ kind: "to", value: structured.to.toLowerCase(), negated: false, raw: `to:${structured.to}` });
+  if (structured.cc) push({ kind: "cc", value: structured.cc.toLowerCase(), negated: false, raw: `cc:${structured.cc}` });
+  if (structured.bcc) push({ kind: "bcc", value: structured.bcc.toLowerCase(), negated: false, raw: `bcc:${structured.bcc}` });
+  if (structured.anyEmail) push({ kind: "anyEmail", value: structured.anyEmail.toLowerCase(), negated: false, raw: `anyemail:${structured.anyEmail}` });
   if (structured.subject) push({ kind: "subject", value: structured.subject, negated: false, raw: `subject:${structured.subject}` });
   if (structured.body) push({ kind: "body", value: structured.body, negated: false, raw: `body:${structured.body}` });
   if (structured.folder) push({ kind: "folder", value: structured.folder, negated: false, raw: `in:${structured.folder}` });
@@ -298,6 +316,7 @@ export function filtersFromStructured(structured: StructuredFilters): SearchFilt
   if (structured.isUnread) push({ kind: "flag", value: "\\Seen", negated: true, raw: "is:unread" });
   if (structured.isRead) push({ kind: "flag", value: "\\Seen", negated: false, raw: "is:read" });
   if (structured.isFlagged) push({ kind: "flag", value: "\\Flagged", negated: false, raw: "is:flagged" });
+  if (structured.isStarred) push({ kind: "flag", value: "\\Flagged", negated: false, raw: "is:starred" });
   if (structured.isAnswered) push({ kind: "flag", value: "\\Answered", negated: false, raw: "is:answered" });
   if (structured.isDraft) push({ kind: "flag", value: "\\Draft", negated: false, raw: "is:draft" });
   if (structured.hasAttachment !== undefined) push({ kind: "hasAttachment", negated: !structured.hasAttachment, raw: "has:attachment" });

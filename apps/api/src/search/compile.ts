@@ -112,6 +112,27 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
         `lower(public.f_array_to_text(coalesce(m.to_emails,'{}'::text[]) || coalesce(m.cc_emails,'{}'::text[]))) LIKE ${p}`
       );
     }
+    case "to": {
+      const p = pb.add(`%${escapeLike(filter.value)}%`);
+      return negate(`lower(public.f_array_to_text(coalesce(m.to_emails,'{}'::text[]))) LIKE ${p}`);
+    }
+    case "cc": {
+      const p = pb.add(`%${escapeLike(filter.value)}%`);
+      return negate(`lower(public.f_array_to_text(coalesce(m.cc_emails,'{}'::text[]))) LIKE ${p}`);
+    }
+    case "bcc": {
+      const p = pb.add(`%${escapeLike(filter.value)}%`);
+      return negate(`lower(public.f_array_to_text(coalesce(m.bcc_emails,'{}'::text[]))) LIKE ${p}`);
+    }
+    case "anyEmail": {
+      // from + to + cc + bcc, flattened to one lowercased text blob (Nylas any_email).
+      const p = pb.add(`%${escapeLike(filter.value)}%`);
+      return negate(
+        `lower(coalesce(m.from_email,'') || ' ' || public.f_array_to_text(` +
+          `coalesce(m.to_emails,'{}'::text[]) || coalesce(m.cc_emails,'{}'::text[]) || ` +
+          `coalesce(m.bcc_emails,'{}'::text[]))) LIKE ${p}`
+      );
+    }
     case "subject": {
       const p = pb.add(`%${escapeLike(filter.value.toLowerCase())}%`);
       return negate(`lower(coalesce(m.subject,'')) LIKE ${p}`);

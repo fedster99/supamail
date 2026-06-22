@@ -18,6 +18,10 @@ export type SearchFilter =
   | { kind: "from"; value: string; negated: boolean; raw: string }
   | { kind: "fromDomain"; value: string; negated: boolean; raw: string }
   | { kind: "recipient"; value: string; negated: boolean; raw: string }
+  | { kind: "to"; value: string; negated: boolean; raw: string }
+  | { kind: "cc"; value: string; negated: boolean; raw: string }
+  | { kind: "bcc"; value: string; negated: boolean; raw: string }
+  | { kind: "anyEmail"; value: string; negated: boolean; raw: string }
   | { kind: "subject"; value: string; negated: boolean; raw: string }
   | { kind: "body"; value: string; negated: boolean; raw: string }
   | { kind: "folder"; value: string; negated: boolean; raw: string }
@@ -55,7 +59,16 @@ export interface ParsedQuery {
 export interface StructuredFilters {
   from?: string;
   fromDomain?: string;
+  /** Exact/substring match against the To recipients only (cc/bcc excluded). */
   to?: string;
+  /** Exact/substring match against the Cc recipients only (email-005). */
+  cc?: string;
+  /** Exact/substring match against the Bcc recipients only (email-005). Bcc is
+   *  only populated for mail this mailbox sent (providers strip it on receipt). */
+  bcc?: string;
+  /** Match across every address field: from + to + cc + bcc (email-005). The
+   *  Nylas `any_email` equivalent. */
+  anyEmail?: string;
   subject?: string;
   body?: string;
   folder?: string;
@@ -67,6 +80,8 @@ export interface StructuredFilters {
   isUnread?: boolean;
   isRead?: boolean;
   isFlagged?: boolean;
+  /** Alias for isFlagged (Nylas/Gmail "starred"). */
+  isStarred?: boolean;
   isAnswered?: boolean;
   isDraft?: boolean;
   hasAttachment?: boolean;

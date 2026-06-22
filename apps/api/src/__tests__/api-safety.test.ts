@@ -222,6 +222,14 @@ function buildApp(options: {
     getMessageHeaders: vi.fn(async (id: string, _opts: { basic?: boolean }) => ({ messageId: id, headers: { "message-id": "<m@example.test>" }, source: "mirror" as const })),
     cleanMessageBody: vi.fn(async (id: string, _opts: { includeQuoted?: boolean; maxChars?: number }) => ({ messageId: id, body: "clean", truncated: false }))
   };
+  const search = vi.fn(async (_req: unknown) => ({
+    results: [],
+    page: { limit: 25, offset: 0, returned: 0, has_more: false },
+    sync_trust: { fully_synced: true, results_may_be_incomplete: false, degraded_reasons: [], accounts: [] },
+    parsed_query: { free_text: "", filters: [], sort: "smart" as const, warnings: [] },
+    read_only: true as const,
+    timing_ms: { total: 0 }
+  }));
   const app = createApiApp({
     apiToken: options.apiToken ?? "api-token",
     adminToken: "adminToken" in options ? options.adminToken : "admin-token",
@@ -229,12 +237,13 @@ function buildApp(options: {
     engine,
     applyMigration,
     send: send as never,
+    search: search as never,
     drafts: drafts as never,
     mutations: mutations as never,
     content: content as never
   });
 
-  return { app, repository, engine, applyMigration, send, drafts, mutations, content };
+  return { app, repository, engine, applyMigration, send, search, drafts, mutations, content };
 }
 
 function auth(token = "api-token"): Record<string, string> {
@@ -842,5 +851,66 @@ describe("API safety", () => {
 
     expect(source).toContain('.name("supamail")');
     expect(source).not.toContain('.name("imap-to-supabase")');
+  });
+
+  // email-005: the GET /search read route exposes the same composable filters.
+  it("protects GET /search behind the API token", async () => {
+    const { app, search } = buildApp();
+    const res = await app.request("/search?q=invoice");
+    expect(res.status).toBe(401);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it("composes the free-text q with structured field/state/date/folder filters", async () => {
+    const { app, search } = buildApp();
+    const res = await app.request(
+      `/search?q=invoice&from=acme&to=me@x.com&cc=team@x.com&unread=true&starred=1&has_attachment=true` +
+        `&received_after=2026-01-01&received_before=2026-02-01&folder=INBOX&thread=t-1&account=${accountId}` +
+        `&sort=recent&limit=5&offset=10&include_body=true`,
+      { headers: auth() }
+    );
+    expect(res.status).toBe(200);
+    expect(search).toHaveBeenCalledTimes(1);
+    const req = search.mock.calls[0][0] as Record<string, unknown>;
+    expect(req).toMatchObject({
+      q: "invoice",
+      accounts: [accountId],
+      sort: "recent",
+      limit: 5,
+      offset: 10,
+      includeBody: true,
+      filters: {
+        from: "acme",
+        to: "me@x.com",
+        cc: "team@x.com",
+        isUnread: true,
+        isStarred: true,
+        hasAttachment: true,
+        after: "2026-01-01",
+        before: "2026-02-01",
+        folder: "INBOX",
+        thread: "t-1"
+      }
+    });
+  });
+
+  it("accepts filters-only search (no q) and rejects an empty search", async () => {
+    const { app, search } = buildApp();
+
+    const filtersOnly = await app.request("/search?unread=true", { headers: auth() });
+    expect(filtersOnly.status).toBe(200);
+    expect((search.mock.calls[0][0] as { q?: string }).q).toBeUndefined();
+    expect((search.mock.calls[0][0] as { filters?: unknown }).filters).toMatchObject({ isUnread: true });
+
+    const empty = await app.request("/search", { headers: auth() });
+    expect(empty.status).toBe(400);
+    await expect(empty.json()).resolves.toMatchObject({ error: "invalid_input" });
+  });
+
+  it("rejects an invalid account uuid on GET /search with 400", async () => {
+    const { app, search } = buildApp();
+    const res = await app.request("/search?q=x&account=not-a-uuid", { headers: auth() });
+    expect(res.status).toBe(400);
+    expect(search).not.toHaveBeenCalled();
   });
 });

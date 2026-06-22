@@ -96,6 +96,42 @@ touch bodies, so a denormalized flag would leak soft-deleted bodies into search.
   Embeddings are populated by an out-of-core job (not in this repo). This keeps the
   "no AI in core" boundary intact while leaving a clean hook.
 
+### Structured filters (email-005)
+
+Nylas-parity structured query filters (`messages?subject=&unread=&received_after=…`)
+are **not a new engine** — they are additional optional predicates over the same
+`searchMessages(db, request)` core, so the differentiator stays the composition: a
+structured filter **narrows** the existing semantic + fuzzy free-text query over the
+**full** mirror history (no Nylas 90-day window), it never replaces it.
+
+- **One filter union, one compiler.** Every filter — whether it arrives as a `q`
+  operator (`from:` `cc:` `is:unread` `after:7d` `in:`) or as a typed `filters`
+  object field (`from`, `cc`, `bcc`, `anyEmail`, `isUnread`, `isStarred`, `after`,
+  `folder`, …) — converges on the same `SearchFilter` tagged union and is turned into
+  a **bound** `$n` predicate by the one compiler. No surface builds SQL of its own.
+- **email-005 added** the precise recipient lanes the union was missing: `to` (To
+  only), `cc` (Cc only), `bcc` (Bcc only — populated only on sent mail), and
+  `anyEmail` (from + to + cc + bcc, the Nylas `any_email`). The pre-existing broad
+  `recipient` lane (To+Cc, reached via `recipient:`/`participant:`/`with:`) is kept
+  for back-compat; `to:`/`cc:` now resolve to their own scoped lanes. `isStarred`
+  is an alias of the `\Flagged` flag. State (`unread`/`starred`/`has_attachment`),
+  date-range (`received_after`/`received_before`), folder scoping, pagination, and
+  ordering already existed and are simply exposed ergonomically.
+- **Three front doors, no logic fork** (the cross-cutting "one core, four doors"
+  rule). The `search_email` MCP tool gains the new fields as **optional input-schema
+  params only** — the tool count and the five tool NAMES are unchanged, so the
+  zero-send guard (`agent-surface-zero-send.test.ts`) and the read-only adapter guard
+  stay green. The CLI `search` command gains `--cc/--bcc/--any-email/--unread/
+  --starred/--since` (still `--json`). A new **read-only** `GET /search` HTTP route
+  (API_TOKEN) maps `?from=&to=&cc=&bcc=&any_email=&unread=&starred=&has_attachment=&
+  received_after=&received_before=&folder=&thread=&account=&sort=&limit=&offset=`
+  onto the same `searchMessages` call. All three are pure reads; none touches
+  `src/mcp/` write boundaries, IMAP, or any mutation path.
+- **Injection safety is structural, not reviewed.** Recipient/folder/date values keep
+  going through the same `Params` binder and `escapeLike()`; a value carrying `'`,
+  `%`, `_`, or `;` is escaped and bound, never interpolated. A unit test asserts a
+  `drop table … ;--`-shaped value never appears in the compiled SQL text.
+
 ## Consequences
 
 - `storeBody` and the soft-delete paths need **zero** code change — a direct result of
@@ -119,6 +155,13 @@ touch bodies, so a denormalized flag would leak soft-deleted bodies into search.
   flagship ranked query returns the expected order.
 - Parser/compiler unit tests prove operator → predicate mapping is deterministic and
   fully parameterized (no string interpolation of user input).
+- email-005: `search-parse.test.ts` proves each new structured filter narrows over its
+  own column (`to`/`cc`/`bcc` scoped, `anyEmail` across from+to+cc+bcc), composes with
+  a semantic free-text query, paginates, and binds an injection-shaped value rather
+  than inlining it. `api-safety.test.ts` proves `GET /search` is API_TOKEN-gated,
+  composes `q` + filters, accepts filters-only, and 400s on an empty/invalid request.
+  The two invariant guards (`agent-surface-zero-send.test.ts`,
+  `sync-adapter-read-only.test.ts`) stay green — no sixth tool, no write path.
 
 ## References
 

@@ -19,7 +19,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0012-three-lane-history-engine.md`: Historical backfill runs after hot sync and live body fetch under the same account lock.
 - `0013-imap-compatibility-contract.md`: Generic IMAP support is a stated contract validated by provider-shape fixtures, real-server smokes, and manual matrix entries.
 - `0014-agent-email-access-core-surface.md`: The MCP server and agent CLI are built in core as a read-only surface; cloud only adds remote transport and auth.
-- `0015-search-layer.md`: Search is a pure-Postgres read layer.
+- `0015-search-layer.md`: Search is a pure-Postgres read layer (extended by email-005 with composable structured field/state/date/folder filters across MCP/CLI/REST, no sixth MCP tool).
 - `0016-draft-produce-only.md`: The reply drafter produces a threaded draft and never sends.
 - `0017-send-primitive.md`: SMTP send/reply is a single reusable primitive authored outside the agent surface; the agent surface stays zero-send and the sync adapter stays read-only.
 - `0018-organize-mutations.md`: Mark/star/move/delete + thread fan-out + folder CRUD are UID-addressed write-only verbs outside the agent surface; the mirror reconciles on the next sync.

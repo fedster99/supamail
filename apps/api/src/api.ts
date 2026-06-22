@@ -11,6 +11,7 @@ import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { sendMessage } from "./send.js";
+import { searchMessages, type SearchRequest, type SearchResponse } from "./search/index.js";
 import {
   cleanMessageBody,
   downloadAttachment,
@@ -90,6 +91,9 @@ interface ApiAppOptions {
   applyMigration: () => Promise<void>;
   /** Single-tenant send door (email-001). Resolves the SendResult JSON. */
   send: (req: SendRequest) => Promise<SendResult>;
+  /** Read-only ranked search over the mirror (email-005, ADR 0015). Composes the
+   *  semantic free-text query with structured field/state/date/folder filters. */
+  search: (req: SearchRequest) => Promise<SearchResponse>;
   /** Draft CRUD (email-003, ADR 0019). Create/update/send APPEND to Drafts (and
    * delete-old where needed); list/get read the mirror. Drafts carry neither Bcc nor
    * attachments — neither can round-trip the saved bytes, so both are send-time-only
@@ -227,6 +231,39 @@ const DRAFT_SCHEMA = z.object({
 
 const TRACK_FOLDER_SCHEMA = z.object({
   path: z.string().min(1).max(1024)
+});
+
+// Read-only search (email-005, ADR 0015). Query params arrive as strings, so the
+// booleans/ints are coerced. Field/state/date/folder filters are collected into the
+// structured `filters` object so they COMPOSE with the free-text `q` (semantic +
+// fuzzy) rather than replace it. Empty/absent params become a no-op (omitted).
+const BOOL_PARAM = z
+  .enum(["true", "false", "1", "0"])
+  .transform((v) => v === "true" || v === "1");
+const WINDOW_ENUM = z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"]);
+const SEARCH_QUERY_SCHEMA = z.object({
+  q: z.string().max(4096).optional(),
+  from: z.string().max(255).optional(),
+  to: z.string().max(255).optional(),
+  cc: z.string().max(255).optional(),
+  bcc: z.string().max(255).optional(),
+  any_email: z.string().max(255).optional(),
+  subject: z.string().max(2000).optional(),
+  body: z.string().max(2000).optional(),
+  folder: z.string().max(1024).optional(),
+  thread: z.string().max(512).optional(),
+  unread: BOOL_PARAM.optional(),
+  starred: BOOL_PARAM.optional(),
+  has_attachment: BOOL_PARAM.optional(),
+  received_after: z.string().max(64).optional(),
+  received_before: z.string().max(64).optional(),
+  account: z.string().uuid().optional(),
+  window: WINDOW_ENUM.optional(),
+  sort: z.enum(["smart", "relevance", "recent", "oldest", "size", "sender"]).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  include_body: BOOL_PARAM.optional(),
+  include_deleted: BOOL_PARAM.optional()
 });
 
 // Organize mutations (email-002). A flag token is a SupaMail short name
@@ -520,6 +557,52 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ fetched });
   });
 
+  // Read-only ranked search over the mirror (email-005, ADR 0015). Structured
+  // field/state/date/folder filters are GET query params that COMPOSE with the
+  // semantic + fuzzy free-text `q` (e.g. ?q=invoice&from=acme.com&unread=true&
+  // received_after=2026-01-01&folder=INBOX). Every value is bound; nothing is
+  // interpolated. Absent params are omitted (no-op). Pagination via limit/offset.
+  app.get("/search", async (c) => {
+    const p = SEARCH_QUERY_SCHEMA.parse(
+      Object.fromEntries(new URL(c.req.url).searchParams.entries())
+    );
+    const filters: NonNullable<SearchRequest["filters"]> = {};
+    if (p.from !== undefined) filters.from = p.from;
+    if (p.to !== undefined) filters.to = p.to;
+    if (p.cc !== undefined) filters.cc = p.cc;
+    if (p.bcc !== undefined) filters.bcc = p.bcc;
+    if (p.any_email !== undefined) filters.anyEmail = p.any_email;
+    if (p.subject !== undefined) filters.subject = p.subject;
+    if (p.body !== undefined) filters.body = p.body;
+    if (p.folder !== undefined) filters.folder = p.folder;
+    if (p.thread !== undefined) filters.thread = p.thread;
+    if (p.unread !== undefined) filters.isUnread = p.unread;
+    if (p.starred !== undefined) filters.isStarred = p.starred;
+    if (p.has_attachment !== undefined) filters.hasAttachment = p.has_attachment;
+    if (p.received_after !== undefined) filters.after = p.received_after;
+    if (p.received_before !== undefined) filters.before = p.received_before;
+    if (p.window !== undefined) filters.window = p.window;
+
+    const request: SearchRequest = {
+      q: p.q,
+      filters: Object.keys(filters).length > 0 ? filters : undefined,
+      accounts: p.account ? [p.account] : undefined,
+      sort: p.sort,
+      limit: p.limit,
+      offset: p.offset,
+      includeBody: p.include_body,
+      includeDeleted: p.include_deleted
+    };
+    // Either q or at least one filter must be present (mirrors the MCP/CLI contract).
+    if (request.q === undefined && request.filters === undefined) {
+      throw new HTTPException(400, {
+        res: c.json({ error: "invalid_input", message: "Provide a query (q) and/or at least one filter." }, 400)
+      });
+    }
+    const response = await options.search(request);
+    return c.json(response);
+  });
+
   // Attachment + content reads (email-004, ADR 0020). Metadata / clean body /
   // headers read the mirror; attachment-byte download + raw MIME (parsed_only) do
   // an on-demand read-only IMAP fetch. `?fields=` shrinks JSON payloads.
@@ -740,6 +823,7 @@ export function startApiServer(options: StartApiServerOptions = {}): ReturnType<
     engine,
     applyMigration: () => applyPublicMigrations(pool),
     send: (req) => sendMessage(pool, config, req),
+    search: (req) => searchMessages(pool, req),
     drafts: {
       create: (req) => createDraft(pool, config, req),
       list: (accountId, opts) => listDrafts(pool, config, accountId, opts),
