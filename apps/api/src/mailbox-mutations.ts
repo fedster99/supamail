@@ -18,9 +18,20 @@ import type { ImapAccount, ImapMessage } from "./types.js";
  * Messages are addressed by their mirror id (imap_messages.id). We resolve the
  * folder path + UIDVALIDITY + UID from the repository and act on IMAP BY UID,
  * after asserting the live mailbox UIDVALIDITY still matches what we mirrored (so
- * a UIDVALIDITY reset can never make us hit the wrong message). We do NOT guess a
- * mirror write — the next sync pass reconciles flags (flag scan) and moves/deletes
- * (UID reconcile); see ADR 0018.
+ * a UIDVALIDITY reset can never make us hit the wrong message).
+ *
+ * Flag mutations (mark read/unread, star/unstar) write the new flag set THROUGH
+ * to the mirror row immediately after a successful STORE: that is a deterministic
+ * update of a KNOWN row to a KNOWN value (not fabricating identity), and it is
+ * required because the flag-scan sync only re-reads flags within
+ * FLAG_DIFF_WINDOW_DAYS, so a change to older mail would otherwise never reconcile.
+ * Moves and deletes still rely on the next sync's UID reconcile (which can lag by
+ * more than the flag window); see ADR 0018.
+ *
+ * Destructive verbs require server capabilities so a fallback can never run a
+ * blanket EXPUNGE: hard delete requires UIDPLUS (UID-scoped EXPUNGE); move
+ * requires MOVE or UIDPLUS (native move, or COPY + UID-scoped EXPUNGE). Both
+ * absent → the verb refuses rather than risk purging unrelated \Deleted messages.
  */
 
 /** A SupaMail well-known flag name mapped to its IMAP system flag. */
@@ -33,6 +44,44 @@ export const SYSTEM_FLAGS = {
 } as const;
 
 export type SystemFlagName = keyof typeof SYSTEM_FLAGS;
+
+/**
+ * Thrown when the live mailbox can no longer be safely addressed by the UID we
+ * mirrored — UIDVALIDITY changed, so the stale UID may now point at a different
+ * message. Callers (api.ts) map this to HTTP 409 Conflict rather than 500: the
+ * request was well-formed, the server state simply moved underneath us.
+ */
+export class MailboxConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MailboxConflictError";
+  }
+}
+
+/**
+ * Thrown when the IMAP server does not advertise the capability a verb needs to
+ * act safely (UIDPLUS for a UID-scoped EXPUNGE, MOVE/UIDPLUS for a non-collateral
+ * move). We refuse rather than fall back to a blanket EXPUNGE that would purge
+ * unrelated \Deleted messages.
+ */
+export class MailboxCapabilityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MailboxCapabilityError";
+  }
+}
+
+/**
+ * Thrown when an IMAP STORE/MOVE/DELETE returned a server-side failure (imapflow
+ * signals these as `false`/empty rather than throwing). We surface it so HTTP/CLI
+ * callers and the mirror write-through never proceed on a silent no-op.
+ */
+export class MailboxMutationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MailboxMutationError";
+  }
+}
 
 /** The resolved IMAP coordinates of one mirrored message. */
 export interface ResolvedMessageTarget {
@@ -94,7 +143,7 @@ export function resolveTrashFolder(
 export class MailboxMutator {
   private constructor(
     private readonly client: ImapFlow,
-    private readonly commandTimeoutMs: number
+    private readonly host: string
   ) {}
 
   static async connect(
@@ -116,8 +165,20 @@ export class MailboxMutator {
       greetingTimeout: config.CONNECT_TIMEOUT_MS,
       socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
     });
-    await client.connect();
-    return new MailboxMutator(client, config.IMAP_COMMAND_TIMEOUT_MS);
+    try {
+      await client.connect();
+    } catch (error) {
+      // Close the socket so an auth/TLS failure during connect cannot leak it.
+      client.close();
+      throw error;
+    }
+    return new MailboxMutator(client, account.host);
+  }
+
+  /** True iff the connected server advertises `name` (e.g. "UIDPLUS", "MOVE").
+   * imapflow exposes capabilities as a Map keyed by the uppercase capability name. */
+  private hasCapability(name: string): boolean {
+    return this.client.capabilities?.has(name) ?? false;
   }
 
   /** List mailboxes so callers can resolve Trash (or validate a move target). */
@@ -138,7 +199,7 @@ export class MailboxMutator {
     try {
       const mailbox = this.client.mailbox;
       if (mailbox && Number(mailbox.uidValidity) !== target.uidValidity) {
-        throw new Error(
+        throw new MailboxConflictError(
           `UIDVALIDITY changed for ${target.folderPath} (mirror ${target.uidValidity} != server ${mailbox.uidValidity}); refusing to mutate by stale UID`
         );
       }
@@ -148,37 +209,83 @@ export class MailboxMutator {
     }
   }
 
-  /** STORE +FLAGS on the message's folder by UID. */
+  /** STORE +FLAGS on the message's folder by UID. imapflow returns `false` on a
+   * server-side STORE failure rather than throwing — we surface that as an error. */
   async addFlags(target: ResolvedMessageTarget, flags: string[]): Promise<boolean> {
-    return this.withUidScope(target, () =>
-      this.client.messageFlagsAdd(String(target.uid), flags, { uid: true })
-    );
+    return this.withUidScope(target, async () => {
+      const ok = await this.client.messageFlagsAdd(String(target.uid), flags, { uid: true });
+      if (!ok) {
+        throw new MailboxMutationError(
+          `STORE +FLAGS failed for UID ${target.uid} in ${target.folderPath} on ${this.host}`
+        );
+      }
+      return ok;
+    });
   }
 
   /** STORE -FLAGS on the message's folder by UID. */
   async removeFlags(target: ResolvedMessageTarget, flags: string[]): Promise<boolean> {
-    return this.withUidScope(target, () =>
-      this.client.messageFlagsRemove(String(target.uid), flags, { uid: true })
-    );
-  }
-
-  /** MOVE the message by UID into `destination`. */
-  async move(target: ResolvedMessageTarget, destination: string): Promise<{ uidMap: Map<number, number> | null }> {
     return this.withUidScope(target, async () => {
-      const result = await this.client.messageMove(String(target.uid), destination, { uid: true });
-      return { uidMap: result && typeof result === "object" ? result.uidMap ?? null : null };
+      const ok = await this.client.messageFlagsRemove(String(target.uid), flags, { uid: true });
+      if (!ok) {
+        throw new MailboxMutationError(
+          `STORE -FLAGS failed for UID ${target.uid} in ${target.folderPath} on ${this.host}`
+        );
+      }
+      return ok;
     });
   }
 
   /**
-   * Hard-delete: STORE +\Deleted then EXPUNGE that single UID. EXPUNGE is scoped
-   * to the one UID (uidRange) so it can never purge other \Deleted messages a
-   * client left behind.
+   * MOVE the message by UID into `destination`. Requires either the MOVE extension
+   * (a native, atomic, safe move) or UIDPLUS (imapflow falls back to COPY + a
+   * UID-scoped EXPUNGE, which is safe). If the server advertises neither, imapflow
+   * would fall back to COPY + a blanket EXPUNGE that purges ALL \Deleted messages
+   * in the folder — so we refuse instead.
+   */
+  async move(target: ResolvedMessageTarget, destination: string): Promise<{ uidMap: Map<number, number> | null }> {
+    if (!this.hasCapability("MOVE") && !this.hasCapability("UIDPLUS")) {
+      throw new MailboxCapabilityError(
+        `Move needs the MOVE or UIDPLUS extension to avoid a collateral EXPUNGE; ${this.host} advertises neither`
+      );
+    }
+    return this.withUidScope(target, async () => {
+      const result = await this.client.messageMove(String(target.uid), destination, { uid: true });
+      if (!result) {
+        throw new MailboxMutationError(
+          `MOVE failed for UID ${target.uid} from ${target.folderPath} to ${destination} on ${this.host}`
+        );
+      }
+      return { uidMap: typeof result === "object" ? result.uidMap ?? null : null };
+    });
+  }
+
+  /**
+   * Hard-delete: STORE +\Deleted then EXPUNGE that single UID. Requires UIDPLUS:
+   * with it, imapflow scopes the EXPUNGE to the one UID (UID EXPUNGE), so it can
+   * never purge other \Deleted messages a client left behind. WITHOUT UIDPLUS,
+   * imapflow falls back to a blanket EXPUNGE of the whole folder — so we refuse.
    */
   async expunge(target: ResolvedMessageTarget): Promise<boolean> {
+    if (!this.hasCapability("UIDPLUS")) {
+      throw new MailboxCapabilityError(
+        `Hard delete needs the UIDPLUS extension for a UID-scoped EXPUNGE; ${this.host} does not advertise it`
+      );
+    }
     return this.withUidScope(target, async () => {
-      await this.client.messageFlagsAdd(String(target.uid), [SYSTEM_FLAGS.deleted], { uid: true });
-      return this.client.messageDelete(String(target.uid), { uid: true });
+      const stored = await this.client.messageFlagsAdd(String(target.uid), [SYSTEM_FLAGS.deleted], { uid: true });
+      if (!stored) {
+        throw new MailboxMutationError(
+          `STORE +\\Deleted failed for UID ${target.uid} in ${target.folderPath} on ${this.host}`
+        );
+      }
+      const ok = await this.client.messageDelete(String(target.uid), { uid: true });
+      if (!ok) {
+        throw new MailboxMutationError(
+          `EXPUNGE failed for UID ${target.uid} in ${target.folderPath} on ${this.host}`
+        );
+      }
+      return ok;
     });
   }
 
@@ -240,10 +347,42 @@ export interface FlagResult {
 }
 
 /**
+ * Write a successful flag change through to the mirror row, best-effort but
+ * surfaced: a failure here logs a warning (and never masks the STORE that already
+ * succeeded on IMAP). This keeps mark-read/star visible in the mirror immediately,
+ * even for mail older than the flag-scan window.
+ */
+async function writeFlagsThrough(
+  repository: MirrorRepository,
+  messageId: string,
+  accountId: string,
+  add: string[],
+  remove: string[]
+): Promise<void> {
+  try {
+    const updated = await repository.applyMessageFlags(messageId, accountId, { add, remove });
+    if (updated === null) {
+      console.warn(JSON.stringify({
+        event: "organize.flag_write_through_missing_row",
+        messageId,
+        accountId
+      }));
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "organize.flag_write_through_failed",
+      messageId,
+      accountId,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+}
+
+/**
  * Apply a flag change to one mirrored message by UID. `add`/`remove` accept the
  * SupaMail short names (`seen`/`flagged`/…), bare keywords, or `\`-prefixed
- * system flags. Relies on the next flag-scan sync pass to reflect the change in
- * the mirror (ADR 0018).
+ * system flags. After a successful STORE the new flags are written through to the
+ * mirror row immediately (ADR 0018) — the flag-scan sync only re-reads recent mail.
  */
 export async function setMessageFlags(
   pool: PgPool,
@@ -268,6 +407,8 @@ export async function setMessageFlags(
   } finally {
     await mutator.logout().catch(() => mutator.close());
   }
+
+  await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
 
   return { messageId, folderPath: target.folderPath, uid: target.uid, added: add, removed: remove };
 }
@@ -471,6 +612,11 @@ export async function setThreadFlags(
     }
   } finally {
     await mutator.logout().catch(() => mutator.close());
+  }
+
+  // Write the flag change through to every thread member's mirror row.
+  for (const target of targets) {
+    await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
   }
 
   return {

@@ -62,7 +62,8 @@ const mutator = vi.hoisted(() => ({
 
 const repo = vi.hoisted(() => ({
   getMessage: vi.fn(),
-  getAccount: vi.fn()
+  getAccount: vi.fn(),
+  applyMessageFlags: vi.fn(async () => ["\\Seen"] as string[])
 }));
 
 // MailboxMutator.connect is intercepted via vi.spyOn (the real lib functions call
@@ -75,6 +76,7 @@ vi.mock("../repository.js", () => ({
   MirrorRepository: class {
     getMessage = repo.getMessage;
     getAccount = repo.getAccount;
+    applyMessageFlags = repo.applyMessageFlags;
   }
 }));
 
@@ -108,6 +110,7 @@ beforeEach(() => {
   mutator.move.mockResolvedValue({ uidMap: new Map<number, number>([[42, 99]]) });
   mutator.list.mockResolvedValue([{ path: "Trash", specialUse: "\\Trash" }]);
   repo.getAccount.mockResolvedValue(account);
+  repo.applyMessageFlags.mockResolvedValue(["\\Seen"]);
 });
 
 describe("setMessageFlags", () => {
@@ -131,6 +134,28 @@ describe("setMessageFlags", () => {
     await setMessageFlags({} as never, config, "msg-1", { remove: ["flagged"] });
     expect(mutator.removeFlags).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), ["\\Flagged"]);
     expect(mutator.addFlags).not.toHaveBeenCalled();
+  });
+
+  it("writes the flag change through to the mirror row after a successful STORE (M1)", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    const { setMessageFlags } = await import("../mailbox-mutations.js");
+    await setMessageFlags({} as never, config, "msg-1", { add: ["seen"], remove: ["flagged"] });
+    expect(repo.applyMessageFlags).toHaveBeenCalledTimes(1);
+    expect(repo.applyMessageFlags).toHaveBeenCalledWith("msg-1", "acc-1", {
+      add: ["\\Seen"],
+      remove: ["\\Flagged"]
+    });
+  });
+
+  it("surfaces a warning but still succeeds if the mirror write-through fails (M1)", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    repo.applyMessageFlags.mockRejectedValueOnce(new Error("db down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { setMessageFlags } = await import("../mailbox-mutations.js");
+    const result = await setMessageFlags({} as never, config, "msg-1", { add: ["seen"] });
+    expect(result).toMatchObject({ messageId: "msg-1", added: ["\\Seen"] });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_failed"));
+    warn.mockRestore();
   });
 
   it("rejects an empty flag change without connecting", async () => {

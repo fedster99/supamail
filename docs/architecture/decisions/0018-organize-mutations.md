@@ -35,9 +35,21 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   UIDVALIDITY no longer matches, the verb aborts rather than touching the wrong
   message. Thread-level verbs resolve the live members from the mirror and apply
   the verb to each.
-- The **mirror is reconciled by the next sync pass** — mutations never guess a
-  mirror write or fabricate identity (same rule as email-001). Mutations are
-  IMAP-authoritative; the mirror converges on the next tick.
+- **Flag mutations write through to the mirror immediately**; moves and deletes
+  reconcile on the next sync pass. A flag change (mark read/unread, star/unstar)
+  updates the KNOWN message row's `flags` to a KNOWN value right after a successful
+  STORE — a deterministic write of existing identity, not fabricating identity, so
+  it stays within the email-001 rule. This is required because the flag-scan sync
+  only re-reads flags within `FLAG_DIFF_WINDOW_DAYS` (~7 days), so a flag change on
+  older mail would otherwise never reconcile. Moves and deletes remain
+  IMAP-authoritative and converge when the next UID reconcile runs.
+- **Destructive verbs require server capabilities** so a fallback can never run a
+  blanket EXPUNGE. Hard delete (EXPUNGE) requires `UIDPLUS` (UID-scoped EXPUNGE);
+  move requires `MOVE` or `UIDPLUS` (native move, or COPY + UID-scoped EXPUNGE). If
+  the server advertises neither, the verb refuses (`MailboxCapabilityError`) rather
+  than risk imapflow's blanket-EXPUNGE fallback purging unrelated `\Deleted`
+  messages. A UIDVALIDITY mismatch raises `MailboxConflictError`, surfaced as HTTP
+  409.
 - Surfaces follow "one core lib, four front doors": library functions exported
   from the barrel, `API_TOKEN`-gated HTTP routes, and CLI commands. Destructive
   verbs (delete / hard-delete / folder delete) require an explicit `--confirm` on
@@ -51,10 +63,10 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
 - The agent read surface and the sync read path are provably unchanged; mutations
   are available to operators (CLI), the single-tenant HTTP door, and the cloud
   multi-tenant wrapper.
-- There is a brief mirror-visibility lag between a mutation and the next sync tick.
-  Reflecting flag/move/delete changes in the mirror is the existing sync
-  reconciler's responsibility; any gap there is a sync-engine concern, not a
-  mutation-primitive one.
+- Flag changes are visible in the mirror immediately (write-through). Move and
+  delete changes are not reflected until the next UID reconcile, which can lag by
+  more than the flag-scan window for older mail — callers should treat move/delete
+  mirror convergence as eventual, while flag state is immediate.
 - Hard delete (`EXPUNGE`) and folder delete are irreversible; the `--confirm` gate
   and the API_TOKEN boundary are the guards. This supersedes the *scope* (not the
   spirit) of ADR 0014/0016 for these new modules only, exactly as ADR 0017 did.

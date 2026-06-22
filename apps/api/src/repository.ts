@@ -1593,6 +1593,69 @@ export class MirrorRepository {
     return result.rows[0] ?? null;
   }
 
+  /**
+   * Write a flag change through to a KNOWN message row (organize mutations,
+   * email-002/ADR 0018). After a successful IMAP STORE we update the mirrored
+   * `flags` array so mark-read/star reflect immediately — the flag-scan sync only
+   * re-reads flags within FLAG_DIFF_WINDOW_DAYS, so older mail would otherwise
+   * never reconcile. This is a deterministic update of a known row to a known
+   * value, account-scoped and parameterized; it does NOT fabricate identity.
+   *
+   * `add`/`remove` are raw IMAP flag tokens (e.g. "\\Seen"). Matching is
+   * case-insensitive so we never duplicate an existing flag. Returns the new flag
+   * array, or null if the row was not found for that account.
+   */
+  async applyMessageFlags(
+    messageId: string,
+    accountId: string,
+    change: { add?: string[]; remove?: string[] }
+  ): Promise<string[] | null> {
+    const add = change.add ?? [];
+    const remove = change.remove ?? [];
+    const removeLower = new Set(remove.map((flag) => flag.toLowerCase()));
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = await client.query<{ flags: string[] | null }>(
+        `
+        SELECT flags
+        FROM public.imap_messages
+        WHERE id = $1 AND account_id = $2
+        FOR UPDATE
+        `,
+        [messageId, accountId]
+      );
+      const row = current.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+
+      const existing = row.flags ?? [];
+      const existingLower = new Set(existing.map((flag) => flag.toLowerCase()));
+      const kept = existing.filter((flag) => !removeLower.has(flag.toLowerCase()));
+      const toAdd = add.filter((flag) => !existingLower.has(flag.toLowerCase()) && !removeLower.has(flag.toLowerCase()));
+      const next = [...kept, ...toAdd];
+
+      await client.query(
+        `
+        UPDATE public.imap_messages
+        SET flags = $3::text[]
+        WHERE id = $1 AND account_id = $2
+        `,
+        [messageId, accountId, next]
+      );
+      await client.query("COMMIT");
+      return next;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async storeBody(body: MessageBodyInput): Promise<void> {
     const client = await this.pool.connect();
     await client.query("BEGIN");

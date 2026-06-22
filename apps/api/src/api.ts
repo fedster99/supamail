@@ -15,6 +15,7 @@ import {
   createFolder,
   deleteFolder,
   deleteMessage,
+  MailboxConflictError,
   moveMessage,
   moveThread,
   renameFolder,
@@ -223,6 +224,11 @@ export function createApiApp(options: ApiAppOptions): Hono {
     }
     if (err instanceof FolderTrackingRejectedError) {
       return c.json({ error: err.code, message: err.message }, 400);
+    }
+    if (err instanceof MailboxConflictError) {
+      // UIDVALIDITY moved underneath us — the request was well-formed, the server
+      // state changed. 409 Conflict, not 500.
+      return c.json({ error: "mailbox_conflict", message: err.message }, 409);
     }
     if (err instanceof z.ZodError) {
       return c.json({ error: "invalid_input", issues: err.issues }, 400);
