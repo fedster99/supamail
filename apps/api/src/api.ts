@@ -11,6 +11,22 @@ import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { sendMessage } from "./send.js";
+import {
+  createFolder,
+  deleteFolder,
+  deleteMessage,
+  moveMessage,
+  moveThread,
+  renameFolder,
+  setMessageFlags,
+  setThreadFlags,
+  type DeleteResult,
+  type FlagResult,
+  type FolderMutationResult,
+  type MoveResult,
+  type ThreadFlagResult,
+  type ThreadMoveResult
+} from "./mailbox-mutations.js";
 import type {
   AccountDetails,
   AccountSummary,
@@ -45,6 +61,17 @@ interface ApiAppOptions {
   applyMigration: () => Promise<void>;
   /** Single-tenant send door (email-001). Resolves the SendResult JSON. */
   send: (req: SendRequest) => Promise<SendResult>;
+  /** Organize mutations (email-002, ADR 0018). Each acts on IMAP by UID. */
+  mutations: {
+    setMessageFlags: (messageId: string, change: { add?: string[]; remove?: string[] }) => Promise<FlagResult>;
+    moveMessage: (messageId: string, folder: string) => Promise<MoveResult>;
+    deleteMessage: (messageId: string, options: { hard?: boolean }) => Promise<DeleteResult>;
+    setThreadFlags: (messageId: string, change: { add?: string[]; remove?: string[] }) => Promise<ThreadFlagResult>;
+    moveThread: (messageId: string, folder: string) => Promise<ThreadMoveResult>;
+    createFolder: (accountId: string, path: string) => Promise<FolderMutationResult>;
+    renameFolder: (accountId: string, path: string, newPath: string) => Promise<FolderMutationResult>;
+    deleteFolder: (accountId: string, path: string) => Promise<FolderMutationResult>;
+  };
 }
 
 interface StartApiServerOptions {
@@ -96,6 +123,30 @@ const SEND_SCHEMA = z.object({
 
 const TRACK_FOLDER_SCHEMA = z.object({
   path: z.string().min(1).max(1024)
+});
+
+// Organize mutations (email-002). A flag token is a SupaMail short name
+// (seen/flagged/…), a bare keyword, or a `\`-prefixed system flag. At least one
+// of add/remove must be present.
+const FLAG_TOKEN = z.string().min(1).max(64);
+const FLAGS_SCHEMA = z.object({
+  add: z.array(FLAG_TOKEN).max(16).optional(),
+  remove: z.array(FLAG_TOKEN).max(16).optional()
+}).refine((v) => (v.add?.length ?? 0) + (v.remove?.length ?? 0) > 0, {
+  message: "At least one flag in add or remove is required"
+});
+
+const MOVE_SCHEMA = z.object({
+  folder: z.string().min(1).max(1024)
+});
+
+const FOLDER_PATH_SCHEMA = z.object({
+  path: z.string().min(1).max(1024)
+});
+
+const RENAME_FOLDER_SCHEMA = z.object({
+  path: z.string().min(1).max(1024),
+  newPath: z.string().min(1).max(1024)
 });
 
 const MUTABLE_ACCOUNT_SETTING_KEYS = [
@@ -285,6 +336,81 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ result });
   });
 
+  // Organize mutations (email-002, ADR 0018). Message-scoped routes resolve the
+  // message → its account → act on IMAP by UID; the mirror reconciles on the next
+  // sync. Folder CRUD is account-scoped.
+  app.post("/messages/:id/flags", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const input = FLAGS_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.setMessageFlags(id, input);
+    return c.json({ result });
+  });
+
+  app.post("/messages/:id/move", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const input = MOVE_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.moveMessage(id, input.folder);
+    return c.json({ result });
+  });
+
+  app.delete("/messages/:id", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const hard = c.req.query("hard") === "true" || c.req.query("hard") === "1";
+    const result = await options.mutations.deleteMessage(id, { hard });
+    return c.json({ result });
+  });
+
+  app.post("/threads/:id/flags", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const input = FLAGS_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.setThreadFlags(id, input);
+    return c.json({ result });
+  });
+
+  app.post("/threads/:id/move", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const input = MOVE_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.moveThread(id, input.folder);
+    return c.json({ result });
+  });
+
+  app.post("/accounts/:id/folders", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const input = FOLDER_PATH_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.createFolder(id, input.path);
+    return c.json({ result }, 201);
+  });
+
+  app.patch("/accounts/:id/folders", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const input = RENAME_FOLDER_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.renameFolder(id, input.path, input.newPath);
+    return c.json({ result });
+  });
+
+  app.delete("/accounts/:id/folders", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const input = FOLDER_PATH_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.mutations.deleteFolder(id, input.path);
+    return c.json({ result });
+  });
+
   return app;
 }
 
@@ -299,7 +425,17 @@ export function startApiServer(options: StartApiServerOptions = {}): ReturnType<
     repository,
     engine,
     applyMigration: () => applyPublicMigrations(pool),
-    send: (req) => sendMessage(pool, config, req)
+    send: (req) => sendMessage(pool, config, req),
+    mutations: {
+      setMessageFlags: (messageId, change) => setMessageFlags(pool, config, messageId, change),
+      moveMessage: (messageId, folder) => moveMessage(pool, config, messageId, folder),
+      deleteMessage: (messageId, opts) => deleteMessage(pool, config, messageId, opts),
+      setThreadFlags: (messageId, change) => setThreadFlags(pool, config, messageId, change),
+      moveThread: (messageId, folder) => moveThread(pool, config, messageId, folder),
+      createFolder: (accountId, path) => createFolder(pool, config, accountId, path),
+      renameFolder: (accountId, path, newPath) => renameFolder(pool, config, accountId, path, newPath),
+      deleteFolder: (accountId, path) => deleteFolder(pool, config, accountId, path)
+    }
   });
 
   const server = serve({ fetch: app.fetch, port: config.PORT });

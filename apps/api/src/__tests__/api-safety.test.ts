@@ -169,16 +169,37 @@ function buildApp(options: {
     sentFolderPath: "Sent",
     warnings: []
   })));
+  const mutations = {
+    setMessageFlags: vi.fn(async (id: string, change: { add?: string[]; remove?: string[] }) => ({
+      messageId: id, folderPath: "INBOX", uid: 7, added: change.add ?? [], removed: change.remove ?? []
+    })),
+    moveMessage: vi.fn(async (id: string, folder: string) => ({
+      messageId: id, fromFolder: "INBOX", toFolder: folder, newUid: 12
+    })),
+    deleteMessage: vi.fn(async (id: string, opts: { hard?: boolean }) => ({
+      messageId: id, fromFolder: "INBOX", mode: opts.hard ? "expunge" : "trash", trashFolder: opts.hard ? null : "Trash"
+    })),
+    setThreadFlags: vi.fn(async (id: string, change: { add?: string[]; remove?: string[] }) => ({
+      seedMessageId: id, messageCount: 2, added: change.add ?? [], removed: change.remove ?? [], messageIds: [id]
+    })),
+    moveThread: vi.fn(async (id: string, folder: string) => ({
+      seedMessageId: id, toFolder: folder, messageCount: 2, messageIds: [id]
+    })),
+    createFolder: vi.fn(async (acct: string, path: string) => ({ accountId: acct, path, created: true })),
+    renameFolder: vi.fn(async (acct: string, path: string, newPath: string) => ({ accountId: acct, path, newPath })),
+    deleteFolder: vi.fn(async (acct: string, path: string) => ({ accountId: acct, path }))
+  };
   const app = createApiApp({
     apiToken: options.apiToken ?? "api-token",
     adminToken: "adminToken" in options ? options.adminToken : "admin-token",
     repository,
     engine,
     applyMigration,
-    send: send as never
+    send: send as never,
+    mutations: mutations as never
   });
 
-  return { app, repository, engine, applyMigration, send };
+  return { app, repository, engine, applyMigration, send, mutations };
 }
 
 function auth(token = "api-token"): Record<string, string> {
@@ -454,6 +475,130 @@ describe("API safety", () => {
     });
     expect(res.status).toBe(404);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("gates the organize-mutation routes behind the API token", async () => {
+    const { app, mutations } = buildApp();
+    const unauthorized = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ add: ["seen"] })
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(mutations.setMessageFlags).not.toHaveBeenCalled();
+  });
+
+  it("validates and dispatches POST /messages/:id/flags for a known message", async () => {
+    const { app, mutations } = buildApp();
+
+    const empty = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    expect(empty.status).toBe(400);
+    expect(mutations.setMessageFlags).not.toHaveBeenCalled();
+
+    const ok = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ add: ["seen"], remove: ["flagged"] })
+    });
+    expect(ok.status).toBe(200);
+    await expect(ok.json()).resolves.toMatchObject({ result: { added: ["seen"], removed: ["flagged"] } });
+    expect(mutations.setMessageFlags).toHaveBeenCalledWith(messageId, { add: ["seen"], remove: ["flagged"] });
+  });
+
+  it("returns 404 from /messages/:id/flags when the message is unknown", async () => {
+    const { app, repository, mutations } = buildApp();
+    repository.getMessage.mockResolvedValueOnce(null as never);
+    const res = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ add: ["seen"] })
+    });
+    expect(res.status).toBe(404);
+    expect(mutations.setMessageFlags).not.toHaveBeenCalled();
+  });
+
+  it("dispatches POST /messages/:id/move with the destination folder", async () => {
+    const { app, mutations } = buildApp();
+    const res = await app.request(`/messages/${messageId}/move`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ folder: "Archive" })
+    });
+    expect(res.status).toBe(200);
+    expect(mutations.moveMessage).toHaveBeenCalledWith(messageId, "Archive");
+  });
+
+  it("maps DELETE /messages/:id ?hard to a hard delete, default to trash", async () => {
+    const { app, mutations } = buildApp();
+
+    const trash = await app.request(`/messages/${messageId}`, { method: "DELETE", headers: auth() });
+    expect(trash.status).toBe(200);
+    expect(mutations.deleteMessage).toHaveBeenLastCalledWith(messageId, { hard: false });
+
+    const hard = await app.request(`/messages/${messageId}?hard=true`, { method: "DELETE", headers: auth() });
+    expect(hard.status).toBe(200);
+    expect(mutations.deleteMessage).toHaveBeenLastCalledWith(messageId, { hard: true });
+  });
+
+  it("dispatches thread-level flags and move", async () => {
+    const { app, mutations } = buildApp();
+
+    const flags = await app.request(`/threads/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ add: ["seen"] })
+    });
+    expect(flags.status).toBe(200);
+    expect(mutations.setThreadFlags).toHaveBeenCalledWith(messageId, { add: ["seen"] });
+
+    const move = await app.request(`/threads/${messageId}/move`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ folder: "Archive" })
+    });
+    expect(move.status).toBe(200);
+    expect(mutations.moveThread).toHaveBeenCalledWith(messageId, "Archive");
+  });
+
+  it("dispatches folder CRUD and returns 404 for an unknown account", async () => {
+    const { app, mutations } = buildApp();
+
+    const create = await app.request(`/accounts/${accountId}/folders`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ path: "Projects" })
+    });
+    expect(create.status).toBe(201);
+    expect(mutations.createFolder).toHaveBeenCalledWith(accountId, "Projects");
+
+    const rename = await app.request(`/accounts/${accountId}/folders`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ path: "Projects", newPath: "Work" })
+    });
+    expect(rename.status).toBe(200);
+    expect(mutations.renameFolder).toHaveBeenCalledWith(accountId, "Projects", "Work");
+
+    const del = await app.request(`/accounts/${accountId}/folders`, {
+      method: "DELETE",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ path: "Work" })
+    });
+    expect(del.status).toBe(200);
+    expect(mutations.deleteFolder).toHaveBeenCalledWith(accountId, "Work");
+
+    const { app: noAccountApp, mutations: noAccountMutations } = buildApp({ account: null });
+    const missing = await noAccountApp.request(`/accounts/${accountId}/folders`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ path: "Projects" })
+    });
+    expect(missing.status).toBe(404);
+    expect(noAccountMutations.createFolder).not.toHaveBeenCalled();
   });
 
   it("uses the SupaMail CLI name", async () => {

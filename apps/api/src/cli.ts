@@ -8,6 +8,16 @@ import { searchMessages } from "./search/index.js";
 import type { SearchRequest, SearchSort } from "./search/index.js";
 import { runDraftReply, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
 import { sendMessage } from "./send.js";
+import {
+  createFolder,
+  deleteFolder,
+  deleteMessage,
+  moveMessage,
+  moveThread,
+  renameFolder,
+  setMessageFlags,
+  setThreadFlags
+} from "./mailbox-mutations.js";
 import type { SendRecipient, SendRequest, WindowStatus } from "./types.js";
 
 const program = new Command();
@@ -305,6 +315,126 @@ program
       references: draft.headers.References
     };
     const result = await sendMessage(pool, config, request);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+// Organize mutations (email-002, ADR 0018). Non-destructive verbs (mark/star/
+// move) need no --confirm; destructive verbs (delete/hard-delete, folder delete)
+// refuse without --confirm. All emit JSON, addressing the message by mirror id and
+// acting on IMAP by UID; the next sync reconciles the mirror.
+program
+  .command("flag <messageId>")
+  .description("Add/remove IMAP flags on a message (e.g. seen, flagged) — non-destructive")
+  .option("--add <flag>", "Flag to add (seen|flagged|... repeatable)", collect, [])
+  .option("--remove <flag>", "Flag to remove (repeatable)", collect, [])
+  .action(async (messageId: string, options) => {
+    const add = options.add as string[];
+    const remove = options.remove as string[];
+    if (add.length === 0 && remove.length === 0) {
+      process.stderr.write("flag requires at least one --add or --remove.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await setMessageFlags(pool, config, messageId, { add, remove });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+const markVerb = (flag: string, present: boolean) =>
+  present ? { add: [flag] } : { remove: [flag] };
+
+program
+  .command("mark-read <messageId>")
+  .description("Mark a message read (STORE +\\Seen) — non-destructive")
+  .option("--unread", "Mark unread instead (STORE -\\Seen)")
+  .action(async (messageId: string, options) => {
+    const result = await setMessageFlags(pool, config, messageId, markVerb("seen", !options.unread));
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("star <messageId>")
+  .description("Star a message (STORE +\\Flagged) — non-destructive")
+  .option("--unstar", "Unstar instead (STORE -\\Flagged)")
+  .action(async (messageId: string, options) => {
+    const result = await setMessageFlags(pool, config, messageId, markVerb("flagged", !options.unstar));
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("move <messageId> <folder>")
+  .description("Move a message to another folder — non-destructive")
+  .action(async (messageId: string, folder: string) => {
+    const result = await moveMessage(pool, config, messageId, folder);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("delete <messageId>")
+  .description("Delete a message: move to Trash by default, or EXPUNGE with --hard (requires --confirm)")
+  .option("--hard", "Permanently delete (STORE +\\Deleted then EXPUNGE) instead of moving to Trash")
+  .option("--confirm", "Required confirmation for this destructive op")
+  .action(async (messageId: string, options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to delete without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await deleteMessage(pool, config, messageId, { hard: Boolean(options.hard) });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("thread-flag <messageId>")
+  .description("Add/remove flags on every message in a thread — non-destructive")
+  .option("--add <flag>", "Flag to add (repeatable)", collect, [])
+  .option("--remove <flag>", "Flag to remove (repeatable)", collect, [])
+  .action(async (messageId: string, options) => {
+    const add = options.add as string[];
+    const remove = options.remove as string[];
+    if (add.length === 0 && remove.length === 0) {
+      process.stderr.write("thread-flag requires at least one --add or --remove.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await setThreadFlags(pool, config, messageId, { add, remove });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("thread-move <messageId> <folder>")
+  .description("Move every message in a thread to a folder — non-destructive")
+  .action(async (messageId: string, folder: string) => {
+    const result = await moveThread(pool, config, messageId, folder);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("folder-create <accountId> <path>")
+  .description("Create a mailbox folder — non-destructive")
+  .action(async (accountId: string, path: string) => {
+    const result = await createFolder(pool, config, accountId, path);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("folder-rename <accountId> <path> <newPath>")
+  .description("Rename a mailbox folder — non-destructive")
+  .action(async (accountId: string, path: string, newPath: string) => {
+    const result = await renameFolder(pool, config, accountId, path, newPath);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("folder-delete <accountId> <path>")
+  .description("Delete a mailbox folder (requires --confirm)")
+  .option("--confirm", "Required confirmation for this destructive op")
+  .action(async (accountId: string, path: string, options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to delete a folder without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await deleteFolder(pool, config, accountId, path);
     console.log(JSON.stringify(result, null, 2));
   });
 
