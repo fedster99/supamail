@@ -584,7 +584,9 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (p.window !== undefined) filters.window = p.window;
 
     const request: SearchRequest = {
-      q: p.q,
+      // Treat an empty/whitespace `?q=` as absent so it doesn't slip past the
+      // "provide q and/or a filter" guard below into an unfiltered recent scan.
+      q: p.q?.trim() ? p.q : undefined,
       filters: Object.keys(filters).length > 0 ? filters : undefined,
       accounts: p.account ? [p.account] : undefined,
       sort: p.sort,

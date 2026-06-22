@@ -66,6 +66,28 @@ export function isRelativeDate(value: string): boolean {
   return RELATIVE_DATE.test(value);
 }
 
+/** A date filter value is acceptable iff it is a relative spec (`7d`) or an
+ * absolute `YYYY-MM-DD[...]` date. Anything else (e.g. `garbage`) is rejected
+ * here so it never reaches `$n::timestamptz`, where Postgres would 500. */
+function isValidDate(value: string): boolean {
+  return isRelativeDate(value) || ABSOLUTE_DATE.test(value);
+}
+
+/** Push a `date` filter for a structured after/before value, or warn+ignore an
+ * unparseable one — the same guard the `after:`/`before:` q-operators apply. */
+function pushDate(
+  op: "after" | "before",
+  value: string,
+  warnings: string[],
+  push: (filter: SearchFilter) => void
+): void {
+  if (isValidDate(value)) {
+    push({ kind: "date", op, value, negated: false, raw: `${op}:${value}` });
+  } else {
+    warnings.push(`unparseable date "${value}" for ${op}:; ignored`);
+  }
+}
+
 function parseSizeToBytes(value: string): number | null {
   const match = SIZE_RE.exec(value.trim());
   if (!match) return null;
@@ -216,7 +238,7 @@ export function parseQuery(input: string): ParsedQuery {
       case "since":
       case "newer_than":
       case "newer": {
-        if (isRelativeDate(rawValue) || ABSOLUTE_DATE.test(rawValue)) {
+        if (isValidDate(rawValue)) {
           filters.push({ kind: "date", op: "after", value: rawValue, negated, raw });
         } else {
           warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
@@ -227,7 +249,7 @@ export function parseQuery(input: string): ParsedQuery {
       case "until":
       case "older_than":
       case "older": {
-        if (isRelativeDate(rawValue) || ABSOLUTE_DATE.test(rawValue)) {
+        if (isValidDate(rawValue)) {
           filters.push({ kind: "date", op: "before", value: rawValue, negated, raw });
         } else {
           warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
@@ -287,8 +309,10 @@ export function parseQuery(input: string): ParsedQuery {
 }
 
 /** Map a typed {@link StructuredFilters} object onto the same filter union the
- * string parser emits, so structured request input and `q` share one compiler. */
-export function filtersFromStructured(structured: StructuredFilters): SearchFilter[] {
+ * string parser emits, so structured request input and `q` share one compiler.
+ * `warnings` collects any ignored input (e.g. an unparseable date) the same way
+ * `parseQuery` does, so a bad structured value is dropped — never sent to SQL. */
+export function filtersFromStructured(structured: StructuredFilters, warnings: string[] = []): SearchFilter[] {
   const out: SearchFilter[] = [];
   const push = (filter: SearchFilter): void => {
     out.push(filter);
@@ -313,16 +337,21 @@ export function filtersFromStructured(structured: StructuredFilters): SearchFilt
   if (structured.filename) push({ kind: "filename", value: structured.filename.toLowerCase(), negated: false, raw: `filename:${structured.filename}` });
   if (structured.filetype) push({ kind: "filetype", value: structured.filetype.toLowerCase(), negated: false, raw: `filetype:${structured.filetype}` });
   if (structured.mime) push({ kind: "mime", value: structured.mime.toLowerCase(), negated: false, raw: `mime:${structured.mime}` });
-  if (structured.isUnread) push({ kind: "flag", value: "\\Seen", negated: true, raw: "is:unread" });
+  // `unread`/`starred` honor an explicit `false` (read / not-starred) the same way
+  // `hasAttachment:false` represents "no attachment" — the compiler can negate the
+  // \Seen/\Flagged flag, so `false` restricts rather than silently no-opping.
+  if (structured.isUnread !== undefined) push({ kind: "flag", value: "\\Seen", negated: structured.isUnread, raw: `is:${structured.isUnread ? "unread" : "read"}` });
   if (structured.isRead) push({ kind: "flag", value: "\\Seen", negated: false, raw: "is:read" });
   if (structured.isFlagged) push({ kind: "flag", value: "\\Flagged", negated: false, raw: "is:flagged" });
-  if (structured.isStarred) push({ kind: "flag", value: "\\Flagged", negated: false, raw: "is:starred" });
+  if (structured.isStarred !== undefined) push({ kind: "flag", value: "\\Flagged", negated: !structured.isStarred, raw: `is:${structured.isStarred ? "starred" : "unstarred"}` });
   if (structured.isAnswered) push({ kind: "flag", value: "\\Answered", negated: false, raw: "is:answered" });
   if (structured.isDraft) push({ kind: "flag", value: "\\Draft", negated: false, raw: "is:draft" });
   if (structured.hasAttachment !== undefined) push({ kind: "hasAttachment", negated: !structured.hasAttachment, raw: "has:attachment" });
   if (structured.hasBody !== undefined) push({ kind: "hasBody", negated: !structured.hasBody, raw: "has:body" });
-  if (structured.after) push({ kind: "date", op: "after", value: structured.after, negated: false, raw: `after:${structured.after}` });
-  if (structured.before) push({ kind: "date", op: "before", value: structured.before, negated: false, raw: `before:${structured.before}` });
+  // Invalid structured dates are ignored with a warning (parity with the q-operator
+  // path) — never passed through to `$n::timestamptz` where Postgres would 500.
+  if (structured.after !== undefined) pushDate("after", structured.after, warnings, push);
+  if (structured.before !== undefined) pushDate("before", structured.before, warnings, push);
   if (structured.largerThan !== undefined) push({ kind: "size", op: "larger", value: structured.largerThan, negated: false, raw: `larger:${structured.largerThan}` });
   if (structured.smallerThan !== undefined) push({ kind: "size", op: "smaller", value: structured.smallerThan, negated: false, raw: `smaller:${structured.smallerThan}` });
   if (structured.window) push({ kind: "window", value: structured.window, negated: false, raw: `window:${structured.window}` });

@@ -169,6 +169,27 @@ describe("email-005 structured filters", () => {
     expect(compiled.values.some((v) => typeof v === "string" && v.includes("\\%") && v.includes("\\_"))).toBe(true);
   });
 
+  it("ignores an invalid structured date (warn, no filter) but keeps relative + absolute ones", () => {
+    // An unparseable `after` must NOT reach the compiler (where `$n::timestamptz`
+    // would make Postgres 500); it is dropped with a warning, exactly like after:.
+    const warnings: string[] = [];
+    const filters = filtersFromStructured({ after: "garbage" }, warnings);
+    expect(findFilter(filters, "date")).toBeUndefined();
+    expect(warnings.join(" ")).toContain("unparseable date");
+
+    // A relative spec (7d) and an absolute date still parse to a date filter.
+    expect(findFilter(filtersFromStructured({ after: "7d" }), "date")).toMatchObject({ op: "after", value: "7d" });
+    expect(findFilter(filtersFromStructured({ before: "2026-01-01" }), "date")).toMatchObject({ op: "before", value: "2026-01-01" });
+  });
+
+  it("honors unread=false (read) and starred=false (not starred) instead of silently dropping them", () => {
+    // false is not a no-op: it inverts, the way hasAttachment:false means "no attachment".
+    expect(findFilter(filtersFromStructured({ isUnread: false }), "flag")).toMatchObject({ value: "\\Seen", negated: false });
+    expect(findFilter(filtersFromStructured({ isUnread: true }), "flag")).toMatchObject({ value: "\\Seen", negated: true });
+    expect(findFilter(filtersFromStructured({ isStarred: false }), "flag")).toMatchObject({ value: "\\Flagged", negated: true });
+    expect(findFilter(filtersFromStructured({ isStarred: true }), "flag")).toMatchObject({ value: "\\Flagged", negated: false });
+  });
+
   it("narrows by received_after/received_before (date range) and folder scope, paginated", () => {
     const compiled = compileSearch(
       "",

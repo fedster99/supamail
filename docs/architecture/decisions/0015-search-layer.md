@@ -168,5 +168,5 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
 - ADR 0014: Agent email access is a core read surface, hosted in cloud.
 - ADR 0001: SupaMail core is email sync only (escape hatch invoked by ADR 0014).
 - GitHub issues #4 (MCP server) and #7 (agent-first email CLI).
-- `apps/api/supabase/migrations/public/0007_search_layer.sql`
+- `apps/api/supabase/migrations/public/0008_search_layer.sql`
 - `apps/api/src/search/`

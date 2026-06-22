@@ -907,6 +907,34 @@ describe("API safety", () => {
     await expect(empty.json()).resolves.toMatchObject({ error: "invalid_input" });
   });
 
+  it("treats an empty/whitespace ?q= with no filters as an empty search (400, not an unfiltered scan)", async () => {
+    const { app, search } = buildApp();
+
+    const emptyQ = await app.request("/search?q=", { headers: auth() });
+    expect(emptyQ.status).toBe(400);
+    await expect(emptyQ.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(search).not.toHaveBeenCalled();
+
+    const whitespaceQ = await app.request("/search?q=%20%20", { headers: auth() });
+    expect(whitespaceQ.status).toBe(400);
+    expect(search).not.toHaveBeenCalled();
+
+    // An empty q WITH a filter is fine: the filter alone satisfies the guard, and
+    // the blank q is dropped so it never reaches the engine as a free-text scan.
+    const emptyQWithFilter = await app.request("/search?q=&unread=true", { headers: auth() });
+    expect(emptyQWithFilter.status).toBe(200);
+    expect((search.mock.calls[0][0] as { q?: string }).q).toBeUndefined();
+    expect((search.mock.calls[0][0] as { filters?: unknown }).filters).toMatchObject({ isUnread: true });
+  });
+
+  it("passes an explicit ?unread=false / ?starred=false through as a restricting filter", async () => {
+    const { app, search } = buildApp();
+    const res = await app.request("/search?unread=false&starred=false", { headers: auth() });
+    expect(res.status).toBe(200);
+    // false is forwarded (not dropped); the engine inverts it to read / not-starred.
+    expect((search.mock.calls[0][0] as { filters?: unknown }).filters).toMatchObject({ isUnread: false, isStarred: false });
+  });
+
   it("rejects an invalid account uuid on GET /search with 400", async () => {
     const { app, search } = buildApp();
     const res = await app.request("/search?q=x&account=not-a-uuid", { headers: auth() });
