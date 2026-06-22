@@ -91,13 +91,14 @@ interface ApiAppOptions {
   /** Single-tenant send door (email-001). Resolves the SendResult JSON. */
   send: (req: SendRequest) => Promise<SendResult>;
   /** Draft CRUD (email-003, ADR 0019). Create/update/send APPEND to Drafts (and
-   * delete-old where needed); list/get read the mirror. Drafts carry no Bcc — it
-   * can't round-trip the saved bytes, so it's a send-time-only field (see ADR 0019). */
+   * delete-old where needed); list/get read the mirror. Drafts carry neither Bcc nor
+   * attachments — neither can round-trip the saved bytes, so both are send-time-only
+   * fields (see ADR 0019 / 0020). */
   drafts: {
-    create: (req: Omit<SendRequest, "bcc">) => Promise<CreateDraftResult>;
+    create: (req: Omit<SendRequest, "bcc" | "attachments">) => Promise<CreateDraftResult>;
     list: (accountId: string, options: { limit?: number }) => Promise<DraftSummary[]>;
     get: (messageId: string) => Promise<DraftDetail | null>;
-    update: (messageId: string, input: Omit<SendRequest, "accountId" | "bcc">) => Promise<UpdateDraftResult>;
+    update: (messageId: string, input: Omit<SendRequest, "accountId" | "bcc" | "attachments">) => Promise<UpdateDraftResult>;
     send: (messageId: string) => Promise<SendDraftResult>;
     delete: (messageId: string, options: { hard?: boolean }) => Promise<DeleteDraftResult>;
   };
@@ -196,6 +197,13 @@ const SEND_SCHEMA = z.object({
 // Bcc set on a saved draft would be silently dropped and never sent. We REJECT it
 // here with a clear message rather than accept-and-drop. Bcc is a send-time-only
 // field — set it on the /accounts/:id/send envelope (see ADR 0019).
+//
+// Attachments are likewise NOT a draft field: a draft composes its bytes once at
+// APPEND time, but `sendDraft` reconstructs the SendRequest from the parsed mirror
+// fields (attachment bytes are never mirrored), so any attachment on a saved draft
+// would be silently dropped on send. We REJECT it here, exactly like Bcc —
+// attachments are a send-time-only field; attach files on the /accounts/:id/send
+// envelope (see ADR 0020).
 const DRAFT_SCHEMA = z.object({
   to: z.array(SEND_RECIPIENT_SCHEMA).optional(),
   cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
@@ -212,7 +220,9 @@ const DRAFT_SCHEMA = z.object({
   inReplyTo: z.string().max(2000).optional(),
   references: z.string().max(8000).optional(),
   messageId: z.string().max(2000).optional(),
-  attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
+  attachments: z.any().optional().refine((v) => v === undefined, {
+    message: "Attachments are not supported on saved drafts — attach files when you send the draft"
+  })
 });
 
 const TRACK_FOLDER_SCHEMA = z.object({
@@ -358,6 +368,21 @@ function parseFields(raw: string | undefined): string[] | undefined {
  */
 function toArrayBuffer(buf: Buffer): ArrayBuffer {
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+}
+
+/**
+ * Build a safe `Content-Disposition` header for an attacker-influenced filename.
+ * The ASCII `filename=` token is stripped of CR/LF/`"`/`;`/`\`/control chars so it
+ * cannot break out of the quoted-string or inject extra disposition params, and an
+ * RFC 5987 `filename*=UTF-8''<percent-encoded>` token carries the original
+ * (possibly non-ASCII) name losslessly. A user agent that understands `filename*`
+ * prefers it; the sanitized ASCII `filename` is the safe fallback.
+ */
+function contentDispositionHeader(disposition: "inline" | "attachment", filename: string): string {
+  const asciiFallback = filename.replace(/[\r\n";\\\x00-\x1f\x7f]/g, "").trim() || "attachment";
+  // RFC 5987: percent-encode everything outside the attr-char set.
+  const encoded = encodeURIComponent(filename).replace(/['()*]/g, (ch) => "%" + ch.charCodeAt(0).toString(16).toUpperCase());
+  return `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
 }
 
 function safeBearerEquals(received: string, expected: Buffer): boolean {
@@ -523,7 +548,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     c.header("content-type", download.contentType ?? "application/octet-stream");
     c.header(
       "content-disposition",
-      `${download.inline ? "inline" : "attachment"}; filename="${(download.filename ?? "attachment").replace(/"/g, "")}"`
+      contentDispositionHeader(download.inline ? "inline" : "attachment", download.filename ?? "attachment")
     );
     return c.body(toArrayBuffer(download.content));
   });
@@ -553,7 +578,10 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (!message) throw new NotFoundError(`Message not found: ${id}`);
     const includeQuoted = c.req.query("include_quoted") === "true" || c.req.query("include_quoted") === "1";
     const maxCharsRaw = c.req.query("max_chars");
-    const maxChars = maxCharsRaw ? Number(maxCharsRaw) : undefined;
+    // A non-numeric `?max_chars=abc` yields NaN, which would silently disable
+    // truncation; fall back to the default (undefined) on anything non-finite.
+    const maxCharsParsed = maxCharsRaw ? Number(maxCharsRaw) : undefined;
+    const maxChars = Number.isFinite(maxCharsParsed) ? maxCharsParsed : undefined;
     const result = await options.content.cleanMessageBody(id, { includeQuoted, maxChars });
     return c.json({ body: result.body, truncated: result.truncated });
   });

@@ -234,7 +234,7 @@ function buildApp(options: {
     content: content as never
   });
 
-  return { app, repository, engine, applyMigration, send, drafts, mutations };
+  return { app, repository, engine, applyMigration, send, drafts, mutations, content };
 }
 
 function auth(token = "api-token"): Record<string, string> {
@@ -558,6 +558,25 @@ describe("API safety", () => {
     expect(drafts.create).not.toHaveBeenCalled();
   });
 
+  it("rejects a draft create carrying attachments with a clear message (attachments are send-time only)", async () => {
+    const { app, drafts } = buildApp();
+    const res = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        subject: "Draft",
+        attachments: [{ filename: "report.pdf", content: "AAAA" }],
+        body: { format: "plain", text: "hello" }
+      })
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json() as { error: string; issues: Array<{ message: string }> };
+    expect(json.error).toBe("invalid_input");
+    expect(json.issues.some((i) => i.message === "Attachments are not supported on saved drafts — attach files when you send the draft")).toBe(true);
+    // The draft is never filed when attachments are present (before any append).
+    expect(drafts.create).not.toHaveBeenCalled();
+  });
+
   it("returns 404 from POST /accounts/:id/drafts for an unknown account", async () => {
     const { app, drafts } = buildApp({ account: null });
     const res = await app.request(`/accounts/${accountId}/drafts`, {
@@ -743,6 +762,79 @@ describe("API safety", () => {
     });
     expect(missing.status).toBe(404);
     expect(noAccountMutations.createFolder).not.toHaveBeenCalled();
+  });
+
+  it("gates the content routes behind the API token", async () => {
+    const { app, content } = buildApp();
+    const unauthorized = await app.request(`/messages/${messageId}/attachments`);
+    expect(unauthorized.status).toBe(401);
+    expect(content.listAttachments).not.toHaveBeenCalled();
+  });
+
+  it("downloads an attachment with a sanitized content-disposition and the body bytes", async () => {
+    const { app, content } = buildApp();
+    const attachmentId = "00000000-0000-4000-8000-0000000000a1";
+    // A hostile filename: quote + CR/LF + semicolon (param injection) + non-ASCII.
+    content.getAttachmentMetadata.mockResolvedValueOnce({
+      attachmentId, messageId, filename: 'evil";\r\nname="x.exe', contentType: "application/pdf",
+      sizeBytes: 8, partNumber: "2", contentId: null, inline: false
+    } as never);
+    content.downloadAttachment.mockResolvedValueOnce({
+      attachmentId, messageId, filename: 'reçu";\r\n.pdf', contentType: "application/pdf",
+      sizeBytes: 8, partNumber: "2", contentId: null, inline: false, content: Buffer.from("PDFBYTES")
+    } as never);
+
+    const res = await app.request(`/attachments/${attachmentId}/download`, { headers: auth() });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/pdf");
+    const disposition = res.headers.get("content-disposition") ?? "";
+    // No CR/LF/quote/semicolon survives in the ASCII filename token (no injection).
+    expect(disposition).not.toContain("\r");
+    expect(disposition).not.toContain("\n");
+    const asciiToken = disposition.match(/filename="([^"]*)"/)?.[1] ?? "";
+    expect(asciiToken).not.toContain('"');
+    expect(asciiToken).not.toContain(";");
+    // The RFC 5987 token is present so the non-ASCII name round-trips.
+    expect(disposition).toContain("filename*=UTF-8''");
+    expect(disposition).toMatch(/filename\*=UTF-8''[^;\r\n]*/);
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.toString()).toBe("PDFBYTES");
+  });
+
+  it("rejects an oversized multipart send part with 413", async () => {
+    const { app, send } = buildApp();
+    const form = new FormData();
+    form.append("payload", JSON.stringify({
+      to: [{ email: "r@example.test" }], subject: "Hi", body: { format: "plain", text: "y" }
+    }));
+    // One file part over the 25MB cap.
+    const big = new Uint8Array(25 * 1024 * 1024 + 1);
+    form.append("file", new File([big], "big.bin", { type: "application/octet-stream" }));
+
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: auth(),
+      body: form
+    });
+    expect(res.status).toBe(413);
+    await expect(res.json()).resolves.toMatchObject({ error: "attachment_too_large" });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("returns only basic headers from GET /messages/:id/headers?basic=true", async () => {
+    const { app, content } = buildApp();
+    const res = await app.request(`/messages/${messageId}/headers?basic=true`, { headers: auth() });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ headers: { "message-id": "<m@example.test>" } });
+    expect(content.getMessageHeaders).toHaveBeenCalledWith(messageId, { basic: true });
+  });
+
+  it("falls back to the default truncation on a non-numeric max_chars", async () => {
+    const { app, content } = buildApp();
+    const res = await app.request(`/messages/${messageId}/clean-body?max_chars=abc`, { headers: auth() });
+    expect(res.status).toBe(200);
+    // NaN must NOT reach the lib — it would disable truncation; default (undefined) instead.
+    expect(content.cleanMessageBody).toHaveBeenCalledWith(messageId, { includeQuoted: false, maxChars: undefined });
   });
 
   it("uses the SupaMail CLI name", async () => {

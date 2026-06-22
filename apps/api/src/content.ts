@@ -305,11 +305,11 @@ export async function getRawMime(
   messageId: string
 ): Promise<RawMimeResult> {
   const stored = await pool.connect();
-  let mirrored: { raw_mime: Buffer | null; raw_bytes: string | null; raw_truncated: boolean } | undefined;
+  let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean } | undefined;
   try {
-    const result = await stored.query<{ raw_mime: Buffer | null; raw_bytes: string | null; raw_truncated: boolean }>(
+    const result = await stored.query<{ raw_mime: Buffer | null; raw_truncated: boolean }>(
       `
-      SELECT raw_mime, raw_bytes, raw_truncated
+      SELECT raw_mime, raw_truncated
       FROM public.imap_message_bodies
       WHERE message_id = $1
       `,

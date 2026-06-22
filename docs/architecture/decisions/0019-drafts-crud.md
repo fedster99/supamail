@@ -108,6 +108,10 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   type as an oversight: Bcc is dropped from the saved bytes by design (nodemailer's
   `keepBcc`), so accepting it on a draft would silently lose recipients. Set Bcc on
   the `send`/`reply` envelope instead.
+- Drafts carry neither Bcc nor attachments; both are send-time-only fields. email-004
+  (ADR 0020) likewise rejects `attachments` on a saved draft — attachment bytes are
+  never mirrored, so `sendDraft` (which rebuilds the SendRequest from the mirror)
+  would drop them silently. Attach files on the `send` envelope instead.
 - HTML drafts are sent as HTML, never flattened. `getDraft` carries `bodyHtml` +
   `isHtml` precisely so `sendDraft` can preserve the original markup; a future change
   must keep that distinction rather than hardcoding `format: "plain"` again.

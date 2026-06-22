@@ -30,19 +30,30 @@ import type { ImapAccount, SendRecipient, SendRequest, SendResult } from "./type
  * {@link import("./mailbox-mutations.js").MailboxMutator}.
  */
 
-/** What a draft create/update carries — a SendRequest minus `bcc`. Bcc cannot
- * round-trip through the APPENDed draft bytes (nodemailer's keepBcc default omits
- * Bcc from the composed MIME), so a Bcc set on a saved draft would be silently
- * dropped and never sent. Bcc is therefore a send-time-only field — set it on the
- * `sendMessage` envelope, not on a draft (see ADR 0019). `accountId` selects the
- * mailbox whose Drafts folder we file to. */
-export type DraftInput = Omit<SendRequest, "bcc">;
+/** What a draft create/update carries — a SendRequest minus `bcc` and
+ * `attachments`. Neither can round-trip through the APPENDed draft bytes: nodemailer's
+ * keepBcc default omits Bcc from the composed MIME, and `sendDraft` rebuilds the
+ * SendRequest from the parsed mirror fields (attachment bytes are never mirrored), so
+ * an attachment on a saved draft would be silently dropped on send. Both are therefore
+ * send-time-only fields — set them on the `sendMessage` envelope, not on a draft (see
+ * ADR 0019 / 0020). `accountId` selects the mailbox whose Drafts folder we file to. */
+export type DraftInput = Omit<SendRequest, "bcc" | "attachments">;
 
 /** Reject a Bcc smuggled past the type system (e.g. an untyped HTTP/JSON caller).
  * Bcc on a draft is dropped end-to-end, so refuse it loudly instead. */
 function rejectBcc(input: unknown): void {
   if (input && typeof input === "object" && (input as { bcc?: unknown }).bcc !== undefined) {
     throw new Error("Bcc is not supported on saved drafts — set Bcc when you send the draft");
+  }
+}
+
+/** Reject attachments smuggled past the type system (e.g. an untyped HTTP/JSON
+ * caller). A draft composes its bytes once at APPEND time, but `sendDraft` rebuilds
+ * the SendRequest from parsed mirror fields (attachment bytes are never mirrored), so
+ * an attachment on a saved draft is dropped on send — refuse it loudly instead. */
+function rejectAttachments(input: unknown): void {
+  if (input && typeof input === "object" && (input as { attachments?: unknown }).attachments !== undefined) {
+    throw new Error("Attachments are not supported on saved drafts — attach files when you send the draft");
   }
 }
 
@@ -152,6 +163,7 @@ export async function createDraft(
   input: DraftInput
 ): Promise<CreateDraftResult> {
   rejectBcc(input);
+  rejectAttachments(input);
   const repository = new MirrorRepository(pool, config);
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
@@ -330,6 +342,7 @@ export async function updateDraft(
   input: Omit<DraftInput, "accountId">
 ): Promise<UpdateDraftResult> {
   rejectBcc(input);
+  rejectAttachments(input);
   const repository = new MirrorRepository(pool, config);
   const existing = await repository.getMessage(messageId);
   if (!existing) throw new Error(`Draft not found: ${messageId}`);

@@ -166,6 +166,24 @@ describe("createDraft", () => {
     expect(mocks.getAccount).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
   });
+
+  it("rejects attachments smuggled past the type system before connecting (bytes can't round-trip a draft)", async () => {
+    const { createDraft } = await import("../drafts.js");
+    await expect(
+      // Attachment bytes are never mirrored, so sendDraft (which rebuilds the
+      // SendRequest from the mirror) would drop them on send — refuse, not accept.
+      createDraft({} as never, config, {
+        accountId: "acc-1",
+        to: [{ email: "rcpt@example.test" }],
+        subject: "My draft",
+        body: { format: "plain", text: "Hello" },
+        attachments: [{ filename: "report.pdf", content: "AAAA" }]
+      } as never)
+    ).rejects.toThrow("Attachments are not supported on saved drafts — attach files when you send the draft");
+    // Refused before any account lookup or IMAP connect.
+    expect(mocks.getAccount).not.toHaveBeenCalled();
+    expect(mocks.append).not.toHaveBeenCalled();
+  });
 });
 
 describe("updateDraft", () => {
