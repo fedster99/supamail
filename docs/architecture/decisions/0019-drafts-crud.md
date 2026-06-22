@@ -48,7 +48,21 @@ introduced:
   (which delivers over SMTP and files a copy to Sent), **then** deletes the draft.
   The SMTP path is **reused, never duplicated** — `drafts.ts` imports `sendMessage`
   and does not touch nodemailer/SMTP itself. Send refuses a draft with no
-  recipients before any delivery.
+  recipients before any delivery. **Body format is preserved on send:** `getDraft`
+  surfaces both the plaintext `body` and the original `bodyHtml` + an `isHtml` flag
+  (derived from `selected_text_format`), and `sendDraft` sends an HTML draft with
+  `body: { format: "html", html }` rather than flattening it through `htmlToText`.
+  An HTML-authored or HTML-synced draft therefore goes out with its links and
+  formatting intact, not as lossy plaintext.
+- **Bcc is rejected on drafts (send-time only).** Bcc cannot round-trip through the
+  APPENDed draft bytes — nodemailer's `keepBcc` default omits Bcc from the composed
+  MIME, so a Bcc stored on a draft would be silently lost and never sent. Rather
+  than accept-and-drop, drafts **reject** Bcc: `DRAFT_SCHEMA` errors with `"Bcc is
+  not supported on saved drafts — set Bcc when you send the draft"`, the CLI
+  `draft-create`/`draft-update` commands expose no `--bcc`, the `createDraft`/
+  `updateDraft` input types omit `bcc`, and the lib re-checks at runtime for an
+  untyped caller. Bcc remains fully supported on the email-001 **send** envelope —
+  set it when the draft is sent.
 - **Delete** reuses email-002 `deleteMessage` directly (trash by default, `\hard`
   EXPUNGE on request), so the blanket-EXPUNGE refusal and UIDVALIDITY guard from
   ADR 0018 apply unchanged — drafts get no new deletion path.
@@ -89,6 +103,14 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   on a server without it, `deleteMessage(hard)` refuses rather than risk a blanket
   EXPUNGE, so update/send surface that capability error instead of silently
   purging.
+- Drafts intentionally do **not** carry Bcc — it is a send-time-only field. A future
+  change must NOT "re-add" `bcc` to `DRAFT_SCHEMA`, the CLI, or the `DraftInput`
+  type as an oversight: Bcc is dropped from the saved bytes by design (nodemailer's
+  `keepBcc`), so accepting it on a draft would silently lose recipients. Set Bcc on
+  the `send`/`reply` envelope instead.
+- HTML drafts are sent as HTML, never flattened. `getDraft` carries `bodyHtml` +
+  `isHtml` precisely so `sendDraft` can preserve the original markup; a future change
+  must keep that distinction rather than hardcoding `format: "plain"` again.
 - The cloud re-pin inherits draft CRUD via `@supamail/api`; cloud adds tenant
   scoping + the human-confirm MCP wrapper, never editing `imap_*` schema.
 
@@ -100,12 +122,14 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
 - `sync-adapter-read-only.test.ts` stays green: the sync adapter still exposes no
   append/store/expunge (APPEND lives only on `SentFolderAppender`).
 - `drafts.test.ts` covers: create APPENDs `\Draft` to the resolved Drafts folder;
-  update = append-new + hard-delete-old; send calls `sendMessage` then deletes
-  (ordering asserted) and refuses a recipient-less draft; delete reuses the
-  email-002 mutation; list/get read the mirror only.
+  create rejects a smuggled Bcc with the clear message before any connect; update =
+  append-new + hard-delete-old; send calls `sendMessage` then deletes (ordering
+  asserted), refuses a recipient-less draft, and sends an HTML draft with
+  `format: "html"` and the real HTML body (not the `htmlToText` flattening); delete
+  reuses the email-002 mutation; list/get read the mirror only.
 - `api-safety.test.ts` covers the `API_TOKEN`-gated draft routes (create with
-  optional recipients, 404 for unknown account/draft, list/get/update/send, and
-  the `?hard` delete mapping).
+  optional recipients, create with `bcc` rejected 400 with the clear message, 404
+  for unknown account/draft, list/get/update/send, and the `?hard` delete mapping).
 - The GreenMail smoke (`scripts/greenmail-smoke.ts`) creates a draft → resyncs →
   asserts it appears in Drafts, then sends it → asserts it leaves Drafts and lands
   in Sent (requires Docker).

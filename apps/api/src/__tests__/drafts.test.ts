@@ -148,6 +148,24 @@ describe("createDraft", () => {
     ).rejects.toThrow(/Account not found/);
     expect(mocks.append).not.toHaveBeenCalled();
   });
+
+  it("rejects a Bcc smuggled past the type system before connecting (Bcc can't round-trip a draft)", async () => {
+    const { createDraft } = await import("../drafts.js");
+    await expect(
+      // A Bcc on a saved draft is dropped end-to-end (nodemailer's keepBcc default
+      // omits it from the APPENDed bytes), so it must be refused, not accepted.
+      createDraft({} as never, config, {
+        accountId: "acc-1",
+        to: [{ email: "rcpt@example.test" }],
+        bcc: [{ email: "secret@example.test" }],
+        subject: "My draft",
+        body: { format: "plain", text: "Hello" }
+      } as never)
+    ).rejects.toThrow("Bcc is not supported on saved drafts — set Bcc when you send the draft");
+    // Refused before any account lookup or IMAP connect.
+    expect(mocks.getAccount).not.toHaveBeenCalled();
+    expect(mocks.append).not.toHaveBeenCalled();
+  });
 });
 
 describe("updateDraft", () => {
@@ -207,8 +225,10 @@ describe("sendDraft", () => {
     references_header: "<orig@peer.test>",
     internal_date: new Date("2026-05-19T00:00:00.000Z"),
     body_text: "Hello there",
+    body_html: null,
     body_plain: null,
-    selected_text_part: null
+    selected_text_part: null,
+    selected_text_format: "plain"
   };
 
   it("sends via the email-001 primitive then deletes the draft", async () => {
@@ -232,6 +252,28 @@ describe("sendDraft", () => {
     const deleteOrder = mocks.deleteMessage.mock.invocationCallOrder[0];
     expect(sendOrder).toBeLessThan(deleteOrder);
     expect(result).toMatchObject({ deletedDraftId: "draft-1", send: { delivered: true } });
+  });
+
+  it("sends an HTML draft as real HTML (not a lossy htmlToText flattening)", async () => {
+    // An HTML-authored/synced draft: selected part is HTML and a stored HTML body
+    // carries the real markup. Send must deliver that HTML, not a flattened render.
+    const html = '<p>Hi <a href="https://supamail.test">link</a></p>';
+    const htmlRow = {
+      ...draftRow,
+      body_text: "Hi link https://supamail.test", // the lossy fallback that must NOT be sent
+      body_html: html,
+      selected_text_format: "html" as const
+    };
+    const pool = mockPoolReturningDraft(htmlRow);
+    const { sendDraft } = await import("../drafts.js");
+    await sendDraft(pool, config, "draft-1");
+
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    const sentReq = mocks.sendMessage.mock.calls[0][2] as { body: { format: string; html?: string } };
+    expect(sentReq.body.format).toBe("html");
+    expect(sentReq.body.html).toBe(html);
+    // The flattened plaintext is never substituted for the real HTML.
+    expect(sentReq.body).not.toMatchObject({ format: "plain" });
   });
 
   it("refuses to send a draft with no recipients (and does not delete)", async () => {

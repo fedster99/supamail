@@ -337,15 +337,15 @@ program
   .requiredOption("--account-id <id>", "Account UUID to file the draft under")
   .option("--to <addr>", "Recipient (repeatable; 'Name <email>' or 'email')", collect, [])
   .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
-  .option("--bcc <addr>", "Bcc recipient (repeatable)", collect, [])
   .option("--subject <text>", "Subject line", "")
   .option("--body <text>", "Plain-text body", "")
   .action(async (options) => {
+    // No --bcc: Bcc can't round-trip through the saved draft bytes, so it is a
+    // send-time-only field (set it on `send`/`reply`). See ADR 0019.
     const result = await createDraft(pool, config, {
       accountId: options.accountId,
       to: parseRecipients(options.to as string[]),
       cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
-      bcc: (options.bcc as string[]).length > 0 ? parseRecipients(options.bcc as string[]) : undefined,
       subject: options.subject,
       body: { format: "plain", text: options.body }
     });
@@ -379,14 +379,13 @@ program
   .description("Update a draft (append-new + delete-old; IMAP drafts are immutable)")
   .option("--to <addr>", "Recipient (repeatable)", collect, [])
   .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
-  .option("--bcc <addr>", "Bcc recipient (repeatable)", collect, [])
   .option("--subject <text>", "Subject line", "")
   .option("--body <text>", "Plain-text body", "")
   .action(async (messageId: string, options) => {
+    // No --bcc: Bcc is a send-time-only field, not a saved-draft field. See ADR 0019.
     const result = await updateDraft(pool, config, messageId, {
       to: parseRecipients(options.to as string[]),
       cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
-      bcc: (options.bcc as string[]).length > 0 ? parseRecipients(options.bcc as string[]) : undefined,
       subject: options.subject,
       body: { format: "plain", text: options.body }
     });

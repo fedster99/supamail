@@ -30,10 +30,21 @@ import type { ImapAccount, SendRecipient, SendRequest, SendResult } from "./type
  * {@link import("./mailbox-mutations.js").MailboxMutator}.
  */
 
-/** What a draft create/update carries — a SendRequest minus the threading-only
- * `messageId` stamping concerns. We reuse SendRequest verbatim so compose stays
- * one code path; `accountId` selects the mailbox whose Drafts folder we file to. */
-export type DraftInput = SendRequest;
+/** What a draft create/update carries — a SendRequest minus `bcc`. Bcc cannot
+ * round-trip through the APPENDed draft bytes (nodemailer's keepBcc default omits
+ * Bcc from the composed MIME), so a Bcc set on a saved draft would be silently
+ * dropped and never sent. Bcc is therefore a send-time-only field — set it on the
+ * `sendMessage` envelope, not on a draft (see ADR 0019). `accountId` selects the
+ * mailbox whose Drafts folder we file to. */
+export type DraftInput = Omit<SendRequest, "bcc">;
+
+/** Reject a Bcc smuggled past the type system (e.g. an untyped HTTP/JSON caller).
+ * Bcc on a draft is dropped end-to-end, so refuse it loudly instead. */
+function rejectBcc(input: unknown): void {
+  if (input && typeof input === "object" && (input as { bcc?: unknown }).bcc !== undefined) {
+    throw new Error("Bcc is not supported on saved drafts — set Bcc when you send the draft");
+  }
+}
 
 /** One draft summary read from the mirror (list view). */
 export interface DraftSummary {
@@ -50,9 +61,15 @@ export interface DraftSummary {
   flags: string[];
 }
 
-/** A single draft with its body text (get view). */
+/** A single draft with its body (get view). Carries both the plaintext `body` and,
+ * when the draft was authored/synced as HTML, the original `bodyHtml` + `isHtml`
+ * flag so send can deliver the real HTML instead of a lossy flattened rendering. */
 export interface DraftDetail extends DraftSummary {
   body: string | null;
+  /** The original HTML body when the draft is HTML, else null. */
+  bodyHtml: string | null;
+  /** True when the draft's selected body part is HTML (format === "html"). */
+  isHtml: boolean;
   inReplyTo: string | null;
   references: string | null;
 }
@@ -134,6 +151,7 @@ export async function createDraft(
   config: AppConfig,
   input: DraftInput
 ): Promise<CreateDraftResult> {
+  rejectBcc(input);
   const repository = new MirrorRepository(pool, config);
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
@@ -158,8 +176,10 @@ interface DraftRow {
   references_header: string | null;
   internal_date: Date;
   body_text: string | null;
+  body_html: string | null;
   body_plain: string | null;
   selected_text_part: string | null;
+  selected_text_format: "plain" | "html" | null;
 }
 
 function toSummary(row: DraftRow): DraftSummary {
@@ -223,7 +243,8 @@ export async function listDrafts(
         m.id, m.account_id, m.folder_path, m.uid, m.rfc_message_id, m.subject,
         m.from_email, m.to_emails, m.cc_emails, m.flags, m.in_reply_to,
         m.references_header, m.internal_date,
-        NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part
+        NULL::text AS body_text, NULL::text AS body_html, NULL::text AS body_plain,
+        NULL::text AS selected_text_part, NULL::text AS selected_text_format
       FROM public.imap_messages m
       WHERE m.account_id = $1
         AND m.deleted_in_provider = false
@@ -259,7 +280,7 @@ export async function getDraft(
         m.id, m.account_id, m.folder_path, m.uid, m.rfc_message_id, m.subject,
         m.from_email, m.to_emails, m.cc_emails, m.flags, m.in_reply_to,
         m.references_header, m.internal_date,
-        b.body_text, b.body_plain, b.selected_text_part
+        b.body_text, b.body_html, b.body_plain, b.selected_text_part, b.selected_text_format
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
@@ -275,9 +296,18 @@ export async function getDraft(
     const isDraftFlagged = (row.flags ?? []).some((f) => f.toLowerCase() === "\\draft");
     if (!isDraftFolder && !isDraftFlagged) return null;
 
+    // The draft is HTML when its selected body part is HTML, or (defensively) when
+    // there is an HTML body but no plaintext to fall back to. Send uses bodyHtml so
+    // links/formatting survive instead of being flattened by htmlToText.
+    const isHtml =
+      row.selected_text_format === "html" ||
+      (row.body_html !== null && row.body_text === null && row.body_plain === null);
+
     return {
       ...toSummary(row),
       body: row.body_text ?? row.body_plain ?? row.selected_text_part ?? null,
+      bodyHtml: row.body_html ?? null,
+      isHtml,
       inReplyTo: row.in_reply_to,
       references: row.references_header
     };
@@ -299,6 +329,7 @@ export async function updateDraft(
   messageId: string,
   input: Omit<DraftInput, "accountId">
 ): Promise<UpdateDraftResult> {
+  rejectBcc(input);
   const repository = new MirrorRepository(pool, config);
   const existing = await repository.getMessage(messageId);
   if (!existing) throw new Error(`Draft not found: ${messageId}`);
@@ -341,12 +372,20 @@ export async function sendDraft(
 
   const to: SendRecipient[] = draft.toEmails.map((email) => ({ email }));
   const cc: SendRecipient[] = draft.ccEmails.map((email) => ({ email }));
+  // Preserve the draft's body format. An HTML-authored (or HTML-synced) draft is
+  // sent as real HTML — flattening it to htmlTo(text) would silently lose links and
+  // formatting. Only a plaintext draft (or an HTML draft with no stored HTML body)
+  // goes out as plain. See ADR 0019.
+  const body: SendRequest["body"] =
+    draft.isHtml && draft.bodyHtml !== null
+      ? { format: "html", html: draft.bodyHtml }
+      : { format: "plain", text: draft.body ?? "" };
   const request: SendRequest = {
     accountId: draft.accountId,
     to,
     cc: cc.length > 0 ? cc : undefined,
     subject: draft.subject ?? "",
-    body: { format: "plain", text: draft.body ?? "" },
+    body,
     inReplyTo: draft.inReplyTo ?? undefined,
     references: draft.references ?? undefined
   };

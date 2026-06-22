@@ -77,12 +77,13 @@ interface ApiAppOptions {
   /** Single-tenant send door (email-001). Resolves the SendResult JSON. */
   send: (req: SendRequest) => Promise<SendResult>;
   /** Draft CRUD (email-003, ADR 0019). Create/update/send APPEND to Drafts (and
-   * delete-old where needed); list/get read the mirror. */
+   * delete-old where needed); list/get read the mirror. Drafts carry no Bcc — it
+   * can't round-trip the saved bytes, so it's a send-time-only field (see ADR 0019). */
   drafts: {
-    create: (req: SendRequest) => Promise<CreateDraftResult>;
+    create: (req: Omit<SendRequest, "bcc">) => Promise<CreateDraftResult>;
     list: (accountId: string, options: { limit?: number }) => Promise<DraftSummary[]>;
     get: (messageId: string) => Promise<DraftDetail | null>;
-    update: (messageId: string, input: Omit<SendRequest, "accountId">) => Promise<UpdateDraftResult>;
+    update: (messageId: string, input: Omit<SendRequest, "accountId" | "bcc">) => Promise<UpdateDraftResult>;
     send: (messageId: string) => Promise<SendDraftResult>;
     delete: (messageId: string, options: { hard?: boolean }) => Promise<DeleteDraftResult>;
   };
@@ -149,10 +150,18 @@ const SEND_SCHEMA = z.object({
 // Draft body (email-003). Unlike SEND_SCHEMA, `to` may be empty/absent — a draft
 // can be saved while still incomplete; the recipient requirement is enforced only
 // when the draft is sent. accountId comes from the path on create.
+//
+// Bcc is intentionally NOT a draft field: it cannot round-trip through the APPENDed
+// draft bytes (nodemailer's keepBcc default omits Bcc from the composed MIME), so a
+// Bcc set on a saved draft would be silently dropped and never sent. We REJECT it
+// here with a clear message rather than accept-and-drop. Bcc is a send-time-only
+// field — set it on the /accounts/:id/send envelope (see ADR 0019).
 const DRAFT_SCHEMA = z.object({
   to: z.array(SEND_RECIPIENT_SCHEMA).optional(),
   cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
-  bcc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
+  bcc: z.any().optional().refine((v) => v === undefined, {
+    message: "Bcc is not supported on saved drafts — set Bcc when you send the draft"
+  }),
   subject: z.string().max(2000).optional(),
   body: z.object({
     format: z.enum(["plain", "html"]),

@@ -524,6 +524,25 @@ describe("API safety", () => {
     );
   });
 
+  it("rejects a draft create carrying bcc with a clear message (Bcc is send-time only)", async () => {
+    const { app, drafts } = buildApp();
+    const res = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        subject: "Draft",
+        bcc: [{ email: "secret@example.test" }],
+        body: { format: "plain", text: "hello" }
+      })
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json() as { error: string; issues: Array<{ message: string }> };
+    expect(json.error).toBe("invalid_input");
+    expect(json.issues.some((i) => i.message === "Bcc is not supported on saved drafts — set Bcc when you send the draft")).toBe(true);
+    // The draft is never filed when Bcc is present.
+    expect(drafts.create).not.toHaveBeenCalled();
+  });
+
   it("returns 404 from POST /accounts/:id/drafts for an unknown account", async () => {
     const { app, drafts } = buildApp({ account: null });
     const res = await app.request(`/accounts/${accountId}/drafts`, {
