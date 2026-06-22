@@ -141,13 +141,25 @@ export class MirrorRepository {
   ) {}
 
   async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
-    // Email-domain autodiscovery (email-008): when host is omitted, fill the
-    // IMAP coordinates (and provider_profile) from the email domain's preset.
-    // Explicit input always wins — an explicit host/port/secure/providerProfile
-    // is never overridden, and the preset only supplies values left blank.
-    const discovered = input.host === undefined ? autodiscoverProfile(input.emailAddress) : null;
-    const host = input.host ?? discovered?.imapDefaults?.host;
-    const port = input.port ?? discovered?.imapDefaults?.port;
+    // IMAP coordinate resolution (email-008) when host is omitted, in precedence:
+    //   (1) explicit host/port/secure (always wins, applied below via `??`),
+    //   (2) an explicitly-named non-generic preset's imapDefaults
+    //       (`--profile fastmail` supplies the fastmail coordinates),
+    //   (3) email-domain autodiscovery (the domain guess),
+    //   (4) clear error.
+    // An explicit `--profile` thus BEATS the domain guess; an explicit host beats
+    // both. The chosen preset id is stored in provider_profile so the SMTP path's
+    // resolveSmtpCreds (ADR 0017) picks up the matching smtpDefaults.
+    const namedProfile =
+      input.providerProfile !== undefined ? getProviderProfile(input.providerProfile) : null;
+    const namedPreset = namedProfile?.imapDefaults ? namedProfile : null;
+    const discovered =
+      input.host === undefined && namedPreset === null
+        ? autodiscoverProfile(input.emailAddress)
+        : null;
+    const presetDefaults = namedPreset?.imapDefaults ?? discovered?.imapDefaults;
+    const host = input.host ?? presetDefaults?.host;
+    const port = input.port ?? presetDefaults?.port;
     const providerProfile =
       input.providerProfile ?? discovered?.id ?? "generic-imap";
 
@@ -157,7 +169,7 @@ export class MirrorRepository {
       );
     }
 
-    const secure = input.secure ?? discovered?.imapDefaults?.secure ?? true;
+    const secure = input.secure ?? presetDefaults?.secure ?? true;
     await assertSafeImapTarget(host, port, secure, {
       allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
     });

@@ -119,7 +119,12 @@ export const fastmailProfile: ProviderProfile = {
   smtpDefaults: { host: () => "smtp.fastmail.com", port: 465, secure: true }
 };
 
-// Zoho Mail: imap.zoho.com:993 (implicit TLS) / smtp.zoho.com:465 (implicit TLS).
+// Zoho Mail (US datacenter): imap.zoho.com:993 (implicit TLS) / smtp.zoho.com:465
+// (implicit TLS). Zoho is MULTI-DATACENTER (US/EU/IN/AU/CN) and the email domain
+// does NOT reveal which DC an account lives in, so `@zoho.com` is deliberately NOT
+// in DOMAIN_TO_PROFILE (it cannot be autodiscovered safely). These US-DC
+// coordinates are reachable only via an explicit `--profile zoho`; EU/IN/AU/CN
+// users pass explicit `--host`/`--smtp-host` (`.eu`/`.in`/`.com.au`/`.zoho.com.cn`).
 export const zohoProfile: ProviderProfile = {
   ...genericImapProfile,
   id: "zoho",
@@ -132,6 +137,9 @@ export const zohoProfile: ProviderProfile = {
 // iCloud Mail: imap.mail.me.com:993 (implicit TLS) / smtp.mail.me.com:587 (STARTTLS).
 // Requires an app-specific password (Apple does not allow the primary password
 // over IMAP/SMTP); that is a credential concern handled by the caller, not here.
+// Username note: iCloud IMAP expects the bare local-part (e.g. `alice`) while SMTP
+// expects the full address (`alice@icloud.com`) — also a caller credential concern,
+// not encoded in these coordinates.
 export const icloudProfile: ProviderProfile = {
   ...genericImapProfile,
   id: "icloud",
@@ -176,12 +184,15 @@ export function listProviderProfiles(): ProviderProfile[] {
  * ymail.com/rocketmail.com → Yahoo. The lookup is a static map only — NO
  * network MX/autoconfig probing. Returns null when no preset matches (the
  * caller then keeps generic IMAP and requires explicit coordinates).
+ *
+ * Zoho is deliberately NOT here: it is multi-datacenter (US/EU/IN/AU/CN) and the
+ * email domain does not reveal the DC, so `@zoho.com` cannot be autodiscovered
+ * safely (the US-DC coordinates are wrong for EU/IN/AU/CN accounts). US-DC users
+ * select `--profile zoho`; other DCs pass explicit `--host`/`--smtp-host`.
  */
 const DOMAIN_TO_PROFILE: ReadonlyMap<string, string> = new Map([
   ["fastmail.com", fastmailProfile.id],
   ["fastmail.fm", fastmailProfile.id],
-  ["zoho.com", zohoProfile.id],
-  ["zohomail.com", zohoProfile.id],
   ["icloud.com", icloudProfile.id],
   ["me.com", icloudProfile.id],
   ["mac.com", icloudProfile.id],

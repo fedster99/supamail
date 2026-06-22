@@ -90,6 +90,72 @@ describe("createAccount email-domain autodiscovery (email-008)", () => {
     expect(p[COL.profile]).toBe("generic-imap");
   });
 
+  it("supplies a named preset's coordinates when --profile is set and host is omitted", async () => {
+    const { pool, insertParams } = stubPool();
+    const repo = new MirrorRepository(pool, config);
+    // Domain (a self-hosted vanity domain) does NOT match any preset; the explicit
+    // --profile fastmail is what supplies the coordinates.
+    await repo.createAccount({
+      emailAddress: "alice@vanity.example",
+      username: "alice@fastmail.com",
+      password: "secret",
+      providerProfile: "fastmail"
+    });
+    const p = insertParams();
+    expect(p[COL.profile]).toBe("fastmail");
+    expect(p[COL.host]).toBe("imap.fastmail.com");
+    expect(p[COL.port]).toBe(993);
+    expect(p[COL.secure]).toBe(true);
+  });
+
+  it("resolves the zoho US-DC coordinates from --profile zoho with no host (M1)", async () => {
+    const { pool, insertParams } = stubPool();
+    const repo = new MirrorRepository(pool, config);
+    // `@zoho.com` is no longer autodiscovered (multi-DC); the US-DC coordinates are
+    // reachable only via the explicit --profile zoho.
+    await repo.createAccount({
+      emailAddress: "bob@zoho.com",
+      username: "bob@zoho.com",
+      password: "secret",
+      providerProfile: "zoho"
+    });
+    const p = insertParams();
+    expect(p[COL.profile]).toBe("zoho");
+    expect(p[COL.host]).toBe("imap.zoho.com");
+    expect(p[COL.port]).toBe(993);
+    expect(p[COL.secure]).toBe(true);
+  });
+
+  it("rejects a host-less @zoho.com with no --profile (multi-DC, not autodiscovered)", async () => {
+    const { pool } = stubPool();
+    const repo = new MirrorRepository(pool, config);
+    await expect(
+      repo.createAccount({
+        emailAddress: "bob@zoho.com",
+        username: "bob@zoho.com",
+        password: "secret"
+      })
+    ).rejects.toThrow(/No IMAP host\/port/);
+  });
+
+  it("lets an explicit host win over a named --profile preset", async () => {
+    const { pool, insertParams } = stubPool();
+    const repo = new MirrorRepository(pool, config);
+    await repo.createAccount({
+      emailAddress: "alice@fastmail.com",
+      host: "imap.self-hosted.test",
+      port: 1993,
+      username: "alice",
+      password: "secret",
+      providerProfile: "fastmail"
+    });
+    const p = insertParams();
+    // Explicit host/port win; the stored profile id is still the named preset.
+    expect(p[COL.host]).toBe("imap.self-hosted.test");
+    expect(p[COL.port]).toBe(1993);
+    expect(p[COL.profile]).toBe("fastmail");
+  });
+
   it("rejects an unknown domain with no explicit host (generic stays explicit-only)", async () => {
     const { pool } = stubPool();
     const repo = new MirrorRepository(pool, config);

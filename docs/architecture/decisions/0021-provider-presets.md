@@ -33,7 +33,7 @@ Add a small static preset table plus a pure domain lookup. No network probing.
   `genericImapProfile` (no known sync quirks) and carrying BOTH coordinate sets:
   - Fastmail — IMAP `imap.fastmail.com:993` (implicit TLS) / SMTP
     `smtp.fastmail.com:465` (implicit TLS).
-  - Zoho — IMAP `imap.zoho.com:993` / SMTP `smtp.zoho.com:465`.
+  - Zoho (US datacenter) — IMAP `imap.zoho.com:993` / SMTP `smtp.zoho.com:465`.
   - iCloud — IMAP `imap.mail.me.com:993` / SMTP `smtp.mail.me.com:587`
     (STARTTLS, `secure=false`).
   - Yahoo — IMAP `imap.mail.yahoo.com:993` / SMTP `smtp.mail.yahoo.com:465`.
@@ -41,7 +41,20 @@ Add a small static preset table plus a pure domain lookup. No network probing.
   These are the providers' published, stable single-host coordinates — not
   guesses. iCloud and Yahoo require an app-specific password (the primary
   password is rejected over IMAP/SMTP); that is a credential concern for the
-  caller, not encoded here.
+  caller, not encoded here. iCloud additionally expects the bare local-part
+  (e.g. `alice`) as the IMAP username while SMTP expects the full address
+  (`alice@icloud.com`) — also a caller credential concern, not encoded in the
+  coordinates.
+
+- **Zoho is multi-datacenter, so it is NOT autodiscovered.** Zoho serves several
+  regional datacenters (US, EU `.eu`, IN `.in`, AU `.com.au`, CN `.zoho.com.cn`),
+  and the email domain (`@zoho.com`) does not reveal which DC an account lives in.
+  The `zoho` preset's `imap.zoho.com`/`smtp.zoho.com` coordinates are correct only
+  for US-DC accounts, so `zoho.com`/`zohomail.com` are deliberately **absent** from
+  the domain map — `@zoho.com` does not auto-resolve. US-DC users select the preset
+  explicitly with `--profile zoho`; EU/IN/AU/CN users pass explicit
+  `--host`/`--smtp-host` for their region's hosts. The preset is still registered
+  and reachable; only domain autodiscovery is withheld.
 - **A new `imapDefaults` hook on `ProviderProfile`** (`{ host, port, secure }`),
   mirroring the existing `smtpDefaults` shape. It is a fixed host string (these
   are shared access hosts, independent of the local-part), set only on real
@@ -49,17 +62,20 @@ Add a small static preset table plus a pure domain lookup. No network probing.
 - **`autodiscoverProfile(emailOrDomain)`** — a pure static-map lookup from the
   email domain to a preset, with the common aliases collapsed: `me.com` /
   `icloud.com` / `mac.com` → iCloud; `ymail.com` / `rocketmail.com` → Yahoo;
-  `fastmail.fm` → Fastmail; `zohomail.com` → Zoho. Returns null on no match. No
-  MX/autoconfig probing, no new dependency.
+  `fastmail.fm` → Fastmail. (Zoho is intentionally not in the map — see above.)
+  Returns null on no match. No MX/autoconfig probing, no new dependency.
 - **Wired into `createAccount` only** (the connect path). When `host` is omitted,
-  the IMAP host/port/secure and `provider_profile` are filled from the
-  autodiscovered preset; **explicit input always wins** (an explicit
-  host/port/secure/providerProfile is never overridden, and the preset fills only
-  blanks). An unknown domain with no explicit host is rejected with a clear
-  error — generic IMAP stays explicit-only. SMTP defaults then resolve through
-  the *unchanged* `resolveSmtpCreds` order, since autodiscovery sets
-  `provider_profile` to the preset id. `CREATE_ACCOUNT_SCHEMA` makes host/port
-  optional; the CLI `--host/--port/--profile` become optional too.
+  the IMAP host/port/secure and `provider_profile` are resolved in this precedence:
+  (1) explicit host/port/secure (always wins); (2) an explicitly-named non-generic
+  preset's `imapDefaults` — `--profile fastmail` (or `--profile zoho`) supplies that
+  preset's coordinates even without a domain match, so an explicit `--profile` beats
+  the domain guess; (3) email-domain `autodiscoverProfile`; (4) a clear error. The
+  preset fills only blanks — an explicit host/port/secure/providerProfile is never
+  overridden — and the chosen preset id is stored in `provider_profile`. An unknown
+  domain with no explicit host and no preset is rejected — generic IMAP stays
+  explicit-only. SMTP defaults then resolve through the *unchanged* `resolveSmtpCreds`
+  order, since the stored `provider_profile` is the preset id. `CREATE_ACCOUNT_SCHEMA`
+  makes host/port optional; the CLI `--host/--port/--profile` become optional too.
 
 This is connectivity config only: no new MCP tool, no write verb, nothing under
 `src/mcp/`. The frozen crypto/envelope (ADR 0002) and the `resolveSmtpCreds`
@@ -83,13 +99,16 @@ resolution-order contract (ADR 0017) are untouched.
 - `provider-profiles.test.ts` — each preset resolves the exact IMAP + SMTP
   coordinates; all four register alongside rackspace + generic; generic carries
   no defaults; domain autodiscovery incl. icloud/me/mac and yahoo/ymail/rocketmail
-  aliases, case-insensitivity, bare domain, and unknown → null.
+  aliases, case-insensitivity, bare domain, and unknown → null. `@zoho.com` /
+  `@zohomail.com` autodiscover to null (multi-DC, not domain-resolvable) while the
+  `zoho` preset still resolves its US-DC coordinates by id.
 - `smtp-creds.test.ts` — each preset's `smtpDefaults` resolve through
   `resolveSmtpCreds`; the existing rackspace defaults still resolve; explicit
   `smtp_host` overrides the preset; generic with no host errors.
 - `create-account-autodiscovery.test.ts` — host-less create fills coordinates +
-  profile from the domain; explicit host/profile wins; unknown domain with no
-  host is rejected.
+  profile from the domain; an explicit `--profile` (e.g. fastmail, or zoho for the
+  US DC) supplies the preset coordinates with no domain match; explicit host wins
+  over `--profile`; unknown domain with no host/preset is rejected.
 - `api-safety.test.ts` — POST /accounts accepts a body without host/port.
 - `agent-surface-zero-send.test.ts` + `sync-adapter-read-only.test.ts` stay green
   and unchanged (no `src/mcp/` change, no new write verb).

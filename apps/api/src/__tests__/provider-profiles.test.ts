@@ -93,9 +93,21 @@ describe("provider presets (email-008)", () => {
 describe("email-domain autodiscovery (email-008)", () => {
   it("maps each provider's primary domain to its preset", () => {
     expect(autodiscoverProfile("alice@fastmail.com")?.id).toBe("fastmail");
-    expect(autodiscoverProfile("bob@zoho.com")?.id).toBe("zoho");
     expect(autodiscoverProfile("carol@icloud.com")?.id).toBe("icloud");
     expect(autodiscoverProfile("dave@yahoo.com")?.id).toBe("yahoo");
+  });
+
+  it("does NOT autodiscover Zoho (multi-DC; domain can't reveal the datacenter)", () => {
+    // Zoho serves US/EU/IN/AU/CN datacenters and `@zoho.com` does not reveal which,
+    // so the US-DC `imap.zoho.com` coordinates can't be inferred from the domain.
+    // The preset stays reachable only via an explicit `--profile zoho` (see below).
+    expect(autodiscoverProfile("bob@zoho.com")).toBeNull();
+    expect(autodiscoverProfile("bob@zohomail.com")).toBeNull();
+    expect(autodiscoverProfile("ZOHO.com")).toBeNull();
+    // But the preset itself still resolves its US-DC coordinates when named by id.
+    const zoho = getProviderProfile("zoho");
+    expect(zoho.id).toBe("zoho");
+    expect(zoho.imapDefaults).toEqual({ host: "imap.zoho.com", port: 993, secure: true });
   });
 
   it("collapses iCloud aliases (icloud/me/mac) to one preset", () => {
@@ -112,7 +124,7 @@ describe("email-domain autodiscovery (email-008)", () => {
 
   it("is case-insensitive and accepts a bare domain", () => {
     expect(autodiscoverProfile("X@Fastmail.COM")?.id).toBe("fastmail");
-    expect(autodiscoverProfile("ZOHO.com")?.id).toBe("zoho");
+    expect(autodiscoverProfile("YAHOO.com")?.id).toBe("yahoo");
   });
 
   it("returns null for an unknown domain (caller keeps generic, explicit required)", () => {
