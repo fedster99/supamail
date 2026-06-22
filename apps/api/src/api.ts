@@ -12,6 +12,20 @@ import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { sendMessage } from "./send.js";
 import {
+  cleanMessageBody,
+  downloadAttachment,
+  getAttachmentMetadata,
+  getMessageHeaders,
+  getRawMime,
+  listAttachments,
+  selectFields,
+  type AttachmentDownload,
+  type AttachmentInfo,
+  type CleanBodyResultDetail,
+  type MessageHeadersResult,
+  type RawMimeResult
+} from "./content.js";
+import {
   createDraft,
   deleteDraft,
   getDraft,
@@ -87,6 +101,17 @@ interface ApiAppOptions {
     send: (messageId: string) => Promise<SendDraftResult>;
     delete: (messageId: string, options: { hard?: boolean }) => Promise<DeleteDraftResult>;
   };
+  /** Attachment + content read surface (email-004, ADR 0020). Attachment metadata,
+   * clean bodies, and full/basic headers read the mirror; attachment-byte download
+   * and raw MIME (under parsed_only) do an on-demand read-only IMAP fetch. */
+  content: {
+    listAttachments: (messageId: string) => Promise<AttachmentInfo[]>;
+    getAttachmentMetadata: (attachmentId: string) => Promise<AttachmentInfo | null>;
+    downloadAttachment: (attachmentId: string) => Promise<AttachmentDownload>;
+    getRawMime: (messageId: string) => Promise<RawMimeResult>;
+    getMessageHeaders: (messageId: string, options: { basic?: boolean }) => Promise<MessageHeadersResult>;
+    cleanMessageBody: (messageId: string, options: { includeQuoted?: boolean; maxChars?: number }) => Promise<CleanBodyResultDetail>;
+  };
   /** Organize mutations (email-002, ADR 0018). Each acts on IMAP by UID. */
   mutations: {
     setMessageFlags: (messageId: string, change: { add?: string[]; remove?: string[] }) => Promise<FlagResult>;
@@ -130,6 +155,20 @@ const SEND_RECIPIENT_SCHEMA = z.object({
   name: z.string().max(255).optional()
 });
 
+// Cap a single base64 attachment payload at ~25MB of decoded bytes (the same
+// BODY_RAW_MAX_BYTES ceiling reads use); base64 inflates ~4/3, so ~34MB encoded.
+const MAX_ATTACHMENT_BASE64_LEN = 34 * 1024 * 1024;
+
+// One outbound attachment (email-004). `content` is base64 of the raw bytes; `cid`
+// makes it an inline image referenced from the HTML body as `cid:<value>`.
+const ATTACHMENT_SCHEMA = z.object({
+  filename: z.string().min(1).max(255),
+  contentType: z.string().max(255).optional(),
+  content: z.string().max(MAX_ATTACHMENT_BASE64_LEN),
+  cid: z.string().max(255).optional(),
+  inline: z.boolean().optional()
+});
+
 // Send body minus accountId (taken from the path). Mirrors SendRequest.
 const SEND_SCHEMA = z.object({
   to: z.array(SEND_RECIPIENT_SCHEMA).min(1),
@@ -144,7 +183,8 @@ const SEND_SCHEMA = z.object({
   headers: z.record(z.string()).optional(),
   inReplyTo: z.string().max(2000).optional(),
   references: z.string().max(8000).optional(),
-  messageId: z.string().max(2000).optional()
+  messageId: z.string().max(2000).optional(),
+  attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
 });
 
 // Draft body (email-003). Unlike SEND_SCHEMA, `to` may be empty/absent — a draft
@@ -171,7 +211,8 @@ const DRAFT_SCHEMA = z.object({
   headers: z.record(z.string()).optional(),
   inReplyTo: z.string().max(2000).optional(),
   references: z.string().max(8000).optional(),
-  messageId: z.string().max(2000).optional()
+  messageId: z.string().max(2000).optional(),
+  attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
 });
 
 const TRACK_FOLDER_SCHEMA = z.object({
@@ -247,6 +288,76 @@ async function parseJsonBody(c: Context): Promise<unknown> {
   } catch {
     throw new HTTPException(400, { res: c.json({ error: "invalid_json" }, 400) });
   }
+}
+
+// Cap one uploaded file part (decoded bytes) at the same ~25MB read ceiling.
+const MAX_MULTIPART_FILE_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Parse a multipart/form-data send (email-004). The `payload` field carries the
+ * JSON send envelope (to/subject/body/…); every File field is decoded to base64
+ * and appended as an attachment (filename + contentType from the part, marked
+ * inline when the field name is `inline`). Returns the merged object for
+ * SEND_SCHEMA. A file over the size cap is rejected with 413.
+ */
+async function parseMultipartSend(c: Context): Promise<unknown> {
+  let body: Record<string, unknown>;
+  try {
+    body = await c.req.parseBody({ all: true });
+  } catch {
+    throw new HTTPException(400, { res: c.json({ error: "invalid_multipart" }, 400) });
+  }
+
+  const payloadRaw = body.payload;
+  let envelope: Record<string, unknown> = {};
+  if (typeof payloadRaw === "string" && payloadRaw.trim().length > 0) {
+    try {
+      envelope = JSON.parse(payloadRaw) as Record<string, unknown>;
+    } catch {
+      throw new HTTPException(400, { res: c.json({ error: "invalid_json", field: "payload" }, 400) });
+    }
+  }
+
+  const attachments: Array<{ filename: string; contentType?: string; content: string; inline?: boolean }> = [];
+  for (const [field, value] of Object.entries(body)) {
+    const parts = Array.isArray(value) ? value : [value];
+    for (const part of parts) {
+      if (!(part instanceof File)) continue;
+      const bytes = Buffer.from(await part.arrayBuffer());
+      if (bytes.length > MAX_MULTIPART_FILE_BYTES) {
+        throw new HTTPException(413, { res: c.json({ error: "attachment_too_large", filename: part.name }, 413) });
+      }
+      attachments.push({
+        filename: part.name || field,
+        contentType: part.type || undefined,
+        content: bytes.toString("base64"),
+        inline: field.toLowerCase() === "inline" ? true : undefined
+      });
+    }
+  }
+
+  // Merge with any base64 attachments already present in the JSON envelope.
+  const existing = Array.isArray(envelope.attachments) ? envelope.attachments : [];
+  if (attachments.length > 0 || existing.length > 0) {
+    envelope.attachments = [...existing, ...attachments];
+  }
+  return envelope;
+}
+
+/** Parse a `?fields=a,b,c` query into a key list (field selection). */
+function parseFields(raw: string | undefined): string[] | undefined {
+  if (!raw) return undefined;
+  const fields = raw.split(",").map((f) => f.trim()).filter(Boolean);
+  return fields.length > 0 ? fields : undefined;
+}
+
+/**
+ * Convert a Node Buffer to the exact ArrayBuffer slice it views, for Hono's
+ * `c.body()`. Node Buffers are often views into a larger pooled ArrayBuffer, so
+ * slice by byteOffset/byteLength to return only this buffer's bytes.
+ */
+function toArrayBuffer(buf: Buffer): ArrayBuffer {
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
 }
 
 function safeBearerEquals(received: string, expected: Buffer): boolean {
@@ -384,11 +495,80 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ fetched });
   });
 
+  // Attachment + content reads (email-004, ADR 0020). Metadata / clean body /
+  // headers read the mirror; attachment-byte download + raw MIME (parsed_only) do
+  // an on-demand read-only IMAP fetch. `?fields=` shrinks JSON payloads.
+  app.get("/messages/:id/attachments", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const fields = parseFields(c.req.query("fields"));
+    const attachments = (await options.content.listAttachments(id)).map((a) => selectFields(a, fields));
+    return c.json({ attachments });
+  });
+
+  app.get("/attachments/:id/metadata", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const meta = await options.content.getAttachmentMetadata(id);
+    if (!meta) throw new NotFoundError(`Attachment not found: ${id}`);
+    return c.json({ attachment: selectFields(meta, parseFields(c.req.query("fields"))) });
+  });
+
+  // Stream the decoded attachment bytes (always an on-demand IMAP fetch).
+  app.get("/attachments/:id/download", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const meta = await options.content.getAttachmentMetadata(id);
+    if (!meta) throw new NotFoundError(`Attachment not found: ${id}`);
+    const download = await options.content.downloadAttachment(id);
+    c.header("content-type", download.contentType ?? "application/octet-stream");
+    c.header(
+      "content-disposition",
+      `${download.inline ? "inline" : "attachment"}; filename="${(download.filename ?? "attachment").replace(/"/g, "")}"`
+    );
+    return c.body(toArrayBuffer(download.content));
+  });
+
+  app.get("/messages/:id/raw", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const raw = await options.content.getRawMime(id);
+    c.header("content-type", "message/rfc822");
+    c.header("x-supamail-raw-source", raw.source);
+    return c.body(toArrayBuffer(raw.raw));
+  });
+
+  app.get("/messages/:id/headers", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const basic = c.req.query("basic") === "true" || c.req.query("basic") === "1";
+    const result = await options.content.getMessageHeaders(id, { basic });
+    return c.json({ headers: result.headers, source: result.source });
+  });
+
+  app.get("/messages/:id/clean-body", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const message = await options.repository.getMessage(id);
+    if (!message) throw new NotFoundError(`Message not found: ${id}`);
+    const includeQuoted = c.req.query("include_quoted") === "true" || c.req.query("include_quoted") === "1";
+    const maxCharsRaw = c.req.query("max_chars");
+    const maxChars = maxCharsRaw ? Number(maxCharsRaw) : undefined;
+    const result = await options.content.cleanMessageBody(id, { includeQuoted, maxChars });
+    return c.json({ body: result.body, truncated: result.truncated });
+  });
+
   app.post("/accounts/:id/send", async (c) => {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
-    const raw = await parseJsonBody(c);
+    // Two transports for attachments (email-004): a JSON body with base64
+    // `attachments`, or a size-capped multipart/form-data upload whose `payload`
+    // part carries the JSON envelope and whose file parts become attachments.
+    const contentType = c.req.header("content-type") ?? "";
+    const raw = contentType.includes("multipart/form-data")
+      ? await parseMultipartSend(c)
+      : await parseJsonBody(c);
     const input = SEND_SCHEMA.parse(raw);
     const result = await options.send({ accountId: id, ...input });
     return c.json({ result });
@@ -539,6 +719,14 @@ export function startApiServer(options: StartApiServerOptions = {}): ReturnType<
       update: (messageId, input) => updateDraft(pool, config, messageId, input),
       send: (messageId) => sendDraft(pool, config, messageId),
       delete: (messageId, opts) => deleteDraft(pool, config, messageId, opts)
+    },
+    content: {
+      listAttachments: (messageId) => listAttachments(pool, config, messageId),
+      getAttachmentMetadata: (attachmentId) => getAttachmentMetadata(pool, config, attachmentId),
+      downloadAttachment: (attachmentId) => downloadAttachment(pool, config, attachmentId),
+      getRawMime: (messageId) => getRawMime(pool, config, messageId),
+      getMessageHeaders: (messageId, opts) => getMessageHeaders(pool, config, messageId, opts),
+      cleanMessageBody: (messageId, opts) => cleanMessageBody(pool, config, messageId, opts)
     },
     mutations: {
       setMessageFlags: (messageId, change) => setMessageFlags(pool, config, messageId, change),

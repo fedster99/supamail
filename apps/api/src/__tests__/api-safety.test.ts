@@ -208,6 +208,20 @@ function buildApp(options: {
     renameFolder: vi.fn(async (acct: string, path: string, newPath: string) => ({ accountId: acct, path, newPath })),
     deleteFolder: vi.fn(async (acct: string, path: string) => ({ accountId: acct, path }))
   };
+  const content = {
+    listAttachments: vi.fn(async (id: string) => [
+      { attachmentId: "att-1", messageId: id, filename: "a.pdf", contentType: "application/pdf", sizeBytes: 10, partNumber: "2", contentId: null, inline: false }
+    ]),
+    getAttachmentMetadata: vi.fn(async (id: string) => ({
+      attachmentId: id, messageId, filename: "a.pdf", contentType: "application/pdf", sizeBytes: 10, partNumber: "2", contentId: null, inline: false
+    })),
+    downloadAttachment: vi.fn(async (id: string) => ({
+      attachmentId: id, messageId, filename: "a.pdf", contentType: "application/pdf", sizeBytes: 10, partNumber: "2", contentId: null, inline: false, content: Buffer.from("PDFBYTES")
+    })),
+    getRawMime: vi.fn(async (id: string) => ({ messageId: id, raw: Buffer.from("Subject: x\r\n\r\nbody"), source: "mirror" as const, truncated: false })),
+    getMessageHeaders: vi.fn(async (id: string, _opts: { basic?: boolean }) => ({ messageId: id, headers: { "message-id": "<m@example.test>" }, source: "mirror" as const })),
+    cleanMessageBody: vi.fn(async (id: string, _opts: { includeQuoted?: boolean; maxChars?: number }) => ({ messageId: id, body: "clean", truncated: false }))
+  };
   const app = createApiApp({
     apiToken: options.apiToken ?? "api-token",
     adminToken: "adminToken" in options ? options.adminToken : "admin-token",
@@ -216,7 +230,8 @@ function buildApp(options: {
     applyMigration,
     send: send as never,
     drafts: drafts as never,
-    mutations: mutations as never
+    mutations: mutations as never,
+    content: content as never
   });
 
   return { app, repository, engine, applyMigration, send, drafts, mutations };

@@ -294,6 +294,24 @@ export interface SendRecipient {
 }
 
 /**
+ * One outbound attachment on a send/draft (email-004, ADR 0020). `content` is the
+ * raw bytes base64-encoded (the JSON/base64 transport); nodemailer's MailComposer
+ * builds the MIME part. Set `cid` for an inline image referenced from the HTML body
+ * as `cid:<that-value>`; `inline: true` marks any part `Content-Disposition: inline`
+ * (a `cid` implies inline). Otherwise the part is a regular `attachment`.
+ */
+export interface SendAttachment {
+  filename: string;
+  contentType?: string;
+  /** Base64-encoded bytes of the part. */
+  content: string;
+  /** Content-ID for an inline image (referenced as `cid:<value>` in the HTML body). */
+  cid?: string;
+  /** Force `Content-Disposition: inline` (implied when `cid` is set). */
+  inline?: boolean;
+}
+
+/**
  * The canonical send superset. A reply is `sendMessage()` fed the draft payload
  * (To/Subject + In-Reply-To/References); a brand-new message is the same call
  * with no threading headers. "Build once," exposed as two product verbs.
@@ -311,7 +329,8 @@ export interface SendRequest {
   references?: string;
   /** Caller-supplied for a stable Message-ID; else one is generated at compose time. */
   messageId?: string;
-  // attachments?: ... deferred to email-004
+  /** Attachments + inline images (email-004, ADR 0020). MailComposer builds the MIME. */
+  attachments?: SendAttachment[];
 }
 
 export interface SendResult {

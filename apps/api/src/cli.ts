@@ -1,6 +1,15 @@
 #!/usr/bin/env node
+import { readFile, writeFile } from "node:fs/promises";
+import { basename } from "node:path";
 import { Command } from "commander";
 import { getConfig } from "./config.js";
+import {
+  cleanMessageBody,
+  downloadAttachment,
+  getMessageHeaders,
+  getRawMime,
+  listAttachments
+} from "./content.js";
 import { applyPublicMigrations, closePool, getPool } from "./db.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
@@ -26,7 +35,7 @@ import {
   setMessageFlags,
   setThreadFlags
 } from "./mailbox-mutations.js";
-import type { SendRecipient, SendRequest, WindowStatus } from "./types.js";
+import type { SendAttachment, SendRecipient, SendRequest, WindowStatus } from "./types.js";
 
 const program = new Command();
 const config = getConfig();
@@ -253,6 +262,24 @@ const parseRecipients = (values: string[]): SendRecipient[] =>
 // The operator IS the human-in-the-loop, so the explicit --confirm flag is the
 // send gate (no token dance, unlike the cloud MCP two-phase confirm). Both verbs
 // refuse without it and call the shared sendMessage primitive.
+// Read a `--attach path` (and `--inline cid=path`) option list into base64 attachments.
+const readAttachments = async (attach: string[], inline: string[]): Promise<SendAttachment[]> => {
+  const out: SendAttachment[] = [];
+  for (const path of attach) {
+    const bytes = await readFile(path);
+    out.push({ filename: basename(path), content: bytes.toString("base64") });
+  }
+  for (const spec of inline) {
+    // `cid=path` (or just `path`, defaulting the cid to the filename).
+    const eq = spec.indexOf("=");
+    const cid = eq > 0 ? spec.slice(0, eq) : undefined;
+    const path = eq > 0 ? spec.slice(eq + 1) : spec;
+    const bytes = await readFile(path);
+    out.push({ filename: basename(path), content: bytes.toString("base64"), cid: cid ?? basename(path), inline: true });
+  }
+  return out;
+};
+
 program
   .command("send")
   .description("Compose and send a new message over SMTP, filing a copy to Sent (requires --confirm)")
@@ -262,6 +289,9 @@ program
   .requiredOption("--body <text>", "Plain-text body")
   .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
   .option("--bcc <addr>", "Bcc recipient (repeatable)", collect, [])
+  .option("--attach <path>", "Attach a file (repeatable)", collect, [])
+  .option("--inline <cid=path>", "Inline image as cid=path (repeatable; referenced as cid:<cid>)", collect, [])
+  .option("--html <html>", "HTML body (sent as HTML; required for inline cid: images)")
   .option("--confirm", "Required human confirmation; without it nothing is sent")
   .action(async (options) => {
     if (!options.confirm) {
@@ -269,13 +299,15 @@ program
       process.exitCode = 1;
       return;
     }
+    const attachments = await readAttachments(options.attach as string[], options.inline as string[]);
     const request: SendRequest = {
       accountId: options.accountId,
       to: parseRecipients(options.to as string[]),
       cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
       bcc: (options.bcc as string[]).length > 0 ? parseRecipients(options.bcc as string[]) : undefined,
       subject: options.subject,
-      body: { format: "plain", text: options.body }
+      body: options.html ? { format: "html", html: options.html } : { format: "plain", text: options.body },
+      attachments: attachments.length > 0 ? attachments : undefined
     };
     const result = await sendMessage(pool, config, request);
     console.log(JSON.stringify(result, null, 2));
@@ -538,6 +570,74 @@ program
       return;
     }
     const result = await deleteFolder(pool, config, accountId, path);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+// Attachment + content reads (email-004, ADR 0020). Metadata / clean body /
+// headers read the mirror; attachment-download + raw (under parsed_only) do an
+// on-demand read-only IMAP fetch. All read-only; all JSON except the byte streams.
+program
+  .command("attachments <messageId>")
+  .description("List a message's attachment metadata from the mirror (read-only, JSON output)")
+  .action(async (messageId: string) => {
+    const result = await listAttachments(pool, config, messageId);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("attachment-download <attachmentId>")
+  .description("Download an attachment's bytes (on-demand IMAP fetch); writes to --out or stdout base64")
+  .option("--out <path>", "Write the decoded bytes to this file (else base64 to stdout)")
+  .action(async (attachmentId: string, options) => {
+    const download = await downloadAttachment(pool, config, attachmentId);
+    if (options.out) {
+      await writeFile(options.out, download.content);
+      console.log(JSON.stringify({
+        attachmentId: download.attachmentId,
+        filename: download.filename,
+        contentType: download.contentType,
+        bytes: download.content.length,
+        out: options.out
+      }, null, 2));
+    } else {
+      process.stdout.write(download.content.toString("base64"));
+      process.stdout.write("\n");
+    }
+  });
+
+program
+  .command("raw <messageId>")
+  .description("Output a message's raw MIME (mirror if stored, else on-demand IMAP fetch); --out or stdout")
+  .option("--out <path>", "Write the raw bytes to this file (else raw to stdout)")
+  .action(async (messageId: string, options) => {
+    const result = await getRawMime(pool, config, messageId);
+    if (options.out) {
+      await writeFile(options.out, result.raw);
+      console.log(JSON.stringify({ messageId, source: result.source, bytes: result.raw.length, out: options.out, truncated: result.truncated }, null, 2));
+    } else {
+      process.stdout.write(result.raw);
+    }
+  });
+
+program
+  .command("headers <messageId>")
+  .description("Print a message's parsed headers from the mirror (read-only, JSON output)")
+  .option("--basic", "Only the basic threading headers (Message-ID/In-Reply-To/References/…)")
+  .action(async (messageId: string, options) => {
+    const result = await getMessageHeaders(pool, config, messageId, { basic: Boolean(options.basic) });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("clean-body <messageId>")
+  .description("Print a deterministically cleaned message body (signature + quoted tail stripped)")
+  .option("--include-quoted", "Keep the quoted reply tail + signature")
+  .option("--max-chars <n>", "Clamp the cleaned body to n characters")
+  .action(async (messageId: string, options) => {
+    const result = await cleanMessageBody(pool, config, messageId, {
+      includeQuoted: Boolean(options.includeQuoted),
+      maxChars: options.maxChars === undefined ? undefined : Number(options.maxChars)
+    });
     console.log(JSON.stringify(result, null, 2));
   });
 

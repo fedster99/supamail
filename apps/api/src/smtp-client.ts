@@ -7,7 +7,7 @@ import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
-import type { ImapAccount, SendRecipient, SendRequest } from "./types.js";
+import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
 /**
  * SMTP compose + transport + a write-only Sent-folder APPEND client (email-001,
@@ -71,6 +71,36 @@ function toAddress(recipient: SendRecipient): { name?: string; address: string }
   return recipient.name ? { name: recipient.name, address: recipient.email } : { address: recipient.email };
 }
 
+/** One MailComposer attachment entry. `content` carries the decoded bytes; an
+ * inline part (cid set or inline:true) gets `contentDisposition: "inline"` so it
+ * renders in-body instead of listing as a separate download. */
+interface ComposerAttachment {
+  filename: string;
+  content: Buffer;
+  contentType?: string;
+  cid?: string;
+  contentDisposition?: "inline" | "attachment";
+}
+
+/**
+ * Map a {@link SendAttachment} (base64 transport) to a MailComposer attachment.
+ * The base64 is decoded here (Buffer.from(..., "base64") is total — invalid input
+ * yields a shorter/empty buffer rather than throwing), so the composed MIME carries
+ * the real bytes. A `cid` (or `inline: true`) marks the part inline for `cid:` HTML
+ * references; otherwise it is a regular attachment.
+ */
+function toComposerAttachment(attachment: SendAttachment): ComposerAttachment {
+  const inline = attachment.inline === true || (attachment.cid !== undefined && attachment.cid !== "");
+  const entry: ComposerAttachment = {
+    filename: attachment.filename,
+    content: Buffer.from(attachment.content, "base64"),
+    contentDisposition: inline ? "inline" : "attachment"
+  };
+  if (attachment.contentType) entry.contentType = attachment.contentType;
+  if (attachment.cid) entry.cid = attachment.cid;
+  return entry;
+}
+
 function domainOf(email: string): string {
   const at = email.lastIndexOf("@");
   return at >= 0 ? email.slice(at + 1) : "localhost";
@@ -91,7 +121,8 @@ export interface BuiltMime {
  * `raw` is what we BOTH submit and APPEND, so the delivered and filed bytes are
  * byte-identical (threading/dedup coherence). Bcc is intentionally NOT emitted
  * into the bytes (nodemailer's keepBcc default) — Bcc recipients ride the SMTP
- * envelope only.
+ * envelope only. Attachments + inline `cid` images (email-004) are passed straight
+ * through to MailComposer, which builds the multipart MIME deterministically.
  */
 export async function buildRawMime(req: SendRequest, from: SendRecipient): Promise<BuiltMime> {
   const messageId = req.messageId ?? `<${randomUUID()}@${domainOf(from.email)}>`;
@@ -111,6 +142,7 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
     messageId,
     inReplyTo: req.inReplyTo ?? headers["In-Reply-To"] ?? headers["in-reply-to"],
     references: req.references ?? headers.References ?? headers.references,
+    attachments: req.attachments?.map(toComposerAttachment),
     headers
   });
 
