@@ -1,6 +1,7 @@
 export * from "./config.js";
 export * from "./crypto.js";
 export * from "./db.js";
+export * from "./drafts.js";
 export * from "./imap-client.js";
 export * from "./locks.js";
 export * from "./mailbox-mutations.js";

@@ -169,6 +169,25 @@ function buildApp(options: {
     sentFolderPath: "Sent",
     warnings: []
   })));
+  const drafts = {
+    create: vi.fn(async (req: { accountId: string }) => ({
+      accountId: req.accountId, draftsFolderPath: "Drafts", rfcMessageId: "<draft@example.test>", appendedUid: 5
+    })),
+    list: vi.fn(async (_accountId: string, _opts: { limit?: number }) => [] as unknown[]),
+    get: vi.fn(async (id: string) => ({
+      messageId: id, accountId, folderPath: "Drafts", uid: 5, rfcMessageId: "<draft@example.test>",
+      subject: "Draft", fromEmail: "user@example.test", toEmails: ["x@example.test"], ccEmails: [],
+      date: "2026-05-19T00:00:00.000Z", flags: ["\\Draft"], body: "hi", inReplyTo: null, references: null
+    })),
+    update: vi.fn(async (id: string) => ({
+      accountId, draftsFolderPath: "Drafts", rfcMessageId: "<draft2@example.test>", appendedUid: 6, replacedMessageId: id
+    })),
+    send: vi.fn(async (id: string) => ({
+      send: { rfcMessageId: "<sent@example.test>", delivered: true, appendedToSent: true, appendedUid: 1, sentFolderPath: "Sent", warnings: [] },
+      deletedDraftId: id
+    })),
+    delete: vi.fn(async (id: string) => ({ messageId: id, fromFolder: "Drafts" }))
+  };
   const mutations = {
     setMessageFlags: vi.fn(async (id: string, change: { add?: string[]; remove?: string[] }) => ({
       messageId: id, folderPath: "INBOX", uid: 7, added: change.add ?? [], removed: change.remove ?? []
@@ -196,10 +215,11 @@ function buildApp(options: {
     engine,
     applyMigration,
     send: send as never,
+    drafts: drafts as never,
     mutations: mutations as never
   });
 
-  return { app, repository, engine, applyMigration, send, mutations };
+  return { app, repository, engine, applyMigration, send, drafts, mutations };
 }
 
 function auth(token = "api-token"): Record<string, string> {
@@ -475,6 +495,96 @@ describe("API safety", () => {
     });
     expect(res.status).toBe(404);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("gates the draft routes behind the API token", async () => {
+    const { app, drafts } = buildApp();
+    const unauthorized = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subject: "Hi", body: { format: "plain", text: "y" } })
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(drafts.create).not.toHaveBeenCalled();
+  });
+
+  it("creates a draft (recipients optional) and returns 201", async () => {
+    const { app, drafts } = buildApp();
+
+    // No `to` — a draft may be saved while incomplete.
+    const res = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ subject: "Draft", body: { format: "plain", text: "hello" } })
+    });
+    expect(res.status).toBe(201);
+    await expect(res.json()).resolves.toMatchObject({ result: { draftsFolderPath: "Drafts" } });
+    expect(drafts.create).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId, subject: "Draft", to: [] })
+    );
+  });
+
+  it("returns 404 from POST /accounts/:id/drafts for an unknown account", async () => {
+    const { app, drafts } = buildApp({ account: null });
+    const res = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ body: { format: "plain", text: "y" } })
+    });
+    expect(res.status).toBe(404);
+    expect(drafts.create).not.toHaveBeenCalled();
+  });
+
+  it("lists drafts and gets a single draft from the mirror", async () => {
+    const { app, drafts } = buildApp();
+
+    const list = await app.request(`/accounts/${accountId}/drafts?limit=10`, { headers: auth() });
+    expect(list.status).toBe(200);
+    expect(drafts.list).toHaveBeenCalledWith(accountId, { limit: 10 });
+
+    const get = await app.request(`/drafts/${messageId}`, { headers: auth() });
+    expect(get.status).toBe(200);
+    await expect(get.json()).resolves.toMatchObject({ draft: { messageId } });
+    expect(drafts.get).toHaveBeenCalledWith(messageId);
+  });
+
+  it("returns 404 from GET /drafts/:id when the draft is unknown", async () => {
+    const { app, drafts } = buildApp();
+    drafts.get.mockResolvedValueOnce(null as never);
+    const res = await app.request(`/drafts/${messageId}`, { headers: auth() });
+    expect(res.status).toBe(404);
+  });
+
+  it("updates a draft (append-new + delete-old) via PATCH /drafts/:id", async () => {
+    const { app, drafts } = buildApp();
+    const res = await app.request(`/drafts/${messageId}`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ subject: "Revised", body: { format: "plain", text: "v2" } })
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ result: { replacedMessageId: messageId } });
+    expect(drafts.update).toHaveBeenCalledWith(messageId, expect.objectContaining({ subject: "Revised" }));
+  });
+
+  it("sends a draft via POST /drafts/:id/send", async () => {
+    const { app, drafts } = buildApp();
+    const res = await app.request(`/drafts/${messageId}/send`, { method: "POST", headers: auth() });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ result: { send: { delivered: true }, deletedDraftId: messageId } });
+    expect(drafts.send).toHaveBeenCalledWith(messageId);
+  });
+
+  it("maps DELETE /drafts/:id ?hard to a hard delete, default to trash", async () => {
+    const { app, drafts } = buildApp();
+
+    const trash = await app.request(`/drafts/${messageId}`, { method: "DELETE", headers: auth() });
+    expect(trash.status).toBe(200);
+    expect(drafts.delete).toHaveBeenLastCalledWith(messageId, { hard: false });
+
+    const hard = await app.request(`/drafts/${messageId}?hard=true`, { method: "DELETE", headers: auth() });
+    expect(hard.status).toBe(200);
+    expect(drafts.delete).toHaveBeenLastCalledWith(messageId, { hard: true });
   });
 
   it("gates the organize-mutation routes behind the API token", async () => {

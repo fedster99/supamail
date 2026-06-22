@@ -23,6 +23,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0016-draft-produce-only.md`: The reply drafter produces a threaded draft and never sends.
 - `0017-send-primitive.md`: SMTP send/reply is a single reusable primitive authored outside the agent surface; the agent surface stays zero-send and the sync adapter stays read-only.
 - `0018-organize-mutations.md`: Mark/star/move/delete + thread fan-out + folder CRUD are UID-addressed write-only verbs outside the agent surface; the mirror reconciles on the next sync.
+- `0019-drafts-crud.md`: Draft CRUD (create/list/get/update/send/delete) saved to the provider Drafts folder is a composition of the send + organize primitives; update is append-new + delete-old (IMAP drafts are immutable); the agent surface stays zero-send.
 
 ## Status Values
 

@@ -7,6 +7,7 @@ import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { MirrorRepository } from "../src/repository.js";
 import { sendMessage } from "../src/send.js";
+import { createDraft, listDrafts, sendDraft } from "../src/drafts.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 
 const execFileAsync = promisify(execFile);
@@ -232,6 +233,27 @@ async function ensureSentFolder(): Promise<void> {
   }
 }
 
+// Same as ensureSentFolder, but for Drafts (email-003): some servers only
+// materialize the Drafts folder once a client APPENDs/creates it.
+async function ensureFolder(name: string): Promise<void> {
+  const client = new ImapFlow({
+    host: "127.0.0.1",
+    port: imapPort,
+    secure: false,
+    auth: { user: mailbox, pass: "any-password" },
+    logger: false
+  });
+  await client.connect();
+  try {
+    const existing = await client.list();
+    if (!existing.some((box) => box.path === name)) {
+      await client.mailboxCreate(name);
+    }
+  } finally {
+    await client.logout().catch(() => client.close());
+  }
+}
+
 async function startGreenMail(): Promise<void> {
   await docker(["rm", "-f", containerName], true);
   await docker([
@@ -400,6 +422,67 @@ async function main(): Promise<void> {
       );
     }
 
+    // Draft path (email-003): create a draft (APPEND \Draft to Drafts), resync so
+    // it is mirrored, assert it appears via listDrafts, then send it (reuses
+    // sendMessage) and assert it left Drafts (deleted-in-provider) and landed in
+    // Sent on the following resync.
+    await ensureFolder("Drafts");
+    const draftMessageId = `<greenmail-draft-${Date.now()}@example.test>`;
+    const createResult = await createDraft(pool, config, {
+      accountId: account.id,
+      to: [{ email: mailbox }],
+      subject: "GreenMail draft smoke",
+      body: { format: "plain", text: "Automated draft-path smoke." },
+      messageId: draftMessageId
+    });
+
+    await pool.query(
+      "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
+      [account.id]
+    );
+    const draftResync = await engine.syncAccount(account.id, "manual");
+    const draftsAfterCreate = await listDrafts(pool, config, account.id, {});
+    const mirroredDraft = draftsAfterCreate.find((d) => d.rfcMessageId === draftMessageId);
+
+    let sentDraftCopies = 0;
+    let draftGoneFromDrafts = false;
+    if (mirroredDraft) {
+      await sendDraft(pool, config, mirroredDraft.messageId);
+      const draftSendResync = await engine.syncAccount(account.id, "manual");
+      const draftAfterSend = await pool.query<{ folder_path: string; deleted_in_provider: boolean }>(
+        `
+        SELECT folder_path, deleted_in_provider
+        FROM public.imap_messages
+        WHERE account_id = $1 AND rfc_message_id = $2
+        `,
+        [account.id, draftMessageId]
+      );
+      // The original Drafts row is now deleted-in-provider; the sent copy is filed
+      // in Sent (and possibly delivered to INBOX).
+      draftGoneFromDrafts = draftAfterSend.rows.some(
+        (row) => row.folder_path === createResult.draftsFolderPath && row.deleted_in_provider === true
+      );
+      sentDraftCopies = draftAfterSend.rows.filter(
+        (row) => row.folder_path === "Sent" && row.deleted_in_provider === false
+      ).length;
+      void draftSendResync;
+    }
+
+    const draftAssertions: Array<[string, boolean]> = [
+      ["draft create appended a UID or folder", typeof createResult.appendedUid === "number" || createResult.draftsFolderPath.length > 0],
+      ["draft resync succeeded", draftResync.outcome === "success"],
+      ["draft mirrored in Drafts", Boolean(mirroredDraft)],
+      ["draft removed from Drafts after send", draftGoneFromDrafts],
+      ["sent draft landed in Sent", sentDraftCopies >= 1]
+    ];
+    const draftFailed = draftAssertions.filter(([, passed]) => !passed);
+    if (draftFailed.length > 0) {
+      throw new Error(
+        `GreenMail draft smoke failed: ${draftFailed.map(([name]) => name).join(", ")}` +
+          ` | createResult=${JSON.stringify(createResult)} | mirroredDraft=${JSON.stringify(mirroredDraft)}`
+      );
+    }
+
     console.log(JSON.stringify({
       ok: true,
       image,
@@ -412,6 +495,12 @@ async function main(): Promise<void> {
         sendResult,
         resyncOutcome: resyncResult.outcome,
         mirroredSentCopies: sentCopy.rows.length
+      },
+      draft: {
+        createResult,
+        mirroredDraft: mirroredDraft ?? null,
+        draftGoneFromDrafts,
+        sentDraftCopies
       }
     }, null, 2));
   } finally {

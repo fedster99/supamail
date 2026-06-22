@@ -9,6 +9,14 @@ import type { SearchRequest, SearchSort } from "./search/index.js";
 import { runDraftReply, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
 import { sendMessage } from "./send.js";
 import {
+  createDraft,
+  deleteDraft,
+  getDraft,
+  listDrafts,
+  sendDraft,
+  updateDraft
+} from "./drafts.js";
+import {
   createFolder,
   deleteFolder,
   deleteMessage,
@@ -315,6 +323,102 @@ program
       references: draft.headers.References
     };
     const result = await sendMessage(pool, config, request);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+// Draft CRUD (email-003, ADR 0019). Create/update/list/get/delete/send drafts
+// saved to the provider Drafts folder. Mostly composition: create APPENDs `\Draft`
+// (reuses email-001 buildRawMime + appender), update = append-new + delete-old,
+// send-draft reuses sendMessage. delete + send-draft refuse without --confirm
+// (send is outward-facing — mirror the send/reply gate).
+program
+  .command("draft-create")
+  .description("Create a draft saved to the provider Drafts folder")
+  .requiredOption("--account-id <id>", "Account UUID to file the draft under")
+  .option("--to <addr>", "Recipient (repeatable; 'Name <email>' or 'email')", collect, [])
+  .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
+  .option("--bcc <addr>", "Bcc recipient (repeatable)", collect, [])
+  .option("--subject <text>", "Subject line", "")
+  .option("--body <text>", "Plain-text body", "")
+  .action(async (options) => {
+    const result = await createDraft(pool, config, {
+      accountId: options.accountId,
+      to: parseRecipients(options.to as string[]),
+      cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
+      bcc: (options.bcc as string[]).length > 0 ? parseRecipients(options.bcc as string[]) : undefined,
+      subject: options.subject,
+      body: { format: "plain", text: options.body }
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("drafts <accountId>")
+  .description("List drafts from the mirror (read-only, JSON output)")
+  .option("--limit <n>", "Maximum results (1-200)", "50")
+  .action(async (accountId: string, options) => {
+    const result = await listDrafts(pool, config, accountId, { limit: Number(options.limit) });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("draft <messageId>")
+  .description("Get one draft with its body from the mirror (read-only, JSON output)")
+  .action(async (messageId: string) => {
+    const result = await getDraft(pool, config, messageId);
+    if (!result) {
+      process.stderr.write(`No mirrored draft with id ${messageId}.\n`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("draft-update <messageId>")
+  .description("Update a draft (append-new + delete-old; IMAP drafts are immutable)")
+  .option("--to <addr>", "Recipient (repeatable)", collect, [])
+  .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
+  .option("--bcc <addr>", "Bcc recipient (repeatable)", collect, [])
+  .option("--subject <text>", "Subject line", "")
+  .option("--body <text>", "Plain-text body", "")
+  .action(async (messageId: string, options) => {
+    const result = await updateDraft(pool, config, messageId, {
+      to: parseRecipients(options.to as string[]),
+      cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
+      bcc: (options.bcc as string[]).length > 0 ? parseRecipients(options.bcc as string[]) : undefined,
+      subject: options.subject,
+      body: { format: "plain", text: options.body }
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("draft-send <messageId>")
+  .description("Send a saved draft over SMTP, then delete it from Drafts (requires --confirm)")
+  .option("--confirm", "Required human confirmation; without it nothing is sent")
+  .action(async (messageId: string, options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to send a draft without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await sendDraft(pool, config, messageId);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("draft-delete <messageId>")
+  .description("Delete a draft: move to Trash by default, or EXPUNGE with --hard (requires --confirm)")
+  .option("--hard", "Permanently delete (EXPUNGE) instead of moving to Trash")
+  .option("--confirm", "Required confirmation for this destructive op")
+  .action(async (messageId: string, options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to delete a draft without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await deleteDraft(pool, config, messageId, { hard: Boolean(options.hard) });
     console.log(JSON.stringify(result, null, 2));
   });
 

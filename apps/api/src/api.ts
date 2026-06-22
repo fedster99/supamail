@@ -12,6 +12,20 @@ import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { sendMessage } from "./send.js";
 import {
+  createDraft,
+  deleteDraft,
+  getDraft,
+  listDrafts,
+  sendDraft,
+  updateDraft,
+  type CreateDraftResult,
+  type DeleteDraftResult,
+  type DraftDetail,
+  type DraftSummary,
+  type SendDraftResult,
+  type UpdateDraftResult
+} from "./drafts.js";
+import {
   createFolder,
   deleteFolder,
   deleteMessage,
@@ -62,6 +76,16 @@ interface ApiAppOptions {
   applyMigration: () => Promise<void>;
   /** Single-tenant send door (email-001). Resolves the SendResult JSON. */
   send: (req: SendRequest) => Promise<SendResult>;
+  /** Draft CRUD (email-003, ADR 0019). Create/update/send APPEND to Drafts (and
+   * delete-old where needed); list/get read the mirror. */
+  drafts: {
+    create: (req: SendRequest) => Promise<CreateDraftResult>;
+    list: (accountId: string, options: { limit?: number }) => Promise<DraftSummary[]>;
+    get: (messageId: string) => Promise<DraftDetail | null>;
+    update: (messageId: string, input: Omit<SendRequest, "accountId">) => Promise<UpdateDraftResult>;
+    send: (messageId: string) => Promise<SendDraftResult>;
+    delete: (messageId: string, options: { hard?: boolean }) => Promise<DeleteDraftResult>;
+  };
   /** Organize mutations (email-002, ADR 0018). Each acts on IMAP by UID. */
   mutations: {
     setMessageFlags: (messageId: string, change: { add?: string[]; remove?: string[] }) => Promise<FlagResult>;
@@ -111,6 +135,25 @@ const SEND_SCHEMA = z.object({
   cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
   bcc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
   subject: z.string().max(2000),
+  body: z.object({
+    format: z.enum(["plain", "html"]),
+    text: z.string().optional(),
+    html: z.string().optional()
+  }),
+  headers: z.record(z.string()).optional(),
+  inReplyTo: z.string().max(2000).optional(),
+  references: z.string().max(8000).optional(),
+  messageId: z.string().max(2000).optional()
+});
+
+// Draft body (email-003). Unlike SEND_SCHEMA, `to` may be empty/absent — a draft
+// can be saved while still incomplete; the recipient requirement is enforced only
+// when the draft is sent. accountId comes from the path on create.
+const DRAFT_SCHEMA = z.object({
+  to: z.array(SEND_RECIPIENT_SCHEMA).optional(),
+  cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
+  bcc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
+  subject: z.string().max(2000).optional(),
   body: z.object({
     format: z.enum(["plain", "html"]),
     text: z.string().optional(),
@@ -342,6 +385,54 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ result });
   });
 
+  // Draft CRUD (email-003, ADR 0019). Create files a `\Draft` APPEND to the
+  // account's Drafts folder; list/get read the mirror; update is APPEND-new +
+  // delete-old; send-draft reuses the email-001 send path then deletes the draft.
+  app.post("/accounts/:id/drafts", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.drafts.create({ accountId: id, ...input, to: input.to ?? [], subject: input.subject ?? "" });
+    return c.json({ result }, 201);
+  });
+
+  app.get("/accounts/:id/drafts", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const limit = c.req.query("limit") ? Number(c.req.query("limit")) : undefined;
+    const drafts = await options.drafts.list(id, { limit });
+    return c.json({ drafts });
+  });
+
+  app.get("/drafts/:id", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const draft = await options.drafts.get(id);
+    if (!draft) throw new NotFoundError(`Draft not found: ${id}`);
+    return c.json({ draft });
+  });
+
+  app.patch("/drafts/:id", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.drafts.update(id, { ...input, to: input.to ?? [], subject: input.subject ?? "" });
+    return c.json({ result });
+  });
+
+  app.post("/drafts/:id/send", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const result = await options.drafts.send(id);
+    return c.json({ result });
+  });
+
+  app.delete("/drafts/:id", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const hard = c.req.query("hard") === "true" || c.req.query("hard") === "1";
+    const result = await options.drafts.delete(id, { hard });
+    return c.json({ result });
+  });
+
   // Organize mutations (email-002, ADR 0018). Message-scoped routes resolve the
   // message → its account → act on IMAP by UID; the mirror reconciles on the next
   // sync. Folder CRUD is account-scoped.
@@ -432,6 +523,14 @@ export function startApiServer(options: StartApiServerOptions = {}): ReturnType<
     engine,
     applyMigration: () => applyPublicMigrations(pool),
     send: (req) => sendMessage(pool, config, req),
+    drafts: {
+      create: (req) => createDraft(pool, config, req),
+      list: (accountId, opts) => listDrafts(pool, config, accountId, opts),
+      get: (messageId) => getDraft(pool, config, messageId),
+      update: (messageId, input) => updateDraft(pool, config, messageId, input),
+      send: (messageId) => sendDraft(pool, config, messageId),
+      delete: (messageId, opts) => deleteDraft(pool, config, messageId, opts)
+    },
     mutations: {
       setMessageFlags: (messageId, change) => setMessageFlags(pool, config, messageId, change),
       moveMessage: (messageId, folder) => moveMessage(pool, config, messageId, folder),
