@@ -2,7 +2,7 @@ import type { AppConfig } from "./config.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
-import { getProviderProfile } from "./provider-profiles.js";
+import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -141,8 +141,24 @@ export class MirrorRepository {
   ) {}
 
   async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
-    const secure = input.secure ?? true;
-    await assertSafeImapTarget(input.host, input.port, secure, {
+    // Email-domain autodiscovery (email-008): when host is omitted, fill the
+    // IMAP coordinates (and provider_profile) from the email domain's preset.
+    // Explicit input always wins — an explicit host/port/secure/providerProfile
+    // is never overridden, and the preset only supplies values left blank.
+    const discovered = input.host === undefined ? autodiscoverProfile(input.emailAddress) : null;
+    const host = input.host ?? discovered?.imapDefaults?.host;
+    const port = input.port ?? discovered?.imapDefaults?.port;
+    const providerProfile =
+      input.providerProfile ?? discovered?.id ?? "generic-imap";
+
+    if (host === undefined || port === undefined) {
+      throw new Error(
+        `No IMAP host/port for ${input.emailAddress}. No provider preset matched the email domain; pass host and port explicitly.`
+      );
+    }
+
+    const secure = input.secure ?? discovered?.imapDefaults?.secure ?? true;
+    await assertSafeImapTarget(host, port, secure, {
       allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
     });
     const accountCount = await this.pool.query<{ count: string }>(
@@ -179,9 +195,9 @@ export class MirrorRepository {
       `,
       [
         input.emailAddress,
-        input.providerProfile ?? "generic-imap",
-        input.host,
-        input.port,
+        providerProfile,
+        host,
+        port,
         secure,
         input.username,
         encrypted,

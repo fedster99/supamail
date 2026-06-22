@@ -330,6 +330,27 @@ describe("API safety", () => {
     }));
   });
 
+  it("accepts POST /accounts without host/port so autodiscovery can fill them (email-008)", async () => {
+    const { app, repository } = buildApp();
+    const response = await app.request("/accounts", {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        emailAddress: "alice@fastmail.com",
+        username: "alice@fastmail.com",
+        password: "secret"
+      })
+    });
+    expect(response.status).toBe(201);
+    // The route forwards the host-less input verbatim; the repository autodiscovers.
+    expect(repository.createAccount).toHaveBeenCalledWith(
+      expect.objectContaining({ emailAddress: "alice@fastmail.com" })
+    );
+    const forwarded = (repository.createAccount as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as Record<string, unknown>;
+    expect(forwarded.host).toBeUndefined();
+    expect(forwarded.port).toBeUndefined();
+  });
+
   it("maps not-found and unique-violation errors to API responses", async () => {
     const notFound = buildApp({ account: null });
     const missingSync = await notFound.app.request(`/accounts/${accountId}/sync`, {

@@ -273,8 +273,10 @@ export interface MirrorHooks {
 
 export interface CreateAccountInput {
   emailAddress: string;
-  host: string;
-  port: number;
+  // host/port are optional: when omitted they are filled from the email
+  // domain's provider preset (email-008 autodiscovery). Explicit values win.
+  host?: string;
+  port?: number;
   secure?: boolean;
   username: string;
   password: string;

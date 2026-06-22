@@ -60,11 +60,11 @@ program
   .command("create-account")
   .description("Create an IMAP account")
   .requiredOption("--email <email>", "Mailbox email address")
-  .requiredOption("--host <host>", "IMAP host")
-  .requiredOption("--port <port>", "IMAP port")
+  .option("--host <host>", "IMAP host (omit to autodiscover from the email domain)")
+  .option("--port <port>", "IMAP port (omit to autodiscover from the email domain)")
   .requiredOption("--username <username>", "IMAP username")
   .requiredOption("--password <password>", "IMAP password")
-  .option("--profile <profile>", "Provider profile", "generic-imap")
+  .option("--profile <profile>", "Provider profile (omit to autodiscover from the email domain)")
   .option("--insecure", "Use plaintext IMAP instead of TLS")
   .option("--body-policy <policy>", "immediate, lazy, or priority_then_backfill")
   .option("--smtp-host <host>", "SMTP host (defaults to provider profile or omitted)")
@@ -76,8 +76,10 @@ program
     const account = await repository.createAccount({
       emailAddress: options.email,
       host: options.host,
-      port: Number(options.port),
-      secure: !options.insecure,
+      port: options.port === undefined ? undefined : Number(options.port),
+      // Only force `secure` when host is explicit; with autodiscovery, leave it
+      // undefined so the preset's own secure value applies.
+      secure: options.host === undefined ? undefined : !options.insecure,
       username: options.username,
       password: options.password,
       smtpHost: options.smtpHost,

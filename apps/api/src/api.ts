@@ -141,8 +141,10 @@ const UUID_SCHEMA = z.string().uuid();
 
 const CREATE_ACCOUNT_SCHEMA = z.object({
   emailAddress: z.string().email().max(255),
-  host: z.string().min(1).max(255),
-  port: z.coerce.number().int().min(1).max(65535),
+  // host/port are optional: when omitted, connect-time autodiscovery fills them
+  // from the email domain's provider preset (email-008). Explicit values win.
+  host: z.string().min(1).max(255).optional(),
+  port: z.coerce.number().int().min(1).max(65535).optional(),
   secure: z.boolean().optional(),
   username: z.string().min(1).max(255),
   password: z.string().min(1).max(1024),
