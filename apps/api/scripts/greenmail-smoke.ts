@@ -2,9 +2,11 @@ import { execFile } from "node:child_process";
 import { once } from "node:events";
 import net from "node:net";
 import { promisify } from "node:util";
+import { ImapFlow } from "imapflow";
 import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { MirrorRepository } from "../src/repository.js";
+import { sendMessage } from "../src/send.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 
 const execFileAsync = promisify(execFile);
@@ -208,6 +210,28 @@ function attachmentMessage(): string {
   ].join("\r\n");
 }
 
+// GreenMail auto-creates only INBOX, so the Sent folder the send primitive
+// APPENDs into must be created first. Real providers ship a Sent folder; this
+// just stands in for that on the test server (smoke-only, not production code).
+async function ensureSentFolder(): Promise<void> {
+  const client = new ImapFlow({
+    host: "127.0.0.1",
+    port: imapPort,
+    secure: false,
+    auth: { user: mailbox, pass: "any-password" },
+    logger: false
+  });
+  await client.connect();
+  try {
+    const existing = await client.list();
+    if (!existing.some((box) => box.path === "Sent")) {
+      await client.mailboxCreate("Sent");
+    }
+  } finally {
+    await client.logout().catch(() => client.close());
+  }
+}
+
 async function startGreenMail(): Promise<void> {
   await docker(["rm", "-f", containerName], true);
   await docker([
@@ -291,6 +315,11 @@ async function main(): Promise<void> {
     secure: false,
     username: mailbox,
     password: "any-password",
+    // SMTP coords for the send primitive (email-001). GreenMail SMTP is plaintext;
+    // secure=false + IMAP_ALLOW_PRIVATE_HOSTS relaxes the requireTLS gate.
+    smtpHost: "127.0.0.1",
+    smtpPort,
+    smtpSecure: false,
     providerProfile: "generic-imap",
     bodyFetchPolicy: "immediate"
   });
@@ -312,6 +341,65 @@ async function main(): Promise<void> {
       throw new Error(`GreenMail smoke failed: ${failed.map(([name]) => name).join(", ")}`);
     }
 
+    // Send path (email-001): reply to a mirrored message over SMTP, which APPENDs
+    // a copy to Sent. The next sync FETCHes that copy; assert it is mirrored and
+    // carries the threading In-Reply-To header (the NULL provider_thread_id path).
+    await ensureSentFolder();
+    const source = await pool.query<{ id: string; rfc_message_id: string | null }>(
+      "SELECT id, rfc_message_id FROM public.imap_messages WHERE account_id = $1 ORDER BY internal_date DESC LIMIT 1",
+      [account.id]
+    );
+    const sourceRow = source.rows[0];
+    const replyMessageId = `<greenmail-reply-${Date.now()}@example.test>`;
+    const sendResult = await sendMessage(pool, config, {
+      accountId: account.id,
+      to: [{ email: mailbox }],
+      subject: "Re: GreenMail smoke 1",
+      body: { format: "plain", text: "Automated send-path smoke reply." },
+      inReplyTo: sourceRow?.rfc_message_id ?? undefined,
+      references: sourceRow?.rfc_message_id ?? undefined,
+      messageId: replyMessageId
+    });
+
+    // Force folder re-discovery so the resync picks up the (just-created) Sent
+    // folder and the message we APPENDed into it; discovery is otherwise gated by
+    // next_folder_discovery_at after the initial sync.
+    await pool.query(
+      "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
+      [account.id]
+    );
+    // Re-sync so the Sent copy (and the delivered copy in INBOX) are mirrored.
+    const resyncResult = await engine.syncAccount(account.id, "manual");
+    const sentCopy = await pool.query<{ folder_path: string; in_reply_to: string | null }>(
+      `
+      SELECT folder_path, in_reply_to
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND rfc_message_id = $2
+        AND deleted_in_provider = false
+      `,
+      [account.id, replyMessageId]
+    );
+    const filedSomewhere = sentCopy.rows.length >= 1;
+    const threadingPresent = sentCopy.rows.some(
+      (row) => row.in_reply_to === (sourceRow?.rfc_message_id ?? null)
+    );
+
+    const sendAssertions: Array<[string, boolean]> = [
+      ["send delivered", sendResult.delivered === true],
+      ["send appended to Sent", sendResult.appendedToSent === true],
+      ["resync succeeded", resyncResult.outcome === "success"],
+      ["sent reply mirrored on resync", filedSomewhere],
+      ["sent reply threads via In-Reply-To", threadingPresent]
+    ];
+    const sendFailed = sendAssertions.filter(([, passed]) => !passed);
+    if (sendFailed.length > 0) {
+      throw new Error(
+        `GreenMail send smoke failed: ${sendFailed.map(([name]) => name).join(", ")}` +
+          ` | sendResult=${JSON.stringify(sendResult)} | mirroredRows=${sentCopy.rows.length}`
+      );
+    }
+
     console.log(JSON.stringify({
       ok: true,
       image,
@@ -319,7 +407,12 @@ async function main(): Promise<void> {
       smtpPort,
       imapPort,
       result,
-      counts
+      counts,
+      send: {
+        sendResult,
+        resyncOutcome: resyncResult.outcome,
+        mirroredSentCopies: sentCopy.rows.length
+      }
     }, null, 2));
   } finally {
     if (process.env.SUPAMAIL_GREENMAIL_KEEP_DATA !== "true") {

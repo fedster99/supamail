@@ -5,6 +5,17 @@ export interface ProviderProfile {
   knownQuirks: ProviderQuirk[];
   priorityForFolder(path: string, specialUse?: string | null): number;
   excludedReason(path: string, specialUse?: string | null): string | null;
+  /**
+   * Default SMTP coordinates for the send path (email-001), used only when the
+   * account row has no explicit smtp_* columns. Set ONLY for real, known
+   * provider mappings — generic IMAP stays explicit-only (no speculative
+   * heuristics). `host` is derived from the IMAP host so per-account hosts work.
+   */
+  smtpDefaults?: {
+    host: (imapHost: string) => string;
+    port: number;
+    secure: boolean;
+  };
 }
 
 export interface ProviderQuirk {
@@ -59,6 +70,9 @@ export const rackspaceProfile: ProviderProfile = {
   id: "rackspace",
   displayName: "Rackspace Email",
   compatibilityStatus: "profiled",
+  // Rackspace submission is a single shared host on implicit TLS, regardless of
+  // the per-account IMAP host. A real, known mapping (not a guess).
+  smtpDefaults: { host: () => "secure.emailsrvr.com", port: 465, secure: true },
   knownQuirks: [
     {
       id: "rackspace-inbox-inbox-alias",

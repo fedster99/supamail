@@ -10,11 +10,14 @@ import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
 import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
+import { sendMessage } from "./send.js";
 import type {
   AccountDetails,
   AccountSummary,
   ImapFolder,
   ImapMessage,
+  SendRequest,
+  SendResult,
   SyncResult,
   UpdateAccountSettingsInput
 } from "./types.js";
@@ -40,6 +43,8 @@ interface ApiAppOptions {
   repository: ApiRepository;
   engine: ApiEngine;
   applyMigration: () => Promise<void>;
+  /** Single-tenant send door (email-001). Resolves the SendResult JSON. */
+  send: (req: SendRequest) => Promise<SendResult>;
 }
 
 interface StartApiServerOptions {
@@ -58,8 +63,35 @@ const CREATE_ACCOUNT_SCHEMA = z.object({
   secure: z.boolean().optional(),
   username: z.string().min(1).max(255),
   password: z.string().min(1).max(1024),
+  smtpHost: z.string().min(1).max(255).optional(),
+  smtpPort: z.coerce.number().int().min(1).max(65535).optional(),
+  smtpSecure: z.boolean().optional(),
+  smtpUsername: z.string().min(1).max(255).optional(),
+  smtpPassword: z.string().min(1).max(1024).optional(),
   providerProfile: z.string().min(1).max(64).optional(),
   bodyFetchPolicy: z.enum(["immediate", "lazy", "priority_then_backfill"]).optional()
+});
+
+const SEND_RECIPIENT_SCHEMA = z.object({
+  email: z.string().email().max(255),
+  name: z.string().max(255).optional()
+});
+
+// Send body minus accountId (taken from the path). Mirrors SendRequest.
+const SEND_SCHEMA = z.object({
+  to: z.array(SEND_RECIPIENT_SCHEMA).min(1),
+  cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
+  bcc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
+  subject: z.string().max(2000),
+  body: z.object({
+    format: z.enum(["plain", "html"]),
+    text: z.string().optional(),
+    html: z.string().optional()
+  }),
+  headers: z.record(z.string()).optional(),
+  inReplyTo: z.string().max(2000).optional(),
+  references: z.string().max(8000).optional(),
+  messageId: z.string().max(2000).optional()
 });
 
 const TRACK_FOLDER_SCHEMA = z.object({
@@ -243,6 +275,16 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ fetched });
   });
 
+  app.post("/accounts/:id/send", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const account = await options.repository.getAccount(id);
+    if (!account) throw new NotFoundError(`Account not found: ${id}`);
+    const raw = await parseJsonBody(c);
+    const input = SEND_SCHEMA.parse(raw);
+    const result = await options.send({ accountId: id, ...input });
+    return c.json({ result });
+  });
+
   return app;
 }
 
@@ -256,7 +298,8 @@ export function startApiServer(options: StartApiServerOptions = {}): ReturnType<
     adminToken: config.ADMIN_TOKEN,
     repository,
     engine,
-    applyMigration: () => applyPublicMigrations(pool)
+    applyMigration: () => applyPublicMigrations(pool),
+    send: (req) => sendMessage(pool, config, req)
   });
 
   const server = serve({ fetch: app.fetch, port: config.PORT });

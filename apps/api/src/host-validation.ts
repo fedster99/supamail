@@ -2,6 +2,8 @@ import { isIP } from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
 
 const ALLOWED_IMAP_PORTS = new Set([143, 993]);
+// SMTP submission: 465 = implicit TLS, 587 = STARTTLS submission, 25 = relay/MTA.
+const ALLOWED_SMTP_PORTS = new Set([25, 465, 587]);
 const IPV4_MAPPED_IPV6_PREFIX = "::ffff:";
 
 export interface HostValidationOptions {
@@ -124,13 +126,19 @@ export async function assertSafeImapTarget(
   // entirely — the operator has opted into trusting whatever the OS resolves.
   if (options.allowPrivateHosts) return;
 
+  await assertHostResolvesPublicly(host, "IMAP");
+}
+
+// Shared SSRF host check: literal-IP and DNS-resolution rejection of
+// private/reserved ranges. Used by both the IMAP and SMTP guards.
+async function assertHostResolvesPublicly(host: string, label: string): Promise<void> {
   let resolved: Array<{ address: string }>;
   try {
     resolved = await dnsLookup(host, { all: true, verbatim: true });
   } catch (error) {
     throw new HostValidationError(
       "dns_lookup_failed",
-      `Could not resolve IMAP host ${host}: ${error instanceof Error ? error.message : String(error)}`
+      `Could not resolve ${label} host ${host}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
   if (resolved.length === 0) {
@@ -144,4 +152,45 @@ export async function assertSafeImapTarget(
       );
     }
   }
+}
+
+// SSRF guard for the send path, mirroring assertSafeImapTarget. SMTP differs in
+// two ways: the allowed ports are the submission/relay ports (25/465/587), and
+// `secure=false` here means STARTTLS (a TLS upgrade), not plaintext — so it is
+// NOT gated behind allowPrivateHosts the way plaintext IMAP is.
+export async function assertSafeSmtpTarget(
+  host: string,
+  port: number,
+  _secure: boolean,
+  options: HostValidationOptions
+): Promise<void> {
+  if (typeof host !== "string" || host.length === 0 || host.length > 255) {
+    throw new HostValidationError("invalid_host", "SMTP host must be a non-empty string under 255 chars");
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new HostValidationError("invalid_port", "SMTP port must be an integer from 1 to 65535");
+  }
+  if (!options.allowPrivateHosts && !ALLOWED_SMTP_PORTS.has(port)) {
+    throw new HostValidationError("invalid_port", `SMTP port must be one of: ${[...ALLOWED_SMTP_PORTS].join(", ")}`);
+  }
+
+  const lowerHost = host.toLowerCase();
+  if (lowerHost === "localhost") {
+    if (!options.allowPrivateHosts) {
+      throw new HostValidationError("private_host_denied", "localhost is not an allowed SMTP host");
+    }
+    return;
+  }
+
+  const literalFamily = isIP(host);
+  if (literalFamily !== 0) {
+    if (isPrivateOrReservedIp(host) && !options.allowPrivateHosts) {
+      throw new HostValidationError("private_host_denied", `Refusing to connect to private/reserved IP ${host}`);
+    }
+    return;
+  }
+
+  if (options.allowPrivateHosts) return;
+
+  await assertHostResolvesPublicly(host, "SMTP");
 }

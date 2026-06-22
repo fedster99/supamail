@@ -152,6 +152,11 @@ export class MirrorRepository {
       throw new Error(`SYNC_MAX_ACCOUNTS limit reached (${this.config.SYNC_MAX_ACCOUNTS})`);
     }
     const encrypted = await encryptPassword(this.pool, input.password, this.config.IMAP_ENCRYPTION_KEY);
+    // SMTP secret reuses the SAME frozen AES-256-GCM envelope (encryptPassword) as
+    // the IMAP password; a NULL here means the send path falls back to IMAP creds.
+    const encryptedSmtp = input.smtpPassword
+      ? await encryptPassword(this.pool, input.smtpPassword, this.config.IMAP_ENCRYPTION_KEY)
+      : null;
     const result = await this.pool.query<AccountSummary>(
       `
       INSERT INTO public.imap_accounts (
@@ -162,9 +167,14 @@ export class MirrorRepository {
         secure,
         username,
         encrypted_password,
+        smtp_host,
+        smtp_port,
+        smtp_secure,
+        smtp_username,
+        encrypted_smtp_password,
         body_fetch_policy
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
       `,
       [
@@ -175,6 +185,11 @@ export class MirrorRepository {
         secure,
         input.username,
         encrypted,
+        input.smtpHost ?? null,
+        input.smtpPort ?? null,
+        input.smtpSecure ?? null,
+        input.smtpUsername ?? null,
+        encryptedSmtp,
         input.bodyFetchPolicy ?? this.config.BODY_FETCH_POLICY
       ]
     );

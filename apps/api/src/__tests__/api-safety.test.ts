@@ -134,6 +134,7 @@ function buildApp(options: {
   createAccount?: (input: unknown) => Promise<AccountSummary>;
   listAccounts?: () => Promise<AccountSummary[]>;
   applyMigration?: () => Promise<void>;
+  send?: (req: unknown) => Promise<unknown>;
 } = {}) {
   const account = options.account === undefined ? makeAccount() : options.account;
   const accountDetails = options.accountDetails === undefined
@@ -160,15 +161,24 @@ function buildApp(options: {
     fetchBody: vi.fn(async () => true)
   };
   const applyMigration = vi.fn(options.applyMigration ?? (async () => undefined));
+  const send = vi.fn(options.send ?? (async () => ({
+    rfcMessageId: "<sent@example.test>",
+    delivered: true,
+    appendedToSent: true,
+    appendedUid: 1,
+    sentFolderPath: "Sent",
+    warnings: []
+  })));
   const app = createApiApp({
     apiToken: options.apiToken ?? "api-token",
     adminToken: "adminToken" in options ? options.adminToken : "admin-token",
     repository,
     engine,
-    applyMigration
+    applyMigration,
+    send: send as never
   });
 
-  return { app, repository, engine, applyMigration };
+  return { app, repository, engine, applyMigration, send };
 }
 
 function auth(token = "api-token"): Record<string, string> {
@@ -390,6 +400,60 @@ describe("API safety", () => {
       archiveFlagSync: true,
       maxBackfillRate: "aggressive"
     });
+  });
+
+  it("gates POST /accounts/:id/send behind the API token", async () => {
+    const { app, send } = buildApp();
+
+    const unauthorized = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: [{ email: "x@example.test" }], subject: "Hi", body: { format: "plain", text: "y" } })
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("validates the send body and dispatches the send primitive for a known account", async () => {
+    const { app, send } = buildApp();
+
+    const invalid = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ subject: "Hi", body: { format: "plain", text: "y" } })
+    });
+    expect(invalid.status).toBe(400);
+    expect(send).not.toHaveBeenCalled();
+
+    const valid = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        to: [{ email: "recipient@example.test" }],
+        subject: "Hello",
+        body: { format: "plain", text: "Body text" }
+      })
+    });
+    expect(valid.status).toBe(200);
+    await expect(valid.json()).resolves.toMatchObject({ result: { delivered: true } });
+    expect(send).toHaveBeenCalledWith({
+      accountId,
+      to: [{ email: "recipient@example.test" }],
+      subject: "Hello",
+      body: { format: "plain", text: "Body text" }
+    });
+  });
+
+  it("returns 404 from /send for an unknown account without dispatching", async () => {
+    const { app, send } = buildApp({ account: null });
+
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ to: [{ email: "x@example.test" }], subject: "Hi", body: { format: "plain", text: "y" } })
+    });
+    expect(res.status).toBe(404);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("uses the SupaMail CLI name", async () => {
