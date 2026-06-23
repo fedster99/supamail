@@ -50,7 +50,11 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   pattern from `imap-client.ts` but exposes only `append()` (+ `list()` to resolve
   the Sent folder). `MirrorImapClient`/`ThrottledImapClient` (the sync read
   adapter) gain no write verb — pinned by `sync-adapter-read-only.test.ts`. The
-  sync path can never write; the send path can never read-sync.
+  sync path can never write; the send path can never read-sync. Update (ADR 0022):
+  that "reused pattern" is now an actual shared function, `connectImap`
+  (`imap-connect.ts`) — `SentFolderAppender` obtains its socket there (and so
+  inherits the close-on-connect-error guard it previously lacked); the append-only
+  verb surface is unchanged.
 - **Reuse the frozen AES-256-GCM envelope for the SMTP secret.** SMTP credentials
   are stored in nullable `smtp_*` columns on `imap_accounts` (migration 0009),
   with `encrypted_smtp_password` using the same envelope as `encrypted_password`

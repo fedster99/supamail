@@ -1,8 +1,7 @@
-import { ImapFlow } from "imapflow";
+import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
-import { decryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
-import { assertSafeImapTarget } from "./host-validation.js";
+import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
 import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
@@ -130,11 +129,12 @@ export function resolveTrashFolder(
 }
 
 /**
- * Write-only IMAP client for organize mutations. Reuses the exact connect +
- * decrypt + assertSafeImapTarget pattern from imap-client.ts / smtp-client.ts but
- * exposes ONLY mutation verbs (STORE flags, MOVE, DELETE+EXPUNGE, mailbox CRUD)
- * and `list()` (so callers can resolve Trash by special-use). It never reads
- * message content and is never used by the sync engine.
+ * Write-only IMAP client for organize mutations. Its socket comes from the one
+ * shared {@link connectImap} prelude (decrypt + assertSafeImapTarget + the
+ * close-on-connect-error guard, imap-connect.ts); it exposes ONLY mutation verbs
+ * (STORE flags, MOVE, DELETE+EXPUNGE, mailbox CRUD) and `list()` (so callers can
+ * resolve Trash by special-use). It never reads message content and is never used
+ * by the sync engine.
  *
  * Every per-message verb is UID-addressed and runs under a per-folder mailbox
  * lock with a UIDVALIDITY guard, so a verb can only ever touch the exact message
@@ -151,27 +151,10 @@ export class MailboxMutator {
     config: AppConfig,
     account: ImapAccount
   ): Promise<MailboxMutator> {
-    await assertSafeImapTarget(account.host, account.port, account.secure, {
-      allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
-    });
-    const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
-    const client = new ImapFlow({
-      host: account.host,
-      port: account.port,
-      secure: account.secure,
-      auth: { user: account.username, pass: password },
-      logger: false,
-      connectionTimeout: config.CONNECT_TIMEOUT_MS,
-      greetingTimeout: config.CONNECT_TIMEOUT_MS,
-      socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
-    });
-    try {
-      await client.connect();
-    } catch (error) {
-      // Close the socket so an auth/TLS failure during connect cannot leak it.
-      client.close();
-      throw error;
-    }
+    // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
+    // one shared connect prelude (imap-connect.ts); this client only adds the
+    // mutation verb surface on top (ADR 0018/0022).
+    const client = await connectImap(pool, config, account);
     return new MailboxMutator(client, account.host);
   }
 
@@ -198,9 +181,17 @@ export class MailboxMutator {
     const lock = await this.client.getMailboxLock(target.folderPath);
     try {
       const mailbox = this.client.mailbox;
-      if (mailbox && Number(mailbox.uidValidity) !== target.uidValidity) {
+      // Shared fail-closed UIDVALIDITY check (imap-connect.ts) — same property as
+      // ContentImapClient's fetch guard, but the mutate path keeps its own
+      // MailboxConflictError (mapped to HTTP 409 by api.ts).
+      if (!uidValidityMatches(mailbox, target.uidValidity)) {
         throw new MailboxConflictError(
-          `UIDVALIDITY changed for ${target.folderPath} (mirror ${target.uidValidity} != server ${mailbox.uidValidity}); refusing to mutate by stale UID`
+          uidValidityMismatchMessage(
+            target.folderPath,
+            target.uidValidity,
+            (mailbox as { uidValidity?: bigint | number }).uidValidity,
+            "mutate"
+          )
         );
       }
       return await op();

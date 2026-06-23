@@ -1,8 +1,7 @@
-import { ImapFlow } from "imapflow";
+import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
-import { decryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
-import { assertSafeImapTarget } from "./host-validation.js";
+import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
 import { cleanBody } from "./mcp/shared.js";
 import { MirrorRepository } from "./repository.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
@@ -23,9 +22,10 @@ import type { ImapAccount, ImapMessage } from "./types.js";
  * - Parsed headers (headers_json) + body text ARE mirrored → read from the mirror,
  *   with an on-demand FETCH fallback only when the body row is absent.
  *
- * The on-demand fetch uses a narrow read-only {@link ContentImapClient} that
- * reuses the exact connect + decrypt + assertSafeImapTarget pattern but exposes
- * ONLY `download()` / `fetchOneSource()` (a READ). It is NOT the sync adapter
+ * The on-demand fetch uses a narrow read-only {@link ContentImapClient} whose
+ * socket comes from the one shared {@link connectImap} prelude (decrypt +
+ * assertSafeImapTarget + the close-on-connect-error guard) but exposes ONLY
+ * `download()` / `fetchOneSource()` (a READ). It is NOT the sync adapter
  * (ThrottledImapClient stays untouched, so sync-adapter-read-only.test.ts holds)
  * and it never writes.
  */
@@ -104,26 +104,10 @@ export class ContentImapClient {
   private constructor(private readonly client: ImapFlow) {}
 
   static async connect(pool: PgPool, config: AppConfig, account: ImapAccount): Promise<ContentImapClient> {
-    await assertSafeImapTarget(account.host, account.port, account.secure, {
-      allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
-    });
-    const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
-    const client = new ImapFlow({
-      host: account.host,
-      port: account.port,
-      secure: account.secure,
-      auth: { user: account.username, pass: password },
-      logger: false,
-      connectionTimeout: config.CONNECT_TIMEOUT_MS,
-      greetingTimeout: config.CONNECT_TIMEOUT_MS,
-      socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
-    });
-    try {
-      await client.connect();
-    } catch (error) {
-      client.close();
-      throw error;
-    }
+    // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
+    // one shared connect prelude (imap-connect.ts); this client only adds the
+    // download/fetch read verb surface on top (ADR 0020/0022).
+    const client = await connectImap(pool, config, account);
     return new ContentImapClient(client);
   }
 
@@ -174,9 +158,16 @@ export class ContentImapClient {
 
   private assertUidValidity(folderPath: string, uidValidity: number): void {
     const mailbox = this.client.mailbox as { uidValidity?: bigint | number } | false | null;
-    if (mailbox && Number(mailbox.uidValidity) !== uidValidity) {
+    // Shared fail-closed UIDVALIDITY check (imap-connect.ts) — same property as
+    // MailboxMutator's mutate guard, but the fetch path keeps its own plain Error.
+    if (!uidValidityMatches(mailbox, uidValidity)) {
       throw new Error(
-        `UIDVALIDITY changed for ${folderPath} (mirror ${uidValidity} != server ${mailbox.uidValidity}); refusing to fetch by stale UID`
+        uidValidityMismatchMessage(
+          folderPath,
+          uidValidity,
+          (mailbox as { uidValidity?: bigint | number }).uidValidity,
+          "fetch"
+        )
       );
     }
   }

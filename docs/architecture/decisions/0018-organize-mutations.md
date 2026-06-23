@@ -30,6 +30,9 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   (SSRF guard) pattern and exposes only the mutation verbs (`addFlags`/`removeFlags`,
   `move`, `expunge`, `createFolder`/`renameFolder`/`deleteFolder`, `list`). The sync
   read adapter gains no write verb (`sync-adapter-read-only.test.ts` enforces this).
+  Update (ADR 0022): that "reused pattern" is now an actual shared function,
+  `connectImap` (`imap-connect.ts`) — `MailboxMutator` obtains its socket there; the
+  mutation verb surface is unchanged.
 - Every per-message verb is **UID-addressed under a UIDVALIDITY guard**: the
   message's mirror row supplies `folder + uidvalidity + uid`; if the server's
   UIDVALIDITY no longer matches, the verb aborts rather than touching the wrong

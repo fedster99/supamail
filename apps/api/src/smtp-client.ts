@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { ImapFlow } from "imapflow";
+import type { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
-import { assertSafeImapTarget } from "./host-validation.js";
+import { connectImap } from "./imap-connect.js";
 import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
 import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
@@ -222,10 +222,11 @@ export function resolveSentFolder(
 }
 
 /**
- * Write-only, single-verb IMAP client for filing the sent copy. It reuses the
- * exact connect + decrypt + assertSafeImapTarget pattern from imap-client.ts but
- * exposes ONLY `append()` (and `list()` so the caller can resolve the Sent
- * folder). The sync path can never write; the send path can never read-sync.
+ * Write-only, single-verb IMAP client for filing the sent copy. Its socket comes
+ * from the one shared {@link connectImap} prelude (decrypt + assertSafeImapTarget +
+ * the close-on-connect-error guard, imap-connect.ts); it exposes ONLY `append()`
+ * (and `list()` so the caller can resolve the Sent folder). The sync path can never
+ * write; the send path can never read-sync.
  */
 export class SentFolderAppender {
   private constructor(private readonly client: ImapFlow) {}
@@ -235,21 +236,10 @@ export class SentFolderAppender {
     config: AppConfig,
     account: ImapAccount
   ): Promise<SentFolderAppender> {
-    await assertSafeImapTarget(account.host, account.port, account.secure, {
-      allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
-    });
-    const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
-    const client = new ImapFlow({
-      host: account.host,
-      port: account.port,
-      secure: account.secure,
-      auth: { user: account.username, pass: password },
-      logger: false,
-      connectionTimeout: config.CONNECT_TIMEOUT_MS,
-      greetingTimeout: config.CONNECT_TIMEOUT_MS,
-      socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
-    });
-    await client.connect();
+    // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
+    // one shared connect prelude (imap-connect.ts); this client only adds the
+    // append-only verb surface on top (ADR 0017/0022).
+    const client = await connectImap(pool, config, account);
     return new SentFolderAppender(client);
   }
 

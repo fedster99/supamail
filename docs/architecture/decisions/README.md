@@ -26,6 +26,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0019-drafts-crud.md`: Draft CRUD (create/list/get/update/send/delete) saved to the provider Drafts folder is a composition of the send + organize primitives; update is append-new + delete-old (IMAP drafts are immutable); the agent surface stays zero-send.
 - `0020-attachments-content.md`: Attachment bytes + raw MIME are on-demand UIDVALIDITY-guarded reads (never mirrored under parsed_only); metadata/headers/clean-bodies come from the mirror; all live outside the agent surface (no sixth MCP tool); clean-body is deterministic (no LLM).
 - `0021-provider-presets.md`: Long-tail IMAP/SMTP presets (Fastmail/Zoho/iCloud/Yahoo) carry both coordinate sets on `ProviderProfile`; a pure static email-domain lookup autodiscovers the preset at connect time (explicit input always wins); connectivity config only — no new MCP tool, frozen crypto + `resolveSmtpCreds` order untouched.
+- `0022-shared-imap-connect-prelude.md`: The four IMAP clients' copied connect prelude (SSRF guard + decrypt + ImapFlow construct + connect) is extracted to one shared `connectImap` (`imap-connect.ts`) with the close-on-connect-error guard baked in (fixing a socket-leak drift on two of the four); the UIDVALIDITY fail-closed comparison is co-located and shared; verb surfaces stay separate — behavior-preserving.
 
 ## Status Values
 
