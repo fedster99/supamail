@@ -71,6 +71,14 @@ Folder resolution mirrors `resolveSentFolder` / `resolveTrashFolder`: a new
 `resolveDraftsFolder` prefers `\Drafts` special-use, then a folder literally named
 "Drafts", then the conventional `"Drafts"`.
 
+> Now shared (arch CC-2): the three resolvers are one-line delegations to a single
+> role-keyed `resolveSpecialUseFolder(mailboxes, role, profile)` (provider-profiles.ts).
+> Each role's exact fallback is preserved — Sent consults the provider profile,
+> Trash/Drafts match the leaf name — so behavior is unchanged; the inconsistency now
+> lives in one visible per-role line for a future deliberate alignment. The SQL
+> `draftFolderPaths` stays a separate encoding (it queries the mirrored folder table,
+> not a live LIST).
+
 **Surfaces** follow "one core lib, four front doors": library functions exported
 from the barrel; `API_TOKEN`-gated HTTP routes (`POST/GET /accounts/:id/drafts`,
 `GET/PATCH/DELETE /drafts/:id`, `POST /drafts/:id/send`); and CLI commands

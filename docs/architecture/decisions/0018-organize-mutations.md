@@ -38,6 +38,11 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   UIDVALIDITY no longer matches, the verb aborts rather than touching the wrong
   message. Thread-level verbs resolve the live members from the mirror and apply
   the verb to each.
+  Update (arch CC-3): the one-hop thread-membership walk (the id-token normalization
+  + the membership WHERE predicate + the oldest-first ORDER) is now shared in
+  `thread-walk.ts` — both this write fan-out (`resolveThreadTargets`) and the
+  read-only `read_thread` source it, so they agree on "what is in a thread" by
+  construction. Each caller keeps its own projection; the rows + order are unchanged.
 - **Flag mutations write through to the mirror immediately**; moves and deletes
   reconcile on the next sync pass. A flag change (mark read/unread, star/unstar)
   updates the KNOWN message row's `flags` to a KNOWN value right after a successful

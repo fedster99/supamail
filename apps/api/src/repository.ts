@@ -52,6 +52,58 @@ export function sanitizeErrorReason(error: string): string {
     .slice(0, ERROR_REASON_MAX_LEN);
 }
 
+/** Resolved IMAP connection coordinates + the chosen provider profile id for a new
+ * account (the twin of {@link import("./smtp-client.js").ResolvedSmtpCreds}). */
+export interface ResolvedImapCoords {
+  host: string;
+  port: number;
+  secure: boolean;
+  /** The provider_profile id to store (drives the SMTP path's smtpDefaults). */
+  providerProfile: string;
+}
+
+/**
+ * Resolve the IMAP coordinates for a new account (email-008, ADR 0021), the twin of
+ * `resolveSmtpCreds`. Precedence (highest first):
+ *   (1) explicit host/port/secure (always wins, applied via `??`),
+ *   (2) an explicitly-named non-generic preset's `imapDefaults`
+ *       (`--profile fastmail` supplies the fastmail coordinates),
+ *   (3) email-domain autodiscovery (the domain guess),
+ *   (4) clear error.
+ * An explicit `--profile` thus BEATS the domain guess; an explicit host beats both.
+ * The chosen preset id is returned in `providerProfile` so the SMTP path's
+ * `resolveSmtpCreds` (ADR 0017) picks up the matching smtpDefaults. Pure: no DB, no
+ * network (autodiscovery is a static map lookup) — tested by direct call.
+ */
+export function resolveImapCoords(input: {
+  emailAddress: string;
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  providerProfile?: string;
+}): ResolvedImapCoords {
+  const namedProfile =
+    input.providerProfile !== undefined ? getProviderProfile(input.providerProfile) : null;
+  const namedPreset = namedProfile?.imapDefaults ? namedProfile : null;
+  const discovered =
+    input.host === undefined && namedPreset === null
+      ? autodiscoverProfile(input.emailAddress)
+      : null;
+  const presetDefaults = namedPreset?.imapDefaults ?? discovered?.imapDefaults;
+  const host = input.host ?? presetDefaults?.host;
+  const port = input.port ?? presetDefaults?.port;
+  const providerProfile = input.providerProfile ?? discovered?.id ?? "generic-imap";
+
+  if (host === undefined || port === undefined) {
+    throw new Error(
+      `No IMAP host/port for ${input.emailAddress}. No provider preset matched the email domain; pass host and port explicitly.`
+    );
+  }
+
+  const secure = input.secure ?? presetDefaults?.secure ?? true;
+  return { host, port, secure, providerProfile };
+}
+
 export class FolderTrackingRejectedError extends Error {
   constructor(
     readonly code: "provider_excluded_folder",
@@ -141,35 +193,11 @@ export class MirrorRepository {
   ) {}
 
   async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
-    // IMAP coordinate resolution (email-008) when host is omitted, in precedence:
-    //   (1) explicit host/port/secure (always wins, applied below via `??`),
-    //   (2) an explicitly-named non-generic preset's imapDefaults
-    //       (`--profile fastmail` supplies the fastmail coordinates),
-    //   (3) email-domain autodiscovery (the domain guess),
-    //   (4) clear error.
-    // An explicit `--profile` thus BEATS the domain guess; an explicit host beats
-    // both. The chosen preset id is stored in provider_profile so the SMTP path's
-    // resolveSmtpCreds (ADR 0017) picks up the matching smtpDefaults.
-    const namedProfile =
-      input.providerProfile !== undefined ? getProviderProfile(input.providerProfile) : null;
-    const namedPreset = namedProfile?.imapDefaults ? namedProfile : null;
-    const discovered =
-      input.host === undefined && namedPreset === null
-        ? autodiscoverProfile(input.emailAddress)
-        : null;
-    const presetDefaults = namedPreset?.imapDefaults ?? discovered?.imapDefaults;
-    const host = input.host ?? presetDefaults?.host;
-    const port = input.port ?? presetDefaults?.port;
-    const providerProfile =
-      input.providerProfile ?? discovered?.id ?? "generic-imap";
-
-    if (host === undefined || port === undefined) {
-      throw new Error(
-        `No IMAP host/port for ${input.emailAddress}. No provider preset matched the email domain; pass host and port explicitly.`
-      );
-    }
-
-    const secure = input.secure ?? presetDefaults?.secure ?? true;
+    // IMAP coordinate resolution (email-008) — the explicit > named-preset >
+    // domain-autodiscovery > error precedence now lives in one place, the twin of
+    // resolveSmtpCreds (ADR 0017/0021). The chosen preset id is stored in
+    // provider_profile so the SMTP path picks up the matching smtpDefaults.
+    const { host, port, secure, providerProfile } = resolveImapCoords(input);
     await assertSafeImapTarget(host, port, secure, {
       allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
     });

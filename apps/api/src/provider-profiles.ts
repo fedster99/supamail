@@ -215,3 +215,95 @@ export function autodiscoverProfile(emailOrDomain: string): ProviderProfile | nu
   const id = DOMAIN_TO_PROFILE.get(domain);
   return id ? (profiles.get(id) ?? null) : null;
 }
+
+// ---------------------------------------------------------------------------
+// One role-keyed special-use folder resolver (CC-2).
+// ---------------------------------------------------------------------------
+
+/** A well-known IMAP role a caller wants to address (file Sent / move to Trash /
+ * APPEND a Draft). The send/mutate/drafts paths each resolved their own folder by
+ * re-encoding the same special-use → fallback → conventional-name precedence; this
+ * is the single home for that precedence. */
+export type SpecialUseRole = "sent" | "trash" | "drafts";
+
+interface SpecialUseRoleSpec {
+  /** The RFC 6154 special-use attribute, lowercased (e.g. "\\sent"). */
+  specialUse: string;
+  /** The conventional folder name used when nothing else matches (e.g. "Sent"). */
+  conventional: string;
+  /**
+   * The per-role SECONDARY fallback, applied only when the server advertises no
+   * matching special-use mailbox. This is where the three historical resolvers
+   * deliberately DIVERGED and that divergence is preserved here verbatim:
+   *   - "sent"   used `profile.priorityForFolder(path, specialUse) === 5`
+   *   - "trash"/"drafts" ignored the profile and matched the leaf name
+   * Returns the chosen folder path, or null to fall through to `conventional`.
+   *
+   * NOTE (future deliberate alignment): the Sent role consults the provider
+   * profile while Trash/Drafts do not. That inconsistency is intentional to keep
+   * this a behavior-preserving extraction; aligning all three on one strategy is a
+   * follow-up that would CHANGE behavior and must be done knowingly.
+   */
+  fallback: (
+    mailboxes: Array<{ path: string; specialUse?: string | null }>,
+    profile: ProviderProfile
+  ) => string | null;
+}
+
+/** Leaf-name match used by the Trash/Drafts fallback: the last path segment
+ * (split on `/` or `.`), lowercased, equals `name`. */
+function byLeafName(
+  mailboxes: Array<{ path: string; specialUse?: string | null }>,
+  name: string
+): string | null {
+  const found = mailboxes.find((m) => m.path.toLowerCase().split(/[/.]/).pop() === name);
+  return found ? found.path : null;
+}
+
+const SPECIAL_USE_ROLES: Record<SpecialUseRole, SpecialUseRoleSpec> = {
+  // Sent falls back via the provider profile's "sent" priority winner (priority 5).
+  sent: {
+    specialUse: "\\sent",
+    conventional: "Sent",
+    fallback: (mailboxes, profile) => {
+      const found = mailboxes.find((m) => profile.priorityForFolder(m.path, m.specialUse) === 5);
+      return found ? found.path : null;
+    }
+  },
+  // Trash falls back via a folder literally named "trash" (profile ignored).
+  trash: {
+    specialUse: "\\trash",
+    conventional: "Trash",
+    fallback: (mailboxes) => byLeafName(mailboxes, "trash")
+  },
+  // Drafts falls back via a folder literally named "drafts" (profile ignored).
+  drafts: {
+    specialUse: "\\drafts",
+    conventional: "Drafts",
+    fallback: (mailboxes) => byLeafName(mailboxes, "drafts")
+  }
+};
+
+/**
+ * Resolve the mailbox that plays `role` (Sent / Trash / Drafts): the matching
+ * RFC 6154 special-use mailbox if the server advertises one, else the role's
+ * SECONDARY fallback (see {@link SpecialUseRoleSpec.fallback} — Sent consults the
+ * profile, Trash/Drafts match the leaf name), else the conventional name.
+ *
+ * This is the single home for the precedence that `resolveSentFolder`,
+ * `resolveTrashFolder`, and `resolveDraftsFolder` each used to re-encode; the
+ * three call sites are now one-line lookups returning the SAME folder they did
+ * before. The SQL `draftFolderPaths` (drafts.ts) intentionally remains a separate
+ * encoding — it queries the mirrored folder table, not a live LIST, so it is not
+ * byte-equivalent to this in-memory predicate.
+ */
+export function resolveSpecialUseFolder(
+  mailboxes: Array<{ path: string; specialUse?: string | null }>,
+  role: SpecialUseRole,
+  profile: ProviderProfile
+): string {
+  const spec = SPECIAL_USE_ROLES[role];
+  const bySpecialUse = mailboxes.find((m) => (m.specialUse ?? "").toLowerCase() === spec.specialUse);
+  if (bySpecialUse) return bySpecialUse.path;
+  return spec.fallback(mailboxes, profile) ?? spec.conventional;
+}

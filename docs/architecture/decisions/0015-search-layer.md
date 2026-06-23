@@ -127,6 +127,13 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   received_after=&received_before=&folder=&thread=&account=&sort=&limit=&offset=`
   onto the same `searchMessages` call. All three are pure reads; none touches
   `src/mcp/` write boundaries, IMAP, or any mutation path.
+
+  > Now guarded (arch #40): the Zod `searchFiltersSchema` and the hand-written
+  > `inputSchema.filters.properties` JSON-Schema were kept in sync only by a comment.
+  > A `search-schema-parity.test.ts` now asserts the two advertise the SAME field set,
+  > so a field added to one but not the other fails the test instead of silently
+  > drifting the agent contract. The advertised JSON-Schema is unchanged (its per-field
+  > descriptions are editorial), so this is a parity guard, not a derivation.
 - **Injection safety is structural, not reviewed.** Recipient/folder/date values keep
   going through the same `Params` binder and `escapeLike()`; a value carrying `'`,
   `%`, `_`, or `;` is escaped and bound, never interpolated. A unit test asserts a

@@ -2,8 +2,9 @@ import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
-import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
+import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
+import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
 
 /**
@@ -114,18 +115,17 @@ export function toImapFlag(token: string): string {
 
 /**
  * Resolve the Trash folder to move into: the `\Trash` special-use mailbox if the
- * server advertises one, else the conventional `"Trash"`. Mirrors
- * resolveSentFolder (smtp-client.ts).
+ * server advertises one, else a folder literally named "trash", else the
+ * conventional `"Trash"`. One-line delegation to the shared role-keyed resolver
+ * (provider-profiles.ts) — the "trash" role keeps its leaf-name fallback and
+ * (unlike Sent) does NOT consult the provider profile (behavior preserved; the
+ * `_profile` parameter stays for signature compatibility).
  */
 export function resolveTrashFolder(
   mailboxes: Array<{ path: string; specialUse?: string | null }>,
   _profile: ProviderProfile
 ): string {
-  const bySpecialUse = mailboxes.find((m) => (m.specialUse ?? "").toLowerCase() === "\\trash");
-  if (bySpecialUse) return bySpecialUse.path;
-  const byName = mailboxes.find((m) => m.path.toLowerCase().split(/[/.]/).pop() === "trash");
-  if (byName) return byName.path;
-  return "Trash";
+  return resolveSpecialUseFolder(mailboxes, "trash", _profile);
 }
 
 /**
@@ -507,15 +507,7 @@ async function resolveThreadTargets(
 ): Promise<{ accountId: string; targets: ResolvedMessageTarget[] }> {
   const client: PgClient = await pool.connect();
   try {
-    const seedResult = await client.query<{
-      id: string;
-      provider_thread_id: string | null;
-      rfc_message_id: string | null;
-      message_id_normalized: string | null;
-      in_reply_to: string | null;
-      references_header: string | null;
-      account_id: string;
-    }>(
+    const seedResult = await client.query<ThreadSeedRow>(
       `
       SELECT id, provider_thread_id, rfc_message_id, message_id_normalized,
              in_reply_to, references_header, account_id
@@ -528,31 +520,19 @@ async function resolveThreadTargets(
     const seed = seedResult.rows[0];
     if (!seed) throw new Error(`Message not found: ${messageId}`);
 
-    const keys = new Set<string>();
-    const pushToken = (token: string): void => {
-      const normalized = token.trim().replace(/^<+/, "").replace(/>+$/, "").trim().toLowerCase();
-      if (normalized) keys.add(normalized);
-    };
-    if (seed.references_header) seed.references_header.split(/\s+/).forEach(pushToken);
-    if (seed.in_reply_to) seed.in_reply_to.split(/\s+/).forEach(pushToken);
-    if (seed.rfc_message_id) pushToken(seed.rfc_message_id);
-    if (seed.message_id_normalized) pushToken(seed.message_id_normalized);
-
+    // Shared one-hop membership walk (CC-3, thread-walk.ts): the normalized key set,
+    // the WHERE predicate, and the oldest-first ORDER are single-sourced so this
+    // write fan-out and the read surface (read_thread) can never diverge on "what is
+    // in a thread." This SELECT keeps its OWN columns (folder + uidvalidity + uid),
+    // no alias.
+    const keys = threadSeedKeys(seed);
     const members = await client.query<ThreadMemberRow>(
       `
       SELECT id, account_id, folder_path, uidvalidity, uid
       FROM public.imap_messages
-      WHERE account_id = $1
-        AND deleted_in_provider = false
-        AND (
-          ($2::text IS NOT NULL AND provider_thread_id = $2)
-          OR id = $3
-          OR message_id_normalized = ANY($4::text[])
-          OR lower(trim(both '<>' from in_reply_to)) = ANY($4::text[])
-        )
-      ORDER BY internal_date ASC, id ASC
+      WHERE ${threadMembershipClause("")}
       `,
-      [seed.account_id, seed.provider_thread_id, seed.id, [...keys]]
+      [seed.account_id, seed.provider_thread_id, seed.id, keys]
     );
 
     const targets = members.rows.map((row) => ({

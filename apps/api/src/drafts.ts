@@ -1,7 +1,7 @@
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { deleteMessage } from "./mailbox-mutations.js";
-import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
+import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import { sendMessage } from "./send.js";
 import { SentFolderAppender, buildRawMime } from "./smtp-client.js";
@@ -113,18 +113,19 @@ export interface DeleteDraftResult {
 
 /**
  * Pick the Drafts folder to APPEND into: the `\Drafts` special-use mailbox if the
- * server advertises one, else the provider profile's "drafts" priority winner,
- * else the conventional `"Drafts"`. Mirrors resolveSentFolder / resolveTrashFolder.
+ * server advertises one, else a folder literally named "drafts", else the
+ * conventional `"Drafts"`. One-line delegation to the shared role-keyed resolver
+ * (provider-profiles.ts) — the "drafts" role keeps its leaf-name fallback and
+ * (unlike Sent) does NOT consult the provider profile (behavior preserved; the
+ * `_profile` parameter stays for signature compatibility). Note: the SQL
+ * `draftFolderPaths` below is a SEPARATE, deliberately-not-shared encoding — it
+ * queries the mirrored folder table, not a live LIST.
  */
 export function resolveDraftsFolder(
   mailboxes: Array<{ path: string; specialUse?: string | null }>,
   _profile: ProviderProfile
 ): string {
-  const bySpecialUse = mailboxes.find((m) => (m.specialUse ?? "").toLowerCase() === "\\drafts");
-  if (bySpecialUse) return bySpecialUse.path;
-  const byName = mailboxes.find((m) => m.path.toLowerCase().split(/[/.]/).pop() === "drafts");
-  if (byName) return byName.path;
-  return "Drafts";
+  return resolveSpecialUseFolder(mailboxes, "drafts", _profile);
 }
 
 /** APPEND `req` to the account's Drafts folder with the `\Draft` flag, reusing the

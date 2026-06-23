@@ -8,41 +8,49 @@ import type { SearchRequest, SearchResponse } from "./types.js";
  * input through this before calling {@link searchMessages}, so the read-tool
  * contract is enforced in one place (ADR 0014).
  */
+/**
+ * The structured `filters` object schema, extracted as a named const so the
+ * advertised MCP JSON-Schema's `filters.properties` can be checked for key parity
+ * against it (#40, search-schema-parity.test.ts). The Zod schema is the source of
+ * truth for validation; the JSON-Schema literal below is the hand-written agent
+ * contract, and the parity test fails if a field is added to one but not the other.
+ */
+export const searchFiltersSchema = z
+  .object({
+    from: z.string().optional(),
+    fromDomain: z.string().optional(),
+    to: z.string().optional(),
+    cc: z.string().optional(),
+    bcc: z.string().optional(),
+    anyEmail: z.string().optional(),
+    subject: z.string().optional(),
+    body: z.string().optional(),
+    folder: z.string().optional(),
+    thread: z.string().optional(),
+    msgid: z.string().optional(),
+    filename: z.string().optional(),
+    filetype: z.string().optional(),
+    mime: z.string().optional(),
+    isUnread: z.boolean().optional(),
+    isRead: z.boolean().optional(),
+    isFlagged: z.boolean().optional(),
+    isStarred: z.boolean().optional(),
+    isAnswered: z.boolean().optional(),
+    isDraft: z.boolean().optional(),
+    hasAttachment: z.boolean().optional(),
+    hasBody: z.boolean().optional(),
+    after: z.string().optional(),
+    before: z.string().optional(),
+    largerThan: z.number().int().nonnegative().optional(),
+    smallerThan: z.number().int().nonnegative().optional(),
+    window: z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"]).optional()
+  })
+  .strict();
+
 export const searchRequestSchema = z
   .object({
     q: z.string().max(4096).optional(),
-    filters: z
-      .object({
-        from: z.string().optional(),
-        fromDomain: z.string().optional(),
-        to: z.string().optional(),
-        cc: z.string().optional(),
-        bcc: z.string().optional(),
-        anyEmail: z.string().optional(),
-        subject: z.string().optional(),
-        body: z.string().optional(),
-        folder: z.string().optional(),
-        thread: z.string().optional(),
-        msgid: z.string().optional(),
-        filename: z.string().optional(),
-        filetype: z.string().optional(),
-        mime: z.string().optional(),
-        isUnread: z.boolean().optional(),
-        isRead: z.boolean().optional(),
-        isFlagged: z.boolean().optional(),
-        isStarred: z.boolean().optional(),
-        isAnswered: z.boolean().optional(),
-        isDraft: z.boolean().optional(),
-        hasAttachment: z.boolean().optional(),
-        hasBody: z.boolean().optional(),
-        after: z.string().optional(),
-        before: z.string().optional(),
-        largerThan: z.number().int().nonnegative().optional(),
-        smallerThan: z.number().int().nonnegative().optional(),
-        window: z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"]).optional()
-      })
-      .strict()
-      .optional(),
+    filters: searchFiltersSchema.optional(),
     accounts: z.union([z.array(z.string()), z.literal("all")]).optional(),
     windowStatus: z.array(z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"])).optional(),
     includeDeleted: z.boolean().optional(),

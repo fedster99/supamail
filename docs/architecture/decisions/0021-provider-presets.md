@@ -77,6 +77,11 @@ Add a small static preset table plus a pure domain lookup. No network probing.
   order, since the stored `provider_profile` is the preset id. `CREATE_ACCOUNT_SCHEMA`
   makes host/port optional; the CLI `--host/--port/--profile` become optional too.
 
+  > Now shared (arch #41): this four-level precedence is extracted from `createAccount`
+  > into a pure `resolveImapCoords(input) → {host,port,secure,providerProfile}`
+  > (repository.ts), the twin of `resolveSmtpCreds`, tested by direct call. Behavior
+  > and the thrown "No IMAP host/port" error are unchanged.
+
 This is connectivity config only: no new MCP tool, no write verb, nothing under
 `src/mcp/`. The frozen crypto/envelope (ADR 0002) and the `resolveSmtpCreds`
 resolution-order contract (ADR 0017) are untouched.

@@ -6,7 +6,7 @@ import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
 import { connectImap } from "./imap-connect.js";
-import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
+import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
 import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
 /**
@@ -206,19 +206,14 @@ export function buildSendEnvelope(from: string, req: SendRequest): SmtpEnvelope 
 /**
  * Pick the Sent folder to APPEND into: the `\Sent` special-use mailbox if the
  * server advertises one, else the provider profile's "sent" priority winner, else
- * the conventional `"Sent"`.
+ * the conventional `"Sent"`. One-line delegation to the shared role-keyed resolver
+ * (provider-profiles.ts) — the "sent" role keeps this profile-based fallback.
  */
 export function resolveSentFolder(
   mailboxes: Array<{ path: string; specialUse?: string | null }>,
   profile: ProviderProfile
 ): string {
-  const bySpecialUse = mailboxes.find((m) => (m.specialUse ?? "").toLowerCase() === "\\sent");
-  if (bySpecialUse) return bySpecialUse.path;
-
-  const byPriority = mailboxes.find((m) => profile.priorityForFolder(m.path, m.specialUse) === 5);
-  if (byPriority) return byPriority.path;
-
-  return "Sent";
+  return resolveSpecialUseFolder(mailboxes, "sent", profile);
 }
 
 /**
