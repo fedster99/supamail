@@ -1,21 +1,31 @@
 import type { ParsedQuery, SearchFilter, SearchSort, StructuredFilters } from "./types.js";
 import { SEARCH_SORTS } from "./types.js";
 import type { WindowStatus } from "../types.js";
+import {
+  DATE_FIELDS,
+  FLAG_FIELDS,
+  SIZE_FIELDS,
+  TEXT_FIELDS,
+  TEXT_FIELD_BY_OPERATOR,
+  WINDOW_STRUCTURED_KEY
+} from "./filter-fields.js";
 
-/** Operator fields we recognize. A `field:value` token whose field is NOT here
+/** The non-table operators: multi-value flag operators, validated date/size
+ * operators, and the non-filter output controls. The per-field `field:value`
+ * operators are sourced from {@link TEXT_FIELD_BY_OPERATOR} so adding a text
+ * field auto-registers it. A `field:value` token whose field is in NEITHER set
  * (e.g. a bare URL like `http://x`) is treated as free text, not an operator. */
-const KNOWN_OPERATORS = new Set([
-  "from", "to", "cc", "recipient", "participant", "with",
-  "subject", "subj", "body",
-  "in", "folder", "label",
-  "thread", "msgid", "message-id",
+const SPECIAL_OPERATORS = [
   "is", "has",
-  "filename", "file", "filetype", "attachment-type", "mime",
   "after", "since", "newer_than", "newer",
   "before", "until", "older_than", "older",
   "larger", "bigger", "smaller",
   "account", "window", "lane",
   "sort", "limit"
+];
+const KNOWN_OPERATORS = new Set<string>([
+  ...TEXT_FIELD_BY_OPERATOR.keys(),
+  ...SPECIAL_OPERATORS
 ]);
 
 const WINDOW_VALUES: WindowStatus[] = ["IN_WINDOW", "EXPIRED", "HISTORICAL"];
@@ -63,6 +73,28 @@ function stripQuotes(value: string): string {
  * SQL interval at compile time so this parser stays clock-free and pure). */
 export function isRelativeDate(value: string): boolean {
   return RELATIVE_DATE.test(value);
+}
+
+/** A date filter value is acceptable iff it is a relative spec (`7d`) or an
+ * absolute `YYYY-MM-DD[...]` date. Anything else (e.g. `garbage`) is rejected
+ * here so it never reaches `$n::timestamptz`, where Postgres would 500. */
+function isValidDate(value: string): boolean {
+  return isRelativeDate(value) || ABSOLUTE_DATE.test(value);
+}
+
+/** Push a `date` filter for a structured after/before value, or warn+ignore an
+ * unparseable one — the same guard the `after:`/`before:` q-operators apply. */
+function pushDate(
+  op: "after" | "before",
+  value: string,
+  warnings: string[],
+  push: (filter: SearchFilter) => void
+): void {
+  if (isValidDate(value)) {
+    push({ kind: "date", op, value, negated: false, raw: `${op}:${value}` });
+  } else {
+    warnings.push(`unparseable date "${value}" for ${op}:; ignored`);
+  }
 }
 
 function parseSizeToBytes(value: string): number | null {
@@ -132,41 +164,19 @@ export function parseQuery(input: string): ParsedQuery {
       continue;
     }
 
+    // Table-driven text fields (from:/to:/cc:/subject:/in:/filename:/…). The
+    // field table single-sources the kind, value-normalization, and value-based
+    // routing (the `from:@domain` → fromDomain split), so this one branch
+    // replaces what used to be ~15 hand-written operator cases.
+    const textField = TEXT_FIELD_BY_OPERATOR.get(field);
+    if (textField) {
+      const normalized = textField.normalize(rawValue);
+      const routed = textField.route ? textField.route(normalized) : { kind: textField.kind, value: normalized };
+      filters.push({ kind: routed.kind, value: routed.value, negated, raw } as SearchFilter);
+      continue;
+    }
+
     switch (field) {
-      case "from": {
-        if (rawValue.startsWith("@")) {
-          filters.push({ kind: "fromDomain", value: rawValue.slice(1).toLowerCase(), negated, raw });
-        } else {
-          filters.push({ kind: "from", value: rawValue.toLowerCase(), negated, raw });
-        }
-        break;
-      }
-      case "to":
-      case "cc":
-      case "recipient":
-      case "participant":
-      case "with":
-        filters.push({ kind: "recipient", value: rawValue.toLowerCase(), negated, raw });
-        break;
-      case "subject":
-      case "subj":
-        filters.push({ kind: "subject", value: rawValue, negated, raw });
-        break;
-      case "body":
-        filters.push({ kind: "body", value: rawValue, negated, raw });
-        break;
-      case "in":
-      case "folder":
-      case "label":
-        filters.push({ kind: "folder", value: rawValue, negated, raw });
-        break;
-      case "thread":
-        filters.push({ kind: "thread", value: rawValue, negated, raw });
-        break;
-      case "msgid":
-      case "message-id":
-        filters.push({ kind: "msgid", value: rawValue, negated, raw });
-        break;
       case "is": {
         const mapped = mapIsFlag(rawValue);
         if ("warning" in mapped) warnings.push(mapped.warning);
@@ -186,22 +196,11 @@ export function parseQuery(input: string): ParsedQuery {
         }
         break;
       }
-      case "filename":
-      case "file":
-        filters.push({ kind: "filename", value: rawValue.toLowerCase(), negated, raw });
-        break;
-      case "filetype":
-      case "attachment-type":
-        filters.push({ kind: "filetype", value: rawValue.toLowerCase(), negated, raw });
-        break;
-      case "mime":
-        filters.push({ kind: "mime", value: rawValue.toLowerCase(), negated, raw });
-        break;
       case "after":
       case "since":
       case "newer_than":
       case "newer": {
-        if (isRelativeDate(rawValue) || ABSOLUTE_DATE.test(rawValue)) {
+        if (isValidDate(rawValue)) {
           filters.push({ kind: "date", op: "after", value: rawValue, negated, raw });
         } else {
           warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
@@ -212,7 +211,7 @@ export function parseQuery(input: string): ParsedQuery {
       case "until":
       case "older_than":
       case "older": {
-        if (isRelativeDate(rawValue) || ABSOLUTE_DATE.test(rawValue)) {
+        if (isValidDate(rawValue)) {
           filters.push({ kind: "date", op: "before", value: rawValue, negated, raw });
         } else {
           warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
@@ -272,40 +271,60 @@ export function parseQuery(input: string): ParsedQuery {
 }
 
 /** Map a typed {@link StructuredFilters} object onto the same filter union the
- * string parser emits, so structured request input and `q` share one compiler. */
-export function filtersFromStructured(structured: StructuredFilters): SearchFilter[] {
+ * string parser emits, so structured request input and `q` share one compiler.
+ * `warnings` collects any ignored input (e.g. an unparseable date) the same way
+ * `parseQuery` does, so a bad structured value is dropped — never sent to SQL.
+ *
+ * Driven by the same {@link TEXT_FIELDS}/{@link FLAG_FIELDS}/{@link DATE_FIELDS}/
+ * {@link SIZE_FIELDS} table the operator parser consumes, so the two adapters
+ * cannot drift. Iteration order matches the historical hand-written push sequence,
+ * so the emitted filter array is byte-identical to before. */
+export function filtersFromStructured(structured: StructuredFilters, warnings: string[] = []): SearchFilter[] {
   const out: SearchFilter[] = [];
   const push = (filter: SearchFilter): void => {
     out.push(filter);
   };
-  if (structured.from) {
-    const v = structured.from.toLowerCase();
-    if (v.startsWith("@")) push({ kind: "fromDomain", value: v.slice(1), negated: false, raw: `from:${structured.from}` });
-    else push({ kind: "from", value: v, negated: false, raw: `from:${structured.from}` });
+
+  // Text fields: same truthy guard as before (`if (structured.x)`), so an empty
+  // string is skipped. `raw` echoes the ORIGINAL (un-normalized) input value.
+  for (const field of TEXT_FIELDS) {
+    const key = field.structuredKey;
+    if (key === undefined) continue; // operator-only lane (recipient)
+    const original = structured[key];
+    if (typeof original !== "string" || !original) continue;
+    const normalized = field.normalize(original);
+    const routed = field.route ? field.route(normalized) : { kind: field.kind, value: normalized };
+    const raw = field.structuredRaw ? field.structuredRaw(original) : `${field.rawPrefix}:${original}`;
+    push({ kind: routed.kind, value: routed.value, negated: false, raw } as SearchFilter);
   }
-  if (structured.fromDomain) {
-    push({ kind: "fromDomain", value: structured.fromDomain.toLowerCase().replace(/^@/, ""), negated: false, raw: `from:@${structured.fromDomain}` });
+
+  // State/presence flags. `honorsFalse` fields emit on an explicit `false` (it
+  // inverts, like `hasAttachment:false` = "no attachment"); the rest no-op on a
+  // falsy value. The flag token, `negated` polarity, and `raw` come from the table.
+  for (const field of FLAG_FIELDS) {
+    const value = structured[field.structuredKey];
+    if (value === undefined) continue;
+    if (!field.honorsFalse && !value) continue;
+    push(field.toFilter(value as boolean));
   }
-  if (structured.to) push({ kind: "recipient", value: structured.to.toLowerCase(), negated: false, raw: `to:${structured.to}` });
-  if (structured.subject) push({ kind: "subject", value: structured.subject, negated: false, raw: `subject:${structured.subject}` });
-  if (structured.body) push({ kind: "body", value: structured.body, negated: false, raw: `body:${structured.body}` });
-  if (structured.folder) push({ kind: "folder", value: structured.folder, negated: false, raw: `in:${structured.folder}` });
-  if (structured.thread) push({ kind: "thread", value: structured.thread, negated: false, raw: `thread:${structured.thread}` });
-  if (structured.msgid) push({ kind: "msgid", value: structured.msgid, negated: false, raw: `msgid:${structured.msgid}` });
-  if (structured.filename) push({ kind: "filename", value: structured.filename.toLowerCase(), negated: false, raw: `filename:${structured.filename}` });
-  if (structured.filetype) push({ kind: "filetype", value: structured.filetype.toLowerCase(), negated: false, raw: `filetype:${structured.filetype}` });
-  if (structured.mime) push({ kind: "mime", value: structured.mime.toLowerCase(), negated: false, raw: `mime:${structured.mime}` });
-  if (structured.isUnread) push({ kind: "flag", value: "\\Seen", negated: true, raw: "is:unread" });
-  if (structured.isRead) push({ kind: "flag", value: "\\Seen", negated: false, raw: "is:read" });
-  if (structured.isFlagged) push({ kind: "flag", value: "\\Flagged", negated: false, raw: "is:flagged" });
-  if (structured.isAnswered) push({ kind: "flag", value: "\\Answered", negated: false, raw: "is:answered" });
-  if (structured.isDraft) push({ kind: "flag", value: "\\Draft", negated: false, raw: "is:draft" });
-  if (structured.hasAttachment !== undefined) push({ kind: "hasAttachment", negated: !structured.hasAttachment, raw: "has:attachment" });
-  if (structured.hasBody !== undefined) push({ kind: "hasBody", negated: !structured.hasBody, raw: "has:body" });
-  if (structured.after) push({ kind: "date", op: "after", value: structured.after, negated: false, raw: `after:${structured.after}` });
-  if (structured.before) push({ kind: "date", op: "before", value: structured.before, negated: false, raw: `before:${structured.before}` });
-  if (structured.largerThan !== undefined) push({ kind: "size", op: "larger", value: structured.largerThan, negated: false, raw: `larger:${structured.largerThan}` });
-  if (structured.smallerThan !== undefined) push({ kind: "size", op: "smaller", value: structured.smallerThan, negated: false, raw: `smaller:${structured.smallerThan}` });
-  if (structured.window) push({ kind: "window", value: structured.window, negated: false, raw: `window:${structured.window}` });
+
+  // Date range. Invalid structured dates are ignored with a warning (parity with
+  // the q-operator path) — never passed through to `$n::timestamptz` (Postgres 500).
+  for (const field of DATE_FIELDS) {
+    const value = structured[field.structuredKey];
+    if (value !== undefined) pushDate(field.op, value as string, warnings, push);
+  }
+
+  // Size range (bound byte count, no validation — Zod already constrains it).
+  for (const field of SIZE_FIELDS) {
+    const value = structured[field.structuredKey];
+    if (value !== undefined) {
+      push({ kind: "size", op: field.op, value: value as number, negated: false, raw: `${field.op}:${value}` });
+    }
+  }
+
+  if (structured[WINDOW_STRUCTURED_KEY]) {
+    push({ kind: "window", value: structured.window as WindowStatus, negated: false, raw: `window:${structured.window}` });
+  }
   return out;
 }

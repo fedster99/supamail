@@ -1,8 +1,7 @@
-import { ImapFlow } from "imapflow";
+import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
-import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
-import { assertSafeImapTarget } from "./host-validation.js";
+import { connectImap } from "./imap-connect.js";
 import { extractAttachmentMetadata, normalizeMessageId, parseHeaders, parseRawMime, selectBodyTextPart } from "./mime.js";
 import { ImapThrottle } from "./throttle.js";
 import type { ImapAccount, ImapMessage, MessageBodyInput, MessageMetadata } from "./types.js";
@@ -172,25 +171,10 @@ export async function createImapClient(
   config: AppConfig,
   account: ImapAccount
 ): Promise<MirrorImapClient> {
-  await assertSafeImapTarget(account.host, account.port, account.secure, {
-    allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
-  });
-  const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
-  const rawClient = new ImapFlow({
-    host: account.host,
-    port: account.port,
-    secure: account.secure,
-    auth: {
-      user: account.username,
-      pass: password
-    },
-    logger: false,
-    connectionTimeout: config.CONNECT_TIMEOUT_MS,
-    greetingTimeout: config.CONNECT_TIMEOUT_MS,
-    socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
-  });
-
-  await rawClient.connect();
+  // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
+  // one shared connect prelude (imap-connect.ts); this adapter only adds the
+  // read-only throttled verb surface on top (ADR 0017/0022).
+  const rawClient = await connectImap(pool, config, account);
   return new ThrottledImapClient(
     rawClient,
     config.IMAP_MAX_COMMANDS_PER_MINUTE,

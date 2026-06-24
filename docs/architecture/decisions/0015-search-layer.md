@@ -96,6 +96,53 @@ touch bodies, so a denormalized flag would leak soft-deleted bodies into search.
   Embeddings are populated by an out-of-core job (not in this repo). This keeps the
   "no AI in core" boundary intact while leaving a clean hook.
 
+### Structured filters (email-005)
+
+Nylas-parity structured query filters (`messages?subject=&unread=&received_after=…`)
+are **not a new engine** — they are additional optional predicates over the same
+`searchMessages(db, request)` core, so the differentiator stays the composition: a
+structured filter **narrows** the existing semantic + fuzzy free-text query over the
+**full** mirror history (no Nylas 90-day window), it never replaces it.
+
+- **One filter union, one compiler.** Every filter — whether it arrives as a `q`
+  operator (`from:` `cc:` `is:unread` `after:7d` `in:`) or as a typed `filters`
+  object field (`from`, `cc`, `bcc`, `anyEmail`, `isUnread`, `isStarred`, `after`,
+  `folder`, …) — converges on the same `SearchFilter` tagged union and is turned into
+  a **bound** `$n` predicate by the one compiler. No surface builds SQL of its own.
+  > Filter fields single-sourced (arch): the per-field rules (kind, value
+  > normalization, operator aliases, structured key) live in one declarative table
+  > (`search/filter-fields.ts`); `parseQuery` and `filtersFromStructured` both consume
+  > it and the schema parity test asserts the table ⟷ Zod ⟷ JSON-Schema key sets agree.
+- **email-005 added** the precise recipient lanes the union was missing: `to` (To
+  only), `cc` (Cc only), `bcc` (Bcc only — populated only on sent mail), and
+  `anyEmail` (from + to + cc + bcc, the Nylas `any_email`). The pre-existing broad
+  `recipient` lane (To+Cc, reached via `recipient:`/`participant:`/`with:`) is kept
+  for back-compat; `to:`/`cc:` now resolve to their own scoped lanes. `isStarred`
+  is an alias of the `\Flagged` flag. State (`unread`/`starred`/`has_attachment`),
+  date-range (`received_after`/`received_before`), folder scoping, pagination, and
+  ordering already existed and are simply exposed ergonomically.
+- **Three front doors, no logic fork** (the cross-cutting "one core, four doors"
+  rule). The `search_email` MCP tool gains the new fields as **optional input-schema
+  params only** — the tool count and the five tool NAMES are unchanged, so the
+  zero-send guard (`agent-surface-zero-send.test.ts`) and the read-only adapter guard
+  stay green. The CLI `search` command gains `--cc/--bcc/--any-email/--unread/
+  --starred/--since` (still `--json`). A new **read-only** `GET /search` HTTP route
+  (API_TOKEN) maps `?from=&to=&cc=&bcc=&any_email=&unread=&starred=&has_attachment=&
+  received_after=&received_before=&folder=&thread=&account=&sort=&limit=&offset=`
+  onto the same `searchMessages` call. All three are pure reads; none touches
+  `src/mcp/` write boundaries, IMAP, or any mutation path.
+
+  > Now guarded (arch #40): the Zod `searchFiltersSchema` and the hand-written
+  > `inputSchema.filters.properties` JSON-Schema were kept in sync only by a comment.
+  > A `search-schema-parity.test.ts` now asserts the two advertise the SAME field set,
+  > so a field added to one but not the other fails the test instead of silently
+  > drifting the agent contract. The advertised JSON-Schema is unchanged (its per-field
+  > descriptions are editorial), so this is a parity guard, not a derivation.
+- **Injection safety is structural, not reviewed.** Recipient/folder/date values keep
+  going through the same `Params` binder and `escapeLike()`; a value carrying `'`,
+  `%`, `_`, or `;` is escaped and bound, never interpolated. A unit test asserts a
+  `drop table … ;--`-shaped value never appears in the compiled SQL text.
+
 ## Consequences
 
 - `storeBody` and the soft-delete paths need **zero** code change — a direct result of
@@ -119,11 +166,35 @@ touch bodies, so a denormalized flag would leak soft-deleted bodies into search.
   flagship ranked query returns the expected order.
 - Parser/compiler unit tests prove operator → predicate mapping is deterministic and
   fully parameterized (no string interpolation of user input).
+- email-005: `search-parse.test.ts` proves each new structured filter narrows over its
+  own column (`to`/`cc`/`bcc` scoped, `anyEmail` across from+to+cc+bcc), composes with
+  a semantic free-text query, paginates, and binds an injection-shaped value rather
+  than inlining it. `api-safety.test.ts` proves `GET /search` is API_TOKEN-gated,
+  composes `q` + filters, accepts filters-only, and 400s on an empty/invalid request.
+  The two invariant guards (`agent-surface-zero-send.test.ts`,
+  `sync-adapter-read-only.test.ts`) stay green — no sixth tool, no write path.
+
+## Review follow-up (recipient-lane indexes + offset cap)
+
+A whole-stack review found that email-005 added the `to:`/`cc:`/`bcc:`/`anyEmail:`
+lanes (`compile.ts`) but `0008_search_layer.sql` only indexed the COMBINED `to||cc`
+"recipient" lane. In the no-free-text path there is no 400-row candidate cap, so a
+filter-only `bcc:x` / `anyemail:foo` degraded to a full account scan bounded only by
+the 15s `statement_timeout` — slow / 500 on a large mailbox.
+
+- `0010_search_recipient_indexes.sql` adds four `gin_trgm_ops` expression indexes whose
+  expressions MATCH the `to`/`cc`/`bcc`/`anyEmail` predicates in `filterPredicate`
+  EXACTLY (`lower(f_array_to_text(coalesce(<col>,'{}')))`, and the from+to+cc+bcc blob
+  for `anyEmail`), each partial on `deleted_in_provider = false` like the 0008
+  recipients index. A lane filter is now index-served, not a scan.
+- The search `offset` is capped (`SEARCH_QUERY_SCHEMA`, `api.ts`) at 5000: a deep
+  OFFSET in the no-candidate-cap structured path scans/scores/discards every prior row.
+  Beyond the cap, narrow with filters; keyset pagination remains the longer-term fix.
 
 ## References
 
 - ADR 0014: Agent email access is a core read surface, hosted in cloud.
 - ADR 0001: SupaMail core is email sync only (escape hatch invoked by ADR 0014).
 - GitHub issues #4 (MCP server) and #7 (agent-first email CLI).
-- `apps/api/supabase/migrations/public/0007_search_layer.sql`
+- `apps/api/supabase/migrations/public/0008_search_layer.sql`
 - `apps/api/src/search/`

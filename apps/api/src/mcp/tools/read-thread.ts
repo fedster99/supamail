@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import type { SyncTrust } from "../../search/index.js";
 import { buildSyncTrust } from "../../search/index.js";
+import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
 import type { MessageAttachment, MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
 import { ATTACHMENTS_AGG, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
 
@@ -48,15 +49,9 @@ const THREAD_SELECT = `
 
 type ThreadRow = MessageDetailRow;
 
-interface SeedRow {
-  id: string;
-  provider_thread_id: string | null;
-  rfc_message_id: string | null;
-  message_id_normalized: string | null;
-  in_reply_to: string | null;
-  references_header: string | null;
-  account_id: string;
-}
+/** The seed message's threading fields. Aliased to the shared {@link ThreadSeedRow}
+ * (CC-3) so read and write resolve the same seed shape. */
+type SeedRow = ThreadSeedRow;
 
 export interface ReadThreadArgs {
   message_id?: string;
@@ -148,28 +143,6 @@ export const readThreadDefinition: ToolDefinition = {
   }
 };
 
-/** Normalize one raw Message-Id-ish token: lowercase, strip surrounding angle
- * brackets and whitespace. Mirrors the SQL `lower(trim(both '<>' from ...))`. */
-function normalizeIdToken(token: string): string {
-  return token.trim().replace(/^<+/, "").replace(/>+$/, "").trim().toLowerCase();
-}
-
-/** Build the distinct id-token key set from a seed row's reference headers
- * (references_header + in_reply_to + rfc_message_id), per I3. */
-function seedKeys(seed: SeedRow): string[] {
-  const raw: string[] = [];
-  if (seed.references_header) raw.push(...seed.references_header.split(/\s+/));
-  if (seed.in_reply_to) raw.push(...seed.in_reply_to.split(/\s+/));
-  if (seed.rfc_message_id) raw.push(seed.rfc_message_id);
-  if (seed.message_id_normalized) raw.push(seed.message_id_normalized);
-  const keys = new Set<string>();
-  for (const token of raw) {
-    const normalized = normalizeIdToken(token);
-    if (normalized) keys.add(normalized);
-  }
-  return [...keys];
-}
-
 /** Distinct, order-preserving non-null participant addresses (from ∪ to ∪ cc). */
 function collectParticipants(rows: ThreadRow[]): string[] {
   const seen = new Set<string>();
@@ -208,21 +181,17 @@ async function fetchThreadRows(
   }
 
   const seed = selector.seed;
-  const keys = seedKeys(seed);
+  // Shared one-hop membership walk (CC-3, thread-walk.ts): the normalized key set,
+  // the WHERE predicate, and the oldest-first ORDER are single-sourced so this read
+  // surface and the write fan-out (resolveThreadTargets) can never diverge on "what
+  // is in a thread." This SELECT keeps its OWN columns + body JOIN (alias `m`).
+  const keys = threadSeedKeys(seed);
   const result = await client.query<ThreadRow>(
     `
     SELECT ${THREAD_SELECT}
     FROM public.imap_messages m
     LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-    WHERE m.account_id = $1
-      AND m.deleted_in_provider = false
-      AND (
-        ($2::text IS NOT NULL AND m.provider_thread_id = $2)
-        OR m.id = $3
-        OR m.message_id_normalized = ANY($4::text[])
-        OR lower(trim(both '<>' from m.in_reply_to)) = ANY($4::text[])
-      )
-    ORDER BY m.internal_date ASC, m.id ASC
+    WHERE ${threadMembershipClause("m")}
     `,
     [seed.account_id, seed.provider_thread_id, seed.id, keys]
   );

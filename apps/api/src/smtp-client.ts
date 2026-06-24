@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { ImapFlow } from "imapflow";
+import type { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
-import { assertSafeImapTarget } from "./host-validation.js";
-import { getProviderProfile, type ProviderProfile } from "./provider-profiles.js";
-import type { ImapAccount, SendRecipient, SendRequest } from "./types.js";
+import { connectImap } from "./imap-connect.js";
+import { getProviderProfile } from "./provider-profiles.js";
+import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
 /**
  * SMTP compose + transport + a write-only Sent-folder APPEND client (email-001,
@@ -71,6 +71,36 @@ function toAddress(recipient: SendRecipient): { name?: string; address: string }
   return recipient.name ? { name: recipient.name, address: recipient.email } : { address: recipient.email };
 }
 
+/** One MailComposer attachment entry. `content` carries the decoded bytes; an
+ * inline part (cid set or inline:true) gets `contentDisposition: "inline"` so it
+ * renders in-body instead of listing as a separate download. */
+interface ComposerAttachment {
+  filename: string;
+  content: Buffer;
+  contentType?: string;
+  cid?: string;
+  contentDisposition?: "inline" | "attachment";
+}
+
+/**
+ * Map a {@link SendAttachment} (base64 transport) to a MailComposer attachment.
+ * The base64 is decoded here (Buffer.from(..., "base64") is total — invalid input
+ * yields a shorter/empty buffer rather than throwing), so the composed MIME carries
+ * the real bytes. A `cid` (or `inline: true`) marks the part inline for `cid:` HTML
+ * references; otherwise it is a regular attachment.
+ */
+function toComposerAttachment(attachment: SendAttachment): ComposerAttachment {
+  const inline = attachment.inline === true || (attachment.cid !== undefined && attachment.cid !== "");
+  const entry: ComposerAttachment = {
+    filename: attachment.filename,
+    content: Buffer.from(attachment.content, "base64"),
+    contentDisposition: inline ? "inline" : "attachment"
+  };
+  if (attachment.contentType) entry.contentType = attachment.contentType;
+  if (attachment.cid) entry.cid = attachment.cid;
+  return entry;
+}
+
 function domainOf(email: string): string {
   const at = email.lastIndexOf("@");
   return at >= 0 ? email.slice(at + 1) : "localhost";
@@ -79,6 +109,54 @@ function domainOf(email: string): string {
 export interface BuiltMime {
   raw: Buffer;
   messageId: string;
+}
+
+/**
+ * Custom headers the caller may NOT stamp through `req.headers`. These are the
+ * structural / identity / routing headers that define WHO the message is from/to
+ * and HOW it is structured — letting a caller set them would let a `POST .../send`
+ * forge a `From:`/`Reply-To`, smuggle a raw `Bcc:` into the SAME bytes that are
+ * both delivered AND filed to Sent (defeating the "Bcc never enters the bytes"
+ * guarantee), or override the multipart Content-Type. Recipients/threading go
+ * through the structured SendRequest fields, never raw headers. Everything else is
+ * restricted to the `X-*` custom-header namespace. Drafts reuse buildRawMime, so
+ * this protects createDraft/updateDraft too. (See the review header trust-boundary
+ * finding.)
+ */
+const FORBIDDEN_CUSTOM_HEADERS = new Set([
+  "from",
+  "to",
+  "cc",
+  "bcc",
+  "sender",
+  "reply-to",
+  "return-path",
+  "received",
+  "content-type",
+  "content-transfer-encoding",
+  "mime-version"
+]);
+
+/**
+ * Reject a forged/structural custom header before it reaches MailComposer. Allows
+ * the threading convenience headers (In-Reply-To/References/Message-ID, which the
+ * structured fields also feed) and any `X-*` token; everything else must be either
+ * absent or an X- custom. Throws a clear error naming the offending header.
+ */
+function assertSafeCustomHeaders(headers: Record<string, string>): void {
+  const ALLOWED_NON_X = new Set(["in-reply-to", "references", "message-id"]);
+  for (const name of Object.keys(headers)) {
+    const lower = name.toLowerCase();
+    if (FORBIDDEN_CUSTOM_HEADERS.has(lower)) {
+      throw new Error(
+        `Header "${name}" cannot be set via custom headers — set it through the structured send fields instead`
+      );
+    }
+    if (lower.startsWith("x-") || ALLOWED_NON_X.has(lower)) continue;
+    throw new Error(
+      `Custom header "${name}" is not allowed — only X-* custom headers (and In-Reply-To/References/Message-ID) may be set`
+    );
+  }
 }
 
 /**
@@ -91,7 +169,8 @@ export interface BuiltMime {
  * `raw` is what we BOTH submit and APPEND, so the delivered and filed bytes are
  * byte-identical (threading/dedup coherence). Bcc is intentionally NOT emitted
  * into the bytes (nodemailer's keepBcc default) — Bcc recipients ride the SMTP
- * envelope only.
+ * envelope only. Attachments + inline `cid` images (email-004) are passed straight
+ * through to MailComposer, which builds the multipart MIME deterministically.
  */
 export async function buildRawMime(req: SendRequest, from: SendRecipient): Promise<BuiltMime> {
   const messageId = req.messageId ?? `<${randomUUID()}@${domainOf(from.email)}>`;
@@ -99,6 +178,9 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
   // Merge convenience threading fields into custom headers without letting an
   // explicit custom header silently win over the structured field.
   const headers: Record<string, string> = { ...(req.headers ?? {}) };
+  // Reject forged/structural headers (Bcc/From/Content-Type/…) before they reach
+  // the bytes that are both delivered AND filed to Sent.
+  assertSafeCustomHeaders(headers);
 
   const composer = new MailComposer({
     from: toAddress(from),
@@ -111,6 +193,7 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
     messageId,
     inReplyTo: req.inReplyTo ?? headers["In-Reply-To"] ?? headers["in-reply-to"],
     references: req.references ?? headers.References ?? headers.references,
+    attachments: req.attachments?.map(toComposerAttachment),
     headers
   });
 
@@ -131,22 +214,32 @@ export interface SmtpEnvelope {
 /**
  * Submit the EXACT composed `raw` bytes over SMTP. Using `raw:` ships byte-for-byte
  * what we also APPEND to Sent. `secure=true` is implicit TLS (465); otherwise we
- * require STARTTLS (`requireTLS`) — UNLESS IMAP_ALLOW_PRIVATE_HOSTS is set, the
- * same dev/self-hosted opt-in that allows plaintext IMAP (so local GreenMail-style
- * SMTP works). `verify()` is skipped (one fewer round-trip; failures surface on
- * send). The envelope carries every recipient incl. Bcc.
+ * require STARTTLS (`requireTLS`). STARTTLS enforcement is decoupled from the
+ * IMAP_ALLOW_PRIVATE_HOSTS opt-in (review decision 3): a non-implicit-TLS host that
+ * resolved PUBLIC ALWAYS gets requireTLS, even when the private-hosts opt-in is set
+ * — so a self-hoster who enables the flag AND sends through a real public :587
+ * provider can never silently fall back to cleartext (MITM strip). We relax
+ * requireTLS only when the target actually resolved private/loopback (`opts
+ * .isPrivateHost`), the local GreenMail-style case. `verify()` is skipped (one
+ * fewer round-trip; failures surface on send). The envelope carries every
+ * recipient incl. Bcc.
  */
 export async function deliverSmtp(
   creds: ResolvedSmtpCreds,
   raw: Buffer,
   envelope: SmtpEnvelope,
-  config: AppConfig
+  config: AppConfig,
+  opts: { isPrivateHost?: boolean } = {}
 ): Promise<void> {
+  // Require STARTTLS for any non-implicit-TLS target, UNLESS the resolved host is
+  // actually private/loopback (dev/self-hosted GreenMail). The IMAP_ALLOW_PRIVATE_
+  // HOSTS opt-in alone no longer drops TLS for a public host.
+  const requireTLS = !creds.secure && !opts.isPrivateHost;
   const transporter = nodemailer.createTransport({
     host: creds.host,
     port: creds.port,
     secure: creds.secure,
-    requireTLS: !creds.secure && !config.IMAP_ALLOW_PRIVATE_HOSTS,
+    requireTLS,
     auth: { user: creds.username, pass: creds.password },
     connectionTimeout: config.CONNECT_TIMEOUT_MS,
     greetingTimeout: config.CONNECT_TIMEOUT_MS,
@@ -172,28 +265,11 @@ export function buildSendEnvelope(from: string, req: SendRequest): SmtpEnvelope 
 }
 
 /**
- * Pick the Sent folder to APPEND into: the `\Sent` special-use mailbox if the
- * server advertises one, else the provider profile's "sent" priority winner, else
- * the conventional `"Sent"`.
- */
-export function resolveSentFolder(
-  mailboxes: Array<{ path: string; specialUse?: string | null }>,
-  profile: ProviderProfile
-): string {
-  const bySpecialUse = mailboxes.find((m) => (m.specialUse ?? "").toLowerCase() === "\\sent");
-  if (bySpecialUse) return bySpecialUse.path;
-
-  const byPriority = mailboxes.find((m) => profile.priorityForFolder(m.path, m.specialUse) === 5);
-  if (byPriority) return byPriority.path;
-
-  return "Sent";
-}
-
-/**
- * Write-only, single-verb IMAP client for filing the sent copy. It reuses the
- * exact connect + decrypt + assertSafeImapTarget pattern from imap-client.ts but
- * exposes ONLY `append()` (and `list()` so the caller can resolve the Sent
- * folder). The sync path can never write; the send path can never read-sync.
+ * Write-only, single-verb IMAP client for filing the sent copy. Its socket comes
+ * from the one shared {@link connectImap} prelude (decrypt + assertSafeImapTarget +
+ * the close-on-connect-error guard, imap-connect.ts); it exposes ONLY `append()`
+ * (and `list()` so the caller can resolve the Sent folder). The sync path can never
+ * write; the send path can never read-sync.
  */
 export class SentFolderAppender {
   private constructor(private readonly client: ImapFlow) {}
@@ -203,21 +279,10 @@ export class SentFolderAppender {
     config: AppConfig,
     account: ImapAccount
   ): Promise<SentFolderAppender> {
-    await assertSafeImapTarget(account.host, account.port, account.secure, {
-      allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
-    });
-    const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
-    const client = new ImapFlow({
-      host: account.host,
-      port: account.port,
-      secure: account.secure,
-      auth: { user: account.username, pass: password },
-      logger: false,
-      connectionTimeout: config.CONNECT_TIMEOUT_MS,
-      greetingTimeout: config.CONNECT_TIMEOUT_MS,
-      socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
-    });
-    await client.connect();
+    // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
+    // one shared connect prelude (imap-connect.ts); this client only adds the
+    // append-only verb surface on top (ADR 0017/0022).
+    const client = await connectImap(pool, config, account);
     return new SentFolderAppender(client);
   }
 

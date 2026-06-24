@@ -130,7 +130,22 @@ export async function assertSafeImapTarget(
 }
 
 // Shared SSRF host check: literal-IP and DNS-resolution rejection of
-// private/reserved ranges. Used by both the IMAP and SMTP guards.
+// private/reserved ranges. Used by both the IMAP and SMTP guards. Throws if ANY
+// resolved address is private/reserved (the SSRF rejection); returning normally
+// therefore means every address resolved public — so a host that reaches here is
+// never private (the SMTP TLS gate relies on that).
+//
+// !!! SSRF GUARD IS CHECK-TIME, NOT CONNECT-TIME (DNS-rebinding TOCTOU) !!!
+// This resolves the host and rejects private/reserved IPs, but it does NOT pin
+// the resolved IP — connectImap/deliverSmtp re-resolve at socket time, so a
+// low-TTL DNS record can return public-at-check and private-at-connect (e.g.
+// 169.254.169.254 / a cloud metadata endpoint). In the single-tenant OSS host
+// the SMTP/IMAP target is operator-controlled, so this is acceptable. The CLOUD
+// MULTI-TENANT LAYER, where a tenant supplies the host, MUST close this window:
+// resolve once here, then connect to the LITERAL resolved IP with
+// `tls.servername = host` for SNI/cert validation (so check and connect see the
+// same address). Do NOT rely on this check alone for untrusted hosts. See ADR
+// 0022 (shared connect prelude) and ADR 0017 (send primitive).
 async function assertHostResolvesPublicly(host: string, label: string): Promise<void> {
   let resolved: Array<{ address: string }>;
   try {
@@ -154,16 +169,25 @@ async function assertHostResolvesPublicly(host: string, label: string): Promise<
   }
 }
 
+/** The result of the SMTP target check. `isPrivateHost` is true only when the
+ * resolved target is actually private/loopback — it gates whether deliverSmtp may
+ * relax STARTTLS enforcement (decision 3): a PUBLIC host always keeps requireTLS,
+ * even under IMAP_ALLOW_PRIVATE_HOSTS. */
+export interface SmtpTargetCheck {
+  isPrivateHost: boolean;
+}
+
 // SSRF guard for the send path, mirroring assertSafeImapTarget. SMTP differs in
 // two ways: the allowed ports are the submission/relay ports (25/465/587), and
 // `secure=false` here means STARTTLS (a TLS upgrade), not plaintext — so it is
-// NOT gated behind allowPrivateHosts the way plaintext IMAP is.
+// NOT gated behind allowPrivateHosts the way plaintext IMAP is. Returns whether
+// the resolved target is private so the caller can decide STARTTLS enforcement.
 export async function assertSafeSmtpTarget(
   host: string,
   port: number,
   _secure: boolean,
   options: HostValidationOptions
-): Promise<void> {
+): Promise<SmtpTargetCheck> {
   if (typeof host !== "string" || host.length === 0 || host.length > 255) {
     throw new HostValidationError("invalid_host", "SMTP host must be a non-empty string under 255 chars");
   }
@@ -179,18 +203,29 @@ export async function assertSafeSmtpTarget(
     if (!options.allowPrivateHosts) {
       throw new HostValidationError("private_host_denied", "localhost is not an allowed SMTP host");
     }
-    return;
+    return { isPrivateHost: true };
   }
 
   const literalFamily = isIP(host);
   if (literalFamily !== 0) {
-    if (isPrivateOrReservedIp(host) && !options.allowPrivateHosts) {
+    const isPrivate = isPrivateOrReservedIp(host);
+    if (isPrivate && !options.allowPrivateHosts) {
       throw new HostValidationError("private_host_denied", `Refusing to connect to private/reserved IP ${host}`);
     }
-    return;
+    return { isPrivateHost: isPrivate };
   }
 
-  if (options.allowPrivateHosts) return;
+  // allowPrivateHosts (dev/self-hosted), hostname (not localhost / literal IP):
+  // skip DNS entirely (dry-run fake hostnames stay cheap). We CANNOT cheaply
+  // prove the host is private, so the TLS gate takes the safe default —
+  // isPrivateHost = false keeps requireTLS ON even under the opt-in (decision 3).
+  // Only localhost and literal private IPs (handled above) relax STARTTLS.
+  if (options.allowPrivateHosts) {
+    return { isPrivateHost: false };
+  }
 
+  // Production path: reject private resolutions. Returning normally means the host
+  // resolved public, so it is not private and requireTLS stays on.
   await assertHostResolvesPublicly(host, "SMTP");
+  return { isPrivateHost: false };
 }

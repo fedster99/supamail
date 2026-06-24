@@ -96,6 +96,114 @@ describe("filtersFromStructured", () => {
     expect(findFilter(filters, "flag")).toMatchObject({ value: "\\Seen", negated: true });
     expect(findFilter(filters, "hasAttachment")?.negated).toBe(false);
   });
+
+  it("an empty structured object yields no filters (absent filters = no-op)", () => {
+    expect(filtersFromStructured({})).toEqual([]);
+  });
+});
+
+// email-005: structured field/state/date/folder filter parity over the mirror.
+describe("email-005 structured filters", () => {
+  it("routes to/cc/bcc/anyEmail to their own scoped filter kinds (lowercased)", () => {
+    const parsed = parseQuery("to:To@X.com cc:Cc@X.com bcc:Bcc@X.com anyemail:Any@X.com");
+    expect(findFilter(parsed.filters, "to")?.value).toBe("to@x.com");
+    expect(findFilter(parsed.filters, "cc")?.value).toBe("cc@x.com");
+    expect(findFilter(parsed.filters, "bcc")?.value).toBe("bcc@x.com");
+    expect(findFilter(parsed.filters, "anyEmail")?.value).toBe("any@x.com");
+  });
+
+  it("keeps recipient:/participant:/with: as the broad (to+cc) filter", () => {
+    expect(findFilter(parseQuery("recipient:x@y.com").filters, "recipient")?.value).toBe("x@y.com");
+    expect(findFilter(parseQuery("with:x@y.com").filters, "recipient")?.value).toBe("x@y.com");
+  });
+
+  it("maps the structured to/cc/bcc/anyEmail object fields to the scoped kinds", () => {
+    const filters = filtersFromStructured({ to: "a@x.com", cc: "b@x.com", bcc: "c@x.com", anyEmail: "d@x.com" });
+    expect(findFilter(filters, "to")?.value).toBe("a@x.com");
+    expect(findFilter(filters, "cc")?.value).toBe("b@x.com");
+    expect(findFilter(filters, "bcc")?.value).toBe("c@x.com");
+    expect(findFilter(filters, "anyEmail")?.value).toBe("d@x.com");
+  });
+
+  it("treats isStarred as the Flagged flag (Nylas/Gmail star)", () => {
+    const filters = filtersFromStructured({ isStarred: true });
+    expect(findFilter(filters, "flag")).toMatchObject({ value: "\\Flagged", negated: false });
+    expect(findFilter(parseQuery("is:starred").filters, "flag")).toMatchObject({ value: "\\Flagged", negated: false });
+  });
+
+  it("composes a semantic free-text query with the structured filters (narrows, never replaces)", () => {
+    const parsed = parseQuery("invoice unread from:acme to:me@x.com");
+    // Free text survives for websearch_to_tsquery; the operators become filters.
+    expect(parsed.freeText).toContain("invoice");
+    expect(parsed.freeText).toContain("unread");
+    expect(findFilter(parsed.filters, "from")?.value).toBe("acme");
+    expect(findFilter(parsed.filters, "to")?.value).toBe("me@x.com");
+  });
+
+  it("compiles to/cc/bcc against their own array column and anyEmail across all of them", () => {
+    const toC = compileSearch("", filtersFromStructured({ to: "a@x.com" }), baseCompileOptions);
+    expect(toC.text).toContain("m.to_emails");
+    expect(toC.text).not.toContain("m.cc_emails");
+    expect(toC.values).toContain("%a@x.com%");
+
+    const ccC = compileSearch("", filtersFromStructured({ cc: "b@x.com" }), baseCompileOptions);
+    expect(ccC.text).toContain("m.cc_emails");
+
+    const bccC = compileSearch("", filtersFromStructured({ bcc: "c@x.com" }), baseCompileOptions);
+    expect(bccC.text).toContain("m.bcc_emails");
+
+    const anyC = compileSearch("", filtersFromStructured({ anyEmail: "d@x.com" }), baseCompileOptions);
+    expect(anyC.text).toContain("m.from_email");
+    expect(anyC.text).toContain("m.to_emails");
+    expect(anyC.text).toContain("m.cc_emails");
+    expect(anyC.text).toContain("m.bcc_emails");
+  });
+
+  it("binds an injection-shaped recipient value as a parameter, never inlining it", () => {
+    const evil = `x%_'; drop table imap_messages;--`;
+    const compiled = compileSearch("", filtersFromStructured({ cc: evil, anyEmail: evil }), baseCompileOptions);
+    // The dangerous text never appears in the SQL string...
+    expect(compiled.text).not.toContain("drop table");
+    expect(compiled.text).not.toContain(evil);
+    // ...and the % / _ LIKE metacharacters in the value are escaped, then bound.
+    expect(compiled.values.some((v) => typeof v === "string" && v.includes("\\%") && v.includes("\\_"))).toBe(true);
+  });
+
+  it("ignores an invalid structured date (warn, no filter) but keeps relative + absolute ones", () => {
+    // An unparseable `after` must NOT reach the compiler (where `$n::timestamptz`
+    // would make Postgres 500); it is dropped with a warning, exactly like after:.
+    const warnings: string[] = [];
+    const filters = filtersFromStructured({ after: "garbage" }, warnings);
+    expect(findFilter(filters, "date")).toBeUndefined();
+    expect(warnings.join(" ")).toContain("unparseable date");
+
+    // A relative spec (7d) and an absolute date still parse to a date filter.
+    expect(findFilter(filtersFromStructured({ after: "7d" }), "date")).toMatchObject({ op: "after", value: "7d" });
+    expect(findFilter(filtersFromStructured({ before: "2026-01-01" }), "date")).toMatchObject({ op: "before", value: "2026-01-01" });
+  });
+
+  it("honors unread=false (read) and starred=false (not starred) instead of silently dropping them", () => {
+    // false is not a no-op: it inverts, the way hasAttachment:false means "no attachment".
+    expect(findFilter(filtersFromStructured({ isUnread: false }), "flag")).toMatchObject({ value: "\\Seen", negated: false });
+    expect(findFilter(filtersFromStructured({ isUnread: true }), "flag")).toMatchObject({ value: "\\Seen", negated: true });
+    expect(findFilter(filtersFromStructured({ isStarred: false }), "flag")).toMatchObject({ value: "\\Flagged", negated: true });
+    expect(findFilter(filtersFromStructured({ isStarred: true }), "flag")).toMatchObject({ value: "\\Flagged", negated: false });
+  });
+
+  it("narrows by received_after/received_before (date range) and folder scope, paginated", () => {
+    const compiled = compileSearch(
+      "",
+      filtersFromStructured({ after: "2026-01-01", before: "2026-02-01", folder: "INBOX" }),
+      { ...baseCompileOptions, limit: 10, offset: 20 }
+    );
+    expect(compiled.text).toContain("m.internal_date >=");
+    expect(compiled.text).toContain("m.internal_date <");
+    expect(compiled.text).toContain("lower(m.folder_path) =");
+    // Pagination: LIMIT n+1 (has_more probe) and the bound offset are present.
+    expect(compiled.values).toContain(11);
+    expect(compiled.values).toContain(20);
+    expect(compiled.values).toContain("inbox");
+  });
 });
 
 describe("compileSearch", () => {

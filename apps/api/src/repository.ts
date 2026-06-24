@@ -2,7 +2,7 @@ import type { AppConfig } from "./config.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
-import { getProviderProfile } from "./provider-profiles.js";
+import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -50,6 +50,58 @@ export function sanitizeErrorReason(error: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, ERROR_REASON_MAX_LEN);
+}
+
+/** Resolved IMAP connection coordinates + the chosen provider profile id for a new
+ * account (the twin of {@link import("./smtp-client.js").ResolvedSmtpCreds}). */
+export interface ResolvedImapCoords {
+  host: string;
+  port: number;
+  secure: boolean;
+  /** The provider_profile id to store (drives the SMTP path's smtpDefaults). */
+  providerProfile: string;
+}
+
+/**
+ * Resolve the IMAP coordinates for a new account (email-008, ADR 0021), the twin of
+ * `resolveSmtpCreds`. Precedence (highest first):
+ *   (1) explicit host/port/secure (always wins, applied via `??`),
+ *   (2) an explicitly-named non-generic preset's `imapDefaults`
+ *       (`--profile fastmail` supplies the fastmail coordinates),
+ *   (3) email-domain autodiscovery (the domain guess),
+ *   (4) clear error.
+ * An explicit `--profile` thus BEATS the domain guess; an explicit host beats both.
+ * The chosen preset id is returned in `providerProfile` so the SMTP path's
+ * `resolveSmtpCreds` (ADR 0017) picks up the matching smtpDefaults. Pure: no DB, no
+ * network (autodiscovery is a static map lookup) — tested by direct call.
+ */
+export function resolveImapCoords(input: {
+  emailAddress: string;
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  providerProfile?: string;
+}): ResolvedImapCoords {
+  const namedProfile =
+    input.providerProfile !== undefined ? getProviderProfile(input.providerProfile) : null;
+  const namedPreset = namedProfile?.imapDefaults ? namedProfile : null;
+  const discovered =
+    input.host === undefined && namedPreset === null
+      ? autodiscoverProfile(input.emailAddress)
+      : null;
+  const presetDefaults = namedPreset?.imapDefaults ?? discovered?.imapDefaults;
+  const host = input.host ?? presetDefaults?.host;
+  const port = input.port ?? presetDefaults?.port;
+  const providerProfile = input.providerProfile ?? discovered?.id ?? "generic-imap";
+
+  if (host === undefined || port === undefined) {
+    throw new Error(
+      `No IMAP host/port for ${input.emailAddress}. No provider preset matched the email domain; pass host and port explicitly.`
+    );
+  }
+
+  const secure = input.secure ?? presetDefaults?.secure ?? true;
+  return { host, port, secure, providerProfile };
 }
 
 export class FolderTrackingRejectedError extends Error {
@@ -141,8 +193,12 @@ export class MirrorRepository {
   ) {}
 
   async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
-    const secure = input.secure ?? true;
-    await assertSafeImapTarget(input.host, input.port, secure, {
+    // IMAP coordinate resolution (email-008) — the explicit > named-preset >
+    // domain-autodiscovery > error precedence now lives in one place, the twin of
+    // resolveSmtpCreds (ADR 0017/0021). The chosen preset id is stored in
+    // provider_profile so the SMTP path picks up the matching smtpDefaults.
+    const { host, port, secure, providerProfile } = resolveImapCoords(input);
+    await assertSafeImapTarget(host, port, secure, {
       allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
     });
     const accountCount = await this.pool.query<{ count: string }>(
@@ -179,9 +235,9 @@ export class MirrorRepository {
       `,
       [
         input.emailAddress,
-        input.providerProfile ?? "generic-imap",
-        input.host,
-        input.port,
+        providerProfile,
+        host,
+        port,
         secure,
         input.username,
         encrypted,
@@ -1591,6 +1647,69 @@ export class MirrorRepository {
   async getMessage(id: string): Promise<ImapMessage | null> {
     const result = await this.pool.query<ImapMessage>("SELECT * FROM public.imap_messages WHERE id = $1", [id]);
     return result.rows[0] ?? null;
+  }
+
+  /**
+   * Write a flag change through to a KNOWN message row (organize mutations,
+   * email-002/ADR 0018). After a successful IMAP STORE we update the mirrored
+   * `flags` array so mark-read/star reflect immediately — the flag-scan sync only
+   * re-reads flags within FLAG_DIFF_WINDOW_DAYS, so older mail would otherwise
+   * never reconcile. This is a deterministic update of a known row to a known
+   * value, account-scoped and parameterized; it does NOT fabricate identity.
+   *
+   * `add`/`remove` are raw IMAP flag tokens (e.g. "\\Seen"). Matching is
+   * case-insensitive so we never duplicate an existing flag. Returns the new flag
+   * array, or null if the row was not found for that account.
+   */
+  async applyMessageFlags(
+    messageId: string,
+    accountId: string,
+    change: { add?: string[]; remove?: string[] }
+  ): Promise<string[] | null> {
+    const add = change.add ?? [];
+    const remove = change.remove ?? [];
+    const removeLower = new Set(remove.map((flag) => flag.toLowerCase()));
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = await client.query<{ flags: string[] | null }>(
+        `
+        SELECT flags
+        FROM public.imap_messages
+        WHERE id = $1 AND account_id = $2
+        FOR UPDATE
+        `,
+        [messageId, accountId]
+      );
+      const row = current.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+
+      const existing = row.flags ?? [];
+      const existingLower = new Set(existing.map((flag) => flag.toLowerCase()));
+      const kept = existing.filter((flag) => !removeLower.has(flag.toLowerCase()));
+      const toAdd = add.filter((flag) => !existingLower.has(flag.toLowerCase()) && !removeLower.has(flag.toLowerCase()));
+      const next = [...kept, ...toAdd];
+
+      await client.query(
+        `
+        UPDATE public.imap_messages
+        SET flags = $3::text[]
+        WHERE id = $1 AND account_id = $2
+        `,
+        [messageId, accountId, next]
+      );
+      await client.query("COMMIT");
+      return next;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async storeBody(body: MessageBodyInput): Promise<void> {

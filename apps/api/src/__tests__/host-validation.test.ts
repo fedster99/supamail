@@ -85,10 +85,11 @@ describe("assertSafeImapTarget", () => {
 });
 
 describe("assertSafeSmtpTarget", () => {
-  it("accepts a public IP literal on a permitted submission port", async () => {
-    await expect(assertSafeSmtpTarget("8.8.8.8", 465, true, STRICT)).resolves.toBeUndefined();
-    await expect(assertSafeSmtpTarget("8.8.8.8", 587, false, STRICT)).resolves.toBeUndefined();
-    await expect(assertSafeSmtpTarget("8.8.8.8", 25, false, STRICT)).resolves.toBeUndefined();
+  it("accepts a public IP literal on a permitted submission port (host classified public)", async () => {
+    // Returns the TLS-gate classification; a public host is never private.
+    await expect(assertSafeSmtpTarget("8.8.8.8", 465, true, STRICT)).resolves.toEqual({ isPrivateHost: false });
+    await expect(assertSafeSmtpTarget("8.8.8.8", 587, false, STRICT)).resolves.toEqual({ isPrivateHost: false });
+    await expect(assertSafeSmtpTarget("8.8.8.8", 25, false, STRICT)).resolves.toEqual({ isPrivateHost: false });
   });
 
   it("rejects non-SMTP ports (port check runs before DNS)", async () => {
@@ -98,7 +99,7 @@ describe("assertSafeSmtpTarget", () => {
 
   it("does NOT gate STARTTLS (secure=false) the way plaintext IMAP is gated", async () => {
     // secure=false on SMTP means STARTTLS, a TLS upgrade — allowed on a public host.
-    await expect(assertSafeSmtpTarget("8.8.8.8", 587, false, STRICT)).resolves.toBeUndefined();
+    await expect(assertSafeSmtpTarget("8.8.8.8", 587, false, STRICT)).resolves.toEqual({ isPrivateHost: false });
   });
 
   it("rejects IP-literal private/metadata targets (SSRF guard)", async () => {
@@ -112,12 +113,16 @@ describe("assertSafeSmtpTarget", () => {
     await expect(assertSafeSmtpTarget("localhost", 465, true, STRICT)).rejects.toThrow(/localhost/);
   });
 
-  it("permits private targets when explicitly opted in", async () => {
-    await expect(assertSafeSmtpTarget("127.0.0.1", 3025, false, PERMISSIVE)).resolves.toBeUndefined();
-    await expect(assertSafeSmtpTarget("localhost", 465, true, PERMISSIVE)).resolves.toBeUndefined();
+  it("permits private targets when explicitly opted in and classifies them private (TLS may relax)", async () => {
+    // localhost / a literal private IP under the opt-in are the only cases that
+    // relax STARTTLS — they classify private.
+    await expect(assertSafeSmtpTarget("127.0.0.1", 3025, false, PERMISSIVE)).resolves.toEqual({ isPrivateHost: true });
+    await expect(assertSafeSmtpTarget("localhost", 465, true, PERMISSIVE)).resolves.toEqual({ isPrivateHost: true });
   });
 
-  it("does not do DNS when permissive (so dry-run fake hostnames are fine)", async () => {
-    await expect(assertSafeSmtpTarget("fake.smtp.local", 587, false, PERMISSIVE)).resolves.toBeUndefined();
+  it("does not do DNS when permissive (so dry-run fake hostnames are fine) and keeps a hostname non-private (requireTLS stays on)", async () => {
+    // A permissive hostname is NOT proven private without DNS, so the TLS gate
+    // takes the safe default: not private → requireTLS stays on (decision 3).
+    await expect(assertSafeSmtpTarget("fake.smtp.local", 587, false, PERMISSIVE)).resolves.toEqual({ isPrivateHost: false });
   });
 });

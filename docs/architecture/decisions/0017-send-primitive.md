@@ -50,7 +50,11 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   pattern from `imap-client.ts` but exposes only `append()` (+ `list()` to resolve
   the Sent folder). `MirrorImapClient`/`ThrottledImapClient` (the sync read
   adapter) gain no write verb — pinned by `sync-adapter-read-only.test.ts`. The
-  sync path can never write; the send path can never read-sync.
+  sync path can never write; the send path can never read-sync. Update (ADR 0022):
+  that "reused pattern" is now an actual shared function, `connectImap`
+  (`imap-connect.ts`) — `SentFolderAppender` obtains its socket there (and so
+  inherits the close-on-connect-error guard it previously lacked); the append-only
+  verb surface is unchanged.
 - **Reuse the frozen AES-256-GCM envelope for the SMTP secret.** SMTP credentials
   are stored in nullable `smtp_*` columns on `imap_accounts` (migration 0009),
   with `encrypted_smtp_password` using the same envelope as `encrypted_password`
@@ -107,6 +111,40 @@ that surface, exactly as 0014 required any write capability to be a new decision
 - `host-validation.test.ts` covers `assertSafeSmtpTarget` SSRF rejection.
 - The GreenMail smoke (`scripts/greenmail-smoke.ts`) submits → APPENDs to Sent →
   syncs → asserts the mirrored Sent row is FETCHable (requires Docker).
+
+## Review follow-up (idempotency, STARTTLS, SSRF, header trust)
+
+A whole-stack review hardened four send-path edges:
+
+- **Idempotency (documented, not built here).** `POST /send` is NOT retry-safe on its
+  own: when `req.messageId` is absent, `buildRawMime` stamps a fresh random Message-ID
+  each call, so a timeout-then-retry re-delivers a DUPLICATE with a different
+  Message-ID (undedupeable). A caller needing at-most-once delivery MUST supply a
+  stable `req.messageId` (a re-send then files the same id and the synced Sent copy
+  dedups). The full idempotency-key ledger stays a CLOUD/fast-follow concern
+  (email-001 design §2.9) — no new OSS infra. Documented in `send.ts`.
+- **STARTTLS decoupled from the private-hosts opt-in.** `deliverSmtp`'s
+  `requireTLS` no longer keys off `IMAP_ALLOW_PRIVATE_HOSTS`. A non-implicit-TLS host
+  that resolved PUBLIC keeps `requireTLS=true` even when the opt-in is set (so a
+  self-hoster who enables the flag AND sends through a real public :587 provider can
+  never silently fall back to cleartext / MITM-strip). STARTTLS relaxes only when the
+  target actually resolved private/loopback — `assertSafeSmtpTarget` now returns an
+  `isPrivateHost` signal that `send.ts` plumbs into `deliverSmtp`.
+- **SSRF is check-time, not connect-time (DNS-rebinding TOCTOU).** `host-validation.ts`
+  resolves and rejects private IPs but does NOT pin the resolved IP; `deliverSmtp`
+  re-resolves at socket time, so a low-TTL record can be public-at-check and
+  private-at-connect. Acceptable for the operator-controlled single-tenant OSS host;
+  the CLOUD multi-tenant layer (tenant-supplied host) MUST pin the resolved IP and
+  connect to the literal address with `tls.servername` for SNI. A prominent comment in
+  `host-validation.ts` records this. See ADR 0022.
+- **Header trust boundary.** `buildRawMime` now denylists structural/identity headers
+  (Bcc/From/To/Cc/Sender/Reply-To/Return-Path/Received/Content-Type/MIME-Version) in
+  `req.headers` and restricts customs to `X-*` (plus the threading headers), so a
+  caller can no longer forge a From / smuggle a raw Bcc into the bytes that are BOTH
+  delivered and filed to Sent. Drafts reuse `buildRawMime`, so this protects
+  `createDraft`/`updateDraft` too. The send/draft Zod schemas additionally reject CR/LF
+  in `headers` values / `inReplyTo` / `references` / `messageId` (header-injection
+  defense in depth).
 
 ## References
 

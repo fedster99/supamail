@@ -273,8 +273,10 @@ export interface MirrorHooks {
 
 export interface CreateAccountInput {
   emailAddress: string;
-  host: string;
-  port: number;
+  // host/port are optional: when omitted they are filled from the email
+  // domain's provider preset (email-008 autodiscovery). Explicit values win.
+  host?: string;
+  port?: number;
   secure?: boolean;
   username: string;
   password: string;
@@ -291,6 +293,24 @@ export interface CreateAccountInput {
 export interface SendRecipient {
   email: string;
   name?: string;
+}
+
+/**
+ * One outbound attachment on a send/draft (email-004, ADR 0020). `content` is the
+ * raw bytes base64-encoded (the JSON/base64 transport); nodemailer's MailComposer
+ * builds the MIME part. Set `cid` for an inline image referenced from the HTML body
+ * as `cid:<that-value>`; `inline: true` marks any part `Content-Disposition: inline`
+ * (a `cid` implies inline). Otherwise the part is a regular `attachment`.
+ */
+export interface SendAttachment {
+  filename: string;
+  contentType?: string;
+  /** Base64-encoded bytes of the part. */
+  content: string;
+  /** Content-ID for an inline image (referenced as `cid:<value>` in the HTML body). */
+  cid?: string;
+  /** Force `Content-Disposition: inline` (implied when `cid` is set). */
+  inline?: boolean;
 }
 
 /**
@@ -311,7 +331,8 @@ export interface SendRequest {
   references?: string;
   /** Caller-supplied for a stable Message-ID; else one is generated at compose time. */
   messageId?: string;
-  // attachments?: ... deferred to email-004
+  /** Attachments + inline images (email-004, ADR 0020). MailComposer builds the MIME. */
+  attachments?: SendAttachment[];
 }
 
 export interface SendResult {

@@ -1,0 +1,36 @@
+# ADR 0020: Attachment Bytes + Raw MIME Are On-Demand Reads; Metadata + Clean Bodies Come From the Mirror; All Off the Agent Surface
+
+Status: Accepted
+
+Date: 2026-06-22
+
+## Context
+
+email-004 adds the Nylas content-parity surface: attachments on send/draft, attachment download + metadata, inline images (Content-ID), raw MIME, full/basic headers, payload field-selection, and deterministic clean bodies. Two pressures shape it:
+
+1. **Storage reality.** The mirror stores attachment *metadata* (`imap_attachments`) and parsed bodies/headers, but under the production default `BODY_STORAGE_MODE=parsed_only` it stores **no** attachment bytes and **no** `raw_mime` (see the parsed-only body-storage decision). So byte-level reads cannot always come from the mirror.
+2. **The sacred boundaries.** The agent MCP surface is the five read tools (ADR 0014) and stays zero-send/read-only (ADR 0017); the sync adapter (`ThrottledImapClient`) must never gain a write verb (ADR 0018). The server instructions also say the *agent* surface exposes attachment metadata only — never bytes.
+
+## Decision
+
+- **Compose half** rides email-001: `SendRequest.attachments` (filename/contentType/base64 content, optional `cid` + `inline`) flow through the existing `buildRawMime` (nodemailer MailComposer handles MIME + inline `cid`) on the **send** path — no new compose path.
+- **Attachments are a send-time-only field; saved drafts REJECT them** (exactly like Bcc, ADR 0019). `createDraft`/`updateDraft` compose the saved bytes via `buildRawMime` from a draft input that carries no attachment-bytes field, so an attachment passed there would be silently dropped from the SAVED draft. Rather than accept-and-drop, `DRAFT_SCHEMA` errors with `"Attachments are not supported on saved drafts — attach files when you send the draft"`, the `createDraft`/`updateDraft` input types omit `attachments` (`Omit<…, "bcc" | "attachments">`), the lib re-checks at runtime (`rejectAttachments`) for an untyped caller, and the CLI `draft-create`/`draft-update` expose no attachment option. Attachments remain fully supported on the email-001 **send** envelope. (Note: as of the ADR 0019 addendum, `sendDraft` resends the draft's RAW bytes, so a draft composed elsewhere WITH attachments would round-trip on send — this rejection is a SupaMail-authored-draft save-time limitation, not a send-time loss.)
+- **Content-Disposition is hardened against attacker-influenced filenames.** The attachment-download route sanitizes the ASCII `filename=` token (strips CR/LF/`"`/`;`/`\`/control chars so it can't break the quoted string or inject extra disposition params) and adds an RFC 5987 `filename*=UTF-8''<percent-encoded>` token so non-ASCII names round-trip losslessly.
+- **Invalid `max_chars` falls back to the default.** A non-numeric `?max_chars=abc` / `--max-chars abc` yields `NaN`, which would silently disable truncation; the HTTP route and CLI guard with `Number.isFinite` and fall back to the `cleanBody` default.
+- **Read half lives in a new `content.ts`, OUTSIDE `src/mcp/`**, reachable via the lib barrel + `API_TOKEN` HTTP routes + the CLI — **never as a sixth MCP tool** (so `agent-surface-zero-send.test.ts` stays unchanged and still asserts exactly five tools).
+- **Storage-aware read strategy:**
+  - Attachment **metadata** → mirror (`imap_attachments`), cheap SELECT.
+  - Attachment **bytes** → ALWAYS an on-demand IMAP part FETCH (never mirrored).
+  - **Raw MIME** → mirror `raw_mime` when present (`raw_mime` mode), else on-demand whole-message FETCH (`parsed_only`).
+  - **Headers** → mirror `headers_json` (+ body headers), with an on-demand FETCH+parse fallback only when nothing is stored.
+  - **Clean body** → STORED body text only (no IMAP), reusing the existing deterministic `cleanBody` heuristic (strip the `On … wrote:` quoted tail + the `-- ` signature unless `includeQuoted`). No LLM, no new dependency.
+- On-demand fetches use a narrow read-only `ContentImapClient` exposing only `downloadPart()` / `fetchOneSource()` — UIDVALIDITY-guarded so a server reset can never make us fetch a different message. It is **not** the sync adapter (`sync-adapter-read-only.test.ts` holds) and never writes; it reuses the frozen connect + `decryptPassword` + `assertSafeImapTarget` pattern. Update (ADR 0022): that "reused pattern" is now an actual shared function, `connectImap` (`imap-connect.ts`) — `ContentImapClient` obtains its socket there, and its UIDVALIDITY fail-closed check is the shared `uidValidityMatches`/`uidValidityMismatchMessage` co-located with the connector (the fetch path keeps its own plain `Error`); the download/fetch verb surface is unchanged.
+- **Field selection** (`selectFields` / `?fields=` / `--fields`) is a pure top-level projection to shrink read payloads.
+
+## Consequences
+
+- Attachment download and (under `parsed_only`) raw MIME / header-fallback each cost one live IMAP round-trip — acceptable; they are explicit, on-demand reads, not hot-path sync.
+- The agent MCP surface is unchanged: bytes/raw/headers/clean-body are operator/automation reads behind `API_TOKEN`, not agent tools. A future agent must NOT add a sixth MCP tool for these (it would break the five-tool assertion).
+- `cleanBody` is deterministic text parsing reused from the shared read layer — it must stay model-free (the "no LLM inside the product" rule).
+- Byte reads inherit the UIDVALIDITY guard, so a mailbox reset fails closed rather than returning the wrong part.
+- Drafts carry neither Bcc (ADR 0019) nor attachments — both are send-time-only fields. A future change must NOT "re-add" `attachments` to `DRAFT_SCHEMA`, the `DraftInput` type, or the CLI as an oversight: `createDraft`/`updateDraft` compose the saved bytes via `buildRawMime`, which has no attachment-bytes field, so an attachment passed there is dropped from the SAVED draft. Attach files on the `send`/`reply` envelope instead. (`sendDraft` resends the draft's RAW bytes — ADR 0019 addendum — so attachments already present in a draft's bytes do round-trip; the rejection is a save-time limitation.)

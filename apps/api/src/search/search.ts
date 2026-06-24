@@ -95,9 +95,11 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
   const parsed = request.q
     ? parseQuery(request.q)
     : { freeText: "", accounts: [], filters: [], sort: null as SearchSort | null, limit: null as number | null, warnings: [] };
-  const structuredFilters = request.filters ? filtersFromStructured(request.filters) : [];
-  const filters = [...parsed.filters, ...structuredFilters];
   const warnings = [...parsed.warnings];
+  // Structured-filter parsing pushes its own warnings (e.g. an ignored bad date)
+  // into the same sink, so the structured surface behaves like the q-operator one.
+  const structuredFilters = request.filters ? filtersFromStructured(request.filters, warnings) : [];
+  const filters = [...parsed.filters, ...structuredFilters];
 
   const sort: SearchSort = parsed.sort ?? request.sort ?? "smart";
   const limit = clamp(parsed.limit ?? request.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT);
