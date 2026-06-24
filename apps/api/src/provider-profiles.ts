@@ -226,6 +226,23 @@ export function autodiscoverProfile(emailOrDomain: string): ProviderProfile | nu
  * is the single home for that precedence. */
 export type SpecialUseRole = "sent" | "trash" | "drafts";
 
+/**
+ * The Drafts identity VOCABULARY, single-sourced so the in-memory role resolver
+ * ({@link SPECIAL_USE_ROLES}.drafts) and the SQL `draftFolderPaths` (drafts.ts)
+ * can never drift on "what names a Drafts folder." Only the VOCABULARY is shared;
+ * the two QUERIES stay deliberately distinct (the resolver matches a live LIST, the
+ * SQL matches the mirrored folder table). All tokens are lowercased for the
+ * case-insensitive comparisons both sides do.
+ *   - `specialUse`   the RFC 6154 attribute (`\drafts`, as imapflow lowercases it).
+ *   - `leafName`     the conventional leaf name a Drafts folder ends in.
+ *   - `conventional` the fallback path used when nothing else matches.
+ */
+export const DRAFTS_VOCABULARY = {
+  specialUse: "\\drafts",
+  leafName: "drafts",
+  conventional: "Drafts"
+} as const;
+
 interface SpecialUseRoleSpec {
   /** The RFC 6154 special-use attribute, lowercased (e.g. "\\sent"). */
   specialUse: string;
@@ -276,11 +293,12 @@ const SPECIAL_USE_ROLES: Record<SpecialUseRole, SpecialUseRoleSpec> = {
     conventional: "Trash",
     fallback: (mailboxes) => byLeafName(mailboxes, "trash")
   },
-  // Drafts falls back via a folder literally named "drafts" (profile ignored).
+  // Drafts falls back via a folder literally named "drafts" (profile ignored). The
+  // vocabulary is shared with the SQL draftFolderPaths (DRAFTS_VOCABULARY).
   drafts: {
-    specialUse: "\\drafts",
-    conventional: "Drafts",
-    fallback: (mailboxes) => byLeafName(mailboxes, "drafts")
+    specialUse: DRAFTS_VOCABULARY.specialUse,
+    conventional: DRAFTS_VOCABULARY.conventional,
+    fallback: (mailboxes) => byLeafName(mailboxes, DRAFTS_VOCABULARY.leafName)
   }
 };
 

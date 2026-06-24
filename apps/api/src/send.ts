@@ -1,14 +1,14 @@
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
-import { getProviderProfile } from "./provider-profiles.js";
+import { closeImap } from "./imap-connect.js";
+import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import {
   SentFolderAppender,
   buildRawMime,
   buildSendEnvelope,
   deliverSmtp,
-  resolveSentFolder,
   resolveSmtpCreds
 } from "./smtp-client.js";
 import type { SendRequest, SendResult } from "./types.js";
@@ -73,7 +73,9 @@ export async function sendMessage(
     appender = await SentFolderAppender.connect(pool, config, account);
     const profile = getProviderProfile(account.provider_profile);
     const mailboxes = await appender.list();
-    sentFolderPath = resolveSentFolder(mailboxes, profile);
+    // Resolve Sent via the shared role-keyed resolver: the "sent" role consults the
+    // provider profile's priority winner for its fallback (behavior preserved).
+    sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
     const result = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
     appendedToSent = true;
     appendedUid = result.uid;
@@ -82,7 +84,7 @@ export async function sendMessage(
       `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
     );
   } finally {
-    if (appender) await appender.logout().catch(() => appender?.close());
+    if (appender) await closeImap(appender);
   }
 
   return {

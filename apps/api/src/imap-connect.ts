@@ -60,6 +60,30 @@ export async function connectImap(
 }
 
 /**
+ * A client that can be torn down: a graceful IMAP LOGOUT, falling back to a hard
+ * socket close. The narrow write/fetch clients (SentFolderAppender, MailboxMutator,
+ * ContentImapClient) each expose exactly this pair, so {@link closeImap} can tear
+ * any of them down uniformly.
+ */
+export interface ClosableImapClient {
+  logout(): Promise<void>;
+  close(): void;
+}
+
+/**
+ * The one shared IMAP teardown twin of {@link connectImap} (review maintainability
+ * finding): try a graceful LOGOUT, and if that rejects (already-broken socket, a
+ * timed-out command) fall back to a hard `close()` so the socket can never leak.
+ * This `await client.logout().catch(() => client.close())` was copy-pasted ~13×
+ * across the appender / mutator / fetch clients; centralizing it keeps the
+ * disconnect policy from drifting the way the connect prelude already prevents for
+ * connect. Behavior is byte-identical to the inlined teardown it replaces.
+ */
+export async function closeImap(client: ClosableImapClient): Promise<void> {
+  await client.logout().catch(() => client.close());
+}
+
+/**
  * The one shared UIDVALIDITY fail-closed comparison (CC-4, co-located with the
  * connector). The mutate path (`MailboxMutator.withUidScope`) and the on-demand
  * fetch path (`ContentImapClient.assertUidValidity`) implement the SAME property —

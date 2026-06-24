@@ -2,10 +2,11 @@ import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { NotFoundError, UnfetchableContentError } from "./errors.js";
-import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
+import { closeImap, connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
 import { cleanBody } from "./mcp/shared.js";
+import { loadMessageAndAccount } from "./message-loader.js";
 import { MirrorRepository } from "./repository.js";
-import type { ImapAccount, ImapMessage } from "./types.js";
+import type { ImapAccount } from "./types.js";
 
 /**
  * Attachment bytes / raw MIME / headers / clean-body read surface (email-004,
@@ -113,6 +114,24 @@ export class ContentImapClient {
   }
 
   /**
+   * Select + lock `folderPath`, assert the live UIDVALIDITY still equals what we
+   * mirrored (a reset would invalidate the UID), then run the read `op` under the
+   * lock and release it in `finally`. The mutate side (`MailboxMutator.withUidScope`)
+   * has the identical lock → assert → finally-release shape; this is the read twin
+   * (it keeps the fetch path's own plain-Error assertion via `assertUidValidity`).
+   * Extracted so `downloadPart`/`fetchOneSource` no longer copy-paste the scope.
+   */
+  private async withUidScope<T>(folderPath: string, uidValidity: number, op: () => Promise<T>): Promise<T> {
+    const lock = await this.client.getMailboxLock(folderPath);
+    try {
+      this.assertUidValidity(folderPath, uidValidity);
+      return await op();
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
    * Download one BODYSTRUCTURE part of the message at `uid` in `folderPath`,
    * asserting the live UIDVALIDITY still matches what we mirrored so a reset can
    * never make us fetch a different message. imapflow decodes the part's
@@ -125,14 +144,10 @@ export class ContentImapClient {
     part: string,
     maxBytes: number
   ): Promise<Buffer> {
-    const lock = await this.client.getMailboxLock(folderPath);
-    try {
-      this.assertUidValidity(folderPath, uidValidity);
+    return this.withUidScope(folderPath, uidValidity, async () => {
       const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
       return await streamToBuffer(result.content);
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   /** Fetch the whole RFC-822 source (capped at `maxBytes`). Used for raw MIME /
@@ -143,18 +158,14 @@ export class ContentImapClient {
     uid: number,
     maxBytes: number
   ): Promise<Buffer> {
-    const lock = await this.client.getMailboxLock(folderPath);
-    try {
-      this.assertUidValidity(folderPath, uidValidity);
+    return this.withUidScope(folderPath, uidValidity, async () => {
       const fetched = await this.client.fetchOne(String(uid), { source: { start: 0, maxLength: maxBytes } }, { uid: true });
       if (fetched && (fetched as { source?: Buffer }).source) {
         return Buffer.from((fetched as { source: Buffer }).source);
       }
       const result = await this.client.download(String(uid), undefined, { uid: true, maxBytes });
       return await streamToBuffer(result.content);
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   private assertUidValidity(folderPath: string, uidValidity: number): void {
@@ -188,17 +199,6 @@ async function streamToBuffer(stream: AsyncIterable<Buffer | Uint8Array | string
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
-}
-
-async function loadMessageAndAccount(
-  repository: MirrorRepository,
-  messageId: string
-): Promise<{ message: ImapMessage; account: ImapAccount }> {
-  const message = await repository.getMessage(messageId);
-  if (!message) throw new NotFoundError(`Message not found: ${messageId}`);
-  const account = await repository.getAccount(message.account_id);
-  if (!account) throw new Error(`Account not found for message ${messageId}: ${message.account_id}`);
-  return { message, account };
 }
 
 /**
@@ -284,7 +284,7 @@ export async function downloadAttachment(
     );
     return { ...meta, content };
   } finally {
-    await reader.logout().catch(() => reader.close());
+    await closeImap(reader);
   }
 }
 
@@ -331,7 +331,7 @@ export async function getRawMime(
     );
     return { messageId, raw, source: "fetch", truncated: raw.length >= config.BODY_RAW_MAX_BYTES };
   } finally {
-    await reader.logout().catch(() => reader.close());
+    await closeImap(reader);
   }
 }
 
@@ -417,7 +417,7 @@ export async function getMessageHeaders(
       headers = parseHeaders(headerBlock);
       source = "fetch";
     } finally {
-      await reader.logout().catch(() => reader.close());
+      await closeImap(reader);
     }
   }
 

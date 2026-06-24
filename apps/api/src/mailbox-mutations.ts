@@ -2,8 +2,9 @@ import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { NotFoundError } from "./errors.js";
-import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
-import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
+import { closeImap, connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
+import { loadMessageAndAccount } from "./message-loader.js";
+import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
@@ -112,21 +113,6 @@ export function toImapFlag(token: string): string {
   const bare = trimmed.replace(/^\\+/, "").toLowerCase();
   if (bare in SYSTEM_FLAGS) return SYSTEM_FLAGS[bare as SystemFlagName];
   return trimmed.startsWith("\\") ? trimmed : `\\${trimmed.replace(/^\\+/, "")}`;
-}
-
-/**
- * Resolve the Trash folder to move into: the `\Trash` special-use mailbox if the
- * server advertises one, else a folder literally named "trash", else the
- * conventional `"Trash"`. One-line delegation to the shared role-keyed resolver
- * (provider-profiles.ts) — the "trash" role keeps its leaf-name fallback and
- * (unlike Sent) does NOT consult the provider profile (behavior preserved; the
- * `_profile` parameter stays for signature compatibility).
- */
-export function resolveTrashFolder(
-  mailboxes: Array<{ path: string; specialUse?: string | null }>,
-  _profile: ProviderProfile
-): string {
-  return resolveSpecialUseFolder(mailboxes, "trash", _profile);
 }
 
 /**
@@ -309,20 +295,6 @@ export class MailboxMutator {
 // Library functions: resolve from the repository, act on IMAP, rely on sync.
 // ---------------------------------------------------------------------------
 
-async function loadMessageAndAccount(
-  repository: MirrorRepository,
-  messageId: string
-): Promise<{ message: ImapMessage; account: ImapAccount }> {
-  const message = await repository.getMessage(messageId);
-  if (!message) throw new NotFoundError(`Message not found: ${messageId}`);
-  if (message.deleted_in_provider) {
-    throw new Error(`Message ${messageId} is already deleted in the provider`);
-  }
-  const account = await repository.getAccount(message.account_id);
-  if (!account) throw new Error(`Account not found for message ${messageId}: ${message.account_id}`);
-  return { message, account };
-}
-
 export interface FlagChange {
   /** Flags to STORE +FLAGS (mark read = ["\\Seen"], star = ["\\Flagged"]). */
   add?: string[];
@@ -394,7 +366,7 @@ export async function setMessageFlags(
   }
 
   const repository = new MirrorRepository(pool, config);
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
   const mutator = await MailboxMutator.connect(pool, config, account);
@@ -402,7 +374,7 @@ export async function setMessageFlags(
     if (add.length > 0) await mutator.addFlags(target, add);
     if (remove.length > 0) await mutator.removeFlags(target, remove);
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 
   await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
@@ -430,7 +402,7 @@ export async function moveMessage(
     throw new Error("moveMessage requires a non-empty destination folder");
   }
   const repository = new MirrorRepository(pool, config);
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
   const mutator = await MailboxMutator.connect(pool, config, account);
@@ -439,7 +411,7 @@ export async function moveMessage(
     const newUid = uidMap?.get(target.uid) ?? null;
     return { messageId, fromFolder: target.folderPath, toFolder: destination, newUid };
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 }
 
@@ -465,7 +437,7 @@ export async function deleteMessage(
   options: { hard?: boolean } = {}
 ): Promise<DeleteResult> {
   const repository = new MirrorRepository(pool, config);
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
   const mutator = await MailboxMutator.connect(pool, config, account);
@@ -476,7 +448,9 @@ export async function deleteMessage(
     }
     const profile = getProviderProfile(account.provider_profile);
     const mailboxes = await mutator.list();
-    const trashFolder = resolveTrashFolder(mailboxes, profile);
+    // Resolve Trash via the shared role-keyed resolver: the "trash" role uses its
+    // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
+    const trashFolder = resolveSpecialUseFolder(mailboxes, "trash", profile);
     // Already in Trash → a non-hard delete is a no-op move onto itself; treat as done.
     if (trashFolder === target.folderPath) {
       return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
@@ -484,7 +458,7 @@ export async function deleteMessage(
     await mutator.move(target, trashFolder);
     return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 }
 
@@ -618,7 +592,7 @@ export async function setThreadFlags(
       appliedIds.push(target.messageId);
     }
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 
   return {
@@ -667,7 +641,7 @@ export async function moveThread(
       moved.push(target.messageId);
     }
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 
   return { seedMessageId: messageId, toFolder: destination, messageCount: moved.length, messageIds: moved, truncated };
@@ -700,7 +674,7 @@ export async function createFolder(
     const result = await mutator.createFolder(path);
     return { accountId, path: result.path, created: result.created };
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 }
 
@@ -721,7 +695,7 @@ export async function renameFolder(
     const result = await mutator.renameFolder(path, newPath);
     return { accountId, path: result.path, newPath: result.newPath };
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 }
 
@@ -741,6 +715,6 @@ export async function deleteFolder(
     const result = await mutator.deleteFolder(path);
     return { accountId, path: result.path };
   } finally {
-    await mutator.logout().catch(() => mutator.close());
+    await closeImap(mutator);
   }
 }

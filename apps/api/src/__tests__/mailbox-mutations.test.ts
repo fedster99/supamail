@@ -1,6 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { MailboxMutator, resolveTrashFolder, toImapFlag } from "../mailbox-mutations.js";
-import { genericImapProfile } from "../provider-profiles.js";
+import { MailboxMutator, toImapFlag } from "../mailbox-mutations.js";
 
 /**
  * Unit coverage for the organize-mutation primitives (email-002, ADR 0018). The
@@ -30,20 +29,9 @@ describe("toImapFlag", () => {
   });
 });
 
-describe("resolveTrashFolder", () => {
-  it("prefers the \\Trash special-use mailbox", () => {
-    const boxes = [
-      { path: "INBOX", specialUse: null },
-      { path: "Deleted Items", specialUse: "\\Trash" }
-    ];
-    expect(resolveTrashFolder(boxes, genericImapProfile)).toBe("Deleted Items");
-  });
-
-  it("falls back to a folder literally named Trash, then the conventional Trash", () => {
-    expect(resolveTrashFolder([{ path: "INBOX/Trash", specialUse: null }], genericImapProfile)).toBe("INBOX/Trash");
-    expect(resolveTrashFolder([{ path: "INBOX", specialUse: null }], genericImapProfile)).toBe("Trash");
-  });
-});
+// Trash-folder resolution (special-use → leaf-name → conventional) is covered by
+// special-use-folder.test.ts; the per-module wrapper was inlined at its call site
+// (review maintainability finding), so its redundant test was removed here.
 
 // --- Mocked MailboxMutator + repository for the library functions. ---
 

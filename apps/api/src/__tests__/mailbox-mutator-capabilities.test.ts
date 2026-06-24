@@ -62,7 +62,8 @@ vi.mock("../host-validation.js", () => ({
   HostValidationError: class extends Error {}
 }));
 
-const { MailboxMutator, MailboxCapabilityError, MailboxMutationError } = await import("../mailbox-mutations.js");
+const { MailboxMutator, MailboxCapabilityError, MailboxConflictError, MailboxMutationError } =
+  await import("../mailbox-mutations.js");
 
 const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 const account = {
@@ -163,5 +164,54 @@ describe("m4: connect closes the socket on failure", () => {
     fake.connectImpl.mockRejectedValue(new Error("TLS handshake failed"));
     await expect(MailboxMutator.connect({} as never, config, account)).rejects.toThrow(/TLS handshake/);
     expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── The core safety invariant of the organize PR: a UIDVALIDITY reset must never
+//    let a write verb hit the wrong message. withUidScope re-checks the live
+//    UIDVALIDITY under the folder lock and throws MailboxConflictError (→ HTTP 409)
+//    BEFORE running any STORE/MOVE/DELETE. Until now this negative path had zero
+//    coverage (the lib tests always set fake.uidValidity == target.uidValidity).
+describe("withUidScope: a UIDVALIDITY mismatch fails closed before any verb runs", () => {
+  beforeEach(() => {
+    // The mirror still expects 100, but the live mailbox has reset to 200.
+    fake.mailbox = { uidValidity: 200 };
+    // Advertise everything so it is the UIDVALIDITY guard — not a capability gate —
+    // that refuses the destructive verbs.
+    fake.capabilities = new Map([["UIDPLUS", true], ["MOVE", true]]);
+  });
+
+  it("addFlags rejects with MailboxConflictError and never STOREs +FLAGS", async () => {
+    const mutator = await MailboxMutator.connect({} as never, config, account);
+    await expect(mutator.addFlags(target, ["\\Seen"])).rejects.toBeInstanceOf(MailboxConflictError);
+    await expect(mutator.addFlags(target, ["\\Seen"])).rejects.toThrow(/UIDVALIDITY changed/);
+    expect(fake.messageFlagsAdd).not.toHaveBeenCalled();
+  });
+
+  it("removeFlags rejects with MailboxConflictError and never STOREs -FLAGS", async () => {
+    const mutator = await MailboxMutator.connect({} as never, config, account);
+    await expect(mutator.removeFlags(target, ["\\Flagged"])).rejects.toBeInstanceOf(MailboxConflictError);
+    expect(fake.messageFlagsRemove).not.toHaveBeenCalled();
+  });
+
+  it("move rejects with MailboxConflictError and never MOVEs (despite MOVE+UIDPLUS present)", async () => {
+    const mutator = await MailboxMutator.connect({} as never, config, account);
+    await expect(mutator.move(target, "Archive")).rejects.toBeInstanceOf(MailboxConflictError);
+    expect(fake.messageMove).not.toHaveBeenCalled();
+  });
+
+  it("expunge rejects with MailboxConflictError and never STOREs \\Deleted or EXPUNGEs", async () => {
+    const mutator = await MailboxMutator.connect({} as never, config, account);
+    await expect(mutator.expunge(target)).rejects.toBeInstanceOf(MailboxConflictError);
+    expect(fake.messageFlagsAdd).not.toHaveBeenCalled();
+    expect(fake.messageDelete).not.toHaveBeenCalled();
+  });
+
+  it("releases the folder lock even when the guard throws", async () => {
+    const release = vi.fn();
+    fake.getMailboxLock.mockImplementation(async () => ({ release }));
+    const mutator = await MailboxMutator.connect({} as never, config, account);
+    await expect(mutator.addFlags(target, ["\\Seen"])).rejects.toBeInstanceOf(MailboxConflictError);
+    expect(release).toHaveBeenCalledTimes(1);
   });
 });

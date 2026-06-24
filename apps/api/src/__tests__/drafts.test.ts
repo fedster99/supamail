@@ -1,6 +1,4 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { resolveDraftsFolder } from "../drafts.js";
-import { genericImapProfile } from "../provider-profiles.js";
 
 /**
  * Unit coverage for the draft CRUD primitives (email-003, ADR 0019). This task is
@@ -14,20 +12,9 @@ import { genericImapProfile } from "../provider-profiles.js";
  * so nothing connects, sends, or mutates a real server.
  */
 
-describe("resolveDraftsFolder", () => {
-  it("prefers the \\Drafts special-use mailbox", () => {
-    const boxes = [
-      { path: "INBOX", specialUse: null },
-      { path: "Brouillons", specialUse: "\\Drafts" }
-    ];
-    expect(resolveDraftsFolder(boxes, genericImapProfile)).toBe("Brouillons");
-  });
-
-  it("falls back to a folder literally named Drafts, then the conventional Drafts", () => {
-    expect(resolveDraftsFolder([{ path: "INBOX.Drafts", specialUse: null }], genericImapProfile)).toBe("INBOX.Drafts");
-    expect(resolveDraftsFolder([{ path: "INBOX", specialUse: null }], genericImapProfile)).toBe("Drafts");
-  });
-});
+// Drafts-folder resolution (special-use → leaf-name → conventional) is covered by
+// special-use-folder.test.ts; the per-module wrapper was inlined at its call site
+// (review maintainability finding), so its redundant test was removed here.
 
 // --- Mocked appender, send primitive, delete mutation, and repository. ---
 

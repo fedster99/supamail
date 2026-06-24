@@ -88,6 +88,50 @@ describe("buildRawMime", () => {
     const raw = decode((await buildRawMime(req, FROM)).raw);
     expect(headerValue(raw, "X-SupaMail-Send")).toBe("primitive");
   });
+
+  // ── Attachment compose seam (email-004): toComposerAttachment was untested —
+  //    send.test.ts never passed req.attachments. Cover one regular base64 part +
+  //    one inline cid image (Content-ID + inline disposition) in one multipart MIME.
+  it("composes a base64 attachment and an inline cid image into the multipart MIME", async () => {
+    const pdfBytes = Buffer.from("%PDF-1.4 fixture");
+    const pngBytes = Buffer.from("\x89PNG\r\n fixture");
+    const req: SendRequest = {
+      ...base,
+      body: { format: "html", html: '<p>see <img src="cid:logo"></p>' },
+      attachments: [
+        { filename: "report.pdf", content: pdfBytes.toString("base64"), contentType: "application/pdf" },
+        { filename: "logo.png", content: pngBytes.toString("base64"), contentType: "image/png", cid: "logo", inline: true }
+      ]
+    };
+    const raw = decode((await buildRawMime(req, FROM)).raw);
+
+    // The whole message is multipart and carries both parts' filenames.
+    expect(raw.toLowerCase()).toContain("multipart/");
+    expect(raw).toContain("report.pdf");
+    expect(raw).toContain("logo.png");
+    // The regular part is an attachment; the cid image is inline with a Content-ID.
+    expect(raw.toLowerCase()).toContain("content-disposition: attachment");
+    expect(raw.toLowerCase()).toContain("content-disposition: inline");
+    expect(raw.toLowerCase()).toContain("content-id: <logo>");
+    // The decoded bytes survive the round-trip (base64 of the real PDF fixture).
+    expect(raw).toContain(pdfBytes.toString("base64"));
+  });
+
+  it("documents the lossy decode of invalid base64 (Buffer.from is total, never throws)", async () => {
+    // "@@@@" is not valid base64. Buffer.from(..., "base64") is TOTAL: it drops the
+    // invalid characters and yields a shorter/empty buffer rather than throwing, so
+    // compose still succeeds — the part is silently truncated, not rejected. This
+    // test pins that documented lossy behavior so a future change is deliberate.
+    const lossy = Buffer.from("@@@@", "base64");
+    expect(lossy.length).toBe(0); // invalid input → empty buffer, no throw
+    const req: SendRequest = {
+      ...base,
+      attachments: [{ filename: "broken.bin", content: "@@@@" }]
+    };
+    // buildRawMime does not throw — it composes a (truncated/empty) part.
+    const { raw } = await buildRawMime(req, FROM);
+    expect(decode(raw)).toContain("broken.bin");
+  });
 });
 
 describe("buildSendEnvelope", () => {
@@ -114,6 +158,7 @@ const mocks = vi.hoisted(() => ({
   appenderAppend: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({ uid: 42 as number | null })),
   appenderList: vi.fn(async () => [{ path: "Sent", specialUse: "\\Sent" }]),
   appenderLogout: vi.fn(async () => undefined),
+  appenderClose: vi.fn(),
   getAccount: vi.fn()
 }));
 
@@ -134,7 +179,7 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
         list: mocks.appenderList,
         append: mocks.appenderAppend,
         logout: mocks.appenderLogout,
-        close: vi.fn()
+        close: mocks.appenderClose
       }))
     }
   };
@@ -173,6 +218,7 @@ describe("sendMessage orchestration", () => {
     vi.clearAllMocks();
     mocks.appenderAppend.mockResolvedValue({ uid: 42 });
     mocks.appenderList.mockResolvedValue([{ path: "Sent", specialUse: "\\Sent" }]);
+    mocks.appenderLogout.mockResolvedValue(undefined);
     mocks.getAccount.mockResolvedValue(account);
   });
 
@@ -248,5 +294,25 @@ describe("sendMessage orchestration", () => {
       })
     ).rejects.toThrow(/Account not found/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+  });
+
+  // ── The appender socket-cleanup fallback: closeImap() tries a graceful LOGOUT
+  //    and, when that rejects (broken/timed-out socket), falls back to a hard
+  //    close() so the socket can never leak. This fallback was previously untested.
+  it("falls back to close() when the appender logout rejects (no leak, still delivered)", async () => {
+    mocks.appenderLogout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
+    const { sendMessage } = await import("../send.js");
+    const cfg = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const result = await sendMessage({} as never, cfg, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    });
+    // The send still succeeds; the teardown swallowed the failed logout and closed.
+    expect(result.delivered).toBe(true);
+    expect(mocks.appenderLogout).toHaveBeenCalledTimes(1);
+    expect(mocks.appenderClose).toHaveBeenCalledTimes(1);
   });
 });

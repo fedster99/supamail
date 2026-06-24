@@ -1,8 +1,9 @@
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { NoRecipientsError, NotFoundError } from "./errors.js";
+import { closeImap } from "./imap-connect.js";
 import { deleteMessage } from "./mailbox-mutations.js";
-import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
+import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import { sendMessage } from "./send.js";
 import { SentFolderAppender, buildRawMime } from "./smtp-client.js";
@@ -124,23 +125,6 @@ export interface DeleteDraftResult {
   fromFolder: string;
 }
 
-/**
- * Pick the Drafts folder to APPEND into: the `\Drafts` special-use mailbox if the
- * server advertises one, else a folder literally named "drafts", else the
- * conventional `"Drafts"`. One-line delegation to the shared role-keyed resolver
- * (provider-profiles.ts) — the "drafts" role keeps its leaf-name fallback and
- * (unlike Sent) does NOT consult the provider profile (behavior preserved; the
- * `_profile` parameter stays for signature compatibility). Note: the SQL
- * `draftFolderPaths` below is a SEPARATE, deliberately-not-shared encoding — it
- * queries the mirrored folder table, not a live LIST.
- */
-export function resolveDraftsFolder(
-  mailboxes: Array<{ path: string; specialUse?: string | null }>,
-  _profile: ProviderProfile
-): string {
-  return resolveSpecialUseFolder(mailboxes, "drafts", _profile);
-}
-
 /** APPEND `req` to the account's Drafts folder with the `\Draft` flag, reusing the
  * email-001 write-only appender. Returns the resolved folder + APPENDUID. */
 async function appendDraft(
@@ -156,12 +140,15 @@ async function appendDraft(
   try {
     const profile = getProviderProfile(account.provider_profile);
     const mailboxes = await appender.list();
-    const draftsFolderPath = resolveDraftsFolder(mailboxes, profile);
+    // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
+    // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
+    // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
+    const draftsFolderPath = resolveSpecialUseFolder(mailboxes, "drafts", profile);
     // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
     const result = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
     return { draftsFolderPath, rfcMessageId: messageId, appendedUid: result.uid };
   } finally {
-    await appender.logout().catch(() => appender.close());
+    await closeImap(appender);
   }
 }
 
@@ -230,22 +217,25 @@ function toSummary(row: DraftRow): DraftSummary {
  * mirrored (provider-profiles keeps them), so this reads the synced folder set.
  */
 async function draftFolderPaths(client: PgClient, accountId: string): Promise<string[]> {
+  // The Drafts vocabulary is shared with the in-memory role resolver
+  // (DRAFTS_VOCABULARY) so the two never drift on "what names a Drafts folder";
+  // the QUERY stays its own distinct encoding (mirrored folder table, not a LIST).
   const result = await client.query<{ path: string }>(
     `
     SELECT path
     FROM public.imap_folders
     WHERE account_id = $1
       AND (
-        lower(coalesce(special_use, '')) = '\\drafts'
-        OR lower(regexp_replace(path, '^.*[/.]', '')) = 'drafts'
+        lower(coalesce(special_use, '')) = $2
+        OR lower(regexp_replace(path, '^.*[/.]', '')) = $3
       )
     `,
-    [accountId]
+    [accountId, DRAFTS_VOCABULARY.specialUse, DRAFTS_VOCABULARY.leafName]
   );
   const paths = result.rows.map((r) => r.path);
   // Always include the conventional name so a draft filed before folder discovery
   // (or on a server that doesn't advertise special-use) is still listed.
-  if (!paths.some((p) => p.toLowerCase() === "drafts")) paths.push("Drafts");
+  if (!paths.some((p) => p.toLowerCase() === DRAFTS_VOCABULARY.leafName)) paths.push(DRAFTS_VOCABULARY.conventional);
   return paths;
 }
 
