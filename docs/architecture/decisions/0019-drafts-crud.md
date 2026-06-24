@@ -43,17 +43,20 @@ introduced:
   then **hard-deletes the previous one** by reusing the email-002 capability-gated
   delete (`deleteMessage(hard)` → UID-scoped EXPUNGE under UIDPLUS). This is the
   same APPEND-then-supersede pattern real IMAP clients use for "save draft."
-- **Send** loads the draft from the mirror, reconstructs a `SendRequest`
-  (To/Cc/Subject + body + In-Reply-To/References), calls email-001 `sendMessage`
-  (which delivers over SMTP and files a copy to Sent), **then** deletes the draft.
-  The SMTP path is **reused, never duplicated** — `drafts.ts` imports `sendMessage`
-  and does not touch nodemailer/SMTP itself. Send refuses a draft with no
-  recipients before any delivery. **Body format is preserved on send:** `getDraft`
-  surfaces both the plaintext `body` and the original `bodyHtml` + an `isHtml` flag
-  (derived from `selected_text_format`), and `sendDraft` sends an HTML draft with
-  `body: { format: "html", html }` rather than flattening it through `htmlToText`.
-  An HTML-authored or HTML-synced draft therefore goes out with its links and
-  formatting intact, not as lossy plaintext.
+- **Send RESENDS the draft's real raw RFC-822 bytes — a true round-trip, NOT a
+  rebuild from the mirror's parsed fields (revised; see the addendum below).**
+  `sendDraft` fetches the draft's actual stored bytes via email-004 `getRawMime`
+  (the mirrored `raw_mime`, or an on-demand UIDVALIDITY-guarded IMAP FETCH from the
+  draft's Drafts folder+UID), submits **those exact bytes** over SMTP via email-001
+  `deliverSmtp` (reusing `resolveSmtpCreds` + the `assertSafeSmtpTarget` SSRF guard +
+  the requireTLS logic), APPENDs **the same bytes** to Sent via `SentFolderAppender`,
+  **then** deletes the draft. The SMTP transport + Sent-append are **reused, never
+  duplicated** — `drafts.ts` does not touch nodemailer itself. Send refuses a draft
+  with no recipients before any delivery. The envelope recipients (MAIL FROM = the
+  account email, RCPT TO = To + Cc) come from the **synced header fields**, never the
+  lazy body, so recipient handling stays safe. Because the real bytes are resent,
+  body + HTML + formatting (and provider-composed attachments) survive **by
+  construction** — there is no mirror-body dependence to lose.
 - **Bcc is rejected on drafts (send-time only).** Bcc cannot round-trip through the
   APPENDed draft bytes — nodemailer's `keepBcc` default omits Bcc from the composed
   MIME, so a Bcc stored on a draft would be silently lost and never sent. Rather
@@ -116,13 +119,17 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   type as an oversight: Bcc is dropped from the saved bytes by design (nodemailer's
   `keepBcc`), so accepting it on a draft would silently lose recipients. Set Bcc on
   the `send`/`reply` envelope instead.
-- Drafts carry neither Bcc nor attachments; both are send-time-only fields. email-004
-  (ADR 0020) likewise rejects `attachments` on a saved draft — attachment bytes are
-  never mirrored, so `sendDraft` (which rebuilds the SendRequest from the mirror)
-  would drop them silently. Attach files on the `send` envelope instead.
-- HTML drafts are sent as HTML, never flattened. `getDraft` carries `bodyHtml` +
-  `isHtml` precisely so `sendDraft` can preserve the original markup; a future change
-  must keep that distinction rather than hardcoding `format: "plain"` again.
+- Drafts carry neither Bcc nor attachments; both are send-time-only fields.
+  `createDraft`/`updateDraft` reject `attachments` because they compose the saved
+  bytes via `buildRawMime` from a `DraftInput` that has no attachment-bytes field —
+  so a passed attachment would be silently dropped from the SAVED draft. (Note: the
+  send-side reason no longer applies — `sendDraft` now resends the draft's RAW bytes,
+  so a draft composed elsewhere WITH attachments would round-trip on send. The create
+  rejection is independent; see the addendum.) Attach files on the `send` envelope.
+- HTML drafts are sent as HTML, never flattened — now automatically, because
+  `sendDraft` resends the draft's real bytes (whatever Content-Type/parts they
+  carry). The `getDraft` `bodyHtml` + `isHtml` distinction is kept for read/display
+  use; it is no longer load-bearing for send (the raw resend preserves markup).
 - The cloud re-pin inherits draft CRUD via `@supamail/api`; cloud adds tenant
   scoping + the human-confirm MCP wrapper, never editing `imap_*` schema.
 
@@ -135,16 +142,21 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   append/store/expunge (APPEND lives only on `SentFolderAppender`).
 - `drafts.test.ts` covers: create APPENDs `\Draft` to the resolved Drafts folder;
   create rejects a smuggled Bcc with the clear message before any connect; update =
-  append-new + hard-delete-old; send calls `sendMessage` then deletes (ordering
-  asserted), refuses a recipient-less draft, and sends an HTML draft with
-  `format: "html"` and the real HTML body (not the `htmlToText` flattening); delete
-  reuses the email-002 mutation; list/get read the mirror only.
+  append-new + hard-delete-old; send RESENDS the draft's raw bytes (asserts the bytes
+  submitted over SMTP and APPENDed to Sent are the fetched `getRawMime` bytes,
+  envelope = the synced To+Cc, deliver-before-delete ordering) and — the empty-body
+  regression guard — that the SENT/Sent-APPENDed bytes CONTAIN the draft body even
+  when the mirror body row is NULL; refuses a recipient-less draft; Sent-APPEND and
+  post-send delete are best-effort; delete reuses the email-002 mutation; list/get
+  read the mirror only.
 - `api-safety.test.ts` covers the `API_TOKEN`-gated draft routes (create with
   optional recipients, create with `bcc` rejected 400 with the clear message, 404
   for unknown account/draft, list/get/update/send, and the `?hard` delete mapping).
-- The GreenMail smoke (`scripts/greenmail-smoke.ts`) creates a draft → resyncs →
-  asserts it appears in Drafts, then sends it → asserts it leaves Drafts and lands
-  in Sent (requires Docker).
+- The GreenMail smoke (`scripts/greenmail-smoke.ts`) creates a draft with a
+  distinctive body → resyncs → asserts it appears in Drafts, then sends it →
+  reads the DELIVERED message straight off the IMAP server and asserts its body is
+  NON-EMPTY and equals the draft body (the end-to-end empty-body proof), and that
+  the draft cleanup is removed-or-best-effort (requires Docker).
 
 ## References
 
@@ -156,6 +168,37 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   compose + the Drafts APPEND).
 - ADR 0018: Organize mutations + the capability-gated `deleteMessage` (reused for
   delete-old and delete-draft).
-- `apps/api/src/drafts.ts`, `apps/api/src/smtp-client.ts`,
-  `apps/api/src/mailbox-mutations.ts`, `apps/api/src/send.ts`.
+- `apps/api/src/drafts.ts`, `apps/api/src/smtp-client.ts`, `apps/api/src/content.ts`
+  (`getRawMime`), `apps/api/src/mailbox-mutations.ts`, `apps/api/src/send.ts`.
 - RFC 3501 §6.3.11 (APPEND), §2.3.2 (the `\Draft` system flag).
+
+## Addendum (2026-06-24): sendDraft resends the draft's raw MIME
+
+The original "Send" decision had `sendDraft` reconstruct a `SendRequest` from the
+mirror's parsed draft fields (`getDraft`'s `body` / `bodyHtml`) and feed it through
+`sendMessage`. That rebuild was a **confirmed production bug** (verified live against
+a real Rackspace mailbox with a Gmail receipt): under lazy body-fetch a freshly
+created or updated draft's BODY may not be mirrored yet (`body` NULL) while its
+headers/recipients ARE — so the rebuild **sent an empty email**. A
+`draft-create` → `draft-update --body …` → `draft-send` delivered an EMPTY message,
+while a direct `send --body …` arrived intact; `delivered: true` never inspected the
+content.
+
+**Fix:** `sendDraft` now performs a true round-trip — it resends the draft's ACTUAL
+raw RFC-822 bytes (`getRawMime`, which fetches on demand from the draft's
+Drafts folder+UID under the UIDVALIDITY guard), submits those exact bytes over SMTP
+(`deliverSmtp` + `resolveSmtpCreds` + `assertSafeSmtpTarget` + the same requireTLS
+logic), APPENDs the same bytes to Sent, then best-effort deletes the draft. The
+envelope recipients still come from the synced header fields (To + Cc), never the
+lazy body. This removes the mirror-body dependence entirely, so body + HTML +
+formatting (and provider-composed attachments) survive **by construction**. The
+"rebuild from the mirror" rationale above — and the body/attachment-loss risk it
+implied — no longer applies. `sendMessage` (the direct-send primitive) is unchanged;
+only `sendDraft` changed. The SACRED invariants hold: no `src/mcp/` write verb / no
+sixth tool, `agent-surface-zero-send` + `sync-adapter-read-only` green, the frozen
+AES-256-GCM envelope untouched.
+
+Open follow-up: the draft-attachment rejection on `createDraft`/`updateDraft` could
+now be revisited — `sendDraft` would round-trip attachments present in the draft's
+raw bytes — but SupaMail-authored drafts still have no path to carry attachment bytes
+into `buildRawMime`, so the create/update rejection stays for now (not lifted here).

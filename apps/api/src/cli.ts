@@ -374,8 +374,9 @@ program
 // Draft CRUD (email-003, ADR 0019). Create/update/list/get/delete/send drafts
 // saved to the provider Drafts folder. Mostly composition: create APPENDs `\Draft`
 // (reuses email-001 buildRawMime + appender), update = append-new + delete-old,
-// send-draft reuses sendMessage. delete + send-draft refuse without --confirm
-// (send is outward-facing — mirror the send/reply gate).
+// send-draft RESENDS the draft's raw bytes over the email-001 SMTP path (ADR 0019
+// addendum). delete + send-draft refuse without --confirm (send is outward-facing
+// — mirror the send/reply gate).
 program
   .command("draft-create")
   .description("Create a draft saved to the provider Drafts folder")

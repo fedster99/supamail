@@ -226,12 +226,13 @@ const SEND_SCHEMA = z.object({
 // here with a clear message rather than accept-and-drop. Bcc is a send-time-only
 // field — set it on the /accounts/:id/send envelope (see ADR 0019).
 //
-// Attachments are likewise NOT a draft field: a draft composes its bytes once at
-// APPEND time, but `sendDraft` reconstructs the SendRequest from the parsed mirror
-// fields (attachment bytes are never mirrored), so any attachment on a saved draft
-// would be silently dropped on send. We REJECT it here, exactly like Bcc —
-// attachments are a send-time-only field; attach files on the /accounts/:id/send
-// envelope (see ADR 0020).
+// Attachments are likewise NOT a draft field: createDraft/updateDraft compose the
+// saved bytes via `buildRawMime` from a draft input that carries no attachment
+// bytes, so any attachment passed here would be silently dropped from the SAVED
+// draft. We REJECT it here, exactly like Bcc — attachments are a send-time-only
+// field; attach files on the /accounts/:id/send envelope (see ADR 0020). (sendDraft
+// now resends the draft's RAW bytes — ADR 0019 addendum — so this is a save-time
+// limitation, not a send-time loss.)
 const DRAFT_SCHEMA = z.object({
   to: z.array(SEND_RECIPIENT_SCHEMA).optional(),
   cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),

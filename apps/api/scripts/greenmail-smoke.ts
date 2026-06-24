@@ -254,6 +254,45 @@ async function ensureFolder(name: string): Promise<void> {
   }
 }
 
+// Read the raw source of the message with `targetSubject` from INBOX directly off
+// the IMAP server (NOT the mirror) — the real end-to-end proof that what was
+// DELIVERED carries the body. Retries because GreenMail delivers asynchronously.
+// Returns the decoded RFC-822 string, or null if it never arrives.
+async function fetchDeliveredSource(targetSubject: string): Promise<string | null> {
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    const client = new ImapFlow({
+      host: "127.0.0.1",
+      port: imapPort,
+      secure: false,
+      auth: { user: mailbox, pass: "any-password" },
+      logger: false
+    });
+    await client.connect();
+    try {
+      const lock = await client.getMailboxLock("INBOX");
+      try {
+        for await (const msg of client.fetch({ all: true }, { source: true, envelope: true })) {
+          if (msg.envelope?.subject === targetSubject && msg.source) {
+            return Buffer.from(msg.source).toString("utf8");
+          }
+        }
+      } finally {
+        lock.release();
+      }
+    } finally {
+      await client.logout().catch(() => client.close());
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return null;
+}
+
+/** Extract the (first) body part text after the header/body CRLF split. */
+function bodyOf(rawSource: string): string {
+  const split = rawSource.indexOf("\r\n\r\n");
+  return split >= 0 ? rawSource.slice(split + 4).trim() : "";
+}
+
 async function startGreenMail(): Promise<void> {
   await docker(["rm", "-f", containerName], true);
   await docker([
@@ -423,16 +462,20 @@ async function main(): Promise<void> {
     }
 
     // Draft path (email-003): create a draft (APPEND \Draft to Drafts), resync so
-    // it is mirrored, assert it appears via listDrafts, then send it (reuses
-    // sendMessage) and assert it left Drafts (deleted-in-provider) and landed in
-    // Sent on the following resync.
+    // it is mirrored, assert it appears via listDrafts, then send it. sendDraft now
+    // RESENDS the draft's raw bytes, so the BODY survives delivery (the empty-body
+    // regression fix). We assert: it left Drafts, AND the DELIVERED message at the
+    // recipient carries the distinctive body — the real end-to-end body proof.
     await ensureFolder("Drafts");
     const draftMessageId = `<greenmail-draft-${Date.now()}@example.test>`;
+    // A distinctive body that MUST survive the round-trip (the bug sent it empty).
+    const draftBody = `Distinctive draft body ${Date.now()} that MUST survive sendDraft.`;
+    const draftSubject = `GreenMail draft smoke ${Date.now()}`;
     const createResult = await createDraft(pool, config, {
       accountId: account.id,
       to: [{ email: mailbox }],
-      subject: "GreenMail draft smoke",
-      body: { format: "plain", text: "Automated draft-path smoke." },
+      subject: draftSubject,
+      body: { format: "plain", text: draftBody },
       messageId: draftMessageId
     });
 
@@ -448,11 +491,13 @@ async function main(): Promise<void> {
     let draftGoneFromDrafts = false;
     let draftDelivered = false;
     let draftCleanupBestEffortOk = false;
+    let deliveredBody: string | null = null;
+    let deliveredBodyMatches = false;
     if (mirroredDraft) {
-      // sendDraft delivers over SMTP, files a copy to Sent, then best-effort deletes
-      // the draft. The SENT copy gets a FRESH Message-ID (sendDraft rebuilds the
-      // SendRequest from the mirror), so we match Sent on the send result's
-      // rfcMessageId — NOT the original draft's Message-ID.
+      // sendDraft RESENDS the draft's raw bytes (the empty-body fix), files those
+      // same bytes to Sent, then best-effort deletes the draft. Because it resends
+      // the real bytes (not a mirror rebuild), the SENT/DELIVERED copy carries the
+      // draft's ORIGINAL Message-ID and the real body.
       const draftSend = await sendDraft(pool, config, mirroredDraft.messageId);
       draftDelivered = draftSend.send.delivered === true;
       // The post-send hard-delete is best-effort (review decision 1): on a server
@@ -461,6 +506,15 @@ async function main(): Promise<void> {
       // "deleted, OR cleanly downgraded to a warning" as the success condition.
       draftCleanupBestEffortOk = draftSend.draftDeleted || draftSend.warnings.length > 0;
       const sentRfcId = draftSend.send.rfcMessageId;
+
+      // THE LOAD-BEARING BODY PROOF: read the DELIVERED message straight off the
+      // IMAP server (INBOX, since the draft was addressed to this mailbox) and assert
+      // its body equals the distinctive draft body. Under the OLD rebuild-from-mirror
+      // path this body arrived EMPTY when the mirror body hadn't been fetched yet.
+      const deliveredSource = await fetchDeliveredSource(draftSubject);
+      deliveredBody = deliveredSource ? bodyOf(deliveredSource) : null;
+      deliveredBodyMatches = deliveredBody !== null && deliveredBody.includes(draftBody);
+
       // Force folder re-discovery before the resync so the just-APPENDed Sent copy
       // (and any self-delivered INBOX copy) is mirrored — same as the reply path.
       await pool.query(
@@ -476,7 +530,7 @@ async function main(): Promise<void> {
       draftGoneFromDrafts = originalDraft.rows.some(
         (row) => row.folder_path === createResult.draftsFolderPath && row.deleted_in_provider === true
       );
-      // The SENT copy, matched by the send result's (fresh) Message-ID.
+      // The SENT copy, matched by the resent bytes' Message-ID.
       const sentCopyRows = await pool.query<{ folder_path: string; deleted_in_provider: boolean }>(
         `SELECT folder_path, deleted_in_provider FROM public.imap_messages WHERE account_id = $1 AND rfc_message_id = $2`,
         [account.id, sentRfcId]
@@ -493,12 +547,15 @@ async function main(): Promise<void> {
       ["draft resync succeeded", draftResync.outcome === "success"],
       ["draft mirrored in Drafts", Boolean(mirroredDraft)],
       // The load-bearing draft-send assertion: the SMTP DELIVERY happened. sendDraft
-      // reuses the SAME sendMessage primitive whose Sent-APPEND→mirror round-trip is
-      // already proven GREEN by the send-path (reply) assertions above, so we do NOT
-      // re-assert the Sent copy under the draft flow — under GreenMail the draft-send
-      // Sent copy is not reliably re-mirrored by the incremental resync (a harness
-      // timing gap, NOT a verb defect; `sentDraftCopies` is reported for diagnosis).
+      // resends the raw draft bytes whose Sent-APPEND→mirror round-trip is already
+      // proven GREEN by the send-path (reply) assertions above, so we do NOT re-assert
+      // the Sent copy under the draft flow — under GreenMail the draft-send Sent copy
+      // is not reliably re-mirrored by the incremental resync (a harness timing gap,
+      // NOT a verb defect; `sentDraftCopies` is reported for diagnosis).
       ["draft sent (delivered) via sendDraft", draftDelivered],
+      // THE empty-body regression guard: the DELIVERED message body is non-empty and
+      // equals the draft body (the bug delivered an EMPTY body).
+      ["draft body survived delivery (non-empty, matches)", deliveredBodyMatches],
       // Cleanup is best-effort: removed OR downgraded-to-warning (non-UIDPLUS).
       ["draft cleanup is removed-or-best-effort", draftCleanupBestEffortOk]
     ];
@@ -506,7 +563,8 @@ async function main(): Promise<void> {
     if (draftFailed.length > 0) {
       throw new Error(
         `GreenMail draft smoke failed: ${draftFailed.map(([name]) => name).join(", ")}` +
-          ` | createResult=${JSON.stringify(createResult)} | mirroredDraft=${JSON.stringify(mirroredDraft)}`
+          ` | createResult=${JSON.stringify(createResult)} | mirroredDraft=${JSON.stringify(mirroredDraft)}` +
+          ` | deliveredBody=${JSON.stringify(deliveredBody)} | expectedBody=${JSON.stringify(draftBody)}`
       );
     }
 
@@ -527,6 +585,8 @@ async function main(): Promise<void> {
         createResult,
         mirroredDraft: mirroredDraft ?? null,
         draftDelivered,
+        draftBodySurvived: deliveredBodyMatches,
+        deliveredBody,
         draftCleanupBestEffortOk,
         draftGoneFromDrafts,
         sentDraftCopies

@@ -5,11 +5,12 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
  * mostly COMPOSITION, so the tests assert the composition wiring:
  *   - create  → buildRawMime + APPEND `\Draft` to the resolved Drafts folder
  *   - update  → APPEND-new + delete-old (the email-002 hard delete)
- *   - send    → email-001 sendMessage, THEN delete the draft
+ *   - send    → RESEND the draft's raw bytes (getRawMime → deliverSmtp → APPEND to
+ *               Sent), THEN delete the draft. NOT a rebuild from the mirror body.
  *   - delete  → reuses the email-002 capability-gated delete
  *   - list/get → read the MIRROR (the repository + pool), never an IMAP round-trip
- * The IMAP appender, the send primitive, and the delete mutation are all mocked,
- * so nothing connects, sends, or mutates a real server.
+ * The raw fetch, SMTP delivery, the IMAP appender, and the delete mutation are all
+ * mocked, so nothing connects, sends, or mutates a real server.
  */
 
 // Drafts-folder resolution (special-use → leaf-name → conventional) is covered by
@@ -20,17 +21,28 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({ uid: 7 as number | null })),
-  list: vi.fn(async () => [{ path: "Drafts", specialUse: "\\Drafts" }]),
+  list: vi.fn(async () => [{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]),
   logout: vi.fn(async () => undefined),
   close: vi.fn(),
   connect: vi.fn(),
-  sendMessage: vi.fn(async (_pool: unknown, _config: unknown, _req: unknown) => ({
-    rfcMessageId: "<sent@example.test>",
-    delivered: true,
-    appendedToSent: true,
-    appendedUid: 1,
-    sentFolderPath: "Sent",
-    warnings: [] as string[]
+  // sendDraft now RESENDS the draft's raw bytes: getRawMime → deliverSmtp → APPEND
+  // to Sent. The raw fetch and the SMTP submit are both mocked.
+  getRawMime: vi.fn(async (_pool: unknown, _config: unknown, _id: string) => ({
+    messageId: "draft-1",
+    raw: Buffer.from("From: user@example.test\r\n\r\nHello there"),
+    source: "fetch" as const,
+    truncated: false
+  })),
+  deliverSmtp: vi.fn(async (_creds: unknown, _raw: Buffer, _envelope: unknown, _config: unknown, _opts?: unknown) => undefined),
+  resolveSmtpCreds: vi.fn(async (_pool: unknown, _config: unknown, _account: unknown) => ({
+    host: "smtp.example.test",
+    port: 587,
+    secure: false,
+    username: "user@example.test",
+    password: "secret"
+  })),
+  assertSafeSmtpTarget: vi.fn(async (_host: string, _port: number, _secure: boolean, _opts?: unknown) => ({
+    isPrivateHost: false
   })),
   deleteMessage: vi.fn(async (_pool: unknown, _config: unknown, id: string, opts: { hard?: boolean }) => ({
     messageId: id,
@@ -47,6 +59,8 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
   return {
     ...actual,
+    deliverSmtp: mocks.deliverSmtp,
+    resolveSmtpCreds: mocks.resolveSmtpCreds,
     SentFolderAppender: {
       connect: vi.fn(async () => ({
         list: mocks.list,
@@ -58,7 +72,8 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../send.js", () => ({ sendMessage: mocks.sendMessage }));
+vi.mock("../content.js", () => ({ getRawMime: mocks.getRawMime }));
+vi.mock("../host-validation.js", () => ({ assertSafeSmtpTarget: mocks.assertSafeSmtpTarget }));
 vi.mock("../mailbox-mutations.js", () => ({ deleteMessage: mocks.deleteMessage }));
 
 vi.mock("../repository.js", () => ({
@@ -84,16 +99,19 @@ const account = {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.append.mockResolvedValue({ uid: 7 });
-  mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }]);
+  mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
   mocks.getAccount.mockResolvedValue(account);
-  mocks.sendMessage.mockResolvedValue({
-    rfcMessageId: "<sent@example.test>",
-    delivered: true,
-    appendedToSent: true,
-    appendedUid: 1,
-    sentFolderPath: "Sent",
-    warnings: []
+  mocks.getRawMime.mockResolvedValue({
+    messageId: "draft-1",
+    raw: Buffer.from("From: user@example.test\r\n\r\nHello there"),
+    source: "fetch",
+    truncated: false
   });
+  mocks.deliverSmtp.mockResolvedValue(undefined);
+  mocks.resolveSmtpCreds.mockResolvedValue({
+    host: "smtp.example.test", port: 587, secure: false, username: "user@example.test", password: "secret"
+  });
+  mocks.assertSafeSmtpTarget.mockResolvedValue({ isPrivateHost: false });
   mocks.deleteMessage.mockImplementation(async (_pool, _config, id: string, opts: { hard?: boolean }) => ({
     messageId: id, fromFolder: "Drafts", mode: opts.hard ? "expunge" : "trash", trashFolder: opts.hard ? null : "Trash"
   }));
@@ -118,7 +136,7 @@ describe("createDraft", () => {
     expect(result).toMatchObject({ accountId: "acc-1", draftsFolderPath: "Drafts", appendedUid: 7 });
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     // Create does NOT send or delete — it only files the draft.
-    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
@@ -255,56 +273,75 @@ describe("sendDraft", () => {
     selected_text_format: "plain"
   };
 
-  it("sends via the email-001 primitive then deletes the draft", async () => {
+  it("RESENDS the draft's raw bytes over SMTP, APPENDs them to Sent, then deletes the draft", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     const { sendDraft } = await import("../drafts.js");
     const result = await sendDraft(pool, config, "draft-1");
 
-    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
-    const sentReq = mocks.sendMessage.mock.calls[0][2];
-    expect(sentReq).toMatchObject({
-      accountId: "acc-1",
-      to: [{ email: "rcpt@example.test" }],
-      subject: "Hello",
-      body: { format: "plain", text: "Hello there" },
-      inReplyTo: "<orig@peer.test>",
-      references: "<orig@peer.test>"
-    });
+    // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
+    // parsed mirror fields — there is no SendRequest reconstruction anymore.
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1");
+    const rawBytes = mocks.getRawMime.mock.results[0].value as Promise<{ raw: Buffer }>;
+    const expectedRaw = (await rawBytes).raw;
+
+    // The SSRF guard runs before delivery (parity with the send path).
+    expect(mocks.assertSafeSmtpTarget).toHaveBeenCalledTimes(1);
+    // The EXACT fetched bytes are submitted over SMTP.
+    expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
+    const [, deliveredRaw, envelope] = mocks.deliverSmtp.mock.calls[0];
+    expect(Buffer.isBuffer(deliveredRaw)).toBe(true);
+    expect((deliveredRaw as Buffer).equals(expectedRaw)).toBe(true);
+    // Envelope recipients come from the SYNCED header fields (To + Cc), never the body.
+    expect(envelope).toMatchObject({ from: "user@example.test", to: ["rcpt@example.test"] });
+
+    // The SAME bytes are filed to Sent (resolved Sent folder).
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+    const [sentPath, sentRaw, sentFlags] = mocks.append.mock.calls[0];
+    expect(sentPath).toBe("Sent");
+    expect((sentRaw as Buffer).equals(expectedRaw)).toBe(true);
+    expect(sentFlags).toContain("\\Seen");
+
     // Delete happens AFTER the send.
     expect(mocks.deleteMessage).toHaveBeenCalledWith(pool, config, "draft-1", { hard: true });
-    const sendOrder = mocks.sendMessage.mock.invocationCallOrder[0];
+    const deliverOrder = mocks.deliverSmtp.mock.invocationCallOrder[0];
     const deleteOrder = mocks.deleteMessage.mock.invocationCallOrder[0];
-    expect(sendOrder).toBeLessThan(deleteOrder);
+    expect(deliverOrder).toBeLessThan(deleteOrder);
     expect(result).toMatchObject({ deletedDraftId: "draft-1", send: { delivered: true } });
   });
 
-  it("sends an HTML draft as real HTML (not a lossy htmlToText flattening)", async () => {
-    // An HTML-authored/synced draft: selected part is HTML and a stored HTML body
-    // carries the real markup. Send must deliver that HTML, not a flattened render.
-    const html = '<p>Hi <a href="https://supamail.test">link</a></p>';
-    const htmlRow = {
-      ...draftRow,
-      body_text: "Hi link https://supamail.test", // the lossy fallback that must NOT be sent
-      body_html: html,
-      selected_text_format: "html" as const
-    };
-    const pool = mockPoolReturningDraft(htmlRow);
+  it("SENT bytes CONTAIN the draft body — the regression that caused the empty send", async () => {
+    // The bug: a freshly created/updated draft whose body wasn't lazily fetched into
+    // the mirror yet (draft.body === null) used to send an EMPTY email because send
+    // rebuilt the SendRequest from the NULL mirror body. The fix resends the raw
+    // bytes, so the body survives even when the mirror body row is absent.
+    const knownBody = "Updated draft body that MUST survive";
+    const rawWithBody = Buffer.from(
+      `From: user@example.test\r\nTo: rcpt@example.test\r\nSubject: Hello\r\n\r\n${knownBody}`
+    );
+    mocks.getRawMime.mockResolvedValueOnce({
+      messageId: "draft-1", raw: rawWithBody, source: "fetch", truncated: false
+    });
+    // The mirror body is NULL (lazy body-fetch hasn't populated it) — the exact
+    // condition that produced the empty send under the old rebuild-from-mirror path.
+    const pool = mockPoolReturningDraft({ ...draftRow, body_text: null, body_plain: null, selected_text_part: null });
     const { sendDraft } = await import("../drafts.js");
     await sendDraft(pool, config, "draft-1");
 
-    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
-    const sentReq = mocks.sendMessage.mock.calls[0][2] as { body: { format: string; html?: string } };
-    expect(sentReq.body.format).toBe("html");
-    expect(sentReq.body.html).toBe(html);
-    // The flattened plaintext is never substituted for the real HTML.
-    expect(sentReq.body).not.toMatchObject({ format: "plain" });
+    // The bytes submitted over SMTP CONTAIN the real body.
+    const [, deliveredRaw] = mocks.deliverSmtp.mock.calls[0];
+    expect((deliveredRaw as Buffer).toString("utf8")).toContain(knownBody);
+    // The Sent-APPEND got the IDENTICAL bytes (same body).
+    const [, sentRaw] = mocks.append.mock.calls[0];
+    expect((sentRaw as Buffer).toString("utf8")).toContain(knownBody);
+    expect((sentRaw as Buffer).equals(deliveredRaw as Buffer)).toBe(true);
   });
 
-  it("refuses to send a draft with no recipients (and does not delete)", async () => {
+  it("refuses to send a draft with no recipients (and does not deliver or delete)", async () => {
     const pool = mockPoolReturningDraft({ ...draftRow, to_emails: [] });
     const { sendDraft } = await import("../drafts.js");
     await expect(sendDraft(pool, config, "draft-1")).rejects.toThrow(/no recipients/);
-    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.getRawMime).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
@@ -312,7 +349,7 @@ describe("sendDraft", () => {
     const pool = mockPoolReturningDraft(null);
     const { sendDraft } = await import("../drafts.js");
     await expect(sendDraft(pool, config, "missing")).rejects.toThrow(/Draft not found/);
-    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
   });
 
   // ── Review PR-A (decision 1): the post-send cleanup is best-effort. The send
@@ -325,13 +362,26 @@ describe("sendDraft", () => {
 
     const result = await sendDraft(pool, config, "draft-1");
     // The send happened and is reported delivered — no throw.
-    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
     expect(result.send.delivered).toBe(true);
     expect(result.deletedDraftId).toBe("draft-1");
     expect(result.draftDeleted).toBe(false);
     expect(result.warnings.join(" ")).toMatch(/removing the draft from Drafts failed/i);
     // The warning is also threaded onto the nested SendResult.
     expect(result.send.warnings.join(" ")).toMatch(/removing the draft/i);
+  });
+
+  it("STILL reports delivered when the Sent-APPEND fails (best-effort filing)", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    // The Sent APPEND rejects AFTER a successful delivery — must not throw.
+    mocks.append.mockRejectedValueOnce(new Error("APPEND to Sent failed"));
+    const { sendDraft } = await import("../drafts.js");
+
+    const result = await sendDraft(pool, config, "draft-1");
+    expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
+    expect(result.send.delivered).toBe(true);
+    expect(result.send.appendedToSent).toBe(false);
+    expect(result.warnings.join(" ")).toMatch(/filing to Sent failed/i);
   });
 
   it("reports draftDeleted=true and no cleanup warning on the happy path", async () => {

@@ -1,13 +1,14 @@
 import type { AppConfig } from "./config.js";
+import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
 import { NoRecipientsError, NotFoundError } from "./errors.js";
+import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
 import { deleteMessage } from "./mailbox-mutations.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
-import { sendMessage } from "./send.js";
-import { SentFolderAppender, buildRawMime } from "./smtp-client.js";
-import type { ImapAccount, SendRecipient, SendRequest, SendResult } from "./types.js";
+import { SentFolderAppender, buildRawMime, deliverSmtp, resolveSmtpCreds } from "./smtp-client.js";
+import type { ImapAccount, SendRequest, SendResult } from "./types.js";
 
 /**
  * Full draft CRUD saved to the provider Drafts folder (email-003, ADR 0019).
@@ -20,9 +21,11 @@ import type { ImapAccount, SendRecipient, SendRequest, SendResult } from "./type
  * - Update  = APPEND-new + delete-old. IMAP drafts are immutable (a message has a
  *   server-assigned UID and cannot be edited in place), so an update files a fresh
  *   draft and hard-deletes the previous one (email-002 `deleteMessage(hard)`).
- * - Send    = load the draft from the mirror → `sendMessage` (email-001) → delete
- *   the draft. The SMTP path is NOT duplicated; we feed sendMessage a SendRequest
- *   reconstructed from the stored draft.
+ * - Send    = RESEND the draft's real raw RFC-822 bytes (a true round-trip): fetch
+ *   the stored bytes (email-004 `getRawMime`), submit them over SMTP (email-001
+ *   `deliverSmtp` + the same SSRF/TLS guards), APPEND the same bytes to Sent, then
+ *   delete the draft. NOT a rebuild from the mirror's parsed body — that lost the
+ *   body when it hadn't been lazily fetched yet (see ADR 0019, revised).
  * - Delete  = email-002 `deleteMessage` (reuses the capability-gated mutation).
  *
  * This module lives OUTSIDE src/mcp/ on purpose: the agent surface is zero-send /
@@ -33,12 +36,15 @@ import type { ImapAccount, SendRecipient, SendRequest, SendResult } from "./type
  */
 
 /** What a draft create/update carries — a SendRequest minus `bcc` and
- * `attachments`. Neither can round-trip through the APPENDed draft bytes: nodemailer's
- * keepBcc default omits Bcc from the composed MIME, and `sendDraft` rebuilds the
- * SendRequest from the parsed mirror fields (attachment bytes are never mirrored), so
- * an attachment on a saved draft would be silently dropped on send. Both are therefore
- * send-time-only fields — set them on the `sendMessage` envelope, not on a draft (see
- * ADR 0019 / 0020). `accountId` selects the mailbox whose Drafts folder we file to. */
+ * `attachments`. Bcc can't round-trip the APPENDed bytes (nodemailer's keepBcc
+ * default omits it from the composed MIME). Attachments aren't carried into our
+ * OWN drafts either: createDraft/updateDraft compose the bytes via `buildRawMime`
+ * from this input, which has no attachment-bytes field, so accepting `attachments`
+ * here would silently file a draft WITHOUT them. (sendDraft now resends the draft's
+ * RAW bytes — see ADR 0019 — so a provider-composed draft with attachments would
+ * round-trip; but SupaMail-authored drafts still can't carry them at create time.)
+ * Both stay send-time-only — set them on the send envelope, not on a draft (ADR
+ * 0019 / 0020). `accountId` selects the mailbox whose Drafts folder we file to. */
 export type DraftInput = Omit<SendRequest, "bcc" | "attachments">;
 
 /** Reject a Bcc smuggled past the type system (e.g. an untyped HTTP/JSON caller).
@@ -50,9 +56,11 @@ function rejectBcc(input: unknown): void {
 }
 
 /** Reject attachments smuggled past the type system (e.g. an untyped HTTP/JSON
- * caller). A draft composes its bytes once at APPEND time, but `sendDraft` rebuilds
- * the SendRequest from parsed mirror fields (attachment bytes are never mirrored), so
- * an attachment on a saved draft is dropped on send — refuse it loudly instead. */
+ * caller). createDraft/updateDraft compose the draft bytes via `buildRawMime` from
+ * this input, which carries no attachment bytes, so an attachment passed here would
+ * be silently dropped from the saved draft — refuse it loudly instead. (Attach
+ * files on the send envelope; sendDraft resends the real raw bytes, so a draft
+ * composed elsewhere WITH attachments still round-trips on send.) */
 function rejectAttachments(input: unknown): void {
   if (input && typeof input === "object" && (input as { attachments?: unknown }).attachments !== undefined) {
     throw new Error("Attachments are not supported on saved drafts — attach files when you send the draft");
@@ -384,10 +392,26 @@ export async function updateDraft(
 }
 
 /**
- * Send a draft: load it from the mirror, reconstruct a SendRequest (To/Cc/Subject
- * + body + threading headers), send it via the email-001 `sendMessage` primitive
- * (which delivers over SMTP and files a copy to Sent), then delete the draft from
- * Drafts. The SMTP path is reused, never duplicated.
+ * Send a draft by RESENDING its real RFC-822 bytes — a true round-trip, NOT a
+ * rebuild from the mirror's parsed fields (ADR 0019, revised).
+ *
+ * The old path reconstructed a `SendRequest` from `getDraft`'s parsed body
+ * (`draft.body` / `draft.bodyHtml`). Under lazy body-fetch a freshly created or
+ * updated draft's BODY may not be mirrored yet (`body` NULL) even though its
+ * headers/recipients are — so the rebuild SENT AN EMPTY EMAIL. The fix sends the
+ * draft's actual stored bytes, so body + HTML + formatting (and provider-composed
+ * attachments) survive by construction and the mirror-body dependence is gone.
+ *
+ * Flow:
+ *  1. `getRawMime` returns the draft's raw bytes — the mirrored `raw_mime`, or an
+ *     on-demand UIDVALIDITY-guarded IMAP FETCH from the draft's Drafts folder+UID
+ *     (folder/uid/uidvalidity are reliably synced even when the body isn't).
+ *  2. `deliverSmtp` submits those EXACT bytes (reusing `resolveSmtpCreds` +
+ *     `assertSafeSmtpTarget` SSRF guard + the requireTLS logic from the send path).
+ *     The envelope `to` = the draft's synced header recipients (To + Cc) — never the
+ *     lazy body — so recipient handling stays safe.
+ *  3. The SAME bytes are APPENDed to Sent (reuse `SentFolderAppender`), as send does.
+ *  4. The draft is best-effort hard-deleted from Drafts.
  */
 export async function sendDraft(
   pool: PgPool,
@@ -400,27 +424,64 @@ export async function sendDraft(
     throw new NoRecipientsError(`Draft ${messageId} has no recipients; add a To address before sending`);
   }
 
-  const to: SendRecipient[] = draft.toEmails.map((email) => ({ email }));
-  const cc: SendRecipient[] = draft.ccEmails.map((email) => ({ email }));
-  // Preserve the draft's body format. An HTML-authored (or HTML-synced) draft is
-  // sent as real HTML — flattening it to htmlTo(text) would silently lose links and
-  // formatting. Only a plaintext draft (or an HTML draft with no stored HTML body)
-  // goes out as plain. See ADR 0019.
-  const body: SendRequest["body"] =
-    draft.isHtml && draft.bodyHtml !== null
-      ? { format: "html", html: draft.bodyHtml }
-      : { format: "plain", text: draft.body ?? "" };
-  const request: SendRequest = {
-    accountId: draft.accountId,
-    to,
-    cc: cc.length > 0 ? cc : undefined,
-    subject: draft.subject ?? "",
-    body,
-    inReplyTo: draft.inReplyTo ?? undefined,
-    references: draft.references ?? undefined
-  };
+  const repository = new MirrorRepository(pool, config);
+  const account = await repository.getAccount(draft.accountId);
+  if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.accountId}`);
 
-  const send = await sendMessage(pool, config, request);
+  // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
+  // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real body
+  // + HTML + formatting (and provider-composed attachments) regardless of whether
+  // the body has been lazily fetched into the mirror yet.
+  const { raw } = await getRawMime(pool, config, messageId);
+
+  // Resolve SMTP creds + run the SSRF guard exactly as send.ts does.
+  const creds = await resolveSmtpCreds(pool, config, account);
+  const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
+    allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
+  });
+
+  // Envelope recipients come from the SYNCED header fields only (never the lazy
+  // body): MAIL FROM = the account email, RCPT TO = the draft's To + Cc.
+  const envelope = { from: account.email_address, to: [...draft.toEmails, ...draft.ccEmails] };
+
+  // Submit the EXACT draft bytes. STARTTLS enforcement matches the send path: a
+  // public host always requires TLS even under IMAP_ALLOW_PRIVATE_HOSTS; it relaxes
+  // only when the target resolved private/loopback.
+  await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
+
+  // Delivery succeeded; file the IDENTICAL bytes to Sent (mirrors send.ts). An
+  // APPEND failure here is non-fatal — the mail is already sent and the next sync
+  // recovers a copy if the provider auto-filed it.
+  const warnings: string[] = [];
+  let appendedToSent = false;
+  let appendedUid: number | null = null;
+  let sentFolderPath: string | null = null;
+  let appender: SentFolderAppender | null = null;
+  try {
+    appender = await SentFolderAppender.connect(pool, config, account);
+    const profile = getProviderProfile(account.provider_profile);
+    const mailboxes = await appender.list();
+    sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
+    const result = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
+    appendedToSent = true;
+    appendedUid = result.uid;
+  } catch (error) {
+    warnings.push(
+      `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
+    );
+  } finally {
+    if (appender) await closeImap(appender);
+  }
+
+  const send: SendResult = {
+    // The resent bytes carry the draft's ORIGINAL Message-ID (no recompose).
+    rfcMessageId: draft.rfcMessageId ?? "",
+    delivered: true,
+    appendedToSent,
+    appendedUid,
+    sentFolderPath,
+    warnings
+  };
 
   // The mail is sent and filed to Sent; remove the draft so it doesn't linger.
   // Hard-delete (reuse email-002) — a sent draft is gone, not trashed. CRITICAL:
@@ -429,7 +490,6 @@ export async function sendDraft(
   // delivered send into a thrown failure (which would invite a duplicate re-send).
   // We downgrade it to a warning and still report delivered; the leftover draft
   // self-heals on the next Drafts sync. (Mirrors send.ts's best-effort Sent-APPEND.)
-  const warnings = [...send.warnings];
   let draftDeleted = true;
   try {
     await deleteMessage(pool, config, messageId, { hard: true });
