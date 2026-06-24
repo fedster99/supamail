@@ -432,7 +432,15 @@ export async function sendDraft(
   // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real body
   // + HTML + formatting (and provider-composed attachments) regardless of whether
   // the body has been lazily fetched into the mirror yet.
-  const { raw } = await getRawMime(pool, config, messageId);
+  const { raw, truncated } = await getRawMime(pool, config, messageId);
+  if (truncated) {
+    // Fail closed: getRawMime caps at BODY_RAW_MAX_BYTES, so these bytes are
+    // incomplete — submitting them would deliver a corrupt/truncated MIME. Refuse
+    // before any SMTP submit. (send.ts can't hit this; it composes its own bytes.)
+    throw new Error(
+      `Draft ${messageId} raw MIME exceeds the fetch cap and would be truncated; refusing to send a corrupt message.`
+    );
+  }
 
   // Resolve SMTP creds + run the SSRF guard exactly as send.ts does.
   const creds = await resolveSmtpCreds(pool, config, account);

@@ -352,6 +352,28 @@ describe("sendDraft", () => {
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
   });
 
+  it("fails closed when the draft raw MIME is truncated (never submits a corrupt message)", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    // getRawMime hit the BODY_RAW_MAX_BYTES cap → the bytes are incomplete.
+    mocks.getRawMime.mockResolvedValueOnce({
+      messageId: "draft-1", raw: Buffer.from("From: user@example.test\r\n\r\npartial"), source: "fetch", truncated: true
+    });
+    const { sendDraft } = await import("../drafts.js");
+    await expect(sendDraft(pool, config, "draft-1")).rejects.toThrow(/truncated/i);
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("does NOT submit over SMTP when the raw fetch fails (fail closed — no empty/garbage send)", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    // e.g. a UIDVALIDITY mismatch, or the draft vanished from the Drafts folder.
+    mocks.getRawMime.mockRejectedValueOnce(new Error("UIDVALIDITY changed for Drafts"));
+    const { sendDraft } = await import("../drafts.js");
+    await expect(sendDraft(pool, config, "draft-1")).rejects.toThrow(/UIDVALIDITY/);
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
   // ── Review PR-A (decision 1): the post-send cleanup is best-effort. The send
   //    is irreversible, so a delete failure must NEVER throw a delivered send. ─
   it("STILL reports delivered when the post-send draft delete rejects (best-effort cleanup)", async () => {
