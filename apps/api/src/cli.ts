@@ -7,7 +7,8 @@ import { MirrorEngine } from "./sync-engine.js";
 import { searchMessages } from "./search/index.js";
 import type { SearchRequest, SearchSort } from "./search/index.js";
 import { runDraftReply, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
-import type { WindowStatus } from "./types.js";
+import { sendMessage } from "./send.js";
+import type { SendRecipient, SendRequest, WindowStatus } from "./types.js";
 
 const program = new Command();
 const config = getConfig();
@@ -39,6 +40,11 @@ program
   .option("--profile <profile>", "Provider profile", "generic-imap")
   .option("--insecure", "Use plaintext IMAP instead of TLS")
   .option("--body-policy <policy>", "immediate, lazy, or priority_then_backfill")
+  .option("--smtp-host <host>", "SMTP host (defaults to provider profile or omitted)")
+  .option("--smtp-port <port>", "SMTP port (e.g. 465 implicit TLS, 587 STARTTLS)")
+  .option("--smtp-insecure", "Use STARTTLS (port 587) instead of implicit TLS")
+  .option("--smtp-username <username>", "SMTP username (defaults to IMAP username)")
+  .option("--smtp-password <password>", "SMTP password (defaults to IMAP password)")
   .action(async (options) => {
     const account = await repository.createAccount({
       emailAddress: options.email,
@@ -47,6 +53,11 @@ program
       secure: !options.insecure,
       username: options.username,
       password: options.password,
+      smtpHost: options.smtpHost,
+      smtpPort: options.smtpPort === undefined ? undefined : Number(options.smtpPort),
+      smtpSecure: options.smtpHost ? !options.smtpInsecure : undefined,
+      smtpUsername: options.smtpUsername,
+      smtpPassword: options.smtpPassword,
       providerProfile: options.profile,
       bodyFetchPolicy: options.bodyPolicy
     });
@@ -211,6 +222,89 @@ program
       body: options.body,
       reply_all: Boolean(options.replyAll)
     });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+const parseRecipients = (values: string[]): SendRecipient[] =>
+  values.map((value) => {
+    const match = value.match(/^\s*(.*?)\s*<\s*([^>]+?)\s*>\s*$/);
+    if (match) return { name: match[1] || undefined, email: match[2] };
+    return { email: value.trim() };
+  });
+
+// The operator IS the human-in-the-loop, so the explicit --confirm flag is the
+// send gate (no token dance, unlike the cloud MCP two-phase confirm). Both verbs
+// refuse without it and call the shared sendMessage primitive.
+program
+  .command("send")
+  .description("Compose and send a new message over SMTP, filing a copy to Sent (requires --confirm)")
+  .requiredOption("--account-id <id>", "Account UUID to send from")
+  .requiredOption("--to <addr>", "Recipient (repeatable; 'Name <email>' or 'email')", collect, [])
+  .requiredOption("--subject <text>", "Subject line")
+  .requiredOption("--body <text>", "Plain-text body")
+  .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
+  .option("--bcc <addr>", "Bcc recipient (repeatable)", collect, [])
+  .option("--confirm", "Required human confirmation; without it nothing is sent")
+  .action(async (options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to send without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const request: SendRequest = {
+      accountId: options.accountId,
+      to: parseRecipients(options.to as string[]),
+      cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
+      bcc: (options.bcc as string[]).length > 0 ? parseRecipients(options.bcc as string[]) : undefined,
+      subject: options.subject,
+      body: { format: "plain", text: options.body }
+    };
+    const result = await sendMessage(pool, config, request);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("reply <sourceMessageId>")
+  .description("Reply to a mirrored message over SMTP with correct threading (requires --confirm)")
+  .requiredOption("--body <text>", "The reply text")
+  .option("--reply-all", "Include the original To+Cc (minus self) as Cc")
+  .option("--confirm", "Required human confirmation; without it nothing is sent")
+  .action(async (sourceMessageId: string, options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to send without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    // Resolve which account to send from BEFORE producing the draft: the reply
+    // must go out from the mailbox the source message belongs to.
+    const source = await repository.getMessage(sourceMessageId);
+    if (!source) {
+      process.stderr.write(`No mirrored message with id ${sourceMessageId}.\n`);
+      process.exitCode = 1;
+      return;
+    }
+    // Reuse the produce-only draft (correct To/Cc/Subject + threading headers,
+    // incl. the NULL provider_thread_id generic-IMAP path) and just send it.
+    const draft = await runDraftReply(pool, {
+      source_message_id: sourceMessageId,
+      body: options.body,
+      reply_all: Boolean(options.replyAll)
+    });
+    if ("error" in draft) {
+      console.log(JSON.stringify(draft, null, 2));
+      process.exitCode = 1;
+      return;
+    }
+    const request: SendRequest = {
+      accountId: source.account_id,
+      to: draft.to,
+      cc: draft.cc.length > 0 ? draft.cc : undefined,
+      subject: draft.subject,
+      body: { format: "plain", text: draft.body.text },
+      inReplyTo: draft.headers["In-Reply-To"],
+      references: draft.headers.References
+    };
+    const result = await sendMessage(pool, config, request);
     console.log(JSON.stringify(result, null, 2));
   });
 

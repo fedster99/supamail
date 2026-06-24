@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0008_search_layer",
+  "schemaVersion": "0009_smtp_send",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -32,6 +32,10 @@
     {
       "id": "0008_search_layer",
       "file": "0008_search_layer.sql"
+    },
+    {
+      "id": "0009_smtp_send",
+      "file": "0009_smtp_send.sql"
     }
   ]
 }

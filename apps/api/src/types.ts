@@ -19,6 +19,11 @@ export interface ImapAccount {
   secure: boolean;
   username: string;
   encrypted_password: Buffer;
+  smtp_host: string | null;
+  smtp_port: number | null;
+  smtp_secure: boolean | null;
+  smtp_username: string | null;
+  encrypted_smtp_password: Buffer | null;
   body_fetch_policy: BodyFetchPolicy;
   live_window_days: LiveWindowDays;
   historical_backfill_mode: HistoricalBackfillMode;
@@ -273,8 +278,51 @@ export interface CreateAccountInput {
   secure?: boolean;
   username: string;
   password: string;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpSecure?: boolean;
+  smtpUsername?: string;
+  smtpPassword?: string;
   providerProfile?: string;
   bodyFetchPolicy?: BodyFetchPolicy;
+}
+
+/** One send recipient. `name` is optional; nodemailer formats `Name <email>`. */
+export interface SendRecipient {
+  email: string;
+  name?: string;
+}
+
+/**
+ * The canonical send superset. A reply is `sendMessage()` fed the draft payload
+ * (To/Subject + In-Reply-To/References); a brand-new message is the same call
+ * with no threading headers. "Build once," exposed as two product verbs.
+ */
+export interface SendRequest {
+  accountId: string;
+  to: SendRecipient[];
+  cc?: SendRecipient[];
+  bcc?: SendRecipient[];
+  subject: string;
+  body: { format: "plain" | "html"; text?: string; html?: string };
+  /** In-Reply-To / References / custom headers (merged with the convenience fields below). */
+  headers?: Record<string, string>;
+  inReplyTo?: string;
+  references?: string;
+  /** Caller-supplied for a stable Message-ID; else one is generated at compose time. */
+  messageId?: string;
+  // attachments?: ... deferred to email-004
+}
+
+export interface SendResult {
+  /** The Message-ID actually stamped on the delivered + filed bytes. */
+  rfcMessageId: string;
+  delivered: boolean;
+  appendedToSent: boolean;
+  /** From UIDPLUS APPENDUID when available, else null. */
+  appendedUid: number | null;
+  sentFolderPath: string | null;
+  warnings: string[];
 }
 
 export interface UpdateAccountSettingsInput {

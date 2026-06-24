@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { assertSafeImapTarget, HostValidationError, isPrivateOrReservedIp } from "../host-validation.js";
+import {
+  assertSafeImapTarget,
+  assertSafeSmtpTarget,
+  HostValidationError,
+  isPrivateOrReservedIp
+} from "../host-validation.js";
 
 const STRICT = { allowPrivateHosts: false };
 const PERMISSIVE = { allowPrivateHosts: true };
@@ -76,5 +81,43 @@ describe("assertSafeImapTarget", () => {
     await expect(
       assertSafeImapTarget("fake.imap.local", 143, false, PERMISSIVE)
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("assertSafeSmtpTarget", () => {
+  it("accepts a public IP literal on a permitted submission port", async () => {
+    await expect(assertSafeSmtpTarget("8.8.8.8", 465, true, STRICT)).resolves.toBeUndefined();
+    await expect(assertSafeSmtpTarget("8.8.8.8", 587, false, STRICT)).resolves.toBeUndefined();
+    await expect(assertSafeSmtpTarget("8.8.8.8", 25, false, STRICT)).resolves.toBeUndefined();
+  });
+
+  it("rejects non-SMTP ports (port check runs before DNS)", async () => {
+    await expect(assertSafeSmtpTarget("8.8.8.8", 993, true, STRICT)).rejects.toBeInstanceOf(HostValidationError);
+    await expect(assertSafeSmtpTarget("8.8.8.8", 80, true, STRICT)).rejects.toBeInstanceOf(HostValidationError);
+  });
+
+  it("does NOT gate STARTTLS (secure=false) the way plaintext IMAP is gated", async () => {
+    // secure=false on SMTP means STARTTLS, a TLS upgrade — allowed on a public host.
+    await expect(assertSafeSmtpTarget("8.8.8.8", 587, false, STRICT)).resolves.toBeUndefined();
+  });
+
+  it("rejects IP-literal private/metadata targets (SSRF guard)", async () => {
+    await expect(assertSafeSmtpTarget("169.254.169.254", 465, true, STRICT)).rejects.toThrow(/private|reserved/i);
+    await expect(assertSafeSmtpTarget("10.0.0.1", 465, true, STRICT)).rejects.toThrow(/private|reserved/i);
+    await expect(assertSafeSmtpTarget("127.0.0.1", 587, false, STRICT)).rejects.toThrow(/private|reserved/i);
+    await expect(assertSafeSmtpTarget("::1", 465, true, STRICT)).rejects.toThrow(/private|reserved/i);
+  });
+
+  it("rejects localhost by name", async () => {
+    await expect(assertSafeSmtpTarget("localhost", 465, true, STRICT)).rejects.toThrow(/localhost/);
+  });
+
+  it("permits private targets when explicitly opted in", async () => {
+    await expect(assertSafeSmtpTarget("127.0.0.1", 3025, false, PERMISSIVE)).resolves.toBeUndefined();
+    await expect(assertSafeSmtpTarget("localhost", 465, true, PERMISSIVE)).resolves.toBeUndefined();
+  });
+
+  it("does not do DNS when permissive (so dry-run fake hostnames are fine)", async () => {
+    await expect(assertSafeSmtpTarget("fake.smtp.local", 587, false, PERMISSIVE)).resolves.toBeUndefined();
   });
 });
