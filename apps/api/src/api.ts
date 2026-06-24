@@ -1,12 +1,14 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { getConfig, type AppConfig } from "./config.js";
 import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
+import { NoRecipientsError, NotFoundError, UnfetchableContentError } from "./errors.js";
 import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
@@ -44,7 +46,9 @@ import {
   createFolder,
   deleteFolder,
   deleteMessage,
+  MailboxCapabilityError,
   MailboxConflictError,
+  MailboxMutationError,
   moveMessage,
   moveThread,
   renameFolder,
@@ -162,9 +166,27 @@ const SEND_RECIPIENT_SCHEMA = z.object({
   name: z.string().max(255).optional()
 });
 
+// A header-safe string: no CR/LF, so a value can never break out of its header
+// line and inject extra headers when it reaches the MIME composer. nodemailer 9
+// strips newlines today, but we reject at the edge so the wire-byte safety is
+// not solely external (defense in depth; see the review CRLF finding).
+const NO_CRLF = (v: string) => !/[\r\n]/.test(v);
+const CRLF_MSG = "must not contain CR or LF characters";
+const headerSafe = (max: number) => z.string().max(max).refine(NO_CRLF, CRLF_MSG);
+// A record whose values are all header-safe (custom headers).
+const HEADER_RECORD = z.record(z.string().refine(NO_CRLF, CRLF_MSG));
+
 // Cap a single base64 attachment payload at ~25MB of decoded bytes (the same
 // BODY_RAW_MAX_BYTES ceiling reads use); base64 inflates ~4/3, so ~34MB encoded.
 const MAX_ATTACHMENT_BASE64_LEN = 34 * 1024 * 1024;
+
+// Whole-request ceiling for BOTH send transports (JSON base64 + multipart). This
+// is enforced by a Hono bodyLimit BEFORE the body is buffered by parseBody/json(),
+// so an oversized request is rejected with 413 without first materializing
+// hundreds of MB on the single shared Node process (the OOM the review flagged).
+// One attachment under MAX_ATTACHMENT_BASE64_LEN (~34MB) plus envelope fits; this
+// bounds the aggregate, not each part. JSON (the default) is the worst case.
+const MAX_SEND_BODY_BYTES = 35 * 1024 * 1024;
 
 // One outbound attachment (email-004). `content` is base64 of the raw bytes; `cid`
 // makes it an inline image referenced from the HTML body as `cid:<value>`.
@@ -187,10 +209,10 @@ const SEND_SCHEMA = z.object({
     text: z.string().optional(),
     html: z.string().optional()
   }),
-  headers: z.record(z.string()).optional(),
-  inReplyTo: z.string().max(2000).optional(),
-  references: z.string().max(8000).optional(),
-  messageId: z.string().max(2000).optional(),
+  headers: HEADER_RECORD.optional(),
+  inReplyTo: headerSafe(2000).optional(),
+  references: headerSafe(8000).optional(),
+  messageId: headerSafe(2000).optional(),
   attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
 });
 
@@ -222,10 +244,10 @@ const DRAFT_SCHEMA = z.object({
     text: z.string().optional(),
     html: z.string().optional()
   }),
-  headers: z.record(z.string()).optional(),
-  inReplyTo: z.string().max(2000).optional(),
-  references: z.string().max(8000).optional(),
-  messageId: z.string().max(2000).optional(),
+  headers: HEADER_RECORD.optional(),
+  inReplyTo: headerSafe(2000).optional(),
+  references: headerSafe(8000).optional(),
+  messageId: headerSafe(2000).optional(),
   attachments: z.any().optional().refine((v) => v === undefined, {
     message: "Attachments are not supported on saved drafts — attach files when you send the draft"
   })
@@ -263,15 +285,23 @@ const SEARCH_QUERY_SCHEMA = z.object({
   window: WINDOW_ENUM.optional(),
   sort: z.enum(["smart", "relevance", "recent", "oldest", "size", "sender"]).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
-  offset: z.coerce.number().int().min(0).optional(),
+  // Cap offset: deep OFFSET in the no-candidate-cap structured path scans/scores/
+  // discards every prior row (bounded only by statement_timeout). A few thousand
+  // is far past any real "page through results" use; beyond it, narrow with
+  // filters instead. (Keyset pagination is the longer-term fix — see ADR 0015.)
+  offset: z.coerce.number().int().min(0).max(5000).optional(),
   include_body: BOOL_PARAM.optional(),
   include_deleted: BOOL_PARAM.optional()
 });
 
 // Organize mutations (email-002). A flag token is a SupaMail short name
 // (seen/flagged/…), a bare keyword, or a `\`-prefixed system flag. At least one
-// of add/remove must be present.
-const FLAG_TOKEN = z.string().min(1).max(64);
+// of add/remove must be present. Charset is constrained to a single optional
+// leading backslash + alphanumerics/underscore/hyphen so a token like
+// `\Junk Foo` or one carrying control chars can never reach imapflow's STORE.
+const FLAG_TOKEN = z.string().min(1).max(64).regex(/^\\?[A-Za-z0-9_-]+$/, {
+  message: "Flag token must be a single optional leading backslash followed by letters, digits, underscore, or hyphen"
+});
 const FLAGS_SCHEMA = z.object({
   add: z.array(FLAG_TOKEN).max(16).optional(),
   remove: z.array(FLAG_TOKEN).max(16).optional()
@@ -323,13 +353,6 @@ const ACCOUNT_SETTINGS_SCHEMA = z.object({
     });
   }
 });
-
-class NotFoundError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "NotFoundError";
-  }
-}
 
 async function parseJsonBody(c: Context): Promise<unknown> {
   try {
@@ -449,6 +472,16 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (err instanceof NotFoundError) {
       return c.json({ error: "not_found", message: err.message }, 404);
     }
+    if (err instanceof NoRecipientsError) {
+      // A send/send-draft with no deliverable recipient — a malformed request,
+      // not a server fault. 400, not 500.
+      return c.json({ error: "no_recipients", message: err.message }, 400);
+    }
+    if (err instanceof UnfetchableContentError) {
+      // Content known in metadata but not fetchable (e.g. an attachment row with
+      // no BODYSTRUCTURE part number). A permanent condition: 422, not 500.
+      return c.json({ error: "content_unfetchable", message: err.message }, 422);
+    }
     if (err instanceof FolderTrackingRejectedError) {
       return c.json({ error: err.code, message: err.message }, 400);
     }
@@ -456,6 +489,19 @@ export function createApiApp(options: ApiAppOptions): Hono {
       // UIDVALIDITY moved underneath us — the request was well-formed, the server
       // state changed. 409 Conflict, not 500.
       return c.json({ error: "mailbox_conflict", message: err.message }, 409);
+    }
+    if (err instanceof MailboxCapabilityError) {
+      // The IMAP server can't perform this verb safely (no UIDPLUS/MOVE — the
+      // long-tail providers this product targets). A permanent refusal, not a
+      // transient fault: 422 Unprocessable Entity with the actionable message,
+      // not a 500 that invites a retry.
+      return c.json({ error: "capability_unsupported", message: err.message }, 422);
+    }
+    if (err instanceof MailboxMutationError) {
+      // A STORE/MOVE/EXPUNGE returned a server-side failure (imapflow signals
+      // these as false/empty). The upstream IMAP server failed to apply the
+      // verb — 502 Bad Gateway, not a generic 500.
+      return c.json({ error: "mailbox_mutation_failed", message: err.message }, 502);
     }
     if (err instanceof z.ZodError) {
       return c.json({ error: "invalid_input", issues: err.issues }, 400);
@@ -673,7 +719,16 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ body: result.body, truncated: result.truncated });
   });
 
-  app.post("/accounts/:id/send", async (c) => {
+  // Bound the WHOLE send request before any buffering (bodyLimit reads
+  // Content-Length / streams with a cap and 413s past MAX_SEND_BODY_BYTES),
+  // covering BOTH the JSON base64 and multipart transports so neither can OOM the
+  // shared Node process by buffering hundreds of MB ahead of the per-part checks.
+  const sendBodyLimit = bodyLimit({
+    maxSize: MAX_SEND_BODY_BYTES,
+    onError: (c) => c.json({ error: "request_too_large" }, 413)
+  });
+
+  app.post("/accounts/:id/send", sendBodyLimit, async (c) => {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);

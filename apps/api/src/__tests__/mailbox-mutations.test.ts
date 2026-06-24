@@ -246,3 +246,98 @@ describe("folder CRUD", () => {
     expect(mutator.createFolder).not.toHaveBeenCalled();
   });
 });
+
+// ── Review PR-A: thread fan-out cap + interleaved write-through ────────────
+describe("setThreadFlags / moveThread fan-out", () => {
+  const seedRow = {
+    id: "msg-1",
+    provider_thread_id: "thread-1",
+    rfc_message_id: "<m1@x>",
+    message_id_normalized: "m1@x",
+    in_reply_to: null,
+    references_header: null,
+    account_id: "acc-1"
+  };
+
+  /** A pool whose first query returns the seed row and whose second returns the
+   * supplied member rows (the LIMIT is applied client-side by resolveThreadTargets,
+   * so we hand back exactly what a `LIMIT n` would). */
+  function poolReturningMembers(members: Array<Record<string, unknown>>): never {
+    let call = 0;
+    const client = {
+      query: vi.fn(async () => {
+        call += 1;
+        return call === 1 ? { rows: [seedRow] } : { rows: members };
+      }),
+      release: vi.fn()
+    };
+    return { connect: vi.fn(async () => client) } as unknown as never;
+  }
+
+  function members(n: number): Array<Record<string, unknown>> {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `msg-${i + 1}`,
+      account_id: "acc-1",
+      folder_path: "INBOX",
+      uidvalidity: "100",
+      uid: String(i + 1)
+    }));
+  }
+
+  it("caps the fan-out at 100 members and flags the result truncated when the thread is larger", async () => {
+    // resolveThreadTargets fetches MAX+1 (101) to detect truncation, then slices to 100.
+    const pool = poolReturningMembers(members(101));
+    const { setThreadFlags } = await import("../mailbox-mutations.js");
+    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+
+    expect(result.messageCount).toBe(100);
+    expect(result.truncated).toBe(true);
+    // One STORE per acted-on member (interleaved with the write-through).
+    expect(mutator.addFlags).toHaveBeenCalledTimes(100);
+    expect(repo.applyMessageFlags).toHaveBeenCalledTimes(100);
+  });
+
+  it("does not truncate a small thread and applies the verb to every member", async () => {
+    const pool = poolReturningMembers(members(3));
+    const { setThreadFlags } = await import("../mailbox-mutations.js");
+    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+    expect(result.messageCount).toBe(3);
+    expect(result.truncated).toBe(false);
+    expect(mutator.addFlags).toHaveBeenCalledTimes(3);
+  });
+
+  it("interleaves the write-through so an earlier member's mirror write persists before a mid-thread STORE failure", async () => {
+    const pool = poolReturningMembers(members(3));
+    // The 2nd member's STORE fails — the 1st member's write-through must already
+    // have run (interleaved), unlike the old STORE-all-then-write-all shape.
+    mutator.addFlags
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce(new Error("STORE failed"));
+    const { setThreadFlags } = await import("../mailbox-mutations.js");
+    await expect(setThreadFlags(pool, config, "msg-1", { add: ["seen"] })).rejects.toThrow(/STORE failed/);
+    // Member 1's mirror write-through ran before the member-2 failure aborted the loop.
+    expect(repo.applyMessageFlags).toHaveBeenCalledTimes(1);
+    expect(repo.applyMessageFlags).toHaveBeenCalledWith("msg-1", "acc-1", { add: ["\\Seen"], remove: [] });
+  });
+
+  it("surfaces a mirrorWriteThroughStale count when a member's write-through fails", async () => {
+    const pool = poolReturningMembers(members(2));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    repo.applyMessageFlags.mockResolvedValueOnce(["\\Seen"]).mockResolvedValueOnce(null as never);
+    const { setThreadFlags } = await import("../mailbox-mutations.js");
+    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+    expect(result.messageCount).toBe(2);
+    expect(result.mirrorWriteThroughStale).toBe(1);
+    warn.mockRestore();
+  });
+
+  it("moveThread caps fan-out at 100 and reports truncated", async () => {
+    const pool = poolReturningMembers(members(101));
+    const { moveThread } = await import("../mailbox-mutations.js");
+    const result = await moveThread(pool, config, "msg-1", "Archive");
+    expect(result.truncated).toBe(true);
+    // Every capped member is in INBOX, none already in Archive, so all 100 move.
+    expect(mutator.move).toHaveBeenCalledTimes(100);
+    expect(result.messageCount).toBe(100);
+  });
+});

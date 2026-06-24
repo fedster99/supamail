@@ -95,9 +95,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0009_smtp_send");
+    expect(version).toBe("0010_search_recipient_indexes");
     expect(manifest).toEqual({
-      schemaVersion: "0009_smtp_send",
+      schemaVersion: "0010_search_recipient_indexes",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -107,7 +107,8 @@ describe("initial schema", () => {
         { id: "0006_history_lane_state", file: "0006_history_lane_state.sql" },
         { id: "0007_optional_raw_mime", file: "0007_optional_raw_mime.sql" },
         { id: "0008_search_layer", file: "0008_search_layer.sql" },
-        { id: "0009_smtp_send", file: "0009_smtp_send.sql" }
+        { id: "0009_smtp_send", file: "0009_smtp_send.sql" },
+        { id: "0010_search_recipient_indexes", file: "0010_search_recipient_indexes.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");

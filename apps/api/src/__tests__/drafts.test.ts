@@ -212,6 +212,25 @@ describe("updateDraft", () => {
     expect(mocks.append).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
+
+  // ── Review PR-A (decision 1): the revised draft is already filed, so a failed
+  //    delete of the OLD draft must downgrade to a warning, not fail the update. ─
+  it("STILL reports the update when the old-draft delete rejects (best-effort cleanup)", async () => {
+    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
+    const { updateDraft } = await import("../drafts.js");
+
+    const result = await updateDraft({} as never, config, "draft-1", {
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Revised",
+      body: { format: "plain", text: "v2" }
+    });
+    // The new draft is filed; the update is reported despite the cleanup failure.
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+    expect(result.replacedMessageId).toBe("draft-1");
+    expect(result.replacedDraftDeleted).toBe(false);
+    expect(result.warnings.join(" ")).toMatch(/removing the previous draft failed/i);
+  });
 });
 
 describe("sendDraft", () => {
@@ -307,6 +326,33 @@ describe("sendDraft", () => {
     const { sendDraft } = await import("../drafts.js");
     await expect(sendDraft(pool, config, "missing")).rejects.toThrow(/Draft not found/);
     expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  // ── Review PR-A (decision 1): the post-send cleanup is best-effort. The send
+  //    is irreversible, so a delete failure must NEVER throw a delivered send. ─
+  it("STILL reports delivered when the post-send draft delete rejects (best-effort cleanup)", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    // The cleanup EXPUNGE fails (e.g. no UIDPLUS) AFTER a successful send.
+    mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
+    const { sendDraft } = await import("../drafts.js");
+
+    const result = await sendDraft(pool, config, "draft-1");
+    // The send happened and is reported delivered — no throw.
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(result.send.delivered).toBe(true);
+    expect(result.deletedDraftId).toBe("draft-1");
+    expect(result.draftDeleted).toBe(false);
+    expect(result.warnings.join(" ")).toMatch(/removing the draft from Drafts failed/i);
+    // The warning is also threaded onto the nested SendResult.
+    expect(result.send.warnings.join(" ")).toMatch(/removing the draft/i);
+  });
+
+  it("reports draftDeleted=true and no cleanup warning on the happy path", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    const { sendDraft } = await import("../drafts.js");
+    const result = await sendDraft(pool, config, "draft-1");
+    expect(result.draftDeleted).toBe(true);
+    expect(result.warnings).toEqual([]);
   });
 });
 

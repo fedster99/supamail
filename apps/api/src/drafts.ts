@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
+import { NoRecipientsError, NotFoundError } from "./errors.js";
 import { deleteMessage } from "./mailbox-mutations.js";
 import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
@@ -97,6 +98,12 @@ export interface CreateDraftResult {
 export interface UpdateDraftResult extends CreateDraftResult {
   /** The mirror id of the superseded draft that was deleted. */
   replacedMessageId: string;
+  /** True when the superseded draft was actually removed; false when the cleanup
+   * delete failed (best-effort — the new draft is already filed). */
+  replacedDraftDeleted: boolean;
+  /** Non-fatal warnings (e.g. the old draft couldn't be EXPUNGEd on a non-UIDPLUS
+   * server). The update still succeeded; a leftover duplicate self-heals on sync. */
+  warnings: string[];
 }
 
 export interface SendDraftResult {
@@ -104,6 +111,12 @@ export interface SendDraftResult {
   send: SendResult;
   /** The mirror id of the draft that was deleted after sending. */
   deletedDraftId: string;
+  /** True when the sent draft was actually removed from Drafts; false when the
+   * post-send cleanup delete failed (the mail is ALREADY sent regardless). */
+  draftDeleted: boolean;
+  /** Non-fatal warnings (e.g. the draft couldn't be EXPUNGEd on a non-UIDPLUS
+   * server). The send still succeeded; the leftover draft self-heals on sync. */
+  warnings: string[];
 }
 
 export interface DeleteDraftResult {
@@ -346,7 +359,7 @@ export async function updateDraft(
   rejectAttachments(input);
   const repository = new MirrorRepository(pool, config);
   const existing = await repository.getMessage(messageId);
-  if (!existing) throw new Error(`Draft not found: ${messageId}`);
+  if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (existing.deleted_in_provider) throw new Error(`Draft ${messageId} is already deleted in the provider`);
   const account = await repository.getAccount(existing.account_id);
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${existing.account_id}`);
@@ -354,16 +367,29 @@ export async function updateDraft(
   const req: SendRequest = { ...input, accountId: account.id };
   const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(pool, config, account, req);
 
-  // Hard-delete the superseded draft (reuse email-002). A replaced draft should
-  // not linger; the next sync reconciles the source row as deleted-in-provider.
-  await deleteMessage(pool, config, messageId, { hard: true });
+  // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
+  // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
+  // EXPUNGE) must NOT fail the update — we downgrade it to a warning and report the
+  // update as done. A lingering old draft self-heals on the next Drafts sync.
+  const warnings: string[] = [];
+  let replacedDraftDeleted = true;
+  try {
+    await deleteMessage(pool, config, messageId, { hard: true });
+  } catch (error) {
+    replacedDraftDeleted = false;
+    warnings.push(
+      `Updated, but removing the previous draft failed: ${error instanceof Error ? error.message : String(error)}. The old copy self-heals on the next sync.`
+    );
+  }
 
   return {
     accountId: account.id,
     draftsFolderPath,
     rfcMessageId,
     appendedUid,
-    replacedMessageId: messageId
+    replacedMessageId: messageId,
+    replacedDraftDeleted,
+    warnings
   };
 }
 
@@ -379,9 +405,9 @@ export async function sendDraft(
   messageId: string
 ): Promise<SendDraftResult> {
   const draft = await getDraft(pool, config, messageId);
-  if (!draft) throw new Error(`Draft not found: ${messageId}`);
+  if (!draft) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (draft.toEmails.length === 0) {
-    throw new Error(`Draft ${messageId} has no recipients; add a To address before sending`);
+    throw new NoRecipientsError(`Draft ${messageId} has no recipients; add a To address before sending`);
   }
 
   const to: SendRecipient[] = draft.toEmails.map((email) => ({ email }));
@@ -407,10 +433,24 @@ export async function sendDraft(
   const send = await sendMessage(pool, config, request);
 
   // The mail is sent and filed to Sent; remove the draft so it doesn't linger.
-  // Hard-delete (reuse email-002) — a sent draft is gone, not trashed.
-  await deleteMessage(pool, config, messageId, { hard: true });
+  // Hard-delete (reuse email-002) — a sent draft is gone, not trashed. CRITICAL:
+  // the send is IRREVERSIBLE and already succeeded, so the cleanup is best-effort
+  // — a delete failure (e.g. no UIDPLUS for a UID-scoped EXPUNGE) must NEVER turn a
+  // delivered send into a thrown failure (which would invite a duplicate re-send).
+  // We downgrade it to a warning and still report delivered; the leftover draft
+  // self-heals on the next Drafts sync. (Mirrors send.ts's best-effort Sent-APPEND.)
+  const warnings = [...send.warnings];
+  let draftDeleted = true;
+  try {
+    await deleteMessage(pool, config, messageId, { hard: true });
+  } catch (error) {
+    draftDeleted = false;
+    warnings.push(
+      `Delivered, but removing the draft from Drafts failed: ${error instanceof Error ? error.message : String(error)}. The leftover draft self-heals on the next sync.`
+    );
+  }
 
-  return { send, deletedDraftId: messageId };
+  return { send: { ...send, warnings }, deletedDraftId: messageId, draftDeleted, warnings };
 }
 
 /**

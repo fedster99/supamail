@@ -78,3 +78,29 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
 - Hard delete (`EXPUNGE`) and folder delete are irreversible; the `--confirm` gate
   and the API_TOKEN boundary are the guards. This supersedes the *scope* (not the
   spirit) of ADR 0014/0016 for these new modules only, exactly as ADR 0017 did.
+
+## Review follow-up (thread fan-out cap + write-through races)
+
+A whole-stack review hardened the thread-level verbs:
+
+- **Bounded fan-out.** `resolveThreadTargets` is capped at the SAME `≤100` ceiling
+  `read_thread` uses (`MAX_THREAD_FANOUT`). A thread mutation does one sequential IMAP
+  round-trip per member under a per-folder lock, so an unbounded fan-out let a
+  pathological thread hold locks and stack latency linearly. The oldest-first
+  thread-walk ORDER makes the cap deterministic, and the results carry a `truncated`
+  flag so a caller sees when only the oldest N members were acted on.
+- **Interleaved mirror write-through.** `setThreadFlags` now writes each member's
+  mirror row through immediately AFTER that member's STORE (inside the per-member loop),
+  instead of STORE-all-then-write-all. A mid-thread STORE failure therefore preserves
+  every earlier member's write-through instead of aborting before ANY mirror write. The
+  result surfaces a `mirrorWriteThroughStale` count so callers see mirror lag; the lag
+  self-heals on the next flag-scan sync.
+- **Known race, documented not gated (decision 6).** Flag write-through races the
+  pre-existing sync flag-scan: `upsertMessages` ON CONFLICT sets `flags =
+  EXCLUDED.flags` unconditionally, so a scan that FETCHed pre-STORE flags and commits
+  AFTER the write-through can briefly revert the mirror flag until the next scan. This
+  is a self-healing window: the next flag-scan re-reads the live (post-STORE) flags and
+  re-converges. The freshness-gated overwrite (don't clobber a mirror flag newer than
+  the scan's FETCH) touches the HOT sync `upsertMessages` ON-CONFLICT path
+  (high blast radius), so it is deliberately deferred — the eventual-convergence
+  guarantee already bounds the staleness to one scan interval.

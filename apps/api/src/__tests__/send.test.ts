@@ -147,7 +147,9 @@ vi.mock("../repository.js", () => ({
 }));
 
 vi.mock("../host-validation.js", () => ({
-  assertSafeSmtpTarget: vi.fn(async () => undefined)
+  // assertSafeSmtpTarget now returns the TLS-gate classification; the public
+  // smtp.example.test in these tests is not private.
+  assertSafeSmtpTarget: vi.fn(async () => ({ isPrivateHost: false }))
 }));
 
 const account = {

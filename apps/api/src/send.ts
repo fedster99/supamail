@@ -28,6 +28,14 @@ import type { SendRequest, SendResult } from "./types.js";
  * failed send files nothing. An APPEND failure after a successful delivery does
  * NOT roll back the delivered mail (irreversible) — it is recorded as a warning
  * and the next sync still mirrors the Sent copy if the provider auto-filed it.
+ *
+ * IDEMPOTENCY (review decision 2): POST /send is NOT retry-safe on its own. When
+ * `req.messageId` is absent, buildRawMime stamps a fresh random Message-ID each
+ * call, so a timeout-then-retry re-delivers a DUPLICATE with a different
+ * Message-ID (undedupeable). A caller that needs at-most-once delivery MUST supply
+ * a stable `req.messageId` (then a re-send files the same id and the synced Sent
+ * copy dedups). The full idempotency-key ledger is intentionally deferred to the
+ * cloud wrapper (email-001 design §2.9 / ADR 0017) — no new OSS infra here.
  */
 export async function sendMessage(
   pool: PgPool,
@@ -43,7 +51,7 @@ export async function sendMessage(
   const warnings: string[] = [];
 
   const creds = await resolveSmtpCreds(pool, config, account);
-  await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
+  const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
     allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
   });
 
@@ -51,7 +59,9 @@ export async function sendMessage(
   const { raw, messageId } = await buildRawMime(req, from);
   const envelope = buildSendEnvelope(account.email_address, req);
 
-  await deliverSmtp(creds, raw, envelope, config);
+  // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
+  // it relaxes only when the target actually resolved private/loopback.
+  await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
 
   // Delivery succeeded; file the identical bytes to Sent. An APPEND failure here
   // is non-fatal — the mail is already sent and the next sync recovers a copy.

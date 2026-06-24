@@ -1,6 +1,7 @@
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
+import { NotFoundError } from "./errors.js";
 import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
 import { getProviderProfile, resolveSpecialUseFolder, type ProviderProfile } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
@@ -313,7 +314,7 @@ async function loadMessageAndAccount(
   messageId: string
 ): Promise<{ message: ImapMessage; account: ImapAccount }> {
   const message = await repository.getMessage(messageId);
-  if (!message) throw new Error(`Message not found: ${messageId}`);
+  if (!message) throw new NotFoundError(`Message not found: ${messageId}`);
   if (message.deleted_in_provider) {
     throw new Error(`Message ${messageId} is already deleted in the provider`);
   }
@@ -341,7 +342,9 @@ export interface FlagResult {
  * Write a successful flag change through to the mirror row, best-effort but
  * surfaced: a failure here logs a warning (and never masks the STORE that already
  * succeeded on IMAP). This keeps mark-read/star visible in the mirror immediately,
- * even for mail older than the flag-scan window.
+ * even for mail older than the flag-scan window. Returns true when the mirror row
+ * was updated, false on a missing row or a DB error (so thread callers can surface
+ * a stale count) — the lag self-heals on the next flag-scan sync.
  */
 async function writeFlagsThrough(
   repository: MirrorRepository,
@@ -349,7 +352,7 @@ async function writeFlagsThrough(
   accountId: string,
   add: string[],
   remove: string[]
-): Promise<void> {
+): Promise<boolean> {
   try {
     const updated = await repository.applyMessageFlags(messageId, accountId, { add, remove });
     if (updated === null) {
@@ -358,7 +361,9 @@ async function writeFlagsThrough(
         messageId,
         accountId
       }));
+      return false;
     }
+    return true;
   } catch (error) {
     console.warn(JSON.stringify({
       event: "organize.flag_write_through_failed",
@@ -366,6 +371,7 @@ async function writeFlagsThrough(
       accountId,
       error: error instanceof Error ? error.message : String(error)
     }));
+    return false;
   }
 }
 
@@ -486,6 +492,16 @@ export async function deleteMessage(
 // Thread-level fan-out: resolve every live message in the thread, then apply.
 // ---------------------------------------------------------------------------
 
+/**
+ * Cap on how many thread members one thread mutation fans out to — the SAME
+ * ceiling read_thread uses (mcp/tools/read-thread.ts MAX_MESSAGES_CEILING). A
+ * thread mutation does one sequential IMAP round-trip per member under a per-folder
+ * lock, so an unbounded fan-out would let a pathological thread hold locks and
+ * stack latency linearly. The oldest-first ORDER (thread-walk) makes the cap
+ * deterministic: the oldest N members are acted on.
+ */
+const MAX_THREAD_FANOUT = 100;
+
 /** A live thread member's IMAP coordinates (id + folder + UIDVALIDITY + UID). */
 interface ThreadMemberRow {
   id: string;
@@ -504,7 +520,7 @@ interface ThreadMemberRow {
 async function resolveThreadTargets(
   pool: PgPool,
   messageId: string
-): Promise<{ accountId: string; targets: ResolvedMessageTarget[] }> {
+): Promise<{ accountId: string; targets: ResolvedMessageTarget[]; truncated: boolean }> {
   const client: PgClient = await pool.connect();
   try {
     const seedResult = await client.query<ThreadSeedRow>(
@@ -518,31 +534,34 @@ async function resolveThreadTargets(
       [messageId]
     );
     const seed = seedResult.rows[0];
-    if (!seed) throw new Error(`Message not found: ${messageId}`);
+    if (!seed) throw new NotFoundError(`Message not found: ${messageId}`);
 
     // Shared one-hop membership walk (CC-3, thread-walk.ts): the normalized key set,
     // the WHERE predicate, and the oldest-first ORDER are single-sourced so this
     // write fan-out and the read surface (read_thread) can never diverge on "what is
     // in a thread." This SELECT keeps its OWN columns (folder + uidvalidity + uid),
-    // no alias.
+    // no alias. We fetch MAX_THREAD_FANOUT + 1 so a full result tells us the thread
+    // was truncated (the +1 row is dropped); $5 is the LIMIT bind.
     const keys = threadSeedKeys(seed);
     const members = await client.query<ThreadMemberRow>(
       `
       SELECT id, account_id, folder_path, uidvalidity, uid
       FROM public.imap_messages
       WHERE ${threadMembershipClause("")}
+      LIMIT $5
       `,
-      [seed.account_id, seed.provider_thread_id, seed.id, keys]
+      [seed.account_id, seed.provider_thread_id, seed.id, keys, MAX_THREAD_FANOUT + 1]
     );
 
-    const targets = members.rows.map((row) => ({
+    const truncated = members.rows.length > MAX_THREAD_FANOUT;
+    const targets = members.rows.slice(0, MAX_THREAD_FANOUT).map((row) => ({
       messageId: row.id,
       accountId: row.account_id,
       folderPath: row.folder_path,
       uidValidity: Number(row.uidvalidity),
       uid: Number(row.uid)
     }));
-    return { accountId: seed.account_id, targets };
+    return { accountId: seed.account_id, targets, truncated };
   } finally {
     client.release();
   }
@@ -554,6 +573,13 @@ export interface ThreadFlagResult {
   added: string[];
   removed: string[];
   messageIds: string[];
+  /** Members whose mirror write-through lagged (the IMAP STORE succeeded but the
+   * mirror row update failed/was missing). 0 = mirror fully in sync. The lag
+   * self-heals on the next flag-scan sync. */
+  mirrorWriteThroughStale: number;
+  /** True when the thread exceeded MAX_THREAD_FANOUT and only the oldest N members
+   * were acted on. */
+  truncated: boolean;
 }
 
 /** Mark/star a whole thread: apply the flag change to every live message in the
@@ -571,31 +597,38 @@ export async function setThreadFlags(
   }
 
   const repository = new MirrorRepository(pool, config);
-  const { accountId, targets } = await resolveThreadTargets(pool, messageId);
+  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
+  // Interleave the mirror write-through INTO the per-member loop: each member's
+  // mirror row is updated immediately after its own STORE succeeds, so a mid-thread
+  // STORE failure (which throws) has already persisted every earlier member's
+  // write-through instead of aborting before ANY mirror write (the previous
+  // STORE-all-then-write-all shape lost all mirror writes on any failure).
+  const appliedIds: string[] = [];
+  let mirrorWriteThroughStale = 0;
   const mutator = await MailboxMutator.connect(pool, config, account);
   try {
     for (const target of targets) {
       if (add.length > 0) await mutator.addFlags(target, add);
       if (remove.length > 0) await mutator.removeFlags(target, remove);
+      const wrote = await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
+      if (!wrote) mirrorWriteThroughStale += 1;
+      appliedIds.push(target.messageId);
     }
   } finally {
     await mutator.logout().catch(() => mutator.close());
   }
 
-  // Write the flag change through to every thread member's mirror row.
-  for (const target of targets) {
-    await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
-  }
-
   return {
     seedMessageId: messageId,
-    messageCount: targets.length,
+    messageCount: appliedIds.length,
     added: add,
     removed: remove,
-    messageIds: targets.map((t) => t.messageId)
+    messageIds: appliedIds,
+    mirrorWriteThroughStale,
+    truncated
   };
 }
 
@@ -604,6 +637,9 @@ export interface ThreadMoveResult {
   toFolder: string;
   messageCount: number;
   messageIds: string[];
+  /** True when the thread exceeded MAX_THREAD_FANOUT and only the oldest N members
+   * were considered. */
+  truncated: boolean;
 }
 
 /** Move a whole thread into `destination`: move every live message in the thread,
@@ -618,7 +654,7 @@ export async function moveThread(
     throw new Error("moveThread requires a non-empty destination folder");
   }
   const repository = new MirrorRepository(pool, config);
-  const { accountId, targets } = await resolveThreadTargets(pool, messageId);
+  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
@@ -634,7 +670,7 @@ export async function moveThread(
     await mutator.logout().catch(() => mutator.close());
   }
 
-  return { seedMessageId: messageId, toFolder: destination, messageCount: moved.length, messageIds: moved };
+  return { seedMessageId: messageId, toFolder: destination, messageCount: moved.length, messageIds: moved, truncated };
 }
 
 // ---------------------------------------------------------------------------

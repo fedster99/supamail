@@ -1,6 +1,7 @@
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
+import { NotFoundError, UnfetchableContentError } from "./errors.js";
 import { connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
 import { cleanBody } from "./mcp/shared.js";
 import { MirrorRepository } from "./repository.js";
@@ -194,7 +195,7 @@ async function loadMessageAndAccount(
   messageId: string
 ): Promise<{ message: ImapMessage; account: ImapAccount }> {
   const message = await repository.getMessage(messageId);
-  if (!message) throw new Error(`Message not found: ${messageId}`);
+  if (!message) throw new NotFoundError(`Message not found: ${messageId}`);
   const account = await repository.getAccount(message.account_id);
   if (!account) throw new Error(`Account not found for message ${messageId}: ${message.account_id}`);
   return { message, account };
@@ -262,9 +263,11 @@ export async function downloadAttachment(
   attachmentId: string
 ): Promise<AttachmentDownload> {
   const meta = await getAttachmentMetadata(pool, config, attachmentId);
-  if (!meta) throw new Error(`Attachment not found: ${attachmentId}`);
+  if (!meta) throw new NotFoundError(`Attachment not found: ${attachmentId}`);
   if (!meta.partNumber) {
-    throw new Error(`Attachment ${attachmentId} has no BODYSTRUCTURE part number; cannot fetch its bytes`);
+    throw new UnfetchableContentError(
+      `Attachment ${attachmentId} has no BODYSTRUCTURE part number; cannot fetch its bytes`
+    );
   }
 
   const repository = new MirrorRepository(pool, config);
@@ -389,7 +392,7 @@ export async function getMessageHeaders(
   } finally {
     client.release();
   }
-  if (!row) throw new Error(`Message not found: ${messageId}`);
+  if (!row) throw new NotFoundError(`Message not found: ${messageId}`);
 
   // Prefer the body's fully-parsed headers (whole-message parse); fall back to the
   // message row's envelope headers_json (always present from metadata sync).
@@ -462,7 +465,7 @@ export async function cleanMessageBody(
   } finally {
     client.release();
   }
-  if (!row) throw new Error(`Message not found: ${messageId}`);
+  if (!row) throw new NotFoundError(`Message not found: ${messageId}`);
 
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
   const cleaned = cleanBody(raw, { includeQuoted: options.includeQuoted ?? false, maxChars: options.maxChars });

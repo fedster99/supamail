@@ -82,6 +82,21 @@ implementation of that claim (one-line notes added to each).
   unchanged and green.
 - `pnpm typecheck` and `pnpm build` pass.
 
+## Review follow-up (SSRF guard is check-time, not connect-time)
+
+The shared SSRF guard (`assertSafeImapTarget` / `assertSafeSmtpTarget` in
+`host-validation.ts`, run inside this prelude) resolves the host and rejects
+private/reserved IPs, but it does NOT pin the resolved IP. The clients
+(`connectImap` / `deliverSmtp`) re-resolve at socket time, so a low-TTL DNS record
+can return public-at-check and private-at-connect (DNS-rebinding TOCTOU, e.g. a
+metadata endpoint at `169.254.169.254`). In the single-tenant OSS host the target is
+operator-controlled, so this is acceptable and the connect path is deliberately NOT
+rewritten. The CLOUD MULTI-TENANT layer, where a tenant supplies the host, MUST close
+this window: resolve once in the prelude, then connect to the LITERAL resolved IP with
+`tls.servername = host` for SNI/cert validation so check and connect observe the same
+address. A prominent comment in `host-validation.ts` records this for the cloud
+implementer; the OSS guard is intentionally check-time only.
+
 ## References
 
 - ADR 0002: Node-side credential encryption (the frozen AES-256-GCM envelope reused).

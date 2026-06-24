@@ -112,6 +112,54 @@ export interface BuiltMime {
 }
 
 /**
+ * Custom headers the caller may NOT stamp through `req.headers`. These are the
+ * structural / identity / routing headers that define WHO the message is from/to
+ * and HOW it is structured — letting a caller set them would let a `POST .../send`
+ * forge a `From:`/`Reply-To`, smuggle a raw `Bcc:` into the SAME bytes that are
+ * both delivered AND filed to Sent (defeating the "Bcc never enters the bytes"
+ * guarantee), or override the multipart Content-Type. Recipients/threading go
+ * through the structured SendRequest fields, never raw headers. Everything else is
+ * restricted to the `X-*` custom-header namespace. Drafts reuse buildRawMime, so
+ * this protects createDraft/updateDraft too. (See the review header trust-boundary
+ * finding.)
+ */
+const FORBIDDEN_CUSTOM_HEADERS = new Set([
+  "from",
+  "to",
+  "cc",
+  "bcc",
+  "sender",
+  "reply-to",
+  "return-path",
+  "received",
+  "content-type",
+  "content-transfer-encoding",
+  "mime-version"
+]);
+
+/**
+ * Reject a forged/structural custom header before it reaches MailComposer. Allows
+ * the threading convenience headers (In-Reply-To/References/Message-ID, which the
+ * structured fields also feed) and any `X-*` token; everything else must be either
+ * absent or an X- custom. Throws a clear error naming the offending header.
+ */
+function assertSafeCustomHeaders(headers: Record<string, string>): void {
+  const ALLOWED_NON_X = new Set(["in-reply-to", "references", "message-id"]);
+  for (const name of Object.keys(headers)) {
+    const lower = name.toLowerCase();
+    if (FORBIDDEN_CUSTOM_HEADERS.has(lower)) {
+      throw new Error(
+        `Header "${name}" cannot be set via custom headers — set it through the structured send fields instead`
+      );
+    }
+    if (lower.startsWith("x-") || ALLOWED_NON_X.has(lower)) continue;
+    throw new Error(
+      `Custom header "${name}" is not allowed — only X-* custom headers (and In-Reply-To/References/Message-ID) may be set`
+    );
+  }
+}
+
+/**
  * Compose deterministic RFC-822 bytes for a {@link SendRequest} via nodemailer's
  * MailComposer (no hand-rolled MIME). A Message-ID is stamped at compose time —
  * the caller's `req.messageId` wins for stability — so the mirrored Sent copy's
@@ -130,6 +178,9 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
   // Merge convenience threading fields into custom headers without letting an
   // explicit custom header silently win over the structured field.
   const headers: Record<string, string> = { ...(req.headers ?? {}) };
+  // Reject forged/structural headers (Bcc/From/Content-Type/…) before they reach
+  // the bytes that are both delivered AND filed to Sent.
+  assertSafeCustomHeaders(headers);
 
   const composer = new MailComposer({
     from: toAddress(from),
@@ -163,22 +214,32 @@ export interface SmtpEnvelope {
 /**
  * Submit the EXACT composed `raw` bytes over SMTP. Using `raw:` ships byte-for-byte
  * what we also APPEND to Sent. `secure=true` is implicit TLS (465); otherwise we
- * require STARTTLS (`requireTLS`) — UNLESS IMAP_ALLOW_PRIVATE_HOSTS is set, the
- * same dev/self-hosted opt-in that allows plaintext IMAP (so local GreenMail-style
- * SMTP works). `verify()` is skipped (one fewer round-trip; failures surface on
- * send). The envelope carries every recipient incl. Bcc.
+ * require STARTTLS (`requireTLS`). STARTTLS enforcement is decoupled from the
+ * IMAP_ALLOW_PRIVATE_HOSTS opt-in (review decision 3): a non-implicit-TLS host that
+ * resolved PUBLIC ALWAYS gets requireTLS, even when the private-hosts opt-in is set
+ * — so a self-hoster who enables the flag AND sends through a real public :587
+ * provider can never silently fall back to cleartext (MITM strip). We relax
+ * requireTLS only when the target actually resolved private/loopback (`opts
+ * .isPrivateHost`), the local GreenMail-style case. `verify()` is skipped (one
+ * fewer round-trip; failures surface on send). The envelope carries every
+ * recipient incl. Bcc.
  */
 export async function deliverSmtp(
   creds: ResolvedSmtpCreds,
   raw: Buffer,
   envelope: SmtpEnvelope,
-  config: AppConfig
+  config: AppConfig,
+  opts: { isPrivateHost?: boolean } = {}
 ): Promise<void> {
+  // Require STARTTLS for any non-implicit-TLS target, UNLESS the resolved host is
+  // actually private/loopback (dev/self-hosted GreenMail). The IMAP_ALLOW_PRIVATE_
+  // HOSTS opt-in alone no longer drops TLS for a public host.
+  const requireTLS = !creds.secure && !opts.isPrivateHost;
   const transporter = nodemailer.createTransport({
     host: creds.host,
     port: creds.port,
     secure: creds.secure,
-    requireTLS: !creds.secure && !config.IMAP_ALLOW_PRIVATE_HOSTS,
+    requireTLS,
     auth: { user: creds.username, pass: creds.password },
     connectionTimeout: config.CONNECT_TIMEOUT_MS,
     greetingTimeout: config.CONNECT_TIMEOUT_MS,

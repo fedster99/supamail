@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
+import { NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
+import { MailboxCapabilityError, MailboxMutationError } from "../mailbox-mutations.js";
 import type { AccountDetails, AccountSummary, ImapFolder, SyncResult, UpdateAccountSettingsInput } from "../types.js";
 
 const accountId = "00000000-0000-4000-8000-000000000001";
@@ -961,5 +963,171 @@ describe("API safety", () => {
     const res = await app.request("/search?q=x&account=not-a-uuid", { headers: auth() });
     expect(res.status).toBe(400);
     expect(search).not.toHaveBeenCalled();
+  });
+
+  // ── Review PR-A: error-contract mapping (409/422/502/404/400) ─────────────
+  it("maps MailboxCapabilityError to 422 capability_unsupported (not a 500)", async () => {
+    const { app, mutations } = buildApp();
+    mutations.deleteMessage.mockRejectedValueOnce(
+      new MailboxCapabilityError("Hard delete needs the UIDPLUS extension") as never
+    );
+    const res = await app.request(`/messages/${messageId}?hard=true`, { method: "DELETE", headers: auth() });
+    expect(res.status).toBe(422);
+    await expect(res.json()).resolves.toMatchObject({
+      error: "capability_unsupported",
+      message: expect.stringContaining("UIDPLUS")
+    });
+  });
+
+  it("maps MailboxMutationError to 502 mailbox_mutation_failed (not a 500)", async () => {
+    const { app, mutations } = buildApp();
+    mutations.setMessageFlags.mockRejectedValueOnce(
+      new MailboxMutationError("STORE +FLAGS failed for UID 42") as never
+    );
+    const res = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ add: ["seen"] })
+    });
+    expect(res.status).toBe(502);
+    await expect(res.json()).resolves.toMatchObject({ error: "mailbox_mutation_failed" });
+  });
+
+  it("still maps MailboxConflictError to 409 (regression guard for the conflict branch)", async () => {
+    const { MailboxConflictError } = await import("../mailbox-mutations.js");
+    const { app, mutations } = buildApp();
+    mutations.moveMessage.mockRejectedValueOnce(new MailboxConflictError("UIDVALIDITY moved") as never);
+    const res = await app.request(`/messages/${messageId}/move`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ folder: "Archive" })
+    });
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toMatchObject({ error: "mailbox_conflict" });
+  });
+
+  it("maps a typed NotFoundError from a draft route to 404 (not a 500)", async () => {
+    const { app, drafts } = buildApp();
+    drafts.send.mockRejectedValueOnce(new NotFoundError("Draft not found: x") as never);
+    const res = await app.request(`/drafts/${messageId}/send`, { method: "POST", headers: auth() });
+    expect(res.status).toBe(404);
+    await expect(res.json()).resolves.toMatchObject({ error: "not_found" });
+  });
+
+  it("maps a no-recipients send-draft to 400 (not a 500)", async () => {
+    const { app, drafts } = buildApp();
+    drafts.send.mockRejectedValueOnce(new NoRecipientsError("Draft has no recipients") as never);
+    const res = await app.request(`/drafts/${messageId}/send`, { method: "POST", headers: auth() });
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({ error: "no_recipients" });
+  });
+
+  it("maps an unfetchable attachment (no BODYSTRUCTURE part) to 422 (not a 500)", async () => {
+    const { app, content } = buildApp();
+    const attachmentId = "00000000-0000-4000-8000-0000000000b2";
+    content.downloadAttachment.mockRejectedValueOnce(
+      new UnfetchableContentError("has no BODYSTRUCTURE part number") as never
+    );
+    const res = await app.request(`/attachments/${attachmentId}/download`, { headers: auth() });
+    expect(res.status).toBe(422);
+    await expect(res.json()).resolves.toMatchObject({ error: "content_unfetchable" });
+  });
+
+  // ── Review PR-A: whole-request body caps (413) on BOTH send transports ────
+  it("rejects an oversized JSON send body with 413 before buffering (default transport)", async () => {
+    const { app, send } = buildApp();
+    // A JSON body well past the ~35MB whole-request cap. bodyLimit fires on the
+    // Content-Length before parseJsonBody/json() buffers it.
+    const huge = "a".repeat(36 * 1024 * 1024);
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        to: [{ email: "r@example.test" }],
+        subject: "Hi",
+        body: { format: "plain", text: huge }
+      })
+    });
+    expect(res.status).toBe(413);
+    await expect(res.json()).resolves.toMatchObject({ error: "request_too_large" });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized multipart send request with 413 (whole-request cap)", async () => {
+    const { app, send } = buildApp();
+    const form = new FormData();
+    form.append("payload", JSON.stringify({
+      to: [{ email: "r@example.test" }], subject: "Hi", body: { format: "plain", text: "y" }
+    }));
+    // One file part over the whole-request 35MB cap (so bodyLimit fires before the
+    // per-part 25MB multipart check even runs).
+    const big = new Uint8Array(36 * 1024 * 1024);
+    form.append("file", new File([big], "big.bin", { type: "application/octet-stream" }));
+
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: auth(),
+      body: form
+    });
+    expect(res.status).toBe(413);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  // ── Review PR-A: CRLF reject + flag-token charset (the header denylist
+  //    itself lives in buildRawMime; see send.test.ts for that unit). ───────
+  it("rejects CR/LF in a send header field (header injection guard)", async () => {
+    const { app, send } = buildApp();
+    for (const evil of [
+      { headers: { "X-Foo": "ok\r\nBcc: leak@evil.test" } },
+      { inReplyTo: "<a@b>\r\nInjected: 1" },
+      { references: "<a@b>\n<c@d>" },
+      { messageId: "<id@x>\r\n" }
+    ]) {
+      const res = await app.request(`/accounts/${accountId}/send`, {
+        method: "POST",
+        headers: { ...auth(), "content-type": "application/json" },
+        body: JSON.stringify({
+          to: [{ email: "r@example.test" }],
+          subject: "Hi",
+          body: { format: "plain", text: "y" },
+          ...evil
+        })
+      });
+      expect(res.status).toBe(400);
+      await expect(res.json()).resolves.toMatchObject({ error: "invalid_input" });
+    }
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid flag token charset (\\Junk Foo / control chars)", async () => {
+    const { app, mutations } = buildApp();
+    for (const bad of ["\\Junk Foo", "see\tn", "a;b"]) {
+      const res = await app.request(`/messages/${messageId}/flags`, {
+        method: "POST",
+        headers: { ...auth(), "content-type": "application/json" },
+        body: JSON.stringify({ add: [bad] })
+      });
+      expect(res.status).toBe(400);
+      await expect(res.json()).resolves.toMatchObject({ error: "invalid_input" });
+    }
+    expect(mutations.setMessageFlags).not.toHaveBeenCalled();
+
+    // A valid token still passes.
+    const ok = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ add: ["\\Seen"], remove: ["flagged"] })
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("caps the search offset at 5000 (deep-offset scan guard)", async () => {
+    const { app, search } = buildApp();
+    const over = await app.request("/search?q=x&offset=10000", { headers: auth() });
+    expect(over.status).toBe(400);
+    expect(search).not.toHaveBeenCalled();
+
+    const ok = await app.request("/search?q=x&offset=5000", { headers: auth() });
+    expect(ok.status).toBe(200);
   });
 });

@@ -170,6 +170,23 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   The two invariant guards (`agent-surface-zero-send.test.ts`,
   `sync-adapter-read-only.test.ts`) stay green — no sixth tool, no write path.
 
+## Review follow-up (recipient-lane indexes + offset cap)
+
+A whole-stack review found that email-005 added the `to:`/`cc:`/`bcc:`/`anyEmail:`
+lanes (`compile.ts`) but `0008_search_layer.sql` only indexed the COMBINED `to||cc`
+"recipient" lane. In the no-free-text path there is no 400-row candidate cap, so a
+filter-only `bcc:x` / `anyemail:foo` degraded to a full account scan bounded only by
+the 15s `statement_timeout` — slow / 500 on a large mailbox.
+
+- `0010_search_recipient_indexes.sql` adds four `gin_trgm_ops` expression indexes whose
+  expressions MATCH the `to`/`cc`/`bcc`/`anyEmail` predicates in `filterPredicate`
+  EXACTLY (`lower(f_array_to_text(coalesce(<col>,'{}')))`, and the from+to+cc+bcc blob
+  for `anyEmail`), each partial on `deleted_in_provider = false` like the 0008
+  recipients index. A lane filter is now index-served, not a scan.
+- The search `offset` is capped (`SEARCH_QUERY_SCHEMA`, `api.ts`) at 5000: a deep
+  OFFSET in the no-candidate-cap structured path scans/scores/discards every prior row.
+  Beyond the cap, narrow with filters; keyset pagination remains the longer-term fix.
+
 ## References
 
 - ADR 0014: Agent email access is a core read surface, hosted in cloud.
