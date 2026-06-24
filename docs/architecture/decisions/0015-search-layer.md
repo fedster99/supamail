@@ -109,6 +109,10 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   object field (`from`, `cc`, `bcc`, `anyEmail`, `isUnread`, `isStarred`, `after`,
   `folder`, …) — converges on the same `SearchFilter` tagged union and is turned into
   a **bound** `$n` predicate by the one compiler. No surface builds SQL of its own.
+  > Filter fields single-sourced (arch): the per-field rules (kind, value
+  > normalization, operator aliases, structured key) live in one declarative table
+  > (`search/filter-fields.ts`); `parseQuery` and `filtersFromStructured` both consume
+  > it and the schema parity test asserts the table ⟷ Zod ⟷ JSON-Schema key sets agree.
 - **email-005 added** the precise recipient lanes the union was missing: `to` (To
   only), `cc` (Cc only), `bcc` (Bcc only — populated only on sent mail), and
   `anyEmail` (from + to + cc + bcc, the Nylas `any_email`). The pre-existing broad

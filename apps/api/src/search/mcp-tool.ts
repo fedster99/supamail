@@ -13,7 +13,10 @@ import type { SearchRequest, SearchResponse } from "./types.js";
  * advertised MCP JSON-Schema's `filters.properties` can be checked for key parity
  * against it (#40, search-schema-parity.test.ts). The Zod schema is the source of
  * truth for validation; the JSON-Schema literal below is the hand-written agent
- * contract, and the parity test fails if a field is added to one but not the other.
+ * contract. The per-field RULES (kind, normalization, operator aliases) are
+ * single-sourced in `search/filter-fields.ts` (`STRUCTURED_FILTER_KEYS`), and the
+ * parity test asserts the field table, this Zod shape, and the JSON-Schema all
+ * advertise the SAME field set — a field added to one but not the others fails.
  */
 export const searchFiltersSchema = z
   .object({
