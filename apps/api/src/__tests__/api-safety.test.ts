@@ -1112,11 +1112,12 @@ describe("API safety", () => {
     }
     expect(mutations.setMessageFlags).not.toHaveBeenCalled();
 
-    // A valid token still passes.
+    // Valid tokens still pass, including RFC 5788 $-prefixed custom keywords
+    // ($Forwarded, $label1) that toImapFlag passes through verbatim.
     const ok = await app.request(`/messages/${messageId}/flags`, {
       method: "POST",
       headers: { ...auth(), "content-type": "application/json" },
-      body: JSON.stringify({ add: ["\\Seen"], remove: ["flagged"] })
+      body: JSON.stringify({ add: ["\\Seen", "$Forwarded", "$label1"], remove: ["flagged"] })
     });
     expect(ok.status).toBe(200);
   });

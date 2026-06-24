@@ -297,10 +297,12 @@ const SEARCH_QUERY_SCHEMA = z.object({
 // Organize mutations (email-002). A flag token is a SupaMail short name
 // (seen/flagged/…), a bare keyword, or a `\`-prefixed system flag. At least one
 // of add/remove must be present. Charset is constrained to a single optional
-// leading backslash + alphanumerics/underscore/hyphen so a token like
-// `\Junk Foo` or one carrying control chars can never reach imapflow's STORE.
-const FLAG_TOKEN = z.string().min(1).max(64).regex(/^\\?[A-Za-z0-9_-]+$/, {
-  message: "Flag token must be a single optional leading backslash followed by letters, digits, underscore, or hyphen"
+// optional single leading \ or $ + alphanumerics/$/underscore/hyphen so a token
+// like `\Junk Foo` or one carrying control chars can never reach imapflow's STORE,
+// while legitimate custom IMAP keywords ($Forwarded, $MDNSent, $label1 — RFC 5788)
+// still pass (toImapFlag's contract: unknown tokens pass through verbatim).
+const FLAG_TOKEN = z.string().min(1).max(64).regex(/^[\\$]?[A-Za-z0-9$_-]+$/, {
+  message: "Flag token must be an optional leading \\ or $ then letters, digits, $, underscore, or hyphen"
 });
 const FLAGS_SCHEMA = z.object({
   add: z.array(FLAG_TOKEN).max(16).optional(),
