@@ -1044,6 +1044,17 @@ export class MirrorRepository {
       FROM public.imap_folders
       WHERE account_id = $1
         AND tracked = true
+        -- A folder discovery has already flagged absent from the provider
+        -- (missing_since stamped) must leave the sync working set immediately.
+        -- Otherwise the loop keeps SELECTing a deleted folder, the provider
+        -- returns a generic error (e.g. Rackspace "Command failed", which is not a
+        -- recognized NONEXISTENT/TRYCREATE missing-mailbox signal so the folder is
+        -- never sidelined to PENDING_VERIFICATION), the run is marked failed, and
+        -- consecutive_failures climbs to BROKEN — bricking the whole account because
+        -- one folder was deleted. Discovery owns the missing-folder lifecycle: it
+        -- clears missing_since on reappearance and tombstones to MISSING/untracked
+        -- after FOLDER_MISSING_GRACE_MS.
+        AND missing_since IS NULL
         AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND sync_priority <= $2
         AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
@@ -1061,6 +1072,9 @@ export class MirrorRepository {
       FROM public.imap_folders
       WHERE account_id = $1
         AND tracked = true
+        -- See getFoldersDueForSync priority query: missing_since folders are owned
+        -- by discovery, not the sync lane.
+        AND missing_since IS NULL
         AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND sync_priority > $2
         AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
@@ -1854,6 +1868,9 @@ export class MirrorRepository {
         FROM public.imap_folders f
         WHERE f.account_id = $1
           AND f.tracked = true
+          -- A deleted folder discovery has flagged (missing_since) must not be
+          -- backfilled either; the history lane SELECTs it too and would fail.
+          AND f.missing_since IS NULL
           AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
           AND f.initial_sync_complete = true
       )
@@ -1975,6 +1992,13 @@ export class MirrorRepository {
       JOIN public.imap_folders f ON f.account_id = m.account_id AND f.path = m.folder_path
       WHERE m.account_id = $1
         AND f.tracked = true
+        -- The body lane SELECTs the folder too (getMailboxLock on folder_path), so a
+        -- folder discovery flagged missing/gone must be excluded here as well — the
+        -- body fetch is the one un-try/caught reader, so a deleted folder here throws
+        -- straight to the account-level catch and bricks the account to BROKEN. Keep
+        -- this filter in lockstep with getFoldersDueForSync / getHistoryBacklog.
+        AND f.missing_since IS NULL
+        AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND m.deleted_in_provider = false
         AND m.window_status = 'IN_WINDOW'
         AND m.body_fetched_at IS NULL
