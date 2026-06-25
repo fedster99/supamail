@@ -5,6 +5,7 @@ import { clearOrphanedLocks } from "../locks.js";
 import type { MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import {
+  backdateMissingSince,
   buildInboxAndSentFolders,
   setupIntegration,
   teardownIntegration
@@ -333,6 +334,128 @@ liveDb("live DB reliability lane", () => {
 
     expect(first.map((folder) => folder.path)).toEqual(["Priority", "RR-A", "RR-B"]);
     expect(second.map((folder) => folder.path)).toEqual(["Priority", "RR-C", "RR-A"]);
+  });
+
+  it("drops folders discovery flagged missing from the sync + history working set", async () => {
+    // Regression: a folder the user created then deleted is stamped missing_since
+    // by discovery, but the sync lane kept SELECTing it. The provider returns a
+    // generic error (e.g. Rackspace "Command failed", not a recognized
+    // NONEXISTENT/TRYCREATE signal, so it is never sidelined to
+    // PENDING_VERIFICATION), the run is marked failed, and consecutive_failures
+    // climbs to BROKEN — one deleted folder bricking the whole account. Missing
+    // folders are discovery's lifecycle to own, not the sync lane's.
+    const h = await setupIntegration("live-missing-folder", { PRIORITY_CUTOFF: 10 });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+
+    // "Projects" stands in for the user-created folder that later gets deleted. Keep
+    // the name clear of noisyFolderFragments (spam/junk/trash/deleted) or
+    // upsertDiscoveredFolders excludes it (tracked=false) and the baseline breaks.
+    await h.repository.upsertDiscoveredFolders(account, [
+      { path: "INBOX", delimiter: "/" },
+      { path: "Projects", delimiter: "/" }
+    ]);
+    // Both folders are priority, due, and initial-sync complete (history-eligible).
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET sync_priority = 1,
+          next_sync_due_at = now() - interval '1 second',
+          initial_sync_complete = true
+      WHERE account_id = $1
+      `,
+      [h.account.id]
+    );
+    // The harness creates the account body_fetch_policy='lazy', which short-circuits
+    // getBodyBacklog to []. Flip it on so the body lane actually SELECTs folders.
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'priority_then_backfill' WHERE id = $1",
+      [h.account.id]
+    );
+    // Seed one in-window, un-body-fetched message per folder so the body lane
+    // (getBodyBacklog) — the one un-try/caught reader that bricks the account
+    // directly — has a reason to SELECT each folder.
+    for (const folderPath of ["INBOX", "Projects"]) {
+      await h.pool.query(
+        `
+        INSERT INTO public.imap_messages
+          (account_id, folder_path, uidvalidity, uid, internal_date,
+           window_status, deleted_in_provider, body_fetched_at)
+        VALUES ($1, $2, 1, 1, now(), 'IN_WINDOW', false, NULL)
+        `,
+        [h.account.id, folderPath]
+      );
+    }
+
+    // Baseline: every reader sees both folders before discovery flags one missing.
+    const beforeSync = await h.repository.getFoldersDueForSync(h.account.id);
+    expect(beforeSync.map((folder) => folder.path).sort()).toEqual(["INBOX", "Projects"]);
+    const beforeAccount = await h.repository.getAccount(h.account.id);
+    if (!beforeAccount) throw new Error("missing account");
+    const beforeHistory = await h.repository.getHistoryBacklog(beforeAccount, 10);
+    expect(beforeHistory.map((folder) => folder.path).sort()).toEqual(["INBOX", "Projects"]);
+    const beforeBodies = await h.repository.getBodyBacklog(beforeAccount, 10);
+    expect(beforeBodies.map((message) => message.folder_path).sort()).toEqual(["INBOX", "Projects"]);
+
+    // Discovery stamps missing_since once the folder vanishes from the provider.
+    await backdateMissingSince(h.pool, h.account.id, "Projects", "1 minute");
+
+    // It must leave ALL sync working sets immediately — without waiting for the
+    // multi-day grace tombstone — so neither the metadata, history, nor body lane
+    // keeps SELECTing the deleted folder and failing the run.
+    const dueSync = await h.repository.getFoldersDueForSync(h.account.id);
+    expect(dueSync.map((folder) => folder.path)).toEqual(["INBOX"]);
+    const afterAccount = await h.repository.getAccount(h.account.id);
+    if (!afterAccount) throw new Error("missing account");
+    const dueHistory = await h.repository.getHistoryBacklog(afterAccount, 10);
+    expect(dueHistory.map((folder) => folder.path)).toEqual(["INBOX"]);
+    const dueBodies = await h.repository.getBodyBacklog(afterAccount, 10);
+    expect(dueBodies.map((message) => message.folder_path)).toEqual(["INBOX"]);
+  });
+
+  it("self-heals a threshold-BROKEN account after its retry cadence, never an AUTH_ERROR one", async () => {
+    // An account bricked by transient failures (e.g. the now-fixed deleted-folder
+    // brick) must recover on its own once the cause clears — not stay dead until an
+    // operator resets it. getRunnableAccounts retries a BROKEN account whose
+    // backoff_until has passed; the next clean run heals it. Terminal breaks
+    // (AUTH_ERROR) NULL backoff_until and are never auto-retried.
+    const h = await setupIntegration("live-self-heal", {
+      STUCK_DEGRADED_RETRY_INTERVAL_MS: 60 * 60_000
+    });
+    activeAccountIds.push(h.account.id);
+
+    // Drive it to BROKEN via the consecutive-failure threshold (BROKEN at 10).
+    for (let i = 0; i < 10; i += 1) {
+      await h.repository.markAccountSyncFailed(h.account.id, "INBOX.Projects: Command failed");
+    }
+    const broken = await h.repository.getAccount(h.account.id);
+    if (!broken) throw new Error("missing account");
+    expect(broken.sync_state).toBe("BROKEN");
+    expect(broken.consecutive_failures).toBeGreaterThanOrEqual(10);
+    expect(broken.backoff_until).not.toBeNull();
+
+    // While the heal backoff is still in the future, it is not retried.
+    const duringBackoff = await h.repository.getRunnableAccounts(25);
+    expect(duringBackoff.map((account) => account.id)).not.toContain(h.account.id);
+
+    // Once the retry time passes, it is picked up again — self-heal, no operator action.
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET backoff_until = now() - interval '1 second' WHERE id = $1",
+      [h.account.id]
+    );
+    const afterBackoff = await h.repository.getRunnableAccounts(25);
+    expect(afterBackoff.map((account) => account.id)).toContain(h.account.id);
+
+    // An AUTH_ERROR break is terminal: BROKEN with backoff_until NULL, never retried
+    // (retrying bad credentials risks a provider lockout).
+    await h.repository.markAccountSyncAuthFailed(h.account.id, "invalid credentials");
+    const authBroken = await h.repository.getAccount(h.account.id);
+    if (!authBroken) throw new Error("missing account");
+    expect(authBroken.sync_state).toBe("BROKEN");
+    expect(authBroken.backoff_until).toBeNull();
+    const authRunnable = await h.repository.getRunnableAccounts(25);
+    expect(authRunnable.map((account) => account.id)).not.toContain(h.account.id);
   });
 
   it("flag scans update known rows only and emit FLAGS_CHANGED", async () => {

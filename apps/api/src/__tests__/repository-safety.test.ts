@@ -92,6 +92,25 @@ describe("repository safety", () => {
     expect(source).toContain("FOLDER_PENDING_VERIFICATION");
   });
 
+  it("drops discovery-flagged missing folders from the sync + history working set", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const collapsed = source.replace(/\s+/g, " ");
+
+    // A folder discovery has stamped missing_since (deleted from the provider) must
+    // leave every sync working set at once. Otherwise the sync lane keeps SELECTing
+    // it, the provider returns a generic error (e.g. Rackspace "Command failed",
+    // which is not a recognized missing-mailbox signal), the run fails, and
+    // consecutive_failures climbs to BROKEN — one deleted folder bricking the
+    // account. All four readers must carry the exclusion: getFoldersDueForSync
+    // (priority + round-robin), getHistoryBacklog, and getBodyBacklog (the body lane
+    // is the one un-try/caught reader, so a missed exclusion there bricks directly).
+    const syncFilter = "AND missing_since IS NULL AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
+    const joinedFilter = "AND f.missing_since IS NULL AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
+
+    expect(collapsed.split(syncFilter).length - 1).toBe(2);
+    expect(collapsed.split(joinedFilter).length - 1).toBe(2);
+  });
+
   it("persists manual folder opt-ins across folder-count cap rediscovery", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
@@ -173,11 +192,19 @@ describe("repository safety", () => {
     expect(source).toContain("FOLDER_MISSING_GRACE_EXCEEDED");
   });
 
-  it("only schedules retryable stuck-degraded broken accounts", async () => {
+  it("self-heals BROKEN accounts that have a scheduled retry, not the terminal ones", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
+    // getRunnableAccounts retries a BROKEN account once its backoff_until passes.
+    // backoff_until IS NOT NULL is the "can recover on its own" marker; the terminal
+    // paths (AUTH_ERROR, UIDVALIDITY-cap, STUCK_DEGRADED_TERMINAL) NULL it on purpose.
     expect(source).toContain("sync_state NOT IN ('PAUSED', 'BROKEN')");
-    expect(source).toContain("sync_state = 'BROKEN' AND sync_state_reason = 'STUCK_DEGRADED_24H'");
+    expect(source).toContain("sync_state = 'BROKEN' AND backoff_until IS NOT NULL");
+    // Failure-threshold BROKEN must schedule its retry on the calm heal cadence ($8 =
+    // STUCK_DEGRADED_RETRY_INTERVAL_MS), so it self-heals but is not hammered.
+    expect(source).toMatch(/WHEN a\.consecutive_failures \+ 1 >= \$3 THEN now\(\) \+ \(\$8::bigint/);
+    // AUTH_ERROR stays terminal: BROKEN with backoff_until NULLed.
+    expect(source).toMatch(/markAccountSyncAuthFailed[\s\S]{0,400}sync_state = 'BROKEN'[\s\S]{0,400}backoff_until = NULL/);
   });
 
   it("enforces the account cap at create time and worker startup", async () => {
