@@ -373,7 +373,16 @@ export class MirrorRepository {
       FROM public.imap_accounts
       WHERE (
           sync_state NOT IN ('PAUSED', 'BROKEN')
-          OR (sync_state = 'BROKEN' AND sync_state_reason = 'STUCK_DEGRADED_24H')
+          -- Self-heal: a BROKEN account is retried once its scheduled retry time
+          -- (backoff_until) passes. backoff_until IS NOT NULL is the deliberate
+          -- "this can recover on its own" marker — failure-threshold and
+          -- STUCK_DEGRADED_24H BROKEN both set it, so a transient cause (a deleted
+          -- folder, a brief provider outage) heals without operator action: the
+          -- next clean run resets sync_state + consecutive_failures. The terminal
+          -- BROKEN paths deliberately NULL backoff_until and stay out forever
+          -- until a human acts: AUTH_ERROR (bad creds — retrying risks lockout),
+          -- the UIDVALIDITY-reset cap, and STUCK_DEGRADED_TERMINAL.
+          OR (sync_state = 'BROKEN' AND backoff_until IS NOT NULL)
         )
         AND (backoff_until IS NULL OR backoff_until <= now())
         AND (
@@ -732,6 +741,12 @@ export class MirrorRepository {
         backoff_until = CASE
           WHEN stuck_state.is_terminal_stuck_degraded THEN NULL
           WHEN stuck_state.is_stuck_degraded THEN now() + ($8::bigint * interval '1 millisecond')
+          -- Failure-threshold BROKEN self-heals (getRunnableAccounts retries it once
+          -- backoff_until passes), but on the calm STUCK_DEGRADED_RETRY_INTERVAL_MS
+          -- ($8) cadence — not the ≤5-min exponential ceiling a DEGRADED account
+          -- uses — so a genuinely-broken account is re-attempted rarely while a
+          -- recovered one still heals within the interval.
+          WHEN a.consecutive_failures + 1 >= $3 THEN now() + ($8::bigint * interval '1 millisecond')
           ELSE now() + (next_backoff.jittered_ms * interval '1 millisecond')
         END
       FROM stuck_state, next_backoff

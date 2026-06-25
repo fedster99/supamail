@@ -414,6 +414,50 @@ liveDb("live DB reliability lane", () => {
     expect(dueBodies.map((message) => message.folder_path)).toEqual(["INBOX"]);
   });
 
+  it("self-heals a threshold-BROKEN account after its retry cadence, never an AUTH_ERROR one", async () => {
+    // An account bricked by transient failures (e.g. the now-fixed deleted-folder
+    // brick) must recover on its own once the cause clears — not stay dead until an
+    // operator resets it. getRunnableAccounts retries a BROKEN account whose
+    // backoff_until has passed; the next clean run heals it. Terminal breaks
+    // (AUTH_ERROR) NULL backoff_until and are never auto-retried.
+    const h = await setupIntegration("live-self-heal", {
+      STUCK_DEGRADED_RETRY_INTERVAL_MS: 60 * 60_000
+    });
+    activeAccountIds.push(h.account.id);
+
+    // Drive it to BROKEN via the consecutive-failure threshold (BROKEN at 10).
+    for (let i = 0; i < 10; i += 1) {
+      await h.repository.markAccountSyncFailed(h.account.id, "INBOX.Projects: Command failed");
+    }
+    const broken = await h.repository.getAccount(h.account.id);
+    if (!broken) throw new Error("missing account");
+    expect(broken.sync_state).toBe("BROKEN");
+    expect(broken.consecutive_failures).toBeGreaterThanOrEqual(10);
+    expect(broken.backoff_until).not.toBeNull();
+
+    // While the heal backoff is still in the future, it is not retried.
+    const duringBackoff = await h.repository.getRunnableAccounts(25);
+    expect(duringBackoff.map((account) => account.id)).not.toContain(h.account.id);
+
+    // Once the retry time passes, it is picked up again — self-heal, no operator action.
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET backoff_until = now() - interval '1 second' WHERE id = $1",
+      [h.account.id]
+    );
+    const afterBackoff = await h.repository.getRunnableAccounts(25);
+    expect(afterBackoff.map((account) => account.id)).toContain(h.account.id);
+
+    // An AUTH_ERROR break is terminal: BROKEN with backoff_until NULL, never retried
+    // (retrying bad credentials risks a provider lockout).
+    await h.repository.markAccountSyncAuthFailed(h.account.id, "invalid credentials");
+    const authBroken = await h.repository.getAccount(h.account.id);
+    if (!authBroken) throw new Error("missing account");
+    expect(authBroken.sync_state).toBe("BROKEN");
+    expect(authBroken.backoff_until).toBeNull();
+    const authRunnable = await h.repository.getRunnableAccounts(25);
+    expect(authRunnable.map((account) => account.id)).not.toContain(h.account.id);
+  });
+
   it("flag scans update known rows only and emit FLAGS_CHANGED", async () => {
     const h = await setupIntegration("live-flags", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);

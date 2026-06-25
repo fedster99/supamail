@@ -192,11 +192,19 @@ describe("repository safety", () => {
     expect(source).toContain("FOLDER_MISSING_GRACE_EXCEEDED");
   });
 
-  it("only schedules retryable stuck-degraded broken accounts", async () => {
+  it("self-heals BROKEN accounts that have a scheduled retry, not the terminal ones", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
+    // getRunnableAccounts retries a BROKEN account once its backoff_until passes.
+    // backoff_until IS NOT NULL is the "can recover on its own" marker; the terminal
+    // paths (AUTH_ERROR, UIDVALIDITY-cap, STUCK_DEGRADED_TERMINAL) NULL it on purpose.
     expect(source).toContain("sync_state NOT IN ('PAUSED', 'BROKEN')");
-    expect(source).toContain("sync_state = 'BROKEN' AND sync_state_reason = 'STUCK_DEGRADED_24H'");
+    expect(source).toContain("sync_state = 'BROKEN' AND backoff_until IS NOT NULL");
+    // Failure-threshold BROKEN must schedule its retry on the calm heal cadence ($8 =
+    // STUCK_DEGRADED_RETRY_INTERVAL_MS), so it self-heals but is not hammered.
+    expect(source).toMatch(/WHEN a\.consecutive_failures \+ 1 >= \$3 THEN now\(\) \+ \(\$8::bigint/);
+    // AUTH_ERROR stays terminal: BROKEN with backoff_until NULLed.
+    expect(source).toMatch(/markAccountSyncAuthFailed[\s\S]{0,400}sync_state = 'BROKEN'[\s\S]{0,400}backoff_until = NULL/);
   });
 
   it("enforces the account cap at create time and worker startup", async () => {
