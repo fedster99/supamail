@@ -95,9 +95,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0010_search_recipient_indexes");
+    expect(version).toBe("0011_webhook_emit_indexes");
     expect(manifest).toEqual({
-      schemaVersion: "0010_search_recipient_indexes",
+      schemaVersion: "0011_webhook_emit_indexes",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -108,7 +108,8 @@ describe("initial schema", () => {
         { id: "0007_optional_raw_mime", file: "0007_optional_raw_mime.sql" },
         { id: "0008_search_layer", file: "0008_search_layer.sql" },
         { id: "0009_smtp_send", file: "0009_smtp_send.sql" },
-        { id: "0010_search_recipient_indexes", file: "0010_search_recipient_indexes.sql" }
+        { id: "0010_search_recipient_indexes", file: "0010_search_recipient_indexes.sql" },
+        { id: "0011_webhook_emit_indexes", file: "0011_webhook_emit_indexes.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -121,6 +122,8 @@ describe("initial schema", () => {
     expect(sql).toContain("headers_synced_count int NOT NULL DEFAULT 0");
     expect(sql).toContain("last_archive_refresh_at timestamptz");
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
+    expect(sql).toContain("imap_messages_created_emit_idx");
+    expect(sql).toContain("imap_messages_updated_emit_idx");
   });
 
   it("adds stuck-degraded escalation state without control-plane tables", async () => {

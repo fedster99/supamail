@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0010_search_recipient_indexes",
+  "schemaVersion": "0011_webhook_emit_indexes",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -40,6 +40,10 @@
     {
       "id": "0010_search_recipient_indexes",
       "file": "0010_search_recipient_indexes.sql"
+    },
+    {
+      "id": "0011_webhook_emit_indexes",
+      "file": "0011_webhook_emit_indexes.sql"
     }
   ]
 }
