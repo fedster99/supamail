@@ -316,6 +316,51 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     await expect(downloadAttachmentStream(pool, config, "att-1")).rejects.toThrow("scope failed");
     expect(reader.logout).toHaveBeenCalledTimes(1); // closeImap ran
   });
+
+  it("releases the lock + connection when the stream is destroyed before end (consumer abort)", async () => {
+    const release = vi.fn();
+    const stream = new Readable({ read() {} }); // stays open until destroyed (no auto-end)
+    const reader = fakeReader({ downloadPartStream: vi.fn(async () => ({ stream, release })) });
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+
+    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    dl.stream.destroy(); // consumer aborts before any byte is read to end
+    await new Promise((r) => setImmediate(r)); // let the 'close' listener run
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(reader.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the lock + connection exactly once when the stream errors mid-flight", async () => {
+    const release = vi.fn();
+    const stream = new Readable({ read() {} });
+    const reader = fakeReader({ downloadPartStream: vi.fn(async () => ({ stream, release })) });
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+
+    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    dl.stream.destroy(new Error("mid-flight")); // emits 'error' then 'close' — both listeners fire
+    await new Promise((r) => setImmediate(r));
+    expect(release).toHaveBeenCalledTimes(1); // memoized teardown runs once, not twice
+    expect(reader.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("teardown never rejects even if the lock release throws (no unhandledRejection)", async () => {
+    const release = vi.fn(() => {
+      throw new Error("release boom");
+    });
+    const reader = fakeReader({
+      downloadPartStream: vi.fn(async () => ({ stream: Readable.from([Buffer.from("x")]), release }))
+    });
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+
+    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    await drain(dl.stream);
+    // close() must resolve, not reject — the auto-close listeners call it unawaited,
+    // where a rejection would become an unhandledRejection and could crash the process.
+    await expect(dl.close()).resolves.toBeUndefined();
+  });
 });
 
 describe("getRawMime fetch branch", () => {

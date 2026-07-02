@@ -28,7 +28,7 @@ import type { ImapAccount } from "./types.js";
  * The on-demand fetch uses a narrow read-only {@link ContentImapClient} whose
  * socket comes from the one shared {@link connectImap} prelude (decrypt +
  * assertSafeImapTarget + the close-on-connect-error guard) but exposes ONLY
- * `download()` / `fetchOneSource()` (a READ). It is NOT the sync adapter
+ * `downloadPart()` / `downloadPartStream()` / `fetchOneSource()` (all READs). It is NOT the sync adapter
  * (ThrottledImapClient stays untouched, so sync-adapter-read-only.test.ts holds)
  * and it never writes.
  */
@@ -368,8 +368,18 @@ export async function downloadAttachmentStream(
   const close = (): Promise<void> => {
     if (!closing) {
       closing = (async () => {
-        scope.release();
-        await closeImap(reader);
+        // Best-effort teardown that must NEVER reject: it runs from the unawaited
+        // 'close'/'error' listeners below (a rejection there becomes an
+        // unhandledRejection and can crash the process), and from the buffered
+        // path's `finally { await close() }` (a reject there would mask the real
+        // error). `closeImap` already swallows a logout() failure; this guards the
+        // lock release + the hard-close fallback too.
+        try {
+          scope.release();
+          await closeImap(reader);
+        } catch {
+          /* teardown is best-effort */
+        }
       })();
     }
     return closing;
