@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
 import { NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
@@ -219,6 +220,10 @@ function buildApp(options: {
     })),
     downloadAttachment: vi.fn(async (id: string) => ({
       attachmentId: id, messageId, filename: "a.pdf", contentType: "application/pdf", sizeBytes: 10, partNumber: "2", contentId: null, inline: false, content: Buffer.from("PDFBYTES")
+    })),
+    downloadAttachmentStream: vi.fn(async (id: string) => ({
+      attachmentId: id, messageId, filename: "a.pdf", contentType: "application/pdf", sizeBytes: 10, partNumber: "2", contentId: null, inline: false,
+      stream: Readable.from([Buffer.from("PDFBYTES")]), close: vi.fn(async () => undefined)
     })),
     getRawMime: vi.fn(async (id: string) => ({ messageId: id, raw: Buffer.from("Subject: x\r\n\r\nbody"), source: "mirror" as const, truncated: false })),
     getMessageHeaders: vi.fn(async (id: string, _opts: { basic?: boolean }) => ({ messageId: id, headers: { "message-id": "<m@example.test>" }, source: "mirror" as const })),
@@ -807,13 +812,10 @@ describe("API safety", () => {
     const { app, content } = buildApp();
     const attachmentId = "00000000-0000-4000-8000-0000000000a1";
     // A hostile filename: quote + CR/LF + semicolon (param injection) + non-ASCII.
-    content.getAttachmentMetadata.mockResolvedValueOnce({
-      attachmentId, messageId, filename: 'evil";\r\nname="x.exe', contentType: "application/pdf",
-      sizeBytes: 8, partNumber: "2", contentId: null, inline: false
-    } as never);
-    content.downloadAttachment.mockResolvedValueOnce({
+    content.downloadAttachmentStream.mockResolvedValueOnce({
       attachmentId, messageId, filename: 'reçu";\r\n.pdf', contentType: "application/pdf",
-      sizeBytes: 8, partNumber: "2", contentId: null, inline: false, content: Buffer.from("PDFBYTES")
+      sizeBytes: 8, partNumber: "2", contentId: null, inline: false,
+      stream: Readable.from([Buffer.from("PDFBYTES")]), close: vi.fn(async () => undefined)
     } as never);
 
     const res = await app.request(`/attachments/${attachmentId}/download`, { headers: auth() });
@@ -1025,7 +1027,7 @@ describe("API safety", () => {
   it("maps an unfetchable attachment (no BODYSTRUCTURE part) to 422 (not a 500)", async () => {
     const { app, content } = buildApp();
     const attachmentId = "00000000-0000-4000-8000-0000000000b2";
-    content.downloadAttachment.mockRejectedValueOnce(
+    content.downloadAttachmentStream.mockRejectedValueOnce(
       new UnfetchableContentError("has no BODYSTRUCTURE part number") as never
     );
     const res = await app.request(`/attachments/${attachmentId}/download`, { headers: auth() });

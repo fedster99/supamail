@@ -1,3 +1,4 @@
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 import type { PgPool } from "../db.js";
@@ -5,11 +6,19 @@ import {
   ContentImapClient,
   cleanMessageBody,
   downloadAttachment,
+  downloadAttachmentStream,
   getMessageHeaders,
   getRawMime,
   listAttachments,
   selectFields
 } from "../content.js";
+
+/** Consume an async-iterable/stream to a string (test helper). */
+async function drain(stream: AsyncIterable<unknown>): Promise<string> {
+  let out = "";
+  for await (const chunk of stream) out += String(chunk);
+  return out;
+}
 import { NotFoundError, UnfetchableContentError } from "../errors.js";
 
 // A minimal fake pool: every connect() yields a client whose query() returns the
@@ -118,9 +127,12 @@ describe("cleanMessageBody (deterministic, no LLM)", () => {
 /** A reader stub standing in for a connected ContentImapClient. logout()/close()
  * mirror the real teardown surface so closeImap() works. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function fakeReader(over: { downloadPart?: any; fetchOneSource?: any } = {}) {
+function fakeReader(over: { downloadPart?: any; downloadPartStream?: any; fetchOneSource?: any } = {}) {
   return {
     downloadPart: over.downloadPart ?? vi.fn(async () => Buffer.from("PART-BYTES")),
+    downloadPartStream:
+      over.downloadPartStream ??
+      vi.fn(async () => ({ stream: Readable.from([Buffer.from("PART-BYTES")]), release: vi.fn() })),
     fetchOneSource: over.fetchOneSource ?? vi.fn(async () => Buffer.from("RAW-BYTES")),
     logout: vi.fn(async () => undefined),
     close: vi.fn()
@@ -197,9 +209,10 @@ describe("downloadAttachment (on-demand IMAP part fetch)", () => {
 
     const out = await downloadAttachment(pool, config, "att-1");
 
-    expect(reader.downloadPart).toHaveBeenCalledTimes(1);
+    // Buffered download now delegates to the streaming primitive + streamToBuffer.
+    expect(reader.downloadPartStream).toHaveBeenCalledTimes(1);
     // folderPath, uidValidity, uid, part, maxBytes — all from the resolved coords.
-    expect(reader.downloadPart).toHaveBeenCalledWith("INBOX", 100, 42, "2", config.BODY_RAW_MAX_BYTES);
+    expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "2", config.BODY_RAW_MAX_BYTES);
     expect(out.attachmentId).toBe("att-1");
     expect(out.filename).toBe("report.pdf");
     expect(out.content.toString()).toBe("PART-BYTES");
@@ -214,7 +227,7 @@ describe("downloadAttachment (on-demand IMAP part fetch)", () => {
       attachment: { id: "att-2", message_id: "m1", filename: "logo.png", mime_type: "image/png", size_bytes: "512", part_number: "1.2", content_id: "<logo>", disposition: "inline" }
     });
     await downloadAttachment(pool, config, "att-2");
-    expect(reader.downloadPart).toHaveBeenCalledWith("INBOX", 100, 42, "1.2", config.BODY_RAW_MAX_BYTES);
+    expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "1.2", config.BODY_RAW_MAX_BYTES);
   });
 
   it("throws NotFoundError when the attachment id is unknown (no IMAP connect)", async () => {
@@ -229,6 +242,79 @@ describe("downloadAttachment (on-demand IMAP part fetch)", () => {
     });
     await expect(downloadAttachment(pool, config, "att-3")).rejects.toBeInstanceOf(UnfetchableContentError);
     expect(connectSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
+  const ATT = { id: "att-1", message_id: "m1", filename: "big.pdf", mime_type: "application/pdf", size_bytes: "9999", part_number: "2", content_id: null, disposition: "attachment" };
+
+  it("returns the decoded stream + metadata and tears down the lock + connection on close", async () => {
+    const release = vi.fn();
+    const reader = fakeReader({
+      downloadPartStream: vi.fn(async () => ({ stream: Readable.from([Buffer.from("STREAM-BYTES")]), release }))
+    });
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+
+    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "2", config.BODY_RAW_MAX_BYTES);
+    expect(dl.attachmentId).toBe("att-1");
+    expect(dl.filename).toBe("big.pdf");
+    expect(await drain(dl.stream)).toBe("STREAM-BYTES");
+
+    await dl.close();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(reader.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards an explicit maxBytes override to the stream fetch", async () => {
+    const reader = fakeReader();
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+    await downloadAttachmentStream(pool, config, "att-1", { maxBytes: 123 });
+    expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "2", 123);
+  });
+
+  it("throws NotFoundError before connecting when the attachment id is unknown", async () => {
+    const pool = routingPool({ attachment: null });
+    await expect(downloadAttachmentStream(pool, config, "missing")).rejects.toBeInstanceOf(NotFoundError);
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("throws UnfetchableContentError before connecting when there is no BODYSTRUCTURE part", async () => {
+    const pool = routingPool({
+      attachment: { ...ATT, part_number: null }
+    });
+    await expect(downloadAttachmentStream(pool, config, "att-1")).rejects.toBeInstanceOf(UnfetchableContentError);
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("close() is idempotent and also fires automatically when the stream ends", async () => {
+    const release = vi.fn();
+    const reader = fakeReader({
+      downloadPartStream: vi.fn(async () => ({ stream: Readable.from([Buffer.from("x")]), release }))
+    });
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+
+    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    await drain(dl.stream); // full consume -> 'close' auto-fires teardown
+    await new Promise((r) => setImmediate(r)); // let the 'close' listener run
+    await dl.close(); // explicit call is a no-op (memoized)
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(reader.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("tears down the connection (no leak) when the scope setup throws after connect", async () => {
+    const reader = fakeReader({
+      downloadPartStream: vi.fn(async () => {
+        throw new Error("scope failed");
+      })
+    });
+    connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
+    const pool = routingPool({ attachment: ATT });
+    await expect(downloadAttachmentStream(pool, config, "att-1")).rejects.toThrow("scope failed");
+    expect(reader.logout).toHaveBeenCalledTimes(1); // closeImap ran
   });
 });
 
@@ -333,5 +419,44 @@ describe("ContentImapClient (UIDVALIDITY guard + verb surface)", () => {
     const client = clientFrom(stub);
     await expect(client.fetchOneSource("INBOX", 100, 42, 1000)).rejects.toThrow(/UIDVALIDITY changed/);
     expect(stub.fetchOne).not.toHaveBeenCalled();
+  });
+
+  it("downloadPartStream returns the decoded stream + a release that unlocks, under a matching UIDVALIDITY", async () => {
+    const release = vi.fn();
+    const stub = imapStub(100, {
+      getMailboxLock: vi.fn(async () => ({ release })),
+      download: vi.fn(async () => ({ content: Readable.from([Buffer.from("DL")]) }))
+    });
+    const client = clientFrom(stub);
+
+    const { stream, release: rel } = await client.downloadPartStream("INBOX", 100, 42, "2", 1000);
+    expect(stub.download).toHaveBeenCalledWith("42", "2", { uid: true, maxBytes: 1000 });
+    expect(await drain(stream)).toBe("DL");
+    // Lock stays held until the caller releases (ownership transferred).
+    expect(release).not.toHaveBeenCalled();
+    rel();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("downloadPartStream fails closed + releases the lock on a UIDVALIDITY mismatch (no download)", async () => {
+    const release = vi.fn();
+    const stub = imapStub(999, { getMailboxLock: vi.fn(async () => ({ release })) });
+    const client = clientFrom(stub);
+    await expect(client.downloadPartStream("INBOX", 100, 42, "2", 1000)).rejects.toThrow(/UIDVALIDITY changed/);
+    expect(stub.download).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("downloadPartStream releases the lock when the download call itself throws", async () => {
+    const release = vi.fn();
+    const stub = imapStub(100, {
+      getMailboxLock: vi.fn(async () => ({ release })),
+      download: vi.fn(async () => {
+        throw new Error("boom");
+      })
+    });
+    const client = clientFrom(stub);
+    await expect(client.downloadPartStream("INBOX", 100, 42, "2", 1000)).rejects.toThrow("boom");
+    expect(release).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,3 +1,4 @@
+import type { Readable } from "node:stream";
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
@@ -48,6 +49,24 @@ export interface AttachmentInfo {
 export interface AttachmentDownload extends AttachmentInfo {
   /** The decoded part bytes (Content-Transfer-Encoding already removed). */
   content: Buffer;
+}
+
+/**
+ * A STREAMING attachment download + the metadata it belongs to. The bytes are never
+ * buffered in full — `stream` is imapflow's decoded part stream (Content-Transfer-Encoding
+ * already removed) piped straight from the IMAP socket, so peak memory stays flat
+ * regardless of file size. The IMAP folder lock + connection are held open for the
+ * stream's lifetime; the caller MUST call `close()` once the stream is fully consumed OR
+ * on error/abort. `close()` is idempotent and also fires automatically on the stream's
+ * `end`/`error`, so a forgotten call can never leak the lock/connection.
+ *
+ * imapflow caps the DECODED stream at `maxBytes` (its byte limiter is the last pipeline
+ * stage): if the file exceeds it the stream is truncated silently, so a caller that must
+ * serve only complete files should treat "bytes read >= maxBytes" as truncated.
+ */
+export interface AttachmentDownloadStream extends AttachmentInfo {
+  stream: Readable;
+  close(): Promise<void>;
 }
 
 /** Raw RFC-822 bytes of a message, plus whether they came from the mirror. */
@@ -148,6 +167,33 @@ export class ContentImapClient {
       const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
       return await streamToBuffer(result.content);
     });
+  }
+
+  /**
+   * Like {@link downloadPart} but returns imapflow's decoded part STREAM instead of
+   * buffering it, so large parts never sit in memory. The folder lock is acquired and
+   * UIDVALIDITY asserted here (a mismatch throws BEFORE any stream exists), then OWNERSHIP
+   * of the lock transfers to the caller: the returned `release` unlocks the mailbox and
+   * MUST be called once the stream is done/aborted (the higher-level
+   * {@link downloadAttachmentStream} wires `release` into its `close()`). If anything
+   * fails before the stream is handed back, the lock is released here.
+   */
+  async downloadPartStream(
+    folderPath: string,
+    uidValidity: number,
+    uid: number,
+    part: string,
+    maxBytes: number
+  ): Promise<{ stream: Readable; release: () => void }> {
+    const lock = await this.client.getMailboxLock(folderPath);
+    try {
+      this.assertUidValidity(folderPath, uidValidity);
+      const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
+      return { stream: result.content as Readable, release: () => lock.release() };
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
   }
 
   /** Fetch the whole RFC-822 source (capped at `maxBytes`). Used for raw MIME /
@@ -262,6 +308,30 @@ export async function downloadAttachment(
   config: AppConfig,
   attachmentId: string
 ): Promise<AttachmentDownload> {
+  const { stream, close, ...meta } = await downloadAttachmentStream(pool, config, attachmentId);
+  try {
+    const content = await streamToBuffer(stream);
+    return { ...meta, content };
+  } finally {
+    await close();
+  }
+}
+
+/**
+ * STREAMING variant of {@link downloadAttachment}: same on-demand IMAP part fetch and the
+ * IDENTICAL preflight (metadata → 404, missing part_number → 422, message/account resolve,
+ * connect, UIDVALIDITY assert — every failure throws BEFORE the stream so the HTTP status
+ * is always decided before headers are sent), but returns imapflow's decoded part stream
+ * instead of a Buffer so peak memory stays flat regardless of file size. `maxBytes` defaults
+ * to `config.BODY_RAW_MAX_BYTES`; the caller owns the returned `close()` (see
+ * {@link AttachmentDownloadStream}).
+ */
+export async function downloadAttachmentStream(
+  pool: PgPool,
+  config: AppConfig,
+  attachmentId: string,
+  opts: { maxBytes?: number } = {}
+): Promise<AttachmentDownloadStream> {
   const meta = await getAttachmentMetadata(pool, config, attachmentId);
   if (!meta) throw new NotFoundError(`Attachment not found: ${attachmentId}`);
   if (!meta.partNumber) {
@@ -270,22 +340,47 @@ export async function downloadAttachment(
     );
   }
 
+  const maxBytes = opts.maxBytes ?? config.BODY_RAW_MAX_BYTES;
   const repository = new MirrorRepository(pool, config);
   const { message, account } = await loadMessageAndAccount(repository, meta.messageId);
 
   const reader = await ContentImapClient.connect(pool, config, account);
+  let scope: { stream: Readable; release: () => void };
   try {
-    const content = await reader.downloadPart(
+    scope = await reader.downloadPartStream(
       message.folder_path,
       Number(message.uidvalidity),
       Number(message.uid),
       meta.partNumber,
-      config.BODY_RAW_MAX_BYTES
+      maxBytes
     );
-    return { ...meta, content };
-  } finally {
+  } catch (err) {
+    // Preflight/scope setup failed after connect — tear the connection down and rethrow
+    // so the caller sees the typed error (no stream, no leaked socket).
     await closeImap(reader);
+    throw err;
   }
+
+  // One memoized teardown: release the folder lock, then close the connection. Concurrent
+  // callers (the caller's explicit close + the end/error auto-close below) await the SAME
+  // promise, so teardown runs exactly once and is always awaitable.
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (!closing) {
+      closing = (async () => {
+        scope.release();
+        await closeImap(reader);
+      })();
+    }
+    return closing;
+  };
+  // `close` fires on normal completion (autoDestroy → 'close' after 'end'), on abort
+  // (consumer destroys the stream → 'close'), and 'error' covers failures — so the lock +
+  // connection are always released even if the caller forgets to await close().
+  scope.stream.once("close", () => void close());
+  scope.stream.once("error", () => void close());
+
+  return { ...meta, stream: scope.stream, close };
 }
 
 /**
