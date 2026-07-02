@@ -4,6 +4,7 @@ import type { Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { timingSafeEqual } from "node:crypto";
+import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { getConfig, type AppConfig } from "./config.js";
@@ -17,12 +18,14 @@ import { searchMessages, type SearchRequest, type SearchResponse } from "./searc
 import {
   cleanMessageBody,
   downloadAttachment,
+  downloadAttachmentStream,
   getAttachmentMetadata,
   getMessageHeaders,
   getRawMime,
   listAttachments,
   selectFields,
   type AttachmentDownload,
+  type AttachmentDownloadStream,
   type AttachmentInfo,
   type CleanBodyResultDetail,
   type MessageHeadersResult,
@@ -117,6 +120,7 @@ interface ApiAppOptions {
     listAttachments: (messageId: string) => Promise<AttachmentInfo[]>;
     getAttachmentMetadata: (attachmentId: string) => Promise<AttachmentInfo | null>;
     downloadAttachment: (attachmentId: string) => Promise<AttachmentDownload>;
+    downloadAttachmentStream: (attachmentId: string) => Promise<AttachmentDownloadStream>;
     getRawMime: (messageId: string) => Promise<RawMimeResult>;
     getMessageHeaders: (messageId: string, options: { basic?: boolean }) => Promise<MessageHeadersResult>;
     cleanMessageBody: (messageId: string, options: { includeQuoted?: boolean; maxChars?: number }) => Promise<CleanBodyResultDetail>;
@@ -675,18 +679,21 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ attachment: selectFields(meta, parseFields(c.req.query("fields"))) });
   });
 
-  // Stream the decoded attachment bytes (always an on-demand IMAP fetch).
+  // Stream the decoded attachment bytes (always an on-demand IMAP fetch). The bytes are
+  // never buffered in full — the part streams straight from the IMAP socket, so peak
+  // memory stays flat regardless of file size. Preflight (404/422/UIDVALIDITY) throws
+  // BEFORE the stream, so the status is settled before headers are sent; the stream owns
+  // its own teardown (auto-close on end/error, and on client abort the web-stream cancel
+  // destroys the source → releases the IMAP lock + connection).
   app.get("/attachments/:id/download", async (c) => {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
-    const meta = await options.content.getAttachmentMetadata(id);
-    if (!meta) throw new NotFoundError(`Attachment not found: ${id}`);
-    const download = await options.content.downloadAttachment(id);
+    const download = await options.content.downloadAttachmentStream(id);
     c.header("content-type", download.contentType ?? "application/octet-stream");
     c.header(
       "content-disposition",
       contentDispositionHeader(download.inline ? "inline" : "attachment", download.filename ?? "attachment")
     );
-    return c.body(toArrayBuffer(download.content));
+    return c.body(Readable.toWeb(download.stream) as unknown as ReadableStream);
   });
 
   app.get("/messages/:id/raw", async (c) => {
@@ -898,6 +905,7 @@ export function startApiServer(options: StartApiServerOptions = {}): ReturnType<
       listAttachments: (messageId) => listAttachments(pool, config, messageId),
       getAttachmentMetadata: (attachmentId) => getAttachmentMetadata(pool, config, attachmentId),
       downloadAttachment: (attachmentId) => downloadAttachment(pool, config, attachmentId),
+      downloadAttachmentStream: (attachmentId) => downloadAttachmentStream(pool, config, attachmentId),
       getRawMime: (messageId) => getRawMime(pool, config, messageId),
       getMessageHeaders: (messageId, opts) => getMessageHeaders(pool, config, messageId, opts),
       cleanMessageBody: (messageId, opts) => cleanMessageBody(pool, config, messageId, opts)
