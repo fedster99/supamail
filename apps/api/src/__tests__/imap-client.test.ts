@@ -5,6 +5,7 @@ import type { AppConfig } from "../config.js";
 import {
   fetchFullMessageBody,
   fetchMessageMetadata,
+  MessageMovedError,
   searchAllUids,
   searchUidsBefore,
   searchUidsSince,
@@ -164,6 +165,27 @@ describe("fetchFullMessageBody mailbox locking", () => {
     await expect(
       fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true })
     ).rejects.toThrow(/expected INBOX\.Notes to be selected/);
+  });
+
+  it("throws MessageMovedError when the UID is gone from the folder (moved/deleted)", async () => {
+    // INBOX.Notes is still present and selectable, but no longer contains uid 1273 —
+    // a filter moved it, or it was deleted, between metadata sync and this body fetch.
+    // fetchOne returns false; without the guard the download fallback would stream
+    // `false.content` and crash, bricking the account. It must be a benign MovedError.
+    const client = new FixtureImapClient([
+      {
+        path: "INBOX.Notes",
+        delimiter: ".",
+        specialUse: undefined,
+        uidValidity: 1,
+        messages: [
+          makeTextMessage({ uid: 9999, subject: "other", from: "a@example.test", to: "b@example.test", body: "x" })
+        ]
+      }
+    ]);
+    await expect(
+      fetchFullMessageBody(client, bodyConfig, notesMessage)
+    ).rejects.toBeInstanceOf(MessageMovedError);
   });
 });
 
