@@ -159,6 +159,76 @@ export async function runLockSelfTest(pool: PgPool): Promise<void> {
   }
 }
 
+/**
+ * Transient startup DB failures that should be RETRIED, not treated as fatal. During a
+ * deploy the old + new instances overlap on the (small) session pooler, so a fresh
+ * instance can briefly fail to check out a session connection: "max clients reached",
+ * checkout timeout, statement_timeout (57014), dropped/closed connections.
+ *
+ * This deliberately does NOT match the pooling-detection failure ("second connection
+ * acquired an already-held advisory lock") — that is a real correctness signal
+ * (transaction pooling breaks advisory locks) and must stay fatal.
+ */
+export function isTransientStartupDbError(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  if (code === "57014") return true; // canceling statement due to statement timeout
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    // Raw node-postgres pg.Pool — supamail's default stack. This is the exact string
+    // pg-pool throws on a checkout timeout (`connectionTimeoutMillis`), and the one a
+    // saturated pool surfaces; keep it first so the default deployment is covered.
+    msg.includes("timeout exceeded when trying to connect") ||
+    msg.includes("connection terminated") ||
+    msg.includes("connection to database closed") ||
+    // Session-pooler-backed deployments (PgBouncer / Supavisor — e.g. cloud, BYO).
+    msg.includes("maxclientsinsessionmode") ||
+    msg.includes("max clients reached") ||
+    msg.includes("too many clients") ||
+    msg.includes("edbhandlerexited") ||
+    // Generic transient network / statement signatures.
+    msg.includes("statement timeout") ||
+    msg.includes("econnrefused") ||
+    msg.includes("etimedout")
+  );
+}
+
+/**
+ * Run the advisory-lock self-test, retrying transient DB errors with exponential
+ * backoff before giving up. The caller still exits if this throws — the retry only
+ * rides through deploy-time session-pooler saturation; it never weakens the gate (a
+ * definitive pooling failure is not transient and is rethrown immediately).
+ *
+ * Default budget ~= 39s across 8 attempts (1+2+4+8+8+8+8s), enough to outlast a single
+ * deploy's instance overlap.
+ */
+export async function runLockSelfTestWithRetry(
+  pool: PgPool,
+  opts?: {
+    maxAttempts?: number;
+    baseDelayMs?: number;
+    maxDelayMs?: number;
+    onRetry?: (info: { attempt: number; maxAttempts: number; delayMs: number; error: unknown }) => void;
+  }
+): Promise<void> {
+  const maxAttempts = opts?.maxAttempts ?? 8;
+  const baseDelayMs = opts?.baseDelayMs ?? 1_000;
+  const maxDelayMs = opts?.maxDelayMs ?? 8_000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await runLockSelfTest(pool);
+      return;
+    } catch (error) {
+      if (attempt >= maxAttempts || !isTransientStartupDbError(error)) {
+        throw error;
+      }
+      const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+      opts?.onRetry?.({ attempt, maxAttempts, delayMs, error });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export async function clearOrphanedLockForAccount(
   pool: PgPool,
   lockId: string | number,
