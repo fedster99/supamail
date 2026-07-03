@@ -174,14 +174,18 @@ export function isTransientStartupDbError(error: unknown): boolean {
   if (code === "57014") return true; // canceling statement due to statement timeout
   const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
   return (
+    // Raw node-postgres pg.Pool — supamail's default stack. This is the exact string
+    // pg-pool throws on a checkout timeout (`connectionTimeoutMillis`), and the one a
+    // saturated pool surfaces; keep it first so the default deployment is covered.
+    msg.includes("timeout exceeded when trying to connect") ||
+    msg.includes("connection terminated") ||
+    msg.includes("connection to database closed") ||
+    // Session-pooler-backed deployments (PgBouncer / Supavisor — e.g. cloud, BYO).
     msg.includes("maxclientsinsessionmode") ||
     msg.includes("max clients reached") ||
     msg.includes("too many clients") ||
-    msg.includes("unable to check out connection") ||
-    msg.includes("echeckouttimeout") ||
     msg.includes("edbhandlerexited") ||
-    msg.includes("connection terminated") ||
-    msg.includes("connection to database closed") ||
+    // Generic transient network / statement signatures.
     msg.includes("statement timeout") ||
     msg.includes("econnrefused") ||
     msg.includes("etimedout")

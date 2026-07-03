@@ -2,15 +2,18 @@ import { describe, expect, it } from "vitest";
 import { isTransientStartupDbError } from "../locks.js";
 
 describe("isTransientStartupDbError", () => {
-  it("treats deploy-time session-pooler saturation as transient (retryable)", () => {
-    // Signatures observed when old + new instances overlap on the session pooler.
+  it("treats deploy-time pool/pooler saturation as transient (retryable)", () => {
+    // Raw pg.Pool (supamail's default stack) — the EXACT strings node-postgres emits
+    // on a checkout timeout / dropped connection. Regression-critical: an earlier port
+    // asserted strings the driver never produces while missing this real one.
+    expect(isTransientStartupDbError(new Error("timeout exceeded when trying to connect"))).toBe(true);
+    expect(isTransientStartupDbError(new Error("Connection terminated unexpectedly"))).toBe(true);
+    expect(isTransientStartupDbError(new Error("connection to database closed"))).toBe(true);
+    // Session-pooler-backed deployments (PgBouncer / Supavisor).
     expect(isTransientStartupDbError(Object.assign(new Error("canceling statement"), { code: "57014" }))).toBe(true);
     expect(isTransientStartupDbError(new Error("MaxClientsInSessionMode: max clients reached"))).toBe(true);
     expect(isTransientStartupDbError(new Error("sorry, too many clients already"))).toBe(true);
-    expect(isTransientStartupDbError(new Error("unable to check out connection"))).toBe(true);
-    expect(isTransientStartupDbError(new Error("ECHECKOUTTIMEOUT: connection checkout"))).toBe(true);
-    expect(isTransientStartupDbError(new Error("Connection terminated unexpectedly"))).toBe(true);
-    expect(isTransientStartupDbError(new Error("connection to database closed"))).toBe(true);
+    // Generic transient network signatures.
     expect(isTransientStartupDbError(new Error("connect ECONNREFUSED 127.0.0.1:5432"))).toBe(true);
     expect(isTransientStartupDbError(new Error("read ETIMEDOUT"))).toBe(true);
   });
