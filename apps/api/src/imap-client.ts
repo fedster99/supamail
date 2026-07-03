@@ -348,6 +348,25 @@ async function streamToBuffer(stream: AsyncIterable<Buffer | Uint8Array | string
   return Buffer.concat(chunks);
 }
 
+/**
+ * A message UID present at metadata-sync time is no longer in its folder at
+ * body-fetch time — moved by a provider filter, or deleted. Terminal and benign:
+ * the body lane catches this and soft-deletes the row (`MOVED_OUT`) instead of
+ * erroring the account. Without it a gone UID makes `fetchOne` return false, the
+ * download fallback fetches `false.content` (undefined) and crashes `streamToBuffer`,
+ * and because the body lane is the one un-try/caught reader that throw bricks the
+ * whole account to BROKEN and re-loops every backfill.
+ */
+export class MessageMovedError extends Error {
+  constructor(
+    public readonly uid: string,
+    public readonly folderPath: string
+  ) {
+    super(`message uid ${uid} is no longer present in ${folderPath}`);
+    this.name = "MessageMovedError";
+  }
+}
+
 export async function fetchFullMessageBody(
   client: MirrorImapClient,
   config: AppConfig,
@@ -382,12 +401,24 @@ export async function fetchFullMessageBody(
       headers: true
     }, { uid: true });
 
-    let rawMime: Buffer = fetched && fetched.source ? Buffer.from(fetched.source) : Buffer.alloc(0);
+    // The UID can vanish between metadata sync and this body fetch (a filter moved
+    // it to another folder, or it was deleted). Treat a gone UID as a terminal,
+    // benign "moved out" so the caller soft-deletes it instead of crashing the body
+    // lane (fetchOne returns false; the download fallback would otherwise stream
+    // `false.content` and throw straight to the account-level catch).
+    if (!fetched) {
+      throw new MessageMovedError(String(message.uid), message.folder_path);
+    }
+
+    let rawMime: Buffer = fetched.source ? Buffer.from(fetched.source) : Buffer.alloc(0);
     if (rawMime.length === 0) {
       const downloaded = await client.download(String(message.uid), undefined, {
         uid: true,
         maxBytes: config.BODY_RAW_MAX_BYTES
       });
+      if (!downloaded || !downloaded.content) {
+        throw new MessageMovedError(String(message.uid), message.folder_path);
+      }
       rawMime = await streamToBuffer(downloaded.content);
     }
 

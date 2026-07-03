@@ -1552,6 +1552,26 @@ export class MirrorRepository {
     return Number(result.rows[0].count);
   }
 
+  /**
+   * A single message whose UID vanished from its folder between metadata sync and
+   * body fetch (see MessageMovedError). Soft-delete it as MOVED_OUT so it drops out
+   * of getBodyBacklog instead of being re-fetched — and re-thrown — every backfill.
+   * MOVED_OUT is the deleted_reason reserved for exactly this case.
+   */
+  async markMessageMovedOut(messageId: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET deleted_in_provider = true,
+          provider_deleted_at = now(),
+          deleted_reason = 'MOVED_OUT'
+      WHERE id = $1
+        AND deleted_in_provider = false
+      `,
+      [messageId]
+    );
+  }
+
   async hasActiveWindowMessages(accountId: string, folder: ImapFolder, uidValidity: number): Promise<boolean> {
     const result = await this.pool.query<{ exists: boolean }>(
       `

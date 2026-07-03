@@ -2,7 +2,7 @@ import type { AppConfig } from "./config.js";
 import { getConfig, getWindowCutoff } from "./config.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
-import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, searchUidsBefore, searchUidsSince } from "./imap-client.js";
+import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, MessageMovedError, searchUidsBefore, searchUidsSince } from "./imap-client.js";
 import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -1301,7 +1301,19 @@ export class MirrorEngine {
     message: ImapMessage,
     skipMailboxLock = false
   ): Promise<void> {
-    const body = await fetchFullMessageBody(client, this.config, message, { skipMailboxLock });
+    let body;
+    try {
+      body = await fetchFullMessageBody(client, this.config, message, { skipMailboxLock });
+    } catch (error) {
+      if (error instanceof MessageMovedError) {
+        // The UID vanished between metadata sync and body fetch. Soft-delete it
+        // (MOVED_OUT) so it leaves getBodyBacklog, instead of re-throwing into the
+        // account-level catch every backfill and bricking the account to BROKEN.
+        await this.repository.markMessageMovedOut(message.id);
+        return;
+      }
+      throw error;
+    }
     await this.repository.storeBody(body);
     await this.hooks.onBodyFetched?.(message, body);
   }
