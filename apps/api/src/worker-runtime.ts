@@ -1,7 +1,7 @@
 import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
 import { closePool, getPool, type PgPool } from "./db.js";
-import { clearOrphanedLocks, runLockSelfTest } from "./locks.js";
+import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 
@@ -123,7 +123,18 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     }
   }
 
-  await runLockSelfTest(pool);
+  // Retry transient session-pooler saturation (deploy-time instance overlap) instead
+  // of crash-looping startup; a real transaction-pooling misconfig stays fatal.
+  await runLockSelfTestWithRetry(pool, {
+    onRetry: ({ attempt, maxAttempts, delayMs, error }) =>
+      console.log(JSON.stringify({
+        event: "worker.lock_self_test.retry",
+        attempt,
+        maxAttempts,
+        delayMs,
+        error: error instanceof Error ? error.message : String(error)
+      }))
+  });
   console.log(JSON.stringify({ event: "worker.lock_self_test.passed" }));
 
   const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
