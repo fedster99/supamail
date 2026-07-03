@@ -11,15 +11,19 @@ describe("sync engine safety", () => {
     expect(source).toContain("markAccountSyncPartial");
   });
 
-  it("soft-deletes a body-fetch UID that moved out instead of bricking the account", async () => {
+  it("handles a moved-out body-fetch UID by window instead of bricking the account", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
     // A UID gone from its folder at body-fetch time must be caught as a benign
-    // MessageMovedError and soft-deleted (MOVED_OUT) so it leaves getBodyBacklog —
-    // NOT re-thrown into the account-level catch, which bricks the account to BROKEN
-    // and re-loops every backfill. Guard the wiring, not just the imap-client throw.
+    // MessageMovedError and taken out of the backlog — NOT re-thrown into the
+    // account-level catch, which bricks the account to BROKEN and re-loops every
+    // backfill. Scope the response by window: IN_WINDOW rows self-heal (safe to
+    // tombstone MOVED_OUT); HISTORICAL/EXPIRED rows never re-observe, so tombstoning
+    // would be unrecoverable — mark the fetch attempted instead.
     expect(source).toContain("error instanceof MessageMovedError");
+    expect(source).toContain('message.window_status === "IN_WINDOW"');
     expect(source).toContain("markMessageMovedOut(message.id)");
+    expect(source).toContain("markBodyFetchAttempted(message.id)");
   });
 
   it("reconciles only the active sync window", async () => {
