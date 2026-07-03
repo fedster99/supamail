@@ -1572,6 +1572,26 @@ export class MirrorRepository {
     );
   }
 
+  /**
+   * Mark a message's body fetch as attempted without storing a body. Used when a UID
+   * moved out (MessageMovedError) for a non-IN_WINDOW row: unlike IN_WINDOW rows,
+   * HISTORICAL/EXPIRED rows are never re-observed and reconcile is IN_WINDOW-only, so
+   * tombstoning them (markMessageMovedOut) would be unrecoverable. This just removes
+   * the row from getHistoryBacklog (which filters body_fetched_at IS NULL) — a benign,
+   * reversible "we tried, the body is gone" watermark, not a soft-delete.
+   */
+  async markBodyFetchAttempted(messageId: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET body_fetched_at = now()
+      WHERE id = $1
+        AND body_fetched_at IS NULL
+      `,
+      [messageId]
+    );
+  }
+
   async hasActiveWindowMessages(accountId: string, folder: ImapFolder, uidValidity: number): Promise<boolean> {
     const result = await this.pool.query<{ exists: boolean }>(
       `

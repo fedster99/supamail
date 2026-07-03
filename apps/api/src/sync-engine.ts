@@ -1306,10 +1306,21 @@ export class MirrorEngine {
       body = await fetchFullMessageBody(client, this.config, message, { skipMailboxLock });
     } catch (error) {
       if (error instanceof MessageMovedError) {
-        // The UID vanished between metadata sync and body fetch. Soft-delete it
-        // (MOVED_OUT) so it leaves getBodyBacklog, instead of re-throwing into the
-        // account-level catch every backfill and bricking the account to BROKEN.
-        await this.repository.markMessageMovedOut(message.id);
+        // The UID vanished between metadata sync and body fetch. Get it out of the
+        // backlog without re-throwing into the account-level catch (which bricks the
+        // account to BROKEN and re-loops every backfill) — but scope the tombstone by
+        // window, because only IN_WINDOW rows self-heal.
+        if (message.window_status === "IN_WINDOW") {
+          // A later metadata sync's ON CONFLICT resets deleted_in_provider, so a rare
+          // transient false-negative recovers. Safe to soft-delete MOVED_OUT.
+          await this.repository.markMessageMovedOut(message.id);
+        } else {
+          // HISTORICAL/EXPIRED rows are never re-observed (backfill walks strictly
+          // backward) and reconcile is IN_WINDOW-only, so a tombstone here would be
+          // unrecoverable. Mark the body fetch attempted instead — non-destructive,
+          // and it still leaves getHistoryBacklog (which filters body_fetched_at IS NULL).
+          await this.repository.markBodyFetchAttempted(message.id);
+        }
         return;
       }
       throw error;
