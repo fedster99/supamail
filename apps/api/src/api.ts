@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { getConfig, type AppConfig } from "./config.js";
 import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
-import { NoRecipientsError, NotFoundError, UnfetchableContentError } from "./errors.js";
+import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "./errors.js";
 import { HostValidationError } from "./host-validation.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
@@ -488,6 +488,13 @@ export function createApiApp(options: ApiAppOptions): Hono {
       // Content known in metadata but not fetchable (e.g. an attachment row with
       // no BODYSTRUCTURE part number). A permanent condition: 422, not 500.
       return c.json({ error: "content_unfetchable", message: err.message }, 422);
+    }
+    if (err instanceof AccountBusyError) {
+      // The per-account advisory lock is held (the sync worker is mid-cycle). The
+      // request was well-formed; it just can't run concurrently. 503 + Retry-After,
+      // not a 500 — the client should retry shortly.
+      c.header("Retry-After", "5");
+      return c.json({ error: "account_busy", message: err.message }, 503);
     }
     if (err instanceof FolderTrackingRejectedError) {
       return c.json({ error: err.code, message: err.message }, 400);
