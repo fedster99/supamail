@@ -3,6 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { Command } from "commander";
 import { getConfig } from "./config.js";
+import { AccountBusyError } from "./errors.js";
 import {
   cleanMessageBody,
   downloadAttachment,
@@ -660,6 +661,14 @@ program
 
 try {
   await program.parseAsync();
+} catch (error) {
+  if (error instanceof AccountBusyError) {
+    // A draft write collided with the sync worker holding the account lock — transient.
+    console.error("Account is busy syncing — retry in a few seconds.");
+    process.exitCode = 1;
+  } else {
+    throw error;
+  }
 } finally {
   await closePool();
 }
