@@ -17,4 +17,19 @@ describe("runtime entrypoint", () => {
       "SUPAMAIL_MODE must be one of: worker, api, combined"
     );
   });
+
+  it("runs the advisory-lock self-test before the API serves (api + combined)", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { resolve } = await import("node:path");
+    const source = await readFile(resolve(process.cwd(), "src/runtime.ts"), "utf8");
+
+    // The API takes the per-account advisory lock (body fetch, draft APPEND, mutations),
+    // so a mispooled standalone API must fail fast at startup like the worker instead of
+    // silently breaking the lock mutex. Guard that the self-test precedes serving.
+    expect(source).toContain("runLockSelfTestWithRetry");
+    const apiSelfTest = source.indexOf("await runApiLockSelfTest(getPool())");
+    const apiServe = source.indexOf("startApiServer();");
+    expect(apiSelfTest).toBeGreaterThan(-1);
+    expect(apiServe).toBeGreaterThan(apiSelfTest);
+  });
 });

@@ -1,7 +1,8 @@
 import { pathToFileURL } from "node:url";
 import { startApiServer } from "./api.js";
 import { getConfig } from "./config.js";
-import { closePool, getPool } from "./db.js";
+import { closePool, getPool, type PgPool } from "./db.js";
+import { runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { startWorkerRuntime } from "./worker-runtime.js";
@@ -33,6 +34,10 @@ export async function startRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env):
   }
 
   if (mode === "api") {
+    // The API takes the per-account advisory lock (on-demand body fetch, draft APPEND,
+    // flag/move mutations), so a standalone API must verify session-affine pooling at
+    // startup like the worker — a transaction pooler silently breaks the lock mutex.
+    await runApiLockSelfTest(getPool());
     const server = startApiServer();
     installApiShutdownHandler(server);
     return;
@@ -40,6 +45,9 @@ export async function startRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env):
 
   const config = getConfig();
   const pool = getPool();
+  // Gate the API on the lock self-test before it starts serving (the worker re-runs
+  // its own below; that redundancy is a couple of startup queries).
+  await runApiLockSelfTest(pool);
   const repository = new MirrorRepository(pool, config);
   const engine = new MirrorEngine({ pool, config, repository });
   const server = startApiServer({ config, pool, repository, engine });
@@ -59,6 +67,20 @@ export async function startRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env):
     closeServer(server);
     await closePool();
   }
+}
+
+async function runApiLockSelfTest(pool: PgPool): Promise<void> {
+  await runLockSelfTestWithRetry(pool, {
+    onRetry: ({ attempt, maxAttempts, delayMs, error }) =>
+      console.log(JSON.stringify({
+        event: "api.lock_self_test.retry",
+        attempt,
+        maxAttempts,
+        delayMs,
+        error: error instanceof Error ? error.message : String(error)
+      }))
+  });
+  console.log(JSON.stringify({ event: "api.lock_self_test.passed" }));
 }
 
 function installApiShutdownHandler(server: ClosableServer): void {
