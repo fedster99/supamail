@@ -95,9 +95,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0011_webhook_emit_indexes");
+    expect(version).toBe("0012_sync_events_retention_index");
     expect(manifest).toEqual({
-      schemaVersion: "0011_webhook_emit_indexes",
+      schemaVersion: "0012_sync_events_retention_index",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -109,7 +109,8 @@ describe("initial schema", () => {
         { id: "0008_search_layer", file: "0008_search_layer.sql" },
         { id: "0009_smtp_send", file: "0009_smtp_send.sql" },
         { id: "0010_search_recipient_indexes", file: "0010_search_recipient_indexes.sql" },
-        { id: "0011_webhook_emit_indexes", file: "0011_webhook_emit_indexes.sql" }
+        { id: "0011_webhook_emit_indexes", file: "0011_webhook_emit_indexes.sql" },
+        { id: "0012_sync_events_retention_index", file: "0012_sync_events_retention_index.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");

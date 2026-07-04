@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0011_webhook_emit_indexes",
+  "schemaVersion": "0012_sync_events_retention_index",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -44,6 +44,10 @@
     {
       "id": "0011_webhook_emit_indexes",
       "file": "0011_webhook_emit_indexes.sql"
+    },
+    {
+      "id": "0012_sync_events_retention_index",
+      "file": "0012_sync_events_retention_index.sql"
     }
   ]
 }

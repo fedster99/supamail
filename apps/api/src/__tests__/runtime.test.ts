@@ -27,9 +27,16 @@ describe("runtime entrypoint", () => {
     // so a mispooled standalone API must fail fast at startup like the worker instead of
     // silently breaking the lock mutex. Guard that the self-test precedes serving.
     expect(source).toContain("runLockSelfTestWithRetry");
+    // api mode: self-test (getPool()) precedes the bare startApiServer().
     const apiSelfTest = source.indexOf("await runApiLockSelfTest(getPool())");
     const apiServe = source.indexOf("startApiServer();");
     expect(apiSelfTest).toBeGreaterThan(-1);
     expect(apiServe).toBeGreaterThan(apiSelfTest);
+    // combined mode (the production API+worker topology): self-test (pool) precedes
+    // startApiServer({ ... }). Distinct anchors so deleting the combined gate fails.
+    const combinedSelfTest = source.indexOf("await runApiLockSelfTest(pool)");
+    const combinedServe = source.indexOf("startApiServer({");
+    expect(combinedSelfTest).toBeGreaterThan(-1);
+    expect(combinedServe).toBeGreaterThan(combinedSelfTest);
   });
 });
