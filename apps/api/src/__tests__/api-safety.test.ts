@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
-import { NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
+import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
 import { MailboxCapabilityError, MailboxMutationError } from "../mailbox-mutations.js";
 import type { AccountDetails, AccountSummary, ImapFolder, SyncResult, UpdateAccountSettingsInput } from "../types.js";
 
@@ -1022,6 +1022,21 @@ describe("API safety", () => {
     const res = await app.request(`/drafts/${messageId}/send`, { method: "POST", headers: auth() });
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toMatchObject({ error: "no_recipients" });
+  });
+
+  it("maps AccountBusyError from a draft create to 503 account_busy + Retry-After (not a 500)", async () => {
+    const { app, drafts } = buildApp();
+    drafts.create.mockRejectedValueOnce(
+      new AccountBusyError("Account is busy syncing; retry the draft shortly") as never
+    );
+    const res = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ subject: "Draft", body: { format: "plain", text: "hello" } })
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("5");
+    await expect(res.json()).resolves.toMatchObject({ error: "account_busy" });
   });
 
   it("maps an unfetchable attachment (no BODYSTRUCTURE part) to 422 (not a 500)", async () => {

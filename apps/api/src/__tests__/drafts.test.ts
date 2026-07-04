@@ -261,6 +261,23 @@ describe("updateDraft", () => {
     expect(result.replacedDraftDeleted).toBe(false);
     expect(result.warnings.join(" ")).toMatch(/removing the previous draft failed/i);
   });
+
+  it("throws AccountBusyError before the delete when the account lock is held (no partial state)", async () => {
+    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.withAccountLock.mockResolvedValueOnce(null); // worker mid-sync holds the lock
+    const { updateDraft } = await import("../drafts.js");
+    const { AccountBusyError } = await import("../errors.js");
+    await expect(
+      updateDraft({} as never, config, "draft-1", {
+        to: [{ email: "rcpt@example.test" }],
+        subject: "Revised",
+        body: { format: "plain", text: "v2" }
+      })
+    ).rejects.toBeInstanceOf(AccountBusyError);
+    // The APPEND 503'd BEFORE the still-unlocked delete-old ran — no orphaned second draft.
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
 });
 
 describe("sendDraft", () => {
@@ -297,6 +314,24 @@ describe("sendDraft", () => {
     selected_text_part: null,
     selected_text_format: "plain"
   };
+
+  it("STILL delivers but skips Sent filing when the account is busy syncing", async () => {
+    mocks.withAccountLock.mockResolvedValueOnce(null); // worker holds the lock during Sent filing
+    const pool = mockPoolReturningDraft(draftRow);
+    const { sendDraft } = await import("../drafts.js");
+    const result = await sendDraft(pool, config, "draft-1");
+
+    // The mail is already delivered; filing to Sent is skipped (not failed).
+    expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(result.send.delivered).toBe(true);
+    expect(result.send.appendedToSent).toBe(false);
+    expect(result.send.appendedUid).toBeNull();
+    expect(result.send.sentFolderPath).toBeNull();
+    expect(result.warnings.join(" ")).toMatch(/busy syncing so filing to Sent was skipped/i);
+    // The draft is still hard-deleted after the send.
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(pool, config, "draft-1", { hard: true });
+  });
 
   it("RESENDS the draft's raw bytes over SMTP, APPENDs them to Sent, then deletes the draft", async () => {
     const pool = mockPoolReturningDraft(draftRow);
