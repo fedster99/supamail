@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
@@ -8,7 +9,7 @@ import { withAccountLock } from "./locks.js";
 import { deleteMessage } from "./mailbox-mutations.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
-import { SentFolderAppender, buildRawMime, deliverSmtp, resolveSmtpCreds } from "./smtp-client.js";
+import { SentFolderAppender, buildRawMime, deliverSmtp, domainOf, resolveSmtpCreds } from "./smtp-client.js";
 import type { ImapAccount, SendRequest, SendResult } from "./types.js";
 
 /**
@@ -46,7 +47,14 @@ import type { ImapAccount, SendRequest, SendResult } from "./types.js";
  * round-trip; but SupaMail-authored drafts still can't carry them at create time.)
  * Both stay send-time-only — set them on the send envelope, not on a draft (ADR
  * 0019 / 0020). `accountId` selects the mailbox whose Drafts folder we file to. */
-export type DraftInput = Omit<SendRequest, "bcc" | "attachments">;
+export type DraftInput = Omit<SendRequest, "bcc" | "attachments"> & {
+  /** Optional idempotency key: a retried create with the same key derives the same
+   * Message-ID and returns the EXISTING draft (search-before-APPEND) instead of a dup.
+   * The key is the operation identity (Stripe-style) — reusing it with a different
+   * payload returns the first draft UNCHANGED, it does not update it. Blank/whitespace
+   * keys are treated as no key. */
+  idempotencyKey?: string;
+};
 
 /** Reject a Bcc smuggled past the type system (e.g. an untyped HTTP/JSON caller).
  * Bcc on a draft is dropped end-to-end, so refuse it loudly instead. */
@@ -136,14 +144,29 @@ export interface DeleteDraftResult {
 
 /** APPEND `req` to the account's Drafts folder with the `\Draft` flag, reusing the
  * email-001 write-only appender. Returns the resolved folder + APPENDUID. */
+/**
+ * Derive a stable Message-ID from an idempotency key so a retried create maps to the
+ * SAME message and can be found by search-before-APPEND instead of duplicating.
+ */
+function buildDraftMessageId(domain: string, idempotencyKey: string): string {
+  const digest = createHash("sha256").update(`${domain}:${idempotencyKey}`).digest("hex");
+  return `<draft-${digest.slice(0, 32)}@${domain}>`;
+}
+
 async function appendDraft(
   pool: PgPool,
   config: AppConfig,
   account: ImapAccount,
-  req: SendRequest
+  req: SendRequest,
+  idempotencyKey?: string | null
 ): Promise<{ draftsFolderPath: string; rfcMessageId: string; appendedUid: number | null }> {
   const from = { email: account.email_address };
-  const { raw, messageId } = await buildRawMime(req, from);
+  // With an idempotency key, stamp a deterministic Message-ID (buildRawMime honors
+  // req.messageId) so a retry finds its own prior APPEND below instead of duping.
+  const composeReq: SendRequest = idempotencyKey
+    ? { ...req, messageId: buildDraftMessageId(domainOf(account.email_address), idempotencyKey) }
+    : req;
+  const { raw, messageId } = await buildRawMime(composeReq, from);
 
   // Serialize the APPEND with the sync worker on the per-account advisory lock:
   // opening a second IMAP connection to the account while the worker is mid-cycle
@@ -160,6 +183,17 @@ async function appendDraft(
       // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
       // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
       const draftsFolderPath = resolveSpecialUseFolder(mailboxes, "drafts", profile);
+
+      // Idempotency: a retried create (same key -> same Message-ID) finds its prior
+      // APPEND and returns that UID instead of filing a duplicate draft. Runs under
+      // the same lock as the APPEND, so search + append are atomic per account.
+      if (idempotencyKey) {
+        const existing = await appender.searchByMessageId(draftsFolderPath, messageId);
+        if (existing.length > 0) {
+          return { draftsFolderPath, rfcMessageId: messageId, appendedUid: Math.max(...existing) };
+        }
+      }
+
       // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
       const appended = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
       return { draftsFolderPath, rfcMessageId: messageId, appendedUid: appended.uid };
@@ -191,7 +225,13 @@ export async function createDraft(
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
 
-  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(pool, config, account, input);
+  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
+    pool,
+    config,
+    account,
+    input,
+    input.idempotencyKey
+  );
   return { accountId: account.id, draftsFolderPath, rfcMessageId, appendedUid };
 }
 
