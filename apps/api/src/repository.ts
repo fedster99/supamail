@@ -523,7 +523,13 @@ export class MirrorRepository {
             WHERE tracked = true
               AND status != 'MISSING'
               AND last_synced_at IS NOT NULL
-          ) AS overall_lag_seconds
+          ) AS overall_lag_seconds,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND last_uidvalidity_reset_at IS NOT NULL
+              AND last_uidvalidity_reset_at > now() - ($11::bigint * interval '1 millisecond')
+          ) AS recent_uidvalidity_reset_count
         FROM public.imap_folders
         WHERE account_id = $1
       ),
@@ -551,6 +557,7 @@ export class MirrorRepository {
         overall_sync_lag_seconds = ceil(folder_health.overall_lag_seconds)::int,
         sync_state = CASE
           WHEN folder_health.incomplete_count > 0 THEN 'INITIAL_SYNC'
+          WHEN folder_health.recent_uidvalidity_reset_count > 0 THEN 'DEGRADED'
           WHEN folder_health.stale_missing_count > 0 THEN 'DEGRADED'
           WHEN folder_health.priority_reconcile_gap_count > 0 THEN 'DEGRADED'
           WHEN folder_health.priority_reconcile_unhealthy_count > 0 THEN 'DEGRADED'
@@ -562,6 +569,7 @@ export class MirrorRepository {
         END,
         sync_state_reason = CASE
           WHEN folder_health.incomplete_count > 0 THEN 'INITIAL_SYNC_IN_PROGRESS'
+          WHEN folder_health.recent_uidvalidity_reset_count > 0 THEN 'RECENT_UIDVALIDITY_RESET'
           WHEN folder_health.stale_missing_count > 0 THEN 'FOLDER_MISSING_GRACE_EXCEEDED'
           WHEN folder_health.priority_reconcile_gap_count > 0 THEN 'RECONCILE_GAPS_FOUND'
           WHEN folder_health.priority_reconcile_unhealthy_count > 0 THEN 'PRIORITY_RECONCILE_STALE'
@@ -601,7 +609,8 @@ export class MirrorRepository {
         this.config.OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS,
         countsTowardBackoff,
         this.config.FOLDER_COUNT_WARN_THRESHOLD,
-        this.config.FOLDER_COUNT_ENFORCE_THRESHOLD
+        this.config.FOLDER_COUNT_ENFORCE_THRESHOLD,
+        this.config.RECENT_UIDVALIDITY_RESET_DEGRADED_MS
       ]
     );
   }
