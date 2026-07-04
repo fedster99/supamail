@@ -41,6 +41,7 @@ import {
   type CreateDraftResult,
   type DeleteDraftResult,
   type DraftDetail,
+  type DraftInput,
   type DraftSummary,
   type SendDraftResult,
   type UpdateDraftResult
@@ -106,7 +107,7 @@ interface ApiAppOptions {
    * attachments — neither can round-trip the saved bytes, so both are send-time-only
    * fields (see ADR 0019 / 0020). */
   drafts: {
-    create: (req: Omit<SendRequest, "bcc" | "attachments">) => Promise<CreateDraftResult>;
+    create: (req: DraftInput) => Promise<CreateDraftResult>;
     list: (accountId: string, options: { limit?: number }) => Promise<DraftSummary[]>;
     get: (messageId: string) => Promise<DraftDetail | null>;
     update: (messageId: string, input: Omit<SendRequest, "accountId" | "bcc" | "attachments">) => Promise<UpdateDraftResult>;
@@ -769,7 +770,16 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
     const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
-    const result = await options.drafts.create({ accountId: id, ...input, to: input.to ?? [], subject: input.subject ?? "" });
+    // Optional idempotent create: a retry carrying the same Idempotency-Key returns the
+    // existing draft instead of filing a duplicate (search-before-APPEND in createDraft).
+    const idempotencyKey = c.req.header("Idempotency-Key");
+    const result = await options.drafts.create({
+      accountId: id,
+      ...input,
+      to: input.to ?? [],
+      subject: input.subject ?? "",
+      idempotencyKey
+    });
     return c.json({ result }, 201);
   });
 

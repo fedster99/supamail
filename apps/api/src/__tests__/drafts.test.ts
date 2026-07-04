@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => ({
   getAccount: vi.fn(),
   getMessage: vi.fn(),
   withAccountLock: vi.fn(),
+  searchByMessageId: vi.fn(),
   poolConnect: vi.fn()
 }));
 
@@ -66,6 +67,7 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
       connect: vi.fn(async () => ({
         list: mocks.list,
         append: mocks.append,
+        searchByMessageId: mocks.searchByMessageId,
         logout: mocks.logout,
         close: mocks.close
       }))
@@ -106,6 +108,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Default: the account lock is free — run the wrapped IMAP work through.
   mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: () => Promise<unknown>) => fn());
+  mocks.searchByMessageId.mockResolvedValue([]); // default: no prior draft (idempotency miss)
   mocks.append.mockResolvedValue({ uid: 7 });
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
   mocks.getAccount.mockResolvedValue(account);
@@ -141,6 +144,51 @@ describe("createDraft", () => {
       })
     ).rejects.toBeInstanceOf(AccountBusyError);
     expect(mocks.append).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing draft (no duplicate APPEND) on an idempotent retry", async () => {
+    // Same Idempotency-Key -> same derived Message-ID -> search finds the prior APPEND.
+    mocks.searchByMessageId.mockResolvedValueOnce([41, 42]);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "My draft",
+      body: { format: "plain", text: "Hello" },
+      idempotencyKey: "req-key-1"
+    });
+    expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(result.appendedUid).toBe(42); // highest UID of the existing match
+  });
+
+  it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
+    const { createDraft } = await import("../drafts.js");
+    await createDraft({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "My draft",
+      body: { format: "plain", text: "Hello" },
+      idempotencyKey: "req-key-2"
+    });
+    expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
+    const [folder, msgId] = mocks.searchByMessageId.mock.calls[0];
+    expect(folder).toBe("Drafts");
+    // Deterministic <draft-{sha256[0:32]}@domain> stamped into the composed bytes.
+    expect(String(msgId)).toMatch(/^<draft-[0-9a-f]{32}@example\.test>$/);
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT search (goes straight to APPEND) when no idempotency key is given", async () => {
+    const { createDraft } = await import("../drafts.js");
+    await createDraft({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "My draft",
+      body: { format: "plain", text: "Hello" }
+    });
+    expect(mocks.searchByMessageId).not.toHaveBeenCalled();
+    expect(mocks.append).toHaveBeenCalledTimes(1);
   });
 
   it("APPENDs the composed bytes with \\Draft to the resolved Drafts folder", async () => {

@@ -101,7 +101,7 @@ function toComposerAttachment(attachment: SendAttachment): ComposerAttachment {
   return entry;
 }
 
-function domainOf(email: string): string {
+export function domainOf(email: string): string {
   const at = email.lastIndexOf("@");
   return at >= 0 ? email.slice(at + 1) : "localhost";
 }
@@ -300,6 +300,22 @@ export class SentFolderAppender {
     const result = await this.client.append(path, raw, flags, date);
     const uid = result && typeof result === "object" && "uid" in result ? (result as { uid?: number }).uid : undefined;
     return { uid: typeof uid === "number" ? uid : null };
+  }
+
+  /**
+   * SEARCH `folderPath` for messages carrying an exact Message-ID header, returning
+   * their UIDs. Used for idempotent draft creation (search-before-APPEND): a retried
+   * create derives the same Message-ID, so a prior APPEND is found instead of duped.
+   * SEARCH needs the mailbox selected, so it takes the folder lock for the search.
+   */
+  async searchByMessageId(folderPath: string, rfcMessageId: string): Promise<number[]> {
+    const lock = await this.client.getMailboxLock(folderPath);
+    try {
+      const uids = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
+      return Array.isArray(uids) ? uids : [];
+    } finally {
+      lock.release();
+    }
   }
 
   async logout(): Promise<void> {
