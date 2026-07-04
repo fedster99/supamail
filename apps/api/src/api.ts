@@ -772,7 +772,10 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
     // Optional idempotent create: a retry carrying the same Idempotency-Key returns the
     // existing draft instead of filing a duplicate (search-before-APPEND in createDraft).
-    const idempotencyKey = c.req.header("Idempotency-Key");
+    // Normalize blank/whitespace to "no key" so "" and "   " behave identically
+    // (both fall back to a non-idempotent APPEND) instead of "" silently duping while
+    // "   " derives a useless Message-ID.
+    const idempotencyKey = c.req.header("Idempotency-Key")?.trim() || undefined;
     const result = await options.drafts.create({
       accountId: id,
       ...input,

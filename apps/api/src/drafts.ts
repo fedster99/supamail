@@ -49,7 +49,10 @@ import type { ImapAccount, SendRequest, SendResult } from "./types.js";
  * 0019 / 0020). `accountId` selects the mailbox whose Drafts folder we file to. */
 export type DraftInput = Omit<SendRequest, "bcc" | "attachments"> & {
   /** Optional idempotency key: a retried create with the same key derives the same
-   * Message-ID and returns the existing draft (search-before-APPEND) instead of a dup. */
+   * Message-ID and returns the EXISTING draft (search-before-APPEND) instead of a dup.
+   * The key is the operation identity (Stripe-style) — reusing it with a different
+   * payload returns the first draft UNCHANGED, it does not update it. Blank/whitespace
+   * keys are treated as no key. */
   idempotencyKey?: string;
 };
 

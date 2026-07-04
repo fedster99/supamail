@@ -589,6 +589,19 @@ describe("API safety", () => {
     );
   });
 
+  it("treats a blank/whitespace Idempotency-Key header as no key", async () => {
+    const { app, drafts } = buildApp();
+    const res = await app.request(`/accounts/${accountId}/drafts`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json", "Idempotency-Key": "   " },
+      body: JSON.stringify({ subject: "Draft", body: { format: "plain", text: "hello" } })
+    });
+    expect(res.status).toBe(201);
+    expect(drafts.create).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId, idempotencyKey: undefined })
+    );
+  });
+
   it("rejects a draft create carrying bcc with a clear message (Bcc is send-time only)", async () => {
     const { app, drafts } = buildApp();
     const res = await app.request(`/accounts/${accountId}/drafts`, {
