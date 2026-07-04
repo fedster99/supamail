@@ -37,6 +37,19 @@ describe("repository safety", () => {
     expect(source).not.toContain("CASE WHEN sync_state = 'INITIAL_SYNC' THEN 'HEALTHY' ELSE sync_state END");
   });
 
+  it("reports DEGRADED for a recent UIDVALIDITY reset (still recovering, not HEALTHY)", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    // Right after a reset a folder is fully soft-deleted and re-syncing; reporting
+    // HEALTHY is misleading. The success-path health CASE must count a recent reset
+    // (imap_folders.last_uidvalidity_reset_at within RECENT_UIDVALIDITY_RESET_DEGRADED_MS)
+    // and degrade on it.
+    expect(source).toContain("recent_uidvalidity_reset_count");
+    expect(source).toContain("last_uidvalidity_reset_at > now()");
+    expect(source).toContain("recent_uidvalidity_reset_count > 0 THEN 'DEGRADED'");
+    expect(source).toContain("RECENT_UIDVALIDITY_RESET");
+  });
+
   it("sanitizes sync run errors before persistence", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
