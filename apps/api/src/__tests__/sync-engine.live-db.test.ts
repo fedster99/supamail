@@ -699,6 +699,76 @@ liveDb("live DB reliability lane", () => {
     expect(degraded.rows[0].sync_state).toBe("DEGRADED");
     expect(degraded.rows[0].sync_state_reason).toBe("RECONCILE_GAPS_FOUND");
   });
+
+  it("retention prunes imap_sync_events older than the retention window, keeping recent ones", async () => {
+    const h = await setupIntegration("live-event-prune");
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_sync_events (account_id, event_type, occurred_at)
+      VALUES ($1, 'PRUNE_TEST_OLD', now() - interval '200 days'),
+             ($1, 'PRUNE_TEST_RECENT', now())
+      `,
+      [h.account.id]
+    );
+
+    const retention = await h.repository.runRetentionJobs();
+    expect(retention.prunedEvents).toBeGreaterThanOrEqual(1);
+
+    const remaining = await h.pool.query<{ event_type: string }>(
+      "SELECT event_type FROM public.imap_sync_events WHERE account_id = $1 AND event_type LIKE 'PRUNE_TEST_%'",
+      [h.account.id]
+    );
+    const types = remaining.rows.map((row) => row.event_type);
+    expect(types).toContain("PRUNE_TEST_RECENT");
+    expect(types).not.toContain("PRUNE_TEST_OLD");
+  });
+
+  it("degrades on a recent UIDVALIDITY reset, then returns HEALTHY once the reset ages out", async () => {
+    const h = await setupIntegration("live-reset-degraded", { RECENT_UIDVALIDITY_RESET_DEGRADED_MS: 60 * 60_000 });
+    activeAccountIds.push(h.account.id);
+    const engine = h.buildEngine({ folders: buildInboxAndSentFolders() });
+    await engine.syncAccount(h.account.id, "manual");
+
+    // Make every folder complete + fully clean, so the account would be HEALTHY —
+    // except for a UIDVALIDITY reset at the given time.
+    const makeCleanWithReset = async (resetAtSql: string) => {
+      await h.pool.query(
+        `
+        UPDATE public.imap_folders
+        SET status = 'ACTIVE',
+            initial_sync_complete = true,
+            last_synced_at = now(),
+            last_full_reconcile_at = now(),
+            last_reconcile_clean = true,
+            missing_since = NULL,
+            last_uidvalidity_reset_at = ${resetAtSql}
+        WHERE account_id = $1
+        `,
+        [h.account.id]
+      );
+    };
+    const readState = async () =>
+      (await h.pool.query<{ sync_state: string; sync_state_reason: string | null }>(
+        "SELECT sync_state, sync_state_reason FROM public.imap_accounts WHERE id = $1",
+        [h.account.id]
+      )).rows[0];
+
+    // A reset within the window → DEGRADED with the reset reason (not straight HEALTHY).
+    await makeCleanWithReset("now()");
+    await h.repository.markAccountSyncSucceeded(h.account.id);
+    const recent = await readState();
+    expect(recent.sync_state).toBe("DEGRADED");
+    expect(recent.sync_state_reason).toBe("RECENT_UIDVALIDITY_RESET");
+
+    // A reset older than the window → HEALTHY (proves the window bound; a stale reset
+    // does not degrade forever).
+    await makeCleanWithReset("now() - interval '2 hours'");
+    await h.repository.markAccountSyncSucceeded(h.account.id);
+    const aged = await readState();
+    expect(aged.sync_state).toBe("HEALTHY");
+    expect(aged.sync_state_reason).toBeNull();
+  });
 });
 
 if (!LIVE_DB_AVAILABLE) {
