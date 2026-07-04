@@ -38,10 +38,12 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   const abort = new AbortController();
   let stopping = false;
   let wakeSleep: (() => void) | null = null;
+  let retentionTimer: ReturnType<typeof setInterval> | null = null;
 
   const stop = () => {
     if (stopping) return;
     stopping = true;
+    if (retentionTimer) clearInterval(retentionTimer);
     abort.abort();
     wakeSleep?.();
   };
@@ -160,12 +162,29 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     max: config.SYNC_MAX_ACCOUNTS
   }));
 
-  const retention = await repository.runRetentionJobs();
-  console.log(JSON.stringify({
-    event: "worker.retention.completed",
-    expired: retention.expired,
-    purged: retention.purged
-  }));
+  const logRetention = (r: { expired: number; purged: number; prunedEvents: number }) =>
+    console.log(JSON.stringify({
+      event: "worker.retention.completed",
+      expired: r.expired,
+      purged: r.purged,
+      prunedEvents: r.prunedEvents
+    }));
+
+  logRetention(await repository.runRetentionJobs());
+  // Re-run retention daily: it was boot-only, so on a long-lived process expiry/purge
+  // and the (previously unbounded) sync-event prune silently stopped after startup.
+  retentionTimer = setInterval(() => {
+    repository
+      .runRetentionJobs()
+      .then(logRetention)
+      .catch((error) =>
+        console.error(JSON.stringify({
+          event: "worker.retention.failed",
+          error: error instanceof Error ? error.message : String(error)
+        }))
+      );
+  }, 24 * 60 * 60_000);
+  retentionTimer.unref?.();
 
   const done = loop().finally(async () => {
     if (options.closePoolOnStop) {

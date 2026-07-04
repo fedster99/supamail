@@ -62,7 +62,8 @@ const envSchema = z.object({
   OVERALL_LAG_HEALTHY_THRESHOLD_MS: z.coerce.number().int().positive().default(15 * 60_000),
   PRIORITY_RECONCILE_HEALTHY_MAX_AGE_MS: z.coerce.number().int().positive().default(24 * 60 * 60_000),
   OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),
-  EXPIRE_AFTER_DAYS: z.coerce.number().int().positive().default(180)
+  EXPIRE_AFTER_DAYS: z.coerce.number().int().positive().default(180),
+  SYNC_EVENT_RETENTION_DAYS: z.coerce.number().int().positive().default(90)
 });
 
 export type AppConfig = z.infer<typeof envSchema> & {
