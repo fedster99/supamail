@@ -796,10 +796,32 @@ export class MirrorRepository {
     return { purged: result.rowCount ?? 0 };
   }
 
-  async runRetentionJobs(): Promise<{ expired: number; purged: number }> {
+  /**
+   * Prune the imap_sync_events audit trail, which is INSERT-only (written on every
+   * sync/reset/delete/state event) and otherwise grows without bound. Bounded per run
+   * so the first prune of a large backlog can't run one huge transaction; the daily
+   * retention cadence drains the rest.
+   */
+  async runSyncEventPruneJob(): Promise<{ prunedEvents: number }> {
+    const result = await this.pool.query(
+      `
+      DELETE FROM public.imap_sync_events
+      WHERE id IN (
+        SELECT id FROM public.imap_sync_events
+        WHERE occurred_at < now() - ($1::int * interval '1 day')
+        LIMIT 50000
+      )
+      `,
+      [this.config.SYNC_EVENT_RETENTION_DAYS]
+    );
+    return { prunedEvents: result.rowCount ?? 0 };
+  }
+
+  async runRetentionJobs(): Promise<{ expired: number; purged: number; prunedEvents: number }> {
     const { expired } = await this.runExpiryJob();
     const { purged } = await this.runPurgeJob();
-    return { expired, purged };
+    const { prunedEvents } = await this.runSyncEventPruneJob();
+    return { expired, purged, prunedEvents };
   }
 
   async upsertDiscoveredFolders(

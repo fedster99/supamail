@@ -333,5 +333,14 @@ describe("repository safety", () => {
     expect(source).toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')");
     expect(source).not.toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING', 'RECONCILE_MISSING')");
     expect(worker).toContain("runRetentionJobs");
+
+    // The INSERT-only imap_sync_events audit table is pruned as part of retention,
+    // bounded per run (LIMIT) so a large first prune can't run one huge transaction.
+    expect(source).toContain("runSyncEventPruneJob");
+    expect(source).toContain("DELETE FROM public.imap_sync_events");
+    expect(source).toContain("LIMIT 50000");
+    // Retention re-runs on a daily timer (was boot-only), cleared on shutdown.
+    expect(worker).toContain("setInterval");
+    expect(worker).toContain("clearInterval(retentionTimer)");
   });
 });
