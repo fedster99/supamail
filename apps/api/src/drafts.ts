@@ -1,9 +1,10 @@
 import type { AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
-import { NoRecipientsError, NotFoundError } from "./errors.js";
+import { AccountBusyError, NoRecipientsError, NotFoundError } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
+import { withAccountLock } from "./locks.js";
 import { deleteMessage } from "./mailbox-mutations.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
@@ -144,20 +145,33 @@ async function appendDraft(
   const from = { email: account.email_address };
   const { raw, messageId } = await buildRawMime(req, from);
 
-  const appender = await SentFolderAppender.connect(pool, config, account);
-  try {
-    const profile = getProviderProfile(account.provider_profile);
-    const mailboxes = await appender.list();
-    // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
-    // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
-    // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
-    const draftsFolderPath = resolveSpecialUseFolder(mailboxes, "drafts", profile);
-    // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
-    const result = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
-    return { draftsFolderPath, rfcMessageId: messageId, appendedUid: result.uid };
-  } finally {
-    await closeImap(appender);
+  // Serialize the APPEND with the sync worker on the per-account advisory lock:
+  // opening a second IMAP connection to the account while the worker is mid-cycle
+  // races and burns the provider's shared per-account command budget (Rackspace caps
+  // ~200/min). Non-blocking — if the worker holds the lock, surface a retryable busy
+  // error instead of colliding. (deleteMessage / content reads still need the same
+  // treatment; that broader on-demand-IMAP serialization is a follow-up.)
+  const result = await withAccountLock(pool, account.lock_id, async () => {
+    const appender = await SentFolderAppender.connect(pool, config, account);
+    try {
+      const profile = getProviderProfile(account.provider_profile);
+      const mailboxes = await appender.list();
+      // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
+      // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
+      // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
+      const draftsFolderPath = resolveSpecialUseFolder(mailboxes, "drafts", profile);
+      // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
+      const appended = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
+      return { draftsFolderPath, rfcMessageId: messageId, appendedUid: appended.uid };
+    } finally {
+      await closeImap(appender);
+    }
+  });
+
+  if (result === null) {
+    throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft shortly`);
   }
+  return result;
 }
 
 /**
@@ -466,13 +480,24 @@ export async function sendDraft(
   let sentFolderPath: string | null = null;
   let appender: SentFolderAppender | null = null;
   try {
-    appender = await SentFolderAppender.connect(pool, config, account);
-    const profile = getProviderProfile(account.provider_profile);
-    const mailboxes = await appender.list();
-    sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
-    const result = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
-    appendedToSent = true;
-    appendedUid = result.uid;
+    // Same per-account advisory lock as the draft APPEND, but here busy is non-fatal:
+    // the mail is already delivered, so if the worker holds the lock we just skip the
+    // Sent filing (the next sync mirrors the copy if the provider auto-filed it).
+    const appended = await withAccountLock(pool, account.lock_id, async () => {
+      appender = await SentFolderAppender.connect(pool, config, account);
+      const profile = getProviderProfile(account.provider_profile);
+      const mailboxes = await appender.list();
+      sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
+      return await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
+    });
+    if (appended === null) {
+      warnings.push(
+        "Delivered, but the account was busy syncing so filing to Sent was skipped. The next sync will mirror the copy if the provider auto-filed it."
+      );
+    } else {
+      appendedToSent = true;
+      appendedUid = appended.uid;
+    }
   } catch (error) {
     warnings.push(
       `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`

@@ -37,3 +37,13 @@ export class UnfetchableContentError extends Error {
     this.name = "UnfetchableContentError";
   }
 }
+
+/** The per-account advisory lock is held (the sync worker is mid-cycle, or another
+ * on-demand IMAP op), so this write can't safely run right now. A transient
+ * condition — the client should retry shortly. Mapped to 503 with Retry-After. */
+export class AccountBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AccountBusyError";
+  }
+}
