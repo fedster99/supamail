@@ -150,4 +150,16 @@ describe("sync engine safety", () => {
     expect(source).toContain("setHistoryBackfillSnapshot");
     expect(source).toContain("advanceHistoryBackfillWatermark");
   });
+
+  it("gates only the history lane behind BACKFILL_WINDOW_*", async () => {
+    const config = await readFile(resolve(process.cwd(), "src/config.ts"), "utf8");
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+
+    expect(config).toContain("BACKFILL_WINDOW_START_HOUR");
+    expect(config).toContain("BACKFILL_WINDOW_END_HOUR");
+    expect(config).toContain("BACKFILL_WINDOW_TIMEZONE");
+    expect(source).toContain("isWithinBackfillWindow(this.config)");
+    expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
+    expect(source.indexOf("isWithinBackfillWindow(this.config)")).toBeLessThan(source.indexOf("getHistoryBacklog(account, 1)"));
+  });
 });

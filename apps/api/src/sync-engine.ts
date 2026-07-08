@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config.js";
-import { getConfig, getWindowCutoff } from "./config.js";
+import { getConfig, getWindowCutoff, isWithinBackfillWindow } from "./config.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
 import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, MessageMovedError, searchUidsBefore, searchUidsSince } from "./imap-client.js";
@@ -1028,6 +1028,9 @@ export class MirrorEngine {
     lockDeadline: number
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
+      return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
+    }
+    if (!isWithinBackfillWindow(this.config)) {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
     }
 
