@@ -2,6 +2,20 @@ import "dotenv/config";
 import { z } from "zod";
 import type { BodyFetchPolicy, BodyStorageMode } from "./types.js";
 
+const optionalHourSchema = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z.coerce.number().int().min(0).max(23).optional()
+);
+
+function isValidTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   // Max connections in the pg pool. Defaults to 10 (the prior hardcoded value). Raise
@@ -64,7 +78,34 @@ const envSchema = z.object({
   OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),
   EXPIRE_AFTER_DAYS: z.coerce.number().int().positive().default(180),
   SYNC_EVENT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
-  RECENT_UIDVALIDITY_RESET_DEGRADED_MS: z.coerce.number().int().positive().default(60 * 60_000)
+  RECENT_UIDVALIDITY_RESET_DEGRADED_MS: z.coerce.number().int().positive().default(60 * 60_000),
+  BACKFILL_WINDOW_START_HOUR: optionalHourSchema,
+  BACKFILL_WINDOW_END_HOUR: optionalHourSchema,
+  BACKFILL_WINDOW_TIMEZONE: z.string().default("UTC").refine(isValidTimeZone, {
+    message: "BACKFILL_WINDOW_TIMEZONE must be a valid IANA time zone"
+  })
+}).superRefine((env, ctx) => {
+  const hasStart = env.BACKFILL_WINDOW_START_HOUR !== undefined;
+  const hasEnd = env.BACKFILL_WINDOW_END_HOUR !== undefined;
+  if (hasStart !== hasEnd) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "BACKFILL_WINDOW_START_HOUR and BACKFILL_WINDOW_END_HOUR must be set together",
+      path: hasStart ? ["BACKFILL_WINDOW_END_HOUR"] : ["BACKFILL_WINDOW_START_HOUR"]
+    });
+  }
+
+  if (
+    hasStart &&
+    hasEnd &&
+    env.BACKFILL_WINDOW_START_HOUR === env.BACKFILL_WINDOW_END_HOUR
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "BACKFILL_WINDOW_START_HOUR and BACKFILL_WINDOW_END_HOUR must differ; unset both to disable the gate",
+      path: ["BACKFILL_WINDOW_END_HOUR"]
+    });
+  }
 });
 
 export type AppConfig = z.infer<typeof envSchema> & {
@@ -87,4 +128,25 @@ export function getWindowCutoff(config: Pick<AppConfig, "WINDOW_DAYS">): Date {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - config.WINDOW_DAYS);
   return cutoff;
+}
+
+export function isWithinBackfillWindow(
+  config: Pick<AppConfig, "BACKFILL_WINDOW_START_HOUR" | "BACKFILL_WINDOW_END_HOUR" | "BACKFILL_WINDOW_TIMEZONE">,
+  now = new Date()
+): boolean {
+  const start = config.BACKFILL_WINDOW_START_HOUR;
+  const end = config.BACKFILL_WINDOW_END_HOUR;
+  if (start === undefined && end === undefined) return true;
+  if (start === undefined || end === undefined) return false;
+
+  const hourPart = new Intl.DateTimeFormat("en-US", {
+    timeZone: config.BACKFILL_WINDOW_TIMEZONE,
+    hour: "2-digit",
+    hour12: false,
+    hourCycle: "h23"
+  }).formatToParts(now).find((part) => part.type === "hour");
+  const hour = Number(hourPart?.value);
+
+  if (start < end) return hour >= start && hour < end;
+  return hour >= start || hour < end;
 }
