@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parseRuntimeMode } from "../runtime.js";
+import { describe, expect, it, vi } from "vitest";
+import { createServerCloser, parseRuntimeMode } from "../runtime.js";
 
 describe("runtime entrypoint", () => {
   it("defaults to worker mode for self-hosted Docker/Fly deploys", () => {
@@ -38,5 +38,38 @@ describe("runtime entrypoint", () => {
     const combinedServe = source.indexOf("startApiServer({");
     expect(combinedSelfTest).toBeGreaterThan(-1);
     expect(combinedServe).toBeGreaterThan(combinedSelfTest);
+  });
+
+  it("closes the API server once and keeps normal already-closed shutdowns out of error logs", () => {
+    const error = Object.assign(new Error("Server is not running."), {
+      code: "ERR_SERVER_NOT_RUNNING"
+    });
+    const server = {
+      close: vi.fn((callback?: (error?: Error) => void) => callback?.(error))
+    };
+    const sink = { error: vi.fn() };
+    const closeOnce = createServerCloser(server, sink);
+
+    closeOnce();
+    closeOnce();
+
+    expect(server.close).toHaveBeenCalledTimes(1);
+    expect(sink.error).not.toHaveBeenCalled();
+  });
+
+  it("still reports genuine API close failures", () => {
+    const error = Object.assign(new Error("socket teardown failed"), { code: "EIO" });
+    const server = {
+      close: (callback?: (error?: Error) => void) => callback?.(error)
+    };
+    const sink = { error: vi.fn() };
+
+    createServerCloser(server, sink)();
+
+    expect(sink.error).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sink.error.mock.calls[0][0])).toMatchObject({
+      event: "api.close.failed",
+      error: { message: "socket teardown failed", code: "EIO" }
+    });
   });
 });
