@@ -58,10 +58,24 @@ describe("sync engine safety", () => {
     // failure terminal).
     expect(isAuthError(new Error("Command failed"))).toBe(false);
     expect(isAuthError(new Error("read ETIMEDOUT"))).toBe(false);
+    // imapflow tags ANY login-exec error with authenticationFailed=true, including
+    // transient server conditions and dead connections — those must NOT go terminal.
+    expect(isAuthError(Object.assign(new Error("Command failed"), {
+      authenticationFailed: true,
+      serverResponseCode: "UNAVAILABLE",
+      response: "Temporary System Problem"
+    }))).toBe(false);
+    expect(isAuthError(Object.assign(new Error("Connection not available"), {
+      authenticationFailed: true,
+      code: "NoConnection"
+    }))).toBe(false);
     // Back-compat: plain strings still pattern-match.
     expect(isAuthError("535 5.7.8 authentication failed")).toBe(true);
 
-    // The persisted reason keeps the server's why, not just "Command failed".
+    // The persisted reason keeps the server's why, not just "Command failed" — and it
+    // must SURVIVE sanitizeErrorReason, whose credential redaction truncates from the
+    // first LOGIN/AUTHENTICATE token onward (markers must precede the server text).
+    const { sanitizeErrorReason } = await import("../repository.js");
     const described = describeSyncError(Object.assign(new Error("Command failed"), {
       authenticationFailed: true,
       serverResponseCode: "AUTHENTICATIONFAILED",
@@ -69,8 +83,9 @@ describe("sync engine safety", () => {
     }));
     expect(described).toContain("Command failed");
     expect(described).toContain("LOGIN failed.");
-    expect(described).toContain("[AUTHENTICATIONFAILED]");
-    expect(described).toContain("[AUTH]");
+    const sanitized = sanitizeErrorReason(described);
+    expect(sanitized).toContain("[AUTHENTICATIONFAILED]");
+    expect(sanitized).toContain("[AUTH]");
 
     // Wiring: classify on the ERROR OBJECT and persist the enriched description.
     expect(source).toContain("isAuthError(error)");

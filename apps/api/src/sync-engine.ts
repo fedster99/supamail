@@ -81,6 +81,13 @@ type HistoryBatchResult = {
 // Response codes that mean the credential itself was rejected (RFC 5530).
 const AUTH_RESPONSE_CODES = new Set(["AUTHENTICATIONFAILED", "AUTHORIZATIONFAILED", "EXPIRED"]);
 
+// RFC 5530 conditions a server can answer LOGIN with that are NOT credential
+// rejections (Gmail/Yahoo "NO [UNAVAILABLE] Temporary System Problem" etc.).
+// imapflow tags ANY error thrown from its login/authenticate exec with
+// authenticationFailed=true, so these must be exempted BEFORE trusting the flag —
+// otherwise a transiently-down server terminal-bricks the account.
+const TRANSIENT_RESPONSE_CODES = new Set(["UNAVAILABLE", "INUSE", "LIMIT", "SERVERBUG"]);
+
 /**
  * Classify an auth failure from the ERROR OBJECT, not just its message. imapflow's
  * login/authenticate failures throw with `message: "Command failed"` and put the real
@@ -96,9 +103,16 @@ export function isAuthError(error: unknown): boolean {
   }
   if (!error || typeof error !== "object") return false;
 
+  // A dead connection is never a credential problem, even when imapflow's login
+  // exec tagged the error before the close surfaced.
+  if (isConnectionLostError(error)) return false;
+
+  // Transient server conditions outrank the auth flag (see TRANSIENT_RESPONSE_CODES).
+  const responseCode = extractImapResponseCode(error);
+  if (responseCode && TRANSIENT_RESPONSE_CODES.has(responseCode)) return false;
+
   if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) return true;
 
-  const responseCode = extractImapResponseCode(error);
   if (responseCode && AUTH_RESPONSE_CODES.has(responseCode)) return true;
 
   // The server's error text (imapflow puts it on `response`/`responseText`) plus the
@@ -119,14 +133,19 @@ export function isAuthError(error: unknown): boolean {
  */
 export function describeSyncError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
+  // Structured markers FIRST, free-form server text LAST: every persistence sink runs
+  // sanitizeErrorReason, whose credential redaction truncates from the first
+  // LOGIN/AUTHENTICATE/PLAIN token to end-of-string. Server text like "LOGIN failed."
+  // trips it, so anything after that text would be redacted away — markers placed
+  // before it always survive.
   const parts = [error.message];
   const responseCode = extractImapResponseCode(error);
+  if (responseCode) parts.push(`[${responseCode}]`);
+  if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) parts.push("[AUTH]");
   const response = (error as { response?: unknown }).response;
   const responseText = (error as { responseText?: unknown }).responseText;
   const serverText = typeof response === "string" ? response : typeof responseText === "string" ? responseText : null;
   if (serverText && serverText !== error.message) parts.push(`— ${serverText}`);
-  if (responseCode) parts.push(`[${responseCode}]`);
-  if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) parts.push("[AUTH]");
   return parts.join(" ");
 }
 
