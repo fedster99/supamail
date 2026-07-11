@@ -841,7 +841,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("partial_success");
     expect(result.foldersProcessed).toBe(1);
     expect(result.errors).toHaveLength(1);
-    expect(result.errors[0]).toContain("Sent: Connection not available");
+    expect(result.errors[0]).toContain("Sent: [Error] [code=NoConnection] Connection not available");
     expect(result.errors[0]).toContain("connection lost");
 
     const account = await h.pool.query<{ consecutive_failures: number; sync_state: string }>(

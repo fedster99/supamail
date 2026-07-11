@@ -350,7 +350,7 @@ integration("provider compatibility fixtures (real Postgres + fixture IMAP)", ()
 
     const result = await engine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("partial_success");
-    expect(result.errors.join("; ")).toMatch(/Archive: provider transient disconnect/);
+    expect(result.errors.join("; ")).toMatch(/Archive: \[Error\] provider transient disconnect/);
 
     const account = (
       await h.pool.query<{ sync_state: string; sync_state_reason: string | null }>(

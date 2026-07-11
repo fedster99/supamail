@@ -2,18 +2,26 @@ import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
 import { closePool, getPool, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
-import { MirrorRepository } from "./repository.js";
+import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 
+export interface WorkerSyncResult {
+  runId: string;
+  outcome: string;
+  foldersProcessed: number;
+  messagesUpserted: number;
+  bodiesFetched: number;
+  errors: string[];
+}
+
 interface WorkerEngine {
-  syncDueAccounts(limit?: number, options?: { signal?: AbortSignal }): Promise<Array<{
-    runId: string;
-    outcome: string;
-    foldersProcessed: number;
-    messagesUpserted: number;
-    bodiesFetched: number;
-    errors: string[];
-  }>>;
+  syncDueAccounts(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
+}
+
+export interface WorkerLogSink {
+  log(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
 }
 
 export interface WorkerRuntimeOptions {
@@ -28,6 +36,46 @@ export interface WorkerRuntimeOptions {
 export interface WorkerRuntime {
   stop(): void;
   done: Promise<void>;
+}
+
+function loggedOutcome(result: WorkerSyncResult) {
+  return {
+    runId: result.runId,
+    outcome: result.outcome,
+    foldersProcessed: result.foldersProcessed,
+    messagesUpserted: result.messagesUpserted,
+    bodiesFetched: result.bodiesFetched,
+    errors: result.errors.map(sanitizeErrorReason)
+  };
+}
+
+/**
+ * Emit severity-correct per-account outcomes for log backends such as Render while
+ * retaining the aggregate tick event used for throughput and duration analysis.
+ * Sanitize again at the logging boundary so an injected/alternate WorkerEngine cannot
+ * bypass the same credential and control-character policy used by MirrorEngine.
+ */
+export function logSyncTick(
+  results: WorkerSyncResult[],
+  durationMs: number,
+  sink: WorkerLogSink = console
+): void {
+  const outcomes = results.map(loggedOutcome);
+
+  for (const outcome of outcomes) {
+    if (outcome.outcome === "failed") {
+      sink.error(JSON.stringify({ event: "sync.account.failed", ...outcome }));
+    } else if (outcome.outcome === "partial_success") {
+      sink.warn(JSON.stringify({ event: "sync.account.partial_success", ...outcome }));
+    }
+  }
+
+  sink.log(JSON.stringify({
+    event: "sync.tick.completed",
+    accounts: outcomes.length,
+    durationMs,
+    outcomes
+  }));
 }
 
 export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Promise<WorkerRuntime> {
@@ -76,19 +124,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   async function tick(): Promise<void> {
     const startedAt = Date.now();
     const results = await engine.syncDueAccounts(undefined, { signal: abort.signal });
-    console.log(JSON.stringify({
-      event: "sync.tick.completed",
-      accounts: results.length,
-      durationMs: Date.now() - startedAt,
-      outcomes: results.map((result) => ({
-        runId: result.runId,
-        outcome: result.outcome,
-        foldersProcessed: result.foldersProcessed,
-        messagesUpserted: result.messagesUpserted,
-        bodiesFetched: result.bodiesFetched,
-        errors: result.errors
-      }))
-    }));
+    logSyncTick(results, Date.now() - startedAt);
   }
 
   async function sleep(ms: number): Promise<void> {
