@@ -77,15 +77,27 @@ describe("sync engine safety", () => {
     // first LOGIN/AUTHENTICATE token onward (markers must precede the server text).
     const { sanitizeErrorReason } = await import("../repository.js");
     const described = describeSyncError(Object.assign(new Error("Command failed"), {
+      code: "ELOGIN",
       authenticationFailed: true,
       serverResponseCode: "AUTHENTICATIONFAILED",
+      responseStatus: "NO",
       response: "LOGIN failed."
     }));
+    expect(described).toContain("[Error]");
+    expect(described).toContain("[code=ELOGIN]");
+    expect(described).toContain("[status=NO]");
     expect(described).toContain("Command failed");
     expect(described).toContain("LOGIN failed.");
     const sanitized = sanitizeErrorReason(described);
+    expect(sanitized).toContain("[Error]");
+    expect(sanitized).toContain("[code=ELOGIN]");
     expect(sanitized).toContain("[AUTHENTICATIONFAILED]");
+    expect(sanitized).toContain("[status=NO]");
     expect(sanitized).toContain("[AUTH]");
+    expect(sanitized).not.toContain("LOGIN failed.");
+
+    class ProviderFailure extends Error {}
+    expect(describeSyncError(new ProviderFailure("provider exploded"))).toContain("[ProviderFailure]");
 
     // Wiring: classify on the ERROR OBJECT and persist the enriched description.
     expect(source).toContain("isAuthError(error)");

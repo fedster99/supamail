@@ -138,10 +138,22 @@ export function describeSyncError(error: unknown): string {
   // LOGIN/AUTHENTICATE/PLAIN token to end-of-string. Server text like "LOGIN failed."
   // trips it, so anything after that text would be redacted away — markers placed
   // before it always survive.
-  const parts = [error.message];
+  const errorClass = error.constructor?.name || error.name || "Error";
+  const parts = [`[${errorClass}]`];
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string" && code.trim()) parts.push(`[code=${code.trim()}]`);
   const responseCode = extractImapResponseCode(error);
   if (responseCode) parts.push(`[${responseCode}]`);
+  const responseStatus = (error as { responseStatus?: unknown }).responseStatus;
+  if (
+    typeof responseStatus === "string"
+    && responseStatus.trim()
+    && responseStatus.trim().toUpperCase() !== responseCode
+  ) {
+    parts.push(`[status=${responseStatus.trim().toUpperCase()}]`);
+  }
   if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) parts.push("[AUTH]");
+  parts.push(error.message);
   const response = (error as { response?: unknown }).response;
   const responseText = (error as { responseText?: unknown }).responseText;
   const serverText = typeof response === "string" ? response : typeof responseText === "string" ? responseText : null;
