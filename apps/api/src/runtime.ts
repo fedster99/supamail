@@ -13,6 +13,10 @@ interface ClosableServer {
   close(callback?: (error?: Error) => void): void;
 }
 
+interface ErrorLogSink {
+  error(message: string): void;
+}
+
 export function parseRuntimeMode(env: NodeJS.ProcessEnv = process.env): SupaMailRuntimeMode {
   const mode = env.SUPAMAIL_MODE ?? "worker";
   if (mode === "worker" || mode === "api" || mode === "combined") return mode;
@@ -51,11 +55,12 @@ export async function startRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env):
   const repository = new MirrorRepository(pool, config);
   const engine = new MirrorEngine({ pool, config, repository });
   const server = startApiServer({ config, pool, repository, engine });
+  const closeApi = createServerCloser(server);
   const worker = await startWorkerRuntime({ config, pool, repository, engine });
 
   const shutdown = () => {
     worker.stop();
-    closeServer(server);
+    closeApi();
   };
 
   process.on("SIGTERM", shutdown);
@@ -64,7 +69,7 @@ export async function startRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env):
   try {
     await worker.done;
   } finally {
-    closeServer(server);
+    closeApi();
     await closePool();
   }
 }
@@ -84,23 +89,42 @@ async function runApiLockSelfTest(pool: PgPool): Promise<void> {
 }
 
 function installApiShutdownHandler(server: ClosableServer): void {
+  const closeApi = createServerCloser(server);
+  let stopping = false;
   const shutdown = async () => {
-    closeServer(server);
+    if (stopping) return;
+    stopping = true;
+    closeApi();
     await closePool();
   };
   process.on("SIGTERM", () => void shutdown());
   process.on("SIGINT", () => void shutdown());
 }
 
-function closeServer(server: ClosableServer): void {
-  server.close((error) => {
-    if (error) {
-      console.error(JSON.stringify({
+/**
+ * Node returns ERR_SERVER_NOT_RUNNING when close is requested after a server has
+ * already stopped. Treat that as successful idempotent shutdown, while preserving
+ * genuine teardown failures as error-level structured logs.
+ */
+export function createServerCloser(
+  server: ClosableServer,
+  sink: ErrorLogSink = console
+): () => void {
+  let closeRequested = false;
+
+  return () => {
+    if (closeRequested) return;
+    closeRequested = true;
+    server.close((error) => {
+      if (!error) return;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ERR_SERVER_NOT_RUNNING") return;
+      sink.error(JSON.stringify({
         event: "api.close.failed",
-        error: { message: error.message, stack: error.stack }
+        error: { message: error.message, code, stack: error.stack }
       }));
-    }
-  });
+    });
+  };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
