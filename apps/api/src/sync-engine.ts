@@ -78,8 +78,56 @@ type HistoryBatchResult = {
   hitLockBudget: boolean;
 };
 
-export function isAuthError(message: string): boolean {
-  return AUTH_ERROR_PATTERNS.some((p) => p.test(message));
+// Response codes that mean the credential itself was rejected (RFC 5530).
+const AUTH_RESPONSE_CODES = new Set(["AUTHENTICATIONFAILED", "AUTHORIZATIONFAILED", "EXPIRED"]);
+
+/**
+ * Classify an auth failure from the ERROR OBJECT, not just its message. imapflow's
+ * login/authenticate failures throw with `message: "Command failed"` and put the real
+ * signal in structured properties (`authenticationFailed: true`, `serverResponseCode`,
+ * and `response` = the server's error text). A message-only regex misses those, so a
+ * bad credential classified as a generic failure and re-tried hourly forever —
+ * hammering the provider with bad logins (lockout risk) instead of going terminal
+ * AUTH_ERROR. Accepts a plain string for back-compat.
+ */
+export function isAuthError(error: unknown): boolean {
+  if (typeof error === "string") {
+    return AUTH_ERROR_PATTERNS.some((p) => p.test(error));
+  }
+  if (!error || typeof error !== "object") return false;
+
+  if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) return true;
+
+  const responseCode = extractImapResponseCode(error);
+  if (responseCode && AUTH_RESPONSE_CODES.has(responseCode)) return true;
+
+  // The server's error text (imapflow puts it on `response`/`responseText`) plus the
+  // message itself. Note: a bare "Command failed" matches NO pattern on purpose — it
+  // is imapflow's generic command error, not an auth signal by itself.
+  const texts = [
+    error instanceof Error ? error.message : "",
+    (error as { response?: unknown }).response,
+    (error as { responseText?: unknown }).responseText
+  ].filter((t): t is string => typeof t === "string" && t.length > 0);
+  return texts.some((text) => AUTH_ERROR_PATTERNS.some((p) => p.test(text)));
+}
+
+/**
+ * Persistable description of a sync failure. `error.message` alone is often just
+ * "Command failed"; keep the server response code + text so the stored reason says
+ * WHY (the okano incident: 67 failures all recorded as the useless "Command failed").
+ */
+export function describeSyncError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const parts = [error.message];
+  const responseCode = extractImapResponseCode(error);
+  const response = (error as { response?: unknown }).response;
+  const responseText = (error as { responseText?: unknown }).responseText;
+  const serverText = typeof response === "string" ? response : typeof responseText === "string" ? responseText : null;
+  if (serverText && serverText !== error.message) parts.push(`— ${serverText}`);
+  if (responseCode) parts.push(`[${responseCode}]`);
+  if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) parts.push("[AUTH]");
+  return parts.join(" ");
 }
 
 export function isMissingMailboxError(error: unknown): boolean {
@@ -234,7 +282,7 @@ export class MirrorEngine {
             // the BROKEN state with DEGRADED.
             if (error instanceof AccountAlreadyFinalizedError) throw error;
             const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
-            const message = error instanceof Error ? error.message : String(error);
+            const message = describeSyncError(error);
             if (isConnectionLostError(error)) {
               // The IMAP connection is gone (an engine timeout closed it or the
               // server dropped it) — every remaining folder would fail with the
@@ -296,14 +344,17 @@ export class MirrorEngine {
           });
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        // Classify on the ERROR OBJECT (imapflow auth failures say "Command failed"
+        // in the message and carry the truth in structured props), and persist the
+        // enriched description so the stored reason explains WHY.
+        const message = describeSyncError(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
         if (error instanceof AccountAlreadyFinalizedError) {
           // Account state was already persisted (e.g. UIDVALIDITY reset limit
           // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
           // the DEGRADED/BROKEN-via-threshold CASE expression.
-        } else if (isAuthError(message)) {
+        } else if (isAuthError(error)) {
           await this.repository.markAccountSyncAuthFailed(account.id, message);
         } else {
           await this.repository.markAccountSyncFailed(account.id, message);
@@ -1055,7 +1106,7 @@ export class MirrorEngine {
         batch = await this.runHistoryBatch(account, folder, client, lockDeadline);
       } catch (error) {
         if (error instanceof AccountAlreadyFinalizedError) throw error;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = describeSyncError(error);
         if (isMissingMailboxError(error)) {
           await this.repository.markFolderPendingVerification(
             account.id,

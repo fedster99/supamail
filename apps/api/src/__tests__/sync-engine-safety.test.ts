@@ -42,10 +42,39 @@ describe("sync engine safety", () => {
     expect(source).toContain("Provider returned no folders");
   });
 
-  it("classifies auth errors and routes them to markAccountSyncAuthFailed (spec §13.1)", async () => {
+  it("classifies auth errors from imapflow's structured error, not just the message (spec §13.1)", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+    const { isAuthError, describeSyncError } = await import("../sync-engine.js");
 
-    expect(source).toContain("isAuthError(message)");
+    // The okano incident: imapflow login failures throw message "Command failed" with
+    // the real signal in structured props. A message-only regex classified a bad
+    // credential as a generic failure → hourly retry hammering instead of terminal
+    // AUTH_ERROR, and 67 runs persisted the useless reason "Command failed".
+    expect(isAuthError(Object.assign(new Error("Command failed"), { authenticationFailed: true }))).toBe(true);
+    expect(isAuthError(Object.assign(new Error("Command failed"), { serverResponseCode: "AUTHENTICATIONFAILED" }))).toBe(true);
+    expect(isAuthError(Object.assign(new Error("Command failed"), { response: "LOGIN failed." }))).toBe(true);
+    // A bare "Command failed" carries no auth signal — it must NOT classify as auth
+    // (it is imapflow's generic command error; over-matching it would make every
+    // failure terminal).
+    expect(isAuthError(new Error("Command failed"))).toBe(false);
+    expect(isAuthError(new Error("read ETIMEDOUT"))).toBe(false);
+    // Back-compat: plain strings still pattern-match.
+    expect(isAuthError("535 5.7.8 authentication failed")).toBe(true);
+
+    // The persisted reason keeps the server's why, not just "Command failed".
+    const described = describeSyncError(Object.assign(new Error("Command failed"), {
+      authenticationFailed: true,
+      serverResponseCode: "AUTHENTICATIONFAILED",
+      response: "LOGIN failed."
+    }));
+    expect(described).toContain("Command failed");
+    expect(described).toContain("LOGIN failed.");
+    expect(described).toContain("[AUTHENTICATIONFAILED]");
+    expect(described).toContain("[AUTH]");
+
+    // Wiring: classify on the ERROR OBJECT and persist the enriched description.
+    expect(source).toContain("isAuthError(error)");
+    expect(source).toContain("const message = describeSyncError(error)");
     expect(source).toContain("markAccountSyncAuthFailed");
   });
 
