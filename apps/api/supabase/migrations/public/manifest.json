@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0012_sync_events_retention_index",
+  "schemaVersion": "0013_body_head_trigram_index",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -48,6 +48,10 @@
     {
       "id": "0012_sync_events_retention_index",
       "file": "0012_sync_events_retention_index.sql"
+    },
+    {
+      "id": "0013_body_head_trigram_index",
+      "file": "0013_body_head_trigram_index.sql"
     }
   ]
 }

@@ -95,9 +95,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0012_sync_events_retention_index");
+    expect(version).toBe("0013_body_head_trigram_index");
     expect(manifest).toEqual({
-      schemaVersion: "0012_sync_events_retention_index",
+      schemaVersion: "0013_body_head_trigram_index",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -110,7 +110,8 @@ describe("initial schema", () => {
         { id: "0009_smtp_send", file: "0009_smtp_send.sql" },
         { id: "0010_search_recipient_indexes", file: "0010_search_recipient_indexes.sql" },
         { id: "0011_webhook_emit_indexes", file: "0011_webhook_emit_indexes.sql" },
-        { id: "0012_sync_events_retention_index", file: "0012_sync_events_retention_index.sql" }
+        { id: "0012_sync_events_retention_index", file: "0012_sync_events_retention_index.sql" },
+        { id: "0013_body_head_trigram_index", file: "0013_body_head_trigram_index.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -123,6 +124,8 @@ describe("initial schema", () => {
     expect(sql).toContain("headers_synced_count int NOT NULL DEFAULT 0");
     expect(sql).toContain("last_archive_refresh_at timestamptz");
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
+    expect(sql).toContain("imap_message_bodies_body_head_trgm_idx");
+    expect(sql).toContain("left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)");
     expect(sql).toContain("imap_messages_created_emit_idx");
     expect(sql).toContain("imap_messages_updated_emit_idx");
   });
