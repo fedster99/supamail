@@ -1,10 +1,12 @@
 # Session Handoff
 
-Last updated: 2026-06-10
+Last updated: 2026-07-12
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 
 ## Current Branch
+
+- Public migration `0013_body_head_trigram_index` adds a bounded 128 KiB body-text trigram expression index for exact substring consumers while ordinary language continues through body FTS. The migration is additive/idempotent and advances the public schema manifest to `0013_body_head_trigram_index`.
 
 - PR #63 follows PR #62 by preserving sanitized error class, ordinary error code, and IMAP response status in persisted sync reasons. The worker emits `sync.account.failed` through `console.error` and `sync.account.partial_success` through `console.warn`, while retaining the aggregate `sync.tick.completed` info event.
 - PR #64 makes API shutdown idempotent so a normal combined-mode rolling deploy does not emit a false `api.close.failed` / `ERR_SERVER_NOT_RUNNING`; genuine close errors remain structured error-level events.
@@ -53,6 +55,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Verification To Date
 
+- Body-head trigram migration (2026-07-12): `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed root typecheck, 498 fast tests, both builds, two idempotent public migration applications, 95 live-DB tests, and 118/118 spec-conformance checks. The local Node 26 shell emitted the expected warning because the repo pins Node 24.
 - Structured failure logging (2026-07-11): focused red/green coverage for error detail retention and worker severity events passed; `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed typecheck, 496 fast tests, both builds, 95 live-DB tests, and 118/118 spec-conformance checks. The first live run correctly exposed two stale exact-string assertions after class markers were added; both contracts were updated and the full gate then passed. Expected local Node 26, Next.js workspace-root, and Node DEP0205 warnings appeared.
 - Idempotent API shutdown (2026-07-11): focused red/green runtime coverage and `INSTALL_CMD=true ./init.sh` passed typecheck, 498 fast tests, and both builds. Production evidence was the normal Render rollout after PR #63 emitting `api.close.failed` with `ERR_SERVER_NOT_RUNNING`; the fix suppresses only that already-closed condition and still tests genuine teardown-error logging.
 - Body storage mode (2026-06-10): `pnpm typecheck`, `pnpm test` (149 unit tests incl. new config/schema/repository-safety coverage), `pnpm test:db:live` twice (38 integration tests incl. a new parsed_only end-to-end fixture sync proving NULL `raw_mime` + intact parsed text, full migration set applied repeatedly for idempotency, 118 spec-conformance scenario checks), and `INSTALL_CMD=true ./init.sh` all passed under the local Node 26 shell (expected engine warnings; repo pins Node 24).
