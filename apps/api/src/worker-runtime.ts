@@ -34,6 +34,28 @@ export function selectSyncLane(
   return nowMs - lastFullSyncStartedAtMs >= config.SYNC_INTERVAL_MS ? "full" : "sent";
 }
 
+function sentLaneSignal(
+  parent: AbortSignal,
+  timeoutMs: number
+): { signal: AbortSignal; dispose(): void } {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timeout = setTimeout(abort, timeoutMs);
+  if (parent.aborted) {
+    abort();
+  } else {
+    parent.addEventListener("abort", abort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timeout);
+      parent.removeEventListener("abort", abort);
+    }
+  };
+}
+
 export interface WorkerLogSink {
   log(message: string): void;
   warn(message: string): void;
@@ -138,14 +160,22 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     process.on("SIGINT", stop);
   }
 
-  async function tick(): Promise<void> {
-    const startedAt = Date.now();
-    const lane = selectSyncLane(startedAt, lastFullSyncStartedAtMs, config);
+  async function tick(lane: "full" | "sent", startedAt: number): Promise<void> {
     if (lane === "full") lastFullSyncStartedAtMs = startedAt;
-    const results = lane === "full"
-      ? await engine.syncDueAccounts(undefined, { signal: abort.signal })
-      : await engine.syncDueSentFolders(undefined, { signal: abort.signal });
-    logSyncTick(results, Date.now() - startedAt);
+    if (lane === "full") {
+      const results = await engine.syncDueAccounts(undefined, { signal: abort.signal });
+      logSyncTick(results, Date.now() - startedAt);
+      return;
+    }
+
+    const fullSweepDueAt = (lastFullSyncStartedAtMs ?? startedAt) + config.SYNC_INTERVAL_MS;
+    const sent = sentLaneSignal(abort.signal, Math.max(1, fullSweepDueAt - startedAt));
+    try {
+      const results = await engine.syncDueSentFolders(undefined, { signal: sent.signal });
+      logSyncTick(results, Date.now() - startedAt);
+    } finally {
+      sent.dispose();
+    }
   }
 
   async function sleep(ms: number): Promise<void> {
@@ -167,8 +197,11 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
 
   async function loop(): Promise<void> {
     while (!stopping) {
+      let lane: "full" | "sent" | null = null;
       try {
-        await tick();
+        const startedAt = Date.now();
+        lane = selectSyncLane(startedAt, lastFullSyncStartedAtMs, config);
+        await tick(lane, startedAt);
       } catch (error) {
         console.error(JSON.stringify({
           event: "sync.tick.failed",
@@ -178,7 +211,14 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
         }));
       }
       if (stopping) break;
-      await sleep(workerPollIntervalMs(config));
+      const pollDelay = workerPollIntervalMs(config);
+      const delay = lane === "sent" && lastFullSyncStartedAtMs !== null
+        ? Math.min(
+          pollDelay,
+          Math.max(0, lastFullSyncStartedAtMs + config.SYNC_INTERVAL_MS - Date.now())
+        )
+        : pollDelay;
+      await sleep(delay);
     }
   }
 

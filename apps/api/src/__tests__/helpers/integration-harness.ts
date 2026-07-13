@@ -13,7 +13,10 @@ export interface IntegrationHarness {
   buildEngine(opts: {
     folders: FixtureFolder[];
     overrides?: Partial<AppConfig>;
-    clientFactory?: (account: unknown) => Promise<MirrorImapClient>;
+    clientFactory?: (
+      account: unknown,
+      options?: { signal?: AbortSignal }
+    ) => Promise<MirrorImapClient>;
   }): MirrorEngine;
 }
 

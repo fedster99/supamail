@@ -210,12 +210,22 @@ export class AccountAlreadyFinalizedError extends Error {
   }
 }
 
+class SentSyncInterruptedError extends Error {
+  constructor() {
+    super("Sent sync interrupted for Inbox-first full sweep");
+    this.name = "SentSyncInterruptedError";
+  }
+}
+
 export interface MirrorEngineOptions {
   pool?: PgPool;
   config?: AppConfig;
   repository?: MirrorRepository;
   hooks?: MirrorHooks;
-  clientFactory?: (account: ImapAccount) => Promise<MirrorImapClient>;
+  clientFactory?: (
+    account: ImapAccount,
+    options?: { signal?: AbortSignal }
+  ) => Promise<MirrorImapClient>;
 }
 
 export class MirrorEngine {
@@ -223,14 +233,18 @@ export class MirrorEngine {
   private readonly config: AppConfig;
   private readonly repository: MirrorRepository;
   private readonly hooks: MirrorHooks;
-  private readonly clientFactory: (account: ImapAccount) => Promise<MirrorImapClient>;
+  private readonly clientFactory: (
+    account: ImapAccount,
+    options?: { signal?: AbortSignal }
+  ) => Promise<MirrorImapClient>;
 
   constructor(options: MirrorEngineOptions = {}) {
     this.pool = options.pool ?? getPool();
     this.config = options.config ?? getConfig();
     this.repository = options.repository ?? new MirrorRepository(this.pool, this.config);
     this.hooks = options.hooks ?? {};
-    this.clientFactory = options.clientFactory ?? ((account) => createImapClient(this.pool, this.config, account));
+    this.clientFactory = options.clientFactory
+      ?? ((account, clientOptions) => createImapClient(this.pool, this.config, account, clientOptions));
   }
 
   async syncDueAccounts(
@@ -258,7 +272,10 @@ export class MirrorEngine {
 
     for (const account of accounts) {
       if (options.signal?.aborted) break;
-      results.push(await this.syncAccount(account.id, "scheduled", { sentOnly: true }));
+      results.push(await this.syncAccount(account.id, "scheduled", {
+        sentOnly: true,
+        signal: options.signal
+      }));
     }
 
     return results;
@@ -267,7 +284,7 @@ export class MirrorEngine {
   async syncAccount(
     accountId: string,
     triggerType: SyncTriggerType = "manual",
-    options: { sentOnly?: boolean } = {}
+    options: { sentOnly?: boolean; signal?: AbortSignal } = {}
   ): Promise<SyncResult> {
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
@@ -289,8 +306,18 @@ export class MirrorEngine {
       const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
       await this.repository.markAccountSyncStarted(account.id, `supamail:${process.pid}`);
       let client: MirrorImapClient | null = null;
+      const interruptActiveClient = () => {
+        if (client) this.abortClient(client);
+      };
+      const throwIfInterrupted = () => {
+        if (!options.signal?.aborted) return;
+        interruptActiveClient();
+        throw new SentSyncInterruptedError();
+      };
+      options.signal?.addEventListener("abort", interruptActiveClient, { once: true });
 
       try {
+        throwIfInterrupted();
         const sentFolders = options.sentOnly
           ? await this.repository.getSentFoldersDueForSync(account.id)
           : null;
@@ -299,7 +326,8 @@ export class MirrorEngine {
           return;
         }
 
-        client = await this.clientFactory(account);
+        client = await this.clientFactory(account, { signal: options.signal });
+        throwIfInterrupted();
 
         if (!options.sentOnly && this.shouldDiscoverFolders(account)) {
           await this.discoverFolders(account, client);
@@ -311,6 +339,7 @@ export class MirrorEngine {
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
         for (const folder of folders) {
+          throwIfInterrupted();
           const isPriorityFolder = folder.sync_priority <= this.config.PRIORITY_CUTOFF;
           if (this.isLockBudgetExpired(lockDeadline) && !isPriorityFolder) {
             result.hitLockBudget = true;
@@ -324,6 +353,7 @@ export class MirrorEngine {
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline
             });
+            throwIfInterrupted();
             result.foldersProcessed += 1;
             result.messagesUpserted += folderResult.messagesUpserted;
             result.flagsUpdated += folderResult.flagsUpdated;
@@ -335,6 +365,7 @@ export class MirrorEngine {
             if (folderResult.flagScanAttempted) remainingFlagScans -= 1;
             await this.repository.heartbeat(account.id);
           } catch (error) {
+            throwIfInterrupted();
             // Account-finalising errors (e.g. UIDVALIDITY reset cap exceeded)
             // must escape the per-folder catch so the outer handler sees them
             // and skips re-marking; otherwise markAccountSyncPartial overrides
@@ -405,6 +436,15 @@ export class MirrorEngine {
           });
         }
       } catch (error) {
+        if (
+          error instanceof SentSyncInterruptedError
+          || (options.sentOnly === true && options.signal?.aborted === true)
+        ) {
+          // The supplemental lane yielded to the due full sweep. This is normal
+          // scheduling, not a mailbox/provider failure or an outage signal.
+          await this.repository.markAccountSentSyncFinished(account.id);
+          return;
+        }
         // Classify on the ERROR OBJECT (imapflow auth failures say "Command failed"
         // in the message and carry the truth in structured props), and persist the
         // enriched description so the stored reason explains WHY.
@@ -423,12 +463,18 @@ export class MirrorEngine {
           await this.repository.markAccountSyncFailed(account.id, message);
         }
       } finally {
+        options.signal?.removeEventListener("abort", interruptActiveClient);
         if (client) await client.logout().catch(() => undefined);
       }
     });
 
     let locked = await runLockedSync();
-    if (locked === null) {
+    // The Sent lane is supplemental. If another worker owns the account, defer
+    // to the next Sent/full pass instead of spending its bounded deadline on
+    // stale-lock recovery or emitting a false lock-busy outage. Full/manual
+    // syncs retain the recovery and failure behavior below.
+    const yieldedBeforeLock = locked === null && options.sentOnly === true;
+    if (locked === null && !yieldedBeforeLock) {
       const recovered = await clearOrphanedLockForAccount(
         this.pool,
         account.lock_id,
@@ -439,7 +485,7 @@ export class MirrorEngine {
       }
     }
 
-    if (locked === null) {
+    if (locked === null && !yieldedBeforeLock) {
       result.outcome = "failed";
       result.errors.push("Account lock busy");
       await this.repository.updateSyncRunStatus(runId, "failed", "Account lock busy");

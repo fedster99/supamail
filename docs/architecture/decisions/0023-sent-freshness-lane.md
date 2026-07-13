@@ -27,6 +27,14 @@ finishes its durable sync run and releases `currently_syncing`, but does not upd
 the account's full-sweep `last_sync_finished_at` or claim that full-account
 health/backoff was recomputed; the next full sweep owns those transitions.
 
+The next full-sweep start time is also the Sent lane's hard scheduling deadline.
+When that deadline arrives, the worker aborts connection setup, throttle waits,
+and the active Sent connection; stops before starting another Sent account; and
+immediately re-evaluates the full lane without another poll sleep. A deadline
+while waiting for the account advisory lock also yields without stale-lock
+recovery, regardless of whether the deadline has fired yet. These intentional yields are recorded as normal completion rather
+than a provider failure or outage signal.
+
 ## Consequences
 
 - Inbox remains first in every bounded full-sweep priority selection.
@@ -35,6 +43,8 @@ health/backoff was recomputed; the next full sweep owns those transitions.
   mailbox sweep. Body/history throughput and reconcile rates remain unchanged.
 - Accounts without due Sent work are filtered before lock acquisition, IMAP
   connection, or sync-run creation, avoiding no-op write and connection churn.
+- A slow provider or a large due-account set cannot let supplemental Sent work
+  occupy the single worker past the next Inbox-first full sweep.
 - Deployments can tune or effectively disable the faster lane by setting
   `SENT_SYNC_INTERVAL_MS` at or above `SYNC_INTERVAL_MS`.
 - Fast-lane failures remain visible in durable sync runs and worker error logs;
@@ -43,13 +53,16 @@ health/backoff was recomputed; the next full sweep owns those transitions.
 ## Verification
 
 - Config tests pin the 30-second default and override behavior.
-- Worker tests pin full/Sent lane interleaving and ensure a slower Sent setting
-  never delays the full sweep.
+- Worker tests pin full/Sent lane interleaving and ensure a slower Sent setting,
+  slow in-flight Sent pass, or rejected deadline cleanup never delays the full
+  sweep.
 - Live Postgres tests prove Inbox keeps the first bounded priority slot and Sent
   receives a shorter `next_sync_due_at` than Inbox.
 - Sync integration proves the fast pass processes only Sent, skips body backlog,
   leaves other due work queued, and does not refresh the full-priority health
-  timestamp.
+  timestamp. It also proves a scheduler abort closes the active IMAP client,
+  cancels pending connection/throttle work, and remains a neutral scheduling
+  yield even under account-lock contention.
 
 ## References
 

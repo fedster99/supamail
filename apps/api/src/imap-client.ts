@@ -75,7 +75,8 @@ export class ThrottledImapClient implements MirrorImapClient {
   constructor(
     private readonly client: ImapFlow,
     maxCommandsPerMinute: number,
-    private readonly commandTimeoutMs: number
+    private readonly commandTimeoutMs: number,
+    private readonly signal?: AbortSignal
   ) {
     this.throttle = new ImapThrottle(maxCommandsPerMinute);
   }
@@ -101,12 +102,12 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   async list(): Promise<MailboxListItem[]> {
-    await this.throttle.acquire();
+    await this.throttle.acquire(this.signal);
     return await this.withCommandTimeout("list", async () => (await this.client.list()) as MailboxListItem[]);
   }
 
   async getMailboxLock(path: string): Promise<MailboxLock> {
-    await this.throttle.acquire();
+    await this.throttle.acquire(this.signal);
     return await this.withCommandTimeout("getMailboxLock", () => this.client.getMailboxLock(path));
   }
 
@@ -115,7 +116,7 @@ export class ThrottledImapClient implements MirrorImapClient {
     query: Record<string, unknown>,
     options?: Record<string, unknown>
   ): AsyncIterable<FetchMessage> {
-    await this.throttle.acquire();
+    await this.throttle.acquire(this.signal);
     const iterator = (this.client.fetch(
       range as never,
       query as never,
@@ -134,7 +135,7 @@ export class ThrottledImapClient implements MirrorImapClient {
     query: Record<string, unknown>,
     options?: Record<string, unknown>
   ): Promise<FetchMessage | false | null> {
-    await this.throttle.acquire();
+    await this.throttle.acquire(this.signal);
     return await this.withCommandTimeout(
       "fetchOne",
       async () => await this.client.fetchOne(range, query as never, options as never) as FetchMessage | false | null
@@ -142,7 +143,7 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   async download(range: string, part?: string, options?: Record<string, unknown>): Promise<DownloadResult> {
-    await this.throttle.acquire();
+    await this.throttle.acquire(this.signal);
     return await this.withCommandTimeout(
       "download",
       async () => await this.client.download(range, part as never, options as never) as DownloadResult
@@ -169,16 +170,18 @@ export class ThrottledImapClient implements MirrorImapClient {
 export async function createImapClient(
   pool: PgPool,
   config: AppConfig,
-  account: ImapAccount
+  account: ImapAccount,
+  options: { signal?: AbortSignal } = {}
 ): Promise<MirrorImapClient> {
   // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
   // one shared connect prelude (imap-connect.ts); this adapter only adds the
   // read-only throttled verb surface on top (ADR 0017/0022).
-  const rawClient = await connectImap(pool, config, account);
+  const rawClient = await connectImap(pool, config, account, options);
   return new ThrottledImapClient(
     rawClient,
     config.IMAP_MAX_COMMANDS_PER_MINUTE,
-    config.IMAP_COMMAND_TIMEOUT_MS
+    config.IMAP_COMMAND_TIMEOUT_MS,
+    options.signal
   );
 }
 

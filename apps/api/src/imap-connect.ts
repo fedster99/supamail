@@ -33,7 +33,8 @@ import type { ImapAccount } from "./types.js";
 export async function connectImap(
   pool: PgPool,
   config: AppConfig,
-  account: ImapAccount
+  account: ImapAccount,
+  options: { signal?: AbortSignal } = {}
 ): Promise<ImapFlow> {
   await assertSafeImapTarget(account.host, account.port, account.secure, {
     allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
@@ -49,12 +50,32 @@ export async function connectImap(
     greetingTimeout: config.CONNECT_TIMEOUT_MS,
     socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
   });
+  if (options.signal?.aborted) {
+    client.close();
+    throw new Error("IMAP connection interrupted for higher-priority sync work");
+  }
+  let closedForInterrupt = false;
+  let interruptConnect: (() => void) | null = null;
+  const interrupted = options.signal
+    ? new Promise<never>((_, reject) => {
+      interruptConnect = () => {
+        closedForInterrupt = true;
+        client.close();
+        reject(new Error("IMAP connection interrupted for higher-priority sync work"));
+      };
+      options.signal?.addEventListener("abort", interruptConnect, { once: true });
+    })
+    : null;
   try {
-    await client.connect();
+    await (interrupted ? Promise.race([client.connect(), interrupted]) : client.connect());
   } catch (error) {
     // Close the socket so an auth/TLS failure during connect cannot leak it.
-    client.close();
+    if (!closedForInterrupt) client.close();
     throw error;
+  } finally {
+    if (interruptConnect) {
+      options.signal?.removeEventListener("abort", interruptConnect);
+    }
   }
   return client;
 }

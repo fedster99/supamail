@@ -1,5 +1,26 @@
-import { describe, expect, it, vi } from "vitest";
-import { logSyncTick, selectSyncLane, workerPollIntervalMs } from "../worker-runtime.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AppConfig } from "../config.js";
+
+vi.mock("../locks.js", () => ({
+  clearOrphanedLocks: vi.fn(async () => ({
+    terminatedBackends: 0,
+    accountsReset: 0,
+    runsClosed: 0
+  })),
+  runLockSelfTestWithRetry: vi.fn(async () => undefined)
+}));
+
+const {
+  logSyncTick,
+  selectSyncLane,
+  startWorkerRuntime,
+  workerPollIntervalMs
+} = await import("../worker-runtime.js");
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("worker Sent polling cadence", () => {
   const config = { SYNC_INTERVAL_MS: 60_000, SENT_SYNC_INTERVAL_MS: 30_000 };
@@ -15,6 +36,90 @@ describe("worker Sent polling cadence", () => {
     const slowerSent = { SYNC_INTERVAL_MS: 60_000, SENT_SYNC_INTERVAL_MS: 120_000 };
 
     expect(workerPollIntervalMs(slowerSent)).toBe(60_000);
+  });
+
+  it("interrupts a slow Sent pass when the next Inbox-first full sweep is due", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    const syncDueAccounts = vi.fn(async () => []);
+    const syncDueSentFolders = vi.fn(async (_limit, options?: { signal?: AbortSignal }) => {
+      await new Promise<void>((resolve) => {
+        options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return [];
+    });
+    const runtime = await startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: {
+        query: vi.fn(async () => ({ rows: [{ count: "0" }] }))
+      } as never,
+      engine: { syncDueAccounts, syncDueSentFolders },
+      repository: {
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+      } as never
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(syncDueAccounts).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(syncDueSentFolders).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(syncDueAccounts).toHaveBeenCalledTimes(2);
+    } finally {
+      runtime.stop();
+      await runtime.done;
+    }
+  });
+
+  it("runs the due full sweep immediately when an interrupted Sent pass rejects", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const syncDueAccounts = vi.fn(async () => []);
+    const syncDueSentFolders = vi.fn(async (_limit, options?: { signal?: AbortSignal }) => {
+      await new Promise<void>((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new Error("deadline cleanup failed")), { once: true });
+      });
+      return [];
+    });
+    const runtime = await startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      engine: { syncDueAccounts, syncDueSentFolders },
+      repository: {
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+      } as never
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(syncDueSentFolders).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(syncDueAccounts).toHaveBeenCalledTimes(2);
+    } finally {
+      runtime.stop();
+      await runtime.done;
+    }
   });
 });
 

@@ -134,6 +134,100 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(runsAfterNoop.rows[0].count).toBe(runsBeforeNoop.rows[0].count);
   });
 
+  it("closes an in-flight Sent IMAP operation when its scheduler deadline aborts", async () => {
+    const h = await setupIntegration("sent-fast-pass-abort");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    await dueAllFolders(h.pool, h.account.id);
+
+    let releaseLock!: () => void;
+    let markStarted!: () => void;
+    const lockGate = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let closeCalls = 0;
+
+    class BlockingSentClient extends FixtureImapClient {
+      close(): void {
+        closeCalls += 1;
+        releaseLock();
+      }
+
+      override async getMailboxLock(path: string) {
+        if (path === "Sent") {
+          markStarted();
+          await lockGate;
+        }
+        return await super.getMailboxLock(path);
+      }
+    }
+
+    const client = new BlockingSentClient(folders);
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => client
+    });
+    const abort = new AbortController();
+    const sync = engine.syncDueSentFolders(1, { signal: abort.signal });
+
+    await started;
+    abort.abort();
+    try {
+      const stoppedPromptly = await Promise.race([
+        sync.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+      ]);
+      expect(stoppedPromptly).toBe(true);
+      expect(closeCalls).toBeGreaterThan(0);
+      const [result] = await sync;
+      expect(result.outcome).toBe("success");
+      expect(result.errors).toEqual([]);
+    } finally {
+      releaseLock();
+      await sync;
+    }
+  });
+
+  it("treats a scheduler abort during Sent connection setup as a neutral yield", async () => {
+    const h = await setupIntegration("sent-fast-pass-connect-abort");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    await dueAllFolders(h.pool, h.account.id);
+
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async (_account, options) => {
+        markStarted();
+        await new Promise<void>((_resolve, reject) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("IMAP connection interrupted for higher-priority sync work")),
+            { once: true }
+          );
+        });
+        throw new Error("unreachable");
+      }
+    });
+    const abort = new AbortController();
+    const sync = engine.syncDueSentFolders(1, { signal: abort.signal });
+
+    await started;
+    abort.abort();
+    const [result] = await sync;
+
+    expect(result.outcome).toBe("success");
+    expect(result.errors).toEqual([]);
+  });
+
   it("Scenario A — initial sync uses snapshot + watermark (spec §10.4)", async () => {
     const h = await setupIntegration("A");
     activeAccountIds.push(h.account.id);
