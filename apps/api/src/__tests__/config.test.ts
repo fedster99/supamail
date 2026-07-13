@@ -24,6 +24,23 @@ describe("config BODY_STORAGE_MODE", () => {
   });
 });
 
+describe("config sent-folder polling", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it("polls Sent twice as often as the full mailbox sweep by default", () => {
+    const config = getConfig(baseEnv);
+
+    expect(config.SYNC_INTERVAL_MS).toBe(60_000);
+    expect(config.SENT_SYNC_INTERVAL_MS).toBe(30_000);
+  });
+
+  it("accepts an independently tuned Sent interval", () => {
+    expect(getConfig({ ...baseEnv, SENT_SYNC_INTERVAL_MS: "15000" }).SENT_SYNC_INTERVAL_MS).toBe(15_000);
+  });
+});
+
 describe("config BACKFILL_WINDOW", () => {
   beforeEach(() => {
     resetConfigForTests();

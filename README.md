@@ -59,7 +59,8 @@ Account-level advisory locks keep sync operations serialized. Folder state track
 These are the current defaults, tuned for a small always-on worker:
 
 - Live sync window: 90 days
-- New mail detection: about 1-2 minutes
+- Inbox/new-mail detection: about 1-2 minutes
+- Sent-folder metadata detection: about 30-60 seconds (lightweight lane; configurable)
 - Folder discovery: every 15 minutes
 - Message delete/move detection: about 6 hours per folder
 - Folder deletion grace period: 7 days

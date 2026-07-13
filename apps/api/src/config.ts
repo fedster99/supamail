@@ -31,6 +31,7 @@ const envSchema = z.object({
     .transform((v) => v === true || v === "true"),
   PORT: z.coerce.number().int().positive().default(3000),
   SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  SENT_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   WINDOW_DAYS: z.coerce.number().int().positive().default(90),
   BODY_FETCH_POLICY: z
     .enum(["immediate", "lazy", "priority_then_backfill"])

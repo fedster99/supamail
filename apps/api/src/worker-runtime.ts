@@ -16,6 +16,22 @@ export interface WorkerSyncResult {
 
 interface WorkerEngine {
   syncDueAccounts(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
+  syncDueSentFolders(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
+}
+
+type SyncCadence = Pick<AppConfig, "SYNC_INTERVAL_MS" | "SENT_SYNC_INTERVAL_MS">;
+
+export function workerPollIntervalMs(config: SyncCadence): number {
+  return Math.min(config.SYNC_INTERVAL_MS, config.SENT_SYNC_INTERVAL_MS);
+}
+
+export function selectSyncLane(
+  nowMs: number,
+  lastFullSyncStartedAtMs: number | null,
+  config: SyncCadence
+): "full" | "sent" {
+  if (lastFullSyncStartedAtMs === null) return "full";
+  return nowMs - lastFullSyncStartedAtMs >= config.SYNC_INTERVAL_MS ? "full" : "sent";
 }
 
 export interface WorkerLogSink {
@@ -87,6 +103,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   let stopping = false;
   let wakeSleep: (() => void) | null = null;
   let retentionTimer: ReturnType<typeof setInterval> | null = null;
+  let lastFullSyncStartedAtMs: number | null = null;
 
   const stop = () => {
     if (stopping) return;
@@ -123,7 +140,11 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
 
   async function tick(): Promise<void> {
     const startedAt = Date.now();
-    const results = await engine.syncDueAccounts(undefined, { signal: abort.signal });
+    const lane = selectSyncLane(startedAt, lastFullSyncStartedAtMs, config);
+    if (lane === "full") lastFullSyncStartedAtMs = startedAt;
+    const results = lane === "full"
+      ? await engine.syncDueAccounts(undefined, { signal: abort.signal })
+      : await engine.syncDueSentFolders(undefined, { signal: abort.signal });
     logSyncTick(results, Date.now() - startedAt);
   }
 
@@ -157,7 +178,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
         }));
       }
       if (stopping) break;
-      await sleep(config.SYNC_INTERVAL_MS);
+      await sleep(workerPollIntervalMs(config));
     }
   }
 

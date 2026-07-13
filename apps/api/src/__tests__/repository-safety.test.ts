@@ -114,13 +114,14 @@ describe("repository safety", () => {
     // it, the provider returns a generic error (e.g. Rackspace "Command failed",
     // which is not a recognized missing-mailbox signal), the run fails, and
     // consecutive_failures climbs to BROKEN — one deleted folder bricking the
-    // account. All four readers must carry the exclusion: getFoldersDueForSync
-    // (priority + round-robin), getHistoryBacklog, and getBodyBacklog (the body lane
-    // is the one un-try/caught reader, so a missed exclusion there bricks directly).
+    // account. All five readers must carry the exclusion: getFoldersDueForSync
+    // (priority + round-robin), getSentFoldersDueForSync, getHistoryBacklog, and
+    // getBodyBacklog (the body lane is the one un-try/caught reader, so a missed
+    // exclusion there bricks directly).
     const syncFilter = "AND missing_since IS NULL AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
     const joinedFilter = "AND f.missing_since IS NULL AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
 
-    expect(collapsed.split(syncFilter).length - 1).toBe(2);
+    expect(collapsed.split(syncFilter).length - 1).toBe(3);
     expect(collapsed.split(joinedFilter).length - 1).toBe(2);
   });
 

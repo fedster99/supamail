@@ -6,6 +6,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Current Branch
 
+- Active branch `fedster99/speed-up-sent-sync` adds ADR 0023's bounded Sent freshness lane: Sent reserves a priority-selection slot and receives a configurable metadata-only poll (`SENT_SYNC_INTERVAL_MS`, default 30 seconds) between 60-second full sweeps. The fast lane filters accounts without due Sent work before lock/connection/run creation, skips discovery/flags/reconcile/body/history, and leaves full-sweep health, backoff, `last_priority_sync_succeeded_at`, and `last_sync_finished_at` untouched.
 - Public migration `0013_body_head_trigram_index` adds a bounded 128 KiB body-text trigram expression index for exact substring consumers while ordinary language continues through body FTS. The migration is additive/idempotent and advances the public schema manifest to `0013_body_head_trigram_index`.
 
 - PR #63 follows PR #62 by preserving sanitized error class, ordinary error code, and IMAP response status in persisted sync reasons. The worker emits `sync.account.failed` through `console.error` and `sync.account.partial_success` through `console.warn`, while retaining the aggregate `sync.tick.completed` info event.
@@ -55,6 +56,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Verification To Date
 
+- Sent freshness lane (2026-07-12): red/green config, worker-cadence, live scheduling, and sync integration coverage; `pnpm test` passed 502 fast tests, `pnpm typecheck`, `pnpm build`, `git diff --check`, and `pnpm test:db:live` passed two idempotent migration applications, 98 live-DB tests, and 118/118 spec-conformance checks. The local Node 26 shell emitted the expected warning because the repo pins Node 24.
 - Body-head trigram migration (2026-07-12): `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed root typecheck, 498 fast tests, both builds, two idempotent public migration applications, 95 live-DB tests, and 118/118 spec-conformance checks. The local Node 26 shell emitted the expected warning because the repo pins Node 24.
 - Structured failure logging (2026-07-11): focused red/green coverage for error detail retention and worker severity events passed; `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed typecheck, 496 fast tests, both builds, 95 live-DB tests, and 118/118 spec-conformance checks. The first live run correctly exposed two stale exact-string assertions after class markers were added; both contracts were updated and the full gate then passed. Expected local Node 26, Next.js workspace-root, and Node DEP0205 warnings appeared.
 - Idempotent API shutdown (2026-07-11): focused red/green runtime coverage and `INSTALL_CMD=true ./init.sh` passed typecheck, 498 fast tests, and both builds. Production evidence was the normal Render rollout after PR #63 emitting `api.close.failed` with `ERR_SERVER_NOT_RUNNING`; the fix suppresses only that already-closed condition and still tests genuine teardown-error logging.

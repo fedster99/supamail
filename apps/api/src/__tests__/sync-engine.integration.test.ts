@@ -89,6 +89,51 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await closePool();
   });
 
+  it("runs a lightweight Sent-only pass without consuming other due folder work", async () => {
+    const h = await setupIntegration("sent-fast-pass");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const engine = h.buildEngine({ folders });
+
+    // Discovery happens in the regular lane. Make both folders due afterward;
+    // the fast lane must still touch only Sent.
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET body_fetch_policy = 'immediate',
+           last_priority_sync_succeeded_at = '2026-01-01T00:00:00.000Z',
+           last_sync_finished_at = '2026-01-01T00:00:00.000Z'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+    await dueAllFolders(h.pool, h.account.id);
+
+    const [result] = await engine.syncDueSentFolders(1);
+
+    expect(result.outcome).toBe("success");
+    expect(result.foldersProcessed).toBe(1);
+    expect(result.bodiesFetched).toBe(0);
+    const stillDue = await h.repository.getFoldersDueForSync(h.account.id);
+    expect(stillDue.map((folder) => folder.path)).toContain("INBOX");
+    expect(stillDue.map((folder) => folder.path)).not.toContain("Sent");
+    const account = await h.repository.getAccount(h.account.id);
+    expect(account?.last_priority_sync_succeeded_at?.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+    expect(account?.last_sync_finished_at?.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+
+    const runsBeforeNoop = await h.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_sync_runs WHERE account_id = $1",
+      [h.account.id]
+    );
+    const noDueWork = await engine.syncDueSentFolders(1);
+    const runsAfterNoop = await h.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_sync_runs WHERE account_id = $1",
+      [h.account.id]
+    );
+
+    expect(noDueWork).toEqual([]);
+    expect(runsAfterNoop.rows[0].count).toBe(runsBeforeNoop.rows[0].count);
+  });
+
   it("Scenario A — initial sync uses snapshot + watermark (spec §10.4)", async () => {
     const h = await setupIntegration("A");
     activeAccountIds.push(h.account.id);
