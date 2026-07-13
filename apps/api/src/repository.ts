@@ -1122,31 +1122,25 @@ export class MirrorRepository {
     const priority = await this.pool.query<ImapFolder>(
       `
       SELECT *
-      FROM (
-        SELECT *
-        FROM public.imap_folders
-        WHERE account_id = $1
-          AND tracked = true
-          -- A folder discovery has already flagged absent from the provider
-          -- (missing_since stamped) must leave the sync working set immediately.
-          -- Otherwise the loop keeps SELECTing a deleted folder, the provider
-          -- returns a generic error (e.g. Rackspace "Command failed", which is not a
-          -- recognized NONEXISTENT/TRYCREATE missing-mailbox signal so the folder is
-          -- never sidelined to PENDING_VERIFICATION), the run is marked failed, and
-          -- consecutive_failures climbs to BROKEN — bricking the whole account because
-          -- one folder was deleted. Discovery owns the missing-folder lifecycle: it
-          -- clears missing_since on reappearance and tombstones to MISSING/untracked
-          -- after FOLDER_MISSING_GRACE_MS.
-          AND missing_since IS NULL
-          AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
-          AND sync_priority <= $2
-          AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
-        -- Sent is the freshness-critical outbound signal. Reserve it a slot in
-        -- the bounded set, then restore normal priority order for execution.
-        ORDER BY CASE WHEN sync_priority = 5 THEN 0 ELSE 1 END, sync_priority, path
-        LIMIT $3
-      ) AS selected_priority
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        -- A folder discovery has already flagged absent from the provider
+        -- (missing_since stamped) must leave the sync working set immediately.
+        -- Otherwise the loop keeps SELECTing a deleted folder, the provider
+        -- returns a generic error (e.g. Rackspace "Command failed", which is not a
+        -- recognized NONEXISTENT/TRYCREATE missing-mailbox signal so the folder is
+        -- never sidelined to PENDING_VERIFICATION), the run is marked failed, and
+        -- consecutive_failures climbs to BROKEN — bricking the whole account because
+        -- one folder was deleted. Discovery owns the missing-folder lifecycle: it
+        -- clears missing_since on reappearance and tombstones to MISSING/untracked
+        -- after FOLDER_MISSING_GRACE_MS.
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+        AND sync_priority <= $2
+        AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
       ORDER BY sync_priority, path
+      LIMIT $3
       `,
       [accountId, this.config.PRIORITY_CUTOFF, this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE]
     );
