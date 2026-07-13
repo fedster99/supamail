@@ -48,7 +48,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder.
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
-  - Sent reserves a slot in the bounded priority selection, then normal priority order is restored for full-sweep execution.
+  - Inbox remains first in bounded full-sweep priority selection. Sent stays at priority 5 and receives a supplemental lightweight refresh on its separate cadence.
   - Body fetch is capped at up to 100 live bodies per worker tick.
   - Raw MIME fetch is capped at 25 MB per message.
   - Account lock budget is 10 minutes.

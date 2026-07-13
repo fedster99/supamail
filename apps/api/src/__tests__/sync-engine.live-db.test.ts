@@ -336,7 +336,7 @@ liveDb("live DB reliability lane", () => {
     expect(second.map((folder) => folder.path)).toEqual(["Priority", "RR-C", "RR-A"]);
   });
 
-  it("reserves the first priority slot for Sent so a busy priority set cannot starve it", async () => {
+  it("keeps Inbox first in the bounded full-sweep priority set", async () => {
     const h = await setupIntegration("live-sent-priority-slot", {
       PRIORITY_CUTOFF: 10,
       MAX_PRIORITY_FOLDERS_PER_CYCLE: 1
@@ -358,7 +358,7 @@ liveDb("live DB reliability lane", () => {
 
     const due = await h.repository.getFoldersDueForSync(h.account.id);
 
-    expect(due.map((folder) => folder.path)).toEqual(["Sent"]);
+    expect(due.map((folder) => folder.path)).toEqual(["INBOX"]);
   });
 
   it("makes Sent due sooner than the regular mailbox sweep", async () => {

@@ -8,17 +8,17 @@ Date: 2026-07-12
 
 Outbound messages are a high-value freshness signal for consumers that detect
 relationship activity and communication outages. Sent was already priority 5,
-but it shared the minute-scale full sweep and the bounded priority-folder set.
-A provider exposing many higher-priority INBOX aliases could crowd Sent out, and
-shortening the whole worker interval would multiply discovery, reconcile, body,
-history, and account-health work.
+but it shared the minute-scale full sweep. Shortening the whole worker interval
+would multiply discovery, reconcile, body, history, and account-health work.
+Inbox is the most freshness-critical folder and must remain first in the bounded
+full-sweep priority set.
 
 ## Decision
 
-Reserve Sent a slot when selecting the bounded priority set, then restore normal
-priority order for full-sweep execution. Interleave a second, due-based Sent-only
-lane at `SENT_SYNC_INTERVAL_MS` (30 seconds by default) between the existing
-`SYNC_INTERVAL_MS` full sweeps.
+Keep normal full-sweep priority ordering, with Inbox before Sent. Interleave a
+second, due-based Sent-only lane at `SENT_SYNC_INTERVAL_MS` (30 seconds by
+default) between the existing `SYNC_INTERVAL_MS` full sweeps. This lane is
+supplemental; it does not promote Sent over Inbox.
 
 The Sent lane uses the same advisory account lock, mailbox lock, command timeout,
 and IMAP throttle as every other sync operation. It updates metadata only and
@@ -29,8 +29,8 @@ health/backoff was recomputed; the next full sweep owns those transitions.
 
 ## Consequences
 
-- Sent metadata is normally observed in 30-60 seconds instead of 1-2 minutes and
-  cannot be starved by a crowded priority set.
+- Inbox remains first in every bounded full-sweep priority selection.
+- Sent metadata is normally observed in 30-60 seconds instead of 1-2 minutes.
 - The extra pass adds a bounded Sent mailbox metadata check, not another full
   mailbox sweep. Body/history throughput and reconcile rates remain unchanged.
 - Accounts without due Sent work are filtered before lock acquisition, IMAP
@@ -45,8 +45,8 @@ health/backoff was recomputed; the next full sweep owns those transitions.
 - Config tests pin the 30-second default and override behavior.
 - Worker tests pin full/Sent lane interleaving and ensure a slower Sent setting
   never delays the full sweep.
-- Live Postgres tests prove Sent reserves a bounded priority slot and receives a
-  shorter `next_sync_due_at` than INBOX.
+- Live Postgres tests prove Inbox keeps the first bounded priority slot and Sent
+  receives a shorter `next_sync_due_at` than Inbox.
 - Sync integration proves the fast pass processes only Sent, skips body backlog,
   leaves other due work queued, and does not refresh the full-priority health
   timestamp.
