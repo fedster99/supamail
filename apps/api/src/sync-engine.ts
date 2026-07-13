@@ -248,7 +248,27 @@ export class MirrorEngine {
     return results;
   }
 
-  async syncAccount(accountId: string, triggerType: SyncTriggerType = "manual"): Promise<SyncResult> {
+  /** Refresh only due Sent folders, leaving expensive secondary lanes to the full sweep. */
+  async syncDueSentFolders(
+    limit = this.config.SYNC_MAX_ACCOUNTS,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<SyncResult[]> {
+    const accounts = await this.repository.getRunnableAccounts(limit, { sentDueOnly: true });
+    const results: SyncResult[] = [];
+
+    for (const account of accounts) {
+      if (options.signal?.aborted) break;
+      results.push(await this.syncAccount(account.id, "scheduled", { sentOnly: true }));
+    }
+
+    return results;
+  }
+
+  async syncAccount(
+    accountId: string,
+    triggerType: SyncTriggerType = "manual",
+    options: { sentOnly?: boolean } = {}
+  ): Promise<SyncResult> {
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
 
@@ -271,13 +291,21 @@ export class MirrorEngine {
       let client: MirrorImapClient | null = null;
 
       try {
+        const sentFolders = options.sentOnly
+          ? await this.repository.getSentFoldersDueForSync(account.id)
+          : null;
+        if (options.sentOnly && sentFolders?.length === 0) {
+          await this.repository.markAccountSentSyncFinished(account.id);
+          return;
+        }
+
         client = await this.clientFactory(account);
 
-        if (this.shouldDiscoverFolders(account)) {
+        if (!options.sentOnly && this.shouldDiscoverFolders(account)) {
           await this.discoverFolders(account, client);
         }
 
-        const folders = await this.repository.getFoldersDueForSync(account.id);
+        const folders = sentFolders ?? await this.repository.getFoldersDueForSync(account.id);
         let priorityFolderFailed = false;
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
@@ -291,8 +319,8 @@ export class MirrorEngine {
 
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
-              allowReconcile: remainingReconciles > 0,
-              allowFlagScan: remainingFlagScans > 0,
+              allowReconcile: !options.sentOnly && remainingReconciles > 0,
+              allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline
             });
@@ -341,17 +369,17 @@ export class MirrorEngine {
           }
         }
 
-        if (this.isLockBudgetExpired(lockDeadline)) {
+        if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!connectionLost) {
+        } else if (!options.sentOnly && !connectionLost) {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
         }
 
-        if (this.isLockBudgetExpired(lockDeadline)) {
+        if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!connectionLost) {
+        } else if (!options.sentOnly && !connectionLost) {
           const historyResult = await this.runHistoryLane(account, client, lockDeadline);
           result.messagesUpserted += historyResult.messagesUpserted;
           result.bodiesFetched += historyResult.bodiesFetched;
@@ -363,7 +391,9 @@ export class MirrorEngine {
           result.outcome = priorityFolderFailed ? "failed" : "partial_success";
         }
 
-        if (result.outcome === "failed") {
+        if (options.sentOnly) {
+          await this.repository.markAccountSentSyncFinished(account.id);
+        } else if (result.outcome === "failed") {
           await this.repository.markAccountSyncFailed(account.id, result.errors.join("; "));
         } else if (result.outcome === "partial_success") {
           await this.repository.markAccountSyncPartial(account.id, result.errors.join("; "), {
@@ -381,7 +411,9 @@ export class MirrorEngine {
         const message = describeSyncError(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
-        if (error instanceof AccountAlreadyFinalizedError) {
+        if (options.sentOnly) {
+          await this.repository.markAccountSentSyncFinished(account.id);
+        } else if (error instanceof AccountAlreadyFinalizedError) {
           // Account state was already persisted (e.g. UIDVALIDITY reset limit
           // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
           // the DEGRADED/BROKEN-via-threshold CASE expression.

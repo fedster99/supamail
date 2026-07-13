@@ -138,8 +138,9 @@ describe("sync engine safety", () => {
 
     expect(source).toContain("isConnectionLostError(error)");
     expect(source).toContain("connectionLost = true");
-    // Both the body backlog and the history lane are skipped once the client is dead.
-    expect(source.match(/} else if \(!connectionLost\) \{/g)).toHaveLength(2);
+    // Both the body backlog and the history lane are skipped for a fast Sent pass
+    // and once the client is dead.
+    expect(source.match(/} else if \(!options\.sentOnly && !connectionLost\) \{/g)).toHaveLength(2);
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {

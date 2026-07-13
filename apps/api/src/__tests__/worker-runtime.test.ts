@@ -1,5 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
-import { logSyncTick } from "../worker-runtime.js";
+import { logSyncTick, selectSyncLane, workerPollIntervalMs } from "../worker-runtime.js";
+
+describe("worker Sent polling cadence", () => {
+  const config = { SYNC_INTERVAL_MS: 60_000, SENT_SYNC_INTERVAL_MS: 30_000 };
+
+  it("interleaves a lightweight Sent pass between full mailbox sweeps", () => {
+    expect(selectSyncLane(0, null, config)).toBe("full");
+    expect(selectSyncLane(30_000, 0, config)).toBe("sent");
+    expect(selectSyncLane(60_000, 0, config)).toBe("full");
+    expect(workerPollIntervalMs(config)).toBe(30_000);
+  });
+
+  it("never lets a slower Sent setting delay the full sweep", () => {
+    const slowerSent = { SYNC_INTERVAL_MS: 60_000, SENT_SYNC_INTERVAL_MS: 120_000 };
+
+    expect(workerPollIntervalMs(slowerSent)).toBe(60_000);
+  });
+});
 
 describe("worker runtime logging", () => {
   it("emits failed and partial account outcomes at Render-queryable severities", () => {

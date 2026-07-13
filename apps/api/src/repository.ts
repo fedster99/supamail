@@ -365,8 +365,23 @@ export class MirrorRepository {
     return result.rows[0] ?? null;
   }
 
-  async getRunnableAccounts(limit = 25): Promise<ImapAccount[]> {
+  async getRunnableAccounts(
+    limit = 25,
+    options: { sentDueOnly?: boolean } = {}
+  ): Promise<ImapAccount[]> {
     const effectiveLimit = Math.min(limit, this.config.SYNC_MAX_ACCOUNTS);
+    const sentDueClause = options.sentDueOnly
+      ? `AND EXISTS (
+          SELECT 1
+          FROM public.imap_folders sf
+          WHERE sf.account_id = public.imap_accounts.id
+            AND sf.tracked = true
+            AND sf.missing_since IS NULL
+            AND sf.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+            AND sf.sync_priority = 5
+            AND (sf.next_sync_due_at IS NULL OR sf.next_sync_due_at <= now())
+        )`
+      : "";
     const result = await this.pool.query<ImapAccount>(
       `
       SELECT *
@@ -390,6 +405,7 @@ export class MirrorRepository {
           OR last_heartbeat_at IS NULL
           OR last_heartbeat_at <= now() - ($2::bigint * interval '1 millisecond')
         )
+        ${sentDueClause}
       ORDER BY COALESCE(last_sync_finished_at, 'epoch'::timestamptz), created_at
       LIMIT $1
       `,
@@ -464,6 +480,25 @@ export class MirrorRepository {
       WHERE id = $1
       `,
       [accountId, startedBy]
+    );
+  }
+
+  /**
+   * Finish the lightweight Sent freshness lane without claiming that the full
+   * mailbox health/backoff contract was re-evaluated. The durable sync run still
+   * records and logs any error; the next full sweep owns health transitions.
+   */
+  async markAccountSentSyncFinished(accountId: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET
+        currently_syncing = false,
+        sync_started_by = NULL,
+        last_heartbeat_at = now()
+      WHERE id = $1
+      `,
+      [accountId]
     );
   }
 
@@ -1087,25 +1122,31 @@ export class MirrorRepository {
     const priority = await this.pool.query<ImapFolder>(
       `
       SELECT *
-      FROM public.imap_folders
-      WHERE account_id = $1
-        AND tracked = true
-        -- A folder discovery has already flagged absent from the provider
-        -- (missing_since stamped) must leave the sync working set immediately.
-        -- Otherwise the loop keeps SELECTing a deleted folder, the provider
-        -- returns a generic error (e.g. Rackspace "Command failed", which is not a
-        -- recognized NONEXISTENT/TRYCREATE missing-mailbox signal so the folder is
-        -- never sidelined to PENDING_VERIFICATION), the run is marked failed, and
-        -- consecutive_failures climbs to BROKEN — bricking the whole account because
-        -- one folder was deleted. Discovery owns the missing-folder lifecycle: it
-        -- clears missing_since on reappearance and tombstones to MISSING/untracked
-        -- after FOLDER_MISSING_GRACE_MS.
-        AND missing_since IS NULL
-        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
-        AND sync_priority <= $2
-        AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
+      FROM (
+        SELECT *
+        FROM public.imap_folders
+        WHERE account_id = $1
+          AND tracked = true
+          -- A folder discovery has already flagged absent from the provider
+          -- (missing_since stamped) must leave the sync working set immediately.
+          -- Otherwise the loop keeps SELECTing a deleted folder, the provider
+          -- returns a generic error (e.g. Rackspace "Command failed", which is not a
+          -- recognized NONEXISTENT/TRYCREATE missing-mailbox signal so the folder is
+          -- never sidelined to PENDING_VERIFICATION), the run is marked failed, and
+          -- consecutive_failures climbs to BROKEN — bricking the whole account because
+          -- one folder was deleted. Discovery owns the missing-folder lifecycle: it
+          -- clears missing_since on reappearance and tombstones to MISSING/untracked
+          -- after FOLDER_MISSING_GRACE_MS.
+          AND missing_since IS NULL
+          AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+          AND sync_priority <= $2
+          AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
+        -- Sent is the freshness-critical outbound signal. Reserve it a slot in
+        -- the bounded set, then restore normal priority order for execution.
+        ORDER BY CASE WHEN sync_priority = 5 THEN 0 ELSE 1 END, sync_priority, path
+        LIMIT $3
+      ) AS selected_priority
       ORDER BY sync_priority, path
-      LIMIT $3
       `,
       [accountId, this.config.PRIORITY_CUTOFF, this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE]
     );
@@ -1142,6 +1183,27 @@ export class MirrorRepository {
     }
 
     return [...priority.rows, ...rr];
+  }
+
+  async getSentFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+        -- Provider profiles reserve priority 5 for the Sent role, including
+        -- SPECIAL-USE and provider-name fallbacks established at discovery.
+        AND sync_priority = 5
+        AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
+      ORDER BY path
+      LIMIT $2
+      `,
+      [accountId, this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE]
+    );
+    return result.rows;
   }
 
   async markFolderSyncStarted(folderId: string): Promise<void> {
@@ -1210,7 +1272,9 @@ export class MirrorRepository {
         last_synced_at = now(),
         last_full_reconcile_at = CASE WHEN $6::boolean IS NOT NULL THEN now() ELSE last_full_reconcile_at END,
         last_reconcile_clean = COALESCE($6, last_reconcile_clean),
-        next_sync_due_at = now() + interval '1 minute',
+        next_sync_due_at = now() + ((
+          CASE WHEN sync_priority = 5 THEN $12::bigint ELSE $13::bigint END
+        ) * interval '1 millisecond'),
         next_flag_scan_at = CASE
           WHEN $7::boolean = true THEN now() + ((
             CASE WHEN sync_priority <= $11::int THEN $8::bigint ELSE $9::bigint END
@@ -1240,7 +1304,9 @@ export class MirrorRepository {
         this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS,
         this.config.RR_FLAG_SCAN_INTERVAL_MS,
         this.config.RECONCILE_INTERVAL_MS,
-        this.config.PRIORITY_CUTOFF
+        this.config.PRIORITY_CUTOFF,
+        this.config.SENT_SYNC_INTERVAL_MS,
+        this.config.SYNC_INTERVAL_MS
       ]
     );
   }

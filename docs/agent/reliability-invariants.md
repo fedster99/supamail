@@ -42,11 +42,13 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 
 - Current default sync edges:
   - Live sync window is `WINDOW_DAYS=90` days.
-  - New mail is polling-based and usually detected in about 1-2 minutes.
+  - Inbox/new mail is polling-based and usually detected in about 1-2 minutes.
+  - Sent metadata has a separate 30-second default cadence. Its lightweight pass skips discovery, flag scan, reconcile, bodies, history, and full-account health/backoff transitions.
   - Folder discovery runs every 15 minutes.
   - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder.
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
+  - Sent reserves a slot in the bounded priority selection, then normal priority order is restored for full-sweep execution.
   - Body fetch is capped at up to 100 live bodies per worker tick.
   - Raw MIME fetch is capped at 25 MB per message.
   - Account lock budget is 10 minutes.

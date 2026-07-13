@@ -336,6 +336,67 @@ liveDb("live DB reliability lane", () => {
     expect(second.map((folder) => folder.path)).toEqual(["Priority", "RR-C", "RR-A"]);
   });
 
+  it("reserves the first priority slot for Sent so a busy priority set cannot starve it", async () => {
+    const h = await setupIntegration("live-sent-priority-slot", {
+      PRIORITY_CUTOFF: 10,
+      MAX_PRIORITY_FOLDERS_PER_CYCLE: 1
+    });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+
+    await h.repository.upsertDiscoveredFolders(account, [
+      { path: "INBOX", delimiter: "/", specialUse: "\\Inbox" },
+      { path: "Sent", delimiter: "/", specialUse: "\\Sent" }
+    ]);
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET next_sync_due_at = now() - interval '1 second'
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+
+    const due = await h.repository.getFoldersDueForSync(h.account.id);
+
+    expect(due.map((folder) => folder.path)).toEqual(["Sent"]);
+  });
+
+  it("makes Sent due sooner than the regular mailbox sweep", async () => {
+    const h = await setupIntegration("live-sent-cadence", {
+      SYNC_INTERVAL_MS: 60_000,
+      SENT_SYNC_INTERVAL_MS: 30_000
+    });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+
+    const folders = await h.repository.upsertDiscoveredFolders(account, [
+      { path: "INBOX", delimiter: "/", specialUse: "\\Inbox" },
+      { path: "Sent", delimiter: "/", specialUse: "\\Sent" }
+    ]);
+    const inbox = folders.find((folder) => folder.path === "INBOX");
+    const sent = folders.find((folder) => folder.path === "Sent");
+    if (!inbox || !sent) throw new Error("missing discovered folders");
+
+    await h.repository.markFolderSynced(inbox.id, { uidValidity: 1 });
+    await h.repository.markFolderSynced(sent.id, { uidValidity: 1 });
+
+    const delays = await h.pool.query<{ path: string; delay_ms: number }>(
+      `SELECT path,
+              round(extract(epoch from (next_sync_due_at - now())) * 1000)::int AS delay_ms
+       FROM public.imap_folders
+       WHERE account_id = $1
+       ORDER BY path`,
+      [h.account.id]
+    );
+    const byPath = Object.fromEntries(delays.rows.map((row) => [row.path, row.delay_ms]));
+
+    expect(byPath.Sent).toBeGreaterThan(25_000);
+    expect(byPath.Sent).toBeLessThanOrEqual(30_000);
+    expect(byPath.INBOX).toBeGreaterThan(55_000);
+    expect(byPath.INBOX).toBeLessThanOrEqual(60_000);
+  });
+
   it("drops folders discovery flagged missing from the sync + history working set", async () => {
     // Regression: a folder the user created then deleted is stamped missing_since
     // by discovery, but the sync lane kept SELECTing it. The provider returns a
