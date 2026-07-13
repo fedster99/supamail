@@ -80,6 +80,27 @@ describe("connectImap (the one shared connect prelude)", () => {
     expect(fake.close).not.toHaveBeenCalled();
   });
 
+  it("closes a pending connection when its scheduler signal aborts", async () => {
+    fake.connectImpl.mockImplementation(async () => await new Promise(() => undefined));
+    const abort = new AbortController();
+    const connecting = connectImap({} as never, config, account, { signal: abort.signal });
+
+    await vi.waitFor(() => expect(fake.connectImpl).toHaveBeenCalledTimes(1));
+    abort.abort();
+
+    await expect(connecting).rejects.toThrow(/interrupted/);
+    expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("never starts a connection when its scheduler signal is already aborted", async () => {
+    const abort = new AbortController();
+    abort.abort();
+
+    await expect(connectImap({} as never, config, account, { signal: abort.signal })).rejects.toThrow(/interrupted/);
+    expect(fake.connectImpl).not.toHaveBeenCalled();
+    expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
   it("runs the SSRF guard and decrypts the password before constructing the client", async () => {
     await connectImap({} as never, config, account);
     expect(assertSafe).toHaveBeenCalledWith("imap.example.test", 993, true, { allowPrivateHosts: false });

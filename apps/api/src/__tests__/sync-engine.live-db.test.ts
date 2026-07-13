@@ -113,6 +113,35 @@ liveDb("live DB reliability lane", () => {
     expect(firstResult.outcome).toBe("success");
   });
 
+  it("lets a Sent pass yield neutrally whenever the account lock is busy", async () => {
+    const h = await setupIntegration("live-sent-lock-yield", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    const locker = await h.pool.connect();
+    await locker.query("SELECT pg_advisory_lock($1::bigint)", [account.lock_id]);
+    const abort = new AbortController();
+
+    try {
+      const engine = h.buildEngine({ folders: oneFolder("Sent") });
+      const result = await engine.syncAccount(h.account.id, "scheduled", {
+        sentOnly: true,
+        signal: abort.signal
+      });
+
+      expect(result.outcome).toBe("success");
+      expect(result.errors).toEqual([]);
+      const run = await h.pool.query<{ status: string; error: string | null }>(
+        "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
+        [result.runId]
+      );
+      expect(run.rows[0]).toEqual({ status: "success", error: null });
+    } finally {
+      await locker.query("SELECT pg_advisory_unlock_all()");
+      locker.release();
+    }
+  });
+
   it("reclaims stale advisory locks from pg_locks, closes the orphaned run, and then syncs", async () => {
     const h = await setupIntegration("live-orphan-lock", {
       INITIAL_SYNC_BATCH_SIZE: 50,
