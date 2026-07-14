@@ -2153,7 +2153,7 @@ export class MirrorRepository {
           SELECT id,
                  uid,
                  flags,
-                 pg_column_size(flags)::bigint AS flag_bytes,
+                 octet_length(to_json(flags)::text)::bigint AS flag_bytes,
                  cardinality(flags)::bigint AS flag_count
           FROM public.imap_messages
           WHERE account_id = $1
@@ -2257,7 +2257,7 @@ export class MirrorRepository {
         client,
         `
         WITH locked AS MATERIALIZED (
-          SELECT pg_column_size(flags)::bigint AS flag_bytes,
+          SELECT octet_length(to_json(flags)::text)::bigint AS flag_bytes,
                  cardinality(flags)::bigint AS flag_count
           FROM public.imap_messages
           WHERE account_id = $1

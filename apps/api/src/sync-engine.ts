@@ -543,28 +543,38 @@ export class MirrorEngine {
         const message = describeSyncError(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
-        if (options.sentOnly) {
-          await this.repository.markAccountSyncYielded(account.id, {
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
-          });
-        } else if (error instanceof AccountAlreadyFinalizedError) {
-          // Account state was already persisted (e.g. UIDVALIDITY reset limit
-          // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
-          // the DEGRADED/BROKEN-via-threshold CASE expression.
-        } else if (isAuthError(error)) {
-          await this.repository.markAccountSyncAuthFailed(account.id, message, {
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
-          });
-        } else {
-          await this.repository.markAccountSyncFailed(account.id, message, {
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
-          });
+        try {
+          if (options.sentOnly) {
+            await this.repository.markAccountSyncYielded(account.id, {
+              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
+              signal: options.signal,
+              expectedSyncOwner: syncOwner
+            });
+          } else if (error instanceof AccountAlreadyFinalizedError) {
+            // Account state was already persisted (e.g. UIDVALIDITY reset limit
+            // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
+            // the DEGRADED/BROKEN-via-threshold CASE expression.
+          } else if (isAuthError(error)) {
+            await this.repository.markAccountSyncAuthFailed(account.id, message, {
+              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
+              signal: options.signal,
+              expectedSyncOwner: syncOwner
+            });
+          } else {
+            await this.repository.markAccountSyncFailed(account.id, message, {
+              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
+              signal: options.signal,
+              expectedSyncOwner: syncOwner
+            });
+          }
+        } catch (finalizationError) {
+          if (!options.signal?.aborted) throw finalizationError;
+          // An abort can arrive after the provider error was classified but
+          // while its account-state write is waiting on Postgres. Defer the
+          // owner-fenced projection cleanup until after the advisory lock is
+          // released, then still finish the durable sync run below.
+          cancellationCleanupRequired = accountSyncStarted;
+          return;
         }
       } finally {
         options.signal?.removeEventListener("abort", interruptActiveClient);

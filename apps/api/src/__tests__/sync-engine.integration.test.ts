@@ -344,6 +344,44 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
   });
 
+  it("finishes a failed run when shutdown interrupts failure finalization", async () => {
+    const h = await setupIntegration("failure-finalization-abort");
+    activeAccountIds.push(h.account.id);
+    const abort = new AbortController();
+    const originalMarkFailed = h.repository.markAccountSyncFailed.bind(h.repository);
+    vi.spyOn(h.repository, "markAccountSyncFailed").mockImplementation(async (...args) => {
+      abort.abort();
+      return await originalMarkFailed(...args);
+    });
+    const engine = h.buildEngine({
+      folders: [],
+      clientFactory: async () => {
+        throw new Error("provider failed before shutdown");
+      }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", { signal: abort.signal });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.errors).toEqual(["[Error] provider failed before shutdown"]);
+    const state = await h.pool.query<{
+      currently_syncing: boolean;
+      sync_started_by: string | null;
+    }>(
+      "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]).toEqual({ currently_syncing: false, sync_started_by: null });
+    const run = await h.pool.query<{ status: string; error: string | null }>(
+      "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0]).toEqual({
+      status: "failed",
+      error: "[Error] provider failed before shutdown"
+    });
+  });
+
   it.each(["body", "history"] as const)(
     "recognizes shutdown after the %s lane without changing account health",
     async (lane) => {

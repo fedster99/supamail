@@ -7,6 +7,7 @@ import { MirrorRepository } from "../repository.js";
 import type { FetchMessage, MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { ImapFolder, MessageMetadata } from "../types.js";
+import { MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES } from "../sync-limits.js";
 import {
   backdateMissingSince,
   buildInboxAndSentFolders,
@@ -800,6 +801,49 @@ liveDb("live DB reliability lane", () => {
     );
     expect(event.rows[0]?.count).toBe("1");
     expect(event.rows[0]?.payload.nextFlags).toContain("\\flagged");
+  });
+
+  it("rejects compressed stored flags by their uncompressed payload size", async () => {
+    const h = await setupIntegration("live-compressed-stored-flags", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = oneFolder("INBOX", 1);
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+
+    await h.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET flags = array_fill(repeat('x', $2::int), ARRAY[$3::int])
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1
+      `,
+      [h.account.id, 2_200, 4_000]
+    );
+    const compressed = await h.pool.query<{ stored_bytes: number; payload_bytes: number }>(
+      `
+      SELECT pg_column_size(flags) AS stored_bytes,
+             octet_length(to_json(flags)::text) AS payload_bytes
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1
+      `,
+      [h.account.id]
+    );
+    expect(compressed.rows[0].stored_bytes).toBeLessThan(MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES);
+    expect(compressed.rows[0].payload_bytes).toBeGreaterThan(MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES);
+
+    await expect(h.repository.applyFlagScan(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [{ uid: 1, flags: [] }]
+    )).rejects.toThrow(/stored flags exceed the aggregate logical event limit/i);
   });
 
   it("rolls back an entire metadata batch when one attachment write fails", async () => {

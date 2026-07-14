@@ -472,6 +472,9 @@ describe("repository flag scan deadline", () => {
     )).rejects.toThrow(/stored flags exceed the aggregate logical event limit/i);
 
     expect(calls.some((sql) => sql.startsWith("SELECT *"))).toBe(false);
+    expect(calls.find((sql) => sql.includes("WITH locked AS MATERIALIZED"))).toContain(
+      "octet_length(to_json(flags)::text)"
+    );
     expect(calls.at(-1)).toBe("ROLLBACK");
   });
 
@@ -640,6 +643,12 @@ describe("repository flag scan deadline", () => {
     expect(logEvent).not.toHaveBeenCalled();
     expect((pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       "LEFT JOIN candidates"
+    );
+    expect((pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
+      "octet_length(to_json(flags)::text)"
+    );
+    expect((pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toContain(
+      "pg_column_size(flags)"
     );
   });
 
