@@ -7,6 +7,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 ## Current Branch
 
 - Active branch `fedster99/10x-email-sync-speed` removes the dominant sync round trips without changing infrastructure: metadata writes are one rollback-safe bulk transaction (50 new messages: about 250 database round trips before, exactly 9 now without attachments, including four deadline-refresh queries), while flag scans fetch only UID+FLAGS and write only changed representations in bounded batches under one overall deadline. Existing account/mailbox locks, identity semantics, counters, event logging, RLS-compatible SQL, hooks, and total-operation budgets remain intact or are stricter; metadata pool acquisition, locks, statements, and commit now share each active lane deadline. Sync-run metadata records acknowledged message-record upserts, cumulative persistence time, attempted/failed batches, and write-service rate; worker ticks separately report rows over monotonic wall time as actual throughput. Failed attempts add time and zero rows, and incomplete telemetry reports no aggregate rate.
+- Public-core PR #69 is open for this branch. Cloud telemetry/benchmark PR #76 is also open, keeps the current production core pin unchanged, and can land independently.
 - ADR 0023 adds a bounded Sent freshness lane: Inbox remains first in full-sweep priority selection, while Sent receives a supplemental configurable metadata-only poll (`SENT_SYNC_INTERVAL_MS`, default 30 seconds) between 60-second full sweeps. The fast lane filters accounts without due Sent work before lock/connection/run creation, skips discovery/flags/reconcile/body/history, and leaves full-sweep health, backoff, `last_priority_sync_succeeded_at`, and `last_sync_finished_at` untouched. Its hard deadline is the next full sweep: an in-flight Sent connection is closed, further Sent accounts are deferred, and the worker rechecks Inbox-first work immediately without recording a false outage.
 - Public migration `0013_body_head_trigram_index` adds a bounded 128 KiB body-text trigram expression index for exact substring consumers while ordinary language continues through body FTS. The migration is additive/idempotent and advances the public schema manifest to `0013_body_head_trigram_index`.
 
@@ -120,14 +121,14 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Open Risks
 
-- The 10x sync-query branch is verified locally but intentionally not deployed or pinned by Cloud yet. Publish an immutable reviewed public-core image first; Cloud must pause sync and apply public migration `0013_body_head_trigram_index` before deploying that image. Historical-backfill UID enumeration remains quadratic across batches and is intentionally deferred to a separate cursor-semantics change with sparse-UID, expunge, crash, and resume coverage.
+- The 10x sync-query branch is verified locally and open as PR #69, but intentionally not deployed or pinned by Cloud yet. Publish an immutable reviewed public-core image first; Cloud must pause sync and apply public migration `0013_body_head_trigram_index` before deploying that image. Historical-backfill UID enumeration remains quadratic across batches and is intentionally deferred to a separate cursor-semantics change with sparse-UID, expunge, crash, and resume coverage.
 - Private `supamail-cloud` now has Supabase Auth, live Stripe billing, Managed Hosting provisioning/mailbox connect, and the stage-one Fly runtime live/passing. BYO Supabase onboarding and the full paid hosted smoke remain future hosted tasks.
-- `supamail-cloud` currently pins this repo at `eff897ec898fb9065686d8738922860dff7a8370` for public migrations and runtime image. This repo's `main` is newer (`d3140c1`), but commits after `eff897e` are docs/test/tracker-only; Cloud does not need a runtime or migration re-pin for that delta.
+- `supamail-cloud` currently pins this repo at `db23ab12b04e5910b8671f6a42cde12dec3af49d` for public migrations and runtime image. PR #69 includes every public-core change since that production pin, not only metadata batching, so benchmark interpretation and rollout safety apply to the combined upgrade.
 - The public `apps/web` page is now a compact OSS/docs page. Keep richer hosted signup and SaaS copy in `supamail-cloud`.
 
 ## Next Best Actions
 
-- Review and publish `fedster99/10x-email-sync-speed` as a public-core PR/image, apply migration `0013` with hosted sync paused, then re-pin Cloud to the immutable image digest and canary one tenant before widening rollout.
+- Review and land public-core PR #69, publish its immutable image, apply migration `0013` with hosted sync paused, then re-pin Cloud to the image digest in a separate PR and canary one tenant before widening rollout.
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
