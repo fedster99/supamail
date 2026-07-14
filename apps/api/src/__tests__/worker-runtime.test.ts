@@ -136,6 +136,11 @@ describe("worker runtime logging", () => {
         outcome: "success",
         foldersProcessed: 2,
         messagesUpserted: 3,
+        metadataRowsCommitted: 3,
+        metadataWriteDurationMs: 150,
+        metadataWriteBatchesAttempted: 1,
+        metadataWriteBatchesFailed: 0,
+        metadataWriteServiceRowsPerSecond: 999,
         bodiesFetched: 1,
         errors: []
       },
@@ -144,6 +149,11 @@ describe("worker runtime logging", () => {
         outcome: "partial_success",
         foldersProcessed: 1,
         messagesUpserted: 0,
+        metadataRowsCommitted: 0,
+        metadataWriteDurationMs: 0,
+        metadataWriteBatchesAttempted: 0,
+        metadataWriteBatchesFailed: 0,
+        metadataWriteServiceRowsPerSecond: null,
         bodiesFetched: 0,
         errors: ["[ProviderFailure] Archive: provider exploded"]
       },
@@ -152,6 +162,11 @@ describe("worker runtime logging", () => {
         outcome: "failed",
         foldersProcessed: 0,
         messagesUpserted: 0,
+        metadataRowsCommitted: 0,
+        metadataWriteDurationMs: 250,
+        metadataWriteBatchesAttempted: 1,
+        metadataWriteBatchesFailed: 1,
+        metadataWriteServiceRowsPerSecond: 0,
         bodiesFetched: 0,
         errors: [
           "[Error] [AUTHENTICATIONFAILED] [AUTH] Command failed",
@@ -169,6 +184,12 @@ describe("worker runtime logging", () => {
       outcome: "failed",
       foldersProcessed: 0,
       messagesUpserted: 0,
+      metadataRowsCommitted: 0,
+      metadataWriteDurationMs: 250,
+      metadataWriteBatchesAttempted: 1,
+      metadataWriteBatchesFailed: 1,
+      metadataTelemetryComplete: true,
+      metadataWriteServiceRowsPerSecond: 0,
       bodiesFetched: 0,
       errors: [
         "[Error] [AUTHENTICATIONFAILED] [AUTH] Command failed",
@@ -186,7 +207,82 @@ describe("worker runtime logging", () => {
     expect(JSON.parse(sink.log.mock.calls[0][0])).toMatchObject({
       event: "sync.tick.completed",
       accounts: 3,
-      durationMs: 42
+      durationMs: 42,
+      metadataRowsCommitted: 3,
+      metadataWriteDurationMs: 400,
+      metadataWriteBatchesAttempted: 2,
+      metadataWriteBatchesFailed: 1,
+      metadataTelemetryComplete: true,
+      metadataWriteServiceRowsPerSecond: 7.5,
+      metadataThroughputRowsPerSecond: 71.43
+    });
+    const tick = JSON.parse(sink.log.mock.calls[0][0]);
+    expect(tick.outcomes[1]).toMatchObject({
+      metadataRowsCommitted: 0,
+      metadataWriteDurationMs: 0,
+      metadataWriteBatchesAttempted: 0,
+      metadataWriteBatchesFailed: 0,
+      metadataTelemetryComplete: true,
+      metadataWriteServiceRowsPerSecond: null
+    });
+  });
+
+  it("marks legacy or impossible telemetry incomplete instead of publishing a partial rate", () => {
+    const sink = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+    logSyncTick([{
+      runId: "legacy-run",
+      outcome: "success",
+      foldersProcessed: 1,
+      messagesUpserted: 2,
+      bodiesFetched: 0,
+      errors: []
+    }], 100, sink);
+
+    expect(JSON.parse(sink.log.mock.calls[0][0])).toMatchObject({
+      metadataTelemetryComplete: false,
+      metadataWriteServiceRowsPerSecond: null,
+      metadataThroughputRowsPerSecond: null
+    });
+
+    sink.log.mockClear();
+    logSyncTick([{
+      runId: "impossible-run",
+      outcome: "success",
+      foldersProcessed: 1,
+      messagesUpserted: 3,
+      metadataRowsCommitted: 3,
+      metadataWriteDurationMs: 0,
+      metadataWriteBatchesAttempted: 1,
+      metadataWriteBatchesFailed: 0,
+      bodiesFetched: 0,
+      errors: []
+    }], 100, sink);
+
+    expect(JSON.parse(sink.log.mock.calls[0][0])).toMatchObject({
+      metadataTelemetryComplete: false,
+      metadataWriteServiceRowsPerSecond: null,
+      metadataThroughputRowsPerSecond: null
+    });
+
+    sink.log.mockClear();
+    logSyncTick([{
+      runId: "missing-successful-rows",
+      outcome: "failed",
+      foldersProcessed: 1,
+      messagesUpserted: 0,
+      metadataRowsCommitted: 0,
+      metadataWriteDurationMs: 20,
+      metadataWriteBatchesAttempted: 2,
+      metadataWriteBatchesFailed: 1,
+      bodiesFetched: 0,
+      errors: ["one batch failed"]
+    }], 100, sink);
+
+    expect(JSON.parse(sink.log.mock.calls[0][0])).toMatchObject({
+      metadataTelemetryComplete: false,
+      metadataWriteServiceRowsPerSecond: null,
+      metadataThroughputRowsPerSecond: null
     });
   });
 });
