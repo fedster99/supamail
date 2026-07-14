@@ -1,9 +1,51 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
-import { isConnectionLostError, isMissingMailboxError } from "../sync-engine.js";
+import { describe, expect, it, vi } from "vitest";
+import { isConnectionLostError, isMissingMailboxError, MirrorEngine } from "../sync-engine.js";
 
 describe("sync engine safety", () => {
+  it("passes the worker shutdown signal into an in-flight full sync", async () => {
+    const abort = new AbortController();
+    const repository = {
+      getRunnableAccounts: vi.fn(async () => [{ id: "account-1" }])
+    };
+    const engine = new MirrorEngine({
+      pool: {} as never,
+      config: {} as never,
+      repository: repository as never
+    });
+    let releaseSync!: () => void;
+    const syncAccount = vi.spyOn(engine, "syncAccount").mockImplementation(
+      async (_accountId, _triggerType, options) => {
+        await new Promise<void>((resolve) => {
+          releaseSync = resolve;
+          options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {} as never;
+      }
+    );
+
+    const sync = engine.syncDueAccounts(1, { signal: abort.signal });
+    await vi.waitFor(() => expect(syncAccount).toHaveBeenCalledOnce());
+    abort.abort();
+
+    const stoppedPromptly = await Promise.race([
+      sync.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 1_000))
+    ]);
+    if (!stoppedPromptly) {
+      // Let the deliberately blocked test double finish so a failing regression
+      // test does not leave an unresolved sync behind.
+      releaseSync();
+      await sync;
+    }
+
+    expect(stoppedPromptly).toBe(true);
+    expect(syncAccount).toHaveBeenCalledWith("account-1", "scheduled", {
+      signal: abort.signal
+    });
+  });
+
   it("does not treat partial folder failures as healthy account syncs", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
