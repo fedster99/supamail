@@ -12,7 +12,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 - PR #63 follows PR #62 by preserving sanitized error class, ordinary error code, and IMAP response status in persisted sync reasons. The worker emits `sync.account.failed` through `console.error` and `sync.account.partial_success` through `console.warn`, while retaining the aggregate `sync.tick.completed` info event.
 - PR #64 makes API shutdown idempotent so a normal combined-mode rolling deploy does not emit a false `api.close.failed` / `ERR_SERVER_NOT_RUNNING`; genuine close errors remain structured error-level events.
-- Integration branch is `main`. As of 2026-06-07 it is at `d3140c1` with no active feature branch; everything below is merged, CI-green, and republished the GHCR core image on each merge.
+- Historical checkpoint: as of 2026-06-07, `main` was at `d3140c1`; everything listed below that checkpoint was merged, CI-green, and republished the GHCR core image on each merge.
 - Recently merged: `#9` configurable `DATABASE_POOL_MAX`; `#10` reap orphaned `imap_sync_runs` on stale-lock recovery; `#12` nested mailbox-lock deadlock fix in history-backfill body fetch; `#13` live-DB proof of run reaping + `DATABASE_POOL_MAX` docs; `#15` reaper `started_at` race guard + reported reap counts; `#11` ADR 0014 (agent email access as a core read surface); `#17` UID-less FETCH guard; `#18` mirror Drafts folders; `#19` Drafts docs follow-up; `#20` historical-backfill acceptance coverage; `#21` issue #2 tracker update.
 - Merged PR `#28` (2026-06-10, `73bc3e8`): adds `BODY_STORAGE_MODE=raw_mime|parsed_only` (default `raw_mime`, unchanged behavior) and public migration `0007_optional_raw_mime` making `imap_message_bodies.raw_mime` nullable. `parsed_only` fetches/parses bodies normally but stores NULL `raw_mime` (raw blobs dominate database size). Maintainer-directed from the hosted product's DB-size investigation; the engine stays single-tenant.
 - Stale PR `#1` (`codex/oss-worker-core`) was closed as superseded by `#5`.
@@ -122,12 +122,12 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 - The 10x sync-query branch is verified locally but intentionally not deployed or pinned by Cloud yet. Publish an immutable reviewed public-core image first; Cloud must pause sync and apply public migration `0013_body_head_trigram_index` before deploying that image. Historical-backfill UID enumeration remains quadratic across batches and is intentionally deferred to a separate cursor-semantics change with sparse-UID, expunge, crash, and resume coverage.
 - Private `supamail-cloud` now has Supabase Auth, live Stripe billing, Managed Hosting provisioning/mailbox connect, and the stage-one Fly runtime live/passing. BYO Supabase onboarding and the full paid hosted smoke remain future hosted tasks.
-- `supamail-cloud` currently pins this repo at `eff897ec898fb9065686d8738922860dff7a8370` for public migrations and runtime image. This repo's `main` is newer (`d3140c1`), but commits after `eff897e` are docs/test/tracker-only; Cloud does not need a runtime or migration re-pin for that delta.
+- `supamail-cloud` currently pins this repo at `eff897ec898fb9065686d8738922860dff7a8370` for public migrations and runtime image. This branch includes every public-core change since that production pin, not only the metadata-batching work, so benchmark results and rollout safety apply to the combined upgrade.
 - The public `apps/web` page is now a compact OSS/docs page. Keep richer hosted signup and SaaS copy in `supamail-cloud`.
 
 ## Next Best Actions
 
-- Review and publish `fedster99/10x-email-sync-speed` as a public-core PR/image, apply migration `0013` with hosted sync paused, then re-pin Cloud to the immutable image digest and canary one tenant before widening rollout.
+- Land `fedster99/10x-email-sync-speed` through a reviewed public-core PR, publish its immutable image, apply migration `0013` with hosted sync paused, then re-pin Cloud to the image digest and canary one tenant before widening rollout.
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
