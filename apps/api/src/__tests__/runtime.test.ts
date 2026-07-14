@@ -40,6 +40,18 @@ describe("runtime entrypoint", () => {
     expect(combinedServe).toBeGreaterThan(combinedSelfTest);
   });
 
+  it("routes combined-mode fatal errors and startup-time signals through API shutdown", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { resolve } = await import("node:path");
+    const source = await readFile(resolve(process.cwd(), "src/runtime.ts"), "utf8");
+
+    expect(source).toContain(
+      "installProcessHandlers: true, onStop: closeApi"
+    );
+    expect(source).not.toContain('process.on("SIGTERM", shutdown)');
+    expect(source).not.toContain('process.on("SIGINT", shutdown)');
+  });
+
   it("closes the API server once and keeps normal already-closed shutdowns out of error logs", () => {
     const error = Object.assign(new Error("Server is not running."), {
       code: "ERR_SERVER_NOT_RUNNING"

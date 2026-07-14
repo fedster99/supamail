@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 
@@ -9,14 +10,19 @@ const defaultThreading = vi.hoisted(() => ({
   pruneTerminalRuns: vi.fn(async () => ({ runsDeleted: 0, assignmentsDeleted: 0 }))
 }));
 
-vi.mock("../locks.js", () => ({
+const lockRuntime = vi.hoisted(() => ({
   clearOrphanedLocks: vi.fn(async () => ({
     terminatedBackends: 0,
     accountsReset: 0,
     runsClosed: 0
   })),
-  runLockSelfTestWithRetry: vi.fn(async () => undefined)
+  runLockSelfTestWithRetry: vi.fn(async (
+    _pool: unknown,
+    _options?: { signal?: AbortSignal }
+  ) => undefined)
 }));
+
+vi.mock("../locks.js", () => lockRuntime);
 
 vi.mock("../threading-repository.js", () => ({
   ThreadingRepository: class {
@@ -33,10 +39,72 @@ vi.mock("../threading-repository.js", () => ({
 
 const {
   logSyncTick,
+  handleFatalProcessEvent,
   selectSyncLane,
   startWorkerRuntime,
   workerPollIntervalMs
 } = await import("../worker-runtime.js");
+
+describe("worker fatal-process handling", () => {
+  it("preserves a failing exit status and invokes the owning runtime shutdown", () => {
+    const shutdown = vi.fn();
+    const sink = { error: vi.fn() };
+    const processState: { exitCode?: number } = {};
+
+    handleFatalProcessEvent(
+      "uncaughtException",
+      new Error("boom"),
+      shutdown,
+      sink,
+      processState
+    );
+
+    expect(processState.exitCode).toBe(1);
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sink.error.mock.calls[0][0])).toMatchObject({
+      event: "process.uncaughtException",
+      error: { message: "boom" }
+    });
+  });
+
+  it("aborts startup and skips maintenance when the process is asked to stop", async () => {
+    const ownerStop = vi.fn();
+    const processEvents = new EventEmitter();
+    const pool = { query: vi.fn() };
+    const repository = { runRetentionJobs: vi.fn() };
+    lockRuntime.clearOrphanedLocks.mockClear();
+    lockRuntime.runLockSelfTestWithRetry.mockImplementationOnce(async (_pool, options) => {
+      const signal = options?.signal;
+      await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+    });
+
+    const starting = startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: pool as never,
+      engine: { syncDueAccounts: vi.fn(), syncDueSentFolders: vi.fn() },
+      threading: null,
+      repository: repository as never,
+      installProcessHandlers: true,
+      processEvents: processEvents as never,
+      onStop: ownerStop
+    });
+
+    await vi.waitFor(() => expect(lockRuntime.runLockSelfTestWithRetry).toHaveBeenCalled());
+    processEvents.emit("SIGTERM");
+    const runtime = await starting;
+    await runtime.done;
+
+    expect(ownerStop).toHaveBeenCalledTimes(1);
+    expect(lockRuntime.clearOrphanedLocks).not.toHaveBeenCalled();
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(repository.runRetentionJobs).not.toHaveBeenCalled();
+  });
+});
 
 afterEach(() => {
   vi.useRealTimers();

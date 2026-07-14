@@ -80,6 +80,14 @@ export interface WorkerLogSink {
   error(message: string): void;
 }
 
+type WorkerProcessEvent = "uncaughtException" | "unhandledRejection" | "SIGTERM" | "SIGINT";
+type WorkerProcessListener = (value?: unknown) => void;
+
+interface WorkerProcessEvents {
+  on(event: WorkerProcessEvent, listener: WorkerProcessListener): unknown;
+  removeListener(event: WorkerProcessEvent, listener: WorkerProcessListener): unknown;
+}
+
 export interface WorkerRuntimeOptions {
   config?: AppConfig;
   pool?: PgPool;
@@ -88,12 +96,36 @@ export interface WorkerRuntimeOptions {
   threading?: WorkerThreading | null;
   repository?: MirrorRepository;
   installProcessHandlers?: boolean;
+  /** Injectable only for embedded runtimes/tests; defaults to the Node process emitter. */
+  processEvents?: WorkerProcessEvents;
+  /** Additional owning-runtime teardown for signals/fatal events (for example, close the combined API). */
+  onStop?: () => void;
   closePoolOnStop?: boolean;
 }
 
 export interface WorkerRuntime {
   stop(): void;
   done: Promise<void>;
+}
+
+export function handleFatalProcessEvent(
+  event: "uncaughtException" | "unhandledRejection",
+  value: unknown,
+  shutdown: () => void,
+  sink: Pick<WorkerLogSink, "error"> = console,
+  processState: { exitCode?: string | number | null } = process
+): void {
+  processState.exitCode = 1;
+  const detail = value instanceof Error
+    ? { message: value.message, stack: value.stack }
+    : String(value);
+  try {
+    sink.error(JSON.stringify(event === "uncaughtException"
+      ? { event: "process.uncaughtException", error: detail }
+      : { event: "process.unhandledRejection", reason: detail }));
+  } finally {
+    shutdown();
+  }
 }
 
 function isNonNegativeCount(value: unknown): value is number {
@@ -219,6 +251,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   let wakeSleep: (() => void) | null = null;
   let retentionTimer: ReturnType<typeof setInterval> | null = null;
   let lastFullSyncStartedAtMs: number | null = null;
+  let removeProcessHandlers = () => undefined;
 
   const stop = () => {
     if (stopping) return;
@@ -227,31 +260,38 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     abort.abort();
     wakeSleep?.();
   };
+  const stopOwningRuntime = () => {
+    stop();
+    options.onStop?.();
+  };
 
   if (options.installProcessHandlers) {
-    process.on("uncaughtException", (error) => {
-      console.error(JSON.stringify({
-        event: "process.uncaughtException",
-        error: error instanceof Error
-          ? { message: error.message, stack: error.stack }
-          : String(error)
-      }));
-      stop();
-    });
-
-    process.on("unhandledRejection", (reason) => {
-      console.error(JSON.stringify({
-        event: "process.unhandledRejection",
-        reason: reason instanceof Error
-          ? { message: reason.message, stack: reason.stack }
-          : String(reason)
-      }));
-      stop();
-    });
-
-    process.on("SIGTERM", stop);
-    process.on("SIGINT", stop);
+    const processEvents = (options.processEvents ?? process) as WorkerProcessEvents;
+    const onUncaughtException: WorkerProcessListener = (error) => {
+      handleFatalProcessEvent("uncaughtException", error, stopOwningRuntime);
+    };
+    const onUnhandledRejection: WorkerProcessListener = (reason) => {
+      handleFatalProcessEvent("unhandledRejection", reason, stopOwningRuntime);
+    };
+    processEvents.on("uncaughtException", onUncaughtException);
+    processEvents.on("unhandledRejection", onUnhandledRejection);
+    processEvents.on("SIGTERM", stopOwningRuntime);
+    processEvents.on("SIGINT", stopOwningRuntime);
+    removeProcessHandlers = () => {
+      processEvents.removeListener("uncaughtException", onUncaughtException);
+      processEvents.removeListener("unhandledRejection", onUnhandledRejection);
+      processEvents.removeListener("SIGTERM", stopOwningRuntime);
+      processEvents.removeListener("SIGINT", stopOwningRuntime);
+    };
   }
+
+  const finishStoppedRuntime = (): WorkerRuntime => {
+    removeProcessHandlers();
+    return {
+      stop,
+      done: options.closePoolOnStop ? closePool() : Promise.resolve()
+    };
+  };
 
   async function tick(lane: "full" | "sent", startedAt: number): Promise<void> {
     const tickStartedAt = performance.now();
@@ -360,24 +400,33 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
 
   // Retry transient session-pooler saturation (deploy-time instance overlap) instead
   // of crash-looping startup; a real transaction-pooling misconfig stays fatal.
-  await runLockSelfTestWithRetry(pool, {
-    onRetry: ({ attempt, maxAttempts, delayMs, error }) =>
-      console.log(JSON.stringify({
-        event: "worker.lock_self_test.retry",
-        attempt,
-        maxAttempts,
-        delayMs,
-        error: error instanceof Error ? error.message : String(error)
-      }))
-  });
+  try {
+    await runLockSelfTestWithRetry(pool, {
+      signal: abort.signal,
+      onRetry: ({ attempt, maxAttempts, delayMs, error }) =>
+        console.log(JSON.stringify({
+          event: "worker.lock_self_test.retry",
+          attempt,
+          maxAttempts,
+          delayMs,
+          error: error instanceof Error ? error.message : String(error)
+        }))
+    });
+  } catch (error) {
+    if (stopping) return finishStoppedRuntime();
+    throw error;
+  }
+  if (stopping) return finishStoppedRuntime();
   console.log(JSON.stringify({ event: "worker.lock_self_test.passed" }));
 
   await threading?.assertRolloutCompatibility?.();
+  if (stopping) return finishStoppedRuntime();
   if (threading?.assertRolloutCompatibility) {
     console.log(JSON.stringify({ event: "threading.rollout_compatibility.passed" }));
   }
 
   const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
+  if (stopping) return finishStoppedRuntime();
   if (sweep.terminatedBackends > 0 || sweep.accountsReset > 0 || sweep.runsClosed > 0) {
     console.warn(JSON.stringify({
       event: "worker.orphaned_locks_cleared",
@@ -390,6 +439,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   const accountCount = await pool.query<{ count: string }>(
     "SELECT count(*)::text AS count FROM public.imap_accounts"
   );
+  if (stopping) return finishStoppedRuntime();
   const count = Number(accountCount.rows[0]?.count ?? 0);
   if (count > config.SYNC_MAX_ACCOUNTS) {
     throw new Error(`Account count ${count} exceeds SYNC_MAX_ACCOUNTS ${config.SYNC_MAX_ACCOUNTS}`);
@@ -420,6 +470,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   };
 
   await runRetention();
+  if (stopping) return finishStoppedRuntime();
   // Re-run retention daily: it was boot-only, so on a long-lived process expiry/purge
   // and the (previously unbounded) sync-event prune silently stopped after startup.
   retentionTimer = setInterval(() => {
@@ -434,6 +485,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   retentionTimer.unref?.();
 
   const done = loop().finally(async () => {
+    removeProcessHandlers();
     if (options.closePoolOnStop) {
       await closePool();
     }
