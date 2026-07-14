@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0014_conversation_threading",
+  "schemaVersion": "0015_threading_production_hardening",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -56,6 +56,10 @@
     {
       "id": "0014_conversation_threading",
       "file": "0014_conversation_threading.sql"
+    },
+    {
+      "id": "0015_threading_production_hardening",
+      "file": "0015_threading_production_hardening.sql"
     }
   ]
 }

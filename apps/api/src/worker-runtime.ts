@@ -8,6 +8,9 @@ import { MirrorEngine } from "./sync-engine.js";
 import { ThreadingRepository, type ThreadingRunResult } from "./threading-repository.js";
 import { metadataRowsPerSecond } from "./sync-engine.js";
 
+const THREADING_STEPS_PER_ACCOUNT_TICK = 10;
+const THREADING_LANE_BUDGET_MS = 20_000;
+
 export interface WorkerSyncResult {
   runId: string;
   outcome: string;
@@ -330,19 +333,33 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     let processed = 0;
     let changed = 0;
     let busy = 0;
-    for (const accountId of accountIds) {
-      if (stopping) break;
-      try {
-        const result = await threading.drainAccount(accountId, { requestedBy: "worker" });
-        processed += result.messagesConsidered;
-        changed += result.assignmentsChanged;
-        if (result.busy) busy += 1;
-      } catch (error) {
-        console.error(JSON.stringify({
-          event: "threading.account.failed",
-          accountId,
-          error: error instanceof Error ? error.message : String(error)
-        }));
+    const laneDeadline = performance.now() + THREADING_LANE_BUDGET_MS;
+    const unfinished = new Set(accountIds);
+    for (
+      let round = 0;
+      round < THREADING_STEPS_PER_ACCOUNT_TICK && unfinished.size > 0 && !stopping;
+      round += 1
+    ) {
+      for (const accountId of accountIds) {
+        if (stopping || performance.now() >= laneDeadline) break;
+        if (!unfinished.has(accountId)) continue;
+        try {
+          const result = await threading.drainAccount(accountId, { requestedBy: "worker" });
+          processed += result.messagesConsidered;
+          changed += result.assignmentsChanged;
+          if (result.busy) {
+            busy += 1;
+            unfinished.delete(accountId);
+          }
+          if (result.ready) unfinished.delete(accountId);
+        } catch (error) {
+          unfinished.delete(accountId);
+          console.error(JSON.stringify({
+            event: "threading.account.failed",
+            accountId,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
       }
     }
     console.log(JSON.stringify({

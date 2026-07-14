@@ -44,6 +44,7 @@ interface ThreadRun {
   cursor_folder_path: string | null;
   cursor_uidvalidity: string | null;
   cursor_uid: string | null;
+  cursor_message_id: string | null;
   attempts: number;
   available_at: Date;
   caught_up_revision: string;
@@ -565,11 +566,14 @@ function comparisonThresholds(
   };
 }
 
-function cursorFrom(row: PhysicalPageRow): Pick<ThreadRun, "cursor_folder_path" | "cursor_uidvalidity" | "cursor_uid"> {
+function cursorFrom(
+  row: PhysicalPageRow
+): Pick<ThreadRun, "cursor_folder_path" | "cursor_uidvalidity" | "cursor_uid" | "cursor_message_id"> {
   return {
-    cursor_folder_path: row.folder_path,
-    cursor_uidvalidity: row.uidvalidity,
-    cursor_uid: row.uid
+    cursor_folder_path: null,
+    cursor_uidvalidity: null,
+    cursor_uid: null,
+    cursor_message_id: row.id
   };
 }
 
@@ -711,6 +715,7 @@ export class ThreadingRepository {
                     SELECT 1 FROM public.imap_thread_subject_work sw
                     WHERE sw.run_id = building.id AND sw.available_at <= now()
                   )
+                  OR building.summary->>'coverage_verified' IS DISTINCT FROM 'true'
                 )
               )
             )
@@ -1849,24 +1854,76 @@ export class ThreadingRepository {
   private async backfillBodyEvidenceBatch(client: PgClient, accountId: string, limit: number): Promise<number> {
     const changed = await client.query<{ count: string }>(
       `WITH candidates AS MATERIALIZED (
-         SELECT body.message_id
+         SELECT body.message_id,
+                CASE
+                  WHEN body.raw_mime_sha256 IS NULL
+                   AND body.raw_mime IS NOT NULL
+                   AND NOT body.raw_truncated
+                  THEN encode(extensions.digest(body.raw_mime, 'sha256'), 'hex')
+                  ELSE body.raw_mime_sha256
+                END AS raw_mime_sha256,
+                CASE
+                  WHEN body.parsed_delivery_sha256 IS NULL
+                   AND NOT body.raw_truncated
+                   AND body.raw_bytes > 0
+                   AND message.from_email IS NOT NULL
+                   AND body.headers_json ? 'message-id'
+                   AND body.headers_json ? 'from'
+                   AND cardinality(
+                     coalesce(message.to_emails, '{}'::text[]) ||
+                     coalesce(message.cc_emails, '{}'::text[]) ||
+                     coalesce(message.bcc_emails, '{}'::text[])
+                   ) > 0
+                   AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+                  THEN encode(extensions.digest(convert_to(jsonb_build_object(
+                    'subject', message.subject,
+                    'from_email', message.from_email,
+                    'to_emails', message.to_emails,
+                    'cc_emails', message.cc_emails,
+                    'bcc_emails', message.bcc_emails,
+                    'size_bytes', message.size_bytes,
+                    'raw_bytes', body.raw_bytes,
+                    'body_text', body.body_text,
+                    'body_html', body.body_html,
+                    'body_plain', body.body_plain,
+                    'selected_text_part', body.selected_text_part,
+                    'selected_text_format', body.selected_text_format,
+                    'headers_json', body.headers_json,
+                    'mime_structure', body.mime_structure,
+                    'parser_warnings', body.parser_warnings
+                  )::text, 'UTF8'), 'sha256'), 'hex')
+                  ELSE body.parsed_delivery_sha256
+                END AS parsed_delivery_sha256
          FROM public.imap_message_bodies body
          JOIN public.imap_messages message ON message.id = body.message_id
          WHERE message.account_id = $1
-           AND body.raw_mime_sha256 IS NULL
-           AND body.raw_mime IS NOT NULL
-           AND NOT body.raw_truncated
+           AND (
+             (body.raw_mime_sha256 IS NULL AND body.raw_mime IS NOT NULL AND NOT body.raw_truncated)
+             OR
+             (
+               body.parsed_delivery_sha256 IS NULL
+               AND NOT body.raw_truncated
+               AND body.raw_bytes > 0
+               AND message.from_email IS NOT NULL
+               AND body.headers_json ? 'message-id'
+               AND body.headers_json ? 'from'
+               AND cardinality(
+                 coalesce(message.to_emails, '{}'::text[]) ||
+                 coalesce(message.cc_emails, '{}'::text[]) ||
+                 coalesce(message.bcc_emails, '{}'::text[])
+               ) > 0
+               AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+             )
+           )
          ORDER BY body.message_id
          LIMIT $2
          FOR UPDATE OF body
        ), repaired AS (
          UPDATE public.imap_message_bodies body
-         SET raw_mime_sha256 = encode(extensions.digest(body.raw_mime, 'sha256'), 'hex')
+         SET raw_mime_sha256 = candidates.raw_mime_sha256,
+             parsed_delivery_sha256 = candidates.parsed_delivery_sha256
          FROM candidates
          WHERE body.message_id = candidates.message_id
-           AND body.raw_mime_sha256 IS NULL
-           AND body.raw_mime IS NOT NULL
-           AND NOT body.raw_truncated
          RETURNING body.message_id
        )
        SELECT count(*)::text AS count FROM repaired`,
@@ -1889,10 +1946,26 @@ export class ThreadingRepository {
            ON run.id = queue.run_id
           AND run.status = ANY($2::text[])
          JOIN public.imap_message_bodies body ON body.message_id = queue.message_id
+         JOIN public.imap_messages message ON message.id = body.message_id
          WHERE queue.account_id = $1
-           AND body.raw_mime_sha256 IS NULL
-           AND body.raw_mime IS NOT NULL
-           AND NOT body.raw_truncated
+           AND (
+             (body.raw_mime_sha256 IS NULL AND body.raw_mime IS NOT NULL AND NOT body.raw_truncated)
+             OR
+             (
+               body.parsed_delivery_sha256 IS NULL
+               AND NOT body.raw_truncated
+               AND body.raw_bytes > 0
+               AND message.from_email IS NOT NULL
+               AND body.headers_json ? 'message-id'
+               AND body.headers_json ? 'from'
+               AND cardinality(
+                 coalesce(message.to_emails, '{}'::text[]) ||
+                 coalesce(message.cc_emails, '{}'::text[]) ||
+                 coalesce(message.bcc_emails, '{}'::text[])
+               ) > 0
+               AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+             )
+           )
          LIMIT 1
        ) AS exists`,
       [accountId, [...LIVE_RUN_STATUSES]]
@@ -1947,6 +2020,22 @@ export class ThreadingRepository {
     requestedBy: string,
     attempted: (ids: string[]) => void
   ): Promise<ThreadingRunResult> {
+    const prunedSingletons = await this.pruneSingletonSubjectWork(client, run, batchSize);
+    if (prunedSingletons > 0) {
+      const operationType = run.status === "building" ? "build_batch" : "incremental";
+      const operation = await this.insertOperation(client, {
+        run,
+        type: operationType,
+        requestedBy,
+        reason: "singleton subject buckets cannot produce a fallback edge",
+        summary: { singleton_subject_buckets_pruned: prunedSingletons, assignments_changed: 0 }
+      });
+      return this.resultForRun(run.account_id, run, {
+        operationId: operation,
+        operationType,
+        queueItemsProcessed: prunedSingletons
+      });
+    }
     const work = await client.query<{ subject_key: string }>(
       `SELECT subject_key FROM public.imap_thread_subject_work
        WHERE run_id = $1 AND available_at <= now()
@@ -2085,6 +2174,9 @@ export class ThreadingRepository {
       return this.processSubjectWork(client, run, batchSize, closureLimits, maxBucket, requestedBy, attempted);
     }
     if (await this.runHasAnyWork(client, run.id)) return this.resultForRun(run.account_id, run);
+    if ((await this.enqueueMissingAssignments(client, run, batchSize)) > 0) {
+      return this.processDirtyQueue(client, run, batchSize, closureLimits, requestedBy, attempted);
+    }
     const ready = await this.markRunReady(client, run);
     return this.resultForRun(run.account_id, ready, { ready: true });
   }
@@ -2104,6 +2196,10 @@ export class ThreadingRepository {
     if (await this.runHasReadySubjectWork(client, run.id)) {
       return this.processSubjectWork(client, run, batchSize, closureLimits, maxBucket, requestedBy, attempted);
     }
+    if (run.status === "ready" && (await this.enqueueMissingAssignments(client, run, batchSize)) > 0) {
+      return this.processDirtyQueue(client, run, batchSize, closureLimits, requestedBy, attempted);
+    }
+    if (run.status === "ready") await this.markRunCoverageVerified(client, run);
     return this.resultForRun(run.account_id, run, { ready: true, active: run.status === "active" });
   }
 
@@ -2263,6 +2359,7 @@ export class ThreadingRepository {
         m.provider_thread_id_namespace AS provider_thread_namespace,
         m.internal_date, m.size_bytes::text AS size_bytes,
         body.raw_mime_sha256 AS raw_mime_hash,
+        body.parsed_delivery_sha256 AS delivery_fingerprint,
         m.subject, m.from_email,
         coalesce(m.to_emails, '{}'::text[]) AS to_emails,
         coalesce(m.cc_emails, '{}'::text[]) AS cc_emails,
@@ -2519,6 +2616,65 @@ export class ThreadingRepository {
     );
   }
 
+  private async pruneSingletonSubjectWork(client: PgClient, run: ThreadRun, limit: number): Promise<number> {
+    const result = await client.query<{ count: string }>(
+      `WITH candidates AS MATERIALIZED (
+         SELECT work.subject_key
+         FROM public.imap_thread_subject_work work
+         WHERE work.run_id = $1 AND work.available_at <= now()
+         ORDER BY work.enqueued_at, work.subject_key
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED
+       ), removed AS (
+         DELETE FROM public.imap_thread_subject_work work
+         USING candidates
+         WHERE work.run_id = $1
+           AND work.subject_key = candidates.subject_key
+           AND NOT EXISTS (
+             SELECT 1
+             FROM public.imap_thread_assignments assignment
+             WHERE assignment.run_id = work.run_id
+               AND assignment.subject_key = work.subject_key
+             OFFSET 1
+           )
+         RETURNING 1
+       )
+       SELECT count(*)::text AS count FROM removed`,
+      [run.id, limit]
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
+  private async enqueueMissingAssignments(client: PgClient, run: ThreadRun, limit: number): Promise<number> {
+    const result = await client.query<{ count: string }>(
+      `WITH missing AS MATERIALIZED (
+         SELECT message.id
+         FROM public.imap_messages message
+         LEFT JOIN public.imap_thread_assignments assignment
+           ON assignment.run_id = $1
+          AND assignment.message_id = message.id
+         WHERE message.account_id = $2
+           AND assignment.message_id IS NULL
+         ORDER BY message.id
+         LIMIT $3
+       ), enqueued AS (
+         INSERT INTO public.imap_thread_work_queue (
+           run_id, message_id, account_id, reason, attempts, available_at,
+           last_error, enqueued_at, updated_at
+         )
+         SELECT $1, missing.id, $2, 'coverage_repair', 0, now(), NULL, now(), now()
+         FROM missing
+         ON CONFLICT (run_id, message_id) DO UPDATE SET
+           reason = EXCLUDED.reason, attempts = 0, available_at = now(),
+           last_error = NULL, enqueued_at = now(), updated_at = now()
+         RETURNING 1
+       )
+       SELECT count(*)::text AS count FROM enqueued`,
+      [run.id, run.account_id, limit]
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
   private async deleteRunQueue(client: PgClient, runId: string, ids: string[]): Promise<number> {
     if (ids.length === 0) return 0;
     const result = await client.query<{ count: string }>(
@@ -2546,14 +2702,11 @@ export class ThreadingRepository {
       SELECT id, folder_path, uidvalidity::text AS uidvalidity, uid::text AS uid
       FROM public.imap_messages
       WHERE account_id = $1
-        AND (
-          $2::text IS NULL
-          OR (folder_path, uidvalidity, uid) > ($2::text, $3::bigint, $4::bigint)
-        )
-      ORDER BY folder_path, uidvalidity, uid
-      LIMIT $5
+        AND ($2::uuid IS NULL OR id > $2::uuid)
+      ORDER BY id
+      LIMIT $3
       `,
-      [run.account_id, run.cursor_folder_path, run.cursor_uidvalidity, run.cursor_uid, limit]
+      [run.account_id, run.cursor_message_id, limit]
     );
     return result.rows;
   }
@@ -2578,7 +2731,7 @@ export class ThreadingRepository {
   private async loadRun(client: PgClient, runId: string): Promise<ThreadRun | null> {
     const result = await client.query<ThreadRun>(
       `SELECT id, account_id, algorithm_version, mode, status, stage, source_run_id,
-              cursor_folder_path, cursor_uidvalidity::text, cursor_uid::text,
+              cursor_folder_path, cursor_uidvalidity::text, cursor_uid::text, cursor_message_id,
               attempts, available_at, caught_up_revision::text, summary
        FROM public.imap_thread_runs WHERE id = $1`,
       [runId]
@@ -2601,7 +2754,7 @@ export class ThreadingRepository {
         source_run_id, requested_by, reason
       ) VALUES ($1, $2, $3, 'building', 'body_evidence', $4, $5, $6)
       RETURNING id, account_id, algorithm_version, mode, status, stage, source_run_id,
-                cursor_folder_path, cursor_uidvalidity::text, cursor_uid::text,
+                cursor_folder_path, cursor_uidvalidity::text, cursor_uid::text, cursor_message_id,
                 attempts, available_at, caught_up_revision::text, summary
       `,
       [state.account_id, this.currentAlgorithmVersion, mode, active?.id ?? null, requestedBy, reason]
@@ -2618,23 +2771,32 @@ export class ThreadingRepository {
     client: PgClient,
     run: ThreadRun,
     stage: RunStage,
-    cursor: Pick<ThreadRun, "cursor_folder_path" | "cursor_uidvalidity" | "cursor_uid"> | null
+    cursor: Pick<ThreadRun, "cursor_folder_path" | "cursor_uidvalidity" | "cursor_uid" | "cursor_message_id"> | null
   ): Promise<ThreadRun> {
     await client.query(
       `UPDATE public.imap_thread_runs
        SET stage = $2,
            cursor_folder_path = $3,
            cursor_uidvalidity = $4,
-           cursor_uid = $5
+           cursor_uid = $5,
+           cursor_message_id = $6
        WHERE id = $1`,
-      [run.id, stage, cursor?.cursor_folder_path ?? null, cursor?.cursor_uidvalidity ?? null, cursor?.cursor_uid ?? null]
+      [
+        run.id,
+        stage,
+        cursor?.cursor_folder_path ?? null,
+        cursor?.cursor_uidvalidity ?? null,
+        cursor?.cursor_uid ?? null,
+        cursor?.cursor_message_id ?? null
+      ]
     );
     return {
       ...run,
       stage,
       cursor_folder_path: cursor?.cursor_folder_path ?? null,
       cursor_uidvalidity: cursor?.cursor_uidvalidity ?? null,
-      cursor_uid: cursor?.cursor_uid ?? null
+      cursor_uid: cursor?.cursor_uid ?? null,
+      cursor_message_id: cursor?.cursor_message_id ?? null
     };
   }
 
@@ -2643,6 +2805,8 @@ export class ThreadingRepository {
       `UPDATE public.imap_thread_runs
        SET status = 'ready', stage = 'ready', completed_at = now(),
            cursor_folder_path = NULL, cursor_uidvalidity = NULL, cursor_uid = NULL,
+           cursor_message_id = NULL,
+           summary = jsonb_set(summary, '{coverage_verified}', 'true'::jsonb, true),
            caught_up_revision = coalesce((
              SELECT revision FROM public.imap_thread_evidence_clock WHERE account_id = $2
            ), 0)
@@ -2650,6 +2814,15 @@ export class ThreadingRepository {
       [run.id, run.account_id]
     );
     return { ...run, status: "ready", stage: "ready" };
+  }
+
+  private async markRunCoverageVerified(client: PgClient, run: ThreadRun): Promise<void> {
+    await client.query(
+      `UPDATE public.imap_thread_runs
+       SET summary = jsonb_set(summary, '{coverage_verified}', 'true'::jsonb, true)
+       WHERE id = $1`,
+      [run.id]
+    );
   }
 
   private async markRunCaughtUp(client: PgClient, run: ThreadRun): Promise<void> {

@@ -424,6 +424,39 @@ liveDb("ThreadingRepository live DB", () => {
     expect(rows.every((row) => row.confidence === "low" && row.is_provisional)).toBe(true);
   });
 
+  it("retires singleton subject buckets in bounded batches", async () => {
+    const accountId = await createAccount("singleton-subject-batches");
+    for (let uid = 1; uid <= 15; uid += 1) {
+      await seedMessage(accountId, {
+        uid,
+        subject: `Re: Unique topic ${uid}`,
+        fromEmail: `sender-${uid}@example.test`,
+        toEmails: [`recipient-${uid}@example.test`],
+        rfcMessageId: `<singleton-subject-${uid}@example.test>`
+      });
+    }
+
+    let runId: string | null = null;
+    for (let pass = 0; pass < 30; pass += 1) {
+      const result = await repository.drainAccount(accountId, { batchSize: 5, requestedBy: "live-test" });
+      runId = result.runId;
+      if (result.stage === "subject") break;
+    }
+    expect(runId).not.toBeNull();
+    const before = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_thread_subject_work WHERE run_id = $1",
+      [runId]
+    );
+    expect(Number(before.rows[0]?.count)).toBe(15);
+
+    await repository.drainAccount(accountId, { batchSize: 5, requestedBy: "live-test" });
+    const after = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_thread_subject_work WHERE run_id = $1",
+      [runId]
+    );
+    expect(Number(after.rows[0]?.count)).toBeLessThanOrEqual(10);
+  });
+
   it("skips an oversized common-subject bucket instead of risking a false merge", async () => {
     const accountId = await createAccount("common-subject-cap");
     await seedMessage(accountId, {
@@ -680,6 +713,100 @@ liveDb("ThreadingRepository live DB", () => {
       { raw_mime_sha256: createHash("sha256").update(rawMime).digest("hex") },
       { raw_mime_sha256: createHash("sha256").update(rawMime).digest("hex") }
     ]);
+  });
+
+  it("uses exact parsed-only delivery evidence without merging reused Message-IDs", async () => {
+    const accountId = await createAccount("parsed-only-delivery-evidence");
+    const messageIds: string[] = [];
+    for (const [index, bodyText] of ["Same parsed delivery", "Same parsed delivery", "Different delivery"].entries()) {
+      messageIds.push(await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 1 ? "Archive" : "INBOX",
+        subject: "Parsed-only copy",
+        fromEmail: "alice@example.test",
+        toEmails: ["bob@example.test"],
+        rfcMessageId: "<parsed-copy@example.test>"
+      }));
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings
+         ) VALUES (
+           $1, NULL, NULL, $2, false,
+           $3, $3, $3, 'plain',
+           $4::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[]
+         )`,
+        [
+          messageIds[index],
+          Buffer.byteLength(bodyText),
+          bodyText,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Bob <bob@example.test>",
+            subject: "Parsed-only copy",
+            "message-id": "<parsed-copy@example.test>"
+          })
+        ]
+      );
+    }
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(3);
+    expect(rows[0]?.delivery_key).toBe(rows[1]?.delivery_key);
+    expect(rows[2]?.delivery_key).not.toBe(rows[0]?.delivery_key);
+
+    const evidence = await pool.query<{ parsed_delivery_sha256: string | null }>(
+      `SELECT parsed_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])
+       ORDER BY message_id`,
+      [messageIds]
+    );
+    expect(evidence.rows.every((row) => row.parsed_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(evidence.rows.map((row) => row.parsed_delivery_sha256)).size).toBe(2);
+  });
+
+  it("repairs missing assignment coverage before a shadow run can become ready", async () => {
+    const accountId = await createAccount("ready-coverage-repair");
+    const first = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Coverage one",
+      rfcMessageId: "<coverage-one@example.test>"
+    });
+    await seedMessage(accountId, {
+      uid: 2,
+      subject: "Coverage two",
+      rfcMessageId: "<coverage-two@example.test>"
+    });
+
+    let runId: string | null = null;
+    for (let pass = 0; pass < 30; pass += 1) {
+      const result = await repository.drainAccount(accountId, { batchSize: 1, requestedBy: "live-test" });
+      runId = result.runId;
+      if (result.stage === "catchup") break;
+    }
+    expect(runId).not.toBeNull();
+
+    await pool.query("DELETE FROM public.imap_thread_assignments WHERE run_id = $1 AND message_id = $2", [runId, first]);
+    await pool.query("DELETE FROM public.imap_thread_work_queue WHERE run_id = $1", [runId]);
+    await pool.query("DELETE FROM public.imap_thread_subject_work WHERE run_id = $1", [runId]);
+
+    const ready = await drainUntilReady(accountId, { batchSize: 1 });
+    expect(ready.runId).toBe(runId);
+    expect(await projection(runId as string)).toHaveLength(2);
+
+    // A 0014 binary could already have marked the incomplete run ready. The
+    // scheduler must still rediscover and repair it even with empty queues.
+    await pool.query("DELETE FROM public.imap_thread_assignments WHERE run_id = $1 AND message_id = $2", [runId, first]);
+    await pool.query("DELETE FROM public.imap_thread_work_queue WHERE run_id = $1", [runId]);
+    await pool.query("UPDATE public.imap_thread_runs SET summary = summary - 'coverage_verified' WHERE id = $1", [runId]);
+    expect(await repository.listAccountsNeedingWork()).toContain(accountId);
+    await repository.drainAccount(accountId, { batchSize: 1, requestedBy: "live-test" });
+    expect(await projection(runId as string)).toHaveLength(2);
+    await repository.drainAccount(accountId, { batchSize: 1, requestedBy: "live-test" });
+    expect(await repository.listAccountsNeedingWork()).not.toContain(accountId);
   });
 
   it("repairs complete bodies written by an old worker after activation and collapses the copies", async () => {
@@ -1096,11 +1223,11 @@ liveDb("ThreadingRepository live DB", () => {
     }
 
     const progress = await pool.query<{
-      cursor_uid: string | null;
+      cursor_message_id: string | null;
       stage: string;
       active_work: string;
     }>(
-      `SELECT candidate.cursor_uid::text, candidate.stage,
+      `SELECT candidate.cursor_message_id::text, candidate.stage,
               (SELECT count(*)::text FROM public.imap_thread_work_queue queue
                WHERE queue.run_id = state.active_run_id) AS active_work
        FROM public.imap_thread_state state
@@ -1109,7 +1236,7 @@ liveDb("ThreadingRepository live DB", () => {
       [accountId, candidateRunId]
     );
     expect(Number(progress.rows[0]?.active_work)).toBeGreaterThan(0);
-    expect(progress.rows[0]?.cursor_uid !== null || progress.rows[0]?.stage !== "body_evidence").toBe(true);
+    expect(progress.rows[0]?.cursor_message_id !== null || progress.rows[0]?.stage !== "body_evidence").toBe(true);
   });
 
   it("routes active, candidate, and rollback work through retained version executors", async () => {
