@@ -244,10 +244,10 @@ export class AccountAlreadyFinalizedError extends Error {
   }
 }
 
-class SentSyncInterruptedError extends Error {
+class SyncInterruptedError extends Error {
   constructor() {
-    super("Sent sync interrupted for Inbox-first full sweep");
-    this.name = "SentSyncInterruptedError";
+    super("Sync interrupted by scheduler");
+    this.name = "SyncInterruptedError";
   }
 }
 
@@ -290,7 +290,7 @@ export class MirrorEngine {
 
     for (const account of accounts) {
       if (options.signal?.aborted) break;
-      results.push(await this.syncAccount(account.id, "scheduled"));
+      results.push(await this.syncAccount(account.id, "scheduled", { signal: options.signal }));
     }
 
     return results;
@@ -357,7 +357,7 @@ export class MirrorEngine {
       const throwIfInterrupted = () => {
         if (!options.signal?.aborted) return;
         interruptActiveClient();
-        throw new SentSyncInterruptedError();
+        throw new SyncInterruptedError();
       };
       options.signal?.addEventListener("abort", interruptActiveClient, { once: true });
 
@@ -367,7 +367,7 @@ export class MirrorEngine {
           ? await this.repository.getSentFoldersDueForSync(account.id)
           : null;
         if (options.sentOnly && sentFolders?.length === 0) {
-          await this.repository.markAccountSentSyncFinished(account.id);
+          await this.repository.markAccountSyncYielded(account.id);
           return;
         }
 
@@ -450,6 +450,7 @@ export class MirrorEngine {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !connectionLost) {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
+          throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
         }
@@ -458,6 +459,7 @@ export class MirrorEngine {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !connectionLost) {
           const historyResult = await this.runHistoryLane(account, client, lockDeadline, metadataWriteStats);
+          throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
           result.bodiesFetched += historyResult.bodiesFetched;
           result.errors.push(...historyResult.errors);
@@ -469,7 +471,7 @@ export class MirrorEngine {
         }
 
         if (options.sentOnly) {
-          await this.repository.markAccountSentSyncFinished(account.id);
+          await this.repository.markAccountSyncYielded(account.id);
         } else if (result.outcome === "failed") {
           await this.repository.markAccountSyncFailed(account.id, result.errors.join("; "));
         } else if (result.outcome === "partial_success") {
@@ -483,12 +485,16 @@ export class MirrorEngine {
         }
       } catch (error) {
         if (
-          error instanceof SentSyncInterruptedError
-          || (options.sentOnly === true && options.signal?.aborted === true)
+          error instanceof SyncInterruptedError
+          || options.signal?.aborted === true
         ) {
-          // The supplemental lane yielded to the due full sweep. This is normal
-          // scheduling, not a mailbox/provider failure or an outage signal.
-          await this.repository.markAccountSentSyncFinished(account.id);
+          // Scheduler cancellation (shutdown or a due full sweep preempting Sent)
+          // is normal, not a mailbox/provider failure or an outage signal.
+          await this.repository.markAccountSyncYielded(account.id);
+          if (!options.sentOnly) {
+            result.outcome = "partial_success";
+            result.errors.push("Sync interrupted by scheduler");
+          }
           return;
         }
         // Classify on the ERROR OBJECT (imapflow auth failures say "Command failed"
@@ -498,7 +504,7 @@ export class MirrorEngine {
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
         if (options.sentOnly) {
-          await this.repository.markAccountSentSyncFinished(account.id);
+          await this.repository.markAccountSyncYielded(account.id);
         } else if (error instanceof AccountAlreadyFinalizedError) {
           // Account state was already persisted (e.g. UIDVALIDITY reset limit
           // exceeded → BROKEN). Don't re-mark; that would override BROKEN with

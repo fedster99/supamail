@@ -647,12 +647,8 @@ export class MirrorRepository {
     );
   }
 
-  /**
-   * Finish the lightweight Sent freshness lane without claiming that the full
-   * mailbox health/backoff contract was re-evaluated. The durable sync run still
-   * records and logs any error; the next full sweep owns health transitions.
-   */
-  async markAccountSentSyncFinished(accountId: string): Promise<void> {
+  /** Clear active-sync state after scheduler cancellation without changing health. */
+  async markAccountSyncYielded(accountId: string): Promise<void> {
     await this.pool.query(
       `
       UPDATE public.imap_accounts
