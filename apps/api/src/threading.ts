@@ -701,10 +701,10 @@ function providerKey(namespace: string | null | undefined, id: string | null | u
 }
 
 function physicalCopyFingerprint(input: ThreadingMessageInput): string | null {
-  const explicit = input.delivery_fingerprint?.trim();
-  if (explicit) return `explicit:${explicit}`;
   const rawMimeHash = input.raw_mime_hash?.trim();
   if (rawMimeHash) return `raw:${rawMimeHash}`;
+  const explicit = input.delivery_fingerprint?.trim();
+  if (explicit) return `parsed:${explicit}`;
   return null;
 }
 

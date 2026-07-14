@@ -51,6 +51,12 @@ hiding unrelated mail from a broken sender that reused an ID. Rows without eithe
 identity use mailbox-row identity. Reads/search count one verified logical
 delivery; IMAP mutations still target every live mailbox row.
 
+When an installation deliberately discarded historical raw MIME, an exact
+parsed-representation digest may provide the corroboration. It covers the parsed
+body variants, MIME structure, full parsed headers, envelope, byte sizes, and
+parser warnings, and is emitted only for complete, non-truncated bodies with a
+sender and recipient. Any disagreement remains split.
+
 ### Bounded fallback evidence
 
 Provider thread IDs (`OBJECTID`/`X-GM-THRID`) are strong, account-scoped
@@ -100,6 +106,12 @@ binary therefore neither ignores nor supersedes a newer candidate silently.
 Run selection uses a persisted five-slot weighted schedule (three active, one
 standby, one building) so sustained active ingress preserves reader freshness
 without starving a shadow build or rollback projection across worker restarts.
+The scan cursor is the immutable physical-message UUID, not mutable mailbox
+coordinates. Catch-up also anti-joins the physical mirror against assignments
+and repairs missing rows in bounded batches, so a run cannot become `ready`
+merely because its queues happen to be empty. Singleton subject buckets are
+retired in bounded batches, and the ordinary worker advances at most ten
+independent steps per account under a 20-second threading-lane budget.
 
 Every incremental changing operation snapshots previous/current assignments in
 `imap_thread_assignment_history`; a latest-operation guard makes incremental

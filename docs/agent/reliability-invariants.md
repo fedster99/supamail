@@ -12,7 +12,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Never treat IMAP UID as globally unique.
 - Store raw and normalized Message-ID separately.
 - Preserve provider message/thread ID namespaces; provider IDs are opaque and not globally unique.
-- A complete, non-truncated raw MIME fetch may store `raw_mime_sha256` as copy evidence. Never hash a truncated body as if it proved delivery equality.
+- A complete, non-truncated raw MIME fetch may store `raw_mime_sha256` as copy evidence. In `parsed_only` history, `parsed_delivery_sha256` may corroborate a copy only when the exact parsed body, MIME structure, parsed headers, envelope, sizes, and parser warnings agree. Never hash a truncated or materially incomplete body as if it proved delivery equality.
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.
 - Attachment metadata is stored during sync; binary attachment fetching is not part of the current core path.
 - Body backlog draining is capped per tick so recent-body work cannot consume the whole lock window forever.
@@ -37,6 +37,8 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Thread-run scheduling is persisted on `imap_thread_state`: active receives three weighted slots while standby and building each receive one. Preserve bounded progress for all available roles across restarts; sustained active ingress must not starve rollout or rollback work.
 - When an exact subject bucket grows past its cap, invalidate any existing `subject_fallback` assignments before marking it skipped. Ambiguity may split a weak conversation; it may never preserve a known stale false merge.
 - Initial builds, rebuilds, and algorithm upgrades are shadow runs. They keyset-scan bounded pages, drain changes that arrived during the scan, and stop at `ready`; they never switch readers automatically.
+- Shadow scans page on immutable physical message UUIDs. Catch-up repeatedly enqueues any physical row without an assignment; `ready` is unreachable until that repair query finds none.
+- The ordinary worker may execute up to ten independently bounded projection steps per account per tick, under a 20-second lane budget. Preserve both caps so large builds progress without delaying mailbox sync.
 - Activation requires complete physical-row coverage and empty catch-up queues, then swaps the active-run pointer atomically. A worker must reject a run newer than its compiled algorithm version without updating it.
 - Incremental drain and full rebuild must call the same pure, versioned algorithm. Repeating a computation over unchanged inputs must not create a material generation.
 - Material assignment changes require an operation row and per-message before/after history. Incremental rollback may reverse only the latest material operation in the active run. Activation rollback requires a caught-up standby. Both must record a rollback operation and pause automatic work pending a clean rebuild.

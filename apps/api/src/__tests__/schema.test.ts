@@ -99,9 +99,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0014_conversation_threading");
+    expect(version).toBe("0015_threading_production_hardening");
     expect(manifest).toEqual({
-      schemaVersion: "0014_conversation_threading",
+      schemaVersion: "0015_threading_production_hardening",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -116,7 +116,8 @@ describe("initial schema", () => {
         { id: "0011_webhook_emit_indexes", file: "0011_webhook_emit_indexes.sql" },
         { id: "0012_sync_events_retention_index", file: "0012_sync_events_retention_index.sql" },
         { id: "0013_body_head_trigram_index", file: "0013_body_head_trigram_index.sql" },
-        { id: "0014_conversation_threading", file: "0014_conversation_threading.sql" }
+        { id: "0014_conversation_threading", file: "0014_conversation_threading.sql" },
+        { id: "0015_threading_production_hardening", file: "0015_threading_production_hardening.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -131,6 +132,8 @@ describe("initial schema", () => {
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
     expect(sql).toContain("imap_message_bodies_body_head_trgm_idx");
     expect(sql).toContain("left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)");
+    expect(sql).toContain("parsed_delivery_sha256 text");
+    expect(sql).toContain("cursor_message_id uuid");
     expect(sql).toContain("imap_messages_created_emit_idx");
     expect(sql).toContain("imap_messages_updated_emit_idx");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_assignments");

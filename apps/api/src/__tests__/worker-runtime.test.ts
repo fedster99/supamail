@@ -462,4 +462,114 @@ describe("worker conversation-threading lane", () => {
       await runtime.done;
     }
   });
+
+  it("advances several bounded shadow-build steps per mailbox tick", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let drainCalls = 0;
+    const drainAccount = vi.fn(async () => {
+      drainCalls += 1;
+      const complete = drainCalls >= 4;
+      return {
+        accountId: "account-1",
+        runId: "run-1",
+        runStatus: complete ? "ready" as const : "building" as const,
+        stage: complete ? "ready" as const : "strong" as const,
+        operationId: `operation-${drainCalls}`,
+        operationType: "build_batch" as const,
+        generation: String(drainCalls),
+        messagesConsidered: 500,
+        assignmentsChanged: 500,
+        queueItemsProcessed: 0,
+        subjectFallbackEnabled: false,
+        busy: false,
+        ready: complete,
+        active: false
+      };
+    });
+    const runtime = await startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      engine: {
+        syncDueAccounts: vi.fn(async () => []),
+        syncDueSentFolders: vi.fn(async () => [])
+      },
+      threading: {
+        listAccountsNeedingWork: vi.fn(async () => ["account-1"]),
+        drainAccount
+      },
+      repository: {
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+      } as never
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drainAccount).toHaveBeenCalledTimes(4);
+    } finally {
+      runtime.stop();
+      await runtime.done;
+    }
+  });
+
+  it("round-robins bounded threading steps across accounts", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const drainAccount = vi.fn(async (accountId: string) => ({
+      accountId,
+      runId: `run-${accountId}`,
+      runStatus: "building" as const,
+      stage: "strong" as const,
+      operationId: `operation-${accountId}`,
+      operationType: "build_batch" as const,
+      generation: "1",
+      messagesConsidered: 500,
+      assignmentsChanged: 500,
+      queueItemsProcessed: 0,
+      subjectFallbackEnabled: false,
+      busy: false,
+      ready: false,
+      active: false
+    }));
+    const runtime = await startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      engine: {
+        syncDueAccounts: vi.fn(async () => []),
+        syncDueSentFolders: vi.fn(async () => [])
+      },
+      threading: {
+        listAccountsNeedingWork: vi.fn(async () => ["account-1", "account-2"]),
+        drainAccount
+      },
+      repository: {
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+      } as never
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drainAccount.mock.calls.slice(0, 4).map(([accountId]) => accountId)).toEqual([
+        "account-1",
+        "account-2",
+        "account-1",
+        "account-2"
+      ]);
+    } finally {
+      runtime.stop();
+      await runtime.done;
+    }
+  });
 });

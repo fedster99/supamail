@@ -303,7 +303,7 @@ SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME stru
 `BODY_STORAGE_MODE` controls whether the raw blob is retained:
 
 - `raw_mime`: store the original RFC822/MIME bytes in `imap_message_bodies.raw_mime`. This is the default.
-- `parsed_only`: fetch and parse bodies normally but store `raw_mime` as NULL. Raw blobs usually dominate database size, so use this when you only need parsed/searchable content. `raw_bytes` and `raw_truncated` still describe the fetched source, but raw MIME cannot be re-read later for re-parsing or attachment extraction.
+- `parsed_only`: fetch and parse bodies normally but store `raw_mime` as NULL. Raw blobs usually dominate database size, so use this when you only need parsed/searchable content. `raw_bytes` and `raw_truncated` still describe the fetched source, and threading derives a strict digest over the complete parsed representation to corroborate mirrored copies without trusting Message-ID alone. Raw MIME cannot be re-read later for re-parsing or attachment extraction.
 
 Before enabling `parsed_only`, apply the public migrations (`pnpm migrate`) so `raw_mime` is nullable; on an un-migrated database every body store fails. While `parsed_only` is active, any re-fetch of an already-stored message (for example `POST /messages/:id/refetch-body` or a UIDVALIDITY-reset re-walk) also overwrites that row's previously stored `raw_mime` with NULL. Switching back to `raw_mime` does not backfill raw blobs for mail synced while `parsed_only` was active.
 
