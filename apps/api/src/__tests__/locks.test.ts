@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { isTransientStartupDbError } from "../locks.js";
+import { describe, expect, it, vi } from "vitest";
+import { isTransientStartupDbError, runLockSelfTestWithRetry } from "../locks.js";
 
 describe("isTransientStartupDbError", () => {
   it("treats deploy-time pool/pooler saturation as transient (retryable)", () => {
@@ -39,5 +39,32 @@ describe("isTransientStartupDbError", () => {
     expect(isTransientStartupDbError(null)).toBe(false);
     expect(isTransientStartupDbError(undefined)).toBe(false);
     expect(isTransientStartupDbError("just a string")).toBe(false);
+  });
+});
+
+describe("runLockSelfTestWithRetry cancellation", () => {
+  it("does not begin a startup lock check when shutdown was already requested", async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const pool = { connect: vi.fn() };
+
+    await expect(runLockSelfTestWithRetry(pool as never, { signal: abort.signal }))
+      .rejects.toMatchObject({ name: "AbortError" });
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("interrupts the retry delay instead of waiting out the deployment budget", async () => {
+    const abort = new AbortController();
+    const pool = {
+      connect: vi.fn(async () => {
+        throw new Error("timeout exceeded when trying to connect");
+      })
+    };
+
+    await expect(runLockSelfTestWithRetry(pool as never, {
+      signal: abort.signal,
+      onRetry: () => abort.abort()
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(pool.connect).toHaveBeenCalledTimes(1);
   });
 });

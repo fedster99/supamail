@@ -56,15 +56,13 @@ export async function startRuntimeFromEnv(env: NodeJS.ProcessEnv = process.env):
   const engine = new MirrorEngine({ pool, config, repository });
   const server = startApiServer({ config, pool, repository, engine });
   const closeApi = createServerCloser(server);
-  const worker = await startWorkerRuntime({ config, pool, repository, engine });
-
-  const shutdown = () => {
-    worker.stop();
-    closeApi();
-  };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  const worker = await startWorkerRuntime({
+    config,
+    pool,
+    repository,
+    engine,
+    installProcessHandlers: true, onStop: closeApi
+  });
 
   try {
     await worker.done;

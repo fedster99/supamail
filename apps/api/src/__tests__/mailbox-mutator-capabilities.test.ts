@@ -36,22 +36,25 @@ const fake = vi.hoisted(() => {
   };
 });
 
-vi.mock("imapflow", () => ({
-  ImapFlow: class {
-    capabilities = fake.capabilities;
-    get mailbox() {
-      return fake.mailbox;
+vi.mock("imapflow", async () => {
+  const { EventEmitter } = await import("node:events");
+  return {
+    ImapFlow: class extends EventEmitter {
+      capabilities = fake.capabilities;
+      get mailbox() {
+        return fake.mailbox;
+      }
+      connect = fake.connectImpl;
+      close = fake.close;
+      logout = fake.logout;
+      getMailboxLock = fake.getMailboxLock;
+      messageFlagsAdd = fake.messageFlagsAdd;
+      messageFlagsRemove = fake.messageFlagsRemove;
+      messageMove = fake.messageMove;
+      messageDelete = fake.messageDelete;
     }
-    connect = fake.connectImpl;
-    close = fake.close;
-    logout = fake.logout;
-    getMailboxLock = fake.getMailboxLock;
-    messageFlagsAdd = fake.messageFlagsAdd;
-    messageFlagsRemove = fake.messageFlagsRemove;
-    messageMove = fake.messageMove;
-    messageDelete = fake.messageDelete;
-  }
-}));
+  };
+});
 
 vi.mock("../crypto.js", () => ({
   decryptPassword: vi.fn(async () => "secret")

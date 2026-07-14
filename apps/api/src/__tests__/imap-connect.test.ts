@@ -17,18 +17,24 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 const fake = vi.hoisted(() => ({
   connectImpl: vi.fn(async () => undefined),
   close: vi.fn(),
+  lastClient: undefined as { emit(event: string, error: Error): boolean } | undefined,
   lastOptions: undefined as unknown
 }));
 
-vi.mock("imapflow", () => ({
-  ImapFlow: class {
-    constructor(options: unknown) {
-      fake.lastOptions = options;
+vi.mock("imapflow", async () => {
+  const { EventEmitter } = await import("node:events");
+  return {
+    ImapFlow: class extends EventEmitter {
+      constructor(options: unknown) {
+        super();
+        fake.lastClient = this;
+        fake.lastOptions = options;
+      }
+      connect = fake.connectImpl;
+      close = fake.close;
     }
-    connect = fake.connectImpl;
-    close = fake.close;
-  }
-}));
+  };
+});
 
 const assertSafe = vi.hoisted(() => vi.fn(async () => undefined));
 const decrypt = vi.hoisted(() => vi.fn(async () => "secret"));
@@ -90,6 +96,41 @@ describe("connectImap (the one shared connect prelude)", () => {
 
     await expect(connecting).rejects.toThrow(/interrupted/);
     expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not crash when ImapFlow emits its late logged-out error after an intentional connect abort", async () => {
+    fake.connectImpl.mockImplementation(async () => await new Promise(() => undefined));
+    const abort = new AbortController();
+    const connecting = connectImap({} as never, config, account, { signal: abort.signal });
+
+    await vi.waitFor(() => expect(fake.connectImpl).toHaveBeenCalledTimes(1));
+    abort.abort();
+    await expect(connecting).rejects.toThrow(/interrupted/);
+
+    const lateError = Object.assign(new Error("Already logged out"), {
+      name: "AuthenticationFailure",
+      authenticationFailed: true
+    });
+    expect(() => fake.lastClient?.emit("error", lateError)).not.toThrow();
+  });
+
+  it("reports unrelated ImapFlow lifecycle errors without logging their message", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await connectImap({} as never, config, account);
+
+    const lifecycleError = Object.assign(new Error("LOGIN user@example.test super-secret"), {
+      name: "ProviderFailure",
+      code: "EPROTO",
+      responseStatus: "NO"
+    });
+    expect(() => fake.lastClient?.emit("error", lifecycleError)).not.toThrow();
+
+    expect(errorLog).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(errorLog.mock.calls[0][0])).toEqual({
+      event: "imap.client.error",
+      error: { name: "ProviderFailure", code: "EPROTO", responseStatus: "NO" }
+    });
+    expect(errorLog.mock.calls[0][0]).not.toContain("super-secret");
   });
 
   it("never starts a connection when its scheduler signal is already aborted", async () => {

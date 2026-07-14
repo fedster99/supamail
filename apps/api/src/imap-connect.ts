@@ -5,6 +5,21 @@ import type { PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import type { ImapAccount } from "./types.js";
 
+function safeLifecycleError(error: unknown): {
+  name: string;
+  code?: string;
+  responseStatus?: string;
+} {
+  const record = error && typeof error === "object"
+    ? error as { code?: unknown; responseStatus?: unknown }
+    : {};
+  return {
+    name: error instanceof Error && error.name ? error.name : "Error",
+    code: typeof record.code === "string" ? record.code : undefined,
+    responseStatus: typeof record.responseStatus === "string" ? record.responseStatus : undefined
+  };
+}
+
 /**
  * The one shared IMAP connect prelude (ADR 0017/0018/0020/0022). Every narrow IMAP
  * client in this codebase — the read-sync `ThrottledImapClient` (imap-client.ts),
@@ -40,6 +55,7 @@ export async function connectImap(
     allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
   });
   const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
+  let closingIntentionally = false;
   const client = new ImapFlow({
     host: account.host,
     port: account.port,
@@ -50,16 +66,29 @@ export async function connectImap(
     greetingTimeout: config.CONNECT_TIMEOUT_MS,
     socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
   });
+  // ImapFlow reports some lifecycle failures through both the command/connect
+  // promise and EventEmitter's special `error` channel. A scheduler abort can
+  // close a pending connection after the server greeting has already queued
+  // authentication; that late continuation then emits "Already logged out".
+  // Without a listener Node treats the event itself as an uncaught exception,
+  // bypassing the promise rejection that the caller already handles.
+  client.on("error", (error: unknown) => {
+    if (closingIntentionally) return;
+    console.error(JSON.stringify({
+      event: "imap.client.error",
+      error: safeLifecycleError(error)
+    }));
+  });
   if (options.signal?.aborted) {
+    closingIntentionally = true;
     client.close();
     throw new Error("IMAP connection interrupted for higher-priority sync work");
   }
-  let closedForInterrupt = false;
   let interruptConnect: (() => void) | null = null;
   const interrupted = options.signal
     ? new Promise<never>((_, reject) => {
       interruptConnect = () => {
-        closedForInterrupt = true;
+        closingIntentionally = true;
         client.close();
         reject(new Error("IMAP connection interrupted for higher-priority sync work"));
       };
@@ -70,7 +99,10 @@ export async function connectImap(
     await (interrupted ? Promise.race([client.connect(), interrupted]) : client.connect());
   } catch (error) {
     // Close the socket so an auth/TLS failure during connect cannot leak it.
-    if (!closedForInterrupt) client.close();
+    if (!closingIntentionally) {
+      closingIntentionally = true;
+      client.close();
+    }
     throw error;
   } finally {
     if (interruptConnect) {

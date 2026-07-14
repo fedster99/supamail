@@ -192,6 +192,31 @@ export function isTransientStartupDbError(error: unknown): boolean {
   );
 }
 
+function startupAbortError(): Error {
+  return Object.assign(new Error("Startup lock self-test interrupted"), { name: "AbortError" });
+}
+
+function throwIfStartupAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw startupAbortError();
+}
+
+async function waitForStartupRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfStartupAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(finish, delayMs);
+    const abort = () => finish(startupAbortError());
+
+    function finish(error?: Error): void {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve();
+    }
+
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
 /**
  * Run the advisory-lock self-test, retrying transient DB errors with exponential
  * backoff before giving up. The caller still exits if this throws — the retry only
@@ -207,6 +232,7 @@ export async function runLockSelfTestWithRetry(
     maxAttempts?: number;
     baseDelayMs?: number;
     maxDelayMs?: number;
+    signal?: AbortSignal;
     onRetry?: (info: { attempt: number; maxAttempts: number; delayMs: number; error: unknown }) => void;
   }
 ): Promise<void> {
@@ -215,16 +241,19 @@ export async function runLockSelfTestWithRetry(
   const maxDelayMs = opts?.maxDelayMs ?? 8_000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    throwIfStartupAborted(opts?.signal);
     try {
       await runLockSelfTest(pool);
+      throwIfStartupAborted(opts?.signal);
       return;
     } catch (error) {
+      throwIfStartupAborted(opts?.signal);
       if (attempt >= maxAttempts || !isTransientStartupDbError(error)) {
         throw error;
       }
       const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
       opts?.onRetry?.({ attempt, maxAttempts, delayMs, error });
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await waitForStartupRetry(delayMs, opts?.signal);
     }
   }
 }
