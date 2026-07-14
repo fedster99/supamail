@@ -22,7 +22,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Worker startup must fail if advisory lock self-test fails.
 - Stale lock recovery must be heartbeat-based and conservative.
 - Stale lock recovery also closes the dead worker's open `imap_sync_runs` row (`status='failed'`, reaped error note) so it stops reading as a perpetually running sync. It must only touch stale accounts; a live account with a fresh heartbeat is left running.
-- `MAX_LOCK_HOLD_MS` is a cooperative fairness budget. It is checked at safe boundaries, not by killing in-flight IMAP commands.
+- `MAX_LOCK_HOLD_MS` is a cooperative fairness budget. It is checked at safe boundaries, not by killing in-flight IMAP commands. A history metadata batch that has already finished its IMAP fetch persists and advances its watermark under its own bounded database-write deadline before yielding.
 - Priority folders may finish past the lock budget; non-priority folders and body batches stop at the next safe boundary.
 - A `hitLockBudget` cycle is normal completion and must not reset backoff counters.
 
@@ -67,6 +67,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - `historical_backfill_mode = 'off'` disables history work. `metadata_only` mirrors historical headers only. `metadata_and_bodies` fetches historical bodies too.
 - Incremental sync only advances `last_uid` after all fetched metadata for the batch succeeds.
 - Partial metadata fetches are hard failures. Do not swallow per-message errors and advance cursors.
+- Metadata, history, and flag batch sizes are capped at 500 at configuration and repository boundaries. A metadata FETCH or direct logical write fails closed at an estimated 32 MiB or 20,000 retained attachments. Persistence keeps the logical batch atomic while splitting SQL statements at 8 MiB or 5,000 attachments; a single record beyond either statement boundary fails closed. Flag FETCH retention is capped at 4 MiB or 20,000 keywords; projected updates and events split at 1 MiB or 5,000 keywords using both stored and incoming representations and reject a pathological single UID.
 - `metadataRowsCommitted` counts acknowledged message-record upserts, including conflict updates (not new-email count or attachment rows). Write-service rate divides those rows by cumulative persistence-path time; worker throughput divides them by monotonic tick wall time. Failed batches add service time and zero rows; no-batch or incomplete mixed-version telemetry reports no rate.
 - Flag scans are due-based, compare normalized flags, and keep FETCH/write locks bounded to incremental-size batches under one overall deadline.
 - Reconcile only runs after initial sync is complete for the folder.
