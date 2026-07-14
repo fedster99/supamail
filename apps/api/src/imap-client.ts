@@ -3,6 +3,14 @@ import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { connectImap } from "./imap-connect.js";
 import { extractAttachmentMetadata, normalizeMessageId, parseHeaders, parseRawMime, selectBodyTextPart } from "./mime.js";
+import {
+  MAX_SYNC_ATTACHMENTS_PER_FETCH,
+  MAX_SYNC_FLAG_FETCH_BYTES,
+  MAX_SYNC_FLAGS_PER_FETCH,
+  MAX_SYNC_METADATA_FETCH_BYTES,
+  flagSnapshotFootprint,
+  metadataMessageFootprint
+} from "./sync-limits.js";
 import { ImapThrottle } from "./throttle.js";
 import type {
   ImapAccount,
@@ -257,6 +265,8 @@ export async function fetchMessageMetadata(
 ): Promise<MessageMetadata[]> {
   const messages: MessageMetadata[] = [];
   const requestedUids = [...new Set(uids)];
+  let retainedBytes = 2;
+  let retainedAttachments = 0;
 
   for (let i = 0; i < requestedUids.length; i += batchSize) {
     const batch = requestedUids.slice(i, i + batchSize);
@@ -297,7 +307,21 @@ export async function fetchMessageMetadata(
         && msg.headers !== undefined
         && msg.bodyStructure !== undefined;
       if (!hasRequestedMetadata) continue;
-      returned.set(msg.uid, parseMessageMetadata(msg));
+      const parsed = parseMessageMetadata(msg);
+      const footprint = metadataMessageFootprint(parsed);
+      const previous = returned.get(msg.uid);
+      if (previous) {
+        const previousFootprint = metadataMessageFootprint(previous);
+        retainedBytes -= previousFootprint.bytes;
+        retainedAttachments -= previousFootprint.attachments;
+      }
+      retainedBytes += footprint.bytes;
+      retainedAttachments += footprint.attachments;
+      if (retainedBytes > MAX_SYNC_METADATA_FETCH_BYTES
+        || retainedAttachments > MAX_SYNC_ATTACHMENTS_PER_FETCH) {
+        throw new Error("IMAP metadata fetch exceeded the aggregate memory budget");
+      }
+      returned.set(msg.uid, parsed);
     }
 
     const missing = batch.filter((uid) => !returned.has(uid));
@@ -321,6 +345,8 @@ export async function fetchMessageFlags(
 ): Promise<MessageFlagSnapshot[]> {
   const snapshots: MessageFlagSnapshot[] = [];
   const requestedUids = [...new Set(uids)];
+  let retainedBytes = 2;
+  let retainedFlags = 0;
 
   for (let i = 0; i < requestedUids.length; i += batchSize) {
     const batch = requestedUids.slice(i, i + batchSize);
@@ -335,7 +361,20 @@ export async function fetchMessageFlags(
         omittedFlags.add(msg.uid);
         continue;
       }
-      returned.set(msg.uid, { uid: msg.uid, flags: [...msg.flags] });
+      const snapshot = { uid: msg.uid, flags: [...msg.flags] };
+      const footprint = flagSnapshotFootprint(snapshot);
+      const previous = returned.get(msg.uid);
+      if (previous) {
+        const previousFootprint = flagSnapshotFootprint(previous);
+        retainedBytes -= previousFootprint.bytes;
+        retainedFlags -= previousFootprint.flags;
+      }
+      retainedBytes += footprint.bytes;
+      retainedFlags += footprint.flags;
+      if (retainedBytes > MAX_SYNC_FLAG_FETCH_BYTES || retainedFlags > MAX_SYNC_FLAGS_PER_FETCH) {
+        throw new Error("IMAP flag fetch exceeded the aggregate memory budget");
+      }
+      returned.set(msg.uid, snapshot);
     }
 
     const missing = batch.filter((uid) => !returned.has(uid));

@@ -239,9 +239,13 @@ export async function clearOrphanedLockForAccount(
       pid: number;
       email_address: string;
       last_heartbeat_at: Date | null;
+      sync_started_by: string | null;
     }>(
       `
-      SELECT pl.pid, account.email_address, account.last_heartbeat_at
+      SELECT pl.pid,
+             account.email_address,
+             account.last_heartbeat_at,
+             account.sync_started_by
       FROM pg_locks pl
       JOIN public.imap_accounts account
         ON pl.classid::bigint = 0
@@ -269,8 +273,9 @@ export async function clearOrphanedLockForAccount(
       SET currently_syncing = false,
           sync_started_by = NULL
       WHERE lock_id = $1
+        AND sync_started_by IS NOT DISTINCT FROM $2::text
       `,
-      [lockId]
+      [lockId, row.sync_started_by]
     );
     // Close the sync run the killed process left open, so it stops reading as
     // perpetually 'running' (previously only the account lock was reaped). The

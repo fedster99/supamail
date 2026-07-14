@@ -14,6 +14,7 @@ import {
   type MirrorImapClient
 } from "../imap-client.js";
 import { FixtureImapClient, makeTextMessage } from "../smoke/fixture-imap.js";
+import { MAX_SYNC_METADATA_FETCH_BYTES } from "../sync-limits.js";
 import type { ImapMessage } from "../types.js";
 
 describe("fetchMessageMetadata", () => {
@@ -239,6 +240,20 @@ describe("fetchMessageMetadata uid guard", () => {
     expect(result[0].flags).toEqual(["\\Flagged"]);
   });
 
+  it("fails closed before retaining an unbounded metadata fetch", async () => {
+    const subject = "x".repeat(Math.floor(MAX_SYNC_METADATA_FETCH_BYTES / 5) + 1);
+    const responses = Array.from({ length: 5 }, (_, index) => ({
+      ...real(index + 1),
+      envelope: { subject }
+    }));
+
+    await expect(fetchMessageMetadata(
+      metadataStub(responses),
+      [1, 2, 3, 4, 5],
+      50
+    )).rejects.toThrow(/aggregate memory budget/);
+  });
+
   it("fails closed when overwrite-critical metadata fields are omitted", async () => {
     const complete = real(100);
     for (const field of ["envelope", "headers", "bodyStructure"] as const) {
@@ -254,6 +269,46 @@ describe("fetchMessageMetadata uid guard", () => {
         fetchMessageMetadata(metadataStub([{ ...real(100), size }]), [100], 50)
       ).rejects.toThrow(/missing 100/);
     }
+  });
+});
+
+describe("fetchMessageFlags payload guard", () => {
+  const flagStub = (
+    yielded: Array<{ uid: number; flags: Set<string> }>
+  ): MirrorImapClient => ({
+    mailbox: { path: "INBOX", uidValidity: 1 },
+    async *fetch() {
+      for (const message of yielded) yield message as FetchMessage;
+    }
+  }) as unknown as MirrorImapClient;
+
+  it("fails closed before retaining an unbounded aggregate keyword set", async () => {
+    const flags = new Set(Array.from({ length: 4_500 }, (_, index) => `keyword-${index}`));
+    const messages = Array.from({ length: 5 }, (_, index) => ({ uid: index + 1, flags }));
+    await expect(fetchMessageFlags(
+      flagStub(messages),
+      [1, 2, 3, 4, 5],
+      50
+    )).rejects.toThrow(/aggregate memory budget/);
+  });
+
+  it("accounts for a replacement response instead of double-counting it", async () => {
+    const large = new Set(Array.from({ length: 15_000 }, (_, index) => `old-${index}`));
+    const replacement = new Set(["\\Seen"]);
+    const other = new Set(Array.from({ length: 4_999 }, (_, index) => `new-${index}`));
+    const result = await fetchMessageFlags(
+      flagStub([
+        { uid: 1, flags: large },
+        { uid: 1, flags: replacement },
+        { uid: 2, flags: other }
+      ]),
+      [1, 2],
+      50
+    );
+    expect(result).toEqual([
+      { uid: 1, flags: ["\\Seen"] },
+      { uid: 2, flags: [...other] }
+    ]);
   });
 });
 

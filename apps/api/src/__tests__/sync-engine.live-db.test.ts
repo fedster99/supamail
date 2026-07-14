@@ -1,8 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { resetConfigForTests } from "../config.js";
+import { Client as PostgresClient, Pool as PostgresPool } from "pg";
+import { getConfig, resetConfigForTests } from "../config.js";
 import { closePool, getPool, type PgClient } from "../db.js";
-import { clearOrphanedLocks } from "../locks.js";
-import type { MirrorImapClient } from "../imap-client.js";
+import { clearOrphanedLockForAccount, clearOrphanedLocks } from "../locks.js";
+import { MirrorRepository } from "../repository.js";
+import type { FetchMessage, MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { ImapFolder, MessageMetadata } from "../types.js";
 import {
@@ -23,6 +25,34 @@ function timeout<T>(promise: Promise<T>, label: string, ms = 5_000): Promise<T> 
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+
+async function waitForBlockedQuery(
+  pool: ReturnType<typeof getPool> | PgClient | PostgresClient,
+  blockerPid: number,
+  queryFragment: string,
+  ms = 5_000
+): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    // The observer deliberately holds the blocking row lock in one long
+    // transaction; clear PostgreSQL's statistics snapshot so each poll sees
+    // backends that began waiting after the previous iteration.
+    await pool.query("SELECT pg_stat_clear_snapshot()");
+    const blocked = await pool.query<{ found: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM pg_stat_activity activity
+         WHERE activity.pid != $1::int
+           AND activity.wait_event_type = 'Lock'
+           AND activity.query ILIKE '%' || $2 || '%'
+       ) AS found`,
+      [blockerPid, queryFragment]
+    );
+    if (blocked.rows[0]?.found) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`blocked query containing ${queryFragment} was not observed`);
 }
 
 function oneFolder(path = "INBOX", messages = 2): FixtureFolder[] {
@@ -230,6 +260,60 @@ liveDb("live DB reliability lane", () => {
       expect(orphanRun.rows[0].error).toMatch(/reaped/);
     } finally {
       await releaseKilledClient(locker);
+    }
+  });
+
+  it("does not let stale-lock recovery erase a newly acquired sync owner", async () => {
+    const h = await setupIntegration("live-orphan-lock-owner-fence", {
+      STALE_HEARTBEAT_MS: 1_000
+    });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+
+    const locker = await h.pool.connect();
+    locker.on("error", () => undefined);
+    await locker.query("SELECT pg_advisory_lock($1::bigint)", [account.lock_id]);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET currently_syncing = true,
+           sync_started_by = 'dead-owner',
+           last_heartbeat_at = now() - interval '10 minutes'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+
+    const reaperPool = {
+      query: vi.fn(async (query: string, params: unknown[] = []) => {
+        const result = await h.pool.query(query, params);
+        if (query.includes("pg_terminate_backend")) {
+          await h.repository.markAccountSyncStarted(h.account.id, "new-owner");
+        }
+        return result;
+      })
+    } as unknown as typeof h.pool;
+
+    try {
+      await expect(clearOrphanedLockForAccount(
+        reaperPool,
+        account.lock_id,
+        1_000
+      )).resolves.toBe(true);
+
+      const state = await h.pool.query<{
+        currently_syncing: boolean;
+        sync_started_by: string | null;
+      }>(
+        "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+        [h.account.id]
+      );
+      expect(state.rows[0]).toEqual({
+        currently_syncing: true,
+        sync_started_by: "new-owner"
+      });
+    } finally {
+      await releaseKilledClient(locker);
+      await h.repository.markAccountSyncYielded(h.account.id);
     }
   });
 
@@ -768,6 +852,570 @@ liveDb("live DB reliability lane", () => {
       [folder.id]
     );
     expect(countAfter.rows[0]?.headers_synced_count).toBe(countBefore);
+  });
+
+  it("rolls back earlier metadata statements when a later bounded chunk fails", async () => {
+    const h = await setupIntegration("live-atomic-split-metadata-batch", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 1) }).syncAccount(h.account.id, "manual");
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+    const countBefore = folder.headers_synced_count;
+    const attachment = (index: number) => ({
+      filename: `attachment-${index}.bin`,
+      mimeType: "application/octet-stream",
+      sizeBytes: 10,
+      disposition: "attachment" as const,
+      contentId: null,
+      partNumber: String(index + 1)
+    });
+    const first = messageMetadata(100);
+    first.attachments = Array.from({ length: 3_000 }, (_, index) => attachment(index));
+    const second = messageMetadata(101);
+    second.attachments = Array.from({ length: 3_000 }, (_, index) => attachment(index));
+    second.attachments[0] = {
+      ...second.attachments[0],
+      disposition: "invalid" as "attachment"
+    };
+
+    await expect(h.repository.upsertMessages(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [first, second],
+      new Date("2026-01-01T00:00:00.000Z")
+    )).rejects.toThrow();
+
+    const persisted = await h.pool.query<{ messages: string; attachments: string }>(
+      `SELECT count(DISTINCT m.id)::text AS messages,
+              count(a.id)::text AS attachments
+       FROM public.imap_messages m
+       LEFT JOIN public.imap_attachments a ON a.message_id = m.id
+       WHERE m.account_id = $1
+         AND m.folder_path = 'INBOX'
+         AND m.uid = ANY($2::bigint[])`,
+      [h.account.id, [100, 101]]
+    );
+    expect(persisted.rows[0]).toEqual({ messages: "0", attachments: "0" });
+    const countAfter = await h.pool.query<{ headers_synced_count: number }>(
+      "SELECT headers_synced_count FROM public.imap_folders WHERE id = $1",
+      [folder.id]
+    );
+    expect(countAfter.rows[0]?.headers_synced_count).toBe(countBefore);
+  });
+
+  it("serializes overlapping repository batches and counts each new UID once", async () => {
+    const h = await setupIntegration("live-concurrent-metadata-batches", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+
+    const [first, second] = await Promise.all([
+      h.repository.upsertMessages(
+        h.account.id,
+        folder,
+        Number(folder.uidvalidity),
+        [messageMetadata(100), messageMetadata(101)],
+        new Date("2026-01-01T00:00:00.000Z")
+      ),
+      h.repository.upsertMessages(
+        h.account.id,
+        folder,
+        Number(folder.uidvalidity),
+        [messageMetadata(101), messageMetadata(102)],
+        new Date("2026-01-01T00:00:00.000Z")
+      )
+    ]);
+
+    expect(first.map((row) => Number(row.uid))).toEqual([100, 101]);
+    expect(second.map((row) => Number(row.uid))).toEqual([101, 102]);
+    const state = await h.pool.query<{ count: string; headers_synced_count: number }>(
+      `SELECT count(m.id)::text AS count, f.headers_synced_count
+       FROM public.imap_folders f
+       LEFT JOIN public.imap_messages m ON m.folder_id = f.id
+       WHERE f.id = $1
+       GROUP BY f.id`,
+      [folder.id]
+    );
+    expect(state.rows[0]).toEqual({ count: "3", headers_synced_count: 3 });
+  });
+
+  it("serializes UIDVALIDITY reset with stale metadata writes", async () => {
+    const h = await setupIntegration("live-uidvalidity-reset-metadata-race", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing synced account");
+    const oldUidValidity = Number(folder.uidvalidity);
+    const newUidValidity = oldUidValidity + 1;
+
+    await h.pool.query(
+      "UPDATE public.imap_folders SET uidvalidity = NULL WHERE id = $1",
+      [folder.id]
+    );
+    await h.repository.upsertMessages(
+      h.account.id,
+      folder,
+      oldUidValidity,
+      [messageMetadata(99)],
+      new Date("2026-01-01T00:00:00.000Z")
+    );
+    const initialized = await h.pool.query<{ uidvalidity: string; headers_synced_count: number }>(
+      "SELECT uidvalidity::text, headers_synced_count FROM public.imap_folders WHERE id = $1",
+      [folder.id]
+    );
+    expect(initialized.rows[0]).toEqual({
+      uidvalidity: String(oldUidValidity),
+      headers_synced_count: 1
+    });
+
+    const blocker = new PostgresClient({ connectionString: process.env.DATABASE_URL });
+    await blocker.connect();
+    await blocker.query("BEGIN");
+    const blockerPid = Number((await blocker.query<{ pid: number }>(
+      "SELECT pg_backend_pid() AS pid"
+    )).rows[0].pid);
+    await blocker.query("SELECT id FROM public.imap_folders WHERE id = $1 FOR UPDATE", [folder.id]);
+
+    const resetPromise = h.repository.handleUidValidityReset(account, folder, newUidValidity);
+    void resetPromise.catch(() => undefined);
+    const stalePool = new PostgresPool({ connectionString: process.env.DATABASE_URL, max: 1 });
+    const staleRepository = new MirrorRepository(stalePool, getConfig());
+    let staleWritePromise!: ReturnType<typeof h.repository.upsertMessages>;
+    try {
+      await waitForBlockedQuery(blocker, blockerPid, "uidvalidity_reset_count");
+      staleWritePromise = staleRepository.upsertMessages(
+        h.account.id,
+        folder,
+        oldUidValidity,
+        [messageMetadata(100)],
+        new Date("2026-01-01T00:00:00.000Z")
+      );
+      void staleWritePromise.catch(() => undefined);
+      await waitForBlockedQuery(blocker, blockerPid, "SELECT id, uidvalidity::text");
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      await blocker.end();
+      await stalePool.end();
+    }
+
+    const [reset, staleWrite] = await Promise.allSettled([resetPromise, staleWritePromise]);
+    expect(reset.status).toBe("fulfilled");
+    expect(staleWrite.status).toBe("rejected");
+
+    await expect(h.repository.upsertMessages(
+      h.account.id,
+      folder,
+      oldUidValidity,
+      [messageMetadata(101)],
+      new Date("2026-01-01T00:00:00.000Z")
+    )).rejects.toThrow(/no longer matches folder/);
+    await expect(h.repository.markFolderSynced(folder.id, {
+      uidValidity: oldUidValidity,
+      lastUid: 101,
+      initialComplete: true
+    })).rejects.toThrow(/lost generation/);
+    await expect(h.repository.advanceInitialSyncWatermark(
+      folder.id,
+      99,
+      101,
+      oldUidValidity
+    )).rejects.toThrow(/lost folder generation/);
+    await expect(h.repository.advanceHistoryBackfillWatermark(
+      folder.id,
+      99,
+      101,
+      oldUidValidity
+    )).rejects.toThrow(/lost folder generation/);
+    await expect(h.repository.setHistoryBackfillSnapshot(
+      folder.id,
+      101,
+      102,
+      1,
+      new Date("2026-01-01T00:00:00.000Z"),
+      oldUidValidity
+    )).rejects.toThrow(/lost folder generation/);
+    await expect(h.repository.markHistoryBackfillComplete(
+      folder.id,
+      oldUidValidity
+    )).rejects.toThrow(/lost folder generation/);
+
+    const state = await h.pool.query<{
+      uidvalidity: string;
+      headers_synced_count: number;
+      active_old_generation: string;
+    }>(
+      `SELECT f.uidvalidity::text,
+              f.headers_synced_count,
+              count(m.id) FILTER (
+                WHERE m.uidvalidity = $2 AND m.deleted_in_provider = false
+              )::text AS active_old_generation
+       FROM public.imap_folders f
+       LEFT JOIN public.imap_messages m ON m.folder_id = f.id
+       WHERE f.id = $1
+       GROUP BY f.id`,
+      [folder.id, oldUidValidity]
+    );
+    expect(state.rows[0]).toEqual({
+      uidvalidity: String(newUidValidity),
+      headers_synced_count: 0,
+      active_old_generation: "0"
+    });
+  });
+
+  it("times out behind the folder lock without changing messages or counters", async () => {
+    const h = await setupIntegration("live-metadata-lock-timeout", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+
+    const blocker = new PostgresClient({ connectionString: process.env.DATABASE_URL });
+    await blocker.connect();
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM public.imap_folders WHERE id = $1 FOR UPDATE", [folder.id]);
+      await expect(h.repository.upsertMessages(
+        h.account.id,
+        folder,
+        Number(folder.uidvalidity),
+        [messageMetadata(100)],
+        new Date("2026-01-01T00:00:00.000Z"),
+        { deadlineAt: Date.now() + 75 }
+      )).rejects.toThrow();
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      await blocker.end();
+    }
+
+    const state = await h.pool.query<{ count: string; headers_synced_count: number }>(
+      `SELECT count(m.id)::text AS count, f.headers_synced_count
+       FROM public.imap_folders f
+       LEFT JOIN public.imap_messages m ON m.folder_id = f.id
+       WHERE f.id = $1
+       GROUP BY f.id`,
+      [folder.id]
+    );
+    expect(state.rows[0]).toEqual({ count: "0", headers_synced_count: 0 });
+    await expect(h.pool.query("SELECT 1 AS ok")).resolves.toMatchObject({ rows: [{ ok: 1 }] });
+  });
+
+  it("cancels a blocked metadata transaction and releases the account lock on shutdown", async () => {
+    const h = await setupIntegration("live-metadata-shutdown-abort", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      INCREMENTAL_TOTAL_TIMEOUT_MS: 30_000
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = oneFolder("INBOX", 1);
+    let pauseIncrementalFetch = false;
+    let notifyFetchStarted!: () => void;
+    let resumeFetch!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      notifyFetchStarted = resolve;
+    });
+    const fetchCanResume = new Promise<void>((resolve) => {
+      resumeFetch = resolve;
+    });
+    class PausingFixtureImapClient extends FixtureImapClient {
+      override async *fetch(
+        range: Parameters<MirrorImapClient["fetch"]>[0],
+        query: Parameters<MirrorImapClient["fetch"]>[1],
+        options?: Parameters<MirrorImapClient["fetch"]>[2]
+      ): AsyncIterable<FetchMessage> {
+        if (pauseIncrementalFetch && Array.isArray(range) && query.envelope === true) {
+          notifyFetchStarted();
+          await fetchCanResume;
+        }
+        void options;
+        yield* super.fetch(range, query);
+      }
+    }
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => new PausingFixtureImapClient(folders)
+    });
+    await engine.syncAccount(h.account.id, "manual");
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing synced account");
+    const healthBefore = await h.pool.query<{
+      sync_state: string;
+      sync_state_reason: string | null;
+      consecutive_failures: number;
+      consecutive_successes: number;
+    }>(
+      `SELECT sync_state, sync_state_reason, consecutive_failures, consecutive_successes
+       FROM public.imap_accounts WHERE id = $1`,
+      [h.account.id]
+    );
+
+    folders[0].messages.push(makeTextMessage({
+      uid: 2,
+      subject: "arrived-before-shutdown",
+      from: "sender@example.test",
+      to: "user@example.test",
+      body: "arrived-before-shutdown",
+      flags: ["\\Seen"]
+    }));
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET next_sync_due_at = now() - interval '1 second',
+           next_flag_scan_at = now() + interval '1 hour',
+           next_reconcile_at = now() + interval '1 hour'
+       WHERE id = $1`,
+      [folder.id]
+    );
+
+    const blocker = new PostgresClient({ connectionString: process.env.DATABASE_URL });
+    await blocker.connect();
+    const abort = new AbortController();
+    let sync: Promise<[Awaited<ReturnType<typeof engine.syncAccount>>]> | null = null;
+    try {
+      pauseIncrementalFetch = true;
+      sync = engine.syncAccount(h.account.id, "scheduled", { signal: abort.signal })
+        .then((result) => [result]);
+      await timeout(fetchStarted, "incremental metadata fetch to start");
+
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM public.imap_folders WHERE id = $1 FOR UPDATE", [folder.id]);
+      const blockerPid = await blocker.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+      resumeFetch();
+
+      await vi.waitFor(async () => {
+        const waiting = await h.pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND $1 = ANY(pg_blocking_pids(pid))`,
+          [blockerPid.rows[0].pid]
+        );
+        expect(waiting.rows[0].count).toBe("1");
+      }, { timeout: 2_000, interval: 10 });
+
+      const abortedAt = Date.now();
+      abort.abort();
+      const stoppedAfterMs = await Promise.race([
+        sync.then(() => Date.now() - abortedAt),
+        new Promise<number>((resolve) => setTimeout(() => resolve(5_000), 5_000))
+      ]);
+      expect(stoppedAfterMs).toBeLessThan(1_000);
+      const [result] = await sync;
+      expect(result.outcome).toBe("partial_success");
+      expect(result.errors).toEqual(["Sync interrupted by scheduler"]);
+    } finally {
+      abort.abort();
+      resumeFetch();
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      await blocker.end();
+      if (sync) await sync.catch(() => undefined);
+    }
+
+    const state = await h.pool.query<{
+      message_count: string;
+      headers_synced_count: number;
+      currently_syncing: boolean;
+      sync_started_by: string | null;
+    }>(
+      `SELECT count(m.id)::text AS message_count,
+              f.headers_synced_count,
+              a.currently_syncing,
+              a.sync_started_by
+       FROM public.imap_accounts a
+       JOIN public.imap_folders f ON f.account_id = a.id AND f.id = $2
+       LEFT JOIN public.imap_messages m ON m.folder_id = f.id
+       WHERE a.id = $1
+       GROUP BY f.id, a.id`,
+      [h.account.id, folder.id]
+    );
+    expect(state.rows[0]).toEqual({
+      message_count: "1",
+      headers_synced_count: 1,
+      currently_syncing: false,
+      sync_started_by: null
+    });
+    const healthAfter = await h.pool.query<{
+      sync_state: string;
+      sync_state_reason: string | null;
+      consecutive_failures: number;
+      consecutive_successes: number;
+    }>(
+      `SELECT sync_state, sync_state_reason, consecutive_failures, consecutive_successes
+       FROM public.imap_accounts WHERE id = $1`,
+      [h.account.id]
+    );
+    expect(healthAfter.rows[0]).toEqual(healthBefore.rows[0]);
+    const locks = await h.pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM pg_locks
+       WHERE locktype = 'advisory'
+         AND granted = true
+         AND objid::bigint = $1::bigint`,
+      [account.lock_id]
+    );
+    expect(locks.rows[0].count).toBe("0");
+  });
+
+  it("releases the account lock before bounded cancellation cleanup", async () => {
+    const h = await setupIntegration("live-shutdown-account-cleanup-lock", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = oneFolder("INBOX", 1);
+    let pauseMailbox = false;
+    let notifyMailboxStarted!: () => void;
+    let resumeMailbox!: () => void;
+    const mailboxStarted = new Promise<void>((resolve) => {
+      notifyMailboxStarted = resolve;
+    });
+    const mailboxCanResume = new Promise<void>((resolve) => {
+      resumeMailbox = resolve;
+    });
+    class BlockingFixtureImapClient extends FixtureImapClient {
+      close(): void {
+        resumeMailbox();
+      }
+
+      override async getMailboxLock(path: string) {
+        if (pauseMailbox && path === "INBOX") {
+          notifyMailboxStarted();
+          await mailboxCanResume;
+        }
+        return await super.getMailboxLock(path);
+      }
+    }
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => new BlockingFixtureImapClient(folders)
+    });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      "UPDATE public.imap_folders SET next_sync_due_at = now() - interval '1 second' WHERE account_id = $1",
+      [h.account.id]
+    );
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing synced account");
+
+    let notifyCleanupEntered!: () => void;
+    const cleanupEntered = new Promise<void>((resolve) => {
+      notifyCleanupEntered = resolve;
+    });
+    const originalYield = h.repository.markAccountSyncYielded.bind(h.repository);
+    vi.spyOn(h.repository, "markAccountSyncYielded").mockImplementation(async (...args) => {
+      notifyCleanupEntered();
+      return await originalYield(...args);
+    });
+
+    const blocker = new PostgresClient({ connectionString: process.env.DATABASE_URL });
+    await blocker.connect();
+    const abort = new AbortController();
+    pauseMailbox = true;
+    const sync = engine.syncAccount(h.account.id, "scheduled", { signal: abort.signal });
+    let syncSettled = false;
+    void sync.finally(() => {
+      syncSettled = true;
+    });
+    try {
+      await timeout(mailboxStarted, "mailbox operation to start");
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM public.imap_accounts WHERE id = $1 FOR UPDATE", [h.account.id]);
+
+      const abortedAt = Date.now();
+      abort.abort();
+      await timeout(cleanupEntered, "cancellation cleanup to start");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(syncSettled).toBe(false);
+
+      const locks = await h.pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM pg_locks
+         WHERE locktype = 'advisory'
+           AND granted = true
+           AND objid::bigint = $1::bigint`,
+        [account.lock_id]
+      );
+      expect(locks.rows[0].count).toBe("0");
+      await blocker.query("ROLLBACK");
+
+      const result = await timeout(sync, "sync cancellation cleanup", 1_500);
+      expect(Date.now() - abortedAt).toBeLessThan(1_500);
+      expect(result.outcome).toBe("partial_success");
+      expect(result.errors).toEqual(["Sync interrupted by scheduler"]);
+    } finally {
+      abort.abort();
+      resumeMailbox();
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      await blocker.end();
+      await sync.catch(() => undefined);
+    }
+
+    const active = await h.pool.query<{ currently_syncing: boolean }>(
+      "SELECT currently_syncing FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(active.rows[0].currently_syncing).toBe(false);
+  });
+
+  it("fences delayed cancellation cleanup from a newer sync owner", async () => {
+    const h = await setupIntegration("live-shutdown-cleanup-owner-fence");
+    activeAccountIds.push(h.account.id);
+    await h.repository.markAccountSyncStarted(h.account.id, "new-owner");
+
+    await h.repository.markAccountSyncYielded(h.account.id, {
+      expectedSyncOwner: "old-owner",
+      deadlineAt: Date.now() + 1_000
+    });
+
+    const state = await h.pool.query<{
+      currently_syncing: boolean;
+      sync_started_by: string | null;
+    }>(
+      "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]).toEqual({
+      currently_syncing: true,
+      sync_started_by: "new-owner"
+    });
+  });
+
+  it("immediately reschedules an active projection when no advisory owner exists", async () => {
+    const h = await setupIntegration("live-shutdown-cleanup-runnable", {
+      STALE_HEARTBEAT_MS: 300_000
+    });
+    activeAccountIds.push(h.account.id);
+    await h.repository.markAccountSyncStarted(h.account.id, "orphaned-projection");
+
+    const runnable = await h.repository.getRunnableAccounts(25);
+    expect(runnable.map((account) => account.id)).toContain(h.account.id);
   });
 
   it("counts committed metadata even when a later hook fails", async () => {

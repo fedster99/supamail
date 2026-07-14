@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { getConfig, isWithinBackfillWindow, resetConfigForTests } from "../config.js";
+import {
+  getConfig,
+  isWithinBackfillWindow,
+  MAX_SYNC_BATCH_SIZE,
+  resetConfigForTests
+} from "../config.js";
 
 const baseEnv = {
   DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/postgres",
@@ -38,6 +43,24 @@ describe("config sent-folder polling", () => {
 
   it("accepts an independently tuned Sent interval", () => {
     expect(getConfig({ ...baseEnv, SENT_SYNC_INTERVAL_MS: "15000" }).SENT_SYNC_INTERVAL_MS).toBe(15_000);
+  });
+});
+
+describe("config sync batch bounds", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it.each([
+    "BODY_BACKFILL_BATCH_SIZE",
+    "INITIAL_SYNC_BATCH_SIZE",
+    "INCREMENTAL_SYNC_BATCH_SIZE"
+  ] as const)("caps %s before it can amplify a bulk database write", (name) => {
+    expect(getConfig({ ...baseEnv, [name]: String(MAX_SYNC_BATCH_SIZE) })[name])
+      .toBe(MAX_SYNC_BATCH_SIZE);
+    resetConfigForTests();
+    expect(() => getConfig({ ...baseEnv, [name]: String(MAX_SYNC_BATCH_SIZE + 1) }))
+      .toThrow();
   });
 });
 

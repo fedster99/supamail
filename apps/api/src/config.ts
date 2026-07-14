@@ -1,6 +1,9 @@
 import "dotenv/config";
 import { z } from "zod";
+import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
 import type { BodyFetchPolicy, BodyStorageMode } from "./types.js";
+
+export { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
 
 const optionalHourSchema = z.preprocess(
   (value) => (value === "" ? undefined : value),
@@ -41,11 +44,11 @@ const envSchema = z.object({
   // deployments where raw blob retention dominates database size.
   BODY_STORAGE_MODE: z.enum(["raw_mime", "parsed_only"]).default("raw_mime"),
   BODY_RAW_MAX_BYTES: z.coerce.number().int().positive().default(25 * 1024 * 1024),
-  BODY_BACKFILL_BATCH_SIZE: z.coerce.number().int().positive().default(25),
+  BODY_BACKFILL_BATCH_SIZE: z.coerce.number().int().positive().max(MAX_SYNC_BATCH_SIZE).default(25),
   MAX_BODY_BATCHES_PER_TICK: z.coerce.number().int().positive().default(4),
-  INITIAL_SYNC_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  INITIAL_SYNC_BATCH_SIZE: z.coerce.number().int().positive().max(MAX_SYNC_BATCH_SIZE).default(50),
   INITIAL_SYNC_BATCH_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),
-  INCREMENTAL_SYNC_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  INCREMENTAL_SYNC_BATCH_SIZE: z.coerce.number().int().positive().max(MAX_SYNC_BATCH_SIZE).default(50),
   INCREMENTAL_TOTAL_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),
   FOLDER_DISCOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(15 * 60_000),
   FLAG_DIFF_WINDOW_DAYS: z.coerce.number().int().positive().default(7),
