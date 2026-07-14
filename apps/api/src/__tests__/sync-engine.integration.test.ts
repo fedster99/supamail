@@ -70,6 +70,25 @@ async function markCurrentTrackedFoldersClean(h: { pool: ReturnType<typeof getPo
   await h.repository.markAccountSyncSucceeded(h.account.id);
 }
 
+async function accountHealthSnapshot(pool: ReturnType<typeof getPool>, accountId: string) {
+  return (
+    await pool.query<{
+      sync_state: string;
+      sync_state_reason: string | null;
+      consecutive_failures: number;
+      consecutive_successes: number;
+      last_sync_finished_at: Date | null;
+      last_priority_sync_succeeded_at: Date | null;
+      backoff_until: Date | null;
+    }>(
+      `SELECT sync_state, sync_state_reason, consecutive_failures, consecutive_successes,
+              last_sync_finished_at, last_priority_sync_succeeded_at, backoff_until
+       FROM public.imap_accounts WHERE id = $1`,
+      [accountId]
+    )
+  ).rows[0];
+}
+
 integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   const activeAccountIds: string[] = [];
 
@@ -282,6 +301,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     activeAccountIds.push(h.account.id);
     const account = await h.repository.getAccount(h.account.id);
     if (!account) throw new Error("missing account");
+    const healthBefore = await accountHealthSnapshot(h.pool, h.account.id);
     let markStarted!: () => void;
     const started = new Promise<void>((resolve) => {
       markStarted = resolve;
@@ -321,7 +341,63 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const state = await h.repository.getAccount(h.account.id);
     expect(state?.currently_syncing).toBe(false);
     expect(state?.sync_started_by).toBeNull();
+    expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
   });
+
+  it.each(["body", "history"] as const)(
+    "recognizes shutdown after the %s lane without changing account health",
+    async (lane) => {
+      const h = await setupIntegration(`full-sync-${lane}-abort`);
+      activeAccountIds.push(h.account.id);
+      const folders = buildInboxAndSentFolders();
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      await dueAllFolders(h.pool, h.account.id);
+      const account = await h.repository.getAccount(h.account.id);
+      if (!account) throw new Error("missing account");
+      const healthBefore = await accountHealthSnapshot(h.pool, h.account.id);
+      const abort = new AbortController();
+      const internal = engine as unknown as {
+        fetchBodyBacklog: () => Promise<{ fetched: number; hitLockBudget: boolean }>;
+        runHistoryLane: () => Promise<{
+          messagesUpserted: number;
+          bodiesFetched: number;
+          hitLockBudget: boolean;
+          errors: string[];
+        }>;
+      };
+
+      if (lane === "body") {
+        vi.spyOn(internal, "fetchBodyBacklog").mockImplementation(async () => {
+          abort.abort();
+          return { fetched: 0, hitLockBudget: false };
+        });
+      } else {
+        vi.spyOn(internal, "runHistoryLane").mockImplementation(async () => {
+          abort.abort();
+          return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
+        });
+      }
+
+      const [result] = await engine.syncDueAccounts(1, { signal: abort.signal });
+
+      expect(result.outcome).toBe("partial_success");
+      expect(result.errors).toEqual(["Sync interrupted by scheduler"]);
+      expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
+      const state = await h.repository.getAccount(h.account.id);
+      expect(state?.currently_syncing).toBe(false);
+      expect(state?.sync_started_by).toBeNull();
+      const locks = await h.pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM pg_locks
+         WHERE locktype = 'advisory'
+           AND granted = true
+           AND objid::bigint = $1::bigint`,
+        [account.lock_id]
+      );
+      expect(locks.rows[0].count).toBe("0");
+    }
+  );
 
   it("treats a scheduler abort during Sent connection setup as a neutral yield", async () => {
     const h = await setupIntegration("sent-fast-pass-connect-abort");
