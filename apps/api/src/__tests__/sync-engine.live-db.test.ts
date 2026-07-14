@@ -1,9 +1,10 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resetConfigForTests } from "../config.js";
 import { closePool, getPool, type PgClient } from "../db.js";
 import { clearOrphanedLocks } from "../locks.js";
 import type { MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
+import type { ImapFolder, MessageMetadata } from "../types.js";
 import {
   backdateMissingSince,
   buildInboxAndSentFolders,
@@ -39,6 +40,32 @@ function oneFolder(path = "INBOX", messages = 2): FixtureFolder[] {
       flags: ["\\Seen"]
     }))
   }];
+}
+
+function messageMetadata(uid: number, overrides: Partial<MessageMetadata> = {}): MessageMetadata {
+  return {
+    uid,
+    internalDate: new Date("2026-06-01T00:00:00.000Z"),
+    sizeBytes: 100,
+    flags: ["\\Seen"],
+    rfcMessageId: `<metadata-${uid}@example.test>`,
+    messageIdNormalized: `metadata-${uid}@example.test`,
+    providerThreadId: null,
+    inReplyTo: null,
+    referencesHeader: null,
+    subject: `metadata-${uid}`,
+    fromEmail: "sender@example.test",
+    fromName: "Sender",
+    toEmails: ["user@example.test"],
+    toNames: ["User"],
+    ccEmails: [],
+    ccNames: [],
+    bccEmails: [],
+    headersJson: { "message-id": `<metadata-${uid}@example.test>` },
+    mimeStructure: null,
+    attachments: [],
+    ...overrides
+  };
 }
 
 async function releaseKilledClient(client: PgClient): Promise<void> {
@@ -549,15 +576,72 @@ liveDb("live DB reliability lane", () => {
   });
 
   it("flag scans update known rows only and emit FLAGS_CHANGED", async () => {
-    const h = await setupIntegration("live-flags", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    const h = await setupIntegration("live-flags", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      INCREMENTAL_SYNC_BATCH_SIZE: 2
+    });
     activeAccountIds.push(h.account.id);
-    const folders = oneFolder("INBOX", 2);
-    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    const folders = oneFolder("INBOX", 3);
+    folders[0].messages[0].uid = 2;
+    folders[0].messages[1].uid = 3;
+    folders[0].messages[2].uid = 4;
+    const fetchQueries: Record<string, unknown>[] = [];
+    const hookUids: number[] = [];
+    class TrackingImapClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        _options?: Record<string, unknown>
+      ) {
+        fetchQueries.push(query);
+        yield* super.fetch(range, query);
+      }
+    }
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50 },
+      clientFactory: async () => new TrackingImapClient(folders),
+      hooks: {
+        onMessageUpsert(message) {
+          hookUids.push(Number(message.uid));
+        }
+      }
+    });
     await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET flags = ARRAY['\\seen']::text[]
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 3
+      `,
+      [h.account.id]
+    );
+
+    const before = await h.pool.query<{
+      uid: string;
+      subject: string | null;
+      headers_json: Record<string, unknown>;
+      mime_structure: unknown;
+      updated_at: Date;
+    }>(
+      `
+      SELECT uid::text AS uid, subject, headers_json, mime_structure, updated_at
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX'
+      ORDER BY uid
+      `,
+      [h.account.id]
+    );
+    const folderBefore = await h.pool.query<{ headers_synced_count: number }>(
+      "SELECT headers_synced_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    hookUids.length = 0;
+    fetchQueries.length = 0;
 
     folders[0].messages[0].flags = ["\\Seen", "\\Flagged"];
     folders[0].messages.push(makeTextMessage({
-      uid: 0,
+      uid: 1,
       subject: "unknown",
       from: "sender@example.test",
       to: "user@example.test",
@@ -577,33 +661,338 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
 
+    const flagWrites = vi.spyOn(h.repository, "applyFlagScan");
     const result = await engine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("success");
     expect(result.flagsUpdated).toBe(1);
+    expect(hookUids).toEqual([2, 3, 4]);
+    expect(flagWrites).toHaveBeenCalledTimes(2);
+    expect(flagWrites.mock.calls.every((call) => call[3].length <= 2)).toBe(true);
+    flagWrites.mockRestore();
 
-    const rows = await h.pool.query<{ uid: string; flags: string[] }>(
+    const projectedFlagFetch = fetchQueries.find((query) => query.flags === true);
+    expect(projectedFlagFetch).toEqual({ uid: true, flags: true });
+
+    const rows = await h.pool.query<{
+      uid: string;
+      flags: string[];
+      subject: string | null;
+      headers_json: Record<string, unknown>;
+      mime_structure: unknown;
+      updated_at: Date;
+    }>(
       `
-      SELECT uid::text AS uid, flags
+      SELECT uid::text AS uid, flags, subject, headers_json, mime_structure, updated_at
       FROM public.imap_messages
       WHERE account_id = $1 AND folder_path = 'INBOX'
       ORDER BY uid
       `,
       [h.account.id]
     );
-    expect(rows.rows.map((row) => Number(row.uid))).toEqual([1, 2]);
+    expect(rows.rows.map((row) => Number(row.uid))).toEqual([2, 3, 4]);
     expect(rows.rows[0].flags.map((flag) => flag.toLowerCase())).toContain("\\flagged");
+    expect(rows.rows[1].flags).toEqual(["\\Seen"]);
+    expect(rows.rows[0].updated_at.getTime()).toBeGreaterThan(before.rows[0].updated_at.getTime());
+    expect(rows.rows[1].updated_at.getTime()).toBeGreaterThan(before.rows[1].updated_at.getTime());
+    expect(rows.rows[2].updated_at.getTime()).toBe(before.rows[2].updated_at.getTime());
+    for (let index = 0; index < rows.rows.length; index += 1) {
+      expect(rows.rows[index].subject).toBe(before.rows[index].subject);
+      expect(rows.rows[index].headers_json).toEqual(before.rows[index].headers_json);
+      expect(rows.rows[index].mime_structure).toEqual(before.rows[index].mime_structure);
+    }
+    const folderAfter = await h.pool.query<{ headers_synced_count: number }>(
+      "SELECT headers_synced_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    expect(folderAfter.rows[0]).toEqual(folderBefore.rows[0]);
 
-    const event = await h.pool.query<{ payload: { nextFlags: string[] } }>(
+    const event = await h.pool.query<{ payload: { nextFlags: string[] }; count: string }>(
       `
-      SELECT payload
+      SELECT min(payload::text)::jsonb AS payload, count(*)::text AS count
       FROM public.imap_sync_events
       WHERE account_id = $1 AND event_type = 'FLAGS_CHANGED'
-      ORDER BY occurred_at DESC
-      LIMIT 1
       `,
       [h.account.id]
     );
+    expect(event.rows[0]?.count).toBe("1");
     expect(event.rows[0]?.payload.nextFlags).toContain("\\flagged");
+  });
+
+  it("rolls back an entire metadata batch when one attachment write fails", async () => {
+    const h = await setupIntegration("live-atomic-metadata-batch", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const folders = oneFolder("INBOX", 1);
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity) throw new Error("missing synced folder");
+    const countBefore = folder.headers_synced_count;
+    const first = messageMetadata(100);
+    const second = messageMetadata(101);
+    second.attachments = [{
+      filename: "invalid.bin",
+      mimeType: "application/octet-stream",
+      sizeBytes: 10,
+      disposition: "invalid" as "attachment",
+      contentId: null,
+      partNumber: "1"
+    }];
+
+    await expect(
+      h.repository.upsertMessages(
+        h.account.id,
+        folder,
+        Number(folder.uidvalidity),
+        [first, second],
+        new Date("2026-01-01T00:00:00.000Z")
+      )
+    ).rejects.toThrow();
+
+    const persisted = await h.pool.query<{ uid: string }>(
+      `
+      SELECT uid::text AS uid
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = ANY($2::bigint[])
+      ORDER BY uid
+      `,
+      [h.account.id, [100, 101]]
+    );
+    expect(persisted.rows).toEqual([]);
+    const countAfter = await h.pool.query<{ headers_synced_count: number }>(
+      "SELECT headers_synced_count FROM public.imap_folders WHERE id = $1",
+      [folder.id]
+    );
+    expect(countAfter.rows[0]?.headers_synced_count).toBe(countBefore);
+  });
+
+  it("counts committed metadata even when a later hook fails", async () => {
+    const h = await setupIntegration("live-metadata-throughput-commit", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const result = await h.buildEngine({
+      folders: oneFolder("INBOX", 2),
+      hooks: {
+        onMessageUpsert() {
+          throw new Error("forced post-commit hook failure");
+        }
+      }
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.messagesUpserted).toBe(0);
+    expect(result.metadataRowsCommitted).toBe(2);
+    expect(result.metadataWriteBatchesAttempted).toBe(1);
+    expect(result.metadataWriteBatchesFailed).toBe(0);
+    expect(result.metadataWriteDurationMs).toBeGreaterThan(0);
+    expect(result.metadataWriteServiceRowsPerSecond).toBeGreaterThan(0);
+
+    const run = await h.pool.query<{
+      messages_upserted: number;
+      metadata: Record<string, unknown>;
+    }>(
+      "SELECT messages_upserted, metadata FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0]?.messages_upserted).toBe(0);
+    expect(run.rows[0]?.metadata).toMatchObject({
+      metadataRowsCommitted: 2,
+      metadataWriteBatchesAttempted: 1,
+      metadataWriteBatchesFailed: 0
+    });
+  });
+
+  it("records a real rolled-back metadata batch as time spent with zero committed rows", async () => {
+    const h = await setupIntegration("live-metadata-throughput-failure", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const originalWrite = h.repository.upsertMessages.bind(h.repository);
+    const write = vi.spyOn(h.repository, "upsertMessages").mockImplementation(async (...args) => {
+      args[3][0].attachments = [{
+        filename: "invalid.bin",
+        mimeType: "application/octet-stream",
+        sizeBytes: 10,
+        disposition: "invalid" as "attachment",
+        contentId: null,
+        partNumber: "1"
+      }];
+      return originalWrite(...args);
+    });
+
+    try {
+      const result = await h.buildEngine({ folders: oneFolder("INBOX", 2) }).syncAccount(h.account.id, "manual");
+      expect(result.metadataRowsCommitted).toBe(0);
+      expect(result.metadataWriteBatchesAttempted).toBe(1);
+      expect(result.metadataWriteBatchesFailed).toBe(1);
+      expect(result.metadataWriteDurationMs).toBeGreaterThan(0);
+      expect(result.metadataWriteServiceRowsPerSecond).toBe(0);
+
+      const persisted = await h.pool.query<{ uid: string }>(
+        "SELECT uid::text AS uid FROM public.imap_messages WHERE account_id = $1 ORDER BY uid",
+        [h.account.id]
+      );
+      expect(persisted.rows).toEqual([]);
+      const folder = await h.pool.query<{ headers_synced_count: number }>(
+        "SELECT headers_synced_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      );
+      expect(folder.rows[0]?.headers_synced_count).toBe(0);
+
+      const run = await h.pool.query<{ metadata: Record<string, unknown> }>(
+        "SELECT metadata FROM public.imap_sync_runs WHERE id = $1",
+        [result.runId]
+      );
+      expect(run.rows[0]?.metadata).toMatchObject({
+        metadataRowsCommitted: 0,
+        metadataWriteBatchesAttempted: 1,
+        metadataWriteBatchesFailed: 1,
+        metadataWriteServiceRowsPerSecond: 0
+      });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it("keeps bulk metadata retries, flags, attachments, and counters compatible", async () => {
+    const h = await setupIntegration("live-bulk-metadata-semantics", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 1) }).syncAccount(h.account.id, "manual");
+
+    const folder = (
+      await h.pool.query<ImapFolder>(
+        "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )
+    ).rows[0];
+    const existingMessage = (
+      await h.pool.query<{ id: string }>(
+        "SELECT id FROM public.imap_messages WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1",
+        [h.account.id]
+      )
+    ).rows[0];
+    if (!folder?.uidvalidity || !existingMessage) throw new Error("missing synced fixture rows");
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_attachments (message_id, filename, part_number, disposition, storage_key)
+      VALUES
+        ($1, 'old.pdf', '2', 'attachment', 'keep-this-key'),
+        ($1, 'keep.pdf', '3', 'attachment', 'also-keep')
+      `,
+      [existingMessage.id]
+    );
+    await h.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET deleted_in_provider = true,
+          provider_deleted_at = now(),
+          deleted_reason = 'PROVIDER_DELETED'
+      WHERE id = $1
+      `,
+      [existingMessage.id]
+    );
+
+    const newMessage = messageMetadata(100, {
+      flags: ["\\Flagged"],
+      attachments: [{
+        filename: "new.txt",
+        mimeType: "text/plain",
+        sizeBytes: 12,
+        disposition: "attachment",
+        contentId: null,
+        partNumber: "1"
+      }]
+    });
+    const existingUpdate = messageMetadata(1, {
+      flags: ["\\Flagged"],
+      headersJson: { "x-bulk-refresh": "yes" },
+      mimeStructure: { refreshed: true },
+      attachments: [{
+        filename: "updated.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 200,
+        disposition: "attachment",
+        contentId: null,
+        partNumber: "2"
+      }]
+    });
+
+    const firstWrite = await h.repository.upsertMessages(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [newMessage, existingUpdate],
+      new Date("2026-01-01T00:00:00.000Z"),
+      { preserveExistingFlags: true }
+    );
+    expect(firstWrite.map((row) => Number(row.uid))).toEqual([100, 1]);
+
+    const afterFirstWrite = await h.pool.query<{
+      uid: string;
+      flags: string[];
+      headers_json: Record<string, unknown>;
+      mime_structure: unknown;
+      deleted_in_provider: boolean;
+    }>(
+      `
+      SELECT uid::text AS uid, flags, headers_json, mime_structure, deleted_in_provider
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = ANY($2::bigint[])
+      ORDER BY uid
+      `,
+      [h.account.id, [1, 100]]
+    );
+    expect(afterFirstWrite.rows[0]).toMatchObject({
+      uid: "1",
+      flags: ["\\Seen"],
+      headers_json: { "x-bulk-refresh": "yes" },
+      mime_structure: { refreshed: true },
+      deleted_in_provider: false
+    });
+    expect(afterFirstWrite.rows[1]).toMatchObject({ uid: "100", flags: ["\\Flagged"] });
+
+    const attachments = await h.pool.query<{
+      uid: string;
+      part_number: string;
+      filename: string | null;
+      storage_key: string | null;
+    }>(
+      `
+      SELECT m.uid::text AS uid, a.part_number, a.filename, a.storage_key
+      FROM public.imap_attachments a
+      JOIN public.imap_messages m ON m.id = a.message_id
+      WHERE m.account_id = $1 AND m.folder_path = 'INBOX'
+      ORDER BY m.uid, a.part_number
+      `,
+      [h.account.id]
+    );
+    expect(attachments.rows).toEqual([
+      { uid: "1", part_number: "2", filename: "updated.pdf", storage_key: "keep-this-key" },
+      { uid: "1", part_number: "3", filename: "keep.pdf", storage_key: "also-keep" },
+      { uid: "100", part_number: "1", filename: "new.txt", storage_key: null }
+    ]);
+
+    await h.repository.upsertMessages(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [newMessage, existingUpdate],
+      new Date("2026-01-01T00:00:00.000Z")
+    );
+    const afterRetry = await h.pool.query<{ uid: string; flags: string[] }>(
+      `
+      SELECT uid::text AS uid, flags
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1
+      `,
+      [h.account.id]
+    );
+    expect(afterRetry.rows[0]).toEqual({ uid: "1", flags: ["\\Flagged"] });
+    const folderAfter = await h.pool.query<{ headers_synced_count: number }>(
+      "SELECT headers_synced_count FROM public.imap_folders WHERE id = $1",
+      [folder.id]
+    );
+    expect(folderAfter.rows[0]?.headers_synced_count).toBe(2);
   });
 
   it("reconcile owns missing-in-DB recovery and emits RECONCILE_BACKFILL", async () => {

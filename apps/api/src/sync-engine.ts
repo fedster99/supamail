@@ -2,7 +2,16 @@ import type { AppConfig } from "./config.js";
 import { getConfig, getWindowCutoff, isWithinBackfillWindow } from "./config.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
-import { fetchFullMessageBody, fetchMessageMetadata, iterateAllUids, MessageMovedError, searchUidsBefore, searchUidsSince } from "./imap-client.js";
+import { performance } from "node:perf_hooks";
+import {
+  fetchFullMessageBody,
+  fetchMessageFlags,
+  fetchMessageMetadata,
+  iterateAllUids,
+  MessageMovedError,
+  searchUidsBefore,
+  searchUidsSince
+} from "./imap-client.js";
 import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -11,6 +20,7 @@ import type {
   ImapFolder,
   ImapMessage,
   HistoryBacklogFolder,
+  MessageMetadata,
   MirrorHooks,
   SyncResult,
   SyncTriggerType
@@ -77,6 +87,30 @@ type HistoryBatchResult = {
   processed: boolean;
   hitLockBudget: boolean;
 };
+
+type MetadataWriteStats = {
+  rowsCommitted: number;
+  durationMs: number;
+  batchesAttempted: number;
+  batchesFailed: number;
+};
+
+export function metadataRowsPerSecond(rowsCommitted: number, durationMs: number): number | null {
+  if (!Number.isFinite(rowsCommitted) || rowsCommitted < 0) return null;
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return null;
+  return Math.round((rowsCommitted * 1000 / durationMs) * 100) / 100;
+}
+
+function applyMetadataWriteStats(result: SyncResult, stats: MetadataWriteStats): void {
+  const durationMs = stats.batchesAttempted > 0
+    ? Math.max(0.01, Math.round(stats.durationMs * 100) / 100)
+    : 0;
+  result.metadataRowsCommitted = stats.rowsCommitted;
+  result.metadataWriteDurationMs = durationMs;
+  result.metadataWriteBatchesAttempted = stats.batchesAttempted;
+  result.metadataWriteBatchesFailed = stats.batchesFailed;
+  result.metadataWriteServiceRowsPerSecond = metadataRowsPerSecond(stats.rowsCommitted, durationMs);
+}
 
 // Response codes that mean the credential itself was rejected (RFC 5530).
 const AUTH_RESPONSE_CODES = new Set(["AUTHENTICATIONFAILED", "AUTHORIZATIONFAILED", "EXPIRED"]);
@@ -290,11 +324,22 @@ export class MirrorEngine {
     if (!account) throw new Error(`Account not found: ${accountId}`);
 
     const runId = await this.repository.startSyncRun(account.id, triggerType);
+    const metadataWriteStats: MetadataWriteStats = {
+      rowsCommitted: 0,
+      durationMs: 0,
+      batchesAttempted: 0,
+      batchesFailed: 0
+    };
     const result: SyncResult = {
       runId,
       outcome: "success",
       foldersProcessed: 0,
       messagesUpserted: 0,
+      metadataRowsCommitted: 0,
+      metadataWriteDurationMs: 0,
+      metadataWriteBatchesAttempted: 0,
+      metadataWriteBatchesFailed: 0,
+      metadataWriteServiceRowsPerSecond: null,
       bodiesFetched: 0,
       flagsUpdated: 0,
       reconcileGapsFound: 0,
@@ -351,7 +396,8 @@ export class MirrorEngine {
               allowReconcile: !options.sentOnly && remainingReconciles > 0,
               allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
               enforceLockDeadline: !isPriorityFolder,
-              lockDeadline
+              lockDeadline,
+              metadataWriteStats
             });
             throwIfInterrupted();
             result.foldersProcessed += 1;
@@ -411,7 +457,7 @@ export class MirrorEngine {
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !connectionLost) {
-          const historyResult = await this.runHistoryLane(account, client, lockDeadline);
+          const historyResult = await this.runHistoryLane(account, client, lockDeadline, metadataWriteStats);
           result.messagesUpserted += historyResult.messagesUpserted;
           result.bodiesFetched += historyResult.bodiesFetched;
           result.errors.push(...historyResult.errors);
@@ -484,6 +530,8 @@ export class MirrorEngine {
         locked = await runLockedSync();
       }
     }
+
+    applyMetadataWriteStats(result, metadataWriteStats);
 
     if (locked === null && !yieldedBeforeLock) {
       result.outcome = "failed";
@@ -656,6 +704,7 @@ export class MirrorEngine {
       allowFlagScan: boolean;
       enforceLockDeadline: boolean;
       lockDeadline: number;
+      metadataWriteStats: MetadataWriteStats;
     }
   ): Promise<FolderSyncResult> {
     await this.repository.markFolderSyncStarted(folder.id);
@@ -712,7 +761,8 @@ export class MirrorEngine {
           client,
           uidValidity,
           uidNext,
-          windowCutoff
+          windowCutoff,
+          options.metadataWriteStats
         );
         return {
           messagesUpserted: initial.messagesUpserted,
@@ -750,12 +800,14 @@ export class MirrorEngine {
           "incremental FETCH",
           () => fetchMessageMetadata(client, batchUids, incrementalBatchSize)
         );
-        const messages = await this.repository.upsertMessages(
+        const messages = await this.upsertMetadataBatch(
+          options.metadataWriteStats,
           account.id,
           folder,
           uidValidity,
           metadata,
-          windowCutoff
+          windowCutoff,
+          { deadlineAt: incrementalDeadline }
         );
         messagesUpserted += messages.length;
         for (const message of messages) {
@@ -784,13 +836,14 @@ export class MirrorEngine {
             () => searchUidsSince(client, flagCutoff)
           ))
         ].sort((a, b) => a - b);
-        if (flagUids.length > 0) {
-          const metadata = await this.withOperationDeadline(
+        for (let i = 0; i < flagUids.length; i += incrementalBatchSize) {
+          const batchUids = flagUids.slice(i, i + incrementalBatchSize);
+          const flags = await this.withOperationDeadline(
             client,
             flagScanDeadline,
             "FLAG_SCAN_TOTAL_TIMEOUT_MS",
             "flag scan FETCH",
-            () => fetchMessageMetadata(client, flagUids, incrementalBatchSize)
+            () => fetchMessageFlags(client, batchUids, incrementalBatchSize)
           );
           this.assertDeadlineAvailable(
             client,
@@ -802,8 +855,8 @@ export class MirrorEngine {
             account.id,
             folder,
             uidValidity,
-            metadata,
-            windowCutoff
+            flags,
+            { deadlineAt: flagScanDeadline }
           );
           flagsUpdated += scan.flagsChanged;
           for (const message of scan.messages) {
@@ -870,12 +923,14 @@ export class MirrorEngine {
               "RECONCILE_TOTAL_TIMEOUT_MS",
               "reconcile backfill write"
             );
-            const messages = await this.repository.upsertMessages(
+            const messages = await this.upsertMetadataBatch(
+              options.metadataWriteStats,
               account.id,
               folder,
               uidValidity,
               metadata,
-              windowCutoff
+              windowCutoff,
+              { deadlineAt: reconcileDeadline }
             );
             backfilled += messages.length;
             for (const message of messages) {
@@ -1027,6 +1082,36 @@ export class MirrorEngine {
     return options.enforceLockDeadline && this.isLockBudgetExpired(options.lockDeadline);
   }
 
+  private async upsertMetadataBatch(
+    stats: MetadataWriteStats,
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    metadata: MessageMetadata[],
+    windowCutoff: Date,
+    options: { preserveExistingFlags?: boolean; deadlineAt?: number } = {}
+  ): Promise<ImapMessage[]> {
+    const startedAt = performance.now();
+    stats.batchesAttempted += 1;
+    try {
+      const rows = await this.repository.upsertMessages(
+        accountId,
+        folder,
+        uidValidity,
+        metadata,
+        windowCutoff,
+        options
+      );
+      stats.rowsCommitted += rows.length;
+      return rows;
+    } catch (error) {
+      stats.batchesFailed += 1;
+      throw error;
+    } finally {
+      stats.durationMs += Math.max(0, performance.now() - startedAt);
+    }
+  }
+
   // Spec §10.4: process ONE batch per cycle, newest-first, advancing the
   // watermark only after a successful upsert. Multi-cycle runs gives big
   // mailboxes resumability and prevents one folder from monopolising a tick.
@@ -1036,7 +1121,8 @@ export class MirrorEngine {
     client: MirrorImapClient,
     uidValidity: number,
     uidNext: number | undefined,
-    windowCutoff: Date
+    windowCutoff: Date,
+    metadataWriteStats: MetadataWriteStats
   ): Promise<{ messagesUpserted: number }> {
     const initialSyncDeadline = Date.now() + this.config.INITIAL_SYNC_BATCH_TIMEOUT_MS;
     let targetMaxUid: number | null = folder.initial_sync_target_max_uid
@@ -1131,12 +1217,14 @@ export class MirrorEngine {
       "INITIAL_SYNC_BATCH_TIMEOUT_MS",
       "initial sync write"
     );
-    const messages = await this.repository.upsertMessages(
+    const messages = await this.upsertMetadataBatch(
+      metadataWriteStats,
       account.id,
       folder,
       uidValidity,
       metadata,
-      windowCutoff
+      windowCutoff,
+      { deadlineAt: initialSyncDeadline }
     );
     for (const message of messages) {
       await this.hooks.onMessageUpsert?.(message);
@@ -1185,7 +1273,8 @@ export class MirrorEngine {
   private async runHistoryLane(
     account: ImapAccount,
     client: MirrorImapClient,
-    lockDeadline: number
+    lockDeadline: number,
+    metadataWriteStats: MetadataWriteStats
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
@@ -1212,7 +1301,7 @@ export class MirrorEngine {
 
       let batch: HistoryBatchResult;
       try {
-        batch = await this.runHistoryBatch(account, folder, client, lockDeadline);
+        batch = await this.runHistoryBatch(account, folder, client, lockDeadline, metadataWriteStats);
       } catch (error) {
         if (error instanceof AccountAlreadyFinalizedError) throw error;
         const message = describeSyncError(error);
@@ -1249,7 +1338,8 @@ export class MirrorEngine {
     account: ImapAccount,
     folder: HistoryBacklogFolder,
     client: MirrorImapClient,
-    lockDeadline: number
+    lockDeadline: number,
+    metadataWriteStats: MetadataWriteStats
   ): Promise<HistoryBatchResult> {
     if (this.isLockBudgetExpired(lockDeadline)) {
       return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
@@ -1347,13 +1437,17 @@ export class MirrorEngine {
 
       const batch = descending.slice().reverse();
       const metadata = await fetchMessageMetadata(client, batch, batchSize);
-      const messages = await this.repository.upsertMessages(
+      const messages = await this.upsertMetadataBatch(
+        metadataWriteStats,
         account.id,
         folder,
         uidValidity,
         metadata,
         windowCutoff,
-        { preserveExistingFlags: !account.archive_flag_sync }
+        {
+          preserveExistingFlags: !account.archive_flag_sync,
+          deadlineAt: lockDeadline
+        }
       );
       for (const message of messages) {
         await this.hooks.onMessageUpsert?.(message);

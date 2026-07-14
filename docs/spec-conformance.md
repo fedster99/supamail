@@ -59,7 +59,7 @@ SupaMail owns a conservative mailbox mirror:
 | Historical backfill should not starve fresh mail. | Implemented | The engine runs hot, body, then history lanes under one advisory lock; history is resumable through folder `backfill_*` state and skipped when the body lane exhausts the lock budget. Spec-conformance Scenario L proves ordering and budget behavior. |
 | Attachment metadata belongs in the mirror, not necessarily attachment binaries. | Implemented | MIME `BODYSTRUCTURE` is parsed into attachment metadata during sync; binary attachment retrieval is outside the current core path. |
 | Worker shutdown should release held resources. | Implemented | SIGTERM/SIGINT abort the loop, wake sleep, and close the Postgres pool so advisory locks release with the session. |
-| Sync should emit durable observability events. | Implemented at mirror-event level | Sync runs, message/folder events, flag changes, reconcile backfills, and retention outcomes are stored or logged. Worker logs preserve sanitized error class/code/provider context, emit failed account outcomes at error severity, and emit partial outcomes at warning severity. Normal idempotent API shutdown is silent; genuine close failures remain error-level events. Stable metrics/alert names remain an open operational layer. |
+| Sync should emit durable observability events. | Implemented at mirror-event level | Sync runs, message/folder events, flag changes, reconcile backfills, and retention outcomes are stored or logged. Worker logs preserve sanitized error class/code/provider context, emit failed account outcomes at error severity, and emit partial outcomes at warning severity. Sync-run metadata exposes acknowledged message-record upserts, cumulative persistence time, attempted/failed batches, and write-service rate; tick logs separately expose rows over monotonic wall time as production throughput. Failed attempts add time but zero rows, and incomplete telemetry emits no aggregate rate. Normal idempotent API shutdown is silent; genuine close failures remain error-level events. Alert thresholds remain an open operational layer. |
 | CI must prove DB behavior against real Postgres. | Implemented | `pnpm test:db:live` starts disposable Postgres, migrates twice, runs live DB integration tests, then runs spec conformance. |
 
 ## Imported Detailed Semantics
@@ -92,7 +92,7 @@ Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge 
 
 These old-spec ideas are still useful, but they are not part of the current implemented contract:
 
-- Stable metrics and alerts: the worker logs structured events and writes sync records, but this repo does not yet define production metric names or alert thresholds as a public contract.
+- Broader metrics and alerts: metadata write-service efficiency and wall-clock throughput now have distinct structured fields, but this repo does not yet define alert thresholds or a complete production metric catalog.
 - Provider-specific live account CI: the open-source project now has a compatibility matrix, deterministic provider-shape fixtures, GreenMail and Dovecot smoke tests, and disposable Postgres. Live provider accounts still require manual smoke runs unless a safe provider-specific CI account is added later.
 - UI fallback for body-fetch failures: SupaMail stores metadata and body state, but it does not own an end-user UI contract.
 - CRM interaction fallback: the old Signal interaction-resolution behavior is intentionally outside SupaMail core.

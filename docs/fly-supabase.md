@@ -97,6 +97,15 @@ Useful tables:
 - `imap_messages.body_fetched_at`
 - `imap_message_bodies.raw_bytes`
 
+Each `sync.tick.completed` worker log separates database write efficiency from
+end-to-end throughput:
+
+- `metadataWriteServiceRowsPerSecond` is committed metadata rows divided by cumulative persistence time.
+- `metadataThroughputRowsPerSecond` is committed metadata rows divided by the full tick's monotonic wall time. Use this for production throughput.
+- `metadataTelemetryComplete=false` makes both rates `null`, so mixed-version or incomplete results cannot report a misleading rate.
+
+`metadataRowsCommitted` includes acknowledged conflict updates, not only newly discovered email. Per-run write counts, duration, batch attempts/failures, and write-service rate are also stored in `imap_sync_runs.metadata`.
+
 Useful Fly commands:
 
 ```bash

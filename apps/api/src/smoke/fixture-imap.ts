@@ -65,9 +65,14 @@ export class FixtureImapClient implements MirrorImapClient {
   ): AsyncIterable<FetchMessage> {
     const messages = this.selectedMessages(range);
     const metadataRequested = Boolean(query.envelope || query.headers || query.bodyStructure);
+    const flagsRequested = query.flags === true;
 
     for (const message of messages) {
-      yield metadataRequested ? this.toFetchMessage(message) : { uid: message.uid };
+      yield metadataRequested
+        ? this.toFetchMessage(message)
+        : flagsRequested
+          ? { uid: message.uid, flags: new Set(message.flags ?? []) }
+          : { uid: message.uid };
     }
   }
 

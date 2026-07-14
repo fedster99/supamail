@@ -54,7 +54,11 @@ describe("repository safety", () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("const sanitizedErrors = result.errors.map(sanitizeErrorReason)");
-    expect(source).toContain("JSON.stringify({ errors: sanitizedErrors, hitLockBudget: result.hitLockBudget })");
+    expect(source).toContain("errors: sanitizedErrors");
+    expect(source).toContain("metadataRowsCommitted: result.metadataRowsCommitted ?? 0");
+    expect(source).toContain(
+      "metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null"
+    );
   });
 
   it("stores NULL raw_mime when BODY_STORAGE_MODE is parsed_only", async () => {
@@ -159,7 +163,7 @@ describe("repository safety", () => {
     const engine = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
     expect(repository).toContain("live_window_target_count = $4");
-    expect(repository).toContain("headers_synced_count = headers_synced_count + 1");
+    expect(repository).toContain("headers_synced_count = headers_synced_count + $2");
     expect(repository).toContain("bodies_fetched_count = bodies_fetched_count + 1");
     expect(repository).toContain("FOR UPDATE");
     expect(repository).toContain("if (!message.body_fetched_at)");
@@ -326,7 +330,20 @@ describe("repository safety", () => {
     expect(source).toContain("FLAGS_CHANGED");
     expect(source).toContain("previousFlags");
     expect(source).toContain("nextFlags");
-    expect(source).toContain("knownMessages");
+    expect(source).toContain("updatedByUid");
+    expect(source).toContain("FOR UPDATE");
+    expect(source).toContain("set_config('lock_timeout'");
+    expect(source).toContain("FLAG_SCAN_TOTAL_TIMEOUT_MS exceeded during flag scan write");
+  });
+
+  it("batches metadata and attachment writes in one rollback-safe transaction", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+
+    expect(source).toContain("Metadata batch contains duplicate UIDs");
+    expect(source).toContain("jsonb_to_recordset($1::jsonb) AS message");
+    expect(source).toContain("jsonb_to_recordset($1::jsonb) AS attachment");
+    expect(source).toContain("Metadata batch wrote");
+    expect(source).toContain('client.query("ROLLBACK")');
   });
 
   it("does not body-backfill messages from untracked folders", async () => {
