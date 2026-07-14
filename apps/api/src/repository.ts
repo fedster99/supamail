@@ -1,10 +1,20 @@
 import { createHash } from "node:crypto";
+import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { AppConfig } from "./config.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import { normalizeMessageId } from "./mime.js";
 import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
+import {
+  assertFlagEventSideWithinLimits,
+  MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
+  MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH,
+  MAX_SYNC_BATCH_SIZE,
+  splitFlagEventBatches,
+  splitFlagWriteBatches,
+  splitMetadataWriteBatches
+} from "./sync-limits.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -17,6 +27,7 @@ import type {
   ImapFolder,
   ImapMessage,
   MessageBodyInput,
+  MessageFlagSnapshot,
   MessageMetadata,
   SyncResult,
   SyncRunStatus,
@@ -30,6 +41,7 @@ const BACKOFF_CEILING_MS = 5 * 60_000;
 const ERROR_REASON_MAX_LEN = 1000;
 const MANUAL_TRACK_OVERRIDE_NOTE = "manual_track_override";
 const MISSING_MAILBOX_VERIFICATION_NOTE = "missing_mailbox_pending_verification";
+const DEFAULT_METADATA_WRITE_TIMEOUT_MS = 5 * 60_000;
 const LIVE_THREAD_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const PURGE_MESSAGE_BATCH_SIZE = 100;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
@@ -49,6 +61,202 @@ const THREADING_BODY_HEADER_KEYS = [
 
 const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
 
+const METADATA_WRITE_TIMEOUT_ERROR = "metadata write deadline exceeded";
+const FLAG_SCAN_TIMEOUT_ERROR = "FLAG_SCAN_TOTAL_TIMEOUT_MS exceeded during flag scan write";
+const SYNC_DATABASE_WRITE_INTERRUPTED_ERROR = "sync database write interrupted";
+
+function deadlineQuery(
+  text: string,
+  queryTimeout: number,
+  values?: unknown[]
+): QueryConfig & { query_timeout: number } {
+  return { text, values, query_timeout: queryTimeout };
+}
+
+async function queryWithDeadline<T extends QueryResultRow = QueryResultRow>(
+  client: PgClient,
+  text: string,
+  values: unknown[] | undefined,
+  deadlineAt: number,
+  remainingMs: (deadlineAt: number) => number,
+  checkAfter = true
+): Promise<QueryResult<T>> {
+  const queryTimeout = remainingMs(deadlineAt);
+  const result = await client.query<T>(deadlineQuery(text, queryTimeout, values));
+  if (checkAfter) remainingMs(deadlineAt);
+  return result;
+}
+
+function createTransactionDeadline(errorMessage: string) {
+  const remainingMs = (deadlineAt: number): number => {
+    const remaining = Math.floor(deadlineAt - Date.now());
+    if (remaining < 1) throw new Error(errorMessage);
+    return remaining;
+  };
+
+  const connect = async (
+    pool: PgPool,
+    deadlineAt: number,
+    signal?: AbortSignal
+  ): Promise<PgClient> => {
+    const timeoutMs = remainingMs(deadlineAt);
+    return await new Promise<PgClient>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(SYNC_DATABASE_WRITE_INTERRUPTED_ERROR));
+      };
+      const timeout = setTimeout(() => {
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        reject(new Error(errorMessage));
+      }, timeoutMs);
+      if (signal?.aborted) {
+        onAbort();
+      } else {
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }
+
+      void pool.connect().then(
+        (client) => {
+          if (settled) {
+            // This checkout arrived after the caller stopped waiting, before any
+            // transaction or query ran on it. Return the clean client normally;
+            // destroying it here would churn the whole pool during abort bursts.
+            client.release();
+            return;
+          }
+          settled = true;
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", onAbort);
+          resolve(client);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
+        }
+      );
+    });
+  };
+
+  const queryControl = async (
+    client: PgClient,
+    text: string,
+    deadlineAt: number,
+    checkAfter = true
+  ): Promise<void> => {
+    await queryWithDeadline(client, text, undefined, deadlineAt, remainingMs, checkAfter);
+  };
+
+  const refreshTimeout = async (client: PgClient, deadlineAt: number): Promise<void> => {
+    const timeoutMs = remainingMs(deadlineAt);
+    await client.query(deadlineQuery(
+      "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)",
+      timeoutMs,
+      [`${timeoutMs}ms`]
+    ));
+    remainingMs(deadlineAt);
+  };
+
+  return { connect, queryControl, refreshTimeout, remainingMs };
+}
+
+const metadataWriteDeadline = createTransactionDeadline(METADATA_WRITE_TIMEOUT_ERROR);
+const flagScanDeadline = createTransactionDeadline(FLAG_SCAN_TIMEOUT_ERROR);
+
+function bindClientAbort(client: PgClient, signal?: AbortSignal): {
+  isReleased(): boolean;
+  release(discard?: boolean): void;
+} {
+  let released = false;
+  const release = (discard = false) => {
+    if (released) return;
+    released = true;
+    signal?.removeEventListener("abort", onAbort);
+    client.release(discard);
+  };
+  const onAbort = () => release(true);
+
+  if (signal?.aborted) {
+    // The signal won the narrow race after checkout but before BEGIN/listener
+    // binding. No work has run on this client, so it remains safe to reuse.
+    release();
+    throw new Error(SYNC_DATABASE_WRITE_INTERRUPTED_ERROR);
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
+  return { isReleased: () => released, release };
+}
+
+async function runMetadataWriteWithDeadline<T extends QueryResultRow>(
+  pool: PgPool,
+  text: string,
+  values: unknown[],
+  deadlineAt: number,
+  signal?: AbortSignal
+): Promise<QueryResult<T>> {
+  const client = await metadataWriteDeadline.connect(pool, deadlineAt, signal);
+  const lease = bindClientAbort(client, signal);
+  let discardClient = false;
+  try {
+    await metadataWriteDeadline.queryControl(client, "BEGIN", deadlineAt);
+    await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+    const result = await queryWithDeadline<T>(
+      client,
+      text,
+      values,
+      deadlineAt,
+      metadataWriteDeadline.remainingMs
+    );
+    await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+    await metadataWriteDeadline.queryControl(client, "COMMIT", deadlineAt, false);
+    return result;
+  } catch (error) {
+    if (!lease.isReleased()) {
+      const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
+      await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
+        discardClient = true;
+      });
+    }
+    throw error;
+  } finally {
+    lease.release(discardClient);
+  }
+}
+
+export interface MetadataWriteOptions {
+  preserveExistingFlags?: boolean;
+  deadlineAt?: number;
+  signal?: AbortSignal;
+}
+
+export interface SyncStateWriteOptions {
+  deadlineAt?: number;
+  signal?: AbortSignal;
+  expectedSyncOwner?: string;
+}
+
+async function runOptionalDeadlineWrite<T extends QueryResultRow>(
+  pool: PgPool,
+  text: string,
+  values: unknown[],
+  options: SyncStateWriteOptions
+): Promise<QueryResult<T>> {
+  return options.deadlineAt === undefined
+    ? await pool.query<T>(text, values)
+    : await runMetadataWriteWithDeadline<T>(
+        pool,
+        text,
+        values,
+        options.deadlineAt,
+        options.signal
+      );
+}
+
 export function normalizeFlags(flags: readonly string[] | null | undefined): string[] {
   return [...new Set((flags ?? []).map((flag) => flag.trim().toLowerCase()).filter(Boolean))]
     .sort();
@@ -61,6 +269,17 @@ function flagsEqual(left: readonly string[] | null | undefined, right: readonly 
     && normalizedLeft.every((flag, index) => flag === normalizedRight[index]);
 }
 
+function flagRepresentationsEqual(
+  left: readonly string[] | null | undefined,
+  right: readonly string[] | null | undefined
+): boolean {
+  if (left == null || right == null) return left === right;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.length === sortedRight.length
+    && sortedLeft.every((flag, index) => flag === sortedRight[index]);
+}
+
 function headerText(value: unknown): string | null {
   if (typeof value === "string") return value.trim() || null;
   if (Array.isArray(value)) {
@@ -70,13 +289,6 @@ function headerText(value: unknown): string | null {
   return value == null ? null : String(value).trim() || null;
 }
 
-/**
- * JSONB does not preserve object insertion order, while the IMAP parser's plain
- * objects do. Comparing JSON.stringify output directly therefore turns harmless
- * key-order changes into perpetual threading work. This canonical form sorts
- * object keys recursively, preserves array order, and mirrors JSON.stringify's
- * omission of undefined object properties.
- */
 export function canonicalJsonForThreadingEvidence(value: unknown): string {
   if (value === null) return "null";
   if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
@@ -468,6 +680,18 @@ export class MirrorRepository {
           currently_syncing = false
           OR last_heartbeat_at IS NULL
           OR last_heartbeat_at <= now() - ($2::bigint * interval '1 millisecond')
+          -- currently_syncing is an observability projection, not ownership.
+          -- If cancellation cleanup was briefly blocked but the session lock is
+          -- already gone, make the account immediately schedulable; the
+          -- authoritative pg_try_advisory_lock still closes the selection race.
+          OR NOT EXISTS (
+            SELECT 1
+            FROM pg_locks active_lock
+            WHERE active_lock.locktype = 'advisory'
+              AND active_lock.classid::bigint = 0
+              AND active_lock.objid::bigint = public.imap_accounts.lock_id
+              AND active_lock.granted = true
+          )
         )
         ${sentDueClause}
       ORDER BY COALESCE(last_sync_finished_at, 'epoch'::timestamptz), created_at
@@ -516,7 +740,15 @@ export class MirrorRepository {
         result.flagsUpdated,
         result.reconcileGapsFound,
         sanitizedErrors[0] ?? null,
-        JSON.stringify({ errors: sanitizedErrors, hitLockBudget: result.hitLockBudget })
+        JSON.stringify({
+          errors: sanitizedErrors,
+          hitLockBudget: result.hitLockBudget,
+          metadataRowsCommitted: result.metadataRowsCommitted ?? 0,
+          metadataWriteDurationMs: result.metadataWriteDurationMs ?? 0,
+          metadataWriteBatchesAttempted: result.metadataWriteBatchesAttempted ?? 0,
+          metadataWriteBatchesFailed: result.metadataWriteBatchesFailed ?? 0,
+          metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null
+        })
       ]
     );
   }
@@ -532,8 +764,13 @@ export class MirrorRepository {
     );
   }
 
-  async markAccountSyncStarted(accountId: string, startedBy: string): Promise<void> {
-    await this.pool.query(
+  async markAccountSyncStarted(
+    accountId: string,
+    startedBy: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    await runOptionalDeadlineWrite(
+      this.pool,
       `
       UPDATE public.imap_accounts
       SET
@@ -543,35 +780,44 @@ export class MirrorRepository {
         last_heartbeat_at = now()
       WHERE id = $1
       `,
-      [accountId, startedBy]
+      [accountId, startedBy],
+      options
     );
   }
 
-  /**
-   * Finish the lightweight Sent freshness lane without claiming that the full
-   * mailbox health/backoff contract was re-evaluated. The durable sync run still
-   * records and logs any error; the next full sweep owns health transitions.
-   */
-  async markAccountSentSyncFinished(accountId: string): Promise<void> {
-    await this.pool.query(
-      `
+  /** Clear active-sync state after scheduler cancellation without changing health. */
+  async markAccountSyncYielded(
+    accountId: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    const query = `
       UPDATE public.imap_accounts
       SET
         currently_syncing = false,
         sync_started_by = NULL,
         last_heartbeat_at = now()
       WHERE id = $1
-      `,
-      [accountId]
+        AND ($2::text IS NULL OR sync_started_by = $2)
+      RETURNING id
+    `;
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
+      query,
+      [accountId, options.expectedSyncOwner ?? null],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync cleanup lost account ${accountId}`);
+    }
   }
 
   async markAccountSyncSucceeded(
     accountId: string,
-    options: { countsTowardBackoff?: boolean } = {}
+    options: SyncStateWriteOptions & { countsTowardBackoff?: boolean } = {}
   ): Promise<void> {
     const countsTowardBackoff = options.countsTowardBackoff ?? true;
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       WITH folder_health AS (
         SELECT
@@ -697,6 +943,8 @@ export class MirrorRepository {
         END
       FROM folder_health, folder_cap
       WHERE id = $1
+        AND ($12::text IS NULL OR sync_started_by = $12)
+      RETURNING id
       `,
       [
         accountId,
@@ -709,9 +957,14 @@ export class MirrorRepository {
         countsTowardBackoff,
         this.config.FOLDER_COUNT_WARN_THRESHOLD,
         this.config.FOLDER_COUNT_ENFORCE_THRESHOLD,
-        this.config.RECENT_UIDVALIDITY_RESET_DEGRADED_MS
-      ]
+        this.config.RECENT_UIDVALIDITY_RESET_DEGRADED_MS,
+        options.expectedSyncOwner ?? null
+      ],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
   // Per spec §12.2: PARTIAL_SUCCESS means priority folders succeeded but some
@@ -721,10 +974,11 @@ export class MirrorRepository {
   async markAccountSyncPartial(
     accountId: string,
     error: string,
-    options: { countsTowardBackoff?: boolean } = {}
+    options: SyncStateWriteOptions & { countsTowardBackoff?: boolean } = {}
   ): Promise<void> {
     const countsTowardBackoff = options.countsTowardBackoff ?? true;
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_accounts
       SET
@@ -752,16 +1006,27 @@ export class MirrorRepository {
           ELSE backoff_until
         END
       WHERE id = $1
+        AND ($4::text IS NULL OR sync_started_by = $4)
+      RETURNING id
       `,
-      [accountId, sanitizeErrorReason(error), countsTowardBackoff]
+      [accountId, sanitizeErrorReason(error), countsTowardBackoff, options.expectedSyncOwner ?? null],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
   // Per spec §12.4 / §13.1: AUTH_ERROR is non-retryable. Skip backoff math and
   // pin the account at BROKEN with a clear reason. Operator intervention is
   // required (rotate creds, re-add account).
-  async markAccountSyncAuthFailed(accountId: string, error: string): Promise<void> {
-    await this.pool.query(
+  async markAccountSyncAuthFailed(
+    accountId: string,
+    error: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_accounts
       SET
@@ -775,16 +1040,27 @@ export class MirrorRepository {
         current_backoff_ms = 0,
         backoff_until = NULL
       WHERE id = $1
+        AND ($3::text IS NULL OR sync_started_by = $3)
+      RETURNING id
       `,
-      [accountId, sanitizeErrorReason(`AUTH_ERROR: ${error}`)]
+      [accountId, sanitizeErrorReason(`AUTH_ERROR: ${error}`), options.expectedSyncOwner ?? null],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
-  async markAccountSyncFailed(accountId: string, error: string): Promise<void> {
+  async markAccountSyncFailed(
+    accountId: string,
+    error: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
     // CTE computes the doubled-and-clamped backoff once so the same value
     // feeds both `current_backoff_ms` and `backoff_until` — without it the
     // expression has to be duplicated and would drift on tuning changes.
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       WITH account_state AS (
         SELECT
@@ -859,6 +1135,8 @@ export class MirrorRepository {
         END
       FROM stuck_state, next_backoff
       WHERE a.id = $1
+        AND ($9::text IS NULL OR a.sync_started_by = $9)
+      RETURNING a.id
       `,
       [
         accountId,
@@ -868,9 +1146,14 @@ export class MirrorRepository {
         BACKOFF_CEILING_MS,
         this.config.STUCK_DEGRADED_BROKEN_THRESHOLD_MS,
         this.config.STUCK_DEGRADED_TERMINAL_THRESHOLD_MS,
-        this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS
-      ]
+        this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS,
+        options.expectedSyncOwner ?? null
+      ],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
   async heartbeat(accountId: string): Promise<void> {
@@ -879,34 +1162,21 @@ export class MirrorRepository {
     ]);
   }
 
-  /**
-   * Mirror writes take a shared lock on the small threading-state row before
-   * mutating evidence. Activation/rebuild takes the same row FOR UPDATE, so it
-   * cannot certify coverage across a message/body write that is still in flight.
-   * The state row is created lazily for accounts that predate threading.
-   */
   private async lockThreadStateForMirrorWrite(client: PgClient, accountId: string): Promise<void> {
     await client.query(
-      `
-      INSERT INTO public.imap_thread_state (account_id)
-      SELECT id FROM public.imap_accounts WHERE id = $1
-      ON CONFLICT (account_id) DO NOTHING
-      `,
+      `INSERT INTO public.imap_thread_state (account_id)
+       SELECT id FROM public.imap_accounts WHERE id = $1
+       ON CONFLICT (account_id) DO NOTHING`,
       [accountId]
     );
     const locked = await client.query<{ account_id: string }>(
-      `
-      SELECT account_id
-      FROM public.imap_thread_state
-      WHERE account_id = $1
-      FOR SHARE
-      `,
+      `SELECT account_id FROM public.imap_thread_state
+       WHERE account_id = $1 FOR SHARE`,
       [accountId]
     );
     if (!locked.rows[0]) throw new Error(`Account not found: ${accountId}`);
   }
 
-  /** Queue bounded message evidence independently for every live algorithm run. */
   private async enqueueThreadingMessages(
     client: PgClient,
     accountId: string,
@@ -915,28 +1185,20 @@ export class MirrorRepository {
   ): Promise<void> {
     if (messageIds.length === 0) return;
     await client.query(
-      `
-      INSERT INTO public.imap_thread_work_queue (
-        run_id, message_id, account_id, reason, attempts, available_at,
-        last_error, enqueued_at, updated_at
-      )
-      SELECT run.id, message.id, message.account_id, $3, 0, now(), NULL, now(), now()
-      FROM public.imap_thread_runs run
-      JOIN public.imap_messages message
-        ON message.account_id = run.account_id
-       AND message.id = ANY($2::uuid[])
-      WHERE run.account_id = $1
-        AND run.status = ANY($4::text[])
-      ON CONFLICT (run_id, message_id)
-      DO UPDATE SET
-        account_id = EXCLUDED.account_id,
-        reason = EXCLUDED.reason,
-        attempts = 0,
-        available_at = now(),
-        last_error = NULL,
-        enqueued_at = now(),
-        updated_at = now()
-      `,
+      `INSERT INTO public.imap_thread_work_queue (
+         run_id, message_id, account_id, reason, attempts, available_at,
+         last_error, enqueued_at, updated_at
+       )
+       SELECT run.id, message.id, message.account_id, $3, 0, now(), NULL, now(), now()
+       FROM public.imap_thread_runs run
+       JOIN public.imap_messages message
+         ON message.account_id = run.account_id
+        AND message.id = ANY($2::uuid[])
+       WHERE run.account_id = $1 AND run.status = ANY($4::text[])
+       ON CONFLICT (run_id, message_id) DO UPDATE SET
+         account_id = EXCLUDED.account_id, reason = EXCLUDED.reason,
+         attempts = 0, available_at = now(), last_error = NULL,
+         enqueued_at = now(), updated_at = now()`,
       [accountId, [...messageIds], reason, [...LIVE_THREAD_RUN_STATUSES]]
     );
   }
@@ -958,20 +1220,12 @@ export class MirrorRepository {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-
-      // Discover only a small candidate page before taking locks. We then lock
-      // threading state first and re-check/row-lock the candidates, matching the
-      // lock order used by message/body ingestion and activation.
       const discovered = await client.query<PurgeCandidate>(
-        `
-        SELECT id, account_id
-        FROM public.imap_messages
-        WHERE deleted_in_provider = true
-          AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
-          AND provider_deleted_at < now() - interval '30 days'
-        ORDER BY id
-        LIMIT $1
-        `,
+        `SELECT id, account_id FROM public.imap_messages
+         WHERE deleted_in_provider = true
+           AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+           AND provider_deleted_at < now() - interval '30 days'
+         ORDER BY id LIMIT $1`,
         [PURGE_MESSAGE_BATCH_SIZE]
       );
       if (discovered.rows.length === 0) {
@@ -981,37 +1235,25 @@ export class MirrorRepository {
 
       const accountIds = [...new Set(discovered.rows.map((row) => row.account_id))].sort();
       await client.query(
-        `
-        INSERT INTO public.imap_thread_state (account_id)
-        SELECT input.account_id
-        FROM unnest($1::uuid[]) AS input(account_id)
-        JOIN public.imap_accounts account ON account.id = input.account_id
-        ON CONFLICT (account_id) DO NOTHING
-        `,
+        `INSERT INTO public.imap_thread_state (account_id)
+         SELECT input.account_id FROM unnest($1::uuid[]) AS input(account_id)
+         JOIN public.imap_accounts account ON account.id = input.account_id
+         ON CONFLICT (account_id) DO NOTHING`,
         [accountIds]
       );
       await client.query(
-        `
-        SELECT account_id
-        FROM public.imap_thread_state
-        WHERE account_id = ANY($1::uuid[])
-        ORDER BY account_id
-        FOR SHARE
-        `,
+        `SELECT account_id FROM public.imap_thread_state
+         WHERE account_id = ANY($1::uuid[]) ORDER BY account_id FOR SHARE`,
         [accountIds]
       );
 
       const locked = await client.query<PurgeCandidate>(
-        `
-        SELECT id, account_id
-        FROM public.imap_messages
-        WHERE id = ANY($1::uuid[])
-          AND deleted_in_provider = true
-          AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
-          AND provider_deleted_at < now() - interval '30 days'
-        ORDER BY id
-        FOR UPDATE SKIP LOCKED
-        `,
+        `SELECT id, account_id FROM public.imap_messages
+         WHERE id = ANY($1::uuid[])
+           AND deleted_in_provider = true
+           AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+           AND provider_deleted_at < now() - interval '30 days'
+         ORDER BY id FOR UPDATE SKIP LOCKED`,
         [discovered.rows.map((row) => row.id)]
       );
       if (locked.rows.length === 0) {
@@ -1019,11 +1261,6 @@ export class MirrorRepository {
         return { purged: 0 };
       }
 
-      // A retained message can be the canonical root/parent/copy for surviving
-      // members. Queue every survivor in each live run before the cascade removes
-      // the victim assignments. Recursively split a pathological batch; a single
-      // >25k fan-out is retained rather than making a huge transaction or leaving
-      // an active projection knowingly stale.
       const acceptedVictims: string[] = [];
       const recomputeTargets = new Map<string, PurgeQueueTarget>();
       const pending: string[][] = [locked.rows.map((row) => row.id)];
@@ -1031,36 +1268,30 @@ export class MirrorRepository {
         const victimIds = pending.shift()!;
         const remaining = PURGE_RECOMPUTE_PAIR_LIMIT - recomputeTargets.size;
         if (remaining <= 0) break;
-        const existingKeys = [...recomputeTargets.keys()];
         const neighbors = await client.query<PurgeQueueTarget>(
-          `
-          WITH affected_components AS (
-            SELECT DISTINCT assignment.run_id, assignment.account_id, assignment.conversation_id
-            FROM public.imap_thread_assignments assignment
-            JOIN public.imap_thread_runs source_run
-              ON source_run.id = assignment.run_id
-             AND source_run.status = ANY($2::text[])
-            WHERE assignment.message_id = ANY($1::uuid[])
-          ), surviving_messages AS (
-            SELECT DISTINCT assignment.account_id, assignment.message_id
-            FROM affected_components component
-            JOIN public.imap_thread_assignments assignment
-              ON assignment.run_id = component.run_id
-             AND assignment.account_id = component.account_id
-             AND assignment.conversation_id = component.conversation_id
-            JOIN public.imap_messages message ON message.id = assignment.message_id
-            WHERE assignment.message_id <> ALL($1::uuid[])
-          )
-          SELECT DISTINCT live_run.id AS run_id, survivor.message_id, survivor.account_id
-          FROM surviving_messages survivor
-          JOIN public.imap_thread_runs live_run
-            ON live_run.account_id = survivor.account_id
-           AND live_run.status = ANY($2::text[])
-          WHERE (live_run.id::text || ':' || survivor.message_id::text) <> ALL($3::text[])
-          ORDER BY run_id, survivor.message_id
-          LIMIT $4
-          `,
-          [victimIds, [...LIVE_THREAD_RUN_STATUSES], existingKeys, remaining + 1]
+          `WITH affected_components AS (
+             SELECT DISTINCT assignment.run_id, assignment.account_id, assignment.conversation_id
+             FROM public.imap_thread_assignments assignment
+             JOIN public.imap_thread_runs source_run
+               ON source_run.id = assignment.run_id AND source_run.status = ANY($2::text[])
+             WHERE assignment.message_id = ANY($1::uuid[])
+           ), surviving_messages AS (
+             SELECT DISTINCT assignment.account_id, assignment.message_id
+             FROM affected_components component
+             JOIN public.imap_thread_assignments assignment
+               ON assignment.run_id = component.run_id
+              AND assignment.account_id = component.account_id
+              AND assignment.conversation_id = component.conversation_id
+             JOIN public.imap_messages message ON message.id = assignment.message_id
+             WHERE assignment.message_id <> ALL($1::uuid[])
+           )
+           SELECT DISTINCT live_run.id AS run_id, survivor.message_id, survivor.account_id
+           FROM surviving_messages survivor
+           JOIN public.imap_thread_runs live_run
+             ON live_run.account_id = survivor.account_id AND live_run.status = ANY($2::text[])
+           WHERE (live_run.id::text || ':' || survivor.message_id::text) <> ALL($3::text[])
+           ORDER BY run_id, survivor.message_id LIMIT $4`,
+          [victimIds, [...LIVE_THREAD_RUN_STATUSES], [...recomputeTargets.keys()], remaining + 1]
         );
         if (neighbors.rows.length > remaining) {
           if (victimIds.length === 1) continue;
@@ -1070,11 +1301,8 @@ export class MirrorRepository {
           continue;
         }
         acceptedVictims.push(...victimIds);
-        for (const row of neighbors.rows) {
-          recomputeTargets.set(`${row.run_id}:${row.message_id}`, row);
-        }
+        for (const row of neighbors.rows) recomputeTargets.set(`${row.run_id}:${row.message_id}`, row);
       }
-
       if (acceptedVictims.length === 0) {
         await client.query("COMMIT");
         return { purged: 0 };
@@ -1084,23 +1312,15 @@ export class MirrorRepository {
       const queueTargets = [...recomputeTargets.values()].filter((row) => !acceptedSet.has(row.message_id));
       if (queueTargets.length > 0) {
         await client.query(
-          `
-          INSERT INTO public.imap_thread_work_queue (
-            run_id, message_id, account_id, reason, attempts, available_at,
-            last_error, enqueued_at, updated_at
-          )
-          SELECT run_id, message_id, account_id, 'retained_neighbor_purged', 0, now(), NULL, now(), now()
-          FROM unnest($1::uuid[], $2::uuid[], $3::uuid[])
-            AS affected(run_id, message_id, account_id)
-          ON CONFLICT (run_id, message_id)
-          DO UPDATE SET
-            reason = EXCLUDED.reason,
-            attempts = 0,
-            available_at = now(),
-            last_error = NULL,
-            enqueued_at = now(),
-            updated_at = now()
-          `,
+          `INSERT INTO public.imap_thread_work_queue (
+             run_id, message_id, account_id, reason, attempts, available_at,
+             last_error, enqueued_at, updated_at
+           )
+           SELECT run_id, message_id, account_id, 'retained_neighbor_purged', 0, now(), NULL, now(), now()
+           FROM unnest($1::uuid[], $2::uuid[], $3::uuid[]) AS affected(run_id, message_id, account_id)
+           ON CONFLICT (run_id, message_id) DO UPDATE SET
+             reason = EXCLUDED.reason, attempts = 0, available_at = now(),
+             last_error = NULL, enqueued_at = now(), updated_at = now()`,
           [
             queueTargets.map((row) => row.run_id),
             queueTargets.map((row) => row.message_id),
@@ -1109,49 +1329,34 @@ export class MirrorRepository {
         );
       }
 
-      // Subject evidence is deliberately separate and compact: one fixed-size
-      // bucket per live run. Fan keys out across all live versions so a shadow
-      // build and the active/rollback projections see the same deletion.
       await client.query(
-        `
-        WITH affected_subjects AS (
-          SELECT DISTINCT assignment.account_id, assignment.subject_key
-          FROM public.imap_thread_assignments assignment
-          JOIN public.imap_thread_runs source_run
-            ON source_run.id = assignment.run_id
-           AND source_run.status = ANY($2::text[])
-          WHERE assignment.message_id = ANY($1::uuid[])
-            AND assignment.subject_key IS NOT NULL
-        )
-        INSERT INTO public.imap_thread_subject_work (
-          run_id, account_id, subject_key, attempts, available_at,
-          last_error, enqueued_at, updated_at
-        )
-        SELECT live_run.id, subject.account_id, subject.subject_key,
-               0, now(), NULL, now(), now()
-        FROM affected_subjects subject
-        JOIN public.imap_thread_runs live_run
-          ON live_run.account_id = subject.account_id
-         AND live_run.status = ANY($2::text[])
-        ON CONFLICT (run_id, subject_key)
-        DO UPDATE SET
-          attempts = 0,
-          available_at = now(),
-          last_error = NULL,
-          enqueued_at = now(),
-          updated_at = now()
-        `,
+        `WITH affected_subjects AS (
+           SELECT DISTINCT assignment.account_id, assignment.subject_key
+           FROM public.imap_thread_assignments assignment
+           JOIN public.imap_thread_runs source_run
+             ON source_run.id = assignment.run_id AND source_run.status = ANY($2::text[])
+           WHERE assignment.message_id = ANY($1::uuid[]) AND assignment.subject_key IS NOT NULL
+         )
+         INSERT INTO public.imap_thread_subject_work (
+           run_id, account_id, subject_key, attempts, available_at,
+           last_error, enqueued_at, updated_at
+         )
+         SELECT live_run.id, subject.account_id, subject.subject_key,
+                0, now(), NULL, now(), now()
+         FROM affected_subjects subject
+         JOIN public.imap_thread_runs live_run
+           ON live_run.account_id = subject.account_id AND live_run.status = ANY($2::text[])
+         ON CONFLICT (run_id, subject_key) DO UPDATE SET
+           attempts = 0, available_at = now(), last_error = NULL,
+           enqueued_at = now(), updated_at = now()`,
         [acceptedVictims, [...LIVE_THREAD_RUN_STATUSES]]
       );
 
       const result = await client.query(
-        `
-        DELETE FROM public.imap_messages
-        WHERE id = ANY($1::uuid[])
-          AND deleted_in_provider = true
-          AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
-          AND provider_deleted_at < now() - interval '30 days'
-        `,
+        `DELETE FROM public.imap_messages
+         WHERE id = ANY($1::uuid[]) AND deleted_in_provider = true
+           AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+           AND provider_deleted_at < now() - interval '30 days'`,
         [acceptedVictims]
       );
       await client.query("COMMIT");
@@ -1524,10 +1729,15 @@ export class MirrorRepository {
     return result.rows;
   }
 
-  async markFolderSyncStarted(folderId: string): Promise<void> {
-    await this.pool.query(
+  async markFolderSyncStarted(
+    folderId: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    await runOptionalDeadlineWrite(
+      this.pool,
       "UPDATE public.imap_folders SET status = 'SYNCING', last_progress_at = now() WHERE id = $1",
-      [folderId]
+      [folderId],
+      options
     );
   }
 
@@ -1538,36 +1748,56 @@ export class MirrorRepository {
     folderId: string,
     targetMaxUid: number,
     oldestUidSynced: number,
-    targetCount: number
+    targetCount: number,
+    expectedUidValidity: number,
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       UPDATE public.imap_folders
       SET initial_sync_target_max_uid = $2,
           initial_sync_oldest_uid_synced = $3,
           live_window_target_count = $4,
           last_progress_at = now()
       WHERE id = $1
-      `,
-      [folderId, targetMaxUid, oldestUidSynced, targetCount]
-    );
+        AND (uidvalidity IS NULL OR uidvalidity = $5)
+      RETURNING id
+    `;
+    const values = [folderId, targetMaxUid, oldestUidSynced, targetCount, expectedUidValidity];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Initial sync snapshot lost folder generation ${folderId}`);
+    }
   }
 
   async advanceInitialSyncWatermark(
     folderId: string,
     newOldestUidSynced: number,
-    lastProgressUid: number
+    lastProgressUid: number,
+    expectedUidValidity: number,
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       UPDATE public.imap_folders
       SET initial_sync_oldest_uid_synced = $2,
           last_progress_at = now(),
           last_progress_uid = $3
       WHERE id = $1
-      `,
-      [folderId, newOldestUidSynced, lastProgressUid]
-    );
+        AND uidvalidity = $4
+      RETURNING id
+    `;
+    const values = [folderId, newOldestUidSynced, lastProgressUid, expectedUidValidity];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Initial sync watermark lost folder generation ${folderId}`);
+    }
   }
 
   async markFolderSynced(folderId: string, patch: {
@@ -1577,9 +1807,8 @@ export class MirrorRepository {
     initialComplete?: boolean;
     reconcileClean?: boolean;
     flagScanCompleted?: boolean;
-  }): Promise<void> {
-    await this.pool.query(
-      `
+  }, options: { deadlineAt?: number; signal?: AbortSignal } = {}): Promise<void> {
+    const query = `
       UPDATE public.imap_folders
       SET
         status = 'ACTIVE',
@@ -1610,23 +1839,32 @@ export class MirrorRepository {
           ELSE COALESCE(next_reconcile_at, now() + ((random() * $10::double precision)::int * interval '1 millisecond'))
         END
       WHERE id = $1
-      `,
-      [
-        folderId,
-        patch.uidValidity,
-        patch.uidNext ?? null,
-        patch.lastUid ?? null,
-        patch.initialComplete ?? null,
-        patch.reconcileClean ?? null,
-        patch.flagScanCompleted ?? null,
-        this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS,
-        this.config.RR_FLAG_SCAN_INTERVAL_MS,
-        this.config.RECONCILE_INTERVAL_MS,
-        this.config.PRIORITY_CUTOFF,
-        this.config.SENT_SYNC_INTERVAL_MS,
-        this.config.SYNC_INTERVAL_MS
-      ]
-    );
+        AND (uidvalidity IS NULL OR uidvalidity = $2)
+      RETURNING id
+    `;
+    const values = [
+      folderId,
+      patch.uidValidity,
+      patch.uidNext ?? null,
+      patch.lastUid ?? null,
+      patch.initialComplete ?? null,
+      patch.reconcileClean ?? null,
+      patch.flagScanCompleted ?? null,
+      this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS,
+      this.config.RR_FLAG_SCAN_INTERVAL_MS,
+      this.config.RECONCILE_INTERVAL_MS,
+      this.config.PRIORITY_CUTOFF,
+      this.config.SENT_SYNC_INTERVAL_MS,
+      this.config.SYNC_INTERVAL_MS
+    ];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Folder sync state lost generation ${folderId}`);
+    }
   }
 
   // Returns the post-reset `uidvalidity_reset_count`, scoped to a rolling
@@ -1640,6 +1878,27 @@ export class MirrorRepository {
     const client = await this.pool.connect();
     await client.query("BEGIN");
     try {
+      const lockedFolder = await client.query<{
+        uidvalidity: string | null;
+        uidvalidity_reset_count: number;
+      }>(
+        `
+        SELECT uidvalidity::text, uidvalidity_reset_count
+        FROM public.imap_folders
+        WHERE id = $1
+          AND account_id = $2
+        FOR UPDATE
+        `,
+        [folder.id, account.id]
+      );
+      const currentFolder = lockedFolder.rows[0];
+      if (!currentFolder) throw new Error(`UIDVALIDITY reset lost folder ${folder.id}`);
+      if (currentFolder.uidvalidity !== null
+        && Number(currentFolder.uidvalidity) === newUidValidity) {
+        await client.query("COMMIT");
+        return { resetCountIn24h: currentFolder.uidvalidity_reset_count };
+      }
+
       await client.query(
         `
         UPDATE public.imap_messages
@@ -1731,137 +1990,183 @@ export class MirrorRepository {
     uidValidity: number,
     messages: MessageMetadata[],
     windowCutoff: Date,
-    options: { preserveExistingFlags?: boolean } = {}
+    options: MetadataWriteOptions = {}
   ): Promise<ImapMessage[]> {
     if (messages.length === 0) return [];
+    if (messages.length > MAX_SYNC_BATCH_SIZE) {
+      throw new Error(
+        `Metadata batch size ${messages.length} exceeds maximum ${MAX_SYNC_BATCH_SIZE}`
+      );
+    }
+    const writeBatches = splitMetadataWriteBatches(messages);
 
-    const rows: ImapMessage[] = [];
-    const client = await this.pool.connect();
+    const uniqueUids = new Set(messages.map((message) => message.uid));
+    if (uniqueUids.size !== messages.length) {
+      throw new Error("Metadata batch contains duplicate UIDs");
+    }
+    for (const message of messages) {
+      if (!Number.isSafeInteger(message.sizeBytes) || message.sizeBytes < 0) {
+        throw new Error(`Metadata batch has invalid size for UID ${message.uid}`);
+      }
+      for (const attachment of message.attachments) {
+        if (attachment.sizeBytes !== null
+          && (!Number.isSafeInteger(attachment.sizeBytes) || attachment.sizeBytes < 0)) {
+          throw new Error(`Metadata batch has invalid attachment size for UID ${message.uid}`);
+        }
+      }
+    }
+    const deadlineAt = options.deadlineAt
+      ?? Date.now() + (this.config.INCREMENTAL_TOTAL_TIMEOUT_MS ?? DEFAULT_METADATA_WRITE_TIMEOUT_MS);
+    const client = await metadataWriteDeadline.connect(this.pool, deadlineAt, options.signal);
+    const lease = bindClientAbort(client, options.signal);
+    let discardClient = false;
 
     try {
-    for (const message of messages) {
-      await client.query("BEGIN");
-      try {
-      await this.lockThreadStateForMirrorWrite(client, accountId);
-      const existing = await client.query<{
-        id: string;
-        rfc_message_id: string | null;
-        message_id_normalized: string | null;
-        provider_message_id: string | null;
-        provider_message_id_namespace: string | null;
-        provider_thread_id: string | null;
-        provider_thread_id_namespace: string | null;
-        in_reply_to: string | null;
-        references_header: string | null;
-        internal_date: Date;
-        size_bytes: string | null;
-        subject: string | null;
-        from_email: string | null;
-        from_name: string | null;
-        to_emails: string[] | null;
-        to_names: (string | null)[] | null;
-        cc_emails: string[] | null;
-        cc_names: (string | null)[] | null;
-        bcc_emails: string[] | null;
-        headers_json: Record<string, string>;
-        thread_assignment_missing: boolean;
-      }>(
-        `
-        SELECT
-          m.id,
-          m.rfc_message_id,
-          m.message_id_normalized,
-          m.provider_message_id,
-          m.provider_message_id_namespace,
-          m.provider_thread_id,
-          m.provider_thread_id_namespace,
-          m.in_reply_to,
-          m.references_header,
-          m.internal_date,
-          m.size_bytes,
-          m.subject,
-          m.from_email,
-          m.from_name,
-          m.to_emails,
-          m.to_names,
-          m.cc_emails,
-          m.cc_names,
-          m.bcc_emails,
-          m.headers_json,
-          EXISTS (
-            SELECT 1
-            FROM public.imap_thread_runs run
-            WHERE run.account_id = m.account_id
-              AND run.status = ANY($5::text[])
-              AND NOT EXISTS (
-                SELECT 1
-                FROM public.imap_thread_assignments assignment
-                WHERE assignment.run_id = run.id
-                  AND assignment.message_id = m.id
-              )
-              AND NOT EXISTS (
-                SELECT 1
-                FROM public.imap_thread_work_queue queued
-                WHERE queued.run_id = run.id
-                  AND queued.message_id = m.id
-              )
-          ) AS thread_assignment_missing
-        FROM public.imap_messages m
-        WHERE m.account_id = $1
-          AND m.folder_path = $2
-          AND m.uidvalidity = $3
-          AND m.uid = $4
-        `,
-        [accountId, folder.path, uidValidity, message.uid, [...LIVE_THREAD_RUN_STATUSES]]
+      await metadataWriteDeadline.queryControl(client, "BEGIN", deadlineAt);
+      await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+      await queryWithDeadline(
+        client,
+        `INSERT INTO public.imap_thread_state (account_id)
+         SELECT id FROM public.imap_accounts WHERE id = $1
+         ON CONFLICT (account_id) DO NOTHING`,
+        [accountId],
+        deadlineAt,
+        metadataWriteDeadline.remainingMs
       );
-      const existingMessage = existing.rows[0];
-      const isNewMessage = !existingMessage;
-      const threadingInputChanged = isNewMessage
-        || existingMessage.thread_assignment_missing
-        || canonicalJsonForThreadingEvidence([
-          existingMessage.rfc_message_id,
-          existingMessage.message_id_normalized,
-          existingMessage.provider_message_id,
-          existingMessage.provider_message_id_namespace,
-          existingMessage.provider_thread_id,
-          existingMessage.provider_thread_id_namespace,
-          existingMessage.in_reply_to,
-          existingMessage.references_header,
-          existingMessage.internal_date?.toISOString(),
-          existingMessage.size_bytes === null ? null : Number(existingMessage.size_bytes),
-          existingMessage.subject,
-          existingMessage.from_email,
-          existingMessage.from_name,
-          existingMessage.to_emails ?? [],
-          existingMessage.to_names ?? [],
-          existingMessage.cc_emails ?? [],
-          existingMessage.cc_names ?? [],
-          existingMessage.bcc_emails ?? [],
-          existingMessage.headers_json ?? {}
-        ]) !== canonicalJsonForThreadingEvidence([
-          message.rfcMessageId ?? existingMessage.rfc_message_id,
-          message.messageIdNormalized ?? existingMessage.message_id_normalized,
-          message.providerMessageId,
-          message.providerMessageIdNamespace,
-          message.providerThreadId,
-          message.providerThreadIdNamespace,
-          message.inReplyTo ?? existingMessage.in_reply_to,
-          message.referencesHeader ?? existingMessage.references_header,
-          message.internalDate.toISOString(),
-          message.sizeBytes,
-          message.subject,
-          message.fromEmail,
-          message.fromName,
-          message.toEmails,
-          message.toNames,
-          message.ccEmails,
-          message.ccNames,
-          message.bccEmails,
-          { ...(existingMessage.headers_json ?? {}), ...message.headersJson }
-        ]);
-
-      const result = await client.query<ImapMessage>(
+      const threadState = await queryWithDeadline<{ account_id: string }>(
+        client,
+        `SELECT account_id FROM public.imap_thread_state
+         WHERE account_id = $1 FOR SHARE`,
+        [accountId],
+        deadlineAt,
+        metadataWriteDeadline.remainingMs
+      );
+      if (!threadState.rows[0]) throw new Error(`Account not found: ${accountId}`);
+      const lockedFolder = await queryWithDeadline<{ id: string; uidvalidity: string | null }>(
+        client,
         `
+        SELECT id, uidvalidity::text
+        FROM public.imap_folders
+        WHERE id = $1
+          AND account_id = $2
+          AND path = $3
+        FOR UPDATE
+        `,
+        [folder.id, accountId, folder.path],
+        deadlineAt,
+        metadataWriteDeadline.remainingMs
+      );
+      if (lockedFolder.rows.length !== 1) {
+        throw new Error(`Metadata batch lost folder ${folder.id}`);
+      }
+      const lockedUidValidity = lockedFolder.rows[0].uidvalidity;
+      if (lockedUidValidity !== null && Number(lockedUidValidity) !== uidValidity) {
+        throw new Error(
+          `Metadata batch UIDVALIDITY ${uidValidity} no longer matches folder ${lockedUidValidity}`
+        );
+      }
+      if (lockedUidValidity === null) {
+        await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+        const initialized = await queryWithDeadline<{ id: string }>(
+          client,
+          `
+          UPDATE public.imap_folders
+          SET uidvalidity = $2
+          WHERE id = $1
+            AND uidvalidity IS NULL
+          RETURNING id
+          `,
+          [folder.id, uidValidity],
+          deadlineAt,
+          metadataWriteDeadline.remainingMs
+        );
+        if (initialized.rows.length !== 1) {
+          throw new Error(`Metadata batch could not initialize UIDVALIDITY for folder ${folder.id}`);
+        }
+      }
+
+      // Use a fresh READ COMMITTED statement after the folder lock is acquired.
+      // Combining both reads into one SELECT can retain a pre-wait snapshot and
+      // double-count an overlapping UID inserted by the transaction ahead of us.
+      await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+      const existing = await queryWithDeadline<{ uid: string }>(
+        client,
+        `
+        SELECT uid::text AS uid
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND uidvalidity = $3
+          AND uid = ANY($4::bigint[])
+        FOR UPDATE
+        `,
+        [accountId, folder.path, uidValidity, [...uniqueUids]],
+        deadlineAt,
+        metadataWriteDeadline.remainingMs
+      );
+      const existingUids = new Set(existing.rows.map((row) => Number(row.uid)));
+
+      const rowsByUid = new Map<number, ImapMessage>();
+      for (const writeBatch of writeBatches) {
+        const input = writeBatch.map((message, ordinal) => ({
+          ordinal,
+          uid: message.uid,
+          rfc_message_id: message.rfcMessageId,
+          message_id_normalized: message.messageIdNormalized,
+          provider_message_id: message.providerMessageId,
+          provider_message_id_namespace: message.providerMessageIdNamespace,
+          provider_thread_id: message.providerThreadId,
+          provider_thread_id_namespace: message.providerThreadIdNamespace,
+          in_reply_to: message.inReplyTo,
+          references_header: message.referencesHeader,
+          internal_date: message.internalDate.toISOString(),
+          size_bytes: message.sizeBytes,
+          subject: message.subject,
+          from_email: message.fromEmail,
+          from_name: message.fromName,
+          to_emails: message.toEmails,
+          to_names: message.toNames,
+          cc_emails: message.ccEmails,
+          cc_names: message.ccNames,
+          bcc_emails: message.bccEmails,
+          flags: message.flags,
+          headers_json: message.headersJson,
+          mime_structure: message.mimeStructure ?? null,
+          window_status: message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW"
+        }));
+        await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+        const result = await queryWithDeadline<ImapMessage>(
+          client,
+          `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS message (
+            ordinal integer,
+            uid bigint,
+            rfc_message_id text,
+            message_id_normalized text,
+            provider_message_id text,
+            provider_message_id_namespace text,
+            provider_thread_id text,
+            provider_thread_id_namespace text,
+            in_reply_to text,
+            references_header text,
+            internal_date timestamptz,
+            size_bytes bigint,
+            subject text,
+            from_email text,
+            from_name text,
+            to_emails text[],
+            to_names text[],
+            cc_emails text[],
+            cc_names text[],
+            bcc_emails text[],
+            flags text[],
+            headers_json jsonb,
+            mime_structure jsonb,
+            window_status text
+          )
+        )
         INSERT INTO public.imap_messages (
           account_id,
           folder_id,
@@ -1891,12 +2196,36 @@ export class MirrorRepository {
           mime_structure,
           window_status
         )
-        VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8,
-          $9, $10, $11, $12, $13, $14, $15, $16,
-          $17, $18, $19, $20, $21, $22, $23, $24,
-          $25, $26, $27
-        )
+        SELECT
+          $2::uuid,
+          $3::uuid,
+          $4::text,
+          $5::bigint,
+          input.uid,
+          input.rfc_message_id,
+          input.message_id_normalized,
+          input.provider_message_id,
+          input.provider_message_id_namespace,
+          input.provider_thread_id,
+          input.provider_thread_id_namespace,
+          input.in_reply_to,
+          input.references_header,
+          input.internal_date,
+          input.size_bytes,
+          input.subject,
+          input.from_email,
+          input.from_name,
+          input.to_emails,
+          input.to_names,
+          input.cc_emails,
+          input.cc_names,
+          input.bcc_emails,
+          input.flags,
+          input.headers_json,
+          input.mime_structure,
+          input.window_status
+        FROM input
+        ORDER BY input.ordinal
         ON CONFLICT (account_id, folder_path, uidvalidity, uid)
         DO UPDATE SET
           folder_id = EXCLUDED.folder_id,
@@ -1918,52 +2247,73 @@ export class MirrorRepository {
           cc_emails = EXCLUDED.cc_emails,
           cc_names = EXCLUDED.cc_names,
           bcc_emails = EXCLUDED.bcc_emails,
-          flags = CASE WHEN $28::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
-          headers_json = public.imap_messages.headers_json || EXCLUDED.headers_json,
+          flags = CASE WHEN $6::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
+          headers_json = EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
-          window_status = EXCLUDED.window_status,
           deleted_in_provider = false,
           provider_deleted_at = NULL,
           deleted_reason = NULL
         RETURNING *
         `,
-        [
-          accountId,
-          folder.id,
-          folder.path,
-          uidValidity,
-          message.uid,
-          message.rfcMessageId,
-          message.messageIdNormalized,
-          message.providerMessageId,
-          message.providerMessageIdNamespace,
-          message.providerThreadId,
-          message.providerThreadIdNamespace,
-          message.inReplyTo,
-          message.referencesHeader,
-          message.internalDate,
-          message.sizeBytes,
-          message.subject,
-          message.fromEmail,
-          message.fromName,
-          message.toEmails,
-          message.toNames,
-          message.ccEmails,
-          message.ccNames,
-          message.bccEmails,
-          message.flags,
-          JSON.stringify(message.headersJson),
-          JSON.stringify(message.mimeStructure ?? null),
-          message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW",
-          options.preserveExistingFlags === true
-        ]
-      );
+          [
+            JSON.stringify(input),
+            accountId,
+            folder.id,
+            folder.path,
+            uidValidity,
+            options.preserveExistingFlags === true
+          ],
+          deadlineAt,
+          metadataWriteDeadline.remainingMs
+        );
+        if (result.rows.length !== writeBatch.length) {
+          throw new Error(
+            `Metadata batch wrote ${result.rows.length}/${writeBatch.length} requested messages`
+          );
+        }
+        for (const row of result.rows) rowsByUid.set(Number(row.uid), row);
 
-      const row = result.rows[0];
-
-      for (const attachment of message.attachments) {
-        await client.query(
-          `
+        const attachmentsByIdentity = new Map<string, {
+          message_id: string;
+          filename: string | null;
+          mime_type: string | null;
+          size_bytes: number | null;
+          part_number: string;
+          content_id: string | null;
+          disposition: "attachment" | "inline";
+        }>();
+        for (const message of writeBatch) {
+          const row = rowsByUid.get(message.uid);
+          if (!row) throw new Error(`Metadata batch lost message UID ${message.uid}`);
+          for (const attachment of message.attachments) {
+            attachmentsByIdentity.set(`${row.id}\u0000${attachment.partNumber}`, {
+              message_id: row.id,
+              filename: attachment.filename,
+              mime_type: attachment.mimeType,
+              size_bytes: attachment.sizeBytes,
+              part_number: attachment.partNumber,
+              content_id: attachment.contentId,
+              disposition: attachment.disposition
+            });
+          }
+        }
+        if (attachmentsByIdentity.size > 0) {
+          await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+          const attachmentResult = await queryWithDeadline<{ id: string }>(
+            client,
+            `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS attachment (
+              message_id uuid,
+              filename text,
+              mime_type text,
+              size_bytes bigint,
+              part_number text,
+              content_id text,
+              disposition text
+            )
+          )
           INSERT INTO public.imap_attachments (
             message_id,
             filename,
@@ -1973,7 +2323,15 @@ export class MirrorRepository {
             content_id,
             disposition
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          SELECT
+            input.message_id,
+            input.filename,
+            input.mime_type,
+            input.size_bytes,
+            input.part_number,
+            input.content_id,
+            input.disposition
+          FROM input
           ON CONFLICT (message_id, part_number)
           DO UPDATE SET
             filename = EXCLUDED.filename,
@@ -1981,43 +2339,59 @@ export class MirrorRepository {
             size_bytes = EXCLUDED.size_bytes,
             content_id = EXCLUDED.content_id,
             disposition = EXCLUDED.disposition
+          RETURNING id
           `,
-          [
-            row.id,
-            attachment.filename,
-            attachment.mimeType,
-            attachment.sizeBytes,
-            attachment.partNumber,
-            attachment.contentId,
-            attachment.disposition
-          ]
-        );
+            [JSON.stringify([...attachmentsByIdentity.values()])],
+            deadlineAt,
+            metadataWriteDeadline.remainingMs
+          );
+          if (attachmentResult.rows.length !== attachmentsByIdentity.size) {
+            throw new Error(
+              `Metadata batch wrote ${attachmentResult.rows.length}/${attachmentsByIdentity.size} attachments`
+            );
+          }
+        }
       }
-      if (isNewMessage) {
-        await client.query(
+      const rows = messages.map((message) => {
+        const row = rowsByUid.get(message.uid);
+        if (!row) throw new Error(`Metadata batch lost message UID ${message.uid}`);
+        return row;
+      });
+      const newMessageCount = messages.length - existingUids.size;
+      if (newMessageCount > 0) {
+        await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+        const folderUpdate = await queryWithDeadline<{ id: string }>(
+          client,
           `
           UPDATE public.imap_folders
-          SET headers_synced_count = headers_synced_count + 1
+          SET headers_synced_count = headers_synced_count + $2
           WHERE id = $1
+          RETURNING id
           `,
-          [folder.id]
+          [folder.id, newMessageCount],
+          deadlineAt,
+          metadataWriteDeadline.remainingMs
         );
+        if (folderUpdate.rows.length !== 1) {
+          throw new Error(`Metadata batch lost folder ${folder.id}`);
+        }
       }
-      if (threadingInputChanged) {
-        await this.enqueueThreadingMessages(client, accountId, [row.id], "metadata_changed");
+      await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+      // Once Postgres acknowledges COMMIT, the durable rows are authoritative even
+      // if the JS event loop observes the wall clock just beyond the deadline.
+      await metadataWriteDeadline.queryControl(client, "COMMIT", deadlineAt, false);
+      return rows;
+    } catch (error) {
+      if (!lease.isReleased()) {
+        const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
+        await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
+          discardClient = true;
+        });
       }
-      await client.query("COMMIT");
-      rows.push(row);
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => undefined);
-        throw error;
-      }
-    }
+      throw error;
     } finally {
-      client.release();
+      lease.release(discardClient);
     }
-
-    return rows;
   }
 
   async applyFlagScan(
@@ -2026,55 +2400,341 @@ export class MirrorRepository {
     uidValidity: number,
     messages: MessageMetadata[],
     windowCutoff: Date
+  ): Promise<{ messages: ImapMessage[]; flagsChanged: number }>;
+  async applyFlagScan(
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    messages: MessageFlagSnapshot[],
+    options?: { deadlineAt?: number; signal?: AbortSignal }
+  ): Promise<{ messages: ImapMessage[]; flagsChanged: number }>;
+  async applyFlagScan(
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    messages: MessageFlagSnapshot[] | MessageMetadata[],
+    options: Date | { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<{ messages: ImapMessage[]; flagsChanged: number }> {
     if (messages.length === 0) return { messages: [], flagsChanged: 0 };
-
-    const uids = messages.map((message) => message.uid);
-    const existing = await this.pool.query<Pick<ImapMessage, "id" | "uid" | "flags">>(
-      `
-      SELECT id, uid, flags
-      FROM public.imap_messages
-      WHERE account_id = $1
-        AND folder_path = $2
-        AND uidvalidity = $3
-        AND uid = ANY($4::bigint[])
-        AND deleted_in_provider = false
-      `,
-      [accountId, folder.path, uidValidity, uids]
-    );
-    const existingByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
-    const knownMessages = messages.filter((message) => existingByUid.has(message.uid));
-    const changed = messages
-      .map((message) => {
-        const row = existingByUid.get(message.uid);
-        if (!row || flagsEqual(row.flags, message.flags)) return null;
-        return {
-          row,
-          message,
-          previousFlags: normalizeFlags(row.flags),
-          nextFlags: normalizeFlags(message.flags)
-        };
-      })
-      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-
-    const rows = await this.upsertMessages(accountId, folder, uidValidity, knownMessages, windowCutoff);
-
-    for (const change of changed) {
-      await this.logEvent(
-        accountId,
-        null,
-        change.row.id,
-        folder.path,
-        change.message.uid,
-        "FLAGS_CHANGED",
-        {
-          previousFlags: change.previousFlags,
-          nextFlags: change.nextFlags
-        }
+    if (messages.length > MAX_SYNC_BATCH_SIZE) {
+      throw new Error(
+        `Flag scan batch size ${messages.length} exceeds maximum ${MAX_SYNC_BATCH_SIZE}`
       );
     }
+    const writeBatches = splitFlagWriteBatches(messages);
+    const uniqueUids = new Set(messages.map((message) => message.uid));
+    if (uniqueUids.size !== messages.length) {
+      throw new Error("Flag scan batch contains duplicate UIDs");
+    }
 
-    return { messages: rows, flagsChanged: changed.length };
+    if (options instanceof Date) {
+      // Preserve the exported pre-projection API: Date callers supplied complete
+      // metadata and expected headers, MIME, and attachments to refresh too.
+      const metadata = messages as MessageMetadata[];
+      const uids = metadata.map((message) => message.uid);
+      const boundedExisting = await this.pool.query<Pick<ImapMessage, "id" | "uid" | "flags"> & {
+        stored_bytes: string;
+        stored_flags: string;
+      }>(
+        `
+        WITH candidates AS MATERIALIZED (
+          SELECT id,
+                 uid,
+                 flags,
+                 octet_length(to_json(flags)::text)::bigint AS flag_bytes,
+                 cardinality(flags)::bigint AS flag_count
+          FROM public.imap_messages
+          WHERE account_id = $1
+            AND folder_path = $2
+            AND uidvalidity = $3
+            AND uid = ANY($4::bigint[])
+            AND deleted_in_provider = false
+        ), totals AS (
+          SELECT COALESCE(sum(flag_bytes), 0)::bigint AS stored_bytes,
+                 COALESCE(sum(flag_count), 0)::bigint AS stored_flags
+          FROM candidates
+        )
+        SELECT candidate.id,
+               candidate.uid,
+               candidate.flags,
+               totals.stored_bytes::text,
+               totals.stored_flags::text
+        FROM totals
+        LEFT JOIN candidates AS candidate
+          ON totals.stored_bytes <= $5::bigint
+         AND totals.stored_flags <= $6::bigint
+        `,
+        [
+          accountId,
+          folder.path,
+          uidValidity,
+          uids,
+          MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
+          MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH
+        ]
+      );
+      const storedBytes = Number(boundedExisting.rows[0]?.stored_bytes ?? 0);
+      const storedFlags = Number(boundedExisting.rows[0]?.stored_flags ?? 0);
+      if (storedBytes > MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES
+        || storedFlags > MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH) {
+        throw new Error("Stored flags exceed the aggregate logical event limit");
+      }
+      const existing = boundedExisting.rows.filter(
+        (row): row is typeof row & { id: string } => typeof row.id === "string"
+      );
+      const existingByUid = new Map(existing.map((row) => [Number(row.uid), row]));
+      const knownMessages = metadata.filter((message) => existingByUid.has(message.uid));
+      const changed = metadata
+        .map((message) => {
+          const row = existingByUid.get(message.uid);
+          if (!row) return null;
+          assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
+          if (flagsEqual(row.flags, message.flags)) return null;
+          return {
+            row,
+            message,
+            previousFlags: normalizeFlags(row.flags),
+            nextFlags: normalizeFlags(message.flags)
+          };
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+      const rows = await this.upsertMessages(
+        accountId,
+        folder,
+        uidValidity,
+        knownMessages,
+        options
+      );
+      for (const change of changed) {
+        await this.logEvent(
+          accountId,
+          null,
+          change.row.id,
+          folder.path,
+          change.message.uid,
+          "FLAGS_CHANGED",
+          {
+            previousFlags: change.previousFlags,
+            nextFlags: change.nextFlags
+          }
+        );
+      }
+      return { messages: rows, flagsChanged: changed.length };
+    }
+
+    const uids = messages.map((message) => message.uid);
+    const deadlineAt = options.deadlineAt
+      ?? Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
+    const client = await flagScanDeadline.connect(this.pool, deadlineAt, options.signal);
+    const lease = bindClientAbort(client, options.signal);
+    let discardClient = false;
+
+    try {
+      await flagScanDeadline.queryControl(client, "BEGIN", deadlineAt);
+      await flagScanDeadline.refreshTimeout(client, deadlineAt);
+
+      // Lock and size the stored side before selecting any flag arrays into the
+      // worker. Legacy rows may individually satisfy the per-message limit but
+      // collectively exceed the transaction budget; materializing them first
+      // defeats the memory bound this guard is meant to provide.
+      const storedFootprint = await queryWithDeadline<{
+        stored_bytes: string;
+        stored_flags: string;
+      }>(
+        client,
+        `
+        WITH locked AS MATERIALIZED (
+          SELECT octet_length(to_json(flags)::text)::bigint AS flag_bytes,
+                 cardinality(flags)::bigint AS flag_count
+          FROM public.imap_messages
+          WHERE account_id = $1
+            AND folder_path = $2
+            AND uidvalidity = $3
+            AND uid = ANY($4::bigint[])
+            AND deleted_in_provider = false
+          FOR UPDATE
+        )
+        SELECT COALESCE(sum(flag_bytes), 0)::text AS stored_bytes,
+               COALESCE(sum(flag_count), 0)::text AS stored_flags
+        FROM locked
+        `,
+        [accountId, folder.path, uidValidity, uids],
+        deadlineAt,
+        flagScanDeadline.remainingMs
+      );
+      const storedBytes = Number(storedFootprint.rows[0]?.stored_bytes ?? 0);
+      const storedFlags = Number(storedFootprint.rows[0]?.stored_flags ?? 0);
+      if (storedBytes > MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES
+        || storedFlags > MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH) {
+        throw new Error("Stored flags exceed the aggregate logical event limit");
+      }
+
+      await flagScanDeadline.refreshTimeout(client, deadlineAt);
+      const existing = await queryWithDeadline<ImapMessage>(
+        client,
+        `
+        SELECT *
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND uidvalidity = $3
+          AND uid = ANY($4::bigint[])
+          AND deleted_in_provider = false
+        FOR UPDATE
+        `,
+        [accountId, folder.path, uidValidity, uids],
+        deadlineAt,
+        flagScanDeadline.remainingMs
+      );
+      const existingByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
+      const updatedByUid = new Map<number, ImapMessage>();
+      const changed = messages
+        .map((message) => {
+          const row = existingByUid.get(message.uid);
+          if (!row) return null;
+          assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
+          if (flagRepresentationsEqual(row.flags, message.flags)) return null;
+          const semanticallyChanged = !flagsEqual(row.flags, message.flags);
+          return {
+            row,
+            message,
+            semanticallyChanged,
+            previousFlags: semanticallyChanged ? normalizeFlags(row.flags) : [],
+            nextFlags: semanticallyChanged ? normalizeFlags(message.flags) : []
+          };
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      const changedByUid = new Map(changed.map((entry) => [entry.message.uid, entry]));
+
+      if (changed.length > 0) {
+        for (const writeBatch of writeBatches) {
+          const changedBatch = writeBatch
+            .map((message) => changedByUid.get(message.uid))
+            .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+          if (changedBatch.length === 0) continue;
+
+          await flagScanDeadline.refreshTimeout(client, deadlineAt);
+          const updated = await queryWithDeadline<ImapMessage>(
+            client,
+            `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS changed_flag (
+              id uuid,
+              flags text[]
+            )
+          )
+          UPDATE public.imap_messages AS message
+          SET flags = input.flags
+          FROM input
+          WHERE message.id = input.id
+          RETURNING message.*
+          `,
+            [JSON.stringify(changedBatch.map(({ row, message }) => ({
+              id: row.id,
+              flags: message.flags
+            })))],
+            deadlineAt,
+            flagScanDeadline.remainingMs
+          );
+          if (updated.rows.length !== changedBatch.length) {
+            throw new Error(
+              `Flag scan updated ${updated.rows.length}/${changedBatch.length} changed messages`
+            );
+          }
+          for (const row of updated.rows) {
+            updatedByUid.set(Number(row.uid), row);
+          }
+        }
+
+        const semanticChanges = changed.filter((entry) => entry.semanticallyChanged);
+        if (semanticChanges.length > 0) {
+          let eventsWritten = 0;
+          for (const eventBatch of splitFlagEventBatches(semanticChanges)) {
+            await flagScanDeadline.refreshTimeout(client, deadlineAt);
+            const events = await queryWithDeadline<{ id: string }>(
+              client,
+              `
+            WITH input AS (
+              SELECT *
+              FROM jsonb_to_recordset($1::jsonb) AS changed_flag (
+                message_id uuid,
+                uid bigint,
+                previous_flags text[],
+                next_flags text[]
+              )
+            )
+            INSERT INTO public.imap_sync_events (
+              account_id,
+              sync_run_id,
+              message_id,
+              folder_path,
+              provider_uid,
+              event_type,
+              payload
+            )
+            SELECT
+              $2,
+              NULL,
+              input.message_id,
+              $3,
+              input.uid,
+              'FLAGS_CHANGED',
+              jsonb_build_object(
+                'previousFlags', input.previous_flags,
+                'nextFlags', input.next_flags
+              )
+            FROM input
+            RETURNING id
+            `,
+              [
+                JSON.stringify(eventBatch.map(({ row, message, previousFlags, nextFlags }) => ({
+                  message_id: row.id,
+                  uid: message.uid,
+                  previous_flags: previousFlags,
+                  next_flags: nextFlags
+                }))),
+                accountId,
+                folder.path,
+              ],
+              deadlineAt,
+              flagScanDeadline.remainingMs
+            );
+            if (events.rows.length !== eventBatch.length) {
+              throw new Error(
+                `Flag scan logged ${events.rows.length}/${eventBatch.length} semantic changes`
+              );
+            }
+            eventsWritten += events.rows.length;
+          }
+          if (eventsWritten !== semanticChanges.length) {
+            throw new Error(
+              `Flag scan logged ${eventsWritten}/${semanticChanges.length} semantic changes`
+            );
+          }
+        }
+      }
+
+      await flagScanDeadline.refreshTimeout(client, deadlineAt);
+      await flagScanDeadline.queryControl(client, "COMMIT", deadlineAt, false);
+      return {
+        messages: messages
+          .map((message) => updatedByUid.get(message.uid) ?? existingByUid.get(message.uid))
+          .filter((message): message is ImapMessage => message !== undefined),
+        flagsChanged: changed.filter((entry) => entry.semanticallyChanged).length
+      };
+    } catch (error) {
+      if (!lease.isReleased()) {
+        const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
+        await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
+          discardClient = true;
+        });
+      }
+      throw error;
+    } finally {
+      lease.release(discardClient);
+    }
   }
 
   async markMissingMessages(accountId: string, folder: ImapFolder, uidValidity: number, liveUids: number[]): Promise<number> {
@@ -2353,46 +3013,29 @@ export class MirrorRepository {
         body_headers_json: Record<string, unknown> | null;
       }>(
         `
-        SELECT
-          account_id,
-          folder_path,
-          body_fetched_at,
-          rfc_message_id,
-          in_reply_to,
-          references_header,
-          m.headers_json,
-          b.raw_mime_sha256,
-          b.headers_json AS body_headers_json
+        SELECT account_id, folder_path, body_fetched_at,
+               rfc_message_id, in_reply_to, references_header,
+               m.headers_json, b.raw_mime_sha256,
+               b.headers_json AS body_headers_json
         FROM public.imap_messages m
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-        WHERE m.id = $1
-        FOR UPDATE OF m
+        WHERE m.id = $1 FOR UPDATE OF m
         `,
         [body.messageId]
       );
       const message = target.rows[0];
       if (!message) throw new Error(`Message not found for body storage: ${body.messageId}`);
 
-      // A metadata FETCH can be incomplete or malformed while the later full MIME
-      // parse has usable threading headers. Fill only missing mirror fields; never
-      // overwrite provider-observed metadata with parser output. Any newly learned
-      // threading/automation header requeues this message for the derived thread
-      // projection, while body storage itself remains independent.
       const recoveredHeaders: Record<string, unknown> = {};
       for (const key of THREADING_BODY_HEADER_KEYS) {
         const value = body.headersJson[key];
-        if (value !== undefined && message.headers_json[key] === undefined) {
-          recoveredHeaders[key] = value;
-        }
+        if (value !== undefined && message.headers_json[key] === undefined) recoveredHeaders[key] = value;
       }
       const recoveredMessageId = message.rfc_message_id ? null : headerText(body.headersJson["message-id"]);
       const recoveredInReplyTo = message.in_reply_to ? null : headerText(body.headersJson["in-reply-to"]);
       const recoveredReferences = message.references_header ? null : headerText(body.headersJson.references);
       const learnedThreadingEvidence = Boolean(
-        recoveredMessageId
-        || recoveredInReplyTo
-        || recoveredReferences
-        || Object.keys(recoveredHeaders).length > 0
+        recoveredMessageId || recoveredInReplyTo || recoveredReferences || Object.keys(recoveredHeaders).length > 0
       );
       const rawMimeSha256 = body.rawTruncated
         ? null
@@ -2403,16 +3046,13 @@ export class MirrorRepository {
 
       if (learnedThreadingEvidence) {
         await client.query(
-          `
-          UPDATE public.imap_messages
-          SET
-            rfc_message_id = COALESCE(rfc_message_id, $2),
-            message_id_normalized = COALESCE(message_id_normalized, $3),
-            in_reply_to = COALESCE(in_reply_to, $4),
-            references_header = COALESCE(references_header, $5),
-            headers_json = headers_json || $6::jsonb
-          WHERE id = $1
-          `,
+          `UPDATE public.imap_messages SET
+             rfc_message_id = COALESCE(rfc_message_id, $2),
+             message_id_normalized = COALESCE(message_id_normalized, $3),
+             in_reply_to = COALESCE(in_reply_to, $4),
+             references_header = COALESCE(references_header, $5),
+             headers_json = headers_json || $6::jsonb
+           WHERE id = $1`,
           [
             body.messageId,
             recoveredMessageId,
@@ -2617,9 +3257,12 @@ export class MirrorRepository {
     targetMaxUid: number,
     oldestUidSynced: number,
     targetCount: number,
-    cutoff: Date
+    cutoff: Date,
+    expectedUidValidity: number,
+    options: SyncStateWriteOptions = {}
   ): Promise<void> {
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_folders
       SET backfill_in_progress = ($4::int > 0),
@@ -2631,31 +3274,67 @@ export class MirrorRepository {
           last_progress_at = now(),
           last_progress_note = 'history_backfill_snapshot'
       WHERE id = $1
+        AND uidvalidity = $6
+      RETURNING id
       `,
-      [folderId, targetMaxUid, oldestUidSynced, targetCount, cutoff]
+      [folderId, targetMaxUid, oldestUidSynced, targetCount, cutoff, expectedUidValidity],
+      options
     );
+    if (result.rows.length !== 1) {
+      throw new Error(`History snapshot lost folder generation ${folderId}`);
+    }
   }
 
   async advanceHistoryBackfillWatermark(
     folderId: string,
     newOldestUidSynced: number,
-    lastProgressUid: number
+    lastProgressUid: number,
+    expectedUidValidity: number,
+    options: { complete?: boolean; deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       UPDATE public.imap_folders
       SET backfill_oldest_uid_synced = $2,
+          backfill_in_progress = CASE WHEN $4::boolean THEN false ELSE backfill_in_progress END,
+          last_archive_refresh_at = CASE WHEN $4::boolean THEN now() ELSE last_archive_refresh_at END,
           last_progress_at = now(),
           last_progress_uid = $3,
-          last_progress_note = 'history_backfill_metadata'
+          last_progress_note = CASE
+            WHEN $4::boolean THEN 'history_backfill_complete'
+            ELSE 'history_backfill_metadata'
+          END
       WHERE id = $1
-      `,
-      [folderId, newOldestUidSynced, lastProgressUid]
-    );
+        AND uidvalidity = $5
+      RETURNING id
+    `;
+    const values = [
+      folderId,
+      newOldestUidSynced,
+      lastProgressUid,
+      options.complete === true,
+      expectedUidValidity
+    ];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool,
+          query,
+          values,
+          options.deadlineAt,
+          options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`History watermark lost folder generation ${folderId}`);
+    }
   }
 
-  async markHistoryBackfillComplete(folderId: string): Promise<void> {
-    await this.pool.query(
+  async markHistoryBackfillComplete(
+    folderId: string,
+    expectedUidValidity: number,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_folders
       SET backfill_in_progress = false,
@@ -2663,9 +3342,15 @@ export class MirrorRepository {
           last_progress_at = now(),
           last_progress_note = 'history_backfill_complete'
       WHERE id = $1
+        AND uidvalidity = $2
+      RETURNING id
       `,
-      [folderId]
+      [folderId, expectedUidValidity],
+      options
     );
+    if (result.rows.length !== 1) {
+      throw new Error(`History completion lost folder generation ${folderId}`);
+    }
   }
 
   async getBodyBacklog(account: ImapAccount, limit: number): Promise<ImapMessage[]> {

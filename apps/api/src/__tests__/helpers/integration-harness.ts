@@ -4,6 +4,7 @@ import { MirrorRepository } from "../../repository.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../../smoke/fixture-imap.js";
 import { MirrorEngine } from "../../sync-engine.js";
 import type { MirrorImapClient } from "../../imap-client.js";
+import type { MirrorHooks } from "../../types.js";
 
 export interface IntegrationHarness {
   pool: PgPool;
@@ -17,6 +18,7 @@ export interface IntegrationHarness {
       account: unknown,
       options?: { signal?: AbortSignal }
     ) => Promise<MirrorImapClient>;
+    hooks?: MirrorHooks;
   }): MirrorEngine;
 }
 
@@ -52,11 +54,12 @@ export async function setupIntegration(suite: string, overrides: Partial<AppConf
     config,
     repository,
     account: { id: account.id },
-    buildEngine({ folders, overrides: engineOverrides = {}, clientFactory }) {
+    buildEngine({ folders, overrides: engineOverrides = {}, clientFactory, hooks }) {
       return new MirrorEngine({
         pool,
         config: { ...config, ...engineOverrides },
         repository,
+        hooks,
         clientFactory:
           clientFactory ?? (async () => new FixtureImapClient(folders))
       });

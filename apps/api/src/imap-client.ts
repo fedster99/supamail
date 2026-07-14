@@ -3,8 +3,22 @@ import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { connectImap } from "./imap-connect.js";
 import { extractAttachmentMetadata, normalizeMessageId, parseHeaders, parseRawMime, selectBodyTextPart } from "./mime.js";
+import {
+  MAX_SYNC_ATTACHMENTS_PER_FETCH,
+  MAX_SYNC_FLAG_FETCH_BYTES,
+  MAX_SYNC_FLAGS_PER_FETCH,
+  MAX_SYNC_METADATA_FETCH_BYTES,
+  flagSnapshotFootprint,
+  metadataMessageFootprint
+} from "./sync-limits.js";
 import { ImapThrottle } from "./throttle.js";
-import type { ImapAccount, ImapMessage, MessageBodyInput, MessageMetadata } from "./types.js";
+import type {
+  ImapAccount,
+  ImapMessage,
+  MessageBodyInput,
+  MessageFlagSnapshot,
+  MessageMetadata
+} from "./types.js";
 
 export interface MailboxStatus {
   path: string;
@@ -273,12 +287,15 @@ export async function fetchMessageMetadata(
 ): Promise<MessageMetadata[]> {
   const messages: MessageMetadata[] = [];
   const providerNamespace = providerObjectIdNamespace(client.capabilities);
+  const requestedUids = [...new Set(uids)];
+  let retainedBytes = 2;
+  let retainedAttachments = 0;
 
-  for (let i = 0; i < uids.length; i += batchSize) {
-    const batch = uids.slice(i, i + batchSize);
+  for (let i = 0; i < requestedUids.length; i += batchSize) {
+    const batch = requestedUids.slice(i, i + batchSize);
     if (batch.length === 0) continue;
     const expected = new Set(batch);
-    const returned = new Set<number>();
+    const returned = new Map<number, MessageMetadata>();
 
     for await (const msg of client.fetch(batch, {
       uid: true,
@@ -302,16 +319,38 @@ export async function fetchMessageMetadata(
         "thread-topic"
       ]
     }, { uid: true })) {
-      // Skip unsolicited / partial FETCH responses that arrive without a UID (e.g. a
-      // server-pushed flag update mid-command). Pushing them would upsert a NULL uid and
-      // violate imap_messages.uid NOT NULL; the `missing` check below still verifies every
-      // requested UID actually came back, so a real message is never silently dropped.
-      if (!Number.isInteger(msg.uid)) continue;
-      returned.add(msg.uid);
-      messages.push(parseMessageMetadata(msg, providerNamespace));
+      // Ignore unsolicited UID-less, out-of-range, and flags-only FETCH responses.
+      // A requested UID is complete only when the fundamental requested fields are
+      // present; the completeness check below still fails closed if its real response
+      // never arrives. Latest complete response wins if a provider repeats a UID.
+      if (!Number.isInteger(msg.uid) || !expected.has(msg.uid)) continue;
+      const hasRequestedMetadata = msg.flags !== undefined
+        && msg.internalDate instanceof Date
+        && typeof msg.size === "number"
+        && Number.isSafeInteger(msg.size)
+        && msg.size >= 0
+        && msg.envelope !== undefined
+        && msg.headers !== undefined
+        && msg.bodyStructure !== undefined;
+      if (!hasRequestedMetadata) continue;
+      const parsed = parseMessageMetadata(msg, providerNamespace);
+      const footprint = metadataMessageFootprint(parsed);
+      const previous = returned.get(msg.uid);
+      if (previous) {
+        const previousFootprint = metadataMessageFootprint(previous);
+        retainedBytes -= previousFootprint.bytes;
+        retainedAttachments -= previousFootprint.attachments;
+      }
+      retainedBytes += footprint.bytes;
+      retainedAttachments += footprint.attachments;
+      if (retainedBytes > MAX_SYNC_METADATA_FETCH_BYTES
+        || retainedAttachments > MAX_SYNC_ATTACHMENTS_PER_FETCH) {
+        throw new Error("IMAP metadata fetch exceeded the aggregate memory budget");
+      }
+      returned.set(msg.uid, parsed);
     }
 
-    const missing = [...expected].filter((uid) => !returned.has(uid));
+    const missing = batch.filter((uid) => !returned.has(uid));
     if (missing.length > 0) {
       throw new Error(
         `IMAP metadata fetch returned ${returned.size}/${expected.size} requested UIDs; missing ${missing
@@ -319,9 +358,67 @@ export async function fetchMessageMetadata(
           .join(",")}`
       );
     }
+    messages.push(...batch.map((uid) => returned.get(uid)!));
   }
 
   return messages;
+}
+
+export async function fetchMessageFlags(
+  client: MirrorImapClient,
+  uids: number[],
+  batchSize: number
+): Promise<MessageFlagSnapshot[]> {
+  const snapshots: MessageFlagSnapshot[] = [];
+  const requestedUids = [...new Set(uids)];
+  let retainedBytes = 2;
+  let retainedFlags = 0;
+
+  for (let i = 0; i < requestedUids.length; i += batchSize) {
+    const batch = requestedUids.slice(i, i + batchSize);
+    if (batch.length === 0) continue;
+    const expected = new Set(batch);
+    const returned = new Map<number, MessageFlagSnapshot>();
+    const omittedFlags = new Set<number>();
+
+    for await (const msg of client.fetch(batch, { uid: true, flags: true }, { uid: true })) {
+      if (!Number.isInteger(msg.uid) || !expected.has(msg.uid)) continue;
+      if (msg.flags === undefined) {
+        omittedFlags.add(msg.uid);
+        continue;
+      }
+      const snapshot = { uid: msg.uid, flags: [...msg.flags] };
+      const footprint = flagSnapshotFootprint(snapshot);
+      const previous = returned.get(msg.uid);
+      if (previous) {
+        const previousFootprint = flagSnapshotFootprint(previous);
+        retainedBytes -= previousFootprint.bytes;
+        retainedFlags -= previousFootprint.flags;
+      }
+      retainedBytes += footprint.bytes;
+      retainedFlags += footprint.flags;
+      if (retainedBytes > MAX_SYNC_FLAG_FETCH_BYTES || retainedFlags > MAX_SYNC_FLAGS_PER_FETCH) {
+        throw new Error("IMAP flag fetch exceeded the aggregate memory budget");
+      }
+      returned.set(msg.uid, snapshot);
+    }
+
+    const missing = batch.filter((uid) => !returned.has(uid));
+    if (missing.length > 0) {
+      const omitted = missing.find((uid) => omittedFlags.has(uid));
+      if (omitted !== undefined) {
+        throw new Error(`IMAP flag fetch omitted FLAGS for requested UID ${omitted}`);
+      }
+      throw new Error(
+        `IMAP flag fetch returned ${returned.size}/${expected.size} requested UIDs; missing ${missing
+          .slice(0, 10)
+          .join(",")}`
+      );
+    }
+    snapshots.push(...batch.map((uid) => returned.get(uid)!));
+  }
+
+  return snapshots;
 }
 
 export async function searchUidsSince(

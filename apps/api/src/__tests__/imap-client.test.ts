@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { AppConfig } from "../config.js";
 import {
   fetchFullMessageBody,
+  fetchMessageFlags,
   fetchMessageMetadata,
   MessageMovedError,
   parseMessageMetadata,
@@ -15,6 +16,7 @@ import {
   type MirrorImapClient
 } from "../imap-client.js";
 import { FixtureImapClient, makeTextMessage } from "../smoke/fixture-imap.js";
+import { MAX_SYNC_METADATA_FETCH_BYTES } from "../sync-limits.js";
 import type { ImapMessage } from "../types.js";
 
 describe("fetchMessageMetadata", () => {
@@ -232,7 +234,8 @@ describe("fetchMessageMetadata uid guard", () => {
     internalDate: new Date("2026-01-01T00:00:00.000Z"),
     size: 10,
     envelope: {},
-    headers: Buffer.alloc(0)
+    headers: Buffer.alloc(0),
+    bodyStructure: null
   });
 
   it("skips an unsolicited FETCH response with no UID without dropping the requested ones", async () => {
@@ -248,5 +251,137 @@ describe("fetchMessageMetadata uid guard", () => {
   it("still throws when a requested UID is genuinely missing", async () => {
     const client = metadataStub([real(100)]);
     await expect(fetchMessageMetadata(client, [100, 101], 50)).rejects.toThrow(/missing 101/);
+  });
+
+  it("ignores unexpected responses and returns each requested UID once in request order", async () => {
+    const client = metadataStub([
+      real(999),
+      { uid: 100, flags: new Set(["\\Seen"]) },
+      real(101),
+      real(100),
+      { ...real(100), flags: new Set(["\\Flagged"]) }
+    ]);
+    const result = await fetchMessageMetadata(client, [100, 101, 100], 50);
+    expect(result.map((message) => message.uid)).toEqual([100, 101]);
+    expect(result[0].flags).toEqual(["\\Flagged"]);
+  });
+
+  it("fails closed before retaining an unbounded metadata fetch", async () => {
+    const subject = "x".repeat(Math.floor(MAX_SYNC_METADATA_FETCH_BYTES / 5) + 1);
+    const responses = Array.from({ length: 5 }, (_, index) => ({
+      ...real(index + 1),
+      envelope: { subject }
+    }));
+
+    await expect(fetchMessageMetadata(
+      metadataStub(responses),
+      [1, 2, 3, 4, 5],
+      50
+    )).rejects.toThrow(/aggregate memory budget/);
+  });
+
+  it("fails closed when overwrite-critical metadata fields are omitted", async () => {
+    const complete = real(100);
+    for (const field of ["envelope", "headers", "bodyStructure"] as const) {
+      const partial = { ...complete };
+      delete partial[field];
+      await expect(fetchMessageMetadata(metadataStub([partial]), [100], 50)).rejects.toThrow(/missing 100/);
+    }
+  });
+
+  it("fails closed when a provider returns an unsafe message size", async () => {
+    for (const size of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      await expect(
+        fetchMessageMetadata(metadataStub([{ ...real(100), size }]), [100], 50)
+      ).rejects.toThrow(/missing 100/);
+    }
+  });
+});
+
+describe("fetchMessageFlags payload guard", () => {
+  const flagStub = (
+    yielded: Array<{ uid: number; flags: Set<string> }>
+  ): MirrorImapClient => ({
+    mailbox: { path: "INBOX", uidValidity: 1 },
+    async *fetch() {
+      for (const message of yielded) yield message as FetchMessage;
+    }
+  }) as unknown as MirrorImapClient;
+
+  it("fails closed before retaining an unbounded aggregate keyword set", async () => {
+    const flags = new Set(Array.from({ length: 4_500 }, (_, index) => `keyword-${index}`));
+    const messages = Array.from({ length: 5 }, (_, index) => ({ uid: index + 1, flags }));
+    await expect(fetchMessageFlags(
+      flagStub(messages),
+      [1, 2, 3, 4, 5],
+      50
+    )).rejects.toThrow(/aggregate memory budget/);
+  });
+
+  it("accounts for a replacement response instead of double-counting it", async () => {
+    const large = new Set(Array.from({ length: 15_000 }, (_, index) => `old-${index}`));
+    const replacement = new Set(["\\Seen"]);
+    const other = new Set(Array.from({ length: 4_999 }, (_, index) => `new-${index}`));
+    const result = await fetchMessageFlags(
+      flagStub([
+        { uid: 1, flags: large },
+        { uid: 1, flags: replacement },
+        { uid: 2, flags: other }
+      ]),
+      [1, 2],
+      50
+    );
+    expect(result).toEqual([
+      { uid: 1, flags: ["\\Seen"] },
+      { uid: 2, flags: [...other] }
+    ]);
+  });
+});
+
+describe("fetchMessageFlags", () => {
+  const flagsStub = (
+    yielded: Array<Partial<FetchMessage>>,
+    calls: Array<{ query: Record<string, unknown>; options?: Record<string, unknown> }> = []
+  ): MirrorImapClient =>
+    ({
+      mailbox: { path: "INBOX", uidValidity: 1 },
+      async *fetch(
+        _range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ) {
+        calls.push({ query, options });
+        for (const msg of yielded) yield msg as FetchMessage;
+      }
+    }) as unknown as MirrorImapClient;
+
+  it("requests only UID and FLAGS and skips UID-less unsolicited responses", async () => {
+    const calls: Array<{ query: Record<string, unknown>; options?: Record<string, unknown> }> = [];
+    const client = flagsStub([
+      { uid: 101, flags: new Set() },
+      { uid: 999, flags: new Set(["\\Seen"]) },
+      { uid: 100, flags: new Set(["\\Seen"]) },
+      { uid: 100, flags: new Set(["\\Seen", "\\Flagged"]) },
+      { flags: new Set(["\\Seen"]) }
+    ], calls);
+
+    await expect(fetchMessageFlags(client, [100, 101, 100], 50)).resolves.toEqual([
+      { uid: 100, flags: ["\\Seen", "\\Flagged"] },
+      { uid: 101, flags: [] }
+    ]);
+    expect(calls).toEqual([{
+      query: { uid: true, flags: true },
+      options: { uid: true }
+    }]);
+  });
+
+  it("fails instead of advancing past a partial UID batch", async () => {
+    const client = flagsStub([{ uid: 100, flags: new Set(["\\Seen"]) }]);
+    await expect(fetchMessageFlags(client, [100, 101], 50)).rejects.toThrow(/missing 101/);
+  });
+
+  it("fails closed when a requested response omits FLAGS", async () => {
+    const client = flagsStub([{ uid: 100 }]);
+    await expect(fetchMessageFlags(client, [100], 50)).rejects.toThrow(/omitted FLAGS.*100/i);
   });
 });

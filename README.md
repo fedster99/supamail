@@ -40,6 +40,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 - Parsed text, HTML, normalized text, and parser metadata
 - Attachment and inline-part metadata
 - Sync runs, sync events, health, lag, retries, and backoff
+- Structured metadata write-service and worker-tick throughput metrics
 - Per-folder and per-account progress percentages for headers and body completeness
 - Folder-count safeguards for unusually large mailboxes
 - Reactive rediscovery when a provider reports a mailbox no longer exists

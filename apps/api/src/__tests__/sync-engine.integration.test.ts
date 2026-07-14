@@ -70,6 +70,25 @@ async function markCurrentTrackedFoldersClean(h: { pool: ReturnType<typeof getPo
   await h.repository.markAccountSyncSucceeded(h.account.id);
 }
 
+async function accountHealthSnapshot(pool: ReturnType<typeof getPool>, accountId: string) {
+  return (
+    await pool.query<{
+      sync_state: string;
+      sync_state_reason: string | null;
+      consecutive_failures: number;
+      consecutive_successes: number;
+      last_sync_finished_at: Date | null;
+      last_priority_sync_succeeded_at: Date | null;
+      backoff_until: Date | null;
+    }>(
+      `SELECT sync_state, sync_state_reason, consecutive_failures, consecutive_successes,
+              last_sync_finished_at, last_priority_sync_succeeded_at, backoff_until
+       FROM public.imap_accounts WHERE id = $1`,
+      [accountId]
+    )
+  ).rows[0];
+}
+
 integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   const activeAccountIds: string[] = [];
 
@@ -179,7 +198,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     try {
       const stoppedPromptly = await Promise.race([
         sync.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 1_000))
       ]);
       expect(stoppedPromptly).toBe(true);
       expect(closeCalls).toBeGreaterThan(0);
@@ -191,6 +210,232 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       await sync;
     }
   });
+
+  it("closes an in-flight full sync when the worker shutdown signal aborts", async () => {
+    const h = await setupIntegration("full-sync-abort");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    await dueAllFolders(h.pool, h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+
+    let releaseLock!: () => void;
+    let markStarted!: () => void;
+    const lockGate = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let closeCalls = 0;
+    let closed = false;
+
+    class BlockingFullSyncClient extends FixtureImapClient {
+      close(): void {
+        closeCalls += 1;
+        closed = true;
+        releaseLock();
+      }
+
+      override async getMailboxLock(path: string) {
+        if (path === "INBOX") {
+          markStarted();
+          await lockGate;
+          if (closed) throw new Error("IMAP connection closed");
+        }
+        return await super.getMailboxLock(path);
+      }
+    }
+
+    const client = new BlockingFullSyncClient(folders);
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => client
+    });
+    const abort = new AbortController();
+    const sync = engine.syncDueAccounts(1, { signal: abort.signal });
+
+    await started;
+    abort.abort();
+    try {
+      const stoppedPromptly = await Promise.race([
+        sync.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 1_000))
+      ]);
+      expect(stoppedPromptly).toBe(true);
+      expect(closeCalls).toBeGreaterThan(0);
+      const [result] = await sync;
+      expect(result.outcome).toBe("partial_success");
+      expect(result.errors).toEqual(["Sync interrupted by scheduler"]);
+      const locks = await h.pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM pg_locks
+         WHERE locktype = 'advisory'
+           AND granted = true
+           AND objid::bigint = $1::bigint`,
+        [account.lock_id]
+      );
+      expect(locks.rows[0].count).toBe("0");
+      const state = await h.pool.query<{ currently_syncing: boolean; sync_started_by: string | null }>(
+        "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+        [h.account.id]
+      );
+      expect(state.rows[0]).toEqual({ currently_syncing: false, sync_started_by: null });
+      const run = await h.pool.query<{ status: string; error: string | null }>(
+        "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
+        [result.runId]
+      );
+      expect(run.rows[0]).toEqual({
+        status: "partial_success",
+        error: "Sync interrupted by scheduler"
+      });
+    } finally {
+      releaseLock();
+      await sync;
+    }
+  });
+
+  it("treats shutdown during full-sync connection setup as cancellation", async () => {
+    const h = await setupIntegration("full-sync-connect-abort");
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    const healthBefore = await accountHealthSnapshot(h.pool, h.account.id);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const engine = h.buildEngine({
+      folders: buildInboxAndSentFolders(),
+      clientFactory: async (_account, options) => {
+        markStarted();
+        await new Promise<void>((_resolve, reject) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("IMAP connection interrupted")),
+            { once: true }
+          );
+        });
+        throw new Error("unreachable");
+      }
+    });
+    const abort = new AbortController();
+    const sync = engine.syncDueAccounts(1, { signal: abort.signal });
+
+    await started;
+    abort.abort();
+    const [result] = await sync;
+
+    expect(result.outcome).toBe("partial_success");
+    expect(result.errors).toEqual(["Sync interrupted by scheduler"]);
+    const locks = await h.pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM pg_locks
+       WHERE locktype = 'advisory'
+         AND granted = true
+         AND objid::bigint = $1::bigint`,
+      [account.lock_id]
+    );
+    expect(locks.rows[0].count).toBe("0");
+    const state = await h.repository.getAccount(h.account.id);
+    expect(state?.currently_syncing).toBe(false);
+    expect(state?.sync_started_by).toBeNull();
+    expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
+  });
+
+  it("finishes a failed run when shutdown interrupts failure finalization", async () => {
+    const h = await setupIntegration("failure-finalization-abort");
+    activeAccountIds.push(h.account.id);
+    const abort = new AbortController();
+    const originalMarkFailed = h.repository.markAccountSyncFailed.bind(h.repository);
+    vi.spyOn(h.repository, "markAccountSyncFailed").mockImplementation(async (...args) => {
+      abort.abort();
+      return await originalMarkFailed(...args);
+    });
+    const engine = h.buildEngine({
+      folders: [],
+      clientFactory: async () => {
+        throw new Error("provider failed before shutdown");
+      }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", { signal: abort.signal });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.errors).toEqual(["[Error] provider failed before shutdown"]);
+    const state = await h.pool.query<{
+      currently_syncing: boolean;
+      sync_started_by: string | null;
+    }>(
+      "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]).toEqual({ currently_syncing: false, sync_started_by: null });
+    const run = await h.pool.query<{ status: string; error: string | null }>(
+      "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0]).toEqual({
+      status: "failed",
+      error: "[Error] provider failed before shutdown"
+    });
+  });
+
+  it.each(["body", "history"] as const)(
+    "recognizes shutdown after the %s lane without changing account health",
+    async (lane) => {
+      const h = await setupIntegration(`full-sync-${lane}-abort`);
+      activeAccountIds.push(h.account.id);
+      const folders = buildInboxAndSentFolders();
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      await dueAllFolders(h.pool, h.account.id);
+      const account = await h.repository.getAccount(h.account.id);
+      if (!account) throw new Error("missing account");
+      const healthBefore = await accountHealthSnapshot(h.pool, h.account.id);
+      const abort = new AbortController();
+      const internal = engine as unknown as {
+        fetchBodyBacklog: () => Promise<{ fetched: number; hitLockBudget: boolean }>;
+        runHistoryLane: () => Promise<{
+          messagesUpserted: number;
+          bodiesFetched: number;
+          hitLockBudget: boolean;
+          errors: string[];
+        }>;
+      };
+
+      if (lane === "body") {
+        vi.spyOn(internal, "fetchBodyBacklog").mockImplementation(async () => {
+          abort.abort();
+          return { fetched: 0, hitLockBudget: false };
+        });
+      } else {
+        vi.spyOn(internal, "runHistoryLane").mockImplementation(async () => {
+          abort.abort();
+          return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
+        });
+      }
+
+      const [result] = await engine.syncDueAccounts(1, { signal: abort.signal });
+
+      expect(result.outcome).toBe("partial_success");
+      expect(result.errors).toEqual(["Sync interrupted by scheduler"]);
+      expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
+      const state = await h.repository.getAccount(h.account.id);
+      expect(state?.currently_syncing).toBe(false);
+      expect(state?.sync_started_by).toBeNull();
+      const locks = await h.pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM pg_locks
+         WHERE locktype = 'advisory'
+           AND granted = true
+           AND objid::bigint = $1::bigint`,
+        [account.lock_id]
+      );
+      expect(locks.rows[0].count).toBe("0");
+    }
+  );
 
   it("treats a scheduler abort during Sent connection setup as a neutral yield", async () => {
     const h = await setupIntegration("sent-fast-pass-connect-abort");
@@ -1767,6 +2012,177 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ).rows[0];
     expect(skippedHistory.historical_target_count).toBeNull();
     expect(Number(skippedHistory.historical_message_count)).toBe(0);
+  });
+
+  it("finishes an in-flight history batch at the safe boundary after the lock budget expires", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("history-safe-boundary", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_LOCK_HOLD_MS: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET body_fetch_policy = 'lazy',
+           historical_backfill_mode = 'metadata_only',
+           max_backfill_rate = 'small'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_101,
+      messages: [
+        makeTextMessage({
+          uid: 1,
+          subject: "historical",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "historical",
+          internalDate: oldDate
+        }),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: recentDate
+        })
+      ]
+    }];
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+
+    class LockBoundaryHistoryFetchClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (Array.isArray(range) && range.includes(1) && query.envelope) {
+          now += 75;
+        }
+        yield* super.fetch(range, query);
+      }
+    }
+
+    try {
+      const result = await h.buildEngine({
+        folders,
+        clientFactory: async () => new LockBoundaryHistoryFetchClient(folders)
+      }).syncAccount(h.account.id, "manual");
+
+      expect(result.outcome).toBe("success");
+      expect(result.hitLockBudget).toBe(true);
+      expect(result.errors).toEqual([]);
+      const history = await h.pool.query<{
+        uid: string;
+        backfill_in_progress: boolean;
+        backfill_oldest_uid_synced: string | null;
+      }>(
+        `SELECT m.uid::text AS uid, f.backfill_in_progress,
+                f.backfill_oldest_uid_synced::text AS backfill_oldest_uid_synced
+         FROM public.imap_messages m
+         JOIN public.imap_folders f ON f.id = m.folder_id
+         WHERE m.account_id = $1 AND m.uid = 1`,
+        [h.account.id]
+      );
+      expect(history.rows).toEqual([{
+        uid: "1",
+        backfill_in_progress: false,
+        backfill_oldest_uid_synced: "1"
+      }]);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("does not advance the history watermark when a post-commit hook fails", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("history-hook-watermark", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET body_fetch_policy = 'lazy',
+           historical_backfill_mode = 'metadata_only',
+           max_backfill_rate = 'small'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_102,
+      messages: [
+        makeTextMessage({
+          uid: 1,
+          subject: "historical-hook",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "historical",
+          internalDate: oldDate
+        }),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh-hook",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: recentDate
+        })
+      ]
+    }];
+
+    const failed = await h.buildEngine({
+      folders,
+      hooks: {
+        onMessageUpsert(message) {
+          if (Number(message.uid) === 1) throw new Error("forced history hook failure");
+        }
+      }
+    }).syncAccount(h.account.id, "manual");
+    expect(failed.outcome).not.toBe("success");
+
+    const afterFailure = await h.pool.query<{
+      backfill_in_progress: boolean;
+      backfill_oldest_uid_synced: string | null;
+    }>(
+      `SELECT backfill_in_progress, backfill_oldest_uid_synced::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+    expect(afterFailure.rows[0]).toEqual({
+      backfill_in_progress: true,
+      backfill_oldest_uid_synced: "2"
+    });
+
+    const retried = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    expect(retried.outcome).toBe("success");
+    const afterRetry = await h.pool.query<{
+      backfill_in_progress: boolean;
+      backfill_oldest_uid_synced: string | null;
+    }>(
+      `SELECT backfill_in_progress, backfill_oldest_uid_synced::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+    expect(afterRetry.rows[0]).toEqual({
+      backfill_in_progress: false,
+      backfill_oldest_uid_synced: "1"
+    });
   });
 
   it("Scenario N — history backfill batches across cycles and resumes from the watermark", async () => {

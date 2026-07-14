@@ -16,7 +16,16 @@ const RUN_ID = "00000000-0000-4000-8000-000000000005";
 const LIVE_STATUSES = ["building", "ready", "active", "standby"];
 
 function sqlText(value: unknown): string {
-  return String(value).replace(/\s+/g, " ").trim();
+  const text = typeof value === "object" && value !== null && "text" in value
+    ? String((value as { text: unknown }).text)
+    : String(value);
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function sqlParams(value: unknown, params: unknown[]): unknown[] {
+  return typeof value === "object" && value !== null && "values" in value
+    ? ((value as { values?: unknown[] }).values ?? [])
+    : params;
 }
 
 function repositoryWithClient(
@@ -70,19 +79,26 @@ describe("repository threading evidence wiring", () => {
     expect(canonicalJsonForThreadingEvidence([1, 2])).not.toBe(canonicalJsonForThreadingEvidence([2, 1]));
   });
 
-  it("treats a new message as one incremental item in every live run", async () => {
+  it("writes provider evidence behind the threading state barrier", async () => {
     const calls: Array<{ sql: string; params: unknown[] }> = [];
     const client = {
       release: vi.fn(),
       query: vi.fn(async (sql: unknown, params: unknown[] = []) => {
         const text = sqlText(sql);
-        calls.push({ sql: text, params });
+        const values = sqlParams(sql, params);
+        calls.push({ sql: text, params: values });
         if (text.includes("FROM public.imap_thread_state") && text.includes("FOR SHARE")) {
           return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
         }
-        if (text.startsWith("SELECT m.id,")) return { rows: [], rowCount: 0 };
-        if (text.startsWith("INSERT INTO public.imap_messages")) {
-          return { rows: [{ id: MESSAGE_ID }], rowCount: 1 };
+        if (text.startsWith("SELECT id") && text.includes("FROM public.imap_folders")) {
+          return { rows: [{ id: FOLDER_ID, uidvalidity: "7" }], rowCount: 1 };
+        }
+        if (text.startsWith("SELECT uid::text AS uid")) return { rows: [], rowCount: 0 };
+        if (text.includes("INSERT INTO public.imap_messages")) {
+          return { rows: [{ id: MESSAGE_ID, uid: "42" }], rowCount: 1 };
+        }
+        if (text.includes("UPDATE public.imap_folders")) {
+          return { rows: [{ id: FOLDER_ID }], rowCount: 1 };
         }
         return { rows: [], rowCount: 0 };
       })
@@ -98,15 +114,19 @@ describe("repository threading evidence wiring", () => {
     );
 
     const stateLockIndex = calls.findIndex((call) => call.sql.includes("FOR SHARE"));
-    const messageWriteIndex = calls.findIndex((call) => call.sql.startsWith("INSERT INTO public.imap_messages"));
+    const messageWriteIndex = calls.findIndex((call) => call.sql.includes("INSERT INTO public.imap_messages"));
     expect(stateLockIndex).toBeGreaterThan(-1);
     expect(stateLockIndex).toBeLessThan(messageWriteIndex);
 
-    const queue = calls.filter((call) => call.sql.startsWith("INSERT INTO public.imap_thread_work_queue"));
-    expect(queue).toHaveLength(1);
-    expect(queue[0]?.sql).toContain("ON CONFLICT (run_id, message_id)");
-    expect(queue[0]?.params).toEqual([ACCOUNT_ID, [MESSAGE_ID], "metadata_changed", LIVE_STATUSES]);
-    expect(queue[0]?.sql).not.toContain("imap_thread_assignments_account");
+    const messageWrite = calls[messageWriteIndex];
+    expect(messageWrite?.sql).toContain("provider_message_id_namespace");
+    expect(messageWrite?.sql).toContain("provider_thread_id_namespace");
+    expect(JSON.parse(String(messageWrite?.params[0]))).toMatchObject([{
+      provider_message_id: "opaque-message",
+      provider_message_id_namespace: "gmail",
+      provider_thread_id: "opaque-thread",
+      provider_thread_id_namespace: "gmail"
+    }]);
   });
 
   it("does not requeue an unchanged body when JSONB key order changes", async () => {

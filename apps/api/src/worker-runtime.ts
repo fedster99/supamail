@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
 import { closePool, getPool, type PgPool } from "./db.js";
@@ -5,12 +6,18 @@ import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { ThreadingRepository, type ThreadingRunResult } from "./threading-repository.js";
+import { metadataRowsPerSecond } from "./sync-engine.js";
 
 export interface WorkerSyncResult {
   runId: string;
   outcome: string;
   foldersProcessed: number;
   messagesUpserted: number;
+  metadataRowsCommitted?: number;
+  metadataWriteDurationMs?: number;
+  metadataWriteBatchesAttempted?: number;
+  metadataWriteBatchesFailed?: number;
+  metadataWriteServiceRowsPerSecond?: number | null;
   bodiesFetched: number;
   errors: string[];
 }
@@ -89,12 +96,59 @@ export interface WorkerRuntime {
   done: Promise<void>;
 }
 
+function isNonNegativeCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isNonNegativeDuration(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function hasCompleteMetadataTelemetry(result: WorkerSyncResult): boolean {
+  const rows = result.metadataRowsCommitted;
+  const durationMs = result.metadataWriteDurationMs;
+  const attempted = result.metadataWriteBatchesAttempted;
+  const failed = result.metadataWriteBatchesFailed;
+  if (!isNonNegativeCount(rows)
+    || !isNonNegativeDuration(durationMs)
+    || !isNonNegativeCount(attempted)
+    || !isNonNegativeCount(failed)
+    || failed > attempted) {
+    return false;
+  }
+  if (attempted === 0) {
+    return rows === 0 && durationMs === 0 && failed === 0;
+  }
+  return durationMs > 0
+    && (failed !== attempted || rows === 0)
+    && rows >= attempted - failed;
+}
+
 function loggedOutcome(result: WorkerSyncResult) {
+  const metadataTelemetryComplete = hasCompleteMetadataTelemetry(result);
+  const metadataRowsCommitted = isNonNegativeCount(result.metadataRowsCommitted) ? result.metadataRowsCommitted : 0;
+  const metadataWriteDurationMs = isNonNegativeDuration(result.metadataWriteDurationMs)
+    ? result.metadataWriteDurationMs
+    : 0;
+  const metadataWriteBatchesAttempted = isNonNegativeCount(result.metadataWriteBatchesAttempted)
+    ? result.metadataWriteBatchesAttempted
+    : 0;
+  const metadataWriteBatchesFailed = isNonNegativeCount(result.metadataWriteBatchesFailed)
+    ? result.metadataWriteBatchesFailed
+    : 0;
   return {
     runId: result.runId,
     outcome: result.outcome,
     foldersProcessed: result.foldersProcessed,
     messagesUpserted: result.messagesUpserted,
+    metadataRowsCommitted,
+    metadataWriteDurationMs,
+    metadataWriteBatchesAttempted,
+    metadataWriteBatchesFailed,
+    metadataTelemetryComplete,
+    metadataWriteServiceRowsPerSecond: metadataTelemetryComplete && metadataWriteBatchesAttempted > 0
+      ? metadataRowsPerSecond(metadataRowsCommitted, metadataWriteDurationMs)
+      : null,
     bodiesFetched: result.bodiesFetched,
     errors: result.errors.map(sanitizeErrorReason)
   };
@@ -112,6 +166,18 @@ export function logSyncTick(
   sink: WorkerLogSink = console
 ): void {
   const outcomes = results.map(loggedOutcome);
+  const metadataRowsCommitted = outcomes.reduce((sum, outcome) => sum + outcome.metadataRowsCommitted, 0);
+  const metadataWriteDurationMs = outcomes.reduce((sum, outcome) => sum + outcome.metadataWriteDurationMs, 0);
+  const metadataWriteBatchesAttempted = outcomes.reduce(
+    (sum, outcome) => sum + outcome.metadataWriteBatchesAttempted,
+    0
+  );
+  const metadataWriteBatchesFailed = outcomes.reduce(
+    (sum, outcome) => sum + outcome.metadataWriteBatchesFailed,
+    0
+  );
+  const metadataTelemetryComplete = outcomes.every((outcome) => outcome.metadataTelemetryComplete);
+  const hasMetadataSample = metadataTelemetryComplete && metadataWriteBatchesAttempted > 0;
 
   for (const outcome of outcomes) {
     if (outcome.outcome === "failed") {
@@ -125,6 +191,17 @@ export function logSyncTick(
     event: "sync.tick.completed",
     accounts: outcomes.length,
     durationMs,
+    metadataRowsCommitted,
+    metadataWriteDurationMs,
+    metadataWriteBatchesAttempted,
+    metadataWriteBatchesFailed,
+    metadataTelemetryComplete,
+    metadataWriteServiceRowsPerSecond: hasMetadataSample
+      ? metadataRowsPerSecond(metadataRowsCommitted, metadataWriteDurationMs)
+      : null,
+    metadataThroughputRowsPerSecond: hasMetadataSample
+      ? metadataRowsPerSecond(metadataRowsCommitted, durationMs)
+      : null,
     outcomes
   }));
 }
@@ -177,10 +254,11 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   }
 
   async function tick(lane: "full" | "sent", startedAt: number): Promise<void> {
+    const tickStartedAt = performance.now();
     if (lane === "full") lastFullSyncStartedAtMs = startedAt;
     if (lane === "full") {
       const results = await engine.syncDueAccounts(undefined, { signal: abort.signal });
-      logSyncTick(results, Date.now() - startedAt);
+      logSyncTick(results, performance.now() - tickStartedAt);
       await drainThreadingLane();
       return;
     }
@@ -189,7 +267,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     const sent = sentLaneSignal(abort.signal, Math.max(1, fullSweepDueAt - startedAt));
     try {
       const results = await engine.syncDueSentFolders(undefined, { signal: sent.signal });
-      logSyncTick(results, Date.now() - startedAt);
+      logSyncTick(results, performance.now() - tickStartedAt);
       await drainThreadingLane();
     } finally {
       sent.dispose();

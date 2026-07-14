@@ -257,11 +257,24 @@ export interface MessageMetadata {
   attachments: AttachmentMetadata[];
 }
 
+export interface MessageFlagSnapshot {
+  uid: number;
+  flags: string[];
+}
+
 export interface SyncResult {
   runId: string;
   outcome: Exclude<SyncRunStatus, "running">;
   foldersProcessed: number;
   messagesUpserted: number;
+  /** Message-metadata records acknowledged only after their upsert transaction commits. */
+  metadataRowsCommitted?: number;
+  /** Cumulative pool checkout, validation, transaction, and rollback service time. */
+  metadataWriteDurationMs?: number;
+  metadataWriteBatchesAttempted?: number;
+  metadataWriteBatchesFailed?: number;
+  /** Acknowledged records per cumulative metadata-write service second; null when no batch ran. */
+  metadataWriteServiceRowsPerSecond?: number | null;
   bodiesFetched: number;
   flagsUpdated: number;
   reconcileGapsFound: number;
