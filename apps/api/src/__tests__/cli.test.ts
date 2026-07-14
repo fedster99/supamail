@@ -41,6 +41,13 @@ const libs = vi.hoisted(() => ({
     body: { text: "reply body" },
     headers: { "In-Reply-To": "<src@x>", References: "<src@x>" }
   })),
+  runReadThread: vi.fn(async (..._a: unknown[]) => ({ thread: { messages: [] } })),
+  drainThreads: vi.fn(async (..._a: unknown[]) => ({ operationId: "op-drain" })),
+  rebuildThreads: vi.fn(async (..._a: unknown[]) => ({ operationId: "op-rebuild" })),
+  activateThreads: vi.fn(async (..._a: unknown[]) => ({ operationId: "op-activate" })),
+  compareThreads: vi.fn(async (..._a: unknown[]) => ({ changedAssignments: 2 })),
+  rollbackThreads: vi.fn(async (..._a: unknown[]) => ({ operationId: "op-rollback" })),
+  pruneThreads: vi.fn(async (..._a: unknown[]) => ({ runsDeleted: 1, assignmentsDeleted: 10 })),
   getMessage: vi.fn(async (..._a: unknown[]) => ({ id: "src-1", account_id: "acc-1" })),
   readFile: vi.fn(async (..._a: unknown[]) => Buffer.from("FILE-CONTENT")),
   writeFile: vi.fn(async (..._a: unknown[]) => undefined),
@@ -59,12 +66,22 @@ vi.mock("../repository.js", () => ({
   }
 }));
 vi.mock("../sync-engine.js", () => ({ MirrorEngine: class {} }));
+vi.mock("../threading-repository.js", () => ({
+  ThreadingRepository: class {
+    drainAccount = libs.drainThreads;
+    rebuildAccount = libs.rebuildThreads;
+    activateRun = libs.activateThreads;
+    compareRuns = libs.compareThreads;
+    rollbackOperation = libs.rollbackThreads;
+    pruneTerminalRuns = libs.pruneThreads;
+  }
+}));
 vi.mock("../search/index.js", () => ({ searchMessages: vi.fn(async () => ({ results: [] })) }));
 vi.mock("../mcp/index.js", () => ({
   runDraftReply: libs.runDraftReply,
   runListFolders: vi.fn(async () => ({})),
   runReadMessage: vi.fn(async () => ({})),
-  runReadThread: vi.fn(async () => ({}))
+  runReadThread: libs.runReadThread
 }));
 vi.mock("../send.js", () => ({ sendMessage: libs.sendMessage }));
 vi.mock("../drafts.js", () => ({
@@ -256,5 +273,99 @@ describe("non-destructive verbs need no --confirm", () => {
   it("move dispatches moveMessage with no gate", async () => {
     await runCli("move", "m1", "Archive");
     expect(libs.moveMessage).toHaveBeenCalledWith(expect.anything(), expect.anything(), "m1", "Archive");
+  });
+});
+
+describe("durable conversation administration", () => {
+  it("rebuilds one account without a mutation confirmation gate", async () => {
+    await runCli("threads-rebuild", "--account-id", "acc-1", "--reason", "algorithm upgrade");
+
+    expect(libs.rebuildThreads).toHaveBeenCalledWith("acc-1", {
+      requestedBy: "cli",
+      reason: "algorithm upgrade"
+    });
+  });
+
+  it("requires confirmation before rolling back a projection operation", async () => {
+    await runCli("threads-rollback", "--account-id", "acc-1", "--operation-id", "op-1");
+    expect(libs.rollbackThreads).not.toHaveBeenCalled();
+    expect(stderr).toMatch(/Refusing to roll back threading without --confirm/);
+    expect(process.exitCode).toBe(1);
+
+    await runCli(
+      "threads-rollback",
+      "--account-id", "acc-1",
+      "--operation-id", "op-1",
+      "--confirm"
+    );
+    expect(libs.rollbackThreads).toHaveBeenCalledWith("acc-1", "op-1", "cli");
+  });
+
+  it("requires confirmation before pruning terminal projections", async () => {
+    await runCli("threads-prune", "--older-than-days", "45", "--batch-size", "20");
+    expect(libs.pruneThreads).not.toHaveBeenCalled();
+    expect(stderr).toMatch(/Refusing to prune threading projections without --confirm/);
+
+    await runCli(
+      "threads-prune",
+      "--older-than-days", "45",
+      "--batch-size", "20",
+      "--confirm"
+    );
+    expect(libs.pruneThreads).toHaveBeenCalledWith({ olderThanDays: 45, batchSize: 20 });
+  });
+
+  it("requires confirmation before atomically activating a reviewed shadow run", async () => {
+    await runCli("threads-activate", "--account-id", "acc-1", "--run-id", "run-1");
+    expect(libs.activateThreads).not.toHaveBeenCalled();
+    expect(stderr).toMatch(/Refusing to activate threading without --confirm/);
+    expect(process.exitCode).toBe(1);
+
+    await runCli(
+      "threads-activate",
+      "--account-id", "acc-1",
+      "--run-id", "run-1",
+      "--comparison-id", "comparison-1",
+      "--reason", "benchmark passed",
+      "--confirm"
+    );
+    expect(libs.activateThreads).toHaveBeenCalledWith("acc-1", "run-1", {
+      requestedBy: "cli",
+      reason: "benchmark passed",
+      comparisonId: "comparison-1"
+    });
+  });
+
+  it("reports bounded active-versus-shadow disagreements without a mutation gate", async () => {
+    await runCli(
+      "threads-compare",
+      "--account-id", "acc-1",
+      "--baseline-run-id", "run-active",
+      "--candidate-run-id", "run-shadow",
+      "--sample-size", "25"
+    );
+    expect(libs.compareThreads).toHaveBeenCalledWith(
+      "acc-1",
+      "run-active",
+      "run-shadow",
+      25,
+      {
+        requestedBy: "cli",
+        thresholds: {
+          maxConversationMergeGroups: 0,
+          maxConversationSplitGroups: 0,
+          maxProvisionalIntroduced: 0
+        }
+      }
+    );
+  });
+
+  it("reads a durable conversation with explicit account scope", async () => {
+    await runCli("thread", "--conversation-id", "thread_123", "--account", "acc-1");
+
+    expect(libs.runReadThread).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      conversation_id: "thread_123",
+      account: "acc-1"
+    }));
   });
 });

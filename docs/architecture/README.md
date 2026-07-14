@@ -12,6 +12,8 @@ SupaMail is a small, stateful email mirror packaged as a monorepo. IMAP is the p
 - `apps/api/src/locks.ts`: session-scoped advisory lock behavior and stale lock recovery.
 - `apps/api/src/imap-client.ts`: ImapFlow adapter, throttling, metadata fetch, UID search, and full body fetch.
 - `apps/api/src/mime.ts`: MIME parsing, normalized text, header extraction, and attachment metadata helpers.
+- `apps/api/src/threading.ts`: pure, deterministic delivery deduplication and conversation-graph algorithm.
+- `apps/api/src/threading-repository.ts`: versioned executor registry and shadow-run state machine, bounded per-run queues/closures, persisted comparison certificates, atomic activation, audit history, retention, and guarded rollback.
 - `apps/api/supabase/migrations/public/`: ordered public mirror migrations and manifest.
 - `apps/web`: Next.js landing site. It is not the product dashboard or CRM surface.
 
@@ -21,7 +23,7 @@ SupaMail is a small, stateful email mirror packaged as a monorepo. IMAP is the p
 IMAP provider -> worker/API -> repository -> public.imap_* tables -> user application
 ```
 
-The worker and API share the same repository and account-locking model. Any IMAP operation that can affect an account must use the account advisory lock.
+The worker and API share the same repository and account-locking model. Any IMAP operation that can affect an account must use the account advisory lock. Threading is a separate, account-scoped derived lane: sync writes authoritative message metadata and fans changed inputs out to each active/candidate/rollback run; a database trigger is the rolling-deploy backstop and advances the evidence clock. The threading worker materializes isolated assignments under its own advisory lock. Mirror writes share-lock `imap_thread_state`, while build activation and rollback lock it exclusively. Readers see only the security-invoker active-assignment view, so a rebuild cannot leak partially computed membership. Replacement activation additionally requires a current, passing comparison certificate for the exact projection generations and evidence revision.
 
 ## Documentation Map
 

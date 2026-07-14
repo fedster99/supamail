@@ -22,10 +22,14 @@ a reproducible harness, and gated in CI.
   permutation test + bootstrap 95% CI, fixed-seed (deterministic).
 - **Runner:** `apps/api/src/eval/run.ts` (`evaluateSearch`) seeds the corpus into
   an isolated account against a **frozen clock** (`EVAL_NOW`) with **deterministic
-  message UUIDs**, runs every query through the real `searchMessages`, scores it
-  with graded judgments, runs the **anti-regression guard** sentinels, and deletes
-  the account. Byte-reproducible run-to-run. `compareSearch` A/Bs the recall
-  branches against the lexical-only baseline on identical data.
+  message UUIDs** and a complete active durable-thread projection, runs every
+  query through the real `searchMessages`, scores it with graded judgments, runs
+  the **anti-regression guard** sentinels, and deletes the account.
+  Byte-reproducible run-to-run. The thread fixtures include a header-only reply
+  chain and two separate conversations that deliberately reuse one provider
+  thread id, so the reader cannot pass by trusting provider hints alone.
+  `compareSearch` A/Bs the recall branches against the lexical-only baseline on
+  identical data.
 - **CLI:** `pnpm --filter @supamail/api eval:search` spins a disposable Postgres
   (or uses `DATABASE_URL`), applies migrations, and prints a scorecard (human
   summary to stderr, JSON to stdout). `eval:search --compare` prints the A/B
@@ -89,10 +93,12 @@ It immediately exposed two email-specific failures the generic metrics missed:
 
 **Shipped (this layer):**
 
-- **Thread grouping** (`groupByThread`, default on): the ranker collapses each
-  conversation (`coalesce(provider_thread_id, id)`) to its single best message via
-  `DISTINCT ON`, and reports `thread.message_count`. Set `groupByThread: false`
-  for raw messages.
+- **Thread grouping** (`groupByThread`, default on): the ranker first collapses
+  mirrored physical copies by stored `delivery_key`, then collapses each durable,
+  account-scoped `conversation_id` to its single best delivery via `DISTINCT ON`.
+  It reports `thread.conversation_id` and a `thread.message_count` of distinct
+  deliveries. Unassigned legacy rows temporarily fall back to provider thread ID
+  and then physical row ID. Set `groupByThread: false` for one result per delivery.
 - **Bulk demotion**: a `list-id` / `list-unsubscribe` (RFC 2369/2919) or bulk-sender
   signal multiplies the email prior down (`-0.7`, clamped), so newsletters sink
   below human correspondence — but stay fully retrievable (`unsubscribe` still

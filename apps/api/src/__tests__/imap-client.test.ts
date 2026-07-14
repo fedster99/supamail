@@ -6,6 +6,8 @@ import {
   fetchFullMessageBody,
   fetchMessageMetadata,
   MessageMovedError,
+  parseMessageMetadata,
+  providerObjectIdNamespace,
   searchAllUids,
   searchUidsBefore,
   searchUidsSince,
@@ -16,6 +18,30 @@ import { FixtureImapClient, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { ImapMessage } from "../types.js";
 
 describe("fetchMessageMetadata", () => {
+  it("keeps provider delivery/thread ids with explicit capability provenance", () => {
+    expect(providerObjectIdNamespace(new Map([["OBJECTID", true]]))).toBe("objectid");
+    expect(providerObjectIdNamespace(new Map([["X-GM-EXT-1", true]]))).toBe("gmail");
+    expect(providerObjectIdNamespace(new Map())).toBeNull();
+
+    const parsed = parseMessageMetadata(
+      {
+        uid: 7,
+        emailId: "provider-message-7",
+        threadId: "provider-thread-2",
+        envelope: { messageId: "<m7@example.test>" },
+        internalDate: new Date("2026-01-01T00:00:00.000Z")
+      },
+      "objectid"
+    );
+
+    expect(parsed).toMatchObject({
+      providerMessageId: "provider-message-7",
+      providerMessageIdNamespace: "objectid",
+      providerThreadId: "provider-thread-2",
+      providerThreadIdNamespace: "objectid"
+    });
+  });
+
   it("fails instead of advancing past a partial UID batch", async () => {
     const client = new FixtureImapClient([
       {

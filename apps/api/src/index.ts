@@ -16,5 +16,7 @@ export * from "./send.js";
 export * from "./smtp-client.js";
 export * from "./sync-engine.js";
 export * from "./target-scheduler.js";
+export * from "./threading.js";
+export * from "./threading-repository.js";
 export * from "./types.js";
 export * from "./worker-runtime.js";

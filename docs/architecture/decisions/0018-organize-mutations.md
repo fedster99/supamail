@@ -38,11 +38,16 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   UIDVALIDITY no longer matches, the verb aborts rather than touching the wrong
   message. Thread-level verbs resolve the live members from the mirror and apply
   the verb to each.
-  Update (arch CC-3): the one-hop thread-membership walk (the id-token normalization
-  + the membership WHERE predicate + the oldest-first ORDER) is now shared in
+  Update (arch CC-3): the one-hop thread-membership walk (strict, case-preserving
+  bracketed RFC token extraction + the membership WHERE predicate + the oldest-first ORDER) is now shared in
   `thread-walk.ts` — both this write fan-out (`resolveThreadTargets`) and the
   read-only `read_thread` source it, so they agree on "what is in a thread" by
   construction. Each caller keeps its own projection; the rows + order are unchanged.
+  Update (ADR 0024): a durable stored `conversation_id` is now authoritative when
+  the seed has an assignment. `read_thread` deduplicates delivery copies for
+  display, while mutation fan-out deliberately keeps every live physical
+  folder/UID row. The shared one-hop walk remains only as a compatibility path
+  for messages still awaiting assignment.
 - **Flag mutations write through to the mirror immediately**; moves and deletes
   reconcile on the next sync pass. A flag change (mark read/unread, star/unstar)
   updates the KNOWN message row's `flags` to a KNOWN value right after a successful
@@ -87,7 +92,7 @@ A whole-stack review hardened the thread-level verbs:
   `read_thread` uses (`MAX_THREAD_FANOUT`). A thread mutation does one sequential IMAP
   round-trip per member under a per-folder lock, so an unbounded fan-out let a
   pathological thread hold locks and stack latency linearly. The oldest-first
-  thread-walk ORDER makes the cap deterministic, and the results carry a `truncated`
+  oldest-first membership order makes the cap deterministic, and the results carry a `truncated`
   flag so a caller sees when only the oldest N members were acted on.
 - **Interleaved mirror write-through.** `setThreadFlags` now writes each member's
   mirror row through immediately AFTER that member's STORE (inside the per-member loop),

@@ -207,6 +207,34 @@ describe("email-005 structured filters", () => {
 });
 
 describe("compileSearch", () => {
+  it("deduplicates deliveries before account-scoped conversation grouping", () => {
+    const compiled = compileSearch("", [], baseCompileOptions);
+
+    expect(compiled.text).toContain("LEFT JOIN public.imap_thread_active_assignments ta");
+    expect(compiled.text).toContain("ta.delivery_key");
+    expect(compiled.text).toContain("b.raw_mime_sha256");
+    expect(compiled.text).toContain("ELSE 'physical:' || m.id::text");
+    expect(compiled.text).toContain("THEN 'conversation:' || ta.conversation_id");
+    expect(compiled.text).toContain("THEN 'provider-thread:' || encode(extensions.digest(");
+    expect(compiled.text).toContain("coalesce(m.provider_thread_id_namespace, 'legacy')");
+    expect(compiled.text).toContain("SELECT DISTINCT ON (r.account_id, r.delivery_key) r.*");
+    expect(compiled.text).toContain(
+      "count(*) OVER (PARTITION BY d.account_id, d.conversation_key)::int AS thread_count"
+    );
+    expect(compiled.text).toContain("SELECT DISTINCT ON (c.account_id, c.conversation_key) c.*");
+    expect(compiled.text).toContain("page.window_status, page.internal_date, page.conversation_id");
+  });
+
+  it("resolves a thread: selector only through the active assignment view and keeps the value bound", () => {
+    const selector = `thread_' ; drop table imap_messages;--`;
+    const compiled = compileSearch("", filtersFromStructured({ thread: selector }), baseCompileOptions);
+
+    expect(compiled.text).toContain("FROM public.imap_thread_active_assignments thread_assignment");
+    expect(compiled.text).not.toContain("FROM public.imap_thread_assignments thread_assignment");
+    expect(compiled.text).not.toContain(selector);
+    expect(compiled.values).toContain(selector);
+  });
+
   it("binds every user value as a parameter and never interpolates it into SQL text", () => {
     const compiled = compileSearch("invoice", filtersFromStructured({ from: "acme" }), {
       ...baseCompileOptions,

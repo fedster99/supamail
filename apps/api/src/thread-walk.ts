@@ -1,3 +1,5 @@
+import { extractMessageIdTokens } from "./threading.js";
+
 /**
  * The ONE shared thread-membership walk (CC-3, ADR 0016's thread-identity rule).
  *
@@ -6,18 +8,18 @@
  * "every live message in the thread seeded by a message" using the SAME one-hop
  * References walk. That walk is three things, all of which used to be hand-copied
  * across the two files:
- *   1. the id-token NORMALIZATION (strip `<>`, lowercase, split on whitespace),
- *   2. the membership WHERE PREDICATE (provider_thread_id OR id OR normalized
- *      Message-Id/In-Reply-To token match), and
+ *   1. strict RFC Message-ID extraction (case-preserving and angle-bracketed),
+ *   2. the membership WHERE PREDICATE (provider_thread_id OR id OR an exact
+ *      strict Message-ID/In-Reply-To token match), and
  *   3. the ORDER (oldest-first: internal_date ASC, id ASC).
  *
  * They are shared here so the read tool and the mutate fan-out agree on "what is in
  * a thread" BY CONSTRUCTION. Each caller keeps its OWN FROM/JOIN/projection (read
  * needs body + participants, write needs folder + uidvalidity + uid), so this is a
- * shared PREDICATE/normalization builder, not one union query — the row source each
+ * shared PREDICATE/token-extraction builder, not one union query — the row source each
  * caller scans is unchanged, only the membership logic is single-sourced.
  *
- * This module is pure SQL fragments + string normalization (no IMAP client, no write
+ * This module is pure SQL fragments + strict token extraction (no IMAP client, no write
  * verb), so it is safe to import from the zero-send agent surface
  * (`agent-surface-zero-send.test.ts`).
  */
@@ -34,30 +36,24 @@ export interface ThreadSeedRow {
 }
 
 /**
- * Normalize one raw Message-Id-ish token: trim, strip surrounding angle brackets,
- * lowercase. Matches the SQL `lower(trim(both '<>' from ...))` used in the predicate
- * so the in-memory key set and the column comparison agree.
+ * Extract one strict, angle-bracketed RFC Message-ID token. The historical name is
+ * retained for source compatibility, but this deliberately does not lowercase or
+ * repair malformed input: RFC Message-ID equality is case-sensitive.
  */
 export function normalizeIdToken(token: string): string {
-  return token.trim().replace(/^<+/, "").replace(/>+$/, "").trim().toLowerCase();
+  return extractMessageIdTokens(token)[0] ?? "";
 }
 
 /**
- * Build the distinct, normalized id-token key set from a seed row's reference
- * headers (references_header + in_reply_to, each split on whitespace) plus its own
- * rfc_message_id + message_id_normalized, per ADR 0016. Order is not significant
- * (the keys feed `= ANY(...)`).
+ * Build the distinct strict id-token key set from a seed row's References,
+ * In-Reply-To, and Message-ID fields. `message_id_normalized` is intentionally not
+ * used: that legacy cache lowercases the local part and can conflate unrelated IDs.
  */
 export function threadSeedKeys(seed: ThreadSeedRow): string[] {
-  const raw: string[] = [];
-  if (seed.references_header) raw.push(...seed.references_header.split(/\s+/));
-  if (seed.in_reply_to) raw.push(...seed.in_reply_to.split(/\s+/));
-  if (seed.rfc_message_id) raw.push(seed.rfc_message_id);
-  if (seed.message_id_normalized) raw.push(seed.message_id_normalized);
   const keys = new Set<string>();
-  for (const token of raw) {
-    const normalized = normalizeIdToken(token);
-    if (normalized) keys.add(normalized);
+  for (const value of [seed.references_header, seed.in_reply_to, seed.rfc_message_id]) {
+    if (!value) continue;
+    for (const token of extractMessageIdTokens(value)) keys.add(token);
   }
   return [...keys];
 }
@@ -66,13 +62,14 @@ export function threadSeedKeys(seed: ThreadSeedRow): string[] {
  * The shared membership WHERE predicate + ORDER, parameterized positionally so each
  * caller can slot it into its own SELECT/FROM/JOIN. The bind parameters MUST be, in
  * order: `$1` = account_id, `$2` = provider_thread_id (nullable), `$3` = seed id,
- * `$4` = the normalized key array (text[]). `tableAlias` is the prefix for the
+ * `$4` = the strict, case-preserving key array (text[]). `tableAlias` is the prefix for the
  * scanned table's columns ("m" for read_thread's aliased JOIN, "" for the write
  * fan-out's unaliased FROM); pass "" for no alias.
  *
  * Identity rule (ADR 0016): a row is in the thread iff it shares the seed's
- * provider_thread_id, IS the seed, or its normalized Message-Id / In-Reply-To is in
- * the seed's key set. Oldest-first by internal_date then id.
+ * provider_thread_id, IS the seed, or its exact bracketed Message-ID / In-Reply-To
+ * is in the seed's strict key set. The raw comparisons intentionally fail closed
+ * on comments, bare IDs, multiple IDs, or other malformed legacy input.
  */
 export function threadMembershipClause(tableAlias: string): string {
   const col = tableAlias ? `${tableAlias}.` : "";
@@ -81,8 +78,14 @@ export function threadMembershipClause(tableAlias: string): string {
       AND (
         ($2::text IS NOT NULL AND ${col}provider_thread_id = $2)
         OR ${col}id = $3
-        OR ${col}message_id_normalized = ANY($4::text[])
-        OR lower(trim(both '<>' from ${col}in_reply_to)) = ANY($4::text[])
+        OR btrim(${col}rfc_message_id) IN (
+          SELECT '<' || strict_id || '>'
+          FROM unnest($4::text[]) AS strict_ids(strict_id)
+        )
+        OR btrim(${col}in_reply_to) IN (
+          SELECT '<' || strict_id || '>'
+          FROM unnest($4::text[]) AS strict_ids(strict_id)
+        )
       )
     ORDER BY ${col}internal_date ASC, ${col}id ASC`;
 }

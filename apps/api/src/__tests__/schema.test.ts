@@ -16,6 +16,10 @@ const progressRollupMigrationPath = resolve(process.cwd(), "supabase/migrations/
 const historyLaneMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0006_history_lane_state.sql");
 const optionalRawMimeMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0007_optional_raw_mime.sql");
 const searchLayerMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0008_search_layer.sql");
+const conversationThreadingMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0014_conversation_threading.sql"
+);
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -95,9 +99,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0013_body_head_trigram_index");
+    expect(version).toBe("0014_conversation_threading");
     expect(manifest).toEqual({
-      schemaVersion: "0013_body_head_trigram_index",
+      schemaVersion: "0014_conversation_threading",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -111,7 +115,8 @@ describe("initial schema", () => {
         { id: "0010_search_recipient_indexes", file: "0010_search_recipient_indexes.sql" },
         { id: "0011_webhook_emit_indexes", file: "0011_webhook_emit_indexes.sql" },
         { id: "0012_sync_events_retention_index", file: "0012_sync_events_retention_index.sql" },
-        { id: "0013_body_head_trigram_index", file: "0013_body_head_trigram_index.sql" }
+        { id: "0013_body_head_trigram_index", file: "0013_body_head_trigram_index.sql" },
+        { id: "0014_conversation_threading", file: "0014_conversation_threading.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -128,6 +133,177 @@ describe("initial schema", () => {
     expect(sql).toContain("left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)");
     expect(sql).toContain("imap_messages_created_emit_idx");
     expect(sql).toContain("imap_messages_updated_emit_idx");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_assignments");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_work_queue");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_operations");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_assignment_history");
+  });
+
+  it("adds safe versioned shadow-run conversation threading", async () => {
+    const sql = await readFile(conversationThreadingMigrationPath, "utf8");
+    const indexStatements = sql.match(/CREATE\s+(?:UNIQUE\s+)?INDEX[\s\S]*?;/gi) ?? [];
+    const indexedSql = indexStatements.join("\n");
+    const operationsDefinition = sql.slice(
+      sql.indexOf("CREATE TABLE IF NOT EXISTS public.imap_thread_operations"),
+      sql.indexOf("CREATE INDEX IF NOT EXISTS imap_thread_operations_account_created_idx")
+    );
+    const historyDefinition = sql.slice(
+      sql.indexOf("CREATE TABLE IF NOT EXISTS public.imap_thread_assignment_history"),
+      sql.indexOf("CREATE INDEX IF NOT EXISTS imap_thread_assignment_history_account_recorded_idx")
+    );
+
+    // Installing on a populated pre-0014 mirror is metadata-only: nullable
+    // columns plus NOT VALID checks, with no large-table index build or DML.
+    for (const column of [
+      "ADD COLUMN IF NOT EXISTS provider_message_id text",
+      "ADD COLUMN IF NOT EXISTS provider_message_id_namespace text",
+      "ADD COLUMN IF NOT EXISTS provider_thread_id_namespace text",
+      "ADD COLUMN IF NOT EXISTS raw_mime_sha256 text"
+    ]) {
+      expect(sql).toContain(column);
+    }
+    for (const constraint of [
+      "imap_messages_provider_message_identity_check",
+      "imap_messages_provider_thread_namespace_check",
+      "imap_message_bodies_raw_mime_sha256_check"
+    ]) {
+      const start = sql.indexOf(`ADD CONSTRAINT ${constraint}`);
+      expect(start).toBeGreaterThan(-1);
+      expect(sql.slice(start, sql.indexOf(";", start))).toContain("NOT VALID");
+    }
+    expect(sql).not.toMatch(/VALIDATE\s+CONSTRAINT/i);
+    expect(indexStatements.some((statement) =>
+      /ON\s+public\.imap_(?:messages|message_bodies)\b/i.test(statement)
+    )).toBe(false);
+    expect(sql).not.toMatch(/\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+public\.imap_(?:messages|message_bodies)\b/i);
+
+    // parsed_only may discard raw_mime after hashing. A present digest is still
+    // exactly lowercase SHA-256 and can never describe truncated bytes.
+    expect(sql).toMatch(/raw_mime_sha256\s+IS\s+NULL[\s\S]*?raw_mime_sha256\s+~\s+'\^\[0-9a-f\]\{64\}\$'[\s\S]*?AND\s+NOT\s+raw_truncated/);
+    expect(sql).not.toMatch(/raw_mime\s+IS\s+NOT\s+NULL[\s\S]*?raw_mime_sha256/);
+    expect(sql).toContain("(provider_message_id IS NULL) = (provider_message_id_namespace IS NULL)");
+    expect(sql).toContain("provider_thread_id_namespace IS NULL OR provider_thread_id IS NOT NULL");
+
+    for (const table of [
+      "imap_thread_runs",
+      "imap_thread_state",
+      "imap_thread_evidence_clock",
+      "imap_thread_assignments",
+      "imap_thread_work_queue",
+      "imap_thread_subject_work",
+      "imap_thread_operations",
+      "imap_thread_run_comparisons",
+      "imap_thread_assignment_history"
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS public.${table}`);
+      expect(sql).toContain(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+      expect(sql).toContain(`REVOKE ALL ON TABLE public.${table} FROM PUBLIC`);
+      expect(sql).toContain(`REVOKE ALL ON TABLE public.${table} FROM anon`);
+      expect(sql).toContain(`REVOKE ALL ON TABLE public.${table} FROM authenticated`);
+    }
+
+    // Each run is isolated. Queue/assignment keys cannot be consumed across a
+    // rolling algorithm upgrade, and the trigger validates denormalized scope.
+    expect(sql).toContain("PRIMARY KEY (run_id, message_id)");
+    expect(sql).toContain("PRIMARY KEY (run_id, subject_key)");
+    expect(sql).toContain("thread assignment algorithm version differs from its run");
+    expect(sql).toContain("thread operation algorithm version differs from its run");
+    expect(sql).toContain("building thread run uses an older algorithm than the active run");
+    expect(sql).toContain("thread source run uses a newer algorithm version");
+    expect(sql).toContain("reversed thread operation scope mismatch");
+    expect(sql).toContain("thread history operation scope mismatch");
+    expect(sql).toContain("previous thread assignment snapshot scope mismatch");
+    expect(sql).toContain("next thread assignment snapshot scope mismatch");
+    expect(sql).toContain("thread comparison baseline scope mismatch");
+    expect(sql).toContain("thread comparison candidate scope mismatch");
+    expect(sql).toContain("CREATE TRIGGER imap_messages_capture_thread_evidence");
+    expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_thread_evidence");
+    expect(sql).toContain("CREATE TRIGGER imap_messages_capture_thread_delete");
+    expect(sql).toContain("caught_up_revision bigint NOT NULL DEFAULT 0");
+    expect(sql).toContain("evidence_revision bigint NOT NULL");
+
+    // Raw evidence stays inspectable but unindexed. Every indexed identity is a
+    // fixed-size digest, including each array member used by GIN.
+    for (const rawColumn of [
+      "strict_message_id",
+      "root_reference",
+      "parent_reference",
+      "reference_ids",
+      "subject_base",
+      "provider_thread_key",
+      "evidence"
+    ]) {
+      expect(indexedSql).not.toMatch(new RegExp(`\\b${rawColumn}\\b`));
+    }
+    for (const fixedHash of [
+      "delivery_key text NOT NULL CHECK (delivery_key ~ '^[0-9a-f]{64}$')",
+      "strict_message_id_hash text",
+      "root_reference_hash text",
+      "parent_reference_hash text",
+      "parent_delivery_key text",
+      "subject_key text",
+      "provider_thread_hash text",
+      "input_hash text NOT NULL CHECK (input_hash ~ '^[0-9a-f]{64}$')"
+    ]) {
+      expect(sql).toContain(fixedHash);
+    }
+    expect(sql).toContain("(provider_thread_key IS NULL) = (provider_thread_hash IS NULL)");
+    expect(sql).toContain("cardinality(reference_ids) = cardinality(reference_hashes)");
+    expect(sql).toContain("array_to_string(reference_hashes, ',') ~ '^([0-9a-f]{64})(,[0-9a-f]{64})*$'");
+    expect(sql).toContain("array_to_string(participant_edge_hashes, ',') ~ '^([0-9a-f]{64})(,[0-9a-f]{64})*$'");
+    expect(sql).toContain("USING gin (run_id, reference_hashes)");
+    expect(sql).toContain("USING gin (run_id, participant_edge_hashes)");
+
+    // The active projection is one account-scoped pointer swap. It fails closed
+    // on status drift and remains a security-invoker, service-only view.
+    expect(sql).toContain("account_id uuid PRIMARY KEY");
+    expect(sql).toContain("scheduler_cursor integer NOT NULL DEFAULT 0");
+    expect(sql).toContain("CHECK (scheduler_cursor BETWEEN 0 AND 4)");
+    expect(sql).toContain("active_account_id uuid GENERATED ALWAYS AS");
+    expect(sql).toContain("UNIQUE (active_account_id) DEFERRABLE INITIALLY DEFERRED");
+    expect(sql).toContain("active_run_id IS DISTINCT FROM building_run_id");
+    expect(sql).toContain("WITH (security_invoker = true, security_barrier = true)");
+    expect(sql).toContain("run.id = state.active_run_id");
+    expect(sql).toContain("run.status = 'active'");
+    expect(sql).toContain("assignment.run_id = run.id");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_active_assignments FROM PUBLIC");
+    expect(sql).toContain("REVOKE ALL ON FUNCTION public.imap_thread_assert_scope() FROM PUBLIC");
+
+    // Lifecycle checks reject impossible run/operation states while allowing a
+    // deferred active-run swap during activation rollback.
+    expect(sql).toContain("status = 'building' AND stage <> 'ready'");
+    expect(sql).toContain("status IN ('ready', 'active', 'standby', 'archived', 'rolled_back') AND stage = 'ready'");
+    expect(sql).toContain("(status = 'building') = (completed_at IS NULL)");
+    expect(sql).toContain("status text NOT NULL DEFAULT 'pending'");
+    expect(sql).toContain("operation_type <> 'rollback' OR reverses_operation_id IS NOT NULL");
+    expect(sql).toContain("to_generation IS NULL OR to_generation > from_generation");
+    expect(sql).toContain("status = 'rolled_back' AND started_at IS NOT NULL AND completed_at IS NOT NULL");
+
+    // Assignment/history decisions remain explainable and reversible. Audit
+    // operations and snapshots deliberately have no run/message purge FK.
+    for (const method of [
+      "'references'",
+      "'in_reply_to'",
+      "'provider_thread'",
+      "'subject_fallback'",
+      "'standalone'"
+    ]) {
+      expect(sql).toContain(method);
+    }
+    expect(sql).toContain("previous_assignment jsonb");
+    expect(sql).toContain("next_assignment jsonb");
+    expect(sql).toContain("UNIQUE (operation_id, message_id)");
+    expect(operationsDefinition).toContain("run_id uuid NOT NULL");
+    expect(operationsDefinition).not.toMatch(/run_id uuid NOT NULL\s+REFERENCES public\.imap_thread_runs/);
+    expect(historyDefinition).toContain("run_id uuid NOT NULL");
+    expect(historyDefinition).toContain("message_id uuid NOT NULL");
+    expect(historyDefinition).not.toMatch(/(?:run_id|message_id) uuid NOT NULL\s+REFERENCES/);
+
+    // Replayed public migrations remain transaction-safe and public-core-only.
+    expect(sql).not.toMatch(/CREATE\s+INDEX\s+CONCURRENTLY/i);
+    expect(sql).not.toMatch(/stripe/i);
+    expect(sql).not.toContain("tenant");
+    expect(sql).not.toMatch(/\bINSERT\s+INTO\s+public\.imap_thread_assignments\b/i);
   });
 
   it("adds stuck-degraded escalation state without control-plane tables", async () => {

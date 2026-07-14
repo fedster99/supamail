@@ -9,9 +9,19 @@ The mirror owns these neutral tables in `public`:
 - `imap_attachments`
 - `imap_sync_runs`
 - `imap_sync_events`
+- `imap_thread_runs`
+- `imap_thread_state`
+- `imap_thread_evidence_clock`
+- `imap_thread_assignments`
+- `imap_thread_work_queue`
+- `imap_thread_subject_work`
+- `imap_thread_operations`
+- `imap_thread_run_comparisons`
+- `imap_thread_assignment_history`
 - `imap_account_progress` (view)
+- `imap_thread_active_assignments` (view)
 
-RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked when those Supabase roles exist. `imap_account_progress` is a `security_invoker` view and also revokes `anon`/`authenticated` access when those roles exist. The worker/API should use a direct Postgres connection string, not the browser-facing Supabase Data API.
+RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked when those Supabase roles exist. `imap_account_progress` and `imap_thread_active_assignments` are `security_invoker` views and also revoke public/browser-role access. The worker/API should use a direct Postgres connection string, not the browser-facing Supabase Data API.
 
 `imap_messages` stays metadata-oriented so list queries remain small. Full body data lives in `imap_message_bodies`.
 
@@ -38,6 +48,24 @@ Historical backfill uses the folder-level `backfill_in_progress`, `backfill_targ
 `0008_search_layer` adds the deterministic, pure-Postgres search layer (see ADR 0015). It adds two STORED generated `tsvector` columns — `imap_messages.header_fts` (weight A subject, B sender, C recipients) and `imap_message_bodies.body_fts` (weight D, the HTML-stripped `body_text`, capped at 128 KB) — so the searchable document materializes incrementally with no trigger or queue and no staleness when the body arrives late. It adds a `btree_gin` account-scoped FTS GIN on `(account_id, header_fts)`, a body FTS GIN, `pg_trgm` GINs on lowercased subject/sender/recipients/filename for substring and identifier matching, a `flags` GIN, and structured b-trees for size, folder, sender, sender-domain, unread, and thread. All message indexes are partial on `deleted_in_provider = false`; search always drives off `imap_messages` (the authoritative account- and soft-delete-scoped side) with `body_fts` used JOIN-only, so soft-deleted bodies never leak. There are deliberately no raw `to_emails`/`cc_emails` array GINs — emails are stored verbatim, so recipient matching is lowercased. A self-gated Tier-2 block creates an opt-in `imap_message_embeddings` table plus an HNSW index only when the `vector` extension is already installed; the pure core never requires pgvector. The read path lives in `apps/api/src/search/` (`searchMessages`), wrapped by the `supamail search` CLI command and the `search_email` MCP tool contract.
 
 `0013_body_head_trigram_index` adds exact substring support over the same bounded 128 KB body head. Consumers must use `left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)` verbatim so PostgreSQL can select the expression GIN; natural-language lexical search continues to use `body_fts`.
+
+`0014_conversation_threading` adds the durable conversation projection (ADR 0024). It preserves three separate identities:
+
+- `imap_messages` remains one physical mailbox row, unique by account, folder, UIDVALIDITY, and UID.
+- `imap_thread_assignments.delivery_key` groups verified physical copies of one delivered email.
+- `imap_thread_assignments.conversation_id` groups deliveries connected by the reply graph.
+
+`imap_messages.provider_message_id` and `provider_message_id_namespace` preserve a provider's delivery identity; `provider_thread_id_namespace` records the provenance of the existing provider conversation hint. `imap_message_bodies.raw_mime_sha256` stores a digest only for a complete, non-truncated MIME fetch. These inputs help distinguish true copies from broken senders that reuse Message-ID.
+
+`imap_thread_runs` is an isolated algorithm snapshot for one account. Its mode is initial, upgrade, or explicit rebuild; its bounded stages are body evidence, strong protocol graph, weak subject buckets, catch-up, and ready. Each run records the mirror evidence revision it has fully consumed. `imap_thread_state` points to at most one active reader run, one rollback standby, and one building/ready shadow; its `scheduler_cursor` persists the three-active/one-standby/one-building weighted schedule across workers and deploys. `imap_thread_evidence_clock` is a monotonic account clock advanced by database triggers for relevant message/body writes. `imap_thread_active_assignments` is the security-invoker/status-checked view used by readers, so cutover is one atomic pointer update rather than an in-place table rewrite.
+
+There is one `imap_thread_assignments` row per physical message row per run. It records the strict Message-ID, fixed-size delivery/conversation evidence keys, raw root/parent/reference evidence, provider hint, normalized subject, assignment method, coarse confidence tier, provisional flag, evidence, input hash, generation, and algorithm version. Raw evidence is inspectable but unindexed; indexed adversarial header/provider values are SHA-256 digests. The RFC/provider inputs in `imap_messages` and `imap_message_bodies` remain authoritative.
+
+`imap_thread_work_queue` receives new rows and changes to thread-relevant metadata, recovered full-body headers, or copy fingerprints independently for every state-referenced run. Repository writes enqueue explicitly, while a database trigger provides the rolling-deploy backstop. The worker drains ready items in bounded account-scoped batches and expands only the affected RFC/provider/prior-conversation closure, with independent row, evidence-byte, and criteria-key limits. `imap_thread_subject_work` evaluates one exact subject digest at a time; buckets above the configured cap are recorded and skipped only after any older weak merge in that bucket has been dissolved.
+
+`imap_thread_operations` records bounded build batches, incremental recomputes, activation, rollback, and failures. `imap_thread_run_comparisons` stores quality thresholds and merge/split/provisional metrics for exact baseline/candidate generations at one evidence revision; replacing an active run requires a still-current passing certificate. `imap_thread_assignment_history` stores per-message before/after snapshots for incremental material changes and intentionally has no message/run foreign key, so audit evidence survives retention. Build snapshots retain compact operation summaries rather than duplicating every assignment as JSON. Incremental rollback may reverse only the latest material operation in the active run. Activation rollback swaps back only to a still-caught-up standby. Both paths record a new operation and pause automatic work pending a clean rebuild. Old terminal projection runs are pruned daily in bounded batches without deleting these audit tables.
+
+Migration 0014 performs no mailbox-wide DML and builds no index on the existing message/body tables. New evidence columns are nullable; new checks on populated tables are `NOT VALID` while still enforcing new writes. The bounded worker backfills complete MIME hashes and assignments after deployment.
 
 ## Migration Boundaries
 

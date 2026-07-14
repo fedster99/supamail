@@ -152,7 +152,13 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
     }
     case "thread": {
       const p = pb.add(filter.value);
-      return negate(`m.provider_thread_id = ${p}`);
+      return negate(
+        `(m.provider_thread_id = ${p} OR EXISTS (` +
+        `SELECT 1 FROM public.imap_thread_active_assignments thread_assignment ` +
+        `WHERE thread_assignment.message_id = m.id ` +
+        `AND thread_assignment.account_id = m.account_id ` +
+        `AND thread_assignment.conversation_id = ${p}))`
+      );
     }
     case "msgid": {
       const p = pb.add(filter.value);
@@ -333,17 +339,52 @@ export function compileSearch(
   const groupedCte = opts.groupByThread
     ? `,
 grouped AS (
-  SELECT DISTINCT ON (r.thread_key) r.*
-  FROM ranked r
-  ORDER BY r.thread_key, r.is_primary DESC, r.score DESC, r.internal_date DESC, r.id DESC
+  SELECT DISTINCT ON (c.account_id, c.conversation_key) c.*
+  FROM counted c
+  ORDER BY
+    c.account_id,
+    c.conversation_key,
+    c.is_primary DESC,
+    c.score DESC,
+    c.internal_date DESC,
+    c.id DESC
 )`
     : "";
-  const pageSource = opts.groupByThread ? "grouped" : "ranked";
+  const pageSource = opts.groupByThread ? "grouped" : "counted";
 
   const candProjection = `SELECT
     m.id, m.account_id, m.folder_path, m.uidvalidity, m.uid,
     m.subject, m.from_email, m.from_name, m.to_emails, m.flags,
     m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
+    ta.conversation_id,
+    coalesce(
+      ta.delivery_key,
+      CASE
+        WHEN nullif(m.provider_message_id_namespace, '') IS NOT NULL
+          AND nullif(m.provider_message_id, '') IS NOT NULL
+          THEN 'provider:' || encode(extensions.digest(
+            m.provider_message_id_namespace || chr(31) || m.provider_message_id,
+            'sha256'
+          ), 'hex')
+        WHEN nullif(m.message_id_normalized, '') IS NOT NULL
+          AND b.raw_mime_sha256 IS NOT NULL
+          THEN 'rfc-body:' || encode(extensions.digest(
+            m.message_id_normalized || chr(31) || b.raw_mime_sha256,
+            'sha256'
+          ), 'hex')
+        ELSE 'physical:' || m.id::text
+      END
+    ) AS delivery_key,
+    CASE
+      WHEN ta.conversation_id IS NOT NULL
+        THEN 'conversation:' || ta.conversation_id
+      WHEN m.provider_thread_id IS NOT NULL
+        THEN 'provider-thread:' || encode(extensions.digest(
+          coalesce(m.provider_thread_id_namespace, 'legacy') || chr(31) || m.provider_thread_id,
+          'sha256'
+        ), 'hex')
+      ELSE 'physical:' || m.id::text
+    END AS conversation_key,
     ${isListish} AS is_listish,
     ${lexHeader} AS lex_header,
     ${lexBody} AS lex_body,
@@ -384,13 +425,19 @@ cand AS (
   ${candProjection}
   FROM public.imap_messages m
   JOIN cand_ids ci ON ci.id = m.id
-  LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id${candWhere}
+  LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+  LEFT JOIN public.imap_thread_active_assignments ta
+    ON ta.message_id = m.id
+   AND ta.account_id = m.account_id${candWhere}
 )`;
   } else {
     candCte = `cand AS (
   ${candProjection}
   FROM public.imap_messages m
   LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+  LEFT JOIN public.imap_thread_active_assignments ta
+    ON ta.message_id = m.id
+   AND ta.account_id = m.account_id
   WHERE ${[...scope, ...structured].join("\n    AND ")}
 )`;
   }
@@ -413,16 +460,33 @@ scored AS (
       + 0.5 * (CASE WHEN coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Flagged']::text[] THEN 1 ELSE 0 END)
       + 0.3 * (CASE WHEN NOT (coalesce(c.flags,'{}'::text[]) @> ARRAY['\\Seen']::text[]) THEN 1 ELSE 0 END)
       - 0.7 * (CASE WHEN c.is_listish THEN 1 ELSE 0 END)
-    )) AS email_prior,
-    count(*) OVER (PARTITION BY coalesce(c.provider_thread_id, c.id::text))::int AS thread_count
+    )) AS email_prior
   FROM cand c
 ),
 ranked AS (
   SELECT
     s.*,
-    (s.text_rel * s.recency * s.email_prior) AS score,
-    coalesce(s.provider_thread_id, s.id::text) AS thread_key
+    (s.text_rel * s.recency * s.email_prior) AS score
   FROM scored s
+),
+delivery_representatives AS (
+  SELECT DISTINCT ON (r.account_id, r.delivery_key) r.*
+  FROM ranked r
+  ORDER BY
+    r.account_id,
+    r.delivery_key,
+    r.is_primary DESC,
+    r.score DESC,
+    (r.body_fetched_at IS NOT NULL) DESC,
+    r.internal_date DESC,
+    r.folder_path ASC,
+    r.id ASC
+),
+counted AS (
+  SELECT
+    d.*,
+    count(*) OVER (PARTITION BY d.account_id, d.conversation_key)::int AS thread_count
+  FROM delivery_representatives d
 )${groupedCte},
 page AS (
   SELECT * FROM ${pageSource} p
@@ -432,7 +496,8 @@ page AS (
 SELECT
   page.id, page.account_id, page.folder_path, page.uidvalidity, page.uid,
   page.subject, page.from_email, page.from_name, page.to_emails, page.flags,
-  page.window_status, page.internal_date, page.provider_thread_id, page.body_fetched_at,
+  page.window_status, page.internal_date, page.conversation_id,
+  page.provider_thread_id, page.body_fetched_at,
   page.thread_count::int AS thread_count,
   page.text_rel::float8 AS text_rel, page.recency::float8 AS recency,
   page.email_prior::float8 AS email_prior, page.score::float8 AS score,

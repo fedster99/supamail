@@ -170,11 +170,13 @@ and self-verifying. Phases 0–2 are pure-deterministic and need no new infra.
   corpus_hash + metric_config + judge/prompt version`; the A/B gate compares
   against the *stored* previous run, not a constant; a corpus change is stamped a
   discontinuity, not a regression.
-- Move the corpus out of the TS literal into JSONL + a loader. Add a corpus-
-  invariant test: **no two ids in any free-text relevant set share a
-  `provider_thread_id`** (guards the latent thread-grouping trap as the corpus
-  grows). Add ≥2 distinct threads sharing a subject so `distinct_thread_ratio` is
-  falsifiable.
+- Move the corpus out of the TS literal into JSONL + a loader. Add corpus
+  invariants over durable `conversation_id` and `delivery_key`: a relevant set
+  must not accidentally award duplicate physical copies, and queries intended to
+  retrieve separate conversations must not label two deliveries from one
+  conversation as independent hits. Also plant account-scoped provider-ID
+  collisions and at least two distinct conversations sharing a subject so both
+  isolation and `distinct_thread_ratio` remain falsifiable.
 
 ### Phase 5 — Break circularity: independent + LLM judge (3–5 days)
 - Add an LLM-judge labeling path (pointwise 0–3 rubric, temperature 0, prompt

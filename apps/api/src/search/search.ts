@@ -19,6 +19,7 @@ interface ResultRow {
   flags: string[] | null;
   window_status: WindowStatus;
   internal_date: Date;
+  conversation_id: string | null;
   provider_thread_id: string | null;
   thread_count: number | null;
   body_fetched_at: Date | null;
@@ -74,7 +75,11 @@ function mapRow(row: ResultRow, explain: boolean): SearchResult {
           final: score
         }
       : null,
-    thread: { provider_thread_id: row.provider_thread_id, message_count: row.thread_count ?? 1 },
+    thread: {
+      conversation_id: row.conversation_id,
+      provider_thread_id: row.provider_thread_id,
+      message_count: row.thread_count ?? 1
+    },
     attachments: { count: row.attachment_count ?? 0 },
     body: row.body ?? null
   };

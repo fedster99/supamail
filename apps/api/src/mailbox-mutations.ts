@@ -485,11 +485,14 @@ interface ThreadMemberRow {
   uid: string;
 }
 
+type ThreadTargetSeedRow = ThreadSeedRow & { conversation_id: string | null };
+
 /**
- * Resolve every live (not deleted-in-provider) message in the thread seeded by
- * `messageId`, using the SAME one-hop References walk as read_thread (ADR 0016):
- * the seed's provider_thread_id + its own id + the normalized
- * Message-Id/In-Reply-To token set. Returns targets grouped per message.
+ * Resolve every live (not deleted-in-provider) physical message row in the
+ * thread seeded by `messageId`. A stored assignment is authoritative and fans
+ * out to the complete account-scoped conversation, including mirrored delivery
+ * copies because every physical UID must receive the mutation. Unassigned seeds
+ * retain the legacy one-hop References walk as a compatibility fallback.
  */
 async function resolveThreadTargets(
   pool: PgPool,
@@ -497,45 +500,79 @@ async function resolveThreadTargets(
 ): Promise<{ accountId: string; targets: ResolvedMessageTarget[]; truncated: boolean }> {
   const client: PgClient = await pool.connect();
   try {
-    const seedResult = await client.query<ThreadSeedRow>(
+    // Pin the active-run pointer and both membership reads to one snapshot. An
+    // activation may commit concurrently, but one mutation must never resolve its
+    // seed under the old projection and its members under the new projection.
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const seedResult = await client.query<ThreadTargetSeedRow>(
       `
-      SELECT id, provider_thread_id, rfc_message_id, message_id_normalized,
-             in_reply_to, references_header, account_id
-      FROM public.imap_messages
-      WHERE id = $1
-        AND deleted_in_provider = false
+      SELECT m.id, m.provider_thread_id, m.rfc_message_id, m.message_id_normalized,
+             m.in_reply_to, m.references_header, m.account_id,
+             assignment.conversation_id
+      FROM public.imap_messages m
+      LEFT JOIN public.imap_thread_active_assignments assignment
+        ON assignment.message_id = m.id
+       AND assignment.account_id = m.account_id
+      WHERE m.id = $1
+        AND m.deleted_in_provider = false
       `,
       [messageId]
     );
     const seed = seedResult.rows[0];
     if (!seed) throw new NotFoundError(`Message not found: ${messageId}`);
 
-    // Shared one-hop membership walk (CC-3, thread-walk.ts): the normalized key set,
-    // the WHERE predicate, and the oldest-first ORDER are single-sourced so this
-    // write fan-out and the read surface (read_thread) can never diverge on "what is
-    // in a thread." This SELECT keeps its OWN columns (folder + uidvalidity + uid),
-    // no alias. We fetch MAX_THREAD_FANOUT + 1 so a full result tells us the thread
-    // was truncated (the +1 row is dropped); $5 is the LIMIT bind.
-    const keys = threadSeedKeys(seed);
-    const members = await client.query<ThreadMemberRow>(
-      `
-      SELECT id, account_id, folder_path, uidvalidity, uid
-      FROM public.imap_messages
-      WHERE ${threadMembershipClause("")}
-      LIMIT $5
-      `,
-      [seed.account_id, seed.provider_thread_id, seed.id, keys, MAX_THREAD_FANOUT + 1]
-    );
+    // Fetch MAX_THREAD_FANOUT + 1 so a full result tells us the thread was
+    // truncated (the +1 row is dropped). Stored conversations intentionally do
+    // NOT collapse delivery_key: mirrored copies are separate physical UIDs and
+    // a whole-thread mailbox mutation must reach every one of them.
+    let memberRows: ThreadMemberRow[];
+    if (seed.conversation_id) {
+      const members = await client.query<ThreadMemberRow>(
+        `
+        SELECT m.id, m.account_id, m.folder_path, m.uidvalidity, m.uid
+        FROM public.imap_thread_active_assignments assignment
+        JOIN public.imap_messages m
+          ON m.id = assignment.message_id
+         AND m.account_id = assignment.account_id
+        WHERE assignment.account_id = $1
+          AND assignment.conversation_id = $2
+          AND m.deleted_in_provider = false
+        ORDER BY m.internal_date ASC, m.id ASC
+        LIMIT $3
+        `,
+        [seed.account_id, seed.conversation_id, MAX_THREAD_FANOUT + 1]
+      );
+      memberRows = members.rows;
+    } else {
+      // Legacy one-hop fallback for messages awaiting an assignment. The shared
+      // predicate keeps its strict, case-preserving token set and deterministic ordering in
+      // sync with read_thread's compatibility path.
+      const keys = threadSeedKeys(seed);
+      const members = await client.query<ThreadMemberRow>(
+        `
+        SELECT id, account_id, folder_path, uidvalidity, uid
+        FROM public.imap_messages
+        WHERE ${threadMembershipClause("")}
+        LIMIT $5
+        `,
+        [seed.account_id, seed.provider_thread_id, seed.id, keys, MAX_THREAD_FANOUT + 1]
+      );
+      memberRows = members.rows;
+    }
 
-    const truncated = members.rows.length > MAX_THREAD_FANOUT;
-    const targets = members.rows.slice(0, MAX_THREAD_FANOUT).map((row) => ({
+    const truncated = memberRows.length > MAX_THREAD_FANOUT;
+    const targets = memberRows.slice(0, MAX_THREAD_FANOUT).map((row) => ({
       messageId: row.id,
       accountId: row.account_id,
       folderPath: row.folder_path,
       uidValidity: Number(row.uidvalidity),
       uid: Number(row.uid)
     }));
+    await client.query("COMMIT");
     return { accountId: seed.account_id, targets, truncated };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
   } finally {
     client.release();
   }

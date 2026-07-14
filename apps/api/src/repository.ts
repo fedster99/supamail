@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { encryptPassword } from "./crypto.js";
-import type { PgPool } from "./db.js";
+import type { PgClient, PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
+import { normalizeMessageId } from "./mime.js";
 import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
 import type {
   AccountDetails,
@@ -28,6 +30,22 @@ const BACKOFF_CEILING_MS = 5 * 60_000;
 const ERROR_REASON_MAX_LEN = 1000;
 const MANUAL_TRACK_OVERRIDE_NOTE = "manual_track_override";
 const MISSING_MAILBOX_VERIFICATION_NOTE = "missing_mailbox_pending_verification";
+const LIVE_THREAD_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
+const PURGE_MESSAGE_BATCH_SIZE = 100;
+const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
+const THREADING_BODY_HEADER_KEYS = [
+  "message-id",
+  "references",
+  "in-reply-to",
+  "auto-submitted",
+  "x-auto-response-suppress",
+  "list-unsubscribe",
+  "list-id",
+  "precedence",
+  "reply-to",
+  "thread-index",
+  "thread-topic"
+] as const;
 
 const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
 
@@ -41,6 +59,52 @@ function flagsEqual(left: readonly string[] | null | undefined, right: readonly 
   const normalizedRight = normalizeFlags(right);
   return normalizedLeft.length === normalizedRight.length
     && normalizedLeft.every((flag, index) => flag === normalizedRight[index]);
+}
+
+function headerText(value: unknown): string | null {
+  if (typeof value === "string") return value.trim() || null;
+  if (Array.isArray(value)) {
+    const joined = value.map((entry) => String(entry).trim()).filter(Boolean).join(" ");
+    return joined || null;
+  }
+  return value == null ? null : String(value).trim() || null;
+}
+
+/**
+ * JSONB does not preserve object insertion order, while the IMAP parser's plain
+ * objects do. Comparing JSON.stringify output directly therefore turns harmless
+ * key-order changes into perpetual threading work. This canonical form sorts
+ * object keys recursively, preserves array order, and mirrors JSON.stringify's
+ * omission of undefined object properties.
+ */
+export function canonicalJsonForThreadingEvidence(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  if (typeof value === "bigint") return JSON.stringify(value.toString());
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => entry === undefined ? "null" : canonicalJsonForThreadingEvidence(entry)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, entry]) => (
+      `${JSON.stringify(key)}:${canonicalJsonForThreadingEvidence(entry)}`
+    )).join(",")}}`;
+  }
+  return JSON.stringify(String(value));
+}
+
+interface PurgeCandidate {
+  id: string;
+  account_id: string;
+}
+
+interface PurgeQueueTarget {
+  run_id: string;
+  message_id: string;
+  account_id: string;
 }
 
 export function sanitizeErrorReason(error: string): string {
@@ -815,6 +879,68 @@ export class MirrorRepository {
     ]);
   }
 
+  /**
+   * Mirror writes take a shared lock on the small threading-state row before
+   * mutating evidence. Activation/rebuild takes the same row FOR UPDATE, so it
+   * cannot certify coverage across a message/body write that is still in flight.
+   * The state row is created lazily for accounts that predate threading.
+   */
+  private async lockThreadStateForMirrorWrite(client: PgClient, accountId: string): Promise<void> {
+    await client.query(
+      `
+      INSERT INTO public.imap_thread_state (account_id)
+      SELECT id FROM public.imap_accounts WHERE id = $1
+      ON CONFLICT (account_id) DO NOTHING
+      `,
+      [accountId]
+    );
+    const locked = await client.query<{ account_id: string }>(
+      `
+      SELECT account_id
+      FROM public.imap_thread_state
+      WHERE account_id = $1
+      FOR SHARE
+      `,
+      [accountId]
+    );
+    if (!locked.rows[0]) throw new Error(`Account not found: ${accountId}`);
+  }
+
+  /** Queue bounded message evidence independently for every live algorithm run. */
+  private async enqueueThreadingMessages(
+    client: PgClient,
+    accountId: string,
+    messageIds: readonly string[],
+    reason: string
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+    await client.query(
+      `
+      INSERT INTO public.imap_thread_work_queue (
+        run_id, message_id, account_id, reason, attempts, available_at,
+        last_error, enqueued_at, updated_at
+      )
+      SELECT run.id, message.id, message.account_id, $3, 0, now(), NULL, now(), now()
+      FROM public.imap_thread_runs run
+      JOIN public.imap_messages message
+        ON message.account_id = run.account_id
+       AND message.id = ANY($2::uuid[])
+      WHERE run.account_id = $1
+        AND run.status = ANY($4::text[])
+      ON CONFLICT (run_id, message_id)
+      DO UPDATE SET
+        account_id = EXCLUDED.account_id,
+        reason = EXCLUDED.reason,
+        attempts = 0,
+        available_at = now(),
+        last_error = NULL,
+        enqueued_at = now(),
+        updated_at = now()
+      `,
+      [accountId, [...messageIds], reason, [...LIVE_THREAD_RUN_STATUSES]]
+    );
+  }
+
   async runExpiryJob(): Promise<{ expired: number }> {
     const result = await this.pool.query(
       `
@@ -829,15 +955,213 @@ export class MirrorRepository {
   }
 
   async runPurgeJob(): Promise<{ purged: number }> {
-    const result = await this.pool.query(
-      `
-      DELETE FROM public.imap_messages
-      WHERE deleted_in_provider = true
-        AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
-        AND provider_deleted_at < now() - interval '30 days'
-      `
-    );
-    return { purged: result.rowCount ?? 0 };
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Discover only a small candidate page before taking locks. We then lock
+      // threading state first and re-check/row-lock the candidates, matching the
+      // lock order used by message/body ingestion and activation.
+      const discovered = await client.query<PurgeCandidate>(
+        `
+        SELECT id, account_id
+        FROM public.imap_messages
+        WHERE deleted_in_provider = true
+          AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+          AND provider_deleted_at < now() - interval '30 days'
+        ORDER BY id
+        LIMIT $1
+        `,
+        [PURGE_MESSAGE_BATCH_SIZE]
+      );
+      if (discovered.rows.length === 0) {
+        await client.query("COMMIT");
+        return { purged: 0 };
+      }
+
+      const accountIds = [...new Set(discovered.rows.map((row) => row.account_id))].sort();
+      await client.query(
+        `
+        INSERT INTO public.imap_thread_state (account_id)
+        SELECT input.account_id
+        FROM unnest($1::uuid[]) AS input(account_id)
+        JOIN public.imap_accounts account ON account.id = input.account_id
+        ON CONFLICT (account_id) DO NOTHING
+        `,
+        [accountIds]
+      );
+      await client.query(
+        `
+        SELECT account_id
+        FROM public.imap_thread_state
+        WHERE account_id = ANY($1::uuid[])
+        ORDER BY account_id
+        FOR SHARE
+        `,
+        [accountIds]
+      );
+
+      const locked = await client.query<PurgeCandidate>(
+        `
+        SELECT id, account_id
+        FROM public.imap_messages
+        WHERE id = ANY($1::uuid[])
+          AND deleted_in_provider = true
+          AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+          AND provider_deleted_at < now() - interval '30 days'
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        `,
+        [discovered.rows.map((row) => row.id)]
+      );
+      if (locked.rows.length === 0) {
+        await client.query("COMMIT");
+        return { purged: 0 };
+      }
+
+      // A retained message can be the canonical root/parent/copy for surviving
+      // members. Queue every survivor in each live run before the cascade removes
+      // the victim assignments. Recursively split a pathological batch; a single
+      // >25k fan-out is retained rather than making a huge transaction or leaving
+      // an active projection knowingly stale.
+      const acceptedVictims: string[] = [];
+      const recomputeTargets = new Map<string, PurgeQueueTarget>();
+      const pending: string[][] = [locked.rows.map((row) => row.id)];
+      while (pending.length > 0) {
+        const victimIds = pending.shift()!;
+        const remaining = PURGE_RECOMPUTE_PAIR_LIMIT - recomputeTargets.size;
+        if (remaining <= 0) break;
+        const existingKeys = [...recomputeTargets.keys()];
+        const neighbors = await client.query<PurgeQueueTarget>(
+          `
+          WITH affected_components AS (
+            SELECT DISTINCT assignment.run_id, assignment.account_id, assignment.conversation_id
+            FROM public.imap_thread_assignments assignment
+            JOIN public.imap_thread_runs source_run
+              ON source_run.id = assignment.run_id
+             AND source_run.status = ANY($2::text[])
+            WHERE assignment.message_id = ANY($1::uuid[])
+          ), surviving_messages AS (
+            SELECT DISTINCT assignment.account_id, assignment.message_id
+            FROM affected_components component
+            JOIN public.imap_thread_assignments assignment
+              ON assignment.run_id = component.run_id
+             AND assignment.account_id = component.account_id
+             AND assignment.conversation_id = component.conversation_id
+            JOIN public.imap_messages message ON message.id = assignment.message_id
+            WHERE assignment.message_id <> ALL($1::uuid[])
+          )
+          SELECT DISTINCT live_run.id AS run_id, survivor.message_id, survivor.account_id
+          FROM surviving_messages survivor
+          JOIN public.imap_thread_runs live_run
+            ON live_run.account_id = survivor.account_id
+           AND live_run.status = ANY($2::text[])
+          WHERE (live_run.id::text || ':' || survivor.message_id::text) <> ALL($3::text[])
+          ORDER BY run_id, survivor.message_id
+          LIMIT $4
+          `,
+          [victimIds, [...LIVE_THREAD_RUN_STATUSES], existingKeys, remaining + 1]
+        );
+        if (neighbors.rows.length > remaining) {
+          if (victimIds.length === 1) continue;
+          const midpoint = Math.ceil(victimIds.length / 2);
+          pending.unshift(victimIds.slice(midpoint));
+          pending.unshift(victimIds.slice(0, midpoint));
+          continue;
+        }
+        acceptedVictims.push(...victimIds);
+        for (const row of neighbors.rows) {
+          recomputeTargets.set(`${row.run_id}:${row.message_id}`, row);
+        }
+      }
+
+      if (acceptedVictims.length === 0) {
+        await client.query("COMMIT");
+        return { purged: 0 };
+      }
+
+      const acceptedSet = new Set(acceptedVictims);
+      const queueTargets = [...recomputeTargets.values()].filter((row) => !acceptedSet.has(row.message_id));
+      if (queueTargets.length > 0) {
+        await client.query(
+          `
+          INSERT INTO public.imap_thread_work_queue (
+            run_id, message_id, account_id, reason, attempts, available_at,
+            last_error, enqueued_at, updated_at
+          )
+          SELECT run_id, message_id, account_id, 'retained_neighbor_purged', 0, now(), NULL, now(), now()
+          FROM unnest($1::uuid[], $2::uuid[], $3::uuid[])
+            AS affected(run_id, message_id, account_id)
+          ON CONFLICT (run_id, message_id)
+          DO UPDATE SET
+            reason = EXCLUDED.reason,
+            attempts = 0,
+            available_at = now(),
+            last_error = NULL,
+            enqueued_at = now(),
+            updated_at = now()
+          `,
+          [
+            queueTargets.map((row) => row.run_id),
+            queueTargets.map((row) => row.message_id),
+            queueTargets.map((row) => row.account_id)
+          ]
+        );
+      }
+
+      // Subject evidence is deliberately separate and compact: one fixed-size
+      // bucket per live run. Fan keys out across all live versions so a shadow
+      // build and the active/rollback projections see the same deletion.
+      await client.query(
+        `
+        WITH affected_subjects AS (
+          SELECT DISTINCT assignment.account_id, assignment.subject_key
+          FROM public.imap_thread_assignments assignment
+          JOIN public.imap_thread_runs source_run
+            ON source_run.id = assignment.run_id
+           AND source_run.status = ANY($2::text[])
+          WHERE assignment.message_id = ANY($1::uuid[])
+            AND assignment.subject_key IS NOT NULL
+        )
+        INSERT INTO public.imap_thread_subject_work (
+          run_id, account_id, subject_key, attempts, available_at,
+          last_error, enqueued_at, updated_at
+        )
+        SELECT live_run.id, subject.account_id, subject.subject_key,
+               0, now(), NULL, now(), now()
+        FROM affected_subjects subject
+        JOIN public.imap_thread_runs live_run
+          ON live_run.account_id = subject.account_id
+         AND live_run.status = ANY($2::text[])
+        ON CONFLICT (run_id, subject_key)
+        DO UPDATE SET
+          attempts = 0,
+          available_at = now(),
+          last_error = NULL,
+          enqueued_at = now(),
+          updated_at = now()
+        `,
+        [acceptedVictims, [...LIVE_THREAD_RUN_STATUSES]]
+      );
+
+      const result = await client.query(
+        `
+        DELETE FROM public.imap_messages
+        WHERE id = ANY($1::uuid[])
+          AND deleted_in_provider = true
+          AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+          AND provider_deleted_at < now() - interval '30 days'
+        `,
+        [acceptedVictims]
+      );
+      await client.query("COMMIT");
+      return { purged: result.rowCount ?? 0 };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /**
@@ -1418,20 +1742,123 @@ export class MirrorRepository {
     for (const message of messages) {
       await client.query("BEGIN");
       try {
-      const existing = await client.query<{ exists: boolean }>(
+      await this.lockThreadStateForMirrorWrite(client, accountId);
+      const existing = await client.query<{
+        id: string;
+        rfc_message_id: string | null;
+        message_id_normalized: string | null;
+        provider_message_id: string | null;
+        provider_message_id_namespace: string | null;
+        provider_thread_id: string | null;
+        provider_thread_id_namespace: string | null;
+        in_reply_to: string | null;
+        references_header: string | null;
+        internal_date: Date;
+        size_bytes: string | null;
+        subject: string | null;
+        from_email: string | null;
+        from_name: string | null;
+        to_emails: string[] | null;
+        to_names: (string | null)[] | null;
+        cc_emails: string[] | null;
+        cc_names: (string | null)[] | null;
+        bcc_emails: string[] | null;
+        headers_json: Record<string, string>;
+        thread_assignment_missing: boolean;
+      }>(
         `
-        SELECT EXISTS (
-          SELECT 1
-          FROM public.imap_messages
-          WHERE account_id = $1
-            AND folder_path = $2
-            AND uidvalidity = $3
-            AND uid = $4
-        ) AS exists
+        SELECT
+          m.id,
+          m.rfc_message_id,
+          m.message_id_normalized,
+          m.provider_message_id,
+          m.provider_message_id_namespace,
+          m.provider_thread_id,
+          m.provider_thread_id_namespace,
+          m.in_reply_to,
+          m.references_header,
+          m.internal_date,
+          m.size_bytes,
+          m.subject,
+          m.from_email,
+          m.from_name,
+          m.to_emails,
+          m.to_names,
+          m.cc_emails,
+          m.cc_names,
+          m.bcc_emails,
+          m.headers_json,
+          EXISTS (
+            SELECT 1
+            FROM public.imap_thread_runs run
+            WHERE run.account_id = m.account_id
+              AND run.status = ANY($5::text[])
+              AND NOT EXISTS (
+                SELECT 1
+                FROM public.imap_thread_assignments assignment
+                WHERE assignment.run_id = run.id
+                  AND assignment.message_id = m.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM public.imap_thread_work_queue queued
+                WHERE queued.run_id = run.id
+                  AND queued.message_id = m.id
+              )
+          ) AS thread_assignment_missing
+        FROM public.imap_messages m
+        WHERE m.account_id = $1
+          AND m.folder_path = $2
+          AND m.uidvalidity = $3
+          AND m.uid = $4
         `,
-        [accountId, folder.path, uidValidity, message.uid]
+        [accountId, folder.path, uidValidity, message.uid, [...LIVE_THREAD_RUN_STATUSES]]
       );
-      const isNewMessage = existing.rows[0]?.exists !== true;
+      const existingMessage = existing.rows[0];
+      const isNewMessage = !existingMessage;
+      const threadingInputChanged = isNewMessage
+        || existingMessage.thread_assignment_missing
+        || canonicalJsonForThreadingEvidence([
+          existingMessage.rfc_message_id,
+          existingMessage.message_id_normalized,
+          existingMessage.provider_message_id,
+          existingMessage.provider_message_id_namespace,
+          existingMessage.provider_thread_id,
+          existingMessage.provider_thread_id_namespace,
+          existingMessage.in_reply_to,
+          existingMessage.references_header,
+          existingMessage.internal_date?.toISOString(),
+          existingMessage.size_bytes === null ? null : Number(existingMessage.size_bytes),
+          existingMessage.subject,
+          existingMessage.from_email,
+          existingMessage.from_name,
+          existingMessage.to_emails ?? [],
+          existingMessage.to_names ?? [],
+          existingMessage.cc_emails ?? [],
+          existingMessage.cc_names ?? [],
+          existingMessage.bcc_emails ?? [],
+          existingMessage.headers_json ?? {}
+        ]) !== canonicalJsonForThreadingEvidence([
+          message.rfcMessageId ?? existingMessage.rfc_message_id,
+          message.messageIdNormalized ?? existingMessage.message_id_normalized,
+          message.providerMessageId,
+          message.providerMessageIdNamespace,
+          message.providerThreadId,
+          message.providerThreadIdNamespace,
+          message.inReplyTo ?? existingMessage.in_reply_to,
+          message.referencesHeader ?? existingMessage.references_header,
+          message.internalDate.toISOString(),
+          message.sizeBytes,
+          message.subject,
+          message.fromEmail,
+          message.fromName,
+          message.toEmails,
+          message.toNames,
+          message.ccEmails,
+          message.ccNames,
+          message.bccEmails,
+          { ...(existingMessage.headers_json ?? {}), ...message.headersJson }
+        ]);
 
       const result = await client.query<ImapMessage>(
         `
@@ -1443,7 +1870,10 @@ export class MirrorRepository {
           uid,
           rfc_message_id,
           message_id_normalized,
+          provider_message_id,
+          provider_message_id_namespace,
           provider_thread_id,
+          provider_thread_id_namespace,
           in_reply_to,
           references_header,
           internal_date,
@@ -1464,13 +1894,34 @@ export class MirrorRepository {
         VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8,
           $9, $10, $11, $12, $13, $14, $15, $16,
-          $17, $18, $19, $20, $21, $22, $23, $24
+          $17, $18, $19, $20, $21, $22, $23, $24,
+          $25, $26, $27
         )
         ON CONFLICT (account_id, folder_path, uidvalidity, uid)
         DO UPDATE SET
-          flags = CASE WHEN $25::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
-          headers_json = EXCLUDED.headers_json,
+          folder_id = EXCLUDED.folder_id,
+          rfc_message_id = COALESCE(EXCLUDED.rfc_message_id, public.imap_messages.rfc_message_id),
+          message_id_normalized = COALESCE(EXCLUDED.message_id_normalized, public.imap_messages.message_id_normalized),
+          provider_message_id = EXCLUDED.provider_message_id,
+          provider_message_id_namespace = EXCLUDED.provider_message_id_namespace,
+          provider_thread_id = EXCLUDED.provider_thread_id,
+          provider_thread_id_namespace = EXCLUDED.provider_thread_id_namespace,
+          in_reply_to = COALESCE(EXCLUDED.in_reply_to, public.imap_messages.in_reply_to),
+          references_header = COALESCE(EXCLUDED.references_header, public.imap_messages.references_header),
+          internal_date = EXCLUDED.internal_date,
+          size_bytes = EXCLUDED.size_bytes,
+          subject = EXCLUDED.subject,
+          from_email = EXCLUDED.from_email,
+          from_name = EXCLUDED.from_name,
+          to_emails = EXCLUDED.to_emails,
+          to_names = EXCLUDED.to_names,
+          cc_emails = EXCLUDED.cc_emails,
+          cc_names = EXCLUDED.cc_names,
+          bcc_emails = EXCLUDED.bcc_emails,
+          flags = CASE WHEN $28::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
+          headers_json = public.imap_messages.headers_json || EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
+          window_status = EXCLUDED.window_status,
           deleted_in_provider = false,
           provider_deleted_at = NULL,
           deleted_reason = NULL
@@ -1484,7 +1935,10 @@ export class MirrorRepository {
           message.uid,
           message.rfcMessageId,
           message.messageIdNormalized,
+          message.providerMessageId,
+          message.providerMessageIdNamespace,
           message.providerThreadId,
+          message.providerThreadIdNamespace,
           message.inReplyTo,
           message.referencesHeader,
           message.internalDate,
@@ -1548,6 +2002,9 @@ export class MirrorRepository {
           `,
           [folder.id]
         );
+      }
+      if (threadingInputChanged) {
+        await this.enqueueThreadingMessages(client, accountId, [row.id], "metadata_changed");
       }
       await client.query("COMMIT");
       rows.push(row);
@@ -1874,30 +2331,105 @@ export class MirrorRepository {
 
   async storeBody(body: MessageBodyInput): Promise<void> {
     const client = await this.pool.connect();
-    await client.query("BEGIN");
-
     try {
+      await client.query("BEGIN");
+      const owner = await client.query<{ account_id: string }>(
+        "SELECT account_id FROM public.imap_messages WHERE id = $1",
+        [body.messageId]
+      );
+      const ownerAccountId = owner.rows[0]?.account_id;
+      if (!ownerAccountId) throw new Error(`Message not found for body storage: ${body.messageId}`);
+      await this.lockThreadStateForMirrorWrite(client, ownerAccountId);
+
       const target = await client.query<{
         account_id: string;
         folder_path: string;
         body_fetched_at: Date | null;
+        rfc_message_id: string | null;
+        in_reply_to: string | null;
+        references_header: string | null;
+        headers_json: Record<string, unknown>;
+        raw_mime_sha256: string | null;
+        body_headers_json: Record<string, unknown> | null;
       }>(
         `
-        SELECT account_id, folder_path, body_fetched_at
-        FROM public.imap_messages
-        WHERE id = $1
-        FOR UPDATE
+        SELECT
+          account_id,
+          folder_path,
+          body_fetched_at,
+          rfc_message_id,
+          in_reply_to,
+          references_header,
+          m.headers_json,
+          b.raw_mime_sha256,
+          b.headers_json AS body_headers_json
+        FROM public.imap_messages m
+        LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+        WHERE m.id = $1
+        FOR UPDATE OF m
         `,
         [body.messageId]
       );
       const message = target.rows[0];
       if (!message) throw new Error(`Message not found for body storage: ${body.messageId}`);
 
+      // A metadata FETCH can be incomplete or malformed while the later full MIME
+      // parse has usable threading headers. Fill only missing mirror fields; never
+      // overwrite provider-observed metadata with parser output. Any newly learned
+      // threading/automation header requeues this message for the derived thread
+      // projection, while body storage itself remains independent.
+      const recoveredHeaders: Record<string, unknown> = {};
+      for (const key of THREADING_BODY_HEADER_KEYS) {
+        const value = body.headersJson[key];
+        if (value !== undefined && message.headers_json[key] === undefined) {
+          recoveredHeaders[key] = value;
+        }
+      }
+      const recoveredMessageId = message.rfc_message_id ? null : headerText(body.headersJson["message-id"]);
+      const recoveredInReplyTo = message.in_reply_to ? null : headerText(body.headersJson["in-reply-to"]);
+      const recoveredReferences = message.references_header ? null : headerText(body.headersJson.references);
+      const learnedThreadingEvidence = Boolean(
+        recoveredMessageId
+        || recoveredInReplyTo
+        || recoveredReferences
+        || Object.keys(recoveredHeaders).length > 0
+      );
+      const rawMimeSha256 = body.rawTruncated
+        ? null
+        : createHash("sha256").update(body.rawMime).digest("hex");
+      const learnedDeliveryEvidence = rawMimeSha256 !== message.raw_mime_sha256;
+      const bodyHeadersChanged = canonicalJsonForThreadingEvidence(message.body_headers_json ?? {})
+        !== canonicalJsonForThreadingEvidence(body.headersJson);
+
+      if (learnedThreadingEvidence) {
+        await client.query(
+          `
+          UPDATE public.imap_messages
+          SET
+            rfc_message_id = COALESCE(rfc_message_id, $2),
+            message_id_normalized = COALESCE(message_id_normalized, $3),
+            in_reply_to = COALESCE(in_reply_to, $4),
+            references_header = COALESCE(references_header, $5),
+            headers_json = headers_json || $6::jsonb
+          WHERE id = $1
+          `,
+          [
+            body.messageId,
+            recoveredMessageId,
+            normalizeMessageId(recoveredMessageId),
+            recoveredInReplyTo,
+            recoveredReferences,
+            JSON.stringify(recoveredHeaders)
+          ]
+        );
+      }
+
       await client.query(
         `
         INSERT INTO public.imap_message_bodies (
           message_id,
           raw_mime,
+          raw_mime_sha256,
           raw_bytes,
           raw_truncated,
           body_text,
@@ -1912,10 +2444,11 @@ export class MirrorRepository {
           created_at,
           updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now(), now())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now(), now())
         ON CONFLICT (message_id)
         DO UPDATE SET
           raw_mime = EXCLUDED.raw_mime,
+          raw_mime_sha256 = EXCLUDED.raw_mime_sha256,
           raw_bytes = EXCLUDED.raw_bytes,
           raw_truncated = EXCLUDED.raw_truncated,
           body_text = EXCLUDED.body_text,
@@ -1932,6 +2465,7 @@ export class MirrorRepository {
         [
           body.messageId,
           this.config.BODY_STORAGE_MODE === "parsed_only" ? null : body.rawMime,
+          rawMimeSha256,
           body.rawBytes,
           body.rawTruncated,
           body.bodyText,
@@ -1944,6 +2478,17 @@ export class MirrorRepository {
           body.parserWarnings
         ]
       );
+
+      if (learnedThreadingEvidence || bodyHeadersChanged || learnedDeliveryEvidence) {
+        await this.enqueueThreadingMessages(
+          client,
+          message.account_id,
+          [body.messageId],
+          learnedThreadingEvidence || bodyHeadersChanged
+            ? "body_headers_changed"
+            : "body_fingerprint_changed"
+        );
+      }
 
       await client.query(
         `

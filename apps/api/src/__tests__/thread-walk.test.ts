@@ -31,20 +31,19 @@ function seed(overrides: Partial<ThreadSeedRow>): ThreadSeedRow {
 }
 
 describe("normalizeIdToken", () => {
-  it("strips surrounding angle brackets, trims, lowercases", () => {
-    expect(normalizeIdToken("  <Root@ACME.com> ")).toBe("root@acme.com");
-    expect(normalizeIdToken("<<weird>>")).toBe("weird");
-    expect(normalizeIdToken("plain@x")).toBe("plain@x");
+  it("extracts a strict bracketed token without changing case", () => {
+    expect(normalizeIdToken("  <Root@ACME.com> ")).toBe("Root@ACME.com");
+    expect(normalizeIdToken("<<weird>>")).toBe("");
+    expect(normalizeIdToken("plain@x")).toBe("");
   });
 
-  it("matches the SQL lower(trim(both '<>' from ...)) shape on an angle-bracketed In-Reply-To", () => {
-    // The same normalization the predicate applies to in_reply_to column values.
-    expect(normalizeIdToken("<R1@x>")).toBe("r1@x");
+  it("extracts the token used by the exact bracketed In-Reply-To SQL comparison", () => {
+    expect(normalizeIdToken("<R1@x>")).toBe("R1@x");
   });
 });
 
 describe("threadSeedKeys (generic-IMAP, header-only linkage)", () => {
-  it("builds the distinct normalized key set from references + in_reply_to + ids", () => {
+  it("builds the distinct strict key set from References, In-Reply-To, and Message-ID", () => {
     const keys = threadSeedKeys(
       seed({
         // NULL provider_thread_id (generic IMAP) — linkage is header-only.
@@ -52,11 +51,11 @@ describe("threadSeedKeys (generic-IMAP, header-only linkage)", () => {
         rfc_message_id: "<r1@x>",
         message_id_normalized: "r1@x",
         in_reply_to: "<r0@x>",
-        references_header: "<r0@x> <R1@x>"
+        references_header: "<r0@x> <r1@x>"
       })
     );
-    // De-duplicated + normalized: r0@x (from references + in_reply_to), r1@x (from
-    // references + rfc_message_id + message_id_normalized, all collapsing to one).
+    // De-duplicated without case folding: r0@x (References + In-Reply-To), r1@x
+    // (References + RFC Message-ID). The lowercased compatibility cache is ignored.
     expect([...keys].sort()).toEqual(["r0@x", "r1@x"]);
   });
 
@@ -68,6 +67,22 @@ describe("threadSeedKeys (generic-IMAP, header-only linkage)", () => {
   it("returns an empty set when the seed has no threading headers", () => {
     expect(threadSeedKeys(seed({}))).toEqual([]);
   });
+
+  it("preserves case-sensitive local parts and ignores the lowercased legacy cache", () => {
+    expect(threadSeedKeys(seed({
+      rfc_message_id: "<Case@x>",
+      references_header: "<case@x>",
+      message_id_normalized: "case@x"
+    }))).toEqual(["case@x", "Case@x"]);
+  });
+
+  it("does not repair bare or malformed IDs into graph keys", () => {
+    expect(threadSeedKeys(seed({
+      rfc_message_id: "Case@x",
+      in_reply_to: "root @ x",
+      references_header: "<also @ malformed>"
+    }))).toEqual([]);
+  });
 });
 
 describe("threadMembershipClause", () => {
@@ -77,8 +92,10 @@ describe("threadMembershipClause", () => {
     expect(clause).toContain("m.deleted_in_provider = false");
     expect(clause).toContain("($2::text IS NOT NULL AND m.provider_thread_id = $2)");
     expect(clause).toContain("OR m.id = $3");
-    expect(clause).toContain("OR m.message_id_normalized = ANY($4::text[])");
-    expect(clause).toContain("OR lower(trim(both '<>' from m.in_reply_to)) = ANY($4::text[])");
+    expect(clause).toContain("OR btrim(m.rfc_message_id) IN");
+    expect(clause).toContain("OR btrim(m.in_reply_to) IN");
+    expect(clause).not.toContain("message_id_normalized");
+    expect(clause).not.toContain("lower(");
     expect(clause).toContain("ORDER BY m.internal_date ASC, m.id ASC");
   });
 
@@ -88,8 +105,10 @@ describe("threadMembershipClause", () => {
     expect(clause).toContain("deleted_in_provider = false");
     expect(clause).toContain("($2::text IS NOT NULL AND provider_thread_id = $2)");
     expect(clause).toContain("OR id = $3");
-    expect(clause).toContain("OR message_id_normalized = ANY($4::text[])");
-    expect(clause).toContain("OR lower(trim(both '<>' from in_reply_to)) = ANY($4::text[])");
+    expect(clause).toContain("OR btrim(rfc_message_id) IN");
+    expect(clause).toContain("OR btrim(in_reply_to) IN");
+    expect(clause).not.toContain("message_id_normalized");
+    expect(clause).not.toContain("lower(");
     expect(clause).toContain("ORDER BY internal_date ASC, id ASC");
     // No alias leaked in.
     expect(clause).not.toContain("m.");
