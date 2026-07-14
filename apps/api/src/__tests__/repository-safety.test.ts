@@ -170,7 +170,8 @@ describe("repository safety", () => {
     expect(repository).toContain("headers_synced_count = 0");
     expect(repository).toContain("bodies_fetched_count = 0");
     expect(repository).toContain("historical_target_count = NULL");
-    expect(engine).toContain("setInitialSyncSnapshot(folder.id, targetMaxUid, oldestSynced, sortedTargets.length)");
+    expect(engine).toContain("setInitialSyncSnapshot(");
+    expect(engine).toContain("sortedTargets.length");
   });
 
   it("persists resumable history-lane state and backlog reasons", async () => {
@@ -338,12 +339,18 @@ describe("repository safety", () => {
 
   it("batches metadata and attachment writes in one rollback-safe transaction", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const batchMethod = source.slice(
+      source.indexOf("async upsertMessages("),
+      source.indexOf("async applyFlagScan(")
+    );
 
-    expect(source).toContain("Metadata batch contains duplicate UIDs");
-    expect(source).toContain("jsonb_to_recordset($1::jsonb) AS message");
-    expect(source).toContain("jsonb_to_recordset($1::jsonb) AS attachment");
-    expect(source).toContain("Metadata batch wrote");
-    expect(source).toContain('client.query("ROLLBACK")');
+    expect(batchMethod).toContain("Metadata batch contains duplicate UIDs");
+    expect(batchMethod).toContain("jsonb_to_recordset($1::jsonb) AS message");
+    expect(batchMethod).toContain("jsonb_to_recordset($1::jsonb) AS attachment");
+    expect(batchMethod).toContain("Metadata batch wrote");
+    expect(batchMethod).toContain('metadataWriteDeadline.queryControl(client, "BEGIN"');
+    expect(batchMethod).toContain('metadataWriteDeadline.queryControl(client, "COMMIT"');
+    expect(batchMethod).toContain('client.query(deadlineQuery("ROLLBACK"');
   });
 
   it("does not body-backfill messages from untracked folders", async () => {

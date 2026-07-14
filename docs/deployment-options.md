@@ -44,6 +44,8 @@ The 256 MB worker profile intentionally uses conservative runtime settings:
 
 This keeps sync metadata and body parsing bounded. If a mailbox regularly has large MIME bodies or the machine OOMs, first increase `BODY_RAW_MAX_BYTES` only if needed; otherwise move the worker to `512mb`.
 
+All three sync batch-size settings accept values from `1` through `500`. A metadata fetch and direct logical write fail closed before retaining more than an estimated 32 MiB or 20,000 attachments. Inside one all-or-nothing database transaction, persistence splits that logical batch into SQL statements capped at an estimated 8 MiB or 5,000 attachments; a single message beyond the statement boundary fails closed. Flag FETCH retention is capped at 4 MiB or 20,000 keywords. Projected updates and their events are split at 1 MiB or 5,000 keywords using both stored and incoming flag representations, with a pathological single UID rejected. These limits prevent a configuration mistake, legacy row, or pathological provider response from turning a bulk write into an unbounded allocation. Prefer the conservative values above on 256 MB workers.
+
 `DATABASE_POOL_MAX` (default 10) sets the Postgres connection pool size for the process. Raise it when one worker drives many accounts/folders concurrently and the database can afford the connections; keep it at or below what a connection-capped Postgres (for example a Supavisor session pooler) allows. It does not change advisory-lock semantics — each pooled connection is its own session.
 
 If your Signal repo already has the Fly and database env vars loaded locally, you can reuse them:

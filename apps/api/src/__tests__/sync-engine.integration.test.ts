@@ -198,7 +198,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     try {
       const stoppedPromptly = await Promise.race([
         sync.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50))
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 1_000))
       ]);
       expect(stoppedPromptly).toBe(true);
       expect(closeCalls).toBeGreaterThan(0);
@@ -342,6 +342,44 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(state?.currently_syncing).toBe(false);
     expect(state?.sync_started_by).toBeNull();
     expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
+  });
+
+  it("finishes a failed run when shutdown interrupts failure finalization", async () => {
+    const h = await setupIntegration("failure-finalization-abort");
+    activeAccountIds.push(h.account.id);
+    const abort = new AbortController();
+    const originalMarkFailed = h.repository.markAccountSyncFailed.bind(h.repository);
+    vi.spyOn(h.repository, "markAccountSyncFailed").mockImplementation(async (...args) => {
+      abort.abort();
+      return await originalMarkFailed(...args);
+    });
+    const engine = h.buildEngine({
+      folders: [],
+      clientFactory: async () => {
+        throw new Error("provider failed before shutdown");
+      }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", { signal: abort.signal });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.errors).toEqual(["[Error] provider failed before shutdown"]);
+    const state = await h.pool.query<{
+      currently_syncing: boolean;
+      sync_started_by: string | null;
+    }>(
+      "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]).toEqual({ currently_syncing: false, sync_started_by: null });
+    const run = await h.pool.query<{ status: string; error: string | null }>(
+      "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0]).toEqual({
+      status: "failed",
+      error: "[Error] provider failed before shutdown"
+    });
   });
 
   it.each(["body", "history"] as const)(
@@ -1974,6 +2012,177 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ).rows[0];
     expect(skippedHistory.historical_target_count).toBeNull();
     expect(Number(skippedHistory.historical_message_count)).toBe(0);
+  });
+
+  it("finishes an in-flight history batch at the safe boundary after the lock budget expires", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("history-safe-boundary", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_LOCK_HOLD_MS: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET body_fetch_policy = 'lazy',
+           historical_backfill_mode = 'metadata_only',
+           max_backfill_rate = 'small'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_101,
+      messages: [
+        makeTextMessage({
+          uid: 1,
+          subject: "historical",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "historical",
+          internalDate: oldDate
+        }),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: recentDate
+        })
+      ]
+    }];
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+
+    class LockBoundaryHistoryFetchClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (Array.isArray(range) && range.includes(1) && query.envelope) {
+          now += 75;
+        }
+        yield* super.fetch(range, query);
+      }
+    }
+
+    try {
+      const result = await h.buildEngine({
+        folders,
+        clientFactory: async () => new LockBoundaryHistoryFetchClient(folders)
+      }).syncAccount(h.account.id, "manual");
+
+      expect(result.outcome).toBe("success");
+      expect(result.hitLockBudget).toBe(true);
+      expect(result.errors).toEqual([]);
+      const history = await h.pool.query<{
+        uid: string;
+        backfill_in_progress: boolean;
+        backfill_oldest_uid_synced: string | null;
+      }>(
+        `SELECT m.uid::text AS uid, f.backfill_in_progress,
+                f.backfill_oldest_uid_synced::text AS backfill_oldest_uid_synced
+         FROM public.imap_messages m
+         JOIN public.imap_folders f ON f.id = m.folder_id
+         WHERE m.account_id = $1 AND m.uid = 1`,
+        [h.account.id]
+      );
+      expect(history.rows).toEqual([{
+        uid: "1",
+        backfill_in_progress: false,
+        backfill_oldest_uid_synced: "1"
+      }]);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("does not advance the history watermark when a post-commit hook fails", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const recentDate = new Date();
+    const h = await setupIntegration("history-hook-watermark", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET body_fetch_policy = 'lazy',
+           historical_backfill_mode = 'metadata_only',
+           max_backfill_rate = 'small'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_102,
+      messages: [
+        makeTextMessage({
+          uid: 1,
+          subject: "historical-hook",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "historical",
+          internalDate: oldDate
+        }),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh-hook",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: recentDate
+        })
+      ]
+    }];
+
+    const failed = await h.buildEngine({
+      folders,
+      hooks: {
+        onMessageUpsert(message) {
+          if (Number(message.uid) === 1) throw new Error("forced history hook failure");
+        }
+      }
+    }).syncAccount(h.account.id, "manual");
+    expect(failed.outcome).not.toBe("success");
+
+    const afterFailure = await h.pool.query<{
+      backfill_in_progress: boolean;
+      backfill_oldest_uid_synced: string | null;
+    }>(
+      `SELECT backfill_in_progress, backfill_oldest_uid_synced::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+    expect(afterFailure.rows[0]).toEqual({
+      backfill_in_progress: true,
+      backfill_oldest_uid_synced: "2"
+    });
+
+    const retried = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    expect(retried.outcome).toBe("success");
+    const afterRetry = await h.pool.query<{
+      backfill_in_progress: boolean;
+      backfill_oldest_uid_synced: string | null;
+    }>(
+      `SELECT backfill_in_progress, backfill_oldest_uid_synced::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+    expect(afterRetry.rows[0]).toEqual({
+      backfill_in_progress: false,
+      backfill_oldest_uid_synced: "1"
+    });
   });
 
   it("Scenario N — history backfill batches across cycles and resumes from the watermark", async () => {

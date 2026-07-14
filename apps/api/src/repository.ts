@@ -4,6 +4,15 @@ import { encryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
+import {
+  assertFlagEventSideWithinLimits,
+  MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
+  MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH,
+  MAX_SYNC_BATCH_SIZE,
+  splitFlagEventBatches,
+  splitFlagWriteBatches,
+  splitMetadataWriteBatches
+} from "./sync-limits.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -36,12 +45,7 @@ const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$
 
 const METADATA_WRITE_TIMEOUT_ERROR = "metadata write deadline exceeded";
 const FLAG_SCAN_TIMEOUT_ERROR = "FLAG_SCAN_TOTAL_TIMEOUT_MS exceeded during flag scan write";
-
-function remainingMetadataWriteMs(deadlineAt: number): number {
-  const remainingMs = Math.floor(deadlineAt - Date.now());
-  if (remainingMs < 1) throw new Error(METADATA_WRITE_TIMEOUT_ERROR);
-  return remainingMs;
-}
+const SYNC_DATABASE_WRITE_INTERRUPTED_ERROR = "sync database write interrupted";
 
 function deadlineQuery(
   text: string,
@@ -65,115 +69,174 @@ async function queryWithDeadline<T extends QueryResultRow = QueryResultRow>(
   return result;
 }
 
-async function connectForMetadataWrite(pool: PgPool, deadlineAt: number): Promise<PgClient> {
-  const remainingMs = remainingMetadataWriteMs(deadlineAt);
+function createTransactionDeadline(errorMessage: string) {
+  const remainingMs = (deadlineAt: number): number => {
+    const remaining = Math.floor(deadlineAt - Date.now());
+    if (remaining < 1) throw new Error(errorMessage);
+    return remaining;
+  };
 
-  return await new Promise<PgClient>((resolve, reject) => {
-    let settled = false;
-    const timeout = setTimeout(() => {
-      settled = true;
-      reject(new Error(METADATA_WRITE_TIMEOUT_ERROR));
-    }, remainingMs);
-
-    void pool.connect().then(
-      (client) => {
-        if (settled) {
-          client.release();
-          return;
-        }
-        settled = true;
-        clearTimeout(timeout);
-        resolve(client);
-      },
-      (error: unknown) => {
+  const connect = async (
+    pool: PgPool,
+    deadlineAt: number,
+    signal?: AbortSignal
+  ): Promise<PgClient> => {
+    const timeoutMs = remainingMs(deadlineAt);
+    return await new Promise<PgClient>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        reject(error);
+        reject(new Error(SYNC_DATABASE_WRITE_INTERRUPTED_ERROR));
+      };
+      const timeout = setTimeout(() => {
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        reject(new Error(errorMessage));
+      }, timeoutMs);
+      if (signal?.aborted) {
+        onAbort();
+      } else {
+        signal?.addEventListener("abort", onAbort, { once: true });
       }
-    );
-  });
-}
 
-async function queryMetadataControl(
-  client: PgClient,
-  text: string,
-  deadlineAt: number,
-  checkAfter = true
-): Promise<void> {
-  await queryWithDeadline(
-    client,
-    text,
-    undefined,
-    deadlineAt,
-    remainingMetadataWriteMs,
-    checkAfter
-  );
-}
-
-async function refreshMetadataWriteTimeout(client: PgClient, deadlineAt: number): Promise<void> {
-  const timeoutMs = remainingMetadataWriteMs(deadlineAt);
-  await client.query(deadlineQuery(
-    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)",
-    timeoutMs,
-    [`${timeoutMs}ms`]
-  ));
-  remainingMetadataWriteMs(deadlineAt);
-}
-
-function remainingFlagScanMs(deadlineAt: number): number {
-  const remainingMs = Math.floor(deadlineAt - Date.now());
-  if (remainingMs < 1) throw new Error(FLAG_SCAN_TIMEOUT_ERROR);
-  return remainingMs;
-}
-
-async function connectForFlagScan(pool: PgPool, deadlineAt: number): Promise<PgClient> {
-  const remainingMs = remainingFlagScanMs(deadlineAt);
-
-  return await new Promise<PgClient>((resolve, reject) => {
-    let settled = false;
-    const timeout = setTimeout(() => {
-      settled = true;
-      reject(new Error(FLAG_SCAN_TIMEOUT_ERROR));
-    }, remainingMs);
-
-    void pool.connect().then(
-      (client) => {
-        if (settled) {
-          client.release();
-          return;
+      void pool.connect().then(
+        (client) => {
+          if (settled) {
+            // This checkout arrived after the caller stopped waiting, before any
+            // transaction or query ran on it. Return the clean client normally;
+            // destroying it here would churn the whole pool during abort bursts.
+            client.release();
+            return;
+          }
+          settled = true;
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", onAbort);
+          resolve(client);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
         }
-        settled = true;
-        clearTimeout(timeout);
-        resolve(client);
-      },
-      (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        reject(error);
-      }
-    );
-  });
+      );
+    });
+  };
+
+  const queryControl = async (
+    client: PgClient,
+    text: string,
+    deadlineAt: number,
+    checkAfter = true
+  ): Promise<void> => {
+    await queryWithDeadline(client, text, undefined, deadlineAt, remainingMs, checkAfter);
+  };
+
+  const refreshTimeout = async (client: PgClient, deadlineAt: number): Promise<void> => {
+    const timeoutMs = remainingMs(deadlineAt);
+    await client.query(deadlineQuery(
+      "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)",
+      timeoutMs,
+      [`${timeoutMs}ms`]
+    ));
+    remainingMs(deadlineAt);
+  };
+
+  return { connect, queryControl, refreshTimeout, remainingMs };
 }
 
-async function refreshFlagScanTimeout(client: PgClient, deadlineAt: number): Promise<void> {
-  const timeoutMs = remainingFlagScanMs(deadlineAt);
-  await client.query(deadlineQuery(
-    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)",
-    timeoutMs,
-    [`${timeoutMs}ms`]
-  ));
-  remainingFlagScanMs(deadlineAt);
+const metadataWriteDeadline = createTransactionDeadline(METADATA_WRITE_TIMEOUT_ERROR);
+const flagScanDeadline = createTransactionDeadline(FLAG_SCAN_TIMEOUT_ERROR);
+
+function bindClientAbort(client: PgClient, signal?: AbortSignal): {
+  isReleased(): boolean;
+  release(discard?: boolean): void;
+} {
+  let released = false;
+  const release = (discard = false) => {
+    if (released) return;
+    released = true;
+    signal?.removeEventListener("abort", onAbort);
+    client.release(discard);
+  };
+  const onAbort = () => release(true);
+
+  if (signal?.aborted) {
+    // The signal won the narrow race after checkout but before BEGIN/listener
+    // binding. No work has run on this client, so it remains safe to reuse.
+    release();
+    throw new Error(SYNC_DATABASE_WRITE_INTERRUPTED_ERROR);
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
+  return { isReleased: () => released, release };
 }
 
-async function queryFlagScanControl(
-  client: PgClient,
+async function runMetadataWriteWithDeadline<T extends QueryResultRow>(
+  pool: PgPool,
   text: string,
+  values: unknown[],
   deadlineAt: number,
-  checkAfter = true
-): Promise<void> {
-  await queryWithDeadline(client, text, undefined, deadlineAt, remainingFlagScanMs, checkAfter);
+  signal?: AbortSignal
+): Promise<QueryResult<T>> {
+  const client = await metadataWriteDeadline.connect(pool, deadlineAt, signal);
+  const lease = bindClientAbort(client, signal);
+  let discardClient = false;
+  try {
+    await metadataWriteDeadline.queryControl(client, "BEGIN", deadlineAt);
+    await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+    const result = await queryWithDeadline<T>(
+      client,
+      text,
+      values,
+      deadlineAt,
+      metadataWriteDeadline.remainingMs
+    );
+    await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+    await metadataWriteDeadline.queryControl(client, "COMMIT", deadlineAt, false);
+    return result;
+  } catch (error) {
+    if (!lease.isReleased()) {
+      const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
+      await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
+        discardClient = true;
+      });
+    }
+    throw error;
+  } finally {
+    lease.release(discardClient);
+  }
+}
+
+export interface MetadataWriteOptions {
+  preserveExistingFlags?: boolean;
+  deadlineAt?: number;
+  signal?: AbortSignal;
+}
+
+export interface SyncStateWriteOptions {
+  deadlineAt?: number;
+  signal?: AbortSignal;
+  expectedSyncOwner?: string;
+}
+
+async function runOptionalDeadlineWrite<T extends QueryResultRow>(
+  pool: PgPool,
+  text: string,
+  values: unknown[],
+  options: SyncStateWriteOptions
+): Promise<QueryResult<T>> {
+  return options.deadlineAt === undefined
+    ? await pool.query<T>(text, values)
+    : await runMetadataWriteWithDeadline<T>(
+        pool,
+        text,
+        values,
+        options.deadlineAt,
+        options.signal
+      );
 }
 
 export function normalizeFlags(flags: readonly string[] | null | undefined): string[] {
@@ -560,6 +623,18 @@ export class MirrorRepository {
           currently_syncing = false
           OR last_heartbeat_at IS NULL
           OR last_heartbeat_at <= now() - ($2::bigint * interval '1 millisecond')
+          -- currently_syncing is an observability projection, not ownership.
+          -- If cancellation cleanup was briefly blocked but the session lock is
+          -- already gone, make the account immediately schedulable; the
+          -- authoritative pg_try_advisory_lock still closes the selection race.
+          OR NOT EXISTS (
+            SELECT 1
+            FROM pg_locks active_lock
+            WHERE active_lock.locktype = 'advisory'
+              AND active_lock.classid::bigint = 0
+              AND active_lock.objid::bigint = public.imap_accounts.lock_id
+              AND active_lock.granted = true
+          )
         )
         ${sentDueClause}
       ORDER BY COALESCE(last_sync_finished_at, 'epoch'::timestamptz), created_at
@@ -632,8 +707,13 @@ export class MirrorRepository {
     );
   }
 
-  async markAccountSyncStarted(accountId: string, startedBy: string): Promise<void> {
-    await this.pool.query(
+  async markAccountSyncStarted(
+    accountId: string,
+    startedBy: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    await runOptionalDeadlineWrite(
+      this.pool,
       `
       UPDATE public.imap_accounts
       SET
@@ -643,31 +723,44 @@ export class MirrorRepository {
         last_heartbeat_at = now()
       WHERE id = $1
       `,
-      [accountId, startedBy]
+      [accountId, startedBy],
+      options
     );
   }
 
   /** Clear active-sync state after scheduler cancellation without changing health. */
-  async markAccountSyncYielded(accountId: string): Promise<void> {
-    await this.pool.query(
-      `
+  async markAccountSyncYielded(
+    accountId: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    const query = `
       UPDATE public.imap_accounts
       SET
         currently_syncing = false,
         sync_started_by = NULL,
         last_heartbeat_at = now()
       WHERE id = $1
-      `,
-      [accountId]
+        AND ($2::text IS NULL OR sync_started_by = $2)
+      RETURNING id
+    `;
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
+      query,
+      [accountId, options.expectedSyncOwner ?? null],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync cleanup lost account ${accountId}`);
+    }
   }
 
   async markAccountSyncSucceeded(
     accountId: string,
-    options: { countsTowardBackoff?: boolean } = {}
+    options: SyncStateWriteOptions & { countsTowardBackoff?: boolean } = {}
   ): Promise<void> {
     const countsTowardBackoff = options.countsTowardBackoff ?? true;
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       WITH folder_health AS (
         SELECT
@@ -793,6 +886,8 @@ export class MirrorRepository {
         END
       FROM folder_health, folder_cap
       WHERE id = $1
+        AND ($12::text IS NULL OR sync_started_by = $12)
+      RETURNING id
       `,
       [
         accountId,
@@ -805,9 +900,14 @@ export class MirrorRepository {
         countsTowardBackoff,
         this.config.FOLDER_COUNT_WARN_THRESHOLD,
         this.config.FOLDER_COUNT_ENFORCE_THRESHOLD,
-        this.config.RECENT_UIDVALIDITY_RESET_DEGRADED_MS
-      ]
+        this.config.RECENT_UIDVALIDITY_RESET_DEGRADED_MS,
+        options.expectedSyncOwner ?? null
+      ],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
   // Per spec §12.2: PARTIAL_SUCCESS means priority folders succeeded but some
@@ -817,10 +917,11 @@ export class MirrorRepository {
   async markAccountSyncPartial(
     accountId: string,
     error: string,
-    options: { countsTowardBackoff?: boolean } = {}
+    options: SyncStateWriteOptions & { countsTowardBackoff?: boolean } = {}
   ): Promise<void> {
     const countsTowardBackoff = options.countsTowardBackoff ?? true;
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_accounts
       SET
@@ -848,16 +949,27 @@ export class MirrorRepository {
           ELSE backoff_until
         END
       WHERE id = $1
+        AND ($4::text IS NULL OR sync_started_by = $4)
+      RETURNING id
       `,
-      [accountId, sanitizeErrorReason(error), countsTowardBackoff]
+      [accountId, sanitizeErrorReason(error), countsTowardBackoff, options.expectedSyncOwner ?? null],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
   // Per spec §12.4 / §13.1: AUTH_ERROR is non-retryable. Skip backoff math and
   // pin the account at BROKEN with a clear reason. Operator intervention is
   // required (rotate creds, re-add account).
-  async markAccountSyncAuthFailed(accountId: string, error: string): Promise<void> {
-    await this.pool.query(
+  async markAccountSyncAuthFailed(
+    accountId: string,
+    error: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_accounts
       SET
@@ -871,16 +983,27 @@ export class MirrorRepository {
         current_backoff_ms = 0,
         backoff_until = NULL
       WHERE id = $1
+        AND ($3::text IS NULL OR sync_started_by = $3)
+      RETURNING id
       `,
-      [accountId, sanitizeErrorReason(`AUTH_ERROR: ${error}`)]
+      [accountId, sanitizeErrorReason(`AUTH_ERROR: ${error}`), options.expectedSyncOwner ?? null],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
-  async markAccountSyncFailed(accountId: string, error: string): Promise<void> {
+  async markAccountSyncFailed(
+    accountId: string,
+    error: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
     // CTE computes the doubled-and-clamped backoff once so the same value
     // feeds both `current_backoff_ms` and `backoff_until` — without it the
     // expression has to be duplicated and would drift on tuning changes.
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       WITH account_state AS (
         SELECT
@@ -955,6 +1078,8 @@ export class MirrorRepository {
         END
       FROM stuck_state, next_backoff
       WHERE a.id = $1
+        AND ($9::text IS NULL OR a.sync_started_by = $9)
+      RETURNING a.id
       `,
       [
         accountId,
@@ -964,9 +1089,14 @@ export class MirrorRepository {
         BACKOFF_CEILING_MS,
         this.config.STUCK_DEGRADED_BROKEN_THRESHOLD_MS,
         this.config.STUCK_DEGRADED_TERMINAL_THRESHOLD_MS,
-        this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS
-      ]
+        this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS,
+        options.expectedSyncOwner ?? null
+      ],
+      options
     );
+    if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
+      throw new Error(`Sync finalization lost account ${accountId}`);
+    }
   }
 
   async heartbeat(accountId: string): Promise<void> {
@@ -1360,10 +1490,15 @@ export class MirrorRepository {
     return result.rows;
   }
 
-  async markFolderSyncStarted(folderId: string): Promise<void> {
-    await this.pool.query(
+  async markFolderSyncStarted(
+    folderId: string,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    await runOptionalDeadlineWrite(
+      this.pool,
       "UPDATE public.imap_folders SET status = 'SYNCING', last_progress_at = now() WHERE id = $1",
-      [folderId]
+      [folderId],
+      options
     );
   }
 
@@ -1374,36 +1509,56 @@ export class MirrorRepository {
     folderId: string,
     targetMaxUid: number,
     oldestUidSynced: number,
-    targetCount: number
+    targetCount: number,
+    expectedUidValidity: number,
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       UPDATE public.imap_folders
       SET initial_sync_target_max_uid = $2,
           initial_sync_oldest_uid_synced = $3,
           live_window_target_count = $4,
           last_progress_at = now()
       WHERE id = $1
-      `,
-      [folderId, targetMaxUid, oldestUidSynced, targetCount]
-    );
+        AND (uidvalidity IS NULL OR uidvalidity = $5)
+      RETURNING id
+    `;
+    const values = [folderId, targetMaxUid, oldestUidSynced, targetCount, expectedUidValidity];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Initial sync snapshot lost folder generation ${folderId}`);
+    }
   }
 
   async advanceInitialSyncWatermark(
     folderId: string,
     newOldestUidSynced: number,
-    lastProgressUid: number
+    lastProgressUid: number,
+    expectedUidValidity: number,
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       UPDATE public.imap_folders
       SET initial_sync_oldest_uid_synced = $2,
           last_progress_at = now(),
           last_progress_uid = $3
       WHERE id = $1
-      `,
-      [folderId, newOldestUidSynced, lastProgressUid]
-    );
+        AND uidvalidity = $4
+      RETURNING id
+    `;
+    const values = [folderId, newOldestUidSynced, lastProgressUid, expectedUidValidity];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Initial sync watermark lost folder generation ${folderId}`);
+    }
   }
 
   async markFolderSynced(folderId: string, patch: {
@@ -1413,9 +1568,8 @@ export class MirrorRepository {
     initialComplete?: boolean;
     reconcileClean?: boolean;
     flagScanCompleted?: boolean;
-  }): Promise<void> {
-    await this.pool.query(
-      `
+  }, options: { deadlineAt?: number; signal?: AbortSignal } = {}): Promise<void> {
+    const query = `
       UPDATE public.imap_folders
       SET
         status = 'ACTIVE',
@@ -1446,23 +1600,32 @@ export class MirrorRepository {
           ELSE COALESCE(next_reconcile_at, now() + ((random() * $10::double precision)::int * interval '1 millisecond'))
         END
       WHERE id = $1
-      `,
-      [
-        folderId,
-        patch.uidValidity,
-        patch.uidNext ?? null,
-        patch.lastUid ?? null,
-        patch.initialComplete ?? null,
-        patch.reconcileClean ?? null,
-        patch.flagScanCompleted ?? null,
-        this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS,
-        this.config.RR_FLAG_SCAN_INTERVAL_MS,
-        this.config.RECONCILE_INTERVAL_MS,
-        this.config.PRIORITY_CUTOFF,
-        this.config.SENT_SYNC_INTERVAL_MS,
-        this.config.SYNC_INTERVAL_MS
-      ]
-    );
+        AND (uidvalidity IS NULL OR uidvalidity = $2)
+      RETURNING id
+    `;
+    const values = [
+      folderId,
+      patch.uidValidity,
+      patch.uidNext ?? null,
+      patch.lastUid ?? null,
+      patch.initialComplete ?? null,
+      patch.reconcileClean ?? null,
+      patch.flagScanCompleted ?? null,
+      this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS,
+      this.config.RR_FLAG_SCAN_INTERVAL_MS,
+      this.config.RECONCILE_INTERVAL_MS,
+      this.config.PRIORITY_CUTOFF,
+      this.config.SENT_SYNC_INTERVAL_MS,
+      this.config.SYNC_INTERVAL_MS
+    ];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Folder sync state lost generation ${folderId}`);
+    }
   }
 
   // Returns the post-reset `uidvalidity_reset_count`, scoped to a rolling
@@ -1476,6 +1639,27 @@ export class MirrorRepository {
     const client = await this.pool.connect();
     await client.query("BEGIN");
     try {
+      const lockedFolder = await client.query<{
+        uidvalidity: string | null;
+        uidvalidity_reset_count: number;
+      }>(
+        `
+        SELECT uidvalidity::text, uidvalidity_reset_count
+        FROM public.imap_folders
+        WHERE id = $1
+          AND account_id = $2
+        FOR UPDATE
+        `,
+        [folder.id, account.id]
+      );
+      const currentFolder = lockedFolder.rows[0];
+      if (!currentFolder) throw new Error(`UIDVALIDITY reset lost folder ${folder.id}`);
+      if (currentFolder.uidvalidity !== null
+        && Number(currentFolder.uidvalidity) === newUidValidity) {
+        await client.query("COMMIT");
+        return { resetCountIn24h: currentFolder.uidvalidity_reset_count };
+      }
+
       await client.query(
         `
         UPDATE public.imap_messages
@@ -1567,9 +1751,15 @@ export class MirrorRepository {
     uidValidity: number,
     messages: MessageMetadata[],
     windowCutoff: Date,
-    options: { preserveExistingFlags?: boolean; deadlineAt?: number } = {}
+    options: MetadataWriteOptions = {}
   ): Promise<ImapMessage[]> {
     if (messages.length === 0) return [];
+    if (messages.length > MAX_SYNC_BATCH_SIZE) {
+      throw new Error(
+        `Metadata batch size ${messages.length} exceeds maximum ${MAX_SYNC_BATCH_SIZE}`
+      );
+    }
+    const writeBatches = splitMetadataWriteBatches(messages);
 
     const uniqueUids = new Set(messages.map((message) => message.uid));
     if (uniqueUids.size !== messages.length) {
@@ -1586,67 +1776,108 @@ export class MirrorRepository {
         }
       }
     }
-    const input = messages.map((message, ordinal) => ({
-      ordinal,
-      uid: message.uid,
-      rfc_message_id: message.rfcMessageId,
-      message_id_normalized: message.messageIdNormalized,
-      provider_thread_id: message.providerThreadId,
-      in_reply_to: message.inReplyTo,
-      references_header: message.referencesHeader,
-      internal_date: message.internalDate.toISOString(),
-      size_bytes: message.sizeBytes,
-      subject: message.subject,
-      from_email: message.fromEmail,
-      from_name: message.fromName,
-      to_emails: message.toEmails,
-      to_names: message.toNames,
-      cc_emails: message.ccEmails,
-      cc_names: message.ccNames,
-      bcc_emails: message.bccEmails,
-      flags: message.flags,
-      headers_json: message.headersJson,
-      mime_structure: message.mimeStructure ?? null,
-      window_status: message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW"
-    }));
-    const serializedInput = JSON.stringify(input);
-
     const deadlineAt = options.deadlineAt
       ?? Date.now() + (this.config.INCREMENTAL_TOTAL_TIMEOUT_MS ?? DEFAULT_METADATA_WRITE_TIMEOUT_MS);
-    const client = await connectForMetadataWrite(this.pool, deadlineAt);
+    const client = await metadataWriteDeadline.connect(this.pool, deadlineAt, options.signal);
+    const lease = bindClientAbort(client, options.signal);
     let discardClient = false;
 
     try {
-      await queryMetadataControl(client, "BEGIN", deadlineAt);
-      await refreshMetadataWriteTimeout(client, deadlineAt);
+      await metadataWriteDeadline.queryControl(client, "BEGIN", deadlineAt);
+      await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+      const lockedFolder = await queryWithDeadline<{ id: string; uidvalidity: string | null }>(
+        client,
+        `
+        SELECT id, uidvalidity::text
+        FROM public.imap_folders
+        WHERE id = $1
+          AND account_id = $2
+          AND path = $3
+        FOR UPDATE
+        `,
+        [folder.id, accountId, folder.path],
+        deadlineAt,
+        metadataWriteDeadline.remainingMs
+      );
+      if (lockedFolder.rows.length !== 1) {
+        throw new Error(`Metadata batch lost folder ${folder.id}`);
+      }
+      const lockedUidValidity = lockedFolder.rows[0].uidvalidity;
+      if (lockedUidValidity !== null && Number(lockedUidValidity) !== uidValidity) {
+        throw new Error(
+          `Metadata batch UIDVALIDITY ${uidValidity} no longer matches folder ${lockedUidValidity}`
+        );
+      }
+      if (lockedUidValidity === null) {
+        await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+        const initialized = await queryWithDeadline<{ id: string }>(
+          client,
+          `
+          UPDATE public.imap_folders
+          SET uidvalidity = $2
+          WHERE id = $1
+            AND uidvalidity IS NULL
+          RETURNING id
+          `,
+          [folder.id, uidValidity],
+          deadlineAt,
+          metadataWriteDeadline.remainingMs
+        );
+        if (initialized.rows.length !== 1) {
+          throw new Error(`Metadata batch could not initialize UIDVALIDITY for folder ${folder.id}`);
+        }
+      }
+
+      // Use a fresh READ COMMITTED statement after the folder lock is acquired.
+      // Combining both reads into one SELECT can retain a pre-wait snapshot and
+      // double-count an overlapping UID inserted by the transaction ahead of us.
+      await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
       const existing = await queryWithDeadline<{ uid: string }>(
         client,
         `
-        WITH locked_folder AS MATERIALIZED (
-          SELECT id
-          FROM public.imap_folders
-          WHERE id = $5
-          FOR UPDATE
-        )
-        SELECT message.uid::text AS uid
-        FROM locked_folder
-        JOIN public.imap_messages AS message
-          ON message.account_id = $1
-         AND message.folder_path = $2
-         AND message.uidvalidity = $3
-         AND message.uid = ANY($4::bigint[])
-        FOR UPDATE OF message
+        SELECT uid::text AS uid
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND uidvalidity = $3
+          AND uid = ANY($4::bigint[])
+        FOR UPDATE
         `,
-        [accountId, folder.path, uidValidity, [...uniqueUids], folder.id],
+        [accountId, folder.path, uidValidity, [...uniqueUids]],
         deadlineAt,
-        remainingMetadataWriteMs
+        metadataWriteDeadline.remainingMs
       );
       const existingUids = new Set(existing.rows.map((row) => Number(row.uid)));
 
-      await refreshMetadataWriteTimeout(client, deadlineAt);
-      const result = await queryWithDeadline<ImapMessage>(
-        client,
-        `
+      const rowsByUid = new Map<number, ImapMessage>();
+      for (const writeBatch of writeBatches) {
+        const input = writeBatch.map((message, ordinal) => ({
+          ordinal,
+          uid: message.uid,
+          rfc_message_id: message.rfcMessageId,
+          message_id_normalized: message.messageIdNormalized,
+          provider_thread_id: message.providerThreadId,
+          in_reply_to: message.inReplyTo,
+          references_header: message.referencesHeader,
+          internal_date: message.internalDate.toISOString(),
+          size_bytes: message.sizeBytes,
+          subject: message.subject,
+          from_email: message.fromEmail,
+          from_name: message.fromName,
+          to_emails: message.toEmails,
+          to_names: message.toNames,
+          cc_emails: message.ccEmails,
+          cc_names: message.ccNames,
+          bcc_emails: message.bccEmails,
+          flags: message.flags,
+          headers_json: message.headersJson,
+          mime_structure: message.mimeStructure ?? null,
+          window_status: message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW"
+        }));
+        await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+        const result = await queryWithDeadline<ImapMessage>(
+          client,
+          `
         WITH input AS (
           SELECT *
           FROM jsonb_to_recordset($1::jsonb) AS message (
@@ -1736,58 +1967,53 @@ export class MirrorRepository {
           deleted_reason = NULL
         RETURNING *
         `,
-        [
-          serializedInput,
-          accountId,
-          folder.id,
-          folder.path,
-          uidValidity,
-          options.preserveExistingFlags === true
-        ],
-        deadlineAt,
-        remainingMetadataWriteMs
-      );
-      if (result.rows.length !== messages.length) {
-        throw new Error(
-          `Metadata batch wrote ${result.rows.length}/${messages.length} requested messages`
+          [
+            JSON.stringify(input),
+            accountId,
+            folder.id,
+            folder.path,
+            uidValidity,
+            options.preserveExistingFlags === true
+          ],
+          deadlineAt,
+          metadataWriteDeadline.remainingMs
         );
-      }
-      const rowsByUid = new Map(result.rows.map((row) => [Number(row.uid), row]));
-      const rows = messages.map((message) => {
-        const row = rowsByUid.get(message.uid);
-        if (!row) throw new Error(`Metadata batch lost message UID ${message.uid}`);
-        return row;
-      });
-
-      const attachmentsByIdentity = new Map<string, {
-        message_id: string;
-        filename: string | null;
-        mime_type: string | null;
-        size_bytes: number | null;
-        part_number: string;
-        content_id: string | null;
-        disposition: "attachment" | "inline";
-      }>();
-      for (let index = 0; index < messages.length; index += 1) {
-        const message = messages[index];
-        const row = rows[index];
-        for (const attachment of message.attachments) {
-          attachmentsByIdentity.set(`${row.id}\u0000${attachment.partNumber}`, {
-            message_id: row.id,
-            filename: attachment.filename,
-            mime_type: attachment.mimeType,
-            size_bytes: attachment.sizeBytes,
-            part_number: attachment.partNumber,
-            content_id: attachment.contentId,
-            disposition: attachment.disposition
-          });
+        if (result.rows.length !== writeBatch.length) {
+          throw new Error(
+            `Metadata batch wrote ${result.rows.length}/${writeBatch.length} requested messages`
+          );
         }
-      }
-      if (attachmentsByIdentity.size > 0) {
-        await refreshMetadataWriteTimeout(client, deadlineAt);
-        const attachmentResult = await queryWithDeadline<{ id: string }>(
-          client,
-          `
+        for (const row of result.rows) rowsByUid.set(Number(row.uid), row);
+
+        const attachmentsByIdentity = new Map<string, {
+          message_id: string;
+          filename: string | null;
+          mime_type: string | null;
+          size_bytes: number | null;
+          part_number: string;
+          content_id: string | null;
+          disposition: "attachment" | "inline";
+        }>();
+        for (const message of writeBatch) {
+          const row = rowsByUid.get(message.uid);
+          if (!row) throw new Error(`Metadata batch lost message UID ${message.uid}`);
+          for (const attachment of message.attachments) {
+            attachmentsByIdentity.set(`${row.id}\u0000${attachment.partNumber}`, {
+              message_id: row.id,
+              filename: attachment.filename,
+              mime_type: attachment.mimeType,
+              size_bytes: attachment.sizeBytes,
+              part_number: attachment.partNumber,
+              content_id: attachment.contentId,
+              disposition: attachment.disposition
+            });
+          }
+        }
+        if (attachmentsByIdentity.size > 0) {
+          await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
+          const attachmentResult = await queryWithDeadline<{ id: string }>(
+            client,
+            `
           WITH input AS (
             SELECT *
             FROM jsonb_to_recordset($1::jsonb) AS attachment (
@@ -1827,19 +2053,25 @@ export class MirrorRepository {
             disposition = EXCLUDED.disposition
           RETURNING id
           `,
-          [JSON.stringify([...attachmentsByIdentity.values()])],
-          deadlineAt,
-          remainingMetadataWriteMs
-        );
-        if (attachmentResult.rows.length !== attachmentsByIdentity.size) {
-          throw new Error(
-            `Metadata batch wrote ${attachmentResult.rows.length}/${attachmentsByIdentity.size} attachments`
+            [JSON.stringify([...attachmentsByIdentity.values()])],
+            deadlineAt,
+            metadataWriteDeadline.remainingMs
           );
+          if (attachmentResult.rows.length !== attachmentsByIdentity.size) {
+            throw new Error(
+              `Metadata batch wrote ${attachmentResult.rows.length}/${attachmentsByIdentity.size} attachments`
+            );
+          }
         }
       }
+      const rows = messages.map((message) => {
+        const row = rowsByUid.get(message.uid);
+        if (!row) throw new Error(`Metadata batch lost message UID ${message.uid}`);
+        return row;
+      });
       const newMessageCount = messages.length - existingUids.size;
       if (newMessageCount > 0) {
-        await refreshMetadataWriteTimeout(client, deadlineAt);
+        await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
         const folderUpdate = await queryWithDeadline<{ id: string }>(
           client,
           `
@@ -1850,25 +2082,27 @@ export class MirrorRepository {
           `,
           [folder.id, newMessageCount],
           deadlineAt,
-          remainingMetadataWriteMs
+          metadataWriteDeadline.remainingMs
         );
         if (folderUpdate.rows.length !== 1) {
           throw new Error(`Metadata batch lost folder ${folder.id}`);
         }
       }
-      await refreshMetadataWriteTimeout(client, deadlineAt);
+      await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
       // Once Postgres acknowledges COMMIT, the durable rows are authoritative even
       // if the JS event loop observes the wall clock just beyond the deadline.
-      await queryMetadataControl(client, "COMMIT", deadlineAt, false);
+      await metadataWriteDeadline.queryControl(client, "COMMIT", deadlineAt, false);
       return rows;
     } catch (error) {
-      const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
-      await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
-        discardClient = true;
-      });
+      if (!lease.isReleased()) {
+        const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
+        await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
+          discardClient = true;
+        });
+      }
       throw error;
     } finally {
-      client.release(discardClient);
+      lease.release(discardClient);
     }
   }
 
@@ -1884,40 +2118,90 @@ export class MirrorRepository {
     folder: ImapFolder,
     uidValidity: number,
     messages: MessageFlagSnapshot[],
-    options?: { deadlineAt?: number }
+    options?: { deadlineAt?: number; signal?: AbortSignal }
   ): Promise<{ messages: ImapMessage[]; flagsChanged: number }>;
   async applyFlagScan(
     accountId: string,
     folder: ImapFolder,
     uidValidity: number,
     messages: MessageFlagSnapshot[] | MessageMetadata[],
-    options: Date | { deadlineAt?: number } = {}
+    options: Date | { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<{ messages: ImapMessage[]; flagsChanged: number }> {
     if (messages.length === 0) return { messages: [], flagsChanged: 0 };
+    if (messages.length > MAX_SYNC_BATCH_SIZE) {
+      throw new Error(
+        `Flag scan batch size ${messages.length} exceeds maximum ${MAX_SYNC_BATCH_SIZE}`
+      );
+    }
+    const writeBatches = splitFlagWriteBatches(messages);
+    const uniqueUids = new Set(messages.map((message) => message.uid));
+    if (uniqueUids.size !== messages.length) {
+      throw new Error("Flag scan batch contains duplicate UIDs");
+    }
 
     if (options instanceof Date) {
       // Preserve the exported pre-projection API: Date callers supplied complete
       // metadata and expected headers, MIME, and attachments to refresh too.
       const metadata = messages as MessageMetadata[];
       const uids = metadata.map((message) => message.uid);
-      const existing = await this.pool.query<Pick<ImapMessage, "id" | "uid" | "flags">>(
+      const boundedExisting = await this.pool.query<Pick<ImapMessage, "id" | "uid" | "flags"> & {
+        stored_bytes: string;
+        stored_flags: string;
+      }>(
         `
-        SELECT id, uid, flags
-        FROM public.imap_messages
-        WHERE account_id = $1
-          AND folder_path = $2
-          AND uidvalidity = $3
-          AND uid = ANY($4::bigint[])
-          AND deleted_in_provider = false
+        WITH candidates AS MATERIALIZED (
+          SELECT id,
+                 uid,
+                 flags,
+                 octet_length(to_json(flags)::text)::bigint AS flag_bytes,
+                 cardinality(flags)::bigint AS flag_count
+          FROM public.imap_messages
+          WHERE account_id = $1
+            AND folder_path = $2
+            AND uidvalidity = $3
+            AND uid = ANY($4::bigint[])
+            AND deleted_in_provider = false
+        ), totals AS (
+          SELECT COALESCE(sum(flag_bytes), 0)::bigint AS stored_bytes,
+                 COALESCE(sum(flag_count), 0)::bigint AS stored_flags
+          FROM candidates
+        )
+        SELECT candidate.id,
+               candidate.uid,
+               candidate.flags,
+               totals.stored_bytes::text,
+               totals.stored_flags::text
+        FROM totals
+        LEFT JOIN candidates AS candidate
+          ON totals.stored_bytes <= $5::bigint
+         AND totals.stored_flags <= $6::bigint
         `,
-        [accountId, folder.path, uidValidity, uids]
+        [
+          accountId,
+          folder.path,
+          uidValidity,
+          uids,
+          MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
+          MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH
+        ]
       );
-      const existingByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
+      const storedBytes = Number(boundedExisting.rows[0]?.stored_bytes ?? 0);
+      const storedFlags = Number(boundedExisting.rows[0]?.stored_flags ?? 0);
+      if (storedBytes > MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES
+        || storedFlags > MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH) {
+        throw new Error("Stored flags exceed the aggregate logical event limit");
+      }
+      const existing = boundedExisting.rows.filter(
+        (row): row is typeof row & { id: string } => typeof row.id === "string"
+      );
+      const existingByUid = new Map(existing.map((row) => [Number(row.uid), row]));
       const knownMessages = metadata.filter((message) => existingByUid.has(message.uid));
       const changed = metadata
         .map((message) => {
           const row = existingByUid.get(message.uid);
-          if (!row || flagsEqual(row.flags, message.flags)) return null;
+          if (!row) return null;
+          assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
+          if (flagsEqual(row.flags, message.flags)) return null;
           return {
             row,
             message,
@@ -1954,12 +2238,51 @@ export class MirrorRepository {
     const uids = messages.map((message) => message.uid);
     const deadlineAt = options.deadlineAt
       ?? Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
-    const client = await connectForFlagScan(this.pool, deadlineAt);
+    const client = await flagScanDeadline.connect(this.pool, deadlineAt, options.signal);
+    const lease = bindClientAbort(client, options.signal);
     let discardClient = false;
 
     try {
-      await queryFlagScanControl(client, "BEGIN", deadlineAt);
-      await refreshFlagScanTimeout(client, deadlineAt);
+      await flagScanDeadline.queryControl(client, "BEGIN", deadlineAt);
+      await flagScanDeadline.refreshTimeout(client, deadlineAt);
+
+      // Lock and size the stored side before selecting any flag arrays into the
+      // worker. Legacy rows may individually satisfy the per-message limit but
+      // collectively exceed the transaction budget; materializing them first
+      // defeats the memory bound this guard is meant to provide.
+      const storedFootprint = await queryWithDeadline<{
+        stored_bytes: string;
+        stored_flags: string;
+      }>(
+        client,
+        `
+        WITH locked AS MATERIALIZED (
+          SELECT octet_length(to_json(flags)::text)::bigint AS flag_bytes,
+                 cardinality(flags)::bigint AS flag_count
+          FROM public.imap_messages
+          WHERE account_id = $1
+            AND folder_path = $2
+            AND uidvalidity = $3
+            AND uid = ANY($4::bigint[])
+            AND deleted_in_provider = false
+          FOR UPDATE
+        )
+        SELECT COALESCE(sum(flag_bytes), 0)::text AS stored_bytes,
+               COALESCE(sum(flag_count), 0)::text AS stored_flags
+        FROM locked
+        `,
+        [accountId, folder.path, uidValidity, uids],
+        deadlineAt,
+        flagScanDeadline.remainingMs
+      );
+      const storedBytes = Number(storedFootprint.rows[0]?.stored_bytes ?? 0);
+      const storedFlags = Number(storedFootprint.rows[0]?.stored_flags ?? 0);
+      if (storedBytes > MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES
+        || storedFlags > MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH) {
+        throw new Error("Stored flags exceed the aggregate logical event limit");
+      }
+
+      await flagScanDeadline.refreshTimeout(client, deadlineAt);
       const existing = await queryWithDeadline<ImapMessage>(
         client,
         `
@@ -1974,41 +2297,86 @@ export class MirrorRepository {
         `,
         [accountId, folder.path, uidValidity, uids],
         deadlineAt,
-        remainingFlagScanMs
+        flagScanDeadline.remainingMs
       );
       const existingByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
       const updatedByUid = new Map<number, ImapMessage>();
-      let flagsChanged = 0;
+      const changed = messages
+        .map((message) => {
+          const row = existingByUid.get(message.uid);
+          if (!row) return null;
+          assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
+          if (flagRepresentationsEqual(row.flags, message.flags)) return null;
+          const semanticallyChanged = !flagsEqual(row.flags, message.flags);
+          return {
+            row,
+            message,
+            semanticallyChanged,
+            previousFlags: semanticallyChanged ? normalizeFlags(row.flags) : [],
+            nextFlags: semanticallyChanged ? normalizeFlags(message.flags) : []
+          };
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      const changedByUid = new Map(changed.map((entry) => [entry.message.uid, entry]));
 
-      for (const message of messages) {
-        remainingFlagScanMs(deadlineAt);
-        const row = existingByUid.get(message.uid);
-        if (!row || flagRepresentationsEqual(row.flags, message.flags)) continue;
-        const semanticallyChanged = !flagsEqual(row.flags, message.flags);
-        await refreshFlagScanTimeout(client, deadlineAt);
-        const updated = await queryWithDeadline<ImapMessage>(
-          client,
-          `
-          UPDATE public.imap_messages
-          SET flags = $2
-          WHERE id = $1
-          RETURNING *
-          `,
-          [row.id, message.flags],
-          deadlineAt,
-          remainingFlagScanMs
-        );
-        if (updated.rows.length !== 1) {
-          throw new Error(`Flag scan update lost message UID ${message.uid}`);
-        }
-        updatedByUid.set(message.uid, updated.rows[0]);
-        if (semanticallyChanged) {
-          const previousFlags = normalizeFlags(row.flags);
-          const nextFlags = normalizeFlags(message.flags);
-          await refreshFlagScanTimeout(client, deadlineAt);
-          await queryWithDeadline(
+      if (changed.length > 0) {
+        for (const writeBatch of writeBatches) {
+          const changedBatch = writeBatch
+            .map((message) => changedByUid.get(message.uid))
+            .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+          if (changedBatch.length === 0) continue;
+
+          await flagScanDeadline.refreshTimeout(client, deadlineAt);
+          const updated = await queryWithDeadline<ImapMessage>(
             client,
             `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS changed_flag (
+              id uuid,
+              flags text[]
+            )
+          )
+          UPDATE public.imap_messages AS message
+          SET flags = input.flags
+          FROM input
+          WHERE message.id = input.id
+          RETURNING message.*
+          `,
+            [JSON.stringify(changedBatch.map(({ row, message }) => ({
+              id: row.id,
+              flags: message.flags
+            })))],
+            deadlineAt,
+            flagScanDeadline.remainingMs
+          );
+          if (updated.rows.length !== changedBatch.length) {
+            throw new Error(
+              `Flag scan updated ${updated.rows.length}/${changedBatch.length} changed messages`
+            );
+          }
+          for (const row of updated.rows) {
+            updatedByUid.set(Number(row.uid), row);
+          }
+        }
+
+        const semanticChanges = changed.filter((entry) => entry.semanticallyChanged);
+        if (semanticChanges.length > 0) {
+          let eventsWritten = 0;
+          for (const eventBatch of splitFlagEventBatches(semanticChanges)) {
+            await flagScanDeadline.refreshTimeout(client, deadlineAt);
+            const events = await queryWithDeadline<{ id: string }>(
+              client,
+              `
+            WITH input AS (
+              SELECT *
+              FROM jsonb_to_recordset($1::jsonb) AS changed_flag (
+                message_id uuid,
+                uid bigint,
+                previous_flags text[],
+                next_flags text[]
+              )
+            )
             INSERT INTO public.imap_sync_events (
               account_id,
               sync_run_id,
@@ -2018,38 +2386,66 @@ export class MirrorRepository {
               event_type,
               payload
             )
-            VALUES ($1, NULL, $2, $3, $4, 'FLAGS_CHANGED', $5)
+            SELECT
+              $2,
+              NULL,
+              input.message_id,
+              $3,
+              input.uid,
+              'FLAGS_CHANGED',
+              jsonb_build_object(
+                'previousFlags', input.previous_flags,
+                'nextFlags', input.next_flags
+              )
+            FROM input
+            RETURNING id
             `,
-            [
-              accountId,
-              row.id,
-              folder.path,
-              message.uid,
-              JSON.stringify({ previousFlags, nextFlags })
-            ],
-            deadlineAt,
-            remainingFlagScanMs
-          );
-          flagsChanged += 1;
+              [
+                JSON.stringify(eventBatch.map(({ row, message, previousFlags, nextFlags }) => ({
+                  message_id: row.id,
+                  uid: message.uid,
+                  previous_flags: previousFlags,
+                  next_flags: nextFlags
+                }))),
+                accountId,
+                folder.path,
+              ],
+              deadlineAt,
+              flagScanDeadline.remainingMs
+            );
+            if (events.rows.length !== eventBatch.length) {
+              throw new Error(
+                `Flag scan logged ${events.rows.length}/${eventBatch.length} semantic changes`
+              );
+            }
+            eventsWritten += events.rows.length;
+          }
+          if (eventsWritten !== semanticChanges.length) {
+            throw new Error(
+              `Flag scan logged ${eventsWritten}/${semanticChanges.length} semantic changes`
+            );
+          }
         }
       }
 
-      await refreshFlagScanTimeout(client, deadlineAt);
-      await queryFlagScanControl(client, "COMMIT", deadlineAt, false);
+      await flagScanDeadline.refreshTimeout(client, deadlineAt);
+      await flagScanDeadline.queryControl(client, "COMMIT", deadlineAt, false);
       return {
         messages: messages
           .map((message) => updatedByUid.get(message.uid) ?? existingByUid.get(message.uid))
           .filter((message): message is ImapMessage => message !== undefined),
-        flagsChanged
+        flagsChanged: changed.filter((entry) => entry.semanticallyChanged).length
       };
     } catch (error) {
-      const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
-      await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
-        discardClient = true;
-      });
+      if (!lease.isReleased()) {
+        const rollbackTimeout = Math.max(1, Math.min(1_000, deadlineAt - Date.now()));
+        await client.query(deadlineQuery("ROLLBACK", rollbackTimeout)).catch(() => {
+          discardClient = true;
+        });
+      }
       throw error;
     } finally {
-      client.release(discardClient);
+      lease.release(discardClient);
     }
   }
 
@@ -2505,9 +2901,12 @@ export class MirrorRepository {
     targetMaxUid: number,
     oldestUidSynced: number,
     targetCount: number,
-    cutoff: Date
+    cutoff: Date,
+    expectedUidValidity: number,
+    options: SyncStateWriteOptions = {}
   ): Promise<void> {
-    await this.pool.query(
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_folders
       SET backfill_in_progress = ($4::int > 0),
@@ -2519,31 +2918,67 @@ export class MirrorRepository {
           last_progress_at = now(),
           last_progress_note = 'history_backfill_snapshot'
       WHERE id = $1
+        AND uidvalidity = $6
+      RETURNING id
       `,
-      [folderId, targetMaxUid, oldestUidSynced, targetCount, cutoff]
+      [folderId, targetMaxUid, oldestUidSynced, targetCount, cutoff, expectedUidValidity],
+      options
     );
+    if (result.rows.length !== 1) {
+      throw new Error(`History snapshot lost folder generation ${folderId}`);
+    }
   }
 
   async advanceHistoryBackfillWatermark(
     folderId: string,
     newOldestUidSynced: number,
-    lastProgressUid: number
+    lastProgressUid: number,
+    expectedUidValidity: number,
+    options: { complete?: boolean; deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       UPDATE public.imap_folders
       SET backfill_oldest_uid_synced = $2,
+          backfill_in_progress = CASE WHEN $4::boolean THEN false ELSE backfill_in_progress END,
+          last_archive_refresh_at = CASE WHEN $4::boolean THEN now() ELSE last_archive_refresh_at END,
           last_progress_at = now(),
           last_progress_uid = $3,
-          last_progress_note = 'history_backfill_metadata'
+          last_progress_note = CASE
+            WHEN $4::boolean THEN 'history_backfill_complete'
+            ELSE 'history_backfill_metadata'
+          END
       WHERE id = $1
-      `,
-      [folderId, newOldestUidSynced, lastProgressUid]
-    );
+        AND uidvalidity = $5
+      RETURNING id
+    `;
+    const values = [
+      folderId,
+      newOldestUidSynced,
+      lastProgressUid,
+      options.complete === true,
+      expectedUidValidity
+    ];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool,
+          query,
+          values,
+          options.deadlineAt,
+          options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`History watermark lost folder generation ${folderId}`);
+    }
   }
 
-  async markHistoryBackfillComplete(folderId: string): Promise<void> {
-    await this.pool.query(
+  async markHistoryBackfillComplete(
+    folderId: string,
+    expectedUidValidity: number,
+    options: SyncStateWriteOptions = {}
+  ): Promise<void> {
+    const result = await runOptionalDeadlineWrite<{ id: string }>(
+      this.pool,
       `
       UPDATE public.imap_folders
       SET backfill_in_progress = false,
@@ -2551,9 +2986,15 @@ export class MirrorRepository {
           last_progress_at = now(),
           last_progress_note = 'history_backfill_complete'
       WHERE id = $1
+        AND uidvalidity = $2
+      RETURNING id
       `,
-      [folderId]
+      [folderId, expectedUidValidity],
+      options
     );
+    if (result.rows.length !== 1) {
+      throw new Error(`History completion lost folder generation ${folderId}`);
+    }
   }
 
   async getBodyBacklog(account: ImapAccount, limit: number): Promise<ImapMessage[]> {
