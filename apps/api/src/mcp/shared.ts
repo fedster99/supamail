@@ -227,15 +227,17 @@ function stripSignature(text: string): string {
 
 /**
  * Run `fn` inside a read-only transaction — the exact wrapper copied from
- * `searchMessages` (search.ts): BEGIN; SET LOCAL transaction_read_only = on;
- * SET LOCAL statement_timeout = '15s'; run fn; COMMIT; ROLLBACK on error; release
- * in finally. The connection is injected (no global pool reach-in) and only
- * SELECTs run inside, so a tool can never send, mutate, or schedule.
+ * `searchMessages` (search.ts), with REPEATABLE READ added so multi-statement
+ * tools resolve an active projection from one snapshot: BEGIN REPEATABLE READ
+ * READ ONLY; SET LOCAL transaction_read_only = on; SET LOCAL statement_timeout
+ * = '15s'; run fn; COMMIT; ROLLBACK on error; release in finally. The connection
+ * is injected (no global pool reach-in) and only SELECTs run inside, so a tool
+ * can never send, mutate, or schedule.
  */
 export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await client.query("SET LOCAL transaction_read_only = on");
     await client.query("SET LOCAL statement_timeout = '15s'");
     const result = await fn(client);

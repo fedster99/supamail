@@ -148,6 +148,8 @@ async function main(): Promise<void> {
     };
 
     console.log(`[test:db:live] DATABASE_URL=${databaseUrl.replace(/:[^@:]*@/, ":***@")}`);
+    console.log("[test:db:live] testing populated pre-0014 threading upgrade");
+    await run(pnpm, ["test:migration:threading-upgrade"], env);
     console.log("[test:db:live] applying migration twice");
     await run(pnpm, ["migrate"], env);
     await run(pnpm, ["migrate"], env);
@@ -164,8 +166,11 @@ async function main(): Promise<void> {
       "src/__tests__/provider-compatibility.integration.test.ts",
       "src/__tests__/sync-engine.integration.test.ts",
       "src/__tests__/sync-engine.live-db.test.ts",
+      "src/__tests__/threading-repository.live-db.test.ts",
+      "src/__tests__/repository-threading-headers.live-db.test.ts",
       "src/__tests__/search.live-db.test.ts",
       "src/__tests__/search-quality.live-db.test.ts",
+      "src/__tests__/search-eval-threading.live-db.test.ts",
       "src/__tests__/content.live-db.test.ts",
       "src/__tests__/mailbox-mutations.live-db.test.ts",
       "src/__tests__/drafts.live-db.test.ts",

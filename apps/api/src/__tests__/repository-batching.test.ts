@@ -23,7 +23,10 @@ function metadata(uid: number): MessageMetadata {
     flags: ["\\Seen"],
     rfcMessageId: `<batch-${uid}@example.test>`,
     messageIdNormalized: `batch-${uid}@example.test`,
+    providerMessageId: null,
+    providerMessageIdNamespace: null,
     providerThreadId: null,
+    providerThreadIdNamespace: null,
     inReplyTo: null,
     referencesHeader: null,
     subject: `batch-${uid}`,
@@ -60,6 +63,9 @@ function repositoryStub(
         queryTimeout: typeof query === "string" ? undefined : query.query_timeout
       });
       afterQuery?.(normalized);
+      if (normalized.includes("FROM public.imap_thread_state") && normalized.includes("FOR SHARE")) {
+        return { rows: [{ account_id: "00000000-0000-4000-8000-000000000001" }] };
+      }
       if (normalized.startsWith("SELECT id") && normalized.includes("FROM public.imap_folders")) {
         return { rows: [{ id: folder.id, uidvalidity: folderUidValidity }] };
       }
@@ -100,7 +106,7 @@ function repositoryStub(
 }
 
 describe("repository metadata batching", () => {
-  it("writes a 50-message batch with eleven bounded database round trips", async () => {
+  it("writes a 50-message batch with thirteen bounded database round trips", async () => {
     const stub = repositoryStub();
     const messages = Array.from({ length: 50 }, (_, index) => metadata(index + 1));
 
@@ -113,10 +119,10 @@ describe("repository metadata batching", () => {
     );
 
     expect(rows.map((row) => Number(row.uid))).toEqual(messages.map((message) => message.uid));
-    expect(stub.calls).toHaveLength(11);
+    expect(stub.calls).toHaveLength(13);
     expect(stub.calls.filter((call) => call.sql === "BEGIN")).toHaveLength(1);
     expect(stub.calls.filter((call) => call.sql.startsWith("SELECT set_config"))).toHaveLength(5);
-    expect(stub.calls.filter((call) => call.queryTimeout !== undefined)).toHaveLength(11);
+    expect(stub.calls.filter((call) => call.queryTimeout !== undefined)).toHaveLength(13);
     expect(stub.calls.filter((call) => call.sql.includes("INSERT INTO public.imap_messages"))).toHaveLength(1);
     expect(stub.calls.filter((call) => call.sql.includes("UPDATE public.imap_folders"))).toHaveLength(1);
     expect(stub.calls.filter((call) => call.sql === "COMMIT")).toHaveLength(1);
@@ -133,7 +139,7 @@ describe("repository metadata batching", () => {
     );
 
     expect(stub.calls.some((call) => call.sql.includes("UPDATE public.imap_folders"))).toBe(false);
-    expect(stub.calls).toHaveLength(9);
+    expect(stub.calls).toHaveLength(11);
   });
 
   it("rejects a stale UIDVALIDITY generation after taking the folder lock", async () => {

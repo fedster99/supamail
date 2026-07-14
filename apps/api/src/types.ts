@@ -179,7 +179,10 @@ export interface ImapMessage {
   uid: string;
   rfc_message_id: string | null;
   message_id_normalized: string | null;
+  provider_message_id: string | null;
+  provider_message_id_namespace: string | null;
   provider_thread_id: string | null;
+  provider_thread_id_namespace: string | null;
   in_reply_to: string | null;
   references_header: string | null;
   internal_date: Date;
@@ -235,7 +238,10 @@ export interface MessageMetadata {
   flags: string[];
   rfcMessageId: string | null;
   messageIdNormalized: string | null;
+  providerMessageId: string | null;
+  providerMessageIdNamespace: "objectid" | "gmail" | null;
   providerThreadId: string | null;
+  providerThreadIdNamespace: "objectid" | "gmail" | null;
   inReplyTo: string | null;
   referencesHeader: string | null;
   subject: string | null;

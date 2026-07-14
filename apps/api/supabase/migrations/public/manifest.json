@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0013_body_head_trigram_index",
+  "schemaVersion": "0014_conversation_threading",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -52,6 +52,10 @@
     {
       "id": "0013_body_head_trigram_index",
       "file": "0013_body_head_trigram_index.sql"
+    },
+    {
+      "id": "0014_conversation_threading",
+      "file": "0014_conversation_threading.sql"
     }
   ]
 }

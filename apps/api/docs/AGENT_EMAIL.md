@@ -26,7 +26,7 @@ object you hand back to the user.
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `search_email` | Canonical ranked search over the mirror. | `q` (free-text + operators), `filters`, `accounts`, `sort`, `limit` |
-| `read_thread` | The whole conversation, seeded from one message. | `message_id` (seed) \| `thread_id?`, `include_quoted=false`, `max_messages=20` |
+| `read_thread` | The whole durable conversation, seeded from one message or selected directly. | `message_id` (seed) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` |
 | `read_message` | One message with full body, cc, attachments. | `message_id`, `include_headers=false`, `include_quoted=false` |
 | `list_folders` | Folders + unread/flagged/total counts for an account. | `account?` |
 | `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `reply_all=false` |
@@ -38,14 +38,31 @@ The stable handle is **`identity.id`** — it equals `imap_messages.id`.
 
 - Pass `identity.id` as `read_message {message_id}` to read that single message.
 - Pass `identity.id` as `read_thread {message_id}` to read the conversation that
-  message belongs to — the thread is **seeded** from that message and walked via
-  `provider_thread_id` (with a references fallback).
-- `read_message` / `read_thread` return `thread_id` = the conversation handle
-  (`provider_thread_id`, or `null` when the provider gives no thread id).
+  message belongs to. A stored assignment resolves the complete, transitive
+  account-scoped conversation and returns one representative for each delivered
+  email, not one result for every mirrored folder copy.
+- `read_thread` returns `thread.conversation_id`, SupaMail's durable conversation
+  handle, plus `thread.provider_thread_id` as provider metadata when available.
+  A direct `conversation_id` lookup always requires `account` because conversation
+  identifiers are account-scoped. Direct legacy `thread_id` lookup also requires
+  `account` because provider IDs are not globally unique.
 - `draft_reply {source_message_id}` takes the same `identity.id`.
 
 You never construct ids yourself — always copy one back from a search hit (or
 from a `read_thread` message).
+
+Search groups by durable conversation by default and first deduplicates physical
+copies of one delivery. A hit's `thread.conversation_id` is therefore the right
+handle for expansion; `thread.message_count` counts distinct delivered emails,
+not folders containing the same email.
+
+Conversation membership is protocol-derived: valid RFC `References` /
+`In-Reply-To`, unresolved parent IDs, then account-scoped provider thread hints.
+The final subject/participant fallback is deliberately conservative and runs
+only over one complete, bounded exact-subject bucket; oversized common subjects
+are skipped. Body similarity and cross-conversation task/document clustering are
+not part of this layer. A message still awaiting its durable assignment
+temporarily uses the legacy one-hop read fallback.
 
 ## Recipes
 

@@ -4,7 +4,9 @@ import { getConfig } from "./config.js";
 import { closePool, getPool, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
-import { metadataRowsPerSecond, MirrorEngine } from "./sync-engine.js";
+import { MirrorEngine } from "./sync-engine.js";
+import { ThreadingRepository, type ThreadingRunResult } from "./threading-repository.js";
+import { metadataRowsPerSecond } from "./sync-engine.js";
 
 export interface WorkerSyncResult {
   runId: string;
@@ -23,6 +25,16 @@ export interface WorkerSyncResult {
 interface WorkerEngine {
   syncDueAccounts(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
   syncDueSentFolders(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
+}
+
+interface WorkerThreading {
+  assertRolloutCompatibility?(): Promise<void>;
+  listAccountsNeedingWork(limit?: number): Promise<string[]>;
+  drainAccount(accountId: string, options?: { requestedBy?: string }): Promise<ThreadingRunResult>;
+  pruneTerminalRuns?(options?: { olderThanDays?: number; batchSize?: number }): Promise<{
+    runsDeleted: number;
+    assignmentsDeleted: number;
+  }>;
 }
 
 type SyncCadence = Pick<AppConfig, "SYNC_INTERVAL_MS" | "SENT_SYNC_INTERVAL_MS">;
@@ -72,6 +84,8 @@ export interface WorkerRuntimeOptions {
   config?: AppConfig;
   pool?: PgPool;
   engine?: WorkerEngine;
+  /** `null` disables the derived-threading lane (primarily for isolated tests). */
+  threading?: WorkerThreading | null;
   repository?: MirrorRepository;
   installProcessHandlers?: boolean;
   closePoolOnStop?: boolean;
@@ -197,6 +211,9 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   const pool = options.pool ?? getPool();
   const repository = options.repository ?? new MirrorRepository(pool, config);
   const engine = options.engine ?? new MirrorEngine({ pool, config, repository });
+  const threading = options.threading === undefined
+    ? new ThreadingRepository(pool)
+    : options.threading;
   const abort = new AbortController();
   let stopping = false;
   let wakeSleep: (() => void) | null = null;
@@ -242,6 +259,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     if (lane === "full") {
       const results = await engine.syncDueAccounts(undefined, { signal: abort.signal });
       logSyncTick(results, performance.now() - tickStartedAt);
+      await drainThreadingLane();
       return;
     }
 
@@ -250,9 +268,50 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     try {
       const results = await engine.syncDueSentFolders(undefined, { signal: sent.signal });
       logSyncTick(results, performance.now() - tickStartedAt);
+      await drainThreadingLane();
     } finally {
       sent.dispose();
     }
+  }
+
+  async function drainThreadingLane(): Promise<void> {
+    if (!threading || stopping) return;
+    let accountIds: string[];
+    try {
+      accountIds = await threading.listAccountsNeedingWork(config.SYNC_MAX_ACCOUNTS);
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "threading.tick.failed",
+        error: error instanceof Error ? error.message : String(error)
+      }));
+      return;
+    }
+
+    let processed = 0;
+    let changed = 0;
+    let busy = 0;
+    for (const accountId of accountIds) {
+      if (stopping) break;
+      try {
+        const result = await threading.drainAccount(accountId, { requestedBy: "worker" });
+        processed += result.messagesConsidered;
+        changed += result.assignmentsChanged;
+        if (result.busy) busy += 1;
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: "threading.account.failed",
+          accountId,
+          error: error instanceof Error ? error.message : String(error)
+        }));
+      }
+    }
+    console.log(JSON.stringify({
+      event: "threading.tick.completed",
+      accounts: accountIds.length,
+      messagesConsidered: processed,
+      assignmentsChanged: changed,
+      busy
+    }));
   }
 
   async function sleep(ms: number): Promise<void> {
@@ -313,6 +372,11 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   });
   console.log(JSON.stringify({ event: "worker.lock_self_test.passed" }));
 
+  await threading?.assertRolloutCompatibility?.();
+  if (threading?.assertRolloutCompatibility) {
+    console.log(JSON.stringify({ event: "threading.rollout_compatibility.passed" }));
+  }
+
   const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
   if (sweep.terminatedBackends > 0 || sweep.accountsReset > 0 || sweep.runsClosed > 0) {
     console.warn(JSON.stringify({
@@ -336,21 +400,30 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     max: config.SYNC_MAX_ACCOUNTS
   }));
 
-  const logRetention = (r: { expired: number; purged: number; prunedEvents: number }) =>
+  const logRetention = (
+    r: { expired: number; purged: number; prunedEvents: number },
+    threadRuns: { runsDeleted: number; assignmentsDeleted: number } = { runsDeleted: 0, assignmentsDeleted: 0 }
+  ) =>
     console.log(JSON.stringify({
       event: "worker.retention.completed",
       expired: r.expired,
       purged: r.purged,
-      prunedEvents: r.prunedEvents
+      prunedEvents: r.prunedEvents,
+      threadRunsDeleted: threadRuns.runsDeleted,
+      threadAssignmentsDeleted: threadRuns.assignmentsDeleted
     }));
 
-  logRetention(await repository.runRetentionJobs());
+  const runRetention = async () => {
+    const retained = await repository.runRetentionJobs();
+    const threadRuns = await threading?.pruneTerminalRuns?.();
+    logRetention(retained, threadRuns);
+  };
+
+  await runRetention();
   // Re-run retention daily: it was boot-only, so on a long-lived process expiry/purge
   // and the (previously unbounded) sync-event prune silently stopped after startup.
   retentionTimer = setInterval(() => {
-    repository
-      .runRetentionJobs()
-      .then(logRetention)
+    runRetention()
       .catch((error) =>
         console.error(JSON.stringify({
           event: "worker.retention.failed",

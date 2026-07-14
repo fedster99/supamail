@@ -35,6 +35,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 - UIDVALIDITY reset handling
 - Reconciliation for provider deletes and missing messages
 - Flags, headers, threading headers, and MIME structure
+- Durable, account-scoped conversation threading with mirrored-copy deduplication
 - Raw RFC822/MIME bodies (retention configurable via `BODY_STORAGE_MODE`)
 - Parsed text, HTML, normalized text, and parser metadata
 - Attachment and inline-part metadata
@@ -51,7 +52,7 @@ SupaMail is the boring sync layer that makes the fun stuff possible.
 IMAP mailbox -> SupaMail worker/API -> Supabase/Postgres -> your app
 ```
 
-SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Supabase is where your application reads from.
+SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Supabase is where your application reads from. Conversation membership is a deterministic, rebuildable projection over the mirrored headers; it never rewrites the observed message rows.
 
 Account-level advisory locks keep sync operations serialized. Folder state tracks UID cursors and UIDVALIDITY. Reconciliation catches gaps so missing messages do not silently become permanent.
 
@@ -216,6 +217,70 @@ from imap_accounts a
 join imap_account_progress p on p.account_id = a.id;
 ```
 
+## Conversation Threading
+
+SupaMail keeps three identities separate:
+
+- A **physical mailbox row** is one `(account, folder, UIDVALIDITY, UID)` occurrence.
+- A **delivery** is one email that may have physical copies in several folders.
+- A **conversation** is the transitive reply graph containing one or more deliveries.
+
+Threading is deliberately conservative. Exact provider delivery identities and verified copy fingerprints deduplicate physical copies. Valid RFC `References` ancestry is preferred; the first valid `In-Reply-To` is used only when `References` has no usable Message-ID. A referenced Message-ID that has not arrived yet becomes a provisional parent, so siblings stay together and a later parent converges into the same graph. Namespaced, account-scoped provider thread IDs are a secondary grouping hint.
+
+Subject matching is only a last resort: an otherwise standalone `Re:` can join exactly one recent root when the base subject and reciprocal participants match exactly. Forwards, list/bulk mail, automated replies, ambiguous candidates, and content similarity never trigger this fallback. Weak evidence runs only over one exact, bounded subject bucket; an oversized common subject is recorded and skipped rather than guessed.
+
+Assignments live in versioned `imap_thread_runs`, with one `imap_thread_assignments` row per physical message and run. Metadata/body changes fan out to every active, standby, ready, and building run. Initial builds, rebuilds, and upgrades remain invisible shadow projections until they are complete, caught up, reviewed, and atomically activated. Operators can run the same deterministic machinery directly:
+
+```bash
+pnpm --filter @supamail/api exec tsx src/cli.ts threads-drain \
+  --account-id <account-uuid>
+
+pnpm --filter @supamail/api exec tsx src/cli.ts threads-rebuild \
+  --account-id <account-uuid> \
+  --reason "algorithm upgrade"
+
+pnpm --filter @supamail/api exec tsx src/cli.ts threads-compare \
+  --account-id <account-uuid> \
+  --baseline-run-id <active-run-uuid> \
+  --candidate-run-id <ready-run-uuid>
+
+pnpm --filter @supamail/api exec tsx src/cli.ts threads-activate \
+  --account-id <account-uuid> \
+  --run-id <ready-run-uuid> \
+  --comparison-id <passed-comparison-uuid> \
+  --reason "benchmark passed" \
+  --confirm
+
+pnpm --filter @supamail/api exec tsx src/cli.ts threads-rollback \
+  --account-id <account-uuid> \
+  --operation-id <latest-operation-uuid> \
+  --confirm
+
+pnpm --filter @supamail/api exec tsx src/cli.ts threads-prune \
+  --older-than-days 30 \
+  --batch-size 100 \
+  --confirm
+```
+
+`threads-rebuild` never switches readers by itself. `threads-compare` stores a
+quality certificate for the exact baseline/candidate generations and mirror
+evidence revision. Any later mail invalidates it. Activation requires a passed
+certificate when replacing an active run, verifies full physical-row coverage
+and empty catch-up queues, then swaps one account-scoped active-run pointer.
+Rollback is audited and pauses automatic work until a clean shadow rebuild is
+activated. A database trigger provides the evidence clock and queue fan-out even
+during a rolling deploy with an older sync worker. Daily retention prunes old
+terminal projection runs in bounded batches but keeps operations, comparisons,
+and incremental before/after history. A persisted weighted scheduler gives the
+active projection three of every five available turns while reserving bounded
+progress for the rollback standby and shadow build. Production executors live in
+an explicit version registry; worker startup and direct drain/rebuild commands
+fail fast if any state-referenced run has no retained executor.
+
+`read_thread` and the `thread` CLI command expose the durable `conversation_id`. Search returns one best result per conversation by default and counts one representative per delivery, so mirrored copies do not inflate results. Whole-thread mailbox mutations intentionally fan out to every live physical row.
+
+This is protocol conversation threading only. SupaMail does not infer that separate conversations concern the same task, document, or decision, and it has no work-item, CRM, belief, or epistemic clustering layer.
+
 ## Body Sync
 
 `BODY_FETCH_POLICY` controls when full bodies are fetched:
@@ -359,6 +424,6 @@ pnpm --filter @supamail/api smoke:load
 
 ## Project Status
 
-SupaMail is early and intentionally focused: email sync only. No calendar, contacts, sending, scheduling, CRM, identity hydration, or AI features are included in the core.
+SupaMail is early and intentionally focused on the mailbox protocol layer. No calendar, contacts, CRM, identity hydration, work-item clustering, or AI features are included in the core.
 
 The repo is independent from the app it came from. It excludes CRM hydration, person/company identity resolution, handle mapping, identity/belief code, MCP routes, Trigger.dev coupling, and internal dashboard logic.

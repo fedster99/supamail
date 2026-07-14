@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closePool, getPool } from "../../db.js";
 import { runReadThread } from "./read-thread.js";
@@ -9,9 +10,11 @@ const liveDb = LIVE_DB_AVAILABLE ? describe : describe.skip;
 const UIDVALIDITY = 88_002;
 const ACCOUNT_EMAIL = `read-thread-live-${process.pid}@example.test`;
 const THREAD_ID = `thread-${process.pid}`;
+const ACTIVE_CONVERSATION_ID = `thread_${"a".repeat(32)}`;
 
 interface SeedMessage {
   uid: number;
+  folderPath?: string;
   subject: string;
   fromEmail: string;
   fromName?: string;
@@ -49,7 +52,7 @@ liveDb("read_thread live DB", () => {
         deleted_in_provider, window_status, size_bytes
       )
       VALUES (
-        $1, 'INBOX', $2, $3, now() - ($4 * interval '1 day'),
+        $1, $18, $2, $3, now() - ($4 * interval '1 day'),
         $5, $6, $7, $8, $9, $10,
         $11, $12, $13,
         $14, $15,
@@ -74,7 +77,8 @@ liveDb("read_thread live DB", () => {
         message.inReplyTo ?? null,
         message.referencesHeader ?? null,
         message.deleted ?? false,
-        (message.body ?? "").length
+        (message.body ?? "").length,
+        message.folderPath ?? "INBOX"
       ]
     );
     const id = result.rows[0].id;
@@ -84,11 +88,17 @@ liveDb("read_thread live DB", () => {
       await pool.query(
         `
         INSERT INTO public.imap_message_bodies (
-          message_id, raw_mime, raw_bytes, raw_truncated, body_text, fetched_at
+          message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated, body_text, fetched_at
         )
-        VALUES ($1, $2, $3, false, $4, now())
+        VALUES ($1, $2, $3, $4, false, $5, now())
         `,
-        [id, Buffer.from(message.body), message.body.length, message.body]
+        [
+          id,
+          Buffer.from(message.body),
+          createHash("sha256").update(message.body).digest("hex"),
+          message.body.length,
+          message.body
+        ]
       );
       await pool.query("UPDATE public.imap_messages SET body_fetched_at = now() WHERE id = $1", [id]);
     }
@@ -222,6 +232,142 @@ liveDb("read_thread live DB", () => {
       referencesHeader: "<r0@x> <r1@x>",
       body: "header-only reply two"
     });
+
+    // Physical delivery copies in another folder. With no active assignment for
+    // these rows, read_thread uses the exact complete-body digest + Message-ID
+    // compatibility key and still returns one logical email.
+    await seedMessage({
+      uid: 9,
+      folderPath: "Sent",
+      subject: "Project kickoff",
+      fromEmail: "alice@acme.com",
+      fromName: "Alice Acme",
+      toEmails: ["bob@acme.com"],
+      ageDays: 5,
+      providerThreadId: THREAD_ID,
+      rfcMessageId: "<root@acme.com>",
+      messageIdNormalized: "root@acme.com",
+      body: "Let's kick off the project on Monday."
+    });
+    await seedMessage({
+      uid: 10,
+      folderPath: "Sent",
+      subject: "Header-linked root",
+      fromEmail: "x-root@x.com",
+      ageDays: 9,
+      providerThreadId: null,
+      rfcMessageId: "<r0@x>",
+      messageIdNormalized: "r0@x",
+      body: "header-only root message"
+    });
+
+    // Three physical rows in one active durable conversation: uid 22 mirrors
+    // uid 20 and therefore shares its delivery key. Their provider/header fields
+    // intentionally do not connect, proving the active pointer drives the read.
+    await seedMessage({
+      uid: 20,
+      subject: "Active assignment root",
+      fromEmail: "active-a@example.test",
+      ageDays: 12,
+      body: "active root"
+    });
+    await seedMessage({
+      uid: 21,
+      subject: "Completely different subject",
+      fromEmail: "active-b@example.test",
+      ageDays: 11,
+      body: "active reply"
+    });
+    await seedMessage({
+      uid: 22,
+      folderPath: "Sent",
+      subject: "Active assignment root",
+      fromEmail: "active-a@example.test",
+      ageDays: 12,
+      body: "active root"
+    });
+
+    const activeRun = await pool.query<{ id: string }>(
+      `
+      INSERT INTO public.imap_thread_runs (
+        account_id, algorithm_version, mode, status, stage,
+        completed_at, activated_at, requested_by
+      )
+      VALUES ($1, 1, 'initial', 'active', 'ready', now(), now(), 'read-thread-live-test')
+      RETURNING id
+      `,
+      [accountId]
+    );
+    const inactiveRun = await pool.query<{ id: string }>(
+      `
+      INSERT INTO public.imap_thread_runs (
+        account_id, algorithm_version, mode, status, stage, source_run_id,
+        completed_at, requested_by
+      )
+      VALUES ($1, 2, 'upgrade', 'archived', 'ready', $2, now(), 'read-thread-live-test')
+      RETURNING id
+      `,
+      [accountId, activeRun.rows[0].id]
+    );
+
+    const assignmentSql = `
+      INSERT INTO public.imap_thread_assignments (
+        run_id, message_id, account_id, delivery_key, conversation_id,
+        assignment_method, confidence, algorithm_version, input_hash,
+        generation, evidence
+      )
+      VALUES ($1, $2, $3, $4, $5, 'references', 'high', $6, $7, 1, '{}'::jsonb)
+    `;
+    await pool.query(assignmentSql, [
+      activeRun.rows[0].id,
+      idByUid.get(20),
+      accountId,
+      "1".repeat(64),
+      ACTIVE_CONVERSATION_ID,
+      1,
+      "a".repeat(64)
+    ]);
+    await pool.query(assignmentSql, [
+      activeRun.rows[0].id,
+      idByUid.get(21),
+      accountId,
+      "2".repeat(64),
+      ACTIVE_CONVERSATION_ID,
+      1,
+      "b".repeat(64)
+    ]);
+    await pool.query(assignmentSql, [
+      activeRun.rows[0].id,
+      idByUid.get(22),
+      accountId,
+      "1".repeat(64),
+      ACTIVE_CONVERSATION_ID,
+      1,
+      "c".repeat(64)
+    ]);
+    // Same conversation id in a non-active archived run must remain invisible.
+    await pool.query(assignmentSql, [
+      inactiveRun.rows[0].id,
+      idByUid.get(5),
+      accountId,
+      "3".repeat(64),
+      ACTIVE_CONVERSATION_ID,
+      2,
+      "d".repeat(64)
+    ]);
+    await pool.query(
+      `
+      INSERT INTO public.imap_thread_state (account_id, active_run_id, previous_run_id)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (account_id) DO UPDATE SET
+        active_run_id = EXCLUDED.active_run_id,
+        previous_run_id = EXCLUDED.previous_run_id,
+        building_run_id = NULL,
+        paused_at = NULL,
+        pause_reason = NULL
+      `,
+      [accountId, activeRun.rows[0].id, inactiveRun.rows[0].id]
+    );
   });
 
   afterAll(async () => {
@@ -238,6 +384,7 @@ liveDb("read_thread live DB", () => {
 
     const ids = out.messages.map((m) => m.message_id);
     expect(ids).toEqual([idByUid.get(1), idByUid.get(2), idByUid.get(3)]);
+    expect(ids).not.toContain(idByUid.get(9)); // mirrored Sent copy
     expect(ids).not.toContain(idByUid.get(4)); // soft-deleted
     expect(ids).not.toContain(idByUid.get(5)); // different thread
     expect(out.thread.message_count).toBe(3);
@@ -250,6 +397,7 @@ liveDb("read_thread live DB", () => {
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
     expect(out.messages.map((m) => m.message_id)).toEqual([idByUid.get(1), idByUid.get(2), idByUid.get(3)]);
+    expect(out.messages.map((m) => m.message_id)).not.toContain(idByUid.get(9));
   });
 
   it("strips quoted tail and signature by default, keeps them with include_quoted", async () => {
@@ -267,7 +415,7 @@ liveDb("read_thread live DB", () => {
   });
 
   it("collects distinct participants and a flat attachments_index", async () => {
-    const out = await runReadThread(pool, { thread_id: THREAD_ID });
+    const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId });
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
 
@@ -285,7 +433,7 @@ liveDb("read_thread live DB", () => {
   });
 
   it("caps to max_messages keeping the newest and reports omitted_message_count", async () => {
-    const out = await runReadThread(pool, { thread_id: THREAD_ID, max_messages: 2 });
+    const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId, max_messages: 2 });
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
 
@@ -304,12 +452,28 @@ liveDb("read_thread live DB", () => {
     // message_id_normalized) + self (r1) + child (r2, via the child's in_reply_to
     // matching the seed's rfc_message_id) — all 3, with no provider thread id.
     expect(ids).toEqual([idByUid.get(6), idByUid.get(7), idByUid.get(8)]);
+    expect(ids).not.toContain(idByUid.get(10)); // mirrored Sent copy
     expect(out.thread.message_count).toBe(3);
     expect(out.thread.provider_thread_id).toBeNull();
   });
 
+  it("reads only the atomically active run and collapses its physical delivery copies", async () => {
+    const out = await runReadThread(pool, { message_id: idByUid.get(20) });
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+
+    expect(out.thread.conversation_id).toBe(ACTIVE_CONVERSATION_ID);
+    expect(out.messages.map((message) => message.message_id)).toEqual([
+      idByUid.get(20),
+      idByUid.get(21)
+    ]);
+    expect(out.messages.map((message) => message.message_id)).not.toContain(idByUid.get(22));
+    // uid 5 has the same conversation id only in the non-active archived run.
+    expect(out.messages.map((message) => message.message_id)).not.toContain(idByUid.get(5));
+  });
+
   it("returns a sync_trust block", async () => {
-    const out = await runReadThread(pool, { thread_id: THREAD_ID });
+    const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId });
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
     expect(out.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);

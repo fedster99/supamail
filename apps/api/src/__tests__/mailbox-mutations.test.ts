@@ -244,18 +244,20 @@ describe("setThreadFlags / moveThread fan-out", () => {
     message_id_normalized: "m1@x",
     in_reply_to: null,
     references_header: null,
-    account_id: "acc-1"
+    account_id: "acc-1",
+    conversation_id: null
   };
 
   /** A pool whose first query returns the seed row and whose second returns the
    * supplied member rows (the LIMIT is applied client-side by resolveThreadTargets,
    * so we hand back exactly what a `LIMIT n` would). */
   function poolReturningMembers(members: Array<Record<string, unknown>>): never {
-    let call = 0;
     const client = {
-      query: vi.fn(async () => {
-        call += 1;
-        return call === 1 ? { rows: [seedRow] } : { rows: members };
+      query: vi.fn(async (sql: string) => {
+        if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" || sql === "COMMIT" || sql === "ROLLBACK") {
+          return { rows: [] };
+        }
+        return sql.includes("WHERE m.id = $1") ? { rows: [seedRow] } : { rows: members };
       }),
       release: vi.fn()
     };
@@ -292,6 +294,50 @@ describe("setThreadFlags / moveThread fan-out", () => {
     expect(result.messageCount).toBe(3);
     expect(result.truncated).toBe(false);
     expect(mutator.addFlags).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses a stored conversation assignment and mutates every physical delivery copy", async () => {
+    const assignedSeed = { ...seedRow, conversation_id: "conversation-1" };
+    const physicalCopies = [
+      {
+        id: "msg-inbox",
+        account_id: "acc-1",
+        folder_path: "INBOX",
+        uidvalidity: "100",
+        uid: "11"
+      },
+      {
+        id: "msg-sent",
+        account_id: "acc-1",
+        folder_path: "Sent",
+        uidvalidity: "200",
+        uid: "22"
+      }
+    ];
+    const query = vi.fn(async (sql: string, _values?: unknown[]) => {
+      if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" || sql === "COMMIT" || sql === "ROLLBACK") {
+        return { rows: [] };
+      }
+      return sql.includes("WHERE m.id = $1") ? { rows: [assignedSeed] } : { rows: physicalCopies };
+    });
+    const client = { query, release: vi.fn() };
+    const pool = { connect: vi.fn(async () => client) } as unknown as never;
+
+    const { setThreadFlags } = await import("../mailbox-mutations.js");
+    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+
+    expect(result.messageIds).toEqual(["msg-inbox", "msg-sent"]);
+    expect(query.mock.calls.some(([sql]) =>
+      sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    )).toBe(true);
+    expect(mutator.addFlags).toHaveBeenCalledTimes(2);
+    expect(mutator.addFlags.mock.calls.map(([target]) => target.folderPath)).toEqual(["INBOX", "Sent"]);
+    const seedCall = query.mock.calls.find(([sql]) => String(sql).includes("WHERE m.id = $1"));
+    const membersCall = query.mock.calls.find(([sql]) => String(sql).includes("assignment.conversation_id = $2"));
+    expect(String(seedCall?.[0])).toContain("public.imap_thread_active_assignments assignment");
+    expect(String(membersCall?.[0])).toContain("public.imap_thread_active_assignments assignment");
+    expect(String(membersCall?.[0])).not.toContain("message_id_normalized");
+    expect(membersCall?.[1]).toEqual(["acc-1", "conversation-1", 101]);
   });
 
   it("interleaves the write-through so an earlier member's mirror write persists before a mid-thread STORE failure", async () => {

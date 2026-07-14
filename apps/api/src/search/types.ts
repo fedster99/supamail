@@ -166,7 +166,11 @@ export interface SearchResult {
   score_breakdown: ScoreBreakdown | null;
   /** The conversation this result represents; message_count is how many of its
    *  messages matched (the collapsed duplicates when grouped by thread). */
-  thread: { provider_thread_id: string | null; message_count: number };
+  thread: {
+    conversation_id: string | null;
+    provider_thread_id: string | null;
+    message_count: number;
+  };
   attachments: { count: number };
   body: string | null;
 }

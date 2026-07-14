@@ -54,6 +54,7 @@ export interface FetchMessage {
   };
   headers?: Buffer;
   bodyStructure?: unknown;
+  emailId?: string;
   threadId?: string;
   source?: Buffer;
 }
@@ -64,6 +65,7 @@ export interface DownloadResult {
 
 export interface MirrorImapClient {
   mailbox: MailboxStatus | false | null;
+  capabilities?: ReadonlyMap<string, boolean | number>;
   usable?: boolean;
   connect?(): Promise<void>;
   close?(): void;
@@ -101,6 +103,10 @@ export class ThrottledImapClient implements MirrorImapClient {
 
   get usable(): boolean {
     return this.client.usable;
+  }
+
+  get capabilities(): ReadonlyMap<string, boolean | number> {
+    return this.client.capabilities;
   }
 
   async connect(): Promise<void> {
@@ -226,7 +232,20 @@ function addressList(addresses: Array<{ address?: string; name?: string }> | und
   return { emails, names };
 }
 
-export function parseMessageMetadata(msg: FetchMessage): MessageMetadata {
+export type ProviderObjectIdNamespace = "objectid" | "gmail";
+
+export function providerObjectIdNamespace(
+  capabilities: ReadonlyMap<string, boolean | number> | undefined
+): ProviderObjectIdNamespace | null {
+  if (capabilities?.has("OBJECTID")) return "objectid";
+  if (capabilities?.has("X-GM-EXT-1")) return "gmail";
+  return null;
+}
+
+export function parseMessageMetadata(
+  msg: FetchMessage,
+  providerNamespace: ProviderObjectIdNamespace | null = null
+): MessageMetadata {
   const headers = parseHeaders(msg.headers);
   const from = firstAddress(msg.envelope?.from);
   const to = addressList(msg.envelope?.to);
@@ -241,7 +260,10 @@ export function parseMessageMetadata(msg: FetchMessage): MessageMetadata {
     flags: [...(msg.flags ?? new Set<string>())],
     rfcMessageId,
     messageIdNormalized: normalizeMessageId(rfcMessageId),
+    providerMessageId: msg.emailId ?? null,
+    providerMessageIdNamespace: msg.emailId ? providerNamespace : null,
     providerThreadId: msg.threadId ?? null,
+    providerThreadIdNamespace: msg.threadId ? providerNamespace : null,
     inReplyTo: headers["in-reply-to"] ?? null,
     referencesHeader: headers.references ?? null,
     subject: msg.envelope?.subject ?? null,
@@ -264,6 +286,7 @@ export async function fetchMessageMetadata(
   batchSize: number
 ): Promise<MessageMetadata[]> {
   const messages: MessageMetadata[] = [];
+  const providerNamespace = providerObjectIdNamespace(client.capabilities);
   const requestedUids = [...new Set(uids)];
   let retainedBytes = 2;
   let retainedAttachments = 0;
@@ -289,8 +312,11 @@ export async function fetchMessageMetadata(
         "auto-submitted",
         "x-auto-response-suppress",
         "list-unsubscribe",
+        "list-id",
         "precedence",
-        "reply-to"
+        "reply-to",
+        "thread-index",
+        "thread-topic"
       ]
     }, { uid: true })) {
       // Ignore unsolicited UID-less, out-of-range, and flags-only FETCH responses.
@@ -307,7 +333,7 @@ export async function fetchMessageMetadata(
         && msg.headers !== undefined
         && msg.bodyStructure !== undefined;
       if (!hasRequestedMetadata) continue;
-      const parsed = parseMessageMetadata(msg);
+      const parsed = parseMessageMetadata(msg, providerNamespace);
       const footprint = metadataMessageFootprint(parsed);
       const previous = returned.get(msg.uid);
       if (previous) {

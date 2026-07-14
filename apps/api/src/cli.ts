@@ -14,6 +14,7 @@ import {
 import { applyPublicMigrations, closePool, getPool } from "./db.js";
 import { MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
+import { ThreadingRepository } from "./threading-repository.js";
 import { searchMessages } from "./search/index.js";
 import type { SearchRequest, SearchSort } from "./search/index.js";
 import { runDraftReply, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
@@ -43,6 +44,7 @@ const config = getConfig();
 const pool = getPool();
 const repository = new MirrorRepository(pool, config);
 const engine = new MirrorEngine({ pool, config, repository });
+const threading = new ThreadingRepository(pool);
 
 program
   .name("supamail")
@@ -112,6 +114,117 @@ program
   });
 
 program
+  .command("threads-drain")
+  .description("Process one bounded batch of pending conversation assignments")
+  .requiredOption("--account-id <id>", "Account UUID")
+  .option("--batch-size <n>", "Maximum initial work items (closure may be larger)", "500")
+  .action(async (options) => {
+    const result = await threading.drainAccount(options.accountId, {
+      batchSize: Number(options.batchSize),
+      requestedBy: "cli"
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("threads-rebuild")
+  .description("Deterministically recompute all conversation assignments for one account")
+  .requiredOption("--account-id <id>", "Account UUID")
+  .option("--reason <text>", "Audit reason for the rebuild")
+  .action(async (options) => {
+    const result = await threading.rebuildAccount(options.accountId, {
+      requestedBy: "cli",
+      reason: options.reason
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("threads-rollback")
+  .description("Roll back the latest material conversation assignment operation")
+  .requiredOption("--account-id <id>", "Account UUID")
+  .requiredOption("--operation-id <id>", "Latest successful threading operation UUID")
+  .option("--confirm", "Required confirmation for a projection rollback")
+  .action(async (options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to roll back threading without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await threading.rollbackOperation(options.accountId, options.operationId, "cli");
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("threads-prune")
+  .description("Delete old terminal threading projections while retaining audit records")
+  .option("--older-than-days <n>", "Minimum terminal age", "30")
+  .option("--batch-size <n>", "Maximum runs deleted in one transaction", "100")
+  .option("--confirm", "Required confirmation for projection retention")
+  .action(async (options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to prune threading projections without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await threading.pruneTerminalRuns({
+      olderThanDays: Number(options.olderThanDays),
+      batchSize: Number(options.batchSize)
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("threads-activate")
+  .description("Atomically activate a reviewed, caught-up shadow conversation run")
+  .requiredOption("--account-id <id>", "Account UUID")
+  .requiredOption("--run-id <id>", "Ready shadow run UUID")
+  .option("--comparison-id <id>", "Passed comparison certificate (required for replacement)")
+  .option("--reason <text>", "Audit reason for activation")
+  .option("--confirm", "Required confirmation for reader cutover")
+  .action(async (options) => {
+    if (!options.confirm) {
+      process.stderr.write("Refusing to activate threading without --confirm.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const result = await threading.activateRun(options.accountId, options.runId, {
+      requestedBy: "cli",
+      reason: options.reason,
+      comparisonId: options.comparisonId
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("threads-compare")
+  .description("Compare a baseline run with a shadow run before activation")
+  .requiredOption("--account-id <id>", "Account UUID")
+  .requiredOption("--baseline-run-id <id>", "Active or prior baseline run UUID")
+  .requiredOption("--candidate-run-id <id>", "Ready shadow run UUID")
+  .option("--sample-size <n>", "Maximum changed-message samples", "100")
+  .option("--max-merge-groups <n>", "Maximum accepted conversation merge groups", "0")
+  .option("--max-split-groups <n>", "Maximum accepted conversation split groups", "0")
+  .option("--max-provisional-introduced <n>", "Maximum newly provisional assignments", "0")
+  .action(async (options) => {
+    const result = await threading.compareRuns(
+      options.accountId,
+      options.baselineRunId,
+      options.candidateRunId,
+      Number(options.sampleSize),
+      {
+        requestedBy: "cli",
+        thresholds: {
+          maxConversationMergeGroups: Number(options.maxMergeGroups),
+          maxConversationSplitGroups: Number(options.maxSplitGroups),
+          maxProvisionalIntroduced: Number(options.maxProvisionalIntroduced)
+        }
+      }
+    );
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
   .command("refetch-body")
   .description("Refetch and overwrite one message body")
   .requiredOption("--message-id <id>", "Message UUID")
@@ -137,7 +250,7 @@ program
   .option("--subject <text>", "Subject contains")
   .option("--body <text>", "Body full-text match")
   .option("--folder <path>", "Folder path (in:; trailing /* matches the subtree)")
-  .option("--thread <id>", "Provider thread id")
+  .option("--thread <id>", "Durable conversation id or legacy provider thread id")
   .option("--filename <glob>", "Attachment filename glob (e.g. *.pdf)")
   .option("--filetype <class>", "Attachment class (pdf,image,video,audio,doc,sheet,zip,text)")
   .option("--is <flag>", "Flag state read|unread|flagged|starred|answered|draft (repeatable)", collect, [])
@@ -222,19 +335,21 @@ program
 
 program
   .command("thread [messageId]")
-  .description("Read a full email thread, seeded from a message id (read-only, JSON output)")
+  .description("Read a full email conversation (read-only, JSON output)")
+  .option("--conversation-id <id>", "Select a durable SupaMail conversation (requires --account)")
   .option("--thread-id <id>", "Select the thread directly by provider_thread_id")
   .option("--account <id>", "Scope the thread to one account UUID")
   .option("--include-quoted", "Keep quoted reply tails + signatures in each body")
   .option("--max-messages <n>", "Max messages to return, newest kept when over the cap")
   .action(async (messageId: string | undefined, options) => {
-    if (!messageId && !options.threadId) {
-      process.stderr.write("thread requires a messageId argument or --thread-id <id>.\n");
+    if (!messageId && !options.conversationId && !options.threadId) {
+      process.stderr.write("thread requires a messageId argument, --conversation-id, or --thread-id.\n");
       process.exitCode = 1;
       return;
     }
     const result = await runReadThread(pool, {
       message_id: messageId ?? undefined,
+      conversation_id: options.conversationId,
       thread_id: options.threadId,
       account: options.account,
       include_quoted: Boolean(options.includeQuoted),

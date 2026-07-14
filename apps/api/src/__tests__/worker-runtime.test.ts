@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 
+const defaultThreading = vi.hoisted(() => ({
+  constructed: vi.fn(),
+  assertRolloutCompatibility: vi.fn(async () => undefined),
+  listAccountsNeedingWork: vi.fn(async () => [] as string[]),
+  drainAccount: vi.fn(),
+  pruneTerminalRuns: vi.fn(async () => ({ runsDeleted: 0, assignmentsDeleted: 0 }))
+}));
+
 vi.mock("../locks.js", () => ({
   clearOrphanedLocks: vi.fn(async () => ({
     terminatedBackends: 0,
@@ -8,6 +16,19 @@ vi.mock("../locks.js", () => ({
     runsClosed: 0
   })),
   runLockSelfTestWithRetry: vi.fn(async () => undefined)
+}));
+
+vi.mock("../threading-repository.js", () => ({
+  ThreadingRepository: class {
+    constructor() {
+      defaultThreading.constructed();
+    }
+
+    listAccountsNeedingWork = defaultThreading.listAccountsNeedingWork;
+    assertRolloutCompatibility = defaultThreading.assertRolloutCompatibility;
+    drainAccount = defaultThreading.drainAccount;
+    pruneTerminalRuns = defaultThreading.pruneTerminalRuns;
+  }
 }));
 
 const {
@@ -284,5 +305,93 @@ describe("worker runtime logging", () => {
       metadataWriteServiceRowsPerSecond: null,
       metadataThroughputRowsPerSecond: null
     });
+  });
+});
+
+describe("worker conversation-threading lane", () => {
+  it("keeps the default threading lane enabled when a shared engine is injected", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    defaultThreading.constructed.mockClear();
+    defaultThreading.assertRolloutCompatibility.mockClear();
+    defaultThreading.listAccountsNeedingWork.mockClear();
+
+    const runtime = await startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      engine: {
+        syncDueAccounts: vi.fn(async () => []),
+        syncDueSentFolders: vi.fn(async () => [])
+      },
+      repository: {
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+      } as never
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(defaultThreading.constructed).toHaveBeenCalledTimes(1);
+      expect(defaultThreading.assertRolloutCompatibility).toHaveBeenCalledTimes(1);
+      expect(defaultThreading.listAccountsNeedingWork).toHaveBeenCalledWith(40);
+    } finally {
+      runtime.stop();
+      await runtime.done;
+    }
+  });
+
+  it("drains durable assignment work after the mailbox sync tick", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const drainAccount = vi.fn(async () => ({
+      accountId: "account-1",
+      runId: "run-1",
+      runStatus: "active" as const,
+      stage: "ready" as const,
+      operationId: "operation-1",
+      operationType: "incremental" as const,
+      generation: "1",
+      messagesConsidered: 3,
+      assignmentsChanged: 2,
+      queueItemsProcessed: 1,
+      subjectFallbackEnabled: true,
+      busy: false,
+      ready: true,
+      active: true
+    }));
+    const runtime = await startWorkerRuntime({
+      config: {
+        SYNC_INTERVAL_MS: 60_000,
+        SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000,
+        SYNC_MAX_ACCOUNTS: 40
+      } as AppConfig,
+      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      engine: {
+        syncDueAccounts: vi.fn(async () => []),
+        syncDueSentFolders: vi.fn(async () => [])
+      },
+      threading: {
+        listAccountsNeedingWork: vi.fn(async () => ["account-1"]),
+        drainAccount
+      },
+      repository: {
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+      } as never
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drainAccount).toHaveBeenCalledWith("account-1", { requestedBy: "worker" });
+    } finally {
+      runtime.stop();
+      await runtime.done;
+    }
   });
 });

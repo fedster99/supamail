@@ -15,7 +15,9 @@ SupaMail owns a conservative mailbox mirror:
 - Metadata, folder state, flags, body fetch state, sync events, and health are durable.
 - Full MIME bodies are fetched according to account policy and always behind the same account lock.
 - Multi-folder moves are normal. A message that leaves one folder may still appear elsewhere with a different folder-scoped UID identity.
+- Physical mailbox rows, duplicate delivery copies, and protocol conversations are separate identities. Conversation assignment is derived and replaceable; it does not redefine mailbox-row identity.
 - Mailbox identity is not CRM identity. SupaMail does not resolve people, companies, handles, relationships, or hydrated activities.
+- Threading stops at protocol conversations. It does not cluster separate conversations by task, document, decision, or semantic similarity.
 - The architecture is intentionally stateful and account-capped. Scaling beyond the default account cap requires a new architecture decision.
 
 ## Reliability Matrix
@@ -24,6 +26,11 @@ SupaMail owns a conservative mailbox mirror:
 | --- | --- | --- |
 | UIDs are scoped by folder and UIDVALIDITY, never globally unique. | Implemented | Message uniqueness is `(account_id, folder_path, uidvalidity, uid)`; `pnpm spec-conformance` covers UIDVALIDITY behavior. |
 | Message-ID is useful but not authoritative identity. | Implemented | Raw and normalized Message-ID are stored for lookup and correlation, but uniqueness is still folder/UIDVALIDITY/UID-scoped. |
+| Mirrored copies and reply conversations must not be one identity. | Implemented | `imap_thread_assignments.delivery_key` groups verified copies while `conversation_id` groups the transitive reply component; reads/search collapse copies, but mailbox mutations retain every live physical UID target. |
+| RFC reply headers should outrank heuristics. | Implemented | The versioned threading algorithm uses valid `References`, otherwise the first valid `In-Reply-To`; strict Message-ID comparison is case-sensitive, malformed tokens are ignored, and cycle guards prefer a split over an invented edge. |
+| Missing parents and out-of-order sync must converge. | Implemented | Unresolved referenced Message-IDs are provisional graph nodes. Siblings can share that parent before it is mirrored, and a later parent materializes the same node during deterministic recomputation. |
+| Provider/subject fallback must be bounded and account-scoped. | Implemented | Namespaced provider delivery/thread IDs are scoped to an account. Subject fallback accepts only an unlinked, non-automated `Re:` with exact base subject, reciprocal exact participants, a 14-day window, and exactly one candidate; forwards/content similarity never merge, and partial incremental universes disable the weak rule. |
+| Conversation assignments must be recomputable and reversible. | Implemented | Thread-relevant input changes enqueue a bounded closure recompute; full rebuild uses the same versioned pure executor. Assignments store method/evidence/confidence signals via provisional state/version/hash/generation, operations record outcomes, incremental history stores reversible before/after snapshots, and only the latest material operation can roll back. |
 | Credentials must not be stored or logged in plaintext. | Implemented with deliberate divergence | SupaMail encrypts IMAP passwords in Node with AES-256-GCM instead of old SQL crypto examples; see ADR 0002. |
 | Do not run concurrent IMAP operations for the same account. | Implemented | Session advisory locks in `withAccountLock`; live DB tests verify concurrent sync serialization. |
 | Advisory locks require session-affine Postgres connections. | Implemented | Worker startup self-test fails fast when session lock semantics are broken; deployment docs require direct/session-affine DB access. |
@@ -66,7 +73,19 @@ SupaMail owns a conservative mailbox mirror:
 
 ### Identity And Normalization
 
-The mirror stores both raw and normalized Message-ID values, but they are correlation helpers only. They must not replace the primary mirror identity of account, folder path, UIDVALIDITY, and UID. This is mailbox identity only; it must not grow into CRM identity hydration, person/company resolution, handle mapping, or activity construction inside SupaMail core. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
+The mirror stores both raw and normalized Message-ID values, but they are correlation helpers only. They must not replace the primary mirror identity of account, folder path, UIDVALIDITY, and UID. The conversation algorithm parses valid RFC Message-ID tokens separately and compares their canonical syntax case-sensitively; the legacy lowercased normalized value is not threading truth.
+
+Threading then builds two derived layers without changing that primary identity. A delivery key identifies verified physical copies, preferring namespaced provider message identity and using strict Message-ID plus exact complete-MIME copy evidence to guard against reused IDs. A conversation ID identifies the transitive account-scoped component built from those deliveries. Search and conversation reads choose one deterministic physical representative for each delivery; IMAP flag/move operations still address every live physical row because each copy has its own folder and UID.
+
+Valid `References` supplies ancestry. Only when it yields no valid token does the first valid `In-Reply-To` supply a parent. Missing tokens remain provisional nodes so siblings and later-arriving parents converge. Provider thread IDs add account-scoped membership but never invent parentage. The final subject fallback is intentionally weak and narrow, and is disabled whenever a bounded incremental drain cannot prove it has a complete candidate universe. Content/body similarity is never protocol-conversation evidence.
+
+This is mailbox/protocol identity only; it must not grow into CRM identity hydration, person/company resolution, handle mapping, activity construction, or work-item clustering inside SupaMail core. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
+
+### Conversation Projection Operations
+
+New or changed threading inputs are upserted into a separate `imap_thread_work_queue` row for every active, candidate, and rollback run. A database trigger also advances an evidence clock and enqueues changes, closing the rolling-deploy gap when an older writer lacks repository instrumentation. The ordinary worker drains one bounded batch per eligible account after both full and supplemental Sent sync passes, expands the affected delivery/reference/provider/prior-conversation closure under row/evidence/criteria budgets, and records a generation only when material assignments change. Exact subject buckets are separate bounded work items; overflow dissolves prior weak merges before skipping ambiguity. Failures persist retryable work and backoff before releasing the account lock.
+
+Migration `0014_conversation_threading` performs no mailbox-wide backfill. Initial builds and algorithm upgrades are versioned shadow runs: bounded body-evidence and protocol keyset scans are followed by subject buckets and a catch-up stage. `threads-drain --account-id` runs one bounded step; `threads-rebuild --account-id` builds a complete shadow; `threads-compare` persists thresholded metrics for exact generations/evidence revision; confirmed `threads-activate` requires that current passing certificate, coverage, and empty queues before atomically switching the active view; confirmed `threads-rollback` reverses a rollout pointer or the latest active material operation and pauses work pending a clean rebuild. A dedicated account advisory lock serializes thread workers, while a shared/exclusive `imap_thread_state` row lock closes the race with mirror writes; neither lock authorizes an IMAP command. A persisted three-active/one-standby/one-building schedule prevents sustained ingress from starving rollout work. Literal version executors keep the active, shadow, and standby projections current during rolling upgrades; startup and direct operator paths fail fast if a referenced executor is absent.
 
 ### Folder Discovery And Scheduling
 

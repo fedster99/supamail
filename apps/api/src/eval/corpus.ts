@@ -27,8 +27,13 @@ export interface EvalMessage {
   attachments: EvalAttachment[];
   /** Explicit size; defaults to the body length when omitted. */
   sizeBytes?: number;
-  /** Conversation id shared by every message in a thread (null = standalone). */
+  /** Legacy provider hint. It is intentionally allowed to be absent or wrong. */
   providerThreadId: string | null;
+  /** Ground-truth durable conversation label. Omitted means a standalone message. */
+  conversationLabel?: string;
+  rfcMessageId?: string;
+  inReplyTo?: string;
+  referencesHeader?: string;
   /** Parsed headers; list-id / list-unsubscribe here mark a message as bulk. */
   headersJson: Record<string, unknown>;
 }
@@ -153,10 +158,12 @@ export const messages: EvalMessage[] = [
       body: "Attaching the new logo assets for the brand refresh.",
       attachments: [{ filename: "logo.png", mimeType: "image/png" }, { filename: "logo-dark.png", mimeType: "image/png" }] }),
 
-  // --- Newsletters (bulk; carry list headers so the ranker can demote them) ---
-  m({ id: "news-1", subject: "Tech Weekly: 10 tools you need", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 2, headersJson: LIST_HEADERS,
+  // --- Newsletters (bulk; carry list headers so the ranker can demote them).
+  //     Two distinct conversations deliberately reuse one provider hint so the
+  //     reader benchmark detects unsafe provider-id grouping. ---
+  m({ id: "news-1", subject: "Tech Weekly: 10 tools you need", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 2, providerThreadId: "dangerously-reused-provider-id", headersJson: LIST_HEADERS,
       body: "This week's roundup of developer tools. Unsubscribe at the bottom of this email." }),
-  m({ id: "news-2", subject: "Tech Weekly: the AI edition", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 9, headersJson: LIST_HEADERS,
+  m({ id: "news-2", subject: "Tech Weekly: the AI edition", fromEmail: "newsletter@techweekly.com", fromName: "Tech Weekly", ageDays: 9, providerThreadId: "dangerously-reused-provider-id", headersJson: LIST_HEADERS,
       body: "Everything about artificial intelligence this week. Unsubscribe link below." }),
 
   // --- Recruiting (from talent@workable.com) ---
@@ -175,16 +182,17 @@ export const messages: EvalMessage[] = [
       body: "Attached is the full dataset export you requested.",
       attachments: [{ filename: "export.csv", mimeType: "text/csv" }], sizeBytes: 6_000_000 }),
 
-  // --- A real conversation: one thread, 4 quoted replies. The phrase "budget
+  // --- A real header-only conversation: one thread, 4 quoted replies and no
+  //     provider thread id. The phrase "budget
   //     proposal" repeats down the quoted bodies, which inflates keyword matches
   //     and produces near-duplicate hits unless results are grouped by thread. ---
-  m({ id: "thr-1", subject: "Q2 budget proposal", fromEmail: "pm@projecthub.io", fromName: "Priya", ageDays: 6, providerThreadId: "thread-budget",
+  m({ id: "thr-1", subject: "Q2 budget proposal", fromEmail: "pm@projecthub.io", fromName: "Priya", ageDays: 6, conversationLabel: "header-only-budget", rfcMessageId: "<eval-budget-1@example.test>",
       body: "Here is the Q2 budget proposal for review. Let me know your thoughts." }),
-  m({ id: "thr-2", subject: "Re: Q2 budget proposal", fromEmail: "sarah@contractor.com", fromName: "Sarah", ageDays: 5, providerThreadId: "thread-budget",
+  m({ id: "thr-2", subject: "Re: Q2 budget proposal", fromEmail: "sarah@contractor.com", fromName: "Sarah", ageDays: 5, conversationLabel: "header-only-budget", rfcMessageId: "<eval-budget-2@example.test>", inReplyTo: "<eval-budget-1@example.test>", referencesHeader: "<eval-budget-1@example.test>",
       body: "Thanks for the Q2 budget proposal. I have a couple of questions.\n> Here is the Q2 budget proposal for review. Let me know your thoughts." }),
-  m({ id: "thr-3", subject: "Re: Q2 budget proposal", fromEmail: "pm@projecthub.io", fromName: "Priya", ageDays: 4, providerThreadId: "thread-budget",
+  m({ id: "thr-3", subject: "Re: Q2 budget proposal", fromEmail: "pm@projecthub.io", fromName: "Priya", ageDays: 4, conversationLabel: "header-only-budget", rfcMessageId: "<eval-budget-3@example.test>", inReplyTo: "<eval-budget-2@example.test>", referencesHeader: "<eval-budget-1@example.test> <eval-budget-2@example.test>",
       body: "Good questions on the budget proposal. Answers inline.\n> Thanks for the Q2 budget proposal. I have a couple of questions.\n>> Here is the Q2 budget proposal for review." }),
-  m({ id: "thr-4", subject: "Re: Q2 budget proposal", fromEmail: "sarah@contractor.com", fromName: "Sarah", ageDays: 3, providerThreadId: "thread-budget",
+  m({ id: "thr-4", subject: "Re: Q2 budget proposal", fromEmail: "sarah@contractor.com", fromName: "Sarah", ageDays: 3, conversationLabel: "header-only-budget", rfcMessageId: "<eval-budget-4@example.test>", inReplyTo: "<eval-budget-3@example.test>", referencesHeader: "<eval-budget-1@example.test> <eval-budget-2@example.test> <eval-budget-3@example.test>",
       body: "The Q2 budget proposal looks good to me now. Approved.\n> Good questions on the budget proposal. Answers inline.\n>> Thanks for the Q2 budget proposal." }),
 
   // --- Human-vs-bulk: a person's question and a newsletter both about "tools".

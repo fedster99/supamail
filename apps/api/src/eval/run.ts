@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { PgPool } from "../db.js";
 import { searchMessages } from "../search/search.js";
+import type { SearchResult } from "../search/types.js";
+import { extractMessageIdTokens, THREADING_ALGORITHM_VERSION } from "../threading.js";
 import { guardQueries, messages, queries, type QueryCategory } from "./corpus.js";
 import { meanMetrics, scoreQuery, type QueryMetrics } from "./metrics.js";
 import { comparePaired, type PairedComparison } from "./significance.js";
@@ -76,6 +78,31 @@ export const EVAL_NOW = "2026-01-15T12:00:00.000Z";
 
 const SATURATION_NDCG = 0.95;
 
+/**
+ * Measure how many distinct conversations are represented by a result page.
+ * Active protocol-thread assignments are authoritative even when the provider
+ * supplies no thread id (the normal generic-IMAP/header-only case). Provider
+ * thread ids are only a legacy fallback and are mailbox-scoped, matching the
+ * search reader's grouping boundary.
+ */
+export function conversationDiversityRatio(
+  results: Array<Pick<SearchResult, "identity" | "thread">>
+): number | null {
+  if (results.length === 0) return null;
+
+  const keys = new Set(results.map((result) => {
+    const accountId = result.identity.account_id;
+    if (result.thread.conversation_id !== null) {
+      return JSON.stringify([accountId, "conversation", result.thread.conversation_id]);
+    }
+    if (result.thread.provider_thread_id !== null) {
+      return JSON.stringify([accountId, "provider", result.thread.provider_thread_id]);
+    }
+    return JSON.stringify([accountId, "message", result.identity.id]);
+  }));
+  return keys.size / results.length;
+}
+
 type ResolveFn = (syntheticId: string) => string;
 
 /**
@@ -88,13 +115,21 @@ function stableUuid(name: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-interface SeededCorpus {
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function evalConversationId(label: string): string {
+  return `thread_${sha256(`supamail-eval-conversation:${label}`).slice(0, 32)}`;
+}
+
+export interface SeededCorpus {
   accountId: string;
   resolve: ResolveFn;
 }
 
 /** Seed the judged corpus into an isolated account against the frozen clock. */
-async function seedCorpus(pool: PgPool, accountEmail: string): Promise<SeededCorpus> {
+export async function seedCorpus(pool: PgPool, accountEmail: string): Promise<SeededCorpus> {
   const accountResult = await pool.query<{ id: string }>(
     `INSERT INTO public.imap_accounts (email_address, host, port, username, encrypted_password)
      VALUES ($1, 'imap.example.test', 993, $1, $2)
@@ -111,11 +146,13 @@ async function seedCorpus(pool: PgPool, accountEmail: string): Promise<SeededCor
       `INSERT INTO public.imap_messages (
          id, account_id, folder_path, uidvalidity, uid, internal_date,
          subject, from_email, from_name, to_emails, flags,
-         provider_thread_id, headers_json,
+         provider_thread_id, rfc_message_id, message_id_normalized,
+         in_reply_to, references_header, headers_json,
          deleted_in_provider, window_status, size_bytes
-       )
-       VALUES ($14, $1, $2, $3, $4, '${EVAL_NOW}'::timestamptz - ($5 * interval '1 day'),
-         $6, $7, $8, $9, $10, $11, $12, false, 'IN_WINDOW', $13)`,
+        )
+        VALUES ($18, $1, $2, $3, $4, '${EVAL_NOW}'::timestamptz - ($5 * interval '1 day'),
+          $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+          false, 'IN_WINDOW', $17)`,
       [
         accountId,
         message.folder,
@@ -128,6 +165,10 @@ async function seedCorpus(pool: PgPool, accountEmail: string): Promise<SeededCor
         message.toEmails,
         message.flags,
         message.providerThreadId,
+        message.rfcMessageId ?? null,
+        message.rfcMessageId?.replace(/^<|>$/g, "") ?? null,
+        message.inReplyTo ?? null,
+        message.referencesHeader ?? null,
         JSON.stringify(message.headersJson),
         message.sizeBytes ?? message.body.length,
         id
@@ -153,6 +194,110 @@ async function seedCorpus(pool: PgPool, accountEmail: string): Promise<SeededCor
       part += 1;
     }
   }
+
+  // Search quality must exercise the production reader contract, not the
+  // provider-thread compatibility path. Seed one complete, active projection
+  // from the corpus labels: the budget exchange is deliberately header-only,
+  // while two newsletters deliberately reuse one dangerous provider thread id
+  // but remain distinct protocol conversations.
+  const runResult = await pool.query<{ id: string }>(
+    `INSERT INTO public.imap_thread_runs (
+       account_id, algorithm_version, mode, status, stage, requested_by, reason,
+       summary, caught_up_revision, completed_at, activated_at
+     )
+     VALUES (
+       $1, $2, 'initial', 'active', 'ready', 'search-eval',
+       'durable search-eval ground truth',
+       $3::jsonb,
+       coalesce((SELECT revision FROM public.imap_thread_evidence_clock WHERE account_id = $1), 0),
+       now(), now()
+     )
+     RETURNING id`,
+    [
+      accountId,
+      THREADING_ALGORITHM_VERSION,
+      JSON.stringify({ source: "search-eval", corpus_messages: messages.length })
+    ]
+  );
+  const runId = runResult.rows[0].id;
+  const assignments = messages.map((message) => {
+    const messageId = uuidBySynthetic.get(message.id);
+    if (!messageId) throw new Error(`Missing seeded UUID for eval message: ${message.id}`);
+    const strictMessageId = extractMessageIdTokens(message.rfcMessageId ?? "")[0] ?? null;
+    const references = extractMessageIdTokens(message.referencesHeader ?? "");
+    const inReplyTo = extractMessageIdTokens(message.inReplyTo ?? "")[0] ?? null;
+    const parentReference = references.at(-1) ?? inReplyTo;
+    const rootReference = references[0] ?? inReplyTo ?? strictMessageId;
+    const conversationLabel = message.conversationLabel ?? message.id;
+    return {
+      message_id: messageId,
+      delivery_key: sha256(`supamail-eval-delivery:${message.id}`),
+      strict_message_id: strictMessageId,
+      strict_message_id_hash: strictMessageId ? sha256(`message-id\u0000${strictMessageId}`) : null,
+      conversation_id: evalConversationId(conversationLabel),
+      root_reference: rootReference,
+      root_reference_hash: rootReference ? sha256(`message-id\u0000${rootReference}`) : null,
+      parent_reference: parentReference,
+      parent_reference_hash: parentReference ? sha256(`message-id\u0000${parentReference}`) : null,
+      reference_ids: references.length > 0 ? references : inReplyTo ? [inReplyTo] : [],
+      reference_hashes: (references.length > 0 ? references : inReplyTo ? [inReplyTo] : [])
+        .map((reference) => sha256(`message-id\u0000${reference}`))
+        .sort(),
+      assignment_method: message.conversationLabel ? "references" : "standalone",
+      input_hash: sha256(`supamail-eval-input:${message.id}`),
+      evidence: {
+        source: "search-eval-ground-truth",
+        synthetic_id: message.id,
+        conversation_label: conversationLabel
+      }
+    };
+  });
+  await pool.query(
+    `WITH incoming AS (
+       SELECT *
+       FROM jsonb_to_recordset($1::jsonb) AS value(
+         message_id uuid, delivery_key text,
+         strict_message_id text, strict_message_id_hash text,
+         conversation_id text,
+         root_reference text, root_reference_hash text,
+         parent_reference text, parent_reference_hash text,
+         reference_ids text[], reference_hashes text[],
+         assignment_method text, input_hash text, evidence jsonb
+       )
+     )
+     INSERT INTO public.imap_thread_assignments (
+       run_id, message_id, account_id, delivery_key,
+       strict_message_id, strict_message_id_hash, conversation_id,
+       root_reference, root_reference_hash,
+       parent_reference, parent_reference_hash,
+       reference_ids, reference_hashes,
+       assignment_method, confidence, algorithm_version,
+       input_hash, generation, evidence
+     )
+     SELECT
+       $2, message_id, $3, delivery_key,
+       strict_message_id, strict_message_id_hash, conversation_id,
+       root_reference, root_reference_hash,
+       parent_reference, parent_reference_hash,
+       reference_ids, reference_hashes,
+       assignment_method, 'high', $4,
+       input_hash, 1, evidence
+     FROM incoming`,
+    [JSON.stringify(assignments), runId, accountId, THREADING_ALGORITHM_VERSION]
+  );
+  await pool.query(
+    `INSERT INTO public.imap_thread_state (
+       account_id, active_run_id, previous_run_id, building_run_id, paused_at, pause_reason
+     )
+     VALUES ($1, $2, NULL, NULL, NULL, NULL)
+     ON CONFLICT (account_id) DO UPDATE SET
+       active_run_id = EXCLUDED.active_run_id,
+       previous_run_id = NULL,
+       building_run_id = NULL,
+       paused_at = NULL,
+       pause_reason = NULL`,
+    [accountId, runId]
+  );
 
   const resolve: ResolveFn = (syntheticId) => {
     const uuid = uuidBySynthetic.get(syntheticId);
@@ -189,9 +334,7 @@ async function runArm(
     const missing = query.relevant.filter((sid) => !top10.has(resolve(sid)));
     const topFirstOk = query.topFirst ? resultUuids[0] === resolve(query.topFirst) : null;
 
-    const topResults = response.results.slice(0, 10);
-    const threadKeys = new Set(topResults.map((r) => r.thread.provider_thread_id ?? r.identity.id));
-    const distinctThreadRatio = topResults.length === 0 ? null : threadKeys.size / topResults.length;
+    const distinctThreadRatio = conversationDiversityRatio(response.results.slice(0, 10));
 
     perQuery.push({
       id: query.id,

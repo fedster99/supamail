@@ -5,13 +5,43 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 ## Identity And Storage
 
 - Message identity is scoped by `(account_id, folder_path, uidvalidity, uid)`.
-- This is mailbox-row identity only. Do not add CRM identity hydration, person/company resolution, handle mapping, or activity construction to SupaMail core.
+- This is physical mailbox-row identity. Do not conflate it with a delivered email or a protocol conversation.
+- An assignment belongs to an account, physical message, and algorithm run. Readers must use `imap_thread_active_assignments`, never choose an arbitrary assignment row.
+- `delivery_key` is the derived delivery-copy identity; `conversation_id` is the derived transitive reply-component identity. Both are account-scoped.
+- Do not add CRM identity hydration, person/company resolution, handle mapping, activity construction, semantic work-item clustering, or an epistemic layer to SupaMail core.
 - Never treat IMAP UID as globally unique.
 - Store raw and normalized Message-ID separately.
+- Preserve provider message/thread ID namespaces; provider IDs are opaque and not globally unique.
+- A complete, non-truncated raw MIME fetch may store `raw_mime_sha256` as copy evidence. Never hash a truncated body as if it proved delivery equality.
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.
 - Attachment metadata is stored during sync; binary attachment fetching is not part of the current core path.
 - Body backlog draining is capped per tick so recent-body work cannot consume the whole lock window forever.
 - Progress counters live on `imap_folders` and must be updated in the same write path as the underlying header/body state they summarize.
+
+## Conversation Threading
+
+- Thread assignments are a replaceable, deterministic projection. Never overwrite source headers or provider identity to force a desired conversation.
+- Parse only syntactically valid bracketed RFC Message-ID tokens for conversation truth. Compare canonical tokens case-sensitively; do not use the legacy lowercased `message_id_normalized` as the graph key.
+- Prefer valid `References`. Use the first valid `In-Reply-To` only when `References` has no usable ID. Ignore malformed tokens and conflicting weaker evidence rather than guessing.
+- A referenced but unmirrored Message-ID is a real provisional graph node. Preserve it so siblings group and a parent arriving later resolves the same component.
+- Ambiguous/reused Message-ID owners must never select an arbitrary parent. Prefer a false split over a false merge.
+- Provider thread IDs are namespaced, account-scoped membership hints. They may connect a component but never create a parent edge.
+- Subject fallback is last and narrow: only an otherwise standalone, human `Re:`; never a forward; exact normalized base subject; exact reciprocal sender/recipient crossing; prior root within 14 days; exactly one candidate.
+- Automated, bulk, and list mail never subject-merge. Content/body similarity is never protocol-conversation evidence.
+- Evaluate subject fallback only inside one complete, exact subject bucket. Skip and record buckets above the safety cap; never truncate one and treat it as complete.
+- Conversation reads and search deduplicate by delivery key. Whole-thread IMAP mutations must still fan out to every live physical row.
+- Soft-deleted rows remain graph evidence even though ordinary reads/search exclude them. Before hard retention removes one, enqueue every surviving component member and subject bucket across every live run; retain a pathological fan-out rather than leave known-stale survivors.
+- New/mutated threading inputs and newly recovered body evidence must enqueue idempotently for every active, candidate, and rollback run. Preserve both repository enqueueing and the database trigger: the latter is the rolling-deploy backstop for old writers. A drain expands the affected RFC/provider/prior-conversation closure and has hard row, evidence-byte, and criteria-key caps.
+- Mirror writes take `FOR SHARE` on `imap_thread_state`; build/activation/rollback take `FOR UPDATE`. Preserve this lock order and READ COMMITTED activation checks so activation sees a writer that committed while it waited. The evidence clock, caught-up revision, empty queues, coverage check, and current passing comparison certificate are all required before replacement activation.
+- A new threading release must retain the previous pure algorithm executor while that version can be active or standby. Register literal versions explicitly; worker startup and direct drain/rebuild/activation paths must fail fast when a state-referenced executor is absent. All state-referenced versions remain independently caught up; an old binary must never silently ignore or supersede a newer candidate.
+- Thread-run scheduling is persisted on `imap_thread_state`: active receives three weighted slots while standby and building each receive one. Preserve bounded progress for all available roles across restarts; sustained active ingress must not starve rollout or rollback work.
+- When an exact subject bucket grows past its cap, invalidate any existing `subject_fallback` assignments before marking it skipped. Ambiguity may split a weak conversation; it may never preserve a known stale false merge.
+- Initial builds, rebuilds, and algorithm upgrades are shadow runs. They keyset-scan bounded pages, drain changes that arrived during the scan, and stop at `ready`; they never switch readers automatically.
+- Activation requires complete physical-row coverage and empty catch-up queues, then swaps the active-run pointer atomically. A worker must reject a run newer than its compiled algorithm version without updating it.
+- Incremental drain and full rebuild must call the same pure, versioned algorithm. Repeating a computation over unchanged inputs must not create a material generation.
+- Material assignment changes require an operation row and per-message before/after history. Incremental rollback may reverse only the latest material operation in the active run. Activation rollback requires a caught-up standby. Both must record a rollback operation and pause automatic work pending a clean rebuild.
+- Assignment history must survive hard message and projection-run retention. Missing history or a missing current assignment makes rollback fail closed.
+- Thread work uses its own account-scoped session advisory lock. It does not authorize an IMAP command and must not borrow or weaken the IMAP account-lock contract.
 
 ## Concurrency And Connections
 

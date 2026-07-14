@@ -10,13 +10,12 @@ import { ATTACHMENTS_AGG, mapMessageRow, toolError, withReadOnlyTx } from "../sh
  * `read_thread` — reassemble a conversation from the mirror and return every
  * message in it, oldest first, with cleaned bodies and a flat attachments index.
  *
- * Seed by a `message_id` (any message in the thread) or directly by a
- * `thread_id` (`provider_thread_id`). When seeded by message id we follow I3's
- * one-hop references walk: the seed's `provider_thread_id` (when present), its
- * own id, and the normalized id-token set drawn from its
- * `references_header` + `in_reply_to` + `rfc_message_id`. This is a single hop —
- * it catches direct parents/children and provider-threaded siblings, not a full
- * transitive reference closure.
+ * Seed by a `message_id` (any message in the thread), a durable
+ * `conversation_id`, or the legacy provider `thread_id`. A message with a stored
+ * assignment resolves through the complete account-scoped conversation and
+ * mirrored delivery copies collapse to one deterministic representative. The
+ * old one-hop References walk remains only as a compatibility fallback for
+ * messages that have not been assigned yet.
  *
  * Read-only by construction (SELECTs inside {@link withReadOnlyTx}); never sends,
  * moves, or mutates mail.
@@ -24,6 +23,36 @@ import { ATTACHMENTS_AGG, mapMessageRow, toolError, withReadOnlyTx } from "../sh
 
 const DEFAULT_MAX_MESSAGES = 20;
 const MAX_MESSAGES_CEILING = 100;
+
+/**
+ * Collapse physical mailbox occurrences only when we have delivery-identity
+ * evidence. An active threading assignment is authoritative. During the
+ * pre-activation compatibility window we can still safely collapse a provider
+ * message id, or an RFC Message-ID paired with the exact complete raw-MIME
+ * digest. Everything else remains a distinct physical row rather than risking
+ * a false merge.
+ *
+ * The fallback keys are fixed-size hashes so sorting a hostile provider value
+ * cannot create an unbounded PostgreSQL sort key.
+ */
+const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
+  ta.delivery_key,
+  CASE
+    WHEN nullif(m.provider_message_id_namespace, '') IS NOT NULL
+      AND nullif(m.provider_message_id, '') IS NOT NULL
+      THEN 'provider:' || encode(extensions.digest(
+        m.provider_message_id_namespace || chr(31) || m.provider_message_id,
+        'sha256'
+      ), 'hex')
+    WHEN nullif(m.message_id_normalized, '') IS NOT NULL
+      AND b.raw_mime_sha256 IS NOT NULL
+      THEN 'rfc-body:' || encode(extensions.digest(
+        m.message_id_normalized || chr(31) || b.raw_mime_sha256,
+        'sha256'
+      ), 'hex')
+    ELSE 'physical:' || m.id::text
+  END
+)`;
 
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
@@ -33,6 +62,7 @@ const THREAD_SELECT = `
   m.account_id,
   m.folder_path,
   m.provider_thread_id,
+  ta.conversation_id,
   m.subject,
   m.from_email,
   m.from_name,
@@ -44,17 +74,30 @@ const THREAD_SELECT = `
   b.body_text,
   b.body_plain,
   b.selected_text_part,
-  ${ATTACHMENTS_AGG}
+  ${ATTACHMENTS_AGG},
+  stats.total_count AS thread_total_count,
+  stats.participants AS thread_participants
 `;
 
-type ThreadRow = MessageDetailRow;
+type ThreadRow = MessageDetailRow & {
+  conversation_id: string | null;
+  thread_total_count: number | string | null;
+  thread_participants: string[] | null;
+};
+
+interface FetchedThread {
+  rows: ThreadRow[];
+  totalCount: number;
+  participants: string[];
+}
 
 /** The seed message's threading fields. Aliased to the shared {@link ThreadSeedRow}
  * (CC-3) so read and write resolve the same seed shape. */
-type SeedRow = ThreadSeedRow;
+type SeedRow = ThreadSeedRow & { conversation_id: string | null };
 
 export interface ReadThreadArgs {
   message_id?: string;
+  conversation_id?: string;
   thread_id?: string;
   account?: string;
   include_quoted?: boolean;
@@ -63,13 +106,14 @@ export interface ReadThreadArgs {
 
 /**
  * Strict input schema for `read_thread` (matches the list_folders validate
- * pattern). Only `account` is a UUID; `thread_id` is a provider_thread_id
- * (free-form text), so it is NOT uuid-validated. The "message_id OR thread_id"
- * requirement is enforced separately so it returns a clearer hint.
+ * pattern). Only `account` is a UUID; provider and durable conversation ids are
+ * opaque text, so they are NOT uuid-validated. The selector requirement is
+ * enforced separately so it returns a clearer hint.
  */
 export const readThreadRequestSchema = z
   .object({
     message_id: z.string().optional(),
+    conversation_id: z.string().optional(),
     thread_id: z.string().optional(),
     account: z.string().uuid().optional(),
     include_quoted: z.boolean().optional(),
@@ -79,6 +123,7 @@ export const readThreadRequestSchema = z
 
 export interface ReadThreadResult {
   thread: {
+    conversation_id: string | null;
     provider_thread_id: string | null;
     subject: string | null;
     participants: string[];
@@ -95,13 +140,14 @@ export const readThreadDefinition: ToolDefinition = {
   title: "Read a full email thread (read-only)",
   description:
     "Reassemble and read a whole conversation from the SupaMail mirror. Provide either a " +
-    "message_id (any message in the thread, used as the seed) OR a thread_id " +
-    "(provider_thread_id). Returns the thread's messages oldest-first with cleaned plain-text " +
+    "message_id (any message in the thread, used as the seed), a durable conversation_id, " +
+    "or a legacy provider thread_id. Direct conversation/thread selectors require account. " +
+    "Returns the thread's messages oldest-first with cleaned plain-text " +
     "bodies (quoted reply tails and signatures stripped unless include_quoted=true), the " +
     "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
-    "ONE-HOP references walk (seed's provider_thread_id + its own id + the normalized " +
-    "Message-Id/In-Reply-To/References tokens) — it catches direct parents, children, and " +
-    "provider-threaded siblings, not a full transitive reference closure. Capped to " +
+    "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
+    "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
+    "provider-threaded siblings only when the seed has no stored assignment. Capped to " +
     "max_messages (default 20), keeping the NEWEST when over the cap; omitted_message_count " +
     "reports how many were dropped. READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
@@ -113,15 +159,23 @@ export const readThreadDefinition: ToolDefinition = {
   inputSchema: {
     type: "object",
     additionalProperties: false,
-    anyOf: [{ required: ["message_id"] }, { required: ["thread_id"] }],
+    anyOf: [
+      { required: ["message_id"] },
+      { required: ["conversation_id", "account"] },
+      { required: ["thread_id", "account"] }
+    ],
     properties: {
       message_id: {
         type: "string",
         description: "A message UUID to seed the thread from (any message in the conversation)."
       },
+      conversation_id: {
+        type: "string",
+        description: "A durable SupaMail conversation_id; account is required because ids are account-scoped."
+      },
       thread_id: {
         type: "string",
-        description: "A provider_thread_id to select the thread directly (alternative to message_id)."
+        description: "A legacy provider_thread_id; account is required because provider ids are not globally unique."
       },
       account: {
         type: "string",
@@ -160,42 +214,183 @@ function collectParticipants(rows: ThreadRow[]): string[] {
   return out;
 }
 
+/**
+ * Count the full logical conversation and collect its participants, but hydrate
+ * bodies/attachments for only the newest requested deliveries. The final SELECT
+ * restores oldest-first order for the public response.
+ */
+function boundedThreadCtes(limitParameter: string): string {
+  return `,
+    thread_stats AS (
+      SELECT
+        (SELECT count(*)::int FROM delivery_representatives) AS total_count,
+        coalesce((
+          SELECT array_agg(first_participant.email ORDER BY
+            first_participant.internal_date,
+            first_participant.message_id,
+            first_participant.ordinality
+          )
+          FROM (
+            SELECT DISTINCT ON (lower(participant.email))
+              participant.email,
+              m.internal_date,
+              m.id AS message_id,
+              participant.ordinality
+            FROM delivery_representatives representative
+            JOIN public.imap_messages m ON m.id = representative.id
+            CROSS JOIN LATERAL unnest(
+              ARRAY[m.from_email]::text[]
+              || coalesce(m.to_emails, '{}'::text[])
+              || coalesce(m.cc_emails, '{}'::text[])
+            ) WITH ORDINALITY AS participant(email, ordinality)
+            WHERE nullif(participant.email, '') IS NOT NULL
+            ORDER BY
+              lower(participant.email),
+              m.internal_date,
+              m.id,
+              participant.ordinality
+          ) first_participant
+        ), '{}'::text[]) AS participants
+    ),
+    limited_representatives AS (
+      SELECT representative.id
+      FROM delivery_representatives representative
+      JOIN public.imap_messages m ON m.id = representative.id
+      ORDER BY m.internal_date DESC, m.id DESC
+      LIMIT ${limitParameter}
+    )`;
+}
+
+function summarizeFetchedRows(rows: ThreadRow[]): FetchedThread {
+  const totalCount = Number(rows[0]?.thread_total_count ?? rows.length);
+  return {
+    rows,
+    totalCount: Number.isFinite(totalCount) ? totalCount : rows.length,
+    participants: rows[0]?.thread_participants ?? collectParticipants(rows)
+  };
+}
+
 async function fetchThreadRows(
   client: PgClient,
-  selector: { kind: "thread"; threadId: string; accountId: string | null } | { kind: "keys"; seed: SeedRow }
-): Promise<ThreadRow[]> {
-  if (selector.kind === "thread") {
+  selector:
+    | { kind: "conversation"; conversationId: string; accountId: string }
+    | { kind: "provider-thread"; threadId: string; accountId: string }
+    | { kind: "keys"; seed: SeedRow },
+  maxMessages: number
+): Promise<FetchedThread> {
+  if (selector.kind === "conversation") {
     const result = await client.query<ThreadRow>(
       `
+      WITH delivery_representatives AS (
+        SELECT DISTINCT ON (assignment.delivery_key)
+          m.id
+        FROM public.imap_thread_active_assignments assignment
+        JOIN public.imap_messages m
+          ON m.id = assignment.message_id
+         AND m.account_id = assignment.account_id
+        WHERE assignment.account_id = $1
+          AND assignment.conversation_id = $2
+          AND m.deleted_in_provider = false
+        ORDER BY
+          assignment.delivery_key,
+          (m.body_fetched_at IS NOT NULL) DESC,
+          m.folder_path ASC,
+          m.id ASC
+      )${boundedThreadCtes("$3")}
       SELECT ${THREAD_SELECT}
-      FROM public.imap_messages m
+      FROM limited_representatives representative
+      JOIN public.imap_messages m ON m.id = representative.id
+      LEFT JOIN public.imap_thread_active_assignments ta
+        ON ta.message_id = m.id
+       AND ta.account_id = m.account_id
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-      WHERE m.provider_thread_id = $1
-        AND ($2::uuid IS NULL OR m.account_id = $2)
-        AND m.deleted_in_provider = false
+      CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
       `,
-      [selector.threadId, selector.accountId]
+      [selector.accountId, selector.conversationId, maxMessages]
     );
-    return result.rows;
+    return summarizeFetchedRows(result.rows);
+  }
+
+  if (selector.kind === "provider-thread") {
+    const result = await client.query<ThreadRow>(
+      `
+      WITH delivery_representatives AS (
+        SELECT DISTINCT ON (m.account_id, ${DELIVERY_REPRESENTATIVE_KEY})
+          m.id
+        FROM public.imap_messages m
+        LEFT JOIN public.imap_thread_active_assignments ta
+          ON ta.message_id = m.id
+         AND ta.account_id = m.account_id
+        LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+        WHERE m.provider_thread_id = $1
+          AND m.account_id = $2
+          AND m.deleted_in_provider = false
+        ORDER BY
+          m.account_id,
+          ${DELIVERY_REPRESENTATIVE_KEY},
+          (m.body_fetched_at IS NOT NULL) DESC,
+          m.folder_path ASC,
+          m.id ASC
+      )${boundedThreadCtes("$3")}
+      SELECT ${THREAD_SELECT}
+      FROM limited_representatives representative
+      JOIN public.imap_messages m ON m.id = representative.id
+      LEFT JOIN public.imap_thread_active_assignments ta
+        ON ta.message_id = m.id
+       AND ta.account_id = m.account_id
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+      CROSS JOIN thread_stats stats
+      ORDER BY m.internal_date ASC, m.id ASC
+      `,
+      [selector.threadId, selector.accountId, maxMessages]
+    );
+    return summarizeFetchedRows(result.rows);
   }
 
   const seed = selector.seed;
-  // Shared one-hop membership walk (CC-3, thread-walk.ts): the normalized key set,
+  // Shared one-hop membership walk (CC-3, thread-walk.ts): the strict,
+  // case-preserving bracketed token set,
   // the WHERE predicate, and the oldest-first ORDER are single-sourced so this read
   // surface and the write fan-out (resolveThreadTargets) can never diverge on "what
   // is in a thread." This SELECT keeps its OWN columns + body JOIN (alias `m`).
   const keys = threadSeedKeys(seed);
   const result = await client.query<ThreadRow>(
     `
+    WITH legacy_candidates AS (
+      SELECT m.id
+      FROM public.imap_messages m
+      WHERE ${threadMembershipClause("m")}
+    ),
+    delivery_representatives AS (
+      SELECT DISTINCT ON (m.account_id, ${DELIVERY_REPRESENTATIVE_KEY})
+        m.id
+      FROM legacy_candidates candidate
+      JOIN public.imap_messages m ON m.id = candidate.id
+      LEFT JOIN public.imap_thread_active_assignments ta
+        ON ta.message_id = m.id
+       AND ta.account_id = m.account_id
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+      ORDER BY
+        m.account_id,
+        ${DELIVERY_REPRESENTATIVE_KEY},
+        (m.body_fetched_at IS NOT NULL) DESC,
+        m.folder_path ASC,
+        m.id ASC
+    )${boundedThreadCtes("$5")}
     SELECT ${THREAD_SELECT}
-    FROM public.imap_messages m
+    FROM limited_representatives representative
+    JOIN public.imap_messages m ON m.id = representative.id
+    LEFT JOIN public.imap_thread_active_assignments ta
+      ON ta.message_id = m.id
+     AND ta.account_id = m.account_id
     LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-    WHERE ${threadMembershipClause("m")}
+    CROSS JOIN thread_stats stats
+    ORDER BY m.internal_date ASC, m.id ASC
     `,
-    [seed.account_id, seed.provider_thread_id, seed.id, keys]
+    [seed.account_id, seed.provider_thread_id, seed.id, keys, maxMessages]
   );
-  return result.rows;
+  return summarizeFetchedRows(result.rows);
 }
 
 export async function runReadThread(pool: PgPool, args: unknown): Promise<ReadThreadResult | ReturnType<typeof toolError>> {
@@ -206,44 +401,69 @@ export async function runReadThread(pool: PgPool, args: unknown): Promise<ReadTh
     return toolError(
       "invalid_input",
       error instanceof Error ? error.message : "Invalid arguments.",
-      "Pass message_id (any message in the thread) or thread_id (provider_thread_id); account must be a UUID."
+      "Pass message_id, or pass conversation_id/thread_id together with the account UUID."
     );
   }
 
   const messageId = typeof input.message_id === "string" ? input.message_id : undefined;
+  const conversationId = typeof input.conversation_id === "string" ? input.conversation_id : undefined;
   const threadId = typeof input.thread_id === "string" ? input.thread_id : undefined;
 
-  if (!messageId && !threadId) {
+  if (!messageId && !conversationId && !threadId) {
     return toolError(
       "invalid_input",
-      "read_thread requires message_id or thread_id.",
-      "Pass message_id (any message in the thread) or thread_id (provider_thread_id)."
+      "read_thread requires message_id, conversation_id, or thread_id.",
+      "Pass message_id, or pass conversation_id/thread_id together with account."
     );
   }
 
   const includeQuoted = input.include_quoted === true;
   const accountScope = typeof input.account === "string" ? input.account : null;
+  if ((conversationId || threadId) && !accountScope) {
+    return toolError(
+      "invalid_input",
+      `${conversationId ? "conversation_id" : "thread_id"} requires account.`,
+      "Provider and conversation identifiers are account-scoped; pass account as a UUID."
+    );
+  }
   // Number.isFinite guards NaN/Infinity so the newest-keeping cap is never
   // silently disabled; non-finite falls back to the default.
   const requestedMax = Number.isFinite(input.max_messages as number) ? (input.max_messages as number) : DEFAULT_MAX_MESSAGES;
   const maxMessages = Math.max(1, Math.min(MAX_MESSAGES_CEILING, Math.floor(requestedMax)));
 
   return withReadOnlyTx(pool, async (client) => {
-    let rows: ThreadRow[];
+    let fetched: FetchedThread;
     let accountIds: string[] | null;
 
-    if (threadId) {
-      rows = await fetchThreadRows(client, { kind: "thread", threadId, accountId: accountScope });
-      accountIds = accountScope ? [accountScope] : null;
+    let resolvedConversationId: string | null = conversationId ?? null;
+
+    if (conversationId) {
+      fetched = await fetchThreadRows(client, {
+        kind: "conversation",
+        conversationId,
+        accountId: accountScope!
+      }, maxMessages);
+      accountIds = [accountScope!];
+    } else if (threadId) {
+      fetched = await fetchThreadRows(client, {
+        kind: "provider-thread",
+        threadId,
+        accountId: accountScope!
+      }, maxMessages);
+      accountIds = [accountScope!];
     } else {
       const seedResult = await client.query<SeedRow>(
         `
         SELECT id, provider_thread_id, rfc_message_id, message_id_normalized,
-               in_reply_to, references_header, account_id
-        FROM public.imap_messages
-        WHERE id = $1
-          AND ($2::uuid IS NULL OR account_id = $2)
-          AND deleted_in_provider = false
+               in_reply_to, references_header, m.account_id,
+               assignment.conversation_id
+        FROM public.imap_messages m
+        LEFT JOIN public.imap_thread_active_assignments assignment
+          ON assignment.message_id = m.id
+         AND assignment.account_id = m.account_id
+        WHERE m.id = $1
+          AND ($2::uuid IS NULL OR m.account_id = $2)
+          AND m.deleted_in_provider = false
         `,
         [messageId, accountScope]
       );
@@ -255,33 +475,60 @@ export async function runReadThread(pool: PgPool, args: unknown): Promise<ReadTh
           "Check the message_id (a UUID from search_email) or scope account. The message may be deleted in the provider."
         );
       }
-      rows = await fetchThreadRows(client, { kind: "keys", seed });
+      if (seed.conversation_id) {
+        resolvedConversationId = seed.conversation_id;
+        fetched = await fetchThreadRows(client, {
+          kind: "conversation",
+          conversationId: seed.conversation_id,
+          accountId: seed.account_id
+        }, maxMessages);
+      } else {
+        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages);
+      }
       accountIds = [seed.account_id];
+    }
+
+    if (fetched.rows.length === 0 && (conversationId || threadId)) {
+      const selector = conversationId ? "conversation_id" : "thread_id";
+      const value = conversationId ?? threadId;
+      return toolError(
+        "not_found",
+        `No thread found for ${selector} ${value}.`,
+        "Check the identifier and account scope. The conversation may have no live messages remaining."
+      );
     }
 
     // sync_trust computed inside the open tx (buildSyncTrust) to avoid a second connection; syncTrustFor is the standalone equivalent.
     const syncTrust = await buildSyncTrust(client, accountIds);
 
-    const totalCount = rows.length;
-    // Cap keeping the NEWEST messages, then restore ascending (oldest-first) order.
-    const kept = totalCount > maxMessages ? rows.slice(totalCount - maxMessages) : rows;
-    const omitted = totalCount - kept.length;
+    const rows = fetched.rows;
+    const totalCount = fetched.totalCount;
+    // SQL already keeps the newest messages; retain a defensive cap for injected
+    // test clients and restore no additional database work in production.
+    const kept = rows.length > maxMessages ? rows.slice(rows.length - maxMessages) : rows;
+    const omitted = Math.max(0, totalCount - kept.length);
 
     const messages = kept.map((row) => mapMessageRow(row, { includeQuoted }));
     const attachmentsIndex = messages.flatMap((message) =>
       message.attachments.map((att) => ({ message_id: message.message_id, ...att }))
     );
 
-    // Representative subject = the newest message's; thread handle = its provider_thread_id.
+    // Representative subject + provider handle come from the newest logical delivery.
+    // A legacy selector may still discover a unanimous stored conversation id.
     const newest = rows[rows.length - 1];
     const providerThreadId = newest?.provider_thread_id ?? (threadId ?? null);
+    if (!resolvedConversationId) {
+      const assignedIds = new Set(rows.map((row) => row.conversation_id).filter((id): id is string => Boolean(id)));
+      if (assignedIds.size === 1) resolvedConversationId = [...assignedIds][0];
+    }
     const subject = newest?.subject ?? null;
 
     return {
       thread: {
+        conversation_id: resolvedConversationId,
         provider_thread_id: providerThreadId,
         subject,
-        participants: collectParticipants(rows),
+        participants: fetched.participants,
         message_count: totalCount
       },
       messages,

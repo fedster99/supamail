@@ -81,7 +81,6 @@ function messageMetadata(uid: number, overrides: Partial<MessageMetadata> = {}):
     flags: ["\\Seen"],
     rfcMessageId: `<metadata-${uid}@example.test>`,
     messageIdNormalized: `metadata-${uid}@example.test`,
-    providerThreadId: null,
     inReplyTo: null,
     referencesHeader: null,
     subject: `metadata-${uid}`,
@@ -95,7 +94,11 @@ function messageMetadata(uid: number, overrides: Partial<MessageMetadata> = {}):
     headersJson: { "message-id": `<metadata-${uid}@example.test>` },
     mimeStructure: null,
     attachments: [],
-    ...overrides
+    ...overrides,
+    providerMessageId: overrides.providerMessageId ?? null,
+    providerMessageIdNamespace: overrides.providerMessageIdNamespace ?? null,
+    providerThreadId: overrides.providerThreadId ?? null,
+    providerThreadIdNamespace: overrides.providerThreadIdNamespace ?? null
   };
 }
 

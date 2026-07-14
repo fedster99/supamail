@@ -1,0 +1,143 @@
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+
+interface Manifest {
+  migrations: Array<{ id: string; file: string }>;
+}
+
+const { Client } = pg;
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) throw new Error("DATABASE_URL is required");
+
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationDir = resolve(here, "../supabase/migrations/public");
+const manifest = JSON.parse(
+  await readFile(resolve(migrationDir, "manifest.json"), "utf8")
+) as Manifest;
+const threadingIndex = manifest.migrations.findIndex((migration) => migration.id === "0014_conversation_threading");
+if (threadingIndex < 1) throw new Error("0014_conversation_threading must follow the legacy schema");
+
+const databaseName = `sm_thread_upgrade_${process.pid}_${randomUUID().slice(0, 8)}`.replace(/-/g, "_");
+const quotedDatabaseName = `"${databaseName}"`;
+const admin = new Client({ connectionString: databaseUrl });
+const targetUrl = new URL(databaseUrl);
+targetUrl.pathname = `/${databaseName}`;
+const target = new Client({ connectionString: targetUrl.toString() });
+
+async function applyFiles(files: Array<{ file: string }>): Promise<void> {
+  for (const migration of files) {
+    await target.query(await readFile(resolve(migrationDir, migration.file), "utf8"));
+  }
+}
+
+await admin.connect();
+try {
+  await admin.query(`CREATE DATABASE ${quotedDatabaseName} TEMPLATE template0`);
+  await target.connect();
+  try {
+    await applyFiles(manifest.migrations.slice(0, threadingIndex));
+    const account = await target.query<{ id: string }>(
+      `INSERT INTO public.imap_accounts (
+         email_address, host, port, username, encrypted_password
+       ) VALUES ('populated-upgrade@example.test', 'imap.example.test', 993,
+                 'populated-upgrade@example.test', decode('00', 'hex'))
+       RETURNING id`
+    );
+    await target.query(
+      `INSERT INTO public.imap_messages (
+         account_id, folder_path, uidvalidity, uid, internal_date,
+         rfc_message_id, message_id_normalized, subject, headers_json,
+         window_status, size_bytes
+       )
+       SELECT $1, 'INBOX', 101, value,
+              timestamptz '2026-01-01 00:00:00+00' + value * interval '1 second',
+              '<legacy-' || value || '@example.test>',
+              'legacy-' || value || '@example.test',
+              'Legacy message ' || value,
+              jsonb_build_object('message-id', '<legacy-' || value || '@example.test>'),
+              'IN_WINDOW', 0
+       FROM generate_series(1, 5000) AS value`,
+      [account.rows[0].id]
+    );
+    await target.query(
+      `INSERT INTO public.imap_message_bodies (
+         message_id, raw_mime, raw_bytes, raw_truncated,
+         body_text, headers_json
+       )
+       SELECT id, NULL, 0, false, 'legacy parsed-only body', '{}'::jsonb
+       FROM public.imap_messages
+       WHERE account_id = $1`,
+      [account.rows[0].id]
+    );
+
+    const startedAt = performance.now();
+    const threadingMigration = manifest.migrations[threadingIndex];
+    await applyFiles([threadingMigration]);
+    await applyFiles([threadingMigration]);
+    const elapsedMs = Math.round(performance.now() - startedAt);
+
+    const result = await target.query<{
+      messages: string;
+      bodies: string;
+      states: string;
+      runs: string;
+      provider_values: string;
+      body_hashes: string;
+      invalid_constraints: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::text FROM public.imap_messages WHERE account_id = $1) AS messages,
+         (SELECT count(*)::text FROM public.imap_message_bodies body
+          JOIN public.imap_messages message ON message.id = body.message_id
+          WHERE message.account_id = $1) AS bodies,
+         (SELECT count(*)::text FROM public.imap_thread_state WHERE account_id = $1) AS states,
+         (SELECT count(*)::text FROM public.imap_thread_runs WHERE account_id = $1) AS runs,
+         (SELECT count(*)::text FROM public.imap_messages
+          WHERE account_id = $1 AND (
+            provider_message_id IS NOT NULL OR provider_message_id_namespace IS NOT NULL
+            OR provider_thread_id_namespace IS NOT NULL
+          )) AS provider_values,
+         (SELECT count(*)::text FROM public.imap_message_bodies body
+          JOIN public.imap_messages message ON message.id = body.message_id
+          WHERE message.account_id = $1 AND body.raw_mime_sha256 IS NOT NULL) AS body_hashes,
+         (SELECT count(*)::text FROM pg_constraint
+          WHERE conname IN (
+            'imap_messages_provider_message_identity_check',
+            'imap_messages_provider_thread_namespace_check',
+            'imap_message_bodies_raw_mime_sha256_check'
+          ) AND convalidated) AS invalid_constraints`,
+      [account.rows[0].id]
+    );
+    const observed = result.rows[0];
+    const expected = {
+      messages: "5000",
+      bodies: "5000",
+      states: "0",
+      runs: "0",
+      provider_values: "0",
+      body_hashes: "0",
+      invalid_constraints: "0"
+    };
+    if (JSON.stringify(observed) !== JSON.stringify(expected)) {
+      throw new Error(`Populated threading migration changed legacy data: ${JSON.stringify(observed)}`);
+    }
+    console.log(JSON.stringify({
+      event: "threading.populated_migration.passed",
+      rows: 5000,
+      elapsedMs
+    }));
+  } finally {
+    await target.end().catch(() => undefined);
+  }
+} finally {
+  await admin.query(
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE datname = $1 AND pid <> pg_backend_pid()`,
+    [databaseName]
+  ).catch(() => undefined);
+  await admin.query(`DROP DATABASE IF EXISTS ${quotedDatabaseName}`).catch(() => undefined);
+  await admin.end().catch(() => undefined);
+}

@@ -36,6 +36,7 @@
     "migrate": "tsx src/cli.ts migrate",
     "test": "vitest run",
     "test:db:live": "tsx scripts/test-db-live.ts",
+    "test:migration:threading-upgrade": "tsx scripts/test-threading-migration-upgrade.ts",
     "test:watch": "vitest"
   },
   "dependencies": {
