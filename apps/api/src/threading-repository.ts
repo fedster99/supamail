@@ -150,6 +150,16 @@ interface ClosureLimits {
   maxCriteriaKeys: number;
 }
 
+type AttemptedThreadWork = (ids: string[], canSubdivide: boolean) => void;
+
+function adaptiveClosureBatchSize(run: ThreadRun, requestedBatchSize: number): number {
+  const stored = run.summary.adaptive_closure_batch_size;
+  const parsed = typeof stored === "number" ? stored : Number(stored);
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? Math.min(requestedBatchSize, parsed)
+    : requestedBatchSize;
+}
+
 export interface ThreadingRunResult {
   accountId: string;
   runId: string | null;
@@ -840,6 +850,7 @@ export class ThreadingRepository {
     ));
     let failedRun: ThreadRun | null = null;
     let attemptedIds: string[] = [];
+    let attemptedCanSubdivide = false;
 
     const result = await this.withAccountLock(accountId, async (client) => {
         // This pass deliberately runs before the thread-state transaction. A
@@ -954,6 +965,11 @@ export class ThreadingRepository {
             return this.emptyResult(accountId);
           }
           failedRun = run;
+          const closureBatchSize = adaptiveClosureBatchSize(run, batchSize);
+          const attempted: AttemptedThreadWork = (ids, canSubdivide) => {
+            attemptedIds = ids;
+            attemptedCanSubdivide = canSubdivide;
+          };
           if (run.available_at > new Date()) {
             await client.query("COMMIT");
             return this.resultForRun(accountId, run, { busy: true });
@@ -964,11 +980,11 @@ export class ThreadingRepository {
             processed = await this.processLiveRun(
               client,
               run,
-              batchSize,
+              closureBatchSize,
               closureLimits,
               maxSubjectBucketMessages,
               options.requestedBy ?? "thread-worker",
-              (ids) => { attemptedIds = ids; }
+              attempted
             );
           } else if (run.stage === "body_evidence") {
             processed = await this.processBodyEvidencePage(
@@ -982,10 +998,10 @@ export class ThreadingRepository {
             processed = await this.processStrongPage(
               client,
               run,
-              batchSize,
+              closureBatchSize,
               closureLimits,
               options.requestedBy ?? "thread-worker",
-              (ids) => { attemptedIds = ids; }
+              attempted
             );
           } else if (run.stage === "subject") {
             processed = await this.processSubjectWork(
@@ -995,17 +1011,17 @@ export class ThreadingRepository {
               closureLimits,
               maxSubjectBucketMessages,
               options.requestedBy ?? "thread-worker",
-              (ids) => { attemptedIds = ids; }
+              attempted
             );
           } else {
             processed = await this.processCatchup(
               client,
               run,
-              batchSize,
+              closureBatchSize,
               closureLimits,
               maxSubjectBucketMessages,
               options.requestedBy ?? "thread-worker",
-              (ids) => { attemptedIds = ids; }
+              attempted
             );
           }
 
@@ -1028,7 +1044,8 @@ export class ThreadingRepository {
               failedRun,
               attemptedIds,
               error,
-              options.requestedBy ?? "thread-worker"
+              options.requestedBy ?? "thread-worker",
+              attemptedCanSubdivide
             );
           }
           throw error;
@@ -2210,7 +2227,7 @@ export class ThreadingRepository {
     batchSize: number,
     closureLimits: ClosureLimits,
     requestedBy: string,
-    attempted: (ids: string[]) => void
+    attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
     const page = await this.loadPhysicalPage(client, run, batchSize);
     if (page.length === 0) {
@@ -2218,7 +2235,7 @@ export class ThreadingRepository {
       return this.resultForRun(run.account_id, next);
     }
     const seedIds = page.map((row) => row.id);
-    attempted(seedIds);
+    attempted(seedIds, true);
     const closure = await this.expandClosure(client, run, seedIds, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: false });
     const persisted = await this.persistAssignments(client, run, assignments, closure.inputs, {
@@ -2249,7 +2266,7 @@ export class ThreadingRepository {
     closureLimits: ClosureLimits,
     maxBucket: number,
     requestedBy: string,
-    attempted: (ids: string[]) => void
+    attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
     const prunedInert = await this.pruneInertSubjectWork(client, run, batchSize);
     if (prunedInert > 0) {
@@ -2308,7 +2325,7 @@ export class ThreadingRepository {
       );
       if (staleWeak.rows.length > 0) {
         const staleIds = staleWeak.rows.map((row) => row.message_id);
-        attempted(staleIds);
+        attempted(staleIds, false);
         const closure = await this.expandClosure(client, run, staleIds, {
           ...closureLimits,
           maxMessages: Math.max(closureLimits.maxMessages, maxBucket)
@@ -2364,7 +2381,7 @@ export class ThreadingRepository {
       });
     }
     const ids = members.rows.map((row) => row.message_id);
-    attempted(ids);
+    attempted(ids, false);
     const closure = await this.expandClosure(client, run, ids, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: true });
     const operationType = run.status === "building" ? "build_batch" : "incremental";
@@ -2396,7 +2413,7 @@ export class ThreadingRepository {
     closureLimits: ClosureLimits,
     maxBucket: number,
     requestedBy: string,
-    attempted: (ids: string[]) => void
+    attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
     if (await this.runHasReadyQueue(client, run.id)) {
       return this.processDirtyQueue(client, run, batchSize, closureLimits, requestedBy, attempted);
@@ -2419,7 +2436,7 @@ export class ThreadingRepository {
     closureLimits: ClosureLimits,
     maxBucket: number,
     requestedBy: string,
-    attempted: (ids: string[]) => void
+    attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
     if (await this.runHasReadyQueue(client, run.id)) {
       return this.processDirtyQueue(client, run, batchSize, closureLimits, requestedBy, attempted);
@@ -2440,7 +2457,7 @@ export class ThreadingRepository {
     batchSize: number,
     closureLimits: ClosureLimits,
     requestedBy: string,
-    attempted: (ids: string[]) => void
+    attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
     const work = await client.query<{ message_id: string }>(
       `SELECT message_id FROM public.imap_thread_work_queue
@@ -2450,7 +2467,7 @@ export class ThreadingRepository {
     );
     const ids = work.rows.map((row) => row.message_id);
     if (ids.length === 0) return this.resultForRun(run.account_id, run);
-    attempted(ids);
+    attempted(ids, true);
     const closure = await this.expandClosure(client, run, ids, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: false });
     const persisted = await this.persistAssignments(client, run, assignments, closure.inputs, {
@@ -3273,24 +3290,39 @@ export class ThreadingRepository {
     run: ThreadRun,
     messageIds: string[],
     error: unknown,
-    requestedBy: string
+    requestedBy: string,
+    canSubdivide: boolean
   ): Promise<void> {
     const reason = sanitizedFailure(error);
+    const adaptiveBatchSize = canSubdivide && messageIds.length > 1 && (
+      error instanceof ThreadingClosureLimitError || error instanceof ThreadingEvidenceLimitError
+    )
+      ? Math.max(1, Math.floor(messageIds.length / 2))
+      : null;
     try {
       await client.query("BEGIN");
       const updated = await client.query<{ id: string }>(
         `UPDATE public.imap_thread_runs
          SET attempts = attempts + 1,
-             available_at = now() + make_interval(
-               secs => least(3600, (5 * power(2, least(attempts, 10)))::integer)
-             ),
-             last_error = $2
+             available_at = CASE WHEN $6::integer IS NOT NULL
+               THEN now() + interval '5 seconds'
+               ELSE now() + make_interval(
+                 secs => least(3600, (5 * power(2, least(attempts, 10)))::integer)
+               )
+             END,
+             last_error = $2,
+             summary = CASE WHEN $6::integer IS NULL THEN summary ELSE jsonb_set(
+               summary,
+               '{adaptive_closure_batch_size}',
+               to_jsonb($6::integer),
+               true
+             ) END
          WHERE id = $1
            AND account_id = $3
            AND algorithm_version = $4
            AND status = $5
          RETURNING id`,
-        [run.id, reason, run.account_id, run.algorithm_version, run.status]
+        [run.id, reason, run.account_id, run.algorithm_version, run.status, adaptiveBatchSize]
       );
       if (!updated.rows[0]) {
         await client.query("ROLLBACK");
@@ -3309,12 +3341,15 @@ export class ThreadingRepository {
           ON CONFLICT (run_id, message_id) DO UPDATE SET
             reason = 'threading_retry',
             attempts = public.imap_thread_work_queue.attempts + 1,
-            available_at = now() + make_interval(
-              secs => least(3600, (5 * power(2, least(public.imap_thread_work_queue.attempts, 10)))::integer)
-            ),
+            available_at = CASE WHEN $5::integer IS NOT NULL
+              THEN now() + interval '5 seconds'
+              ELSE now() + make_interval(
+                secs => least(3600, (5 * power(2, least(public.imap_thread_work_queue.attempts, 10)))::integer)
+              )
+            END,
             last_error = EXCLUDED.last_error
           `,
-          [run.id, run.account_id, messageIds, reason]
+          [run.id, run.account_id, messageIds, reason, adaptiveBatchSize]
         );
       }
       await this.insertOperation(client, {
@@ -3323,7 +3358,11 @@ export class ThreadingRepository {
         requestedBy,
         reason: "threading processing failed",
         status: "failed",
-        summary: { error: reason, messages_attempted: messageIds.length }
+        summary: {
+          error: reason,
+          messages_attempted: messageIds.length,
+          adaptive_retry_batch_size: adaptiveBatchSize
+        }
       });
       await client.query("COMMIT");
     } catch {
