@@ -49,7 +49,7 @@ The lanes are conceptual scheduling phases, not separate state machines. Each ph
 
 A new account is considered "onboarded" when live-window metadata (headers + envelopes + flags + folder state) is complete. Bodies and history fill in progressively. This commits to honest framing in product copy and in the API contract.
 
-- `sync_state = 'HEALTHY'` requires: live-window headers complete, priority-folder bodies current, reconcile clean. History lane *completeness* does not affect `sync_state` (an account is not DEGRADED for incomplete backfill); a history-lane *error*, like any lane error, still counts toward the run outcome.
+- `sync_state = 'HEALTHY'` requires: live-window headers complete, priority-folder bodies current, reconcile clean. Reconcile cleanliness describes the post-pass mirror: gap counts preserve evidence of drift observed before the pass, but drift fully repaired in that pass is clean. Overflowed, interrupted, or otherwise incomplete repair remains unclean and retries on the next full-sync cadence. History lane *completeness* does not affect `sync_state` (an account is not DEGRADED for incomplete backfill); a history-lane *error*, like any lane error, still counts toward the run outcome.
 - Search lives downstream of SupaMail. SupaMail's job is to surface completeness clearly so search consumers can degrade gracefully. SupaMail does not implement search.
 - `live_window_days` is immutable after account creation in v0.1. Changing it requires a migration story we haven't built.
 

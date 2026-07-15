@@ -45,6 +45,7 @@ const DEFAULT_METADATA_WRITE_TIMEOUT_MS = 5 * 60_000;
 const LIVE_THREAD_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const PURGE_MESSAGE_BATCH_SIZE = 100;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
+const RECONCILE_MISSING_UID_LIMIT = 5_000;
 const MIME_EVIDENCE_EXTRACTOR = "mime_body";
 const MIME_EVIDENCE_EXTRACTOR_VERSION = "mime_evidence_v1";
 const MAX_MESSAGE_EVIDENCE_ROWS = 100;
@@ -1880,7 +1881,12 @@ export class MirrorRepository {
           ELSE next_flag_scan_at
         END,
         next_reconcile_at = CASE
-          WHEN $6::boolean IS NOT NULL
+          -- A completed clean reconcile returns to the normal six-hour
+          -- cadence. An incomplete bounded repair must retry on the next full
+          -- sync cadence instead of pinning degraded health for six hours.
+          WHEN $6::boolean = false
+            THEN now() + ($13::bigint * interval '1 millisecond')
+          WHEN $6::boolean = true
             THEN now()
               + ($10::bigint * interval '1 millisecond')
               + ((random() * 900000)::int * interval '1 millisecond')
@@ -2879,7 +2885,12 @@ export class MirrorRepository {
     uidValidity: number,
     liveUids: AsyncIterable<number>,
     options: { failIfEmpty?: boolean; emptyError?: string; batchSize?: number } = {}
-  ): Promise<{ markedCount: number; liveUidCount: number; missingInDbUids: number[] }> {
+  ): Promise<{
+    markedCount: number;
+    liveUidCount: number;
+    missingInDbUids: number[];
+    missingInDbTruncated: boolean;
+  }> {
     const batchSize = options.batchSize ?? 10_000;
     const client = await this.pool.connect();
     const batch: number[] = [];
@@ -2952,16 +2963,19 @@ export class MirrorRepository {
             AND m.deleted_in_provider = false
         )
         ORDER BY live.uid DESC
-        LIMIT 5000
+        LIMIT $4
         `,
-        [accountId, folder.path, uidValidity]
+        [accountId, folder.path, uidValidity, RECONCILE_MISSING_UID_LIMIT + 1]
       );
 
       await client.query("COMMIT");
       return {
         markedCount: Number(markedResult.rows[0].count),
         liveUidCount,
-        missingInDbUids: missingResult.rows.map((row) => Number(row.uid))
+        missingInDbUids: missingResult.rows
+          .slice(0, RECONCILE_MISSING_UID_LIMIT)
+          .map((row) => Number(row.uid)),
+        missingInDbTruncated: missingResult.rows.length > RECONCILE_MISSING_UID_LIMIT
       };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);

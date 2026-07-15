@@ -1705,7 +1705,8 @@ liveDb("live DB reliability lane", () => {
       `
       UPDATE public.imap_folders
       SET next_sync_due_at = now() - interval '1 second',
-          next_flag_scan_at = now() - interval '1 second'
+          next_flag_scan_at = now() - interval '1 second',
+          next_reconcile_at = now() - interval '1 second'
       WHERE account_id = $1 AND path = 'INBOX'
       `,
       [h.account.id]
@@ -1737,6 +1738,153 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
     expect(event.rows[0]?.payload.backfilled).toBeGreaterThanOrEqual(1);
+
+    const health = await h.pool.query<{
+      sync_state: string;
+      sync_state_reason: string | null;
+      last_reconcile_clean: boolean | null;
+    }>(
+      `
+      SELECT a.sync_state, a.sync_state_reason, f.last_reconcile_clean
+      FROM public.imap_accounts a
+      JOIN public.imap_folders f ON f.account_id = a.id AND f.path = 'INBOX'
+      WHERE a.id = $1
+      `,
+      [h.account.id]
+    );
+    expect(health.rows[0]).toEqual({
+      sync_state: "HEALTHY",
+      sync_state_reason: null,
+      last_reconcile_clean: true
+    });
+  });
+
+  it("finishes healthy when reconcile repairs provider-missing messages", async () => {
+    const h = await setupIntegration("live-reconcile-repaired-health", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = oneFolder("INBOX", 2);
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    // Simulate a normal provider-side move/delete after both messages were
+    // mirrored. Reconcile should tombstone the vanished UID and finish clean.
+    folders[0].messages = folders[0].messages.filter((message) => message.uid !== 2);
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET next_sync_due_at = now() - interval '1 second',
+          next_reconcile_at = now() - interval '1 second'
+      WHERE account_id = $1 AND path = 'INBOX'
+      `,
+      [h.account.id]
+    );
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileGapsFound).toBe(1);
+
+    const health = await h.pool.query<{
+      sync_state: string;
+      sync_state_reason: string | null;
+      last_reconcile_clean: boolean | null;
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `
+      SELECT
+        a.sync_state,
+        a.sync_state_reason,
+        f.last_reconcile_clean,
+        m.deleted_in_provider,
+        m.deleted_reason
+      FROM public.imap_accounts a
+      JOIN public.imap_folders f ON f.account_id = a.id AND f.path = 'INBOX'
+      JOIN public.imap_messages m
+        ON m.account_id = a.id
+       AND m.folder_path = f.path
+       AND m.uid = 2
+      WHERE a.id = $1
+      `,
+      [h.account.id]
+    );
+
+    expect(health.rows[0]).toEqual({
+      sync_state: "HEALTHY",
+      sync_state_reason: null,
+      last_reconcile_clean: true,
+      deleted_in_provider: true,
+      deleted_reason: "RECONCILE_MISSING"
+    });
+  });
+
+  it("reports when missing-in-DB repair exceeds the bounded reconcile batch", async () => {
+    const h = await setupIntegration("live-reconcile-missing-db-overflow", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+
+    const folder = await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
+
+    async function* providerUids() {
+      for (let uid = 1; uid <= 5_001; uid += 1) yield uid;
+    }
+
+    const result = await h.repository.markMissingMessagesFromLiveUidStream(
+      h.account.id,
+      folder.rows[0],
+      Number(folder.rows[0].uidvalidity),
+      providerUids()
+    );
+
+    expect(result.missingInDbUids).toHaveLength(5_000);
+    expect(result.missingInDbTruncated).toBe(true);
+  });
+
+  it("schedules an early retry when reconcile repair remains incomplete", async () => {
+    const h = await setupIntegration("live-reconcile-early-retry", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      SYNC_INTERVAL_MS: 60_000,
+      RECONCILE_INTERVAL_MS: 6 * 60 * 60_000
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+
+    const folder = await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
+
+    await h.repository.markFolderSynced(folder.rows[0].id, {
+      uidValidity: Number(folder.rows[0].uidvalidity),
+      initialComplete: true,
+      reconcileClean: false
+    });
+
+    const retry = await h.pool.query<{
+      last_reconcile_clean: boolean;
+      retries_soon: boolean;
+    }>(
+      `
+      SELECT
+        last_reconcile_clean,
+        next_reconcile_at <= now() + interval '2 minutes' AS retries_soon
+      FROM public.imap_folders
+      WHERE id = $1
+      `,
+      [folder.rows[0].id]
+    );
+    expect(retry.rows[0]).toEqual({
+      last_reconcile_clean: false,
+      retries_soon: true
+    });
   });
 
   it("reconcile treats archive-only folders as clean when the live window is empty", async () => {

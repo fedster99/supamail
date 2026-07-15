@@ -30,6 +30,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0023-sent-freshness-lane.md`: Sent metadata refreshes on a supplemental 30-second cadence that preserves Inbox-first full-sweep ordering and skips expensive secondary lanes and full-account health transitions.
 - `0024-durable-conversation-threading.md`: Delivery copies and RFC reply graphs become a stored, account-scoped, versioned, rebuildable conversation projection with conservative provider/subject fallbacks.
 - `0025-structured-message-evidence.md`: Decoded MIME yields bounded attachment/calendar/provider-resource evidence for downstream use without introducing semantic work-item clustering into SupaMail.
+- `0026-post-repair-reconcile-health.md`: Reconcile gap counts describe observed drift, while account health describes the post-repair mirror state.
 
 ## Status Values
 
