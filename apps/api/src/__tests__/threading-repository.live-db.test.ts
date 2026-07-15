@@ -1661,6 +1661,96 @@ liveDb("ThreadingRepository live DB", () => {
     expect(failed.rows[0]?.error).toMatch(/evidence bytes/);
   });
 
+  it("counts recipient evidence once when enforcing the closure byte bound", async () => {
+    const accountId = await createAccount("recipient-evidence-accounting");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Recipient evidence accounting",
+      toEmails: [`${"r".repeat(700)}@example.test`],
+      rfcMessageId: "<recipient-evidence-accounting@example.test>"
+    });
+
+    let strong: ThreadingRunResult | null = null;
+    for (let pass = 0; pass < 10; pass += 1) {
+      strong = await repository.drainAccount(accountId, {
+        batchSize: 1,
+        maxClosureEvidenceBytes: 1_024,
+        requestedBy: "live-test"
+      });
+      if (strong.stage === "strong") break;
+    }
+    await expect(repository.drainAccount(accountId, {
+      batchSize: 1,
+      maxClosureEvidenceBytes: 1_024,
+      requestedBy: "live-test"
+    })).resolves.toMatchObject({ runId: strong?.runId, assignmentsChanged: 1 });
+  });
+
+  it("subdivides a retry page when only the aggregate evidence exceeds the bound", async () => {
+    const accountId = await createAccount("adaptive-evidence-page");
+    for (let uid = 1; uid <= 4; uid += 1) {
+      await seedMessage(accountId, {
+        uid,
+        subject: `Independent evidence ${uid}`,
+        rfcMessageId: `<adaptive-evidence-${uid}@example.test>`,
+        headersJson: { "x-bounded-evidence": "x".repeat(350) }
+      });
+    }
+
+    let runId: string | null = null;
+    for (let pass = 0; pass < 10; pass += 1) {
+      const result = await repository.drainAccount(accountId, {
+        batchSize: 4,
+        maxClosureEvidenceBytes: 1_024,
+        requestedBy: "live-test"
+      });
+      runId = result.runId;
+      if (result.stage === "strong") break;
+    }
+    expect(runId).not.toBeNull();
+    await pool.query("UPDATE public.imap_thread_runs SET attempts = 8 WHERE id = $1", [runId]);
+    await expect(repository.drainAccount(accountId, {
+      batchSize: 4,
+      maxClosureEvidenceBytes: 1_024,
+      requestedBy: "live-test"
+    })).rejects.toBeInstanceOf(ThreadingEvidenceLimitError);
+
+    const adaptive = await pool.query<{
+      attempts: number;
+      batch_size: string | null;
+      retry_delay_seconds: number;
+      max_queue_delay_seconds: number;
+    }>(
+      `SELECT attempts,
+              summary->>'adaptive_closure_batch_size' AS batch_size,
+              extract(epoch FROM available_at - now())::double precision AS retry_delay_seconds,
+              (SELECT max(extract(epoch FROM queue.available_at - now()))::double precision
+               FROM public.imap_thread_work_queue queue
+               WHERE queue.run_id = run.id) AS max_queue_delay_seconds
+       FROM public.imap_thread_runs run WHERE run.id = $1`,
+      [runId]
+    );
+    expect(adaptive.rows[0]).toMatchObject({ attempts: 9, batch_size: "2" });
+    expect(adaptive.rows[0]?.retry_delay_seconds).toBeGreaterThan(0);
+    expect(adaptive.rows[0]?.retry_delay_seconds).toBeLessThanOrEqual(5);
+    expect(adaptive.rows[0]?.max_queue_delay_seconds).toBeGreaterThan(0);
+    expect(adaptive.rows[0]?.max_queue_delay_seconds).toBeLessThanOrEqual(5);
+
+    await pool.query("UPDATE public.imap_thread_runs SET available_at = now() WHERE id = $1", [runId]);
+    await pool.query("UPDATE public.imap_thread_work_queue SET available_at = now() WHERE run_id = $1", [runId]);
+    let ready: ThreadingRunResult | null = null;
+    for (let pass = 0; pass < 30; pass += 1) {
+      ready = await repository.drainAccount(accountId, {
+        batchSize: 4,
+        maxClosureEvidenceBytes: 1_024,
+        requestedBy: "live-test"
+      });
+      if (ready.ready && ready.runStatus === "ready") break;
+    }
+    expect(ready).toMatchObject({ runId, runStatus: "ready", ready: true });
+    expect(await projection(runId as string)).toHaveLength(4);
+  });
+
   it("accepts a measured 17 MiB production-sized evidence page under the default bound", async () => {
     const accountId = await createAccount("production-evidence-page");
     const evidence = "x".repeat(1_044_000);
