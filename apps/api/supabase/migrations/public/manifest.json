@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0016_message_evidence",
+  "schemaVersion": "0017_threading_body_backfill_index",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -64,6 +64,10 @@
     {
       "id": "0016_message_evidence",
       "file": "0016_message_evidence.sql"
+    },
+    {
+      "id": "0017_threading_body_backfill_index",
+      "file": "0017_threading_body_backfill_index.sql"
     }
   ]
 }
