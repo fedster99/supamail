@@ -715,6 +715,98 @@ liveDb("ThreadingRepository live DB", () => {
     ]);
   });
 
+  it("bounds legacy body hashing independently from the projection batch", async () => {
+    const accountId = await createAccount("bounded-body-evidence");
+    const rawMime = Buffer.from(
+      "Message-ID: <bounded@example.test>\r\nSubject: Bounded\r\n\r\nLegacy body"
+    );
+    for (const uid of [1, 2]) {
+      const messageId = await seedMessage(accountId, {
+        uid,
+        subject: "Bounded body evidence",
+        fromEmail: "alice@example.test",
+        toEmails: ["bob@example.test"],
+        rfcMessageId: `<bounded-${uid}@example.test>`,
+        rawMime,
+        rawMimeSha256: null
+      });
+      await pool.query(
+        `UPDATE public.imap_message_bodies
+         SET body_text = 'Legacy body',
+             headers_json = $2::jsonb
+         WHERE message_id = $1`,
+        [messageId, JSON.stringify({
+          from: "Alice <alice@example.test>",
+          to: "Bob <bob@example.test>",
+          subject: "Bounded body evidence",
+          "message-id": `<bounded-${uid}@example.test>`
+        })]
+      );
+    }
+    const bounded = new ThreadingRepository(pool, { bodyEvidenceBatchSize: 1 });
+
+    const first = await bounded.drainAccount(accountId, { batchSize: 500, requestedBy: "live-test" });
+    expect(first.runId).toBeNull();
+    expect((await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_message_bodies body
+       JOIN public.imap_messages message ON message.id = body.message_id
+       WHERE message.account_id = $1 AND body.raw_mime_sha256 IS NOT NULL`,
+      [accountId]
+    )).rows[0]?.count).toBe("1");
+    expect((await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_message_bodies body
+       JOIN public.imap_messages message ON message.id = body.message_id
+       WHERE message.account_id = $1 AND body.parsed_delivery_sha256 IS NOT NULL`,
+      [accountId]
+    )).rows[0]?.count).toBe("0");
+
+    const second = await bounded.drainAccount(accountId, { batchSize: 500, requestedBy: "live-test" });
+    expect(second.runId).toBeNull();
+    expect((await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_message_bodies body
+       JOIN public.imap_messages message ON message.id = body.message_id
+       WHERE message.account_id = $1 AND body.raw_mime_sha256 IS NOT NULL`,
+      [accountId]
+    )).rows[0]?.count).toBe("2");
+
+    const third = await bounded.drainAccount(accountId, { batchSize: 500, requestedBy: "live-test" });
+    expect(third).toMatchObject({ runStatus: "building", stage: "strong" });
+  });
+
+  it("releases a blocked legacy body repair at its dedicated statement deadline", async () => {
+    const accountId = await createAccount("body-evidence-deadline");
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Body evidence deadline",
+      rfcMessageId: "<body-evidence-deadline@example.test>",
+      rawMime: Buffer.from("Message-ID: <body-evidence-deadline@example.test>\r\n\r\nBlocked"),
+      rawMimeSha256: null
+    });
+    const blocker = await pool.connect();
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        "SELECT message_id FROM public.imap_message_bodies WHERE message_id = $1 FOR UPDATE",
+        [messageId]
+      );
+      const bounded = new ThreadingRepository(pool, {
+        bodyEvidenceBatchSize: 1,
+        bodyEvidenceStatementTimeoutMs: 100
+      });
+      const startedAt = performance.now();
+
+      await expect(bounded.drainAccount(accountId, { batchSize: 500, requestedBy: "live-test" }))
+        .rejects.toThrow(/statement timeout|canceling statement/);
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+    }
+  });
+
   it("uses exact parsed-only delivery evidence without merging reused Message-IDs", async () => {
     const accountId = await createAccount("parsed-only-delivery-evidence");
     const messageIds: string[] = [];
@@ -766,6 +858,45 @@ liveDb("ThreadingRepository live DB", () => {
     );
     expect(evidence.rows.every((row) => row.parsed_delivery_sha256 !== null)).toBe(true);
     expect(new Set(evidence.rows.map((row) => row.parsed_delivery_sha256)).size).toBe(2);
+  });
+
+  it("does not derive a fallback delivery fingerprint when an exact raw digest exists", async () => {
+    const accountId = await createAccount("raw-digest-needs-no-fallback");
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Exact raw evidence",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<exact-raw@example.test>"
+    });
+    await pool.query(
+      `INSERT INTO public.imap_message_bodies (
+         message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+         body_text, body_plain, selected_text_part, selected_text_format,
+         headers_json, mime_structure, parser_warnings
+       ) VALUES (
+         $1, NULL, $2, 128, false,
+         'Exact body', 'Exact body', 'Exact body', 'plain',
+         $3::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[]
+       )`,
+      [
+        messageId,
+        "b".repeat(64),
+        JSON.stringify({
+          from: "Alice <alice@example.test>",
+          to: "Bob <bob@example.test>",
+          subject: "Exact raw evidence",
+          "message-id": "<exact-raw@example.test>"
+        })
+      ]
+    );
+
+    await drainUntilReady(accountId, { batchSize: 1 });
+    const evidence = await pool.query<{ parsed_delivery_sha256: string | null }>(
+      "SELECT parsed_delivery_sha256 FROM public.imap_message_bodies WHERE message_id = $1",
+      [messageId]
+    );
+    expect(evidence.rows[0]?.parsed_delivery_sha256).toBeNull();
   });
 
   it("repairs missing assignment coverage before a shadow run can become ready", async () => {
