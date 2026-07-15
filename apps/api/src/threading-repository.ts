@@ -2251,20 +2251,20 @@ export class ThreadingRepository {
     requestedBy: string,
     attempted: (ids: string[]) => void
   ): Promise<ThreadingRunResult> {
-    const prunedSingletons = await this.pruneSingletonSubjectWork(client, run, batchSize);
-    if (prunedSingletons > 0) {
+    const prunedInert = await this.pruneInertSubjectWork(client, run, batchSize);
+    if (prunedInert > 0) {
       const operationType = run.status === "building" ? "build_batch" : "incremental";
       const operation = await this.insertOperation(client, {
         run,
         type: operationType,
         requestedBy,
-        reason: "singleton subject buckets cannot produce a fallback edge",
-        summary: { singleton_subject_buckets_pruned: prunedSingletons, assignments_changed: 0 }
+        reason: "subject buckets with fewer than two eligible deliveries cannot produce a fallback edge",
+        summary: { inert_subject_buckets_pruned: prunedInert, assignments_changed: 0 }
       });
       return this.resultForRun(run.account_id, run, {
         operationId: operation,
         operationType,
-        queueItemsProcessed: prunedSingletons
+        queueItemsProcessed: prunedInert
       });
     }
     const work = await client.query<{ subject_key: string }>(
@@ -2892,12 +2892,33 @@ export class ThreadingRepository {
     );
   }
 
-  private async pruneSingletonSubjectWork(client: PgClient, run: ThreadRun, limit: number): Promise<number> {
+  private async pruneInertSubjectWork(client: PgClient, run: ThreadRun, limit: number): Promise<number> {
     const result = await client.query<{ count: string }>(
       `WITH candidates AS MATERIALIZED (
          SELECT work.subject_key
          FROM public.imap_thread_subject_work work
-         WHERE work.run_id = $1 AND work.available_at <= now()
+         WHERE work.run_id = $1
+           AND work.available_at <= now()
+           AND NOT EXISTS (
+             SELECT 1
+             FROM public.imap_thread_assignments existing_weak
+             WHERE existing_weak.run_id = work.run_id
+               AND existing_weak.subject_key = work.subject_key
+               AND existing_weak.assignment_method = 'subject_fallback'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM (
+               SELECT eligible.delivery_key
+               FROM public.imap_thread_assignments eligible
+               WHERE eligible.run_id = work.run_id
+                 AND eligible.subject_key = work.subject_key
+                 AND eligible.subject_fallback_eligible
+               GROUP BY eligible.delivery_key
+               LIMIT 1
+               OFFSET 1
+             ) second_eligible_delivery
+           )
          ORDER BY work.enqueued_at, work.subject_key
          LIMIT $2
          FOR UPDATE SKIP LOCKED
@@ -2908,10 +2929,23 @@ export class ThreadingRepository {
            AND work.subject_key = candidates.subject_key
            AND NOT EXISTS (
              SELECT 1
-             FROM public.imap_thread_assignments assignment
-             WHERE assignment.run_id = work.run_id
-               AND assignment.subject_key = work.subject_key
-             OFFSET 1
+             FROM public.imap_thread_assignments existing_weak
+             WHERE existing_weak.run_id = work.run_id
+               AND existing_weak.subject_key = work.subject_key
+               AND existing_weak.assignment_method = 'subject_fallback'
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM (
+               SELECT eligible.delivery_key
+               FROM public.imap_thread_assignments eligible
+               WHERE eligible.run_id = work.run_id
+                 AND eligible.subject_key = work.subject_key
+                 AND eligible.subject_fallback_eligible
+               GROUP BY eligible.delivery_key
+               LIMIT 1
+               OFFSET 1
+             ) second_eligible_delivery
            )
          RETURNING 1
        )
