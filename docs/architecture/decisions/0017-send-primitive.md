@@ -45,6 +45,20 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   APPENDed to Sent, so the delivered and filed bytes are byte-identical
   (threading/dedup coherence). This byte identity is load-bearing — recomposing
   separately for APPEND would break dedup.
+- **Serialize the whole outbound provider operation with the account lock.**
+  `sendMessage` acquires the same session advisory lock used by sync and draft
+  APPENDs before SMTP submission, and keeps it through Sent APPEND and IMAP
+  teardown. It fails closed if the initial heartbeat cannot persist and refreshes
+  that heartbeat below the stale-reaper threshold for the full operation.
+  Immediately before SMTP it re-proves heartbeat persistence and exact session
+  ownership; immediately after SMTP acceptance it marks the operation confirmed.
+  Known-lost liveness therefore cannot cross the irreversible boundary, while a
+  later liveness/unlock failure is a warning on the delivered result. If the
+  non-blocking lock is unavailable, it throws
+  `AccountBusyError` before SMTP delivery; the HTTP surface maps that to
+  `503 account_busy` plus `Retry-After`. This makes that specific failure
+  proven-unsent and safe for a caller to retry, while preserving the existing
+  rule that an ambiguous SMTP failure must not be retried blindly.
 - **APPEND lives on a separate write-only client, not a widened read adapter.**
   `SentFolderAppender` reuses the connect + decrypt + `assertSafeImapTarget`
   pattern from `imap-client.ts` but exposes only `append()` (+ `list()` to resolve
@@ -88,10 +102,20 @@ that surface, exactly as 0014 required any write capability to be a new decision
 
 - An operator/agent can send a correctly-threaded reply or a new message end to
   end, while the agent MCP surface stays provably zero-send.
+- A direct send may fail transiently with `AccountBusyError` when sync or another
+  account-scoped provider operation owns the lock. No SMTP delivery has happened
+  in that case; HTTP callers receive `503 account_busy` and may retry according
+  to `Retry-After`.
 - "Sent-but-not-appended" is the one genuinely lossy failure (SMTP delivers, then
   APPEND fails). v1 deliberately does not roll back a delivered email; it logs a
   warning and relies on the next sync to mirror the Sent copy if the provider
   auto-filed it. A retry queue is added only if it bites.
+- Once SMTP delivery is confirmed, Sent-appender logout/fallback-close failures
+  are warnings in the delivered result, never thrown failures that invite a
+  duplicate re-send.
+- Nodemailer transport close follows the same phase rule: `sendMail` failure still
+  throws, but `transporter.close()` failure after acceptance is reported through
+  the delivered result's warnings and never overwrites confirmation.
 - Double-send protection in v1 is the explicit `--confirm` (CLI) / single call
   (HTTP); the `imap_send_attempts` idempotency ledger is a fast-follow.
 - The cloud re-pin inherits the primitive via `@supamail/api`; the cloud adds
@@ -106,8 +130,18 @@ that surface, exactly as 0014 required any write capability to be a new decision
   append/store/expunge/setFlags (APPEND lives only on `SentFolderAppender`).
 - `send.test.ts` covers Message-ID stamping/honoring, In-Reply-To/References merge
   on the NULL `provider_thread_id` generic-IMAP path, CC/BCC/custom-header
-  encoding, byte-identical deliver-vs-append, deliver-before-append ordering, and
-  the APPEND-failure warning path.
+  encoding, byte-identical deliver-vs-append, lock coverage across delivery,
+  APPEND, graceful/fallback teardown, busy-before-delivery behavior,
+  pre/post-confirmation liveness fault injection, deliver-before-append ordering,
+  and post-delivery APPEND/close warning paths. `smtp-client.test.ts` separately
+  proves transport-close failure cannot overwrite SMTP acceptance or the original
+  SMTP error.
+- `send.live-db.test.ts` proves against real Postgres sessions that a competing
+  advisory-lock owner prevents delivery, direct and draft sends contend on the
+  same lock, the lock remains held through graceful/fallback teardown, and a
+  heartbeat keeps a long send safe from stale-lock recovery before final release.
+  It also proves a fault-injected false unlock evicts the client and releases the
+  lock for another real session.
 - `host-validation.test.ts` covers `assertSafeSmtpTarget` SSRF rejection.
 - The GreenMail smoke (`scripts/greenmail-smoke.ts`) submits → APPENDs to Sent →
   syncs → asserts the mirrored Sent row is FETCHable (requires Docker).
@@ -155,6 +189,7 @@ A whole-stack review hardened four send-path edges:
   preserves).
 - ADR 0016: The reply drafter produces, never sends (this is the send path it
   defers to).
+- ADR 0003: Session-affine Postgres advisory locks serialize account operations.
 - `apps/api/src/send.ts`, `apps/api/src/smtp-client.ts`,
   `apps/api/supabase/migrations/public/0009_smtp_send.sql`.
 - RFC 5322 §3.6.4 (message threading: In-Reply-To / References).

@@ -1,11 +1,22 @@
 # Session Handoff
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 
 ## Current Branch
 
+- Local branch `fedster99/smtp-account-lock-v2` is rebased onto current
+  `origin/main` at `88c025d` and is intentionally uncommitted/unpushed. It closes
+  the outbound-send serialization gap: `sendMessage` and `sendDraft` share the
+  existing per-account advisory lock across their full provider sequence;
+  contention throws `AccountBusyError` before delivery. Initial heartbeat
+  persistence/session ownership is fail-closed, transient refresh errors retry,
+  and long sends refresh below the stale-reaper threshold. Liveness is re-proven
+  before SMTP; after confirmation, heartbeat/unlock/transport/appender teardown
+  failures are warnings. False/error unlock evicts the pool client. No
+  feature-list state changed because this is a maintainer-directed reliability
+  repair, not a newly selected tracked feature.
 - Active branch `fedster99/work-item-evidence` adds public migration `0016_message_evidence` and ADR 0025. Full MIME parsing now persists bounded decoded attachment SHA-256, calendar-instance, and strict provider-resource evidence without storing attachment bytes or making semantic cluster assignments. Evidence writes are atomic/versioned/idempotent; truncated fetches remain incomplete; existing body lanes backfill only missing extractor versions. Local live verification applies migrations twice, passes 152 live tests, and finishes all 118 spec-conformance checks.
 - Active branch `fedster99/threading-long-lived-benchmark` adds one missing adversarial release-gate slice: an explicit RFC reply chain spanning 2020–2026 remains one conversation despite subject changes, while a new message that only reuses the old subject remains separate. This is benchmark-only; production threading logic is unchanged.
 - Merged PR #72 adds ADR 0024's durable conversation projection. It separates physical mailbox rows, verified delivery copies, and RFC reply conversations; handles unresolved parents and orphan repair; and uses account-scoped provider hints plus a deliberately narrow subject fallback. Initial builds/upgrades/rebuilds are isolated, versioned shadow runs with bounded row/evidence/criteria work and per-run queues. Readers switch through one atomic active pointer only after coverage/catch-up checks and a persisted passing comparison for the exact generations/evidence revision; activation and latest incremental changes are auditable and reversible. A literal production executor registry plus startup/direct-path guards keeps rollback versions supported across a rollout, while a persisted three-active/one-standby/one-building schedule prevents sustained ingress from starving shadow or rollback work. Search/read APIs deduplicate delivery copies, while mailbox mutations still fan out to every physical UID. This is protocol threading only—there is no task/document/work-item, CRM, belief, or epistemic clustering layer.
@@ -13,7 +24,6 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - History metadata that finishes its IMAP fetch at the cooperative lock boundary persists under its own bounded database-write deadline, advances the watermark, and yields with `hitLockBudget` instead of becoming a repeated failure.
 - ADR 0023 adds a bounded Sent freshness lane: Inbox remains first in full-sweep priority selection, while Sent receives a supplemental configurable metadata-only poll (`SENT_SYNC_INTERVAL_MS`, default 30 seconds) between 60-second full sweeps. The fast lane filters accounts without due Sent work before lock/connection/run creation, skips discovery/flags/reconcile/body/history, and leaves full-sweep health, backoff, `last_priority_sync_succeeded_at`, and `last_sync_finished_at` untouched. Its hard deadline is the next full sweep: an in-flight Sent connection is closed, further Sent accounts are deferred, and the worker rechecks Inbox-first work immediately without recording a false outage.
 - Public migration `0013_body_head_trigram_index` adds a bounded 128 KiB body-text trigram expression index for exact substring consumers while ordinary language continues through body FTS. The migration is additive/idempotent and advances the public schema manifest to `0013_body_head_trigram_index`.
-
 - PR #63 follows PR #62 by preserving sanitized error class, ordinary error code, and IMAP response status in persisted sync reasons. The worker emits `sync.account.failed` through `console.error` and `sync.account.partial_success` through `console.warn`, while retaining the aggregate `sync.tick.completed` info event.
 - PR #64 makes API shutdown idempotent so a normal combined-mode rolling deploy does not emit a false `api.close.failed` / `ERR_SERVER_NOT_RUNNING`; genuine close errors remain structured error-level events.
 - Integration branch is `main`. This branch is rebased onto `8c00bb7` (PR #70, full-sync shutdown cancellation), after PR #69 introduced batched metadata persistence; the GHCR core image republishes after CI succeeds on each `main` push.
@@ -62,6 +72,18 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Verification To Date
 
+- SMTP account-lock repair after rebasing onto current `origin/main` on
+  2026-07-15: review hardening added draft/direct cross-contention, an explicit
+  pre/post-SMTP liveness phase contract, transient refresh retry, full-lifetime
+  heartbeat versus the real stale reaper, validated unlock with client eviction,
+  graceful/fallback teardown lock coverage, and delivered-with-warning
+  transport/appender close failures. The earlier pre-rebase gate passed the
+  focused suite (123 tests), root typecheck, 633/633 fast tests, both production
+  builds, `pnpm test:db:live` (16 files / 155 tests, including 6 real-session
+  outbound lock tests), and 118/118 spec-conformance checks. After rebasing onto
+  `88c025d`, the focused suite passed 125 tests and the full `./init.sh` gate
+  passed typecheck, 653 fast tests, both builds, 158 live-Postgres tests (including
+  all 6 outbound lock tests), and 118/118 spec-conformance checks.
 - Long-lived threading benchmark (2026-07-14): the required-slice assertion failed first, then passed after adding the labeled multi-year chain and dangerous subject-reuse negative. `INSTALL_CMD=true ./init.sh` passed harness check, typecheck, 627 fast tests, and both production builds. `pnpm test:db:live` preserved the populated migration fixture, applied migrations twice, passed all 152 live-DB tests—including bounded incremental orphan resolution—and passed 118/118 spec-conformance assertions. Local Node 26 emitted the expected Node-24 engine and DEP0205 warnings.
 - Threading production hardening (2026-07-14): `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed the harness check, root typecheck, 625 fast tests, and both production builds before the live gate exposed a test-path mismatch around queue-empty 0014-ready coverage repair. The corrected regression explicitly exercises the scheduler-visible ready run through repair and final coverage certification. A fresh `pnpm test:db:live` then preserved a populated 5,000-row pre-0014 mirror, applied all public migrations twice, passed all 152 live-DB tests, and passed 118/118 spec-conformance assertions. Review additionally caught and fixed two rollout defects before release: old ready runs with empty queues were not scheduler-visible for coverage repair, and consecutive per-account catch-up steps could starve later accounts; focused worker tests now prove round-robin fairness. The local Node 26 shell emitted expected engine/deprecation warnings while CI remains pinned to Node 24.
 - IMAP abort-race fix (2026-07-14): a focused regression first failed because emitting ImapFlow's late `Already logged out` error after an intentional pending-connect abort threw through EventEmitter; it passes after installing the runtime-client listener. A second red/green runtime regression proves combined API+worker mode enables the existing worker fatal-process handlers, and a third proves unrelated client errors remain observable without logging their message. Independent review then caught that the first combined-mode wiring could leave the API serving and exit successfully after a fatal event; a fourth red/green regression proves the owning runtime now shuts down with exit status 1. The final reviews caught the same ownership gap for SIGTERM/SIGINT during worker startup and the still-running startup work behind that close; the combined API close callback is now installed before worker startup checks, the lock-test retry budget is cancellation-aware, later maintenance phases short-circuit, and process listeners are removed at completion. The final `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed the harness check, root typecheck, 623 fast tests, both builds, two idempotent migration applications, all 149 live-DB tests, and 118/118 spec-conformance checks; the final structured review returned no actionable regressions. The local Node 26 shell emitted the expected engine/deprecation warnings while CI remains pinned to Node 24.

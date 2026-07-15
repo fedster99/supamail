@@ -49,6 +49,20 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 ## Concurrency And Connections
 
 - One IMAP operation per account at a time across worker and API.
+- Direct `sendMessage` and `sendDraft` share that account lock. Draft send acquires
+  before a possibly-live raw fetch; both hold through SMTP, Sent APPEND, and
+  appender teardown, with draft cleanup also inside the same lock.
+- Lock acquisition must fail closed when its initial heartbeat cannot persist.
+  Long outbound operations refresh heartbeat below `STALE_HEARTBEAT_MS` for their
+  full lifetime so stale-lock recovery cannot terminate live work.
+- Before irreversible SMTP, the lock lease must synchronously prove both heartbeat
+  persistence and ownership by the exact current Postgres session. Transient
+  refresh errors retry; known-lost/unknown liveness cannot cross that boundary.
+- `pg_advisory_unlock` must return true. False/error destroys the pool client rather
+  than returning a possibly lock-owning session to the pool.
+- Send lock contention must raise `AccountBusyError` before delivery. Once SMTP is
+  confirmed, heartbeat/unlock, SMTP transport close, APPEND, appender teardown,
+  and draft-cleanup failures are warnings, never thrown retry signals.
 - Use session-scoped Postgres advisory locks, not transaction locks.
 - `DATABASE_URL` must be direct or session-affine. Transaction poolers are unsafe for this architecture.
 - `DATABASE_POOL_MAX` (default 10) caps Postgres connections per process. It does not change advisory-lock semantics: each pooled connection is its own session. Raise it for many concurrent accounts; keep it within a connection-capped pooler's limit.

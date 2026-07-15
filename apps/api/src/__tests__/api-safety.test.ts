@@ -549,6 +549,29 @@ describe("API safety", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("maps a busy direct send to 503 account_busy before delivery", async () => {
+    const { app, send } = buildApp({
+      send: async () => {
+        throw new AccountBusyError("Account is busy syncing; retry the send shortly");
+      }
+    });
+
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({
+        to: [{ email: "x@example.test" }],
+        subject: "Hi",
+        body: { format: "plain", text: "y" }
+      })
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("5");
+    await expect(res.json()).resolves.toMatchObject({ error: "account_busy" });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("gates the draft routes behind the API token", async () => {
     const { app, drafts } = buildApp();
     const unauthorized = await app.request(`/accounts/${accountId}/drafts`, {

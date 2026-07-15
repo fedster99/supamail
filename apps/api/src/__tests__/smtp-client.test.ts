@@ -14,11 +14,12 @@ import type { SendRequest } from "../types.js";
  * nodemailer is mocked so the transport config is captured without a socket.
  */
 
+const transport = vi.hoisted(() => ({
+  sendMail: vi.fn(async () => undefined),
+  close: vi.fn()
+}));
 const createTransport = vi.hoisted(() =>
-  vi.fn((_options: Record<string, unknown>) => ({
-    sendMail: vi.fn(async () => undefined),
-    close: vi.fn()
-  }))
+  vi.fn((_options: Record<string, unknown>) => transport)
 );
 
 vi.mock("nodemailer", () => ({
@@ -96,6 +97,10 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
 
   beforeEach(() => {
     createTransport.mockClear();
+    transport.sendMail.mockReset();
+    transport.sendMail.mockResolvedValue(undefined);
+    transport.close.mockReset();
+    transport.close.mockImplementation(() => undefined);
   });
 
   it("sets requireTLS=true for a PUBLIC STARTTLS host (isPrivateHost not set)", async () => {
@@ -121,5 +126,25 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     const { deliverSmtp } = await import("../smtp-client.js");
     await deliverSmtp({ ...creds, secure: true, port: 465 }, Buffer.from("raw"), envelope, config);
     expect(createTransport.mock.calls[0][0]).toMatchObject({ requireTLS: false, secure: true });
+  });
+
+  it("returns a warning instead of overwriting confirmed delivery when transport close throws", async () => {
+    const warning = vi.fn();
+    transport.close.mockImplementationOnce(() => {
+      throw new Error("transport close failed");
+    });
+    const { deliverSmtp } = await import("../smtp-client.js");
+    await deliverSmtp(creds, Buffer.from("raw"), envelope, config, { onPostDeliveryWarning: warning });
+    expect(transport.sendMail).toHaveBeenCalledTimes(1);
+    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/Delivered.*transport close failed/i));
+  });
+
+  it("preserves the original SMTP error when send and close both fail", async () => {
+    transport.sendMail.mockRejectedValueOnce(new Error("SMTP rejected message"));
+    transport.close.mockImplementationOnce(() => {
+      throw new Error("transport close failed");
+    });
+    const { deliverSmtp } = await import("../smtp-client.js");
+    await expect(deliverSmtp(creds, Buffer.from("raw"), envelope, config)).rejects.toThrow(/SMTP rejected message/);
   });
 });

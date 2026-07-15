@@ -53,6 +53,8 @@ const mocks = vi.hoisted(() => ({
   getAccount: vi.fn(),
   getMessage: vi.fn(),
   withAccountLock: vi.fn(),
+  lockAssertLive: vi.fn(),
+  lockConfirmIrreversible: vi.fn(),
   searchByMessageId: vi.fn(),
   poolConnect: vi.fn()
 }));
@@ -104,10 +106,21 @@ const account = {
   encrypted_password: Buffer.from("x")
 };
 
+function mockAccountLock() {
+  return {
+    lockId: account.lock_id,
+    client: {},
+    assertLive: mocks.lockAssertLive,
+    confirmIrreversible: mocks.lockConfirmIrreversible
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   // Default: the account lock is free — run the wrapped IMAP work through.
-  mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: () => Promise<unknown>) => fn());
+  mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => fn(mockAccountLock()));
+  mocks.lockAssertLive.mockResolvedValue(undefined);
+  mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
   mocks.searchByMessageId.mockResolvedValue([]); // default: no prior draft (idempotency miss)
   mocks.append.mockResolvedValue({ uid: 7 });
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
@@ -363,28 +376,30 @@ describe("sendDraft", () => {
     selected_text_format: "plain"
   };
 
-  it("STILL delivers but skips Sent filing when the account is busy syncing", async () => {
-    mocks.withAccountLock.mockResolvedValueOnce(null); // worker holds the lock during Sent filing
+  it("throws AccountBusyError before raw fetch or SMTP when the account is busy", async () => {
+    mocks.withAccountLock.mockResolvedValueOnce(null);
     const pool = mockPoolReturningDraft(draftRow);
+    const { AccountBusyError } = await import("../errors.js");
     const { sendDraft } = await import("../drafts.js");
-    const result = await sendDraft(pool, config, "draft-1");
 
-    // The mail is already delivered; filing to Sent is skipped (not failed).
-    expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
+    await expect(sendDraft(pool, config, "draft-1")).rejects.toBeInstanceOf(AccountBusyError);
+    expect(mocks.getRawMime).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(result.send.delivered).toBe(true);
-    expect(result.send.appendedToSent).toBe(false);
-    expect(result.send.appendedUid).toBeNull();
-    expect(result.send.sentFolderPath).toBeNull();
-    expect(result.warnings.join(" ")).toMatch(/busy syncing so filing to Sent was skipped/i);
-    // The draft is still hard-deleted after the send.
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(pool, config, "draft-1", { hard: true });
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
   it("RESENDS the draft's raw bytes over SMTP, APPENDs them to Sent, then deletes the draft", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     const { sendDraft } = await import("../drafts.js");
     const result = await sendDraft(pool, config, "draft-1");
+
+    expect(mocks.withAccountLock).toHaveBeenCalledWith(
+      pool,
+      account.lock_id,
+      expect.any(Function),
+      expect.objectContaining({ heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
+    );
 
     // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
     // parsed mirror fields — there is no SendRequest reconstruction anymore.
@@ -512,6 +527,55 @@ describe("sendDraft", () => {
     expect(result.send.delivered).toBe(true);
     expect(result.send.appendedToSent).toBe(false);
     expect(result.warnings.join(" ")).toMatch(/filing to Sent failed/i);
+  });
+
+  it("holds the lock through SMTP, APPEND, fallback teardown, and draft cleanup", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    let lockHeld = false;
+    mocks.withAccountLock.mockImplementationOnce(async (_pool, _lockId, fn: (lock: unknown) => Promise<unknown>) => {
+      lockHeld = true;
+      try {
+        return await fn(mockAccountLock());
+      } finally {
+        lockHeld = false;
+      }
+    });
+    mocks.deliverSmtp.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+    });
+    mocks.append.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+      return { uid: 7 };
+    });
+    mocks.logout.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+      throw new Error("LOGOUT timed out");
+    });
+    mocks.close.mockImplementationOnce(() => {
+      expect(lockHeld).toBe(true);
+    });
+    mocks.deleteMessage.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+      return { messageId: "draft-1", fromFolder: "Drafts", mode: "expunge", trashFolder: null };
+    });
+
+    const { sendDraft } = await import("../drafts.js");
+    const result = await sendDraft(pool, config, "draft-1");
+    expect(result.send.delivered).toBe(true);
+    expect(lockHeld).toBe(false);
+  });
+
+  it("downgrades appender logout plus fallback-close failure after delivery to a warning", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    mocks.logout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
+    mocks.close.mockImplementationOnce(() => {
+      throw new Error("socket close failed");
+    });
+
+    const { sendDraft } = await import("../drafts.js");
+    const result = await sendDraft(pool, config, "draft-1");
+    expect(result.send.delivered).toBe(true);
+    expect(result.warnings.join(" ")).toMatch(/closing the Sent connection failed: socket close failed/i);
   });
 
   it("reports draftDeleted=true and no cleanup warning on the happy path", async () => {

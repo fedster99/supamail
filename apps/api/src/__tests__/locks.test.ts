@@ -1,5 +1,117 @@
 import { describe, expect, it, vi } from "vitest";
-import { isTransientStartupDbError, runLockSelfTestWithRetry } from "../locks.js";
+import {
+  accountLockHeartbeatIntervalMs,
+  isTransientStartupDbError,
+  runLockSelfTestWithRetry,
+  withAccountLock
+} from "../locks.js";
+
+describe("withAccountLock heartbeat", () => {
+  it("fails closed before callback work when the initial heartbeat cannot persist", async () => {
+    const callback = vi.fn(async () => "unsafe");
+    const client = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }], rowCount: 1 })
+        .mockRejectedValueOnce(new Error("heartbeat write failed"))
+        .mockResolvedValueOnce({ rows: [{ unlocked: true }], rowCount: 1 }),
+      release: vi.fn()
+    };
+    const pool = { connect: vi.fn(async () => client) } as never;
+
+    await expect(withAccountLock(pool, "42", callback)).rejects.toThrow(/heartbeat write failed/i);
+    expect(callback).not.toHaveBeenCalled();
+    expect(client.query).toHaveBeenLastCalledWith("SELECT pg_advisory_unlock($1::bigint) AS unlocked", ["42"]);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the heartbeat update finds no account row", async () => {
+    const callback = vi.fn(async () => "unsafe");
+    const client = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+        .mockResolvedValueOnce({ rows: [{ unlocked: true }], rowCount: 1 }),
+      release: vi.fn()
+    };
+    const pool = { connect: vi.fn(async () => client) } as never;
+
+    await expect(withAccountLock(pool, "42", callback)).rejects.toThrow(/account row not found/i);
+    expect(callback).not.toHaveBeenCalled();
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("derives a refresh cadence safely inside the stale threshold", () => {
+    expect(accountLockHeartbeatIntervalMs(300_000)).toBe(60_000);
+    expect(accountLockHeartbeatIntervalMs(900)).toBe(300);
+    expect(accountLockHeartbeatIntervalMs(Number.NaN)).toBe(60_000);
+  });
+
+  it("retries a transient heartbeat error while the session remains valid", async () => {
+    const transient = Object.assign(new Error("canceling statement due to timeout"), { code: "57014" });
+    const callback = vi.fn(async () => "safe");
+    const client = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }] })
+        .mockRejectedValueOnce(transient)
+        .mockResolvedValueOnce({ rows: [{ heartbeat_persisted: true, lock_held: true }] })
+        .mockResolvedValueOnce({ rows: [{ unlocked: true }] }),
+      release: vi.fn()
+    };
+    const pool = { connect: vi.fn(async () => client) } as never;
+
+    await expect(withAccountLock(pool, "42", callback)).resolves.toBe("safe");
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(client.query).toHaveBeenCalledTimes(4);
+    expect(client.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it("rejects and evicts the client when advisory unlock returns false before confirmation", async () => {
+    const client = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }] })
+        .mockResolvedValueOnce({ rows: [{ heartbeat_persisted: true, lock_held: true }] })
+        .mockResolvedValueOnce({ rows: [{ unlocked: false }] }),
+      release: vi.fn()
+    };
+    const pool = { connect: vi.fn(async () => client) } as never;
+
+    await expect(withAccountLock(pool, "42", async () => "done")).rejects.toThrow(/unlock=false/i);
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it("rejects and evicts the client when advisory unlock throws", async () => {
+    const client = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }] })
+        .mockResolvedValueOnce({ rows: [{ heartbeat_persisted: true, lock_held: true }] })
+        .mockRejectedValueOnce(new Error("unlock connection failure")),
+      release: vi.fn()
+    };
+    const pool = { connect: vi.fn(async () => client) } as never;
+
+    await expect(withAccountLock(pool, "42", async () => "done")).rejects.toThrow(/unlock connection failure/i);
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it("warns instead of rejecting after confirmation when unlock fails, while still evicting", async () => {
+    const warning = vi.fn();
+    const client = {
+      query: vi.fn()
+        .mockResolvedValueOnce({ rows: [{ locked: true }] })
+        .mockResolvedValueOnce({ rows: [{ heartbeat_persisted: true, lock_held: true }] })
+        .mockResolvedValueOnce({ rows: [{ unlocked: false }] }),
+      release: vi.fn()
+    };
+    const pool = { connect: vi.fn(async () => client) } as never;
+
+    await expect(withAccountLock(pool, "42", async (lock) => {
+      lock.confirmIrreversible();
+      return "delivered";
+    }, { onPostIrreversibleWarning: warning })).resolves.toBe("delivered");
+    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/already confirmed.*unlock failed/i));
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+});
 
 describe("isTransientStartupDbError", () => {
   it("treats deploy-time pool/pooler saturation as transient (retryable)", () => {

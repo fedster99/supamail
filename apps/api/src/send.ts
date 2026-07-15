@@ -1,7 +1,9 @@
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
+import { AccountBusyError } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
+import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import {
@@ -15,10 +17,11 @@ import type { SendRequest, SendResult } from "./types.js";
 
 /**
  * The send/reply primitive (email-001, ADR 0017). Loads the account, validates
- * the SMTP target (SSRF guard), composes deterministic RFC-822 bytes, submits
- * them over SMTP, then APPENDs the SAME bytes to the Sent folder. It does NOT
- * insert a mirror row — the next sync pass FETCHes the real Sent copy and mirrors
- * it with a server-assigned UID, so identity is never guessed.
+ * the SMTP target (SSRF guard), composes deterministic RFC-822 bytes, then holds
+ * the account advisory lock across SMTP submission and APPEND of the SAME bytes
+ * to the Sent folder. It does NOT insert a mirror row — the next sync pass FETCHes
+ * the real Sent copy and mirrors it with a server-assigned UID, so identity is
+ * never guessed.
  *
  * This lives OUTSIDE src/mcp/ on purpose: the agent surface stays zero-send. The
  * caller (CLI with --confirm, the single-tenant HTTP door, or the cloud runtime)
@@ -48,8 +51,6 @@ export async function sendMessage(
     throw new Error(`Account not found: ${req.accountId}`);
   }
 
-  const warnings: string[] = [];
-
   const creds = await resolveSmtpCreds(pool, config, account);
   const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
     allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
@@ -58,41 +59,95 @@ export async function sendMessage(
   const from = { email: account.email_address };
   const { raw, messageId } = await buildRawMime(req, from);
   const envelope = buildSendEnvelope(account.email_address, req);
-
-  // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
-  // it relaxes only when the target actually resolved private/loopback.
-  await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
-
-  // Delivery succeeded; file the identical bytes to Sent. An APPEND failure here
-  // is non-fatal — the mail is already sent and the next sync recovers a copy.
-  let appendedToSent = false;
-  let appendedUid: number | null = null;
-  let sentFolderPath: string | null = null;
-  let appender: SentFolderAppender | null = null;
-  try {
-    appender = await SentFolderAppender.connect(pool, config, account);
-    const profile = getProviderProfile(account.provider_profile);
-    const mailboxes = await appender.list();
-    // Resolve Sent via the shared role-keyed resolver: the "sent" role consults the
-    // provider profile's priority winner for its fallback (behavior preserved).
-    sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
-    const result = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
-    appendedToSent = true;
-    appendedUid = result.uid;
-  } catch (error) {
-    warnings.push(
-      `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
-    );
-  } finally {
-    if (appender) await closeImap(appender);
-  }
-
-  return {
-    rfcMessageId: messageId,
-    delivered: true,
-    appendedToSent,
-    appendedUid,
-    sentFolderPath,
-    warnings
+  const warnings: string[] = [];
+  const addWarning = (warning: string) => {
+    if (!warnings.includes(warning)) warnings.push(warning);
   };
+
+  // SMTP submission and the matching Sent APPEND are one account-scoped provider
+  // operation. Hold the SAME advisory lock used by sync and draft APPENDs across
+  // both network verbs so the worker cannot race this send or consume the provider's
+  // per-account command budget concurrently. Acquisition is deliberately
+  // non-blocking: callers get the established transient AccountBusyError before
+  // any irreversible SMTP delivery happens.
+  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
+    // Synchronous phase gate: a periodic refresh may have failed since acquisition.
+    // Do not cross the irreversible SMTP boundary until heartbeat persistence and
+    // ownership by this exact Postgres session are both re-proven.
+    await lock.assertLive();
+
+    // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
+    // it relaxes only when the target actually resolved private/loopback.
+    await deliverSmtp(creds, raw, envelope, config, {
+      isPrivateHost,
+      onPostDeliveryWarning: addWarning
+    });
+    lock.confirmIrreversible();
+
+    // Delivery succeeded; file the identical bytes to Sent while the account lock
+    // remains held. An APPEND failure is non-fatal — the mail is already sent and
+    // the next sync recovers a copy if the provider auto-filed it.
+    let appendedToSent = false;
+    let appendedUid: number | null = null;
+    let sentFolderPath: string | null = null;
+    let appender: SentFolderAppender | null = null;
+    let lockLiveForFiling = true;
+    try {
+      try {
+        await lock.assertLive();
+      } catch (error) {
+        lockLiveForFiling = false;
+        addWarning(
+          `Delivered, but filing to Sent was skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
+        );
+      }
+
+      if (lockLiveForFiling) {
+        try {
+          appender = await SentFolderAppender.connect(pool, config, account);
+          const profile = getProviderProfile(account.provider_profile);
+          const mailboxes = await appender.list();
+          // Resolve Sent via the shared role-keyed resolver: the "sent" role consults the
+          // provider profile's priority winner for its fallback (behavior preserved).
+          sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
+          const appended = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
+          appendedToSent = true;
+          appendedUid = appended.uid;
+        } catch (error) {
+          addWarning(
+            `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
+          );
+        }
+      }
+    } finally {
+      if (appender) {
+        try {
+          await closeImap(appender);
+        } catch (error) {
+          // SMTP is already confirmed. Teardown failure is diagnostic only; never
+          // turn it into a thrown response that could invite a duplicate re-send.
+          addWarning(
+            `Delivered, but closing the Sent connection failed: ${error instanceof Error ? error.message : String(error)}.`
+          );
+        }
+      }
+    }
+
+    return {
+      rfcMessageId: messageId,
+      delivered: true as const,
+      appendedToSent,
+      appendedUid,
+      sentFolderPath,
+      warnings
+    };
+  }, {
+    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
+    onPostIrreversibleWarning: addWarning
+  });
+
+  if (result === null) {
+    throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the send shortly`);
+  }
+  return result;
 }
