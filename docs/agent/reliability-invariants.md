@@ -120,12 +120,14 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Flag scans are due-based, compare normalized flags, and keep FETCH/write locks bounded to incremental-size batches under one overall deadline.
 - Reconcile only runs after initial sync is complete for the folder.
 - Reconcile must handle both sides: mark provider-missing local rows and backfill missing-in-DB provider UIDs.
+- Reconcile gap telemetry describes drift observed before repair; `last_reconcile_clean` and account health describe the mirror after repair. A pass that tombstones every provider-missing row and backfills every returned missing-in-DB UID is clean even when `reconcile_gaps_found` is nonzero.
+- Missing-in-DB repair is bounded to 5,000 UIDs per pass and must detect overflow with a sentinel row. Overflow, lock-budget interruption, or incomplete backfill leaves reconcile unclean and schedules another reconcile on the next full-sync cadence instead of the normal six-hour cadence.
 
 ## Health And Backoff
 
 - Health must not lie.
 - Accounts remain `INITIAL_SYNC` while tracked folders are incomplete.
-- Accounts remain or become `DEGRADED` when priority lag, reconcile drift, folder missing, UIDVALIDITY reset, or timeout semantics require it.
+- Accounts remain or become `DEGRADED` when priority lag, unresolved reconcile drift, folder missing, UIDVALIDITY reset, or timeout semantics require it. Drift fully repaired in the same reconcile pass is not unresolved.
 - Long-stuck `DEGRADED` accounts with no priority success escalate to retryable `BROKEN` (`STUCK_DEGRADED_24H`) and then terminal `BROKEN` (`STUCK_DEGRADED_TERMINAL`) if recovery keeps failing.
 - `AUTH_ERROR` is non-retryable and pins the account `BROKEN`.
 - `PARTIAL_SUCCESS` increments success counters only when priority folders succeeded and round-robin folders failed.

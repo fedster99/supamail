@@ -21,6 +21,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Current Branch
 
+- Active branch `fedster99/fix-reconcile-health-after-repair` separates observed reconcile gaps from unresolved reconcile state. A pass that fully tombstones provider-missing rows or backfills missing-in-DB UIDs now finishes clean and can return the account to `HEALTHY`; the run still records its bounded gap count. Missing-in-DB overflow is detected with a 5,001st sentinel row, remains degraded, and retries on the next full-sync cadence. ADR 0026 records the contract; no migration or public API change is required.
 - Local branch `fedster99/smtp-account-lock-v2` is rebased onto current
   `origin/main` at `88c025d` and is intentionally uncommitted/unpushed. It closes
   the outbound-send serialization gap: `sendMessage` and `sendDraft` share the
@@ -87,6 +88,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Verification To Date
 
+- Reconcile post-repair health fix (2026-07-14): the provider-delete regression first proved the old behavior by ending `DEGRADED` with `RECONCILE_GAPS_FOUND` despite a successful tombstone. The missing-in-DB overflow and early-retry regressions also failed before their implementations. After the fix, the focused live-DB slice passed all four repair/health tests. Under Node 24, `pnpm harness:check`, `pnpm typecheck`, `pnpm test` (636 fast tests), `pnpm build`, and `pnpm test:db:live` passed. The live gate preserved the populated migration fixture, applied migrations twice, passed all 155 live-DB tests, and passed 118/118 spec-conformance assertions.
 - SMTP account-lock repair after rebasing onto current `origin/main` on
   2026-07-15: review hardening added draft/direct cross-contention, an explicit
   pre/post-SMTP liveness phase contract, transient refresh retry, full-lifetime
@@ -154,6 +156,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Delivery-copy identity and conversation identity are derived, account-scoped `delivery_key` / `conversation_id` assignments, not replacements for mailbox-row identity. RFC reply edges outrank provider hints; unresolved parent IDs remain provisional; conservative subject matching is disabled for incomplete incremental universes. Conversation threading must remain separate from semantic work-item or epistemic clustering.
 - Session-affine Postgres is required for advisory locks.
 - `MAX_LOCK_HOLD_MS` is a cooperative account-lock fairness budget: priority folders may complete past the deadline, non-priority/body work stops at safe boundaries, and budget-hit cycles are neutral for backoff counters.
+- Reconcile health describes the post-repair mirror, not whether drift was observed before the pass. `reconcile_gaps_found` preserves bounded observation telemetry; fully repaired drift is clean, while overflowed, interrupted, or incomplete repair remains degraded and retries on the next full-sync cadence.
 - Stuck-degraded escalation is driven by `imap_accounts.last_priority_sync_succeeded_at`: priority success refreshes it, retryable `STUCK_DEGRADED_24H` probes hourly without compounding exponential backoff, and `STUCK_DEGRADED_TERMINAL` stops automatic scheduling until operator action.
 - Folder-count caps warn first, then enforce by tracking only priority folders; the cap uses the latest provider LIST count so provider-side pruning recovers automatically.
 - `PENDING_VERIFICATION` is reserved for missing-mailbox verification and is excluded from normal folder scheduling; missing-mailbox errors force near-term folder discovery.
@@ -177,6 +180,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Next Best Actions
 
+- Review and land `fedster99/fix-reconcile-health-after-repair`, publish its immutable image, then re-pin downstream consumers. Confirm ordinary provider delete/move drift records a nonzero gap count without leaving a fully repaired account stuck `DEGRADED`.
 - Review and land `fedster99/fix-imap-abort-race`, publish its immutable image, then re-pin downstream consumers and canary the Sent/full-sweep deadline boundary. Confirm there are no further `Already logged out`, `process.uncaughtException`, or Render restart events.
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
