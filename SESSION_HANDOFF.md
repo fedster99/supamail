@@ -1,5 +1,15 @@
 # Session Handoff
 
+## 2026-07-15 — Credential replacement API
+
+- Branch `fedster99/supamail-credential-reconnect` adds authenticated
+  `PATCH /accounts/:id/credentials` for password/app-password repair.
+- Replacement uses the existing AES-256-GCM envelope under the account advisory
+  lock, clears auth backoff/counters, and leaves health `DEGRADED` with
+  `CREDENTIALS_UPDATED_PENDING_SYNC` until provider sync proves recovery.
+- API and live-Postgres regressions cover validation, encrypted replacement,
+  health reset, and exclusion while a sync session owns the account lock.
+
 ## 2026-07-15 — Production-sized threading closure evidence
 
 - A real v2 production shadow build expanded a 500-message seed page into a

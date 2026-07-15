@@ -320,10 +320,13 @@ Attachment binaries are not downloaded by default. SupaMail stores attachment me
 - `POST /accounts`
 - `POST /accounts/:id/sync`
 - `POST /accounts/:id/folders/track`
+- `PATCH /accounts/:id/credentials`
 - `PATCH /accounts/:id/settings`
 - `POST /messages/:id/refetch-body`
 
 Account responses intentionally omit encrypted passwords, lock IDs, and worker internals. `GET /accounts/:id` includes account progress percentages and per-folder progress rows.
+
+`PATCH /accounts/:id/credentials` replaces a rejected password or app password under the account advisory lock. It resets terminal auth failure to `DEGRADED` with `CREDENTIALS_UPDATED_PENDING_SYNC`; the next successful sync establishes `HEALTHY` rather than the credential write claiming health prematurely.
 
 Example:
 

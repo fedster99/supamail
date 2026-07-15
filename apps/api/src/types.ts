@@ -389,3 +389,11 @@ export interface UpdateAccountSettingsInput {
   archiveFlagSync?: boolean;
   maxBackfillRate?: MaxBackfillRate;
 }
+
+export interface UpdateAccountCredentialsInput {
+  password: string;
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  username?: string;
+}
