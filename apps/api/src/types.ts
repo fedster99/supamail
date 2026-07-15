@@ -220,6 +220,24 @@ export interface MessageBodyInput {
   headersJson: Record<string, unknown>;
   mimeStructure: unknown;
   parserWarnings: string[];
+  evidence: MessageEvidenceInput[];
+}
+
+export type MessageEvidenceKind =
+  | "attachment_content"
+  | "calendar_instance"
+  | "provider_resource";
+
+/**
+ * Neutral, deterministic evidence extracted while decoded MIME is available.
+ * It identifies an artifact or external resource; it does not claim that two
+ * messages belong to the same protocol conversation or work item.
+ */
+export interface MessageEvidenceInput {
+  kind: MessageEvidenceKind;
+  namespace: string;
+  key: string;
+  metadata: Record<string, string | number | boolean | null>;
 }
 
 export interface AttachmentMetadata {

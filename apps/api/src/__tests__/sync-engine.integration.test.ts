@@ -2584,7 +2584,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         selectedTextFormat: "plain",
         headersJson: {},
         mimeStructure: null,
-        parserWarnings: []
+        parserWarnings: [],
+        evidence: []
       });
     }
 

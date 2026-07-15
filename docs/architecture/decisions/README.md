@@ -29,6 +29,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0022-shared-imap-connect-prelude.md`: The four IMAP clients' copied connect prelude (SSRF guard + decrypt + ImapFlow construct + connect) is extracted to one shared `connectImap` (`imap-connect.ts`) with the close-on-connect-error guard baked in (fixing a socket-leak drift on two of the four); the UIDVALIDITY fail-closed comparison is co-located and shared; verb surfaces stay separate — behavior-preserving.
 - `0023-sent-freshness-lane.md`: Sent metadata refreshes on a supplemental 30-second cadence that preserves Inbox-first full-sweep ordering and skips expensive secondary lanes and full-account health transitions.
 - `0024-durable-conversation-threading.md`: Delivery copies and RFC reply graphs become a stored, account-scoped, versioned, rebuildable conversation projection with conservative provider/subject fallbacks.
+- `0025-structured-message-evidence.md`: Decoded MIME yields bounded attachment/calendar/provider-resource evidence for downstream use without introducing semantic work-item clustering into SupaMail.
 
 ## Status Values
 

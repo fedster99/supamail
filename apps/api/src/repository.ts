@@ -45,6 +45,9 @@ const DEFAULT_METADATA_WRITE_TIMEOUT_MS = 5 * 60_000;
 const LIVE_THREAD_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const PURGE_MESSAGE_BATCH_SIZE = 100;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
+const MIME_EVIDENCE_EXTRACTOR = "mime_body";
+const MIME_EVIDENCE_EXTRACTOR_VERSION = "mime_evidence_v1";
+const MAX_MESSAGE_EVIDENCE_ROWS = 100;
 const THREADING_BODY_HEADER_KEYS = [
   "message-id",
   "references",
@@ -306,6 +309,53 @@ export function canonicalJsonForThreadingEvidence(value: unknown): string {
     )).join(",")}}`;
   }
   return JSON.stringify(String(value));
+}
+
+interface PreparedMessageEvidenceRow {
+  message_id: string;
+  extractor: string;
+  extractor_version: string;
+  kind: string;
+  namespace: string;
+  evidence_key: string;
+  evidence_key_sha256: string;
+  metadata: Record<string, string | number | boolean | null>;
+}
+
+function prepareMessageEvidence(body: MessageBodyInput): PreparedMessageEvidenceRow[] {
+  if (body.evidence.length > MAX_MESSAGE_EVIDENCE_ROWS) {
+    throw new Error(`Message evidence exceeds ${MAX_MESSAGE_EVIDENCE_ROWS} rows`);
+  }
+  const rows = new Map<string, PreparedMessageEvidenceRow>();
+  for (const item of body.evidence) {
+    if (!item.namespace || item.namespace.length > 64 || !/^[a-z0-9_]+$/.test(item.namespace)) {
+      throw new Error("Message evidence namespace is invalid");
+    }
+    if (!item.key || Buffer.byteLength(item.key, "utf8") > 2_048) {
+      throw new Error("Message evidence key is invalid");
+    }
+    const metadataJson = canonicalJsonForThreadingEvidence(item.metadata);
+    if (Buffer.byteLength(metadataJson, "utf8") > 16_384) {
+      throw new Error("Message evidence metadata is too large");
+    }
+    const evidenceKeySha256 = createHash("sha256").update(item.key).digest("hex");
+    const identity = `${item.kind}\u0000${item.namespace}\u0000${evidenceKeySha256}`;
+    rows.set(identity, {
+      message_id: body.messageId,
+      extractor: MIME_EVIDENCE_EXTRACTOR,
+      extractor_version: MIME_EVIDENCE_EXTRACTOR_VERSION,
+      kind: item.kind,
+      namespace: item.namespace,
+      evidence_key: item.key,
+      evidence_key_sha256: evidenceKeySha256,
+      metadata: JSON.parse(metadataJson) as Record<string, string | number | boolean | null>
+    });
+  }
+  return [...rows.values()].sort((left, right) =>
+    `${left.kind}\u0000${left.namespace}\u0000${left.evidence_key_sha256}`.localeCompare(
+      `${right.kind}\u0000${right.namespace}\u0000${right.evidence_key_sha256}`
+    )
+  );
 }
 
 interface PurgeCandidate {
@@ -2990,6 +3040,12 @@ export class MirrorRepository {
   }
 
   async storeBody(body: MessageBodyInput): Promise<void> {
+    const preparedEvidence = body.rawTruncated ? [] : prepareMessageEvidence(body);
+    const structuredEvidenceSha256 = body.rawTruncated
+      ? null
+      : createHash("sha256")
+        .update(canonicalJsonForThreadingEvidence(preparedEvidence))
+        .digest("hex");
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -3080,11 +3136,19 @@ export class MirrorRepository {
           headers_json,
           mime_structure,
           parser_warnings,
+          structured_evidence_extractor_version,
+          structured_evidence_sha256,
+          structured_evidence_complete,
+          structured_evidence_extracted_at,
           fetched_at,
           created_at,
           updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now(), now())
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+          $14, $15, $16, now(),
+          now(), now(), now()
+        )
         ON CONFLICT (message_id)
         DO UPDATE SET
           raw_mime = EXCLUDED.raw_mime,
@@ -3099,6 +3163,10 @@ export class MirrorRepository {
           headers_json = EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
           parser_warnings = EXCLUDED.parser_warnings,
+          structured_evidence_extractor_version = EXCLUDED.structured_evidence_extractor_version,
+          structured_evidence_sha256 = EXCLUDED.structured_evidence_sha256,
+          structured_evidence_complete = EXCLUDED.structured_evidence_complete,
+          structured_evidence_extracted_at = EXCLUDED.structured_evidence_extracted_at,
           fetched_at = now(),
           updated_at = now()
         `,
@@ -3115,9 +3183,80 @@ export class MirrorRepository {
           body.selectedTextFormat,
           JSON.stringify(body.headersJson),
           JSON.stringify(body.mimeStructure ?? null),
-          body.parserWarnings
+          body.parserWarnings,
+          MIME_EVIDENCE_EXTRACTOR_VERSION,
+          structuredEvidenceSha256,
+          !body.rawTruncated
         ]
       );
+
+      if (!body.rawTruncated) {
+        if (preparedEvidence.length > 0) {
+          await client.query(
+            `
+            INSERT INTO public.imap_message_evidence (
+              message_id,
+              extractor,
+              extractor_version,
+              kind,
+              namespace,
+              evidence_key,
+              evidence_key_sha256,
+              metadata,
+              created_at,
+              updated_at
+            )
+            SELECT
+              input.message_id,
+              input.extractor,
+              input.extractor_version,
+              input.kind,
+              input.namespace,
+              input.evidence_key,
+              input.evidence_key_sha256,
+              input.metadata,
+              now(),
+              now()
+            FROM jsonb_to_recordset($1::jsonb) AS input (
+              message_id uuid,
+              extractor text,
+              extractor_version text,
+              kind text,
+              namespace text,
+              evidence_key text,
+              evidence_key_sha256 text,
+              metadata jsonb
+            )
+            ON CONFLICT (message_id, extractor, kind, namespace, evidence_key_sha256)
+            DO UPDATE SET
+              extractor_version = EXCLUDED.extractor_version,
+              evidence_key = EXCLUDED.evidence_key,
+              metadata = EXCLUDED.metadata,
+              updated_at = now()
+            `,
+            [JSON.stringify(preparedEvidence)]
+          );
+        }
+        await client.query(
+          `
+          DELETE FROM public.imap_message_evidence existing
+          WHERE existing.message_id = $1
+            AND existing.extractor = $2
+            AND NOT EXISTS (
+              SELECT 1
+              FROM jsonb_to_recordset($3::jsonb) AS current_evidence (
+                kind text,
+                namespace text,
+                evidence_key_sha256 text
+              )
+              WHERE current_evidence.kind = existing.kind
+                AND current_evidence.namespace = existing.namespace
+                AND current_evidence.evidence_key_sha256 = existing.evidence_key_sha256
+            )
+          `,
+          [body.messageId, MIME_EVIDENCE_EXTRACTOR, JSON.stringify(preparedEvidence)]
+        );
+      }
 
       if (learnedThreadingEvidence || bodyHeadersChanged || learnedDeliveryEvidence) {
         await this.enqueueThreadingMessages(
@@ -3175,11 +3314,15 @@ export class MirrorRepository {
               AND EXISTS (
                 SELECT 1
                 FROM public.imap_messages m
+                LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
                 WHERE m.account_id = f.account_id
                   AND m.folder_path = f.path
                   AND m.deleted_in_provider = false
                   AND m.window_status = 'HISTORICAL'
-                  AND m.body_fetched_at IS NULL
+                  AND (
+                    m.body_fetched_at IS NULL
+                    OR b.structured_evidence_extractor_version IS DISTINCT FROM $5
+                  )
               )
             THEN 'body'
             WHEN $3::text = 'weekly'
@@ -3224,7 +3367,8 @@ export class MirrorRepository {
         account.id,
         account.historical_backfill_mode,
         account.archive_refresh_interval,
-        limit
+        limit,
+        MIME_EVIDENCE_EXTRACTOR_VERSION
       ]
     );
     return result.rows;
@@ -3237,17 +3381,21 @@ export class MirrorRepository {
   ): Promise<ImapMessage[]> {
     const result = await this.pool.query<ImapMessage>(
       `
-      SELECT *
-      FROM public.imap_messages
-      WHERE account_id = $1
-        AND folder_path = $2
-        AND deleted_in_provider = false
-        AND window_status = 'HISTORICAL'
-        AND body_fetched_at IS NULL
-      ORDER BY uid DESC
+      SELECT m.*
+      FROM public.imap_messages m
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+      WHERE m.account_id = $1
+        AND m.folder_path = $2
+        AND m.deleted_in_provider = false
+        AND m.window_status = 'HISTORICAL'
+        AND (
+          m.body_fetched_at IS NULL
+          OR b.structured_evidence_extractor_version IS DISTINCT FROM $4
+        )
+      ORDER BY m.uid DESC
       LIMIT $3
       `,
-      [accountId, folder.path, limit]
+      [accountId, folder.path, limit, MIME_EVIDENCE_EXTRACTOR_VERSION]
     );
     return result.rows;
   }
@@ -3357,8 +3505,8 @@ export class MirrorRepository {
     const policy = account.body_fetch_policy || (this.config.BODY_FETCH_POLICY as BodyFetchPolicy);
     if (policy === "lazy") return [];
 
-    const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $3" : "";
-    const params: unknown[] = [account.id, limit];
+    const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $4" : "";
+    const params: unknown[] = [account.id, limit, MIME_EVIDENCE_EXTRACTOR_VERSION];
     if (policy === "priority_then_backfill") params.push(this.config.PRIORITY_CUTOFF);
 
     const result = await this.pool.query<ImapMessage>(
@@ -3366,6 +3514,7 @@ export class MirrorRepository {
       SELECT m.*
       FROM public.imap_messages m
       JOIN public.imap_folders f ON f.account_id = m.account_id AND f.path = m.folder_path
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.account_id = $1
         AND f.tracked = true
         -- The body lane SELECTs the folder too (getMailboxLock on folder_path), so a
@@ -3377,7 +3526,10 @@ export class MirrorRepository {
         AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND m.deleted_in_provider = false
         AND m.window_status = 'IN_WINDOW'
-        AND m.body_fetched_at IS NULL
+        AND (
+          m.body_fetched_at IS NULL
+          OR b.structured_evidence_extractor_version IS DISTINCT FROM $3
+        )
         ${priorityClause}
       ORDER BY f.sync_priority, m.uid DESC
       LIMIT $2

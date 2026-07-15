@@ -177,13 +177,92 @@ describe("repository threading evidence wiring", () => {
       selectedTextFormat: "plain",
       headersJson: { "x-a": "first", "x-z": "last" },
       mimeStructure: null,
-      parserWarnings: []
+      parserWarnings: [],
+      evidence: []
     });
 
     expect(calls.some((call) => call.sql.startsWith("INSERT INTO public.imap_thread_work_queue"))).toBe(false);
     const stateLockIndex = calls.findIndex((call) => call.sql.includes("FOR SHARE"));
     const bodyWriteIndex = calls.findIndex((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"));
     expect(stateLockIndex).toBeLessThan(bodyWriteIndex);
+  });
+
+  it("atomically replaces structured message evidence on body recomputation", async () => {
+    const rawMime = Buffer.from("Message-ID: <evidence@example.test>\r\n\r\nbody");
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const client = {
+      release: vi.fn(),
+      query: vi.fn(async (sql: unknown, params: unknown[] = []) => {
+        const text = sqlText(sql);
+        const values = sqlParams(sql, params);
+        calls.push({ sql: text, params: values });
+        if (text === "SELECT account_id FROM public.imap_messages WHERE id = $1") {
+          return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
+        }
+        if (text.includes("FROM public.imap_thread_state") && text.includes("FOR SHARE")) {
+          return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
+        }
+        if (text.includes("LEFT JOIN public.imap_message_bodies")) {
+          return {
+            rows: [{
+              account_id: ACCOUNT_ID,
+              folder_path: "INBOX",
+              body_fetched_at: new Date("2026-01-01T00:00:00.000Z"),
+              rfc_message_id: "<evidence@example.test>",
+              in_reply_to: null,
+              references_header: null,
+              headers_json: {},
+              raw_mime_sha256: null,
+              body_headers_json: {}
+            }],
+            rowCount: 1
+          };
+        }
+        if (text.startsWith("INSERT INTO public.imap_message_evidence")) {
+          return { rows: [{ id: "evidence-row" }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      })
+    };
+    const repository = repositoryWithClient(client);
+
+    await repository.storeBody({
+      messageId: MESSAGE_ID,
+      rawMime,
+      rawBytes: rawMime.byteLength,
+      rawTruncated: false,
+      bodyText: "body",
+      bodyHtml: null,
+      bodyPlain: "body",
+      selectedTextPart: "body",
+      selectedTextFormat: "plain",
+      headersJson: {},
+      mimeStructure: null,
+      parserWarnings: [],
+      evidence: [{
+        kind: "provider_resource",
+        namespace: "github_issue",
+        key: "acme/mail#42",
+        metadata: { provider: "github", number: 42 }
+      }]
+    });
+
+    const deleteIndex = calls.findIndex((call) => call.sql.startsWith("DELETE FROM public.imap_message_evidence"));
+    const insertIndex = calls.findIndex((call) => call.sql.startsWith("INSERT INTO public.imap_message_evidence"));
+    const commitIndex = calls.findIndex((call) => call.sql === "COMMIT");
+    expect(deleteIndex).toBeGreaterThan(-1);
+    expect(insertIndex).toBeLessThan(deleteIndex);
+    expect(deleteIndex).toBeLessThan(commitIndex);
+
+    const inserted = JSON.parse(String(calls[insertIndex]?.params[0]));
+    expect(inserted).toEqual([expect.objectContaining({
+      message_id: MESSAGE_ID,
+      kind: "provider_resource",
+      namespace: "github_issue",
+      evidence_key: "acme/mail#42",
+      evidence_key_sha256: createHash("sha256").update("acme/mail#42").digest("hex"),
+      extractor_version: "mime_evidence_v1"
+    })]);
   });
 
   it("requeues every live run when a complete body fingerprint changes", async () => {
@@ -233,7 +312,8 @@ describe("repository threading evidence wiring", () => {
       selectedTextFormat: "plain",
       headersJson: {},
       mimeStructure: null,
-      parserWarnings: []
+      parserWarnings: [],
+      evidence: []
     });
 
     const queue = calls.find((call) => call.sql.startsWith("INSERT INTO public.imap_thread_work_queue"));

@@ -162,6 +162,19 @@ describe("fetchFullMessageBody mailbox locking", () => {
     expect(body.rawBytes).toBeGreaterThan(0);
   });
 
+  it("marks structured evidence incomplete instead of trusting a truncated MIME fetch", async () => {
+    const client = notesClient();
+    const body = await fetchFullMessageBody(
+      client,
+      { BODY_RAW_MAX_BYTES: 64 } as unknown as AppConfig,
+      notesMessage
+    );
+
+    expect(body.rawTruncated).toBe(true);
+    expect(body.evidence).toEqual([]);
+    expect(body.parserWarnings).toContain("artifact_evidence_omitted_raw_truncated");
+  });
+
   it("reuses the selected mailbox without re-locking when skipMailboxLock is set (no nested-lock deadlock)", async () => {
     const client = notesClient();
     await client.getMailboxLock("INBOX.Notes"); // caller already holds the lock
