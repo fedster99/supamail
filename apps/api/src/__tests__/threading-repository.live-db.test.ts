@@ -1514,6 +1514,26 @@ liveDb("ThreadingRepository live DB", () => {
     expect(failed.rows[0]?.error).toMatch(/evidence bytes/);
   });
 
+  it("accepts a measured 17 MiB production-sized evidence page under the default bound", async () => {
+    const accountId = await createAccount("production-evidence-page");
+    const evidence = "x".repeat(1_044_000);
+    for (let uid = 1; uid <= 17; uid += 1) {
+      await seedMessage(accountId, {
+        uid,
+        subject: `Production evidence ${uid}`,
+        rfcMessageId: `<production-evidence-${uid}@example.test>`,
+        headersJson: { "x-production-evidence": evidence }
+      });
+    }
+
+    await repository.drainAccount(accountId, { batchSize: 17, requestedBy: "live-test" });
+    await repository.drainAccount(accountId, { batchSize: 17, requestedBy: "live-test" });
+    await expect(repository.drainAccount(accountId, {
+      batchSize: 17,
+      requestedBy: "live-test"
+    })).resolves.toMatchObject({ messagesConsidered: 17, assignmentsChanged: 17 });
+  });
+
   it("lets an older rolling-deploy worker observe but never mutate a newer active run", async () => {
     const accountId = await createAccount("version-skew");
     const newer = await pool.query<{ id: string }>(
