@@ -63,7 +63,11 @@ export const genericImapProfile: ProviderProfile = {
   knownQuirks: [],
   priorityForFolder(path, specialUse) {
     const normalized = normalizedPath(specialUse || path);
-    if (normalized.includes("inbox")) return 1;
+    // IMAP hierarchy names commonly prefix every child with `INBOX.`. Only the
+    // exact inbox role belongs in the hottest lane; treating every descendant
+    // as Inbox can consume the bounded priority set and starve the real Sent
+    // folder that outbound reconciliation depends on.
+    if (normalized === "inbox") return 1;
     if (normalized.includes("sent")) return 5;
     return 100;
   },
@@ -94,7 +98,7 @@ export const rackspaceProfile: ProviderProfile = {
   ],
   priorityForFolder(path, specialUse) {
     const normalized = normalizedPath(specialUse || path);
-    if (path === "INBOX" || normalized.includes("inbox")) return 1;
+    if (normalized === "inbox") return 1;
     if (normalized.includes("sent")) return 5;
     return 100;
   }
