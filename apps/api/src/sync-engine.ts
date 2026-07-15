@@ -1032,7 +1032,15 @@ export class MirrorEngine {
           );
         }
         reconcileGapsFound = reconcile.markedCount + reconcile.missingInDbUids.length;
-        reconcileClean = reconcileGapsFound === 0;
+        // Gap count is evidence that the mirror drifted before this pass, not
+        // evidence that it is still dirty afterward. Provider-missing rows are
+        // tombstoned inside markMissingMessagesFromLiveUidStream, and every
+        // returned missing-in-DB UID has been fetched and upserted by this point.
+        // Keep health degraded only when the bounded repair was interrupted or
+        // the missing-UID result overflowed this pass.
+        reconcileClean = !hitLockBudget
+          && !reconcile.missingInDbTruncated
+          && backfilled === reconcile.missingInDbUids.length;
       }
 
       await this.repository.markFolderSynced(folder.id, {

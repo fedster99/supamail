@@ -44,8 +44,9 @@ SupaMail owns a conservative mailbox mirror:
 | Do not reconcile unfinished initial sync folders. | Implemented | Reconcile runs only after initial sync completion; health remains `INITIAL_SYNC` while any tracked folder is incomplete. |
 | Incremental sync must not advance through partial metadata fetches. | Implemented | Metadata fetch fails if any requested UID is missing; unit coverage pins partial-batch behavior. |
 | Incremental sync must respect a hard operation deadline. | Implemented | `INCREMENTAL_TOTAL_TIMEOUT_MS` aborts IMAP work, treats the cycle as transient failure, and does not advance `last_uid`. |
-| Reconcile provider deletes and missing-in-DB rows. | Implemented | Temp-table UID stream finds missing local rows and provider-only rows; live DB tests verify `RECONCILE_BACKFILL`. |
-| Reconcile must be staggered and budgeted. | Implemented | `next_reconcile_at`, `RECONCILE_INTERVAL_MS`, and `MAX_RECONCILES_PER_CYCLE` keep reconciliation due-based instead of every-folder/every-cycle. |
+| Reconcile provider deletes and missing-in-DB rows. | Implemented | Temp-table UID stream finds missing local rows and provider-only rows; live DB tests verify provider tombstones and `RECONCILE_BACKFILL`. |
+| Reconcile health must describe post-repair state. | Implemented | Observed gaps remain run telemetry, while fully repaired provider deletes or missing-in-DB rows finish with `last_reconcile_clean = true`; bounded overflow or interrupted repair remains degraded and retries on the next full-sync cadence. |
+| Reconcile must be staggered and budgeted. | Implemented | `next_reconcile_at`, `RECONCILE_INTERVAL_MS`, and `MAX_RECONCILES_PER_CYCLE` keep clean reconciliation due-based instead of every-folder/every-cycle; incomplete repair retries early. |
 | Flag scans are due-based and diff actual flag changes. | Implemented | `applyFlagScan` compares normalized old/new flags, logs `FLAGS_CHANGED`, and does not backfill unknown UIDs. |
 | Flag scans must be budgeted. | Implemented | Priority and round-robin flag scan intervals are separate, and `MAX_FLAG_SCANS_PER_CYCLE` limits per-cycle work. |
 | Exclude folder explosions such as Spam/Trash/All Mail by default. | Implemented | Provider profiles exclude dangerous/system folders including SPECIAL-USE `\All` and `All Mail`. |
@@ -55,7 +56,7 @@ SupaMail owns a conservative mailbox mirror:
 | Missing folders get a grace period before tombstoning. | Implemented | Folder discovery stamps `missing_since`; past grace marks folder `MISSING` and tombstones in-window rows. |
 | Missing-mailbox folder operations should force rediscovery. | Implemented | Missing-mailbox errors move the folder to `PENDING_VERIFICATION`, stamp `missing_since`, set `next_folder_discovery_at = now()`, and pause normal scheduling until discovery resolves it; spec-conformance Scenario K proves the full path. |
 | UIDVALIDITY resets trigger controlled resync and a rolling reset cap. | Implemented | Reset handler tombstones old rows, resets folder state, and marks account `BROKEN` after the configured 24h cap. |
-| Health must not lie. | Implemented | Account health stays `INITIAL_SYNC`/`DEGRADED` until tracked folders, lag, and reconcile state are actually clean. |
+| Health must not lie. | Implemented | Account health stays `INITIAL_SYNC`/`DEGRADED` until tracked folders, lag, and post-repair reconcile state are actually clean; repaired pre-pass drift remains observable without pinning stale degraded health. |
 | Stuck `DEGRADED` must escalate without hiding recovery forever. | Implemented | `last_priority_sync_succeeded_at` drives retryable `STUCK_DEGRADED_24H`, hourly retry via `backoff_until`, terminal `STUCK_DEGRADED_TERMINAL`, and recovery on successful priority sync; spec-conformance Scenario I proves it. |
 | Partial success is not a hard failure when priority folders succeed. | Implemented | Priority failure makes sync failed; round-robin-only failure is `partial_success` and increments success counters. |
 | Backoff should be conservative and jittered. | Implemented | Transient failures use jittered exponential backoff; stored backoff resets only after stable success. |
