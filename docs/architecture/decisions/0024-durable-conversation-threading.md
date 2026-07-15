@@ -57,6 +57,33 @@ body variants, MIME structure, full parsed headers, envelope, byte sizes, and
 parser warnings, and is emitted only for complete, non-truncated bodies with a
 sender and recipient. Any disagreement remains split.
 
+Algorithm v2 treats raw-MIME, full parsed-representation, and transport-invariant
+authored-representation digests as a set of evidence tokens instead of choosing
+one tier and discarding the others. Physical rows with the same strict Message-ID
+belong to one delivery component when any token is shared. The authored digest is
+the conservative answer to a common provider mutation: an Inbox copy may add
+`Received`, authentication, routing, and spam headers and change wire size while
+the Sent copy retains the original bytes. It excludes those transport fields but
+includes the original Message-ID and Date, envelope, stable MIME headers, every
+parsed body variant, MIME structure, parser warnings, and the complete structured
+evidence digest (including decoded attachment identities). This safely collapses
+transport-mutated and raw/parsed-only mirrors while still splitting reused
+Message-IDs whose authored representations differ. The v1 executor remains
+registered for active and rollback projections.
+
+V2 queues every eligible row only after the same strict Message-ID has produced
+different delivery candidates. The next bounded preflight derives at most the
+normal body-evidence batch under the same server deadline. The queue item survives
+ordinary projection cleanup, and the authored-evidence trigger schedules
+deterministic recomputation after repair. This avoids hashing every historical
+body while resolving real collisions; any computed mismatch remains split.
+If a queued body becomes truncated or otherwise incomplete before repair, its
+special queue item is downgraded to ordinary recomputation instead of wedging the
+run. Parsed/authored digests are derived projections too: body refetches and
+provider corrections to their envelope inputs clear them at the database boundary,
+then the evidence triggers recompute every state-referenced run. Stale exact-copy
+evidence is therefore never retained after its source changes.
+
 ### Bounded fallback evidence
 
 Provider thread IDs (`OBJECTID`/`X-GM-THRID`) are strong, account-scoped

@@ -3169,6 +3169,8 @@ export class MirrorRepository {
         DO UPDATE SET
           raw_mime = EXCLUDED.raw_mime,
           raw_mime_sha256 = EXCLUDED.raw_mime_sha256,
+          parsed_delivery_sha256 = NULL,
+          authored_delivery_sha256 = NULL,
           raw_bytes = EXCLUDED.raw_bytes,
           raw_truncated = EXCLUDED.raw_truncated,
           body_text = EXCLUDED.body_text,

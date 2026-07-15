@@ -3,6 +3,7 @@ import {
   THREADING_ALGORITHM_VERSION,
   canonicalizeMessageId,
   computeThreadAssignments,
+  computeThreadAssignmentsV1,
   extractMessageIdTokens,
   type ThreadingAssignment,
   type ThreadingMessageInput
@@ -543,6 +544,85 @@ describe("delivery copies and ambiguous duplicate Message-ID values", () => {
       subject_base: "project atlas",
       algorithm_version: THREADING_ALGORITHM_VERSION
     });
+  });
+
+  it("collapses copies when exact parsed evidence bridges raw and parsed-only storage", () => {
+    const inputs = [
+      message("raw-copy", {
+        folder_path: "INBOX",
+        uid: 10,
+        rfc_message_id: "<cross-tier-copy@x>",
+        raw_mime_hash: "exact-wire-hash",
+        delivery_fingerprint: "same-complete-parsed-message"
+      }),
+      message("parsed-only-copy", {
+        folder_path: "INBOX.INBOX",
+        uid: 10,
+        rfc_message_id: "<cross-tier-copy@x>",
+        delivery_fingerprint: "same-complete-parsed-message"
+      })
+    ];
+    const assignments = computeThreadAssignments(inputs);
+
+    expect(THREADING_ALGORITHM_VERSION).toBe(2);
+    expect(byId(assignments, "raw-copy").delivery_key)
+      .toBe(byId(assignments, "parsed-only-copy").delivery_key);
+    expect(byId(assignments, "raw-copy").evidence.collapsed_physical_ids)
+      .toEqual(["parsed-only-copy", "raw-copy"]);
+    expect(assignments.every((assignment) => assignment.algorithm_version === 2)).toBe(true);
+
+    const retainedV1 = computeThreadAssignmentsV1(inputs);
+    expect(byId(retainedV1, "raw-copy").delivery_key)
+      .not.toBe(byId(retainedV1, "parsed-only-copy").delivery_key);
+    expect(retainedV1.every((assignment) => assignment.algorithm_version === 1)).toBe(true);
+  });
+
+  it("uses authored evidence across transport-mutated raw copies without changing v1", () => {
+    const inputs = [
+      message("sent-copy", {
+        folder_path: "Sent",
+        rfc_message_id: "<transport-mutated@x>",
+        raw_mime_hash: "sent-wire-hash",
+        authored_delivery_fingerprint: "same-authored-message"
+      }),
+      message("received-copy", {
+        folder_path: "INBOX",
+        rfc_message_id: "<transport-mutated@x>",
+        raw_mime_hash: "received-wire-hash",
+        authored_delivery_fingerprint: "same-authored-message"
+      })
+    ];
+
+    const assignments = computeThreadAssignments(inputs);
+    expect(byId(assignments, "sent-copy").delivery_key)
+      .toBe(byId(assignments, "received-copy").delivery_key);
+
+    const retainedV1 = computeThreadAssignmentsV1(inputs);
+    expect(byId(retainedV1, "sent-copy").delivery_key)
+      .not.toBe(byId(retainedV1, "received-copy").delivery_key);
+  });
+
+  it("keeps authored-only delivery evidence unavailable to retained v1 runs", () => {
+    const inputs = [
+      message("sent-copy", {
+        folder_path: "Sent",
+        rfc_message_id: "<authored-only@x>",
+        authored_delivery_fingerprint: "same-authored-message"
+      }),
+      message("received-copy", {
+        folder_path: "INBOX",
+        rfc_message_id: "<authored-only@x>",
+        authored_delivery_fingerprint: "same-authored-message"
+      })
+    ];
+
+    const assignments = computeThreadAssignments(inputs);
+    expect(byId(assignments, "sent-copy").delivery_key)
+      .toBe(byId(assignments, "received-copy").delivery_key);
+
+    const retainedV1 = computeThreadAssignmentsV1(inputs);
+    expect(byId(retainedV1, "sent-copy").delivery_key)
+      .not.toBe(byId(retainedV1, "received-copy").delivery_key);
   });
 
   it("prefers an account-scoped provider message identity over inconsistent RFC ids", () => {

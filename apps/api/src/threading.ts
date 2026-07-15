@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
  * used by incremental processing and deterministic backfills.
  */
 
-export const THREADING_ALGORITHM_VERSION = 1 as const;
+export const THREADING_ALGORITHM_VERSION = 2 as const;
 
 type HeaderValue = string | readonly string[] | null | undefined;
 
@@ -47,6 +47,8 @@ export interface ThreadingMessageInput {
   /** Strong copy evidence supplied by the caller, ideally a raw-MIME hash. */
   delivery_fingerprint?: string | null;
   raw_mime_hash?: string | null;
+  /** Transport-invariant authored MIME evidence, computed only for collisions. */
+  authored_delivery_fingerprint?: string | null;
   subject?: string | null;
   from_email?: string | null;
   to_emails?: readonly string[] | null;
@@ -132,6 +134,7 @@ interface ParsedPhysicalMessage {
   providerMessageKey: string | null;
   providerThreadKey: string | null;
   copyFingerprint: string | null;
+  copyFingerprints: string[];
   timestamp: number | null;
   subject: ParsedSubject;
   rawSubject: string | null;
@@ -704,8 +707,18 @@ function physicalCopyFingerprint(input: ThreadingMessageInput): string | null {
   const rawMimeHash = input.raw_mime_hash?.trim();
   if (rawMimeHash) return `raw:${rawMimeHash}`;
   const explicit = input.delivery_fingerprint?.trim();
-  if (explicit) return `parsed:${explicit}`;
-  return null;
+  return explicit ? `parsed:${explicit}` : null;
+}
+
+function physicalCopyFingerprints(input: ThreadingMessageInput): string[] {
+  const fingerprints: string[] = [];
+  const legacy = physicalCopyFingerprint(input);
+  if (legacy) fingerprints.push(legacy);
+  const parsed = input.delivery_fingerprint?.trim();
+  if (parsed && legacy !== `parsed:${parsed}`) fingerprints.push(`parsed:${parsed}`);
+  const authored = input.authored_delivery_fingerprint?.trim();
+  if (authored) fingerprints.push(`authored:${authored}`);
+  return [...new Set(fingerprints)];
 }
 
 function parsePhysicalMessage(input: ThreadingMessageInput): ParsedPhysicalMessage {
@@ -807,6 +820,7 @@ function parsePhysicalMessage(input: ThreadingMessageInput): ParsedPhysicalMessa
       "provider-thread"
     ),
     copyFingerprint: physicalCopyFingerprint(input),
+    copyFingerprints: physicalCopyFingerprints(input),
     timestamp,
     subject: parsedSubject,
     rawSubject: input.subject?.trim() || null,
@@ -853,7 +867,7 @@ function compatibleReferenceChains(left: readonly string[], right: readonly stri
   return isChainSuffix(left, right) || isChainSuffix(right, left);
 }
 
-function buildDeliveries(messages: ParsedPhysicalMessage[]): Delivery[] {
+function buildLegacyDeliveryGroups(messages: ParsedPhysicalMessage[]): Map<string, ParsedPhysicalMessage[]> {
   const baseGroups = new Map<string, ParsedPhysicalMessage[]>();
   for (const message of messages) {
     const key = baseDeliveryKey(message);
@@ -894,6 +908,107 @@ function buildDeliveries(messages: ParsedPhysicalMessage[]): Delivery[] {
       groups.set(`delivery:variant:${sha256(`${baseKey}\u0000${variant}`)}`, variantMessages);
     }
   }
+
+  return groups;
+}
+
+function sharedFingerprintComponents(messages: ParsedPhysicalMessage[]): ParsedPhysicalMessage[][] {
+  const ordered = [...messages].sort((left, right) => binaryCompare(left.stableKey, right.stableKey));
+  const parents = ordered.map((_, index) => index);
+  const find = (index: number): number => {
+    let root = index;
+    while (parents[root] !== root) root = parents[root];
+    while (parents[index] !== index) {
+      const next = parents[index];
+      parents[index] = root;
+      index = next;
+    }
+    return root;
+  };
+  const union = (left: number, right: number): void => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot === rightRoot) return;
+    if (leftRoot < rightRoot) parents[rightRoot] = leftRoot;
+    else parents[leftRoot] = rightRoot;
+  };
+  const fingerprintOwner = new Map<string, number>();
+  ordered.forEach((message, index) => {
+    for (const fingerprint of message.copyFingerprints) {
+      const owner = fingerprintOwner.get(fingerprint);
+      if (owner === undefined) fingerprintOwner.set(fingerprint, index);
+      else union(index, owner);
+    }
+  });
+
+  const components = new Map<number, ParsedPhysicalMessage[]>();
+  ordered.forEach((message, index) => {
+    const root = find(index);
+    const component = components.get(root) ?? [];
+    component.push(message);
+    components.set(root, component);
+  });
+  return [...components.values()].sort((left, right) => binaryCompare(left[0].stableKey, right[0].stableKey));
+}
+
+function componentFingerprintKey(messages: ParsedPhysicalMessage[]): string {
+  const fingerprints = [...new Set(messages.flatMap((message) => message.copyFingerprints))].sort();
+  if (fingerprints.length > 0) return `fingerprints:${fingerprints.join("\u0000")}`;
+  return `physical:${messages[0].stableKey}`;
+}
+
+function buildSharedEvidenceDeliveryGroups(messages: ParsedPhysicalMessage[]): Map<string, ParsedPhysicalMessage[]> {
+  const groups = new Map<string, ParsedPhysicalMessage[]>();
+  const providerGroups = new Map<string, ParsedPhysicalMessage[]>();
+  const messageIdGroups = new Map<string, ParsedPhysicalMessage[]>();
+  const fingerprintOnly: ParsedPhysicalMessage[] = [];
+
+  for (const message of messages) {
+    if (message.providerMessageKey) {
+      const key = baseDeliveryKey(message);
+      const group = providerGroups.get(key) ?? [];
+      group.push(message);
+      providerGroups.set(key, group);
+    } else if (message.messageId) {
+      const key = baseDeliveryKey(message);
+      const group = messageIdGroups.get(key) ?? [];
+      group.push(message);
+      messageIdGroups.set(key, group);
+    } else if (message.copyFingerprints.length > 0) {
+      fingerprintOnly.push(message);
+    } else {
+      groups.set(baseDeliveryKey(message), [message]);
+    }
+  }
+
+  for (const [key, group] of providerGroups) groups.set(key, group);
+  for (const [baseKey, candidates] of messageIdGroups) {
+    const components = sharedFingerprintComponents(candidates);
+    if (components.length === 1) {
+      groups.set(baseKey, components[0]);
+      continue;
+    }
+    for (const component of components) {
+      const variant = componentFingerprintKey(component);
+      groups.set(`delivery:variant:${sha256(`${baseKey}\u0000${variant}`)}`, component);
+    }
+  }
+
+  for (const component of sharedFingerprintComponents(fingerprintOnly)) {
+    const accountId = component[0].input.account_id;
+    const variant = componentFingerprintKey(component);
+    groups.set(`delivery:fingerprint:${sha256(`${accountId}\u0000${variant}`)}`, component);
+  }
+  return groups;
+}
+
+function buildDeliveries(
+  messages: ParsedPhysicalMessage[],
+  groupingVersion: 1 | 2
+): Delivery[] {
+  const groups = groupingVersion === 1
+    ? buildLegacyDeliveryGroups(messages)
+    : buildSharedEvidenceDeliveryGroups(messages);
 
   const deliveries: Delivery[] = [];
   for (const [key, unsorted] of groups) {
@@ -1048,11 +1163,16 @@ function conversationId(accountId: string, anchor: string): string {
   return `thread_${sha256(`supamail-conversation\u0000${accountId}\u0000${anchor}`).slice(0, 32)}`;
 }
 
-function threadAccount(inputs: ThreadingMessageInput[], options: Required<ThreadingOptions>): ThreadingAssignment[] {
+function threadAccount(
+  inputs: ThreadingMessageInput[],
+  options: Required<ThreadingOptions>,
+  algorithmVersion: number,
+  groupingVersion: 1 | 2
+): ThreadingAssignment[] {
   const accountId = inputs[0]?.account_id;
   if (!accountId) return [];
   const parsed = inputs.map(parsePhysicalMessage);
-  const deliveries = buildDeliveries(parsed);
+  const deliveries = buildDeliveries(parsed, groupingVersion);
 
   const tokenOwners = new Map<string, Delivery[]>();
   for (const delivery of deliveries) {
@@ -1349,7 +1469,7 @@ function threadAccount(inputs: ThreadingMessageInput[], options: Required<Thread
     const parentReference = node.parent?.reference ?? null;
     const parentDeliveryKey = node.parent?.deliveryKey ?? null;
     const assignmentHash = sha256(stableStringify({
-      algorithm_version: THREADING_ALGORITHM_VERSION,
+      algorithm_version: algorithmVersion,
       normalized_input_hash: delivery.normalizedInputHash,
       conversation_anchor: summary.anchor,
       parent_reference: parentReference,
@@ -1385,7 +1505,7 @@ function threadAccount(inputs: ThreadingMessageInput[], options: Required<Thread
           parse_warnings: [...evidence.parse_warnings]
         },
         input_hash: assignmentHash,
-        algorithm_version: THREADING_ALGORITHM_VERSION
+        algorithm_version: algorithmVersion
       });
     }
   }
@@ -1396,10 +1516,11 @@ function threadAccount(inputs: ThreadingMessageInput[], options: Required<Thread
   );
 }
 
-/** Build deterministic assignments for any number of accounts. */
-export function computeThreadAssignments(
+function computeThreadAssignmentsForVersion(
   messages: readonly ThreadingMessageInput[],
-  options: ThreadingOptions = {}
+  options: ThreadingOptions,
+  algorithmVersion: number,
+  groupingVersion: 1 | 2
 ): ThreadingAssignment[] {
   const physicalIds = new Set<string>();
   const accounts = new Map<string, ThreadingMessageInput[]>();
@@ -1422,7 +1543,30 @@ export function computeThreadAssignments(
 
   return [...accounts.entries()]
     .sort(([left], [right]) => binaryCompare(left, right))
-    .flatMap(([, accountMessages]) => threadAccount(accountMessages, resolvedOptions));
+    .flatMap(([, accountMessages]) =>
+      threadAccount(accountMessages, resolvedOptions, algorithmVersion, groupingVersion)
+    );
+}
+
+/** Retained verbatim v1 behavior for active, standby, and rollback runs. */
+export function computeThreadAssignmentsV1(
+  messages: readonly ThreadingMessageInput[],
+  options: ThreadingOptions = {}
+): ThreadingAssignment[] {
+  return computeThreadAssignmentsForVersion(messages, options, 1, 1);
+}
+
+/** Build deterministic assignments for any number of accounts. */
+export function computeThreadAssignments(
+  messages: readonly ThreadingMessageInput[],
+  options: ThreadingOptions = {}
+): ThreadingAssignment[] {
+  return computeThreadAssignmentsForVersion(
+    messages,
+    options,
+    THREADING_ALGORITHM_VERSION,
+    THREADING_ALGORITHM_VERSION
+  );
 }
 
 /** Short alias for callers that model this as a pure threading pass. */
