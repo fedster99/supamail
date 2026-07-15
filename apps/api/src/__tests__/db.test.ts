@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { assertSessionConnectionUrl, createPool } from "../db.js";
 
 describe("database connection guard", () => {
@@ -37,6 +37,32 @@ describe("createPool size", () => {
     try {
       expect(maxOf(pool)).toBe(25);
     } finally {
+      await pool.end();
+    }
+  });
+});
+
+describe("createPool runtime errors", () => {
+  const URL = "postgresql://postgres:pass@db.example.com:5432/postgres";
+
+  it("keeps a terminated idle client from becoming an uncaught process exception", async () => {
+    const error = Object.assign(new Error("terminating connection due to administrator command"), {
+      code: "57P01"
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const pool = createPool({ DATABASE_URL: URL });
+    try {
+      expect(() => pool.emit("error", error)).not.toThrow();
+      expect(log).toHaveBeenCalledWith(JSON.stringify({
+        event: "database.pool.idle_client_error",
+        error: {
+          message: error.message,
+          code: "57P01",
+          stack: error.stack
+        }
+      }));
+    } finally {
+      log.mockRestore();
       await pool.end();
     }
   });

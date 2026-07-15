@@ -42,13 +42,29 @@ export function createPool(
   config: Pick<AppConfig, "DATABASE_URL"> & Partial<Pick<AppConfig, "DATABASE_POOL_MAX">> = getConfig()
 ): PgPool {
   assertSessionConnectionUrl(config.DATABASE_URL);
-  return new Pool({
+  const pool = new Pool({
     connectionString: config.DATABASE_URL,
     // Backward-compatible: callers passing only { DATABASE_URL } still get the old max of 10.
     max: config.DATABASE_POOL_MAX ?? 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000
   });
+  // node-postgres emits errors from idle clients on the pool itself. Without a
+  // listener, EventEmitter promotes a recoverable connection loss (database
+  // restart, failover, or administrator termination) to an uncaught exception
+  // and takes down the whole API/worker process. The pool has already removed
+  // the failed client; log it and let the next checkout establish a new one.
+  pool.on("error", (error) => {
+    console.error(JSON.stringify({
+      event: "database.pool.idle_client_error",
+      error: {
+        message: error.message,
+        code: (error as NodeJS.ErrnoException).code,
+        stack: error.stack
+      }
+    }));
+  });
+  return pool;
 }
 
 export function getPool(): PgPool {

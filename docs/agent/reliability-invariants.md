@@ -66,6 +66,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Use session-scoped Postgres advisory locks, not transaction locks.
 - `DATABASE_URL` must be direct or session-affine. Transaction poolers are unsafe for this architecture.
 - `DATABASE_POOL_MAX` (default 10) caps Postgres connections per process. It does not change advisory-lock semantics: each pooled connection is its own session. Raise it for many concurrent accounts; keep it within a connection-capped pooler's limit.
+- Every runtime Postgres pool must handle its `error` event. node-postgres has already removed an idle client before emitting this event; log the lost session and let a later checkout reconnect. Never let database restart/failover or administrator termination of an idle session become an uncaught process exception.
 - Worker startup must fail if advisory lock self-test fails.
 - Every runtime ImapFlow client must have an `error` listener before connecting. Promise rejection remains the command/error contract, but EventEmitter's special unhandled `error` behavior must never turn a late event after intentional cancellation into a process crash. Combined API+worker mode installs the worker process handlers with an owner-level close callback before worker startup checks; SIGTERM/SIGINT and fatal events stop the worker and close the API immediately, cancel the lock-test retry budget, and skip later startup maintenance, while fatal events also retain a nonzero process exit status.
 - Stale lock recovery must be heartbeat-based and conservative.
