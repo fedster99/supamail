@@ -3,7 +3,9 @@ import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { AppConfig } from "./config.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
+import { AccountBusyError } from "./errors.js";
 import { assertSafeImapTarget } from "./host-validation.js";
+import { withAccountLock } from "./locks.js";
 import { normalizeMessageId } from "./mime.js";
 import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
 import {
@@ -32,6 +34,7 @@ import type {
   SyncResult,
   SyncRunStatus,
   SyncTriggerType,
+  UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
 } from "./types.js";
 
@@ -690,6 +693,53 @@ export class MirrorRepository {
       ]
     );
     return result.rows[0] ?? null;
+  }
+
+  async updateAccountCredentials(
+    accountId: string,
+    input: UpdateAccountCredentialsInput
+  ): Promise<AccountSummary | null> {
+    const current = await this.pool.query<{ lock_id: string }>(
+      `SELECT lock_id
+       FROM public.imap_accounts
+       WHERE id = $1`,
+      [accountId]
+    );
+    const existing = current.rows[0];
+    if (!existing) return null;
+
+    const encrypted = await encryptPassword(
+      this.pool,
+      input.password,
+      this.config.IMAP_ENCRYPTION_KEY
+    );
+    const updated = await withAccountLock(this.pool, existing.lock_id, async (lock) => {
+      const result = await lock.client.query<AccountSummary>(
+        `UPDATE public.imap_accounts
+         SET encrypted_password = $2,
+             sync_state = 'DEGRADED',
+             sync_state_reason = 'CREDENTIALS_UPDATED_PENDING_SYNC',
+             consecutive_failures = 0,
+             consecutive_successes = 0,
+             current_backoff_ms = 0,
+             backoff_until = NULL,
+             currently_syncing = false,
+             sync_started_by = NULL,
+             next_folder_discovery_at = now(),
+             updated_at = now()
+         WHERE id = $1
+         RETURNING ${ACCOUNT_SUMMARY_COLUMNS}`,
+        [accountId, encrypted]
+      );
+      return result.rows[0] ?? null;
+    });
+
+    if (updated === null) {
+      throw new AccountBusyError(
+        `Account ${accountId} is busy syncing; retry credential replacement shortly`
+      );
+    }
+    return updated;
   }
 
   async getRunnableAccounts(

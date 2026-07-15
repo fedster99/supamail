@@ -5,7 +5,14 @@ import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
 import { MailboxCapabilityError, MailboxMutationError } from "../mailbox-mutations.js";
-import type { AccountDetails, AccountSummary, ImapFolder, SyncResult, UpdateAccountSettingsInput } from "../types.js";
+import type {
+  AccountDetails,
+  AccountSummary,
+  ImapFolder,
+  SyncResult,
+  UpdateAccountCredentialsInput,
+  UpdateAccountSettingsInput
+} from "../types.js";
 
 const accountId = "00000000-0000-4000-8000-000000000001";
 const messageId = "00000000-0000-4000-8000-000000000002";
@@ -133,6 +140,10 @@ function buildApp(options: {
   account?: AccountSummary | null;
   accountDetails?: AccountDetails | null;
   trackFolder?: (accountId: string, path: string) => Promise<ImapFolder | null>;
+  updateAccountCredentials?: (
+    accountId: string,
+    input: UpdateAccountCredentialsInput
+  ) => Promise<AccountSummary | null>;
   updateAccountSettings?: (accountId: string, input: UpdateAccountSettingsInput) => Promise<AccountSummary | null>;
   createAccount?: (input: unknown) => Promise<AccountSummary>;
   listAccounts?: () => Promise<AccountSummary[]>;
@@ -150,6 +161,12 @@ function buildApp(options: {
     }))),
     getAccount: vi.fn(async () => account),
     getAccountDetails: vi.fn(async () => accountDetails),
+    updateAccountCredentials: vi.fn(options.updateAccountCredentials ?? (async () => makeAccount({
+      sync_state: "DEGRADED",
+      sync_state_reason: "CREDENTIALS_UPDATED_PENDING_SYNC",
+      consecutive_failures: 0,
+      consecutive_successes: 0
+    }))),
     updateAccountSettings: vi.fn(options.updateAccountSettings ?? (async (_accountId, input) => makeAccount({
       historical_backfill_mode: input.historicalBackfillMode ?? "metadata_and_bodies",
       archive_refresh_interval: input.archiveRefreshInterval ?? "monthly",
@@ -493,6 +510,55 @@ describe("API safety", () => {
       archiveFlagSync: true,
       maxBackfillRate: "aggressive"
     });
+  });
+
+  it("replaces rejected account credentials and returns a pending-sync health state", async () => {
+    const { app } = buildApp();
+
+    const response = await app.request(`/accounts/${accountId}/credentials`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ password: "new-app-password" })
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      account: {
+        id: accountId,
+        sync_state: "DEGRADED",
+        sync_state_reason: "CREDENTIALS_UPDATED_PENDING_SYNC",
+        consecutive_failures: 0,
+        consecutive_successes: 0
+      }
+    });
+  });
+
+  it("rejects empty replacement credentials before touching the account", async () => {
+    const { app, repository } = buildApp();
+
+    const response = await app.request(`/accounts/${accountId}/credentials`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ password: "" })
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(repository.updateAccountCredentials).not.toHaveBeenCalled();
+  });
+
+  it("rejects connection-coordinate changes on the credential endpoint", async () => {
+    const { app, repository } = buildApp();
+
+    const response = await app.request(`/accounts/${accountId}/credentials`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ password: "new-app-password", host: "imap.other.test" })
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(repository.updateAccountCredentials).not.toHaveBeenCalled();
   });
 
   it("gates POST /accounts/:id/send behind the API token", async () => {

@@ -73,6 +73,7 @@ import type {
   SendRequest,
   SendResult,
   SyncResult,
+  UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
 } from "./types.js";
 
@@ -81,6 +82,7 @@ interface ApiRepository {
   createAccount(input: unknown): Promise<AccountSummary>;
   getAccount(id: string): Promise<unknown | null>;
   getAccountDetails(id: string): Promise<AccountDetails | null>;
+  updateAccountCredentials(accountId: string, input: UpdateAccountCredentialsInput): Promise<AccountSummary | null>;
   updateAccountSettings(accountId: string, input: UpdateAccountSettingsInput): Promise<AccountSummary | null>;
   trackFolder(accountId: string, path: string): Promise<ImapFolder | null>;
   getMessage(id: string): Promise<ImapMessage | null>;
@@ -165,6 +167,10 @@ const CREATE_ACCOUNT_SCHEMA = z.object({
   providerProfile: z.string().min(1).max(64).optional(),
   bodyFetchPolicy: z.enum(["immediate", "lazy", "priority_then_backfill"]).optional()
 });
+
+const UPDATE_ACCOUNT_CREDENTIALS_SCHEMA = z.object({
+  password: z.string().min(1).max(1024)
+}).strict();
 
 const SEND_RECIPIENT_SCHEMA = z.object({
   email: z.string().email().max(255),
@@ -582,6 +588,15 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
     const result = await options.engine.syncAccount(id, "api");
     return c.json({ result });
+  });
+
+  app.patch("/accounts/:id/credentials", async (c) => {
+    const id = UUID_SCHEMA.parse(c.req.param("id"));
+    const raw = await parseJsonBody(c);
+    const input = UPDATE_ACCOUNT_CREDENTIALS_SCHEMA.parse(raw);
+    const updated = await options.repository.updateAccountCredentials(id, input);
+    if (!updated) throw new NotFoundError(`Account not found: ${id}`);
+    return c.json({ account: updated });
   });
 
   app.post("/accounts/:id/folders/track", async (c) => {

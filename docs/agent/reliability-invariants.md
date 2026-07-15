@@ -131,6 +131,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Accounts remain or become `DEGRADED` when priority lag, unresolved reconcile drift, folder missing, UIDVALIDITY reset, or timeout semantics require it. Drift fully repaired in the same reconcile pass is not unresolved.
 - Long-stuck `DEGRADED` accounts with no priority success escalate to retryable `BROKEN` (`STUCK_DEGRADED_24H`) and then terminal `BROKEN` (`STUCK_DEGRADED_TERMINAL`) if recovery keeps failing.
 - `AUTH_ERROR` is non-retryable and pins the account `BROKEN`.
+- Credential replacement must hold the account advisory lock, reset auth backoff/counters, and leave the account `DEGRADED` with `CREDENTIALS_UPDATED_PENDING_SYNC` until sync proves health.
 - `PARTIAL_SUCCESS` increments success counters only when priority folders succeeded and round-robin folders failed.
 - Backoff must be conservative, jittered, and reset only after stable success.
 

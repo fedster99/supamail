@@ -17,11 +17,13 @@ Encrypt IMAP passwords in Node using AES-256-GCM before persistence. Store only 
 - The encryption key remains an application environment secret.
 - Database logs and query introspection should not see plaintext passwords or the master key.
 - Code that creates or uses accounts must go through the repository/crypto path instead of writing credentials directly.
+- Credential replacement uses the same encrypted envelope, runs under the account advisory lock, and resets auth failure to a pending-sync health state rather than claiming the new secret works before provider evidence exists.
 
 ## Verification
 
 - `apps/api/src/crypto.ts` owns password encryption/decryption.
 - `apps/api/src/repository.ts` encrypts in `createAccount`.
+- `PATCH /accounts/:id/credentials` calls the repository replacement path; live-DB coverage proves encryption, health reset, and lock exclusion.
 - `apps/api/src/__tests__/crypto.test.ts` covers the round trip and failure cases.
 
 ## References

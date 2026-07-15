@@ -172,6 +172,7 @@ async function main(): Promise<void> {
       "src/__tests__/search-quality.live-db.test.ts",
       "src/__tests__/search-eval-threading.live-db.test.ts",
       "src/__tests__/content.live-db.test.ts",
+      "src/__tests__/account-credentials.live-db.test.ts",
       "src/__tests__/mailbox-mutations.live-db.test.ts",
       "src/__tests__/drafts.live-db.test.ts",
       "src/__tests__/send.live-db.test.ts",

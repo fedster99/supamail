@@ -11,6 +11,8 @@ The core API and CLI accept:
 - password or app password
 - provider profile
 
+The authenticated HTTP API replaces a rejected password or app password with `PATCH /accounts/:id/credentials`. Replacement is serialized against sync and does not declare the mailbox healthy; health remains pending until the next successful provider sync.
+
 ## First-Class V1 Providers
 
 - Generic IMAP: user supplies host, port, username, and password.
