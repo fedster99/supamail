@@ -9,6 +9,8 @@ import {
 } from "./threading.js";
 
 const DEFAULT_BATCH_SIZE = 500;
+const DEFAULT_BODY_EVIDENCE_BATCH_SIZE = 2;
+const DEFAULT_BODY_EVIDENCE_STATEMENT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_CLOSURE_MESSAGES = 25_000;
 const DEFAULT_MAX_CLOSURE_EVIDENCE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_CLOSURE_CRITERIA_KEYS = 100_000;
@@ -234,6 +236,10 @@ export const PRODUCTION_THREADING_ALGORITHMS: ReadonlyMap<number, ThreadingAlgor
 export interface ThreadingRepositoryOptions {
   /** Version used for newly-created shadow runs and activation. */
   currentAlgorithmVersion?: number;
+  /** Legacy body fingerprints are expensive and must not inherit the much larger projection batch. */
+  bodyEvidenceBatchSize?: number;
+  /** Server-side deadline for one legacy fingerprint repair transaction. */
+  bodyEvidenceStatementTimeoutMs?: number;
   /**
    * Every executor still needed by an active or rollback run. A new release
    * must retain the previous executor until its standby retention window ends.
@@ -581,11 +587,22 @@ function cursorFrom(
 export class ThreadingRepository {
   private readonly currentAlgorithmVersion: number;
   private readonly algorithms: ReadonlyMap<number, ThreadingAlgorithmExecutor>;
+  private readonly bodyEvidenceBatchSize: number;
+  private readonly bodyEvidenceStatementTimeoutMs: number;
 
   constructor(private readonly pool: PgPool, options: ThreadingRepositoryOptions = {}) {
     this.currentAlgorithmVersion = options.currentAlgorithmVersion ?? THREADING_ALGORITHM_VERSION;
     if (!Number.isSafeInteger(this.currentAlgorithmVersion) || this.currentAlgorithmVersion <= 0) {
       throw new Error("current threading algorithm version must be a positive safe integer");
+    }
+    this.bodyEvidenceBatchSize = options.bodyEvidenceBatchSize ?? DEFAULT_BODY_EVIDENCE_BATCH_SIZE;
+    if (!Number.isSafeInteger(this.bodyEvidenceBatchSize) || this.bodyEvidenceBatchSize <= 0) {
+      throw new Error("threading body evidence batch size must be a positive safe integer");
+    }
+    this.bodyEvidenceStatementTimeoutMs = options.bodyEvidenceStatementTimeoutMs
+      ?? DEFAULT_BODY_EVIDENCE_STATEMENT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.bodyEvidenceStatementTimeoutMs) || this.bodyEvidenceStatementTimeoutMs <= 0) {
+      throw new Error("threading body evidence statement timeout must be a positive safe integer");
     }
     this.algorithms = options.algorithms ?? PRODUCTION_THREADING_ALGORITHMS;
     if (!this.algorithms.has(this.currentAlgorithmVersion)) {
@@ -802,11 +819,16 @@ export class ThreadingRepository {
         // then hashing that same row would invert the lock order and deadlock.
         // The update is bounded, idempotent, and its evidence trigger queues all
         // live runs before the projection transaction begins.
-        const bodyHashesBackfilled = await this.backfillBodyEvidenceBatch(client, accountId, batchSize);
+        const bodyEvidenceBatchSize = Math.min(batchSize, this.bodyEvidenceBatchSize);
+        const bodyHashesBackfilled = await this.backfillBodyEvidenceBatchWithinDeadline(
+          client,
+          accountId,
+          bodyEvidenceBatchSize
+        );
         // A full page may have more eligible bodies behind it. Leave every
         // projection queue untouched until a shorter page proves this bounded
         // preflight has reached the end of the current backlog.
-        if (bodyHashesBackfilled === batchSize) return this.emptyResult(accountId);
+        if (bodyHashesBackfilled === bodyEvidenceBatchSize) return this.emptyResult(accountId);
 
         // READ COMMITTED is required after waiting for a legacy writer's SHARE
         // lock: the gap check below must see the queue/body row that writer just
@@ -1851,10 +1873,33 @@ export class ThreadingRepository {
    * transaction: legacy body writers acquire these row locks in the opposite
    * order before the database-owned evidence trigger runs.
    */
+  private async backfillBodyEvidenceBatchWithinDeadline(
+    client: PgClient,
+    accountId: string,
+    limit: number
+  ): Promise<number> {
+    await client.query("BEGIN");
+    try {
+      await client.query(
+        "SELECT set_config('statement_timeout', $1, true)",
+        [`${this.bodyEvidenceStatementTimeoutMs}ms`]
+      );
+      const changed = await this.backfillBodyEvidenceBatch(client, accountId, limit);
+      await client.query("COMMIT");
+      return changed;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
   private async backfillBodyEvidenceBatch(client: PgClient, accountId: string, limit: number): Promise<number> {
-    const changed = await client.query<{ count: string }>(
-      `WITH candidates AS MATERIALIZED (
-         SELECT body.message_id,
+    const candidates = await client.query<{
+      message_id: string;
+      raw_mime_sha256: string | null;
+      parsed_delivery_sha256: string | null;
+    }>(
+      `SELECT body.message_id,
                 CASE
                   WHEN body.raw_mime_sha256 IS NULL
                    AND body.raw_mime IS NOT NULL
@@ -1864,6 +1909,8 @@ export class ThreadingRepository {
                 END AS raw_mime_sha256,
                 CASE
                   WHEN body.parsed_delivery_sha256 IS NULL
+                   AND body.raw_mime_sha256 IS NULL
+                   AND body.raw_mime IS NULL
                    AND NOT body.raw_truncated
                    AND body.raw_bytes > 0
                    AND message.from_email IS NOT NULL
@@ -1902,6 +1949,7 @@ export class ThreadingRepository {
              OR
              (
                body.parsed_delivery_sha256 IS NULL
+               AND body.raw_mime_sha256 IS NULL
                AND NOT body.raw_truncated
                AND body.raw_bytes > 0
                AND message.from_email IS NOT NULL
@@ -1917,17 +1965,30 @@ export class ThreadingRepository {
            )
          ORDER BY body.message_id
          LIMIT $2
-         FOR UPDATE OF body
+         FOR UPDATE OF body`,
+      [accountId, limit]
+    );
+    if (candidates.rows.length === 0) return 0;
+
+    const changed = await client.query<{ count: string }>(
+      `WITH candidates AS MATERIALIZED (
+         SELECT *
+         FROM jsonb_to_recordset($1::jsonb) AS candidate(
+           message_id uuid,
+           raw_mime_sha256 text,
+           parsed_delivery_sha256 text
+         )
        ), repaired AS (
          UPDATE public.imap_message_bodies body
          SET raw_mime_sha256 = candidates.raw_mime_sha256,
              parsed_delivery_sha256 = candidates.parsed_delivery_sha256
          FROM candidates
          WHERE body.message_id = candidates.message_id
+           AND body.message_id = ANY($2::uuid[])
          RETURNING body.message_id
        )
        SELECT count(*)::text AS count FROM repaired`,
-      [accountId, limit]
+      [JSON.stringify(candidates.rows), candidates.rows.map((candidate) => candidate.message_id)]
     );
     return Number(changed.rows[0]?.count ?? 0);
   }
@@ -1953,6 +2014,7 @@ export class ThreadingRepository {
              OR
              (
                body.parsed_delivery_sha256 IS NULL
+               AND body.raw_mime_sha256 IS NULL
                AND NOT body.raw_truncated
                AND body.raw_bytes > 0
                AND message.from_email IS NOT NULL
