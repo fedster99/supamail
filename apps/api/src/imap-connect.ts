@@ -120,7 +120,7 @@ export async function connectImap(
  */
 export interface ClosableImapClient {
   logout(): Promise<void>;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 /**
@@ -133,7 +133,11 @@ export interface ClosableImapClient {
  * connect. Behavior is byte-identical to the inlined teardown it replaces.
  */
 export async function closeImap(client: ClosableImapClient): Promise<void> {
-  await client.logout().catch(() => client.close());
+  try {
+    await client.logout();
+  } catch {
+    await client.close();
+  }
 }
 
 /**

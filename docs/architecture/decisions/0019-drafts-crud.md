@@ -56,7 +56,14 @@ introduced:
   account email, RCPT TO = To + Cc) come from the **synced header fields**, never the
   lazy body, so recipient handling stays safe. Because the real bytes are resent,
   body + HTML + formatting (and provider-composed attachments) survive **by
-  construction** — there is no mirror-body dependence to lose.
+  construction** — there is no mirror-body dependence to lose. The same
+  per-account advisory lock is acquired before the possibly-live `getRawMime`
+  fetch and held across SMTP, Sent APPEND, appender teardown, and best-effort draft
+  deletion. Contention therefore raises `AccountBusyError` before any provider
+  operation or delivery, and the lock heartbeat stays fresh for its full lifetime.
+  Draft raw fetch may take time, so liveness is synchronously re-proven immediately
+  before SMTP. Once delivery is confirmed, later liveness loss skips remaining
+  provider cleanup and becomes a warning rather than a thrown retry signal.
 - **Bcc is rejected on drafts (send-time only).** Bcc cannot round-trip through the
   APPENDed draft bytes — nodemailer's `keepBcc` default omits Bcc from the composed
   MIME, so a Bcc stored on a draft would be silently lost and never sent. Rather
@@ -102,6 +109,9 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
 
 - An operator/agent can create, revise, send, and delete real drafts in the
   provider Drafts folder, while the agent MCP surface stays provably zero-send.
+- Draft send can return transient `AccountBusyError` before raw fetch or SMTP when
+  sync/direct-send owns the account lock; that outcome is proven-unsent and safe
+  for callers to retry according to the HTTP `Retry-After` contract.
 - Because create/update do not insert a mirror row, a freshly-created or updated
   draft is not visible to list/get until the next Drafts sync (eventual mirror
   convergence — the same discipline as email-001's Sent APPEND). Update returns the
@@ -112,8 +122,8 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   operator can delete the stale copy.
 - Hard delete (EXPUNGE) for update/send requires UIDPLUS (inherited from ADR 0018);
   on a server without it, `deleteMessage(hard)` refuses rather than risk a blanket
-  EXPUNGE, so update/send surface that capability error instead of silently
-  purging.
+  EXPUNGE. Update surfaces that capability error; after confirmed draft delivery,
+  send records draft-cleanup failure as a warning instead of throwing.
 - Drafts intentionally do **not** carry Bcc — it is a send-time-only field. A future
   change must NOT "re-add" `bcc` to `DRAFT_SCHEMA`, the CLI, or the `DraftInput`
   type as an oversight: Bcc is dropped from the saved bytes by design (nodemailer's
@@ -146,9 +156,11 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   submitted over SMTP and APPENDed to Sent are the fetched `getRawMime` bytes,
   envelope = the synced To+Cc, deliver-before-delete ordering) and — the empty-body
   regression guard — that the SENT/Sent-APPENDed bytes CONTAIN the draft body even
-  when the mirror body row is NULL; refuses a recipient-less draft; Sent-APPEND and
-  post-send delete are best-effort; delete reuses the email-002 mutation; list/get
-  read the mirror only.
+  when the mirror body row is NULL; refuses a recipient-less draft; rejects lock
+  contention before raw fetch/SMTP; holds the lock through SMTP, APPEND,
+  graceful/fallback teardown, and cleanup; treats post-delivery APPEND, teardown,
+  liveness loss, unlock, and delete failures as warnings; delete reuses the
+  email-002 mutation; list/get read the mirror only.
 - `api-safety.test.ts` covers the `API_TOKEN`-gated draft routes (create with
   optional recipients, create with `bcc` rejected 400 with the clear message, 404
   for unknown account/draft, list/get/update/send, and the `?hard` delete mapping).
@@ -193,8 +205,9 @@ envelope recipients still come from the synced header fields (To + Cc), never th
 lazy body. This removes the mirror-body dependence entirely, so body + HTML +
 formatting (and provider-composed attachments) survive **by construction**. The
 "rebuild from the mirror" rationale above — and the body/attachment-loss risk it
-implied — no longer applies. `sendMessage` (the direct-send primitive) is unchanged;
-only `sendDraft` changed. The SACRED invariants hold: no `src/mcp/` write verb / no
+implied — no longer applies. At the time of this addendum, `sendMessage` (the
+direct-send primitive) was unchanged and only `sendDraft` changed. The SACRED
+invariants hold: no `src/mcp/` write verb / no
 sixth tool, `agent-surface-zero-send` + `sync-adapter-read-only` green, the frozen
 AES-256-GCM envelope untouched.
 

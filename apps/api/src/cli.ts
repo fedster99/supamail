@@ -778,7 +778,8 @@ try {
   await program.parseAsync();
 } catch (error) {
   if (error instanceof AccountBusyError) {
-    // A draft write collided with the sync worker holding the account lock — transient.
+    // A send or draft write collided with the account lock — transient and
+    // guaranteed to have failed before direct SMTP delivery.
     console.error("Account is busy syncing — retry in a few seconds.");
     process.exitCode = 1;
   } else {

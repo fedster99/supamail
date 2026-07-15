@@ -159,8 +159,20 @@ const mocks = vi.hoisted(() => ({
   appenderList: vi.fn(async () => [{ path: "Sent", specialUse: "\\Sent" }]),
   appenderLogout: vi.fn(async () => undefined),
   appenderClose: vi.fn(),
-  getAccount: vi.fn()
+  getAccount: vi.fn(),
+  withAccountLock: vi.fn(),
+  lockAssertLive: vi.fn(),
+  lockConfirmIrreversible: vi.fn()
 }));
+
+function mockAccountLock() {
+  return {
+    lockId: account.lock_id,
+    client: {},
+    assertLive: mocks.lockAssertLive,
+    confirmIrreversible: mocks.lockConfirmIrreversible
+  };
+}
 
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
@@ -191,6 +203,11 @@ vi.mock("../repository.js", () => ({
   }
 }));
 
+vi.mock("../locks.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../locks.js")>();
+  return { ...actual, withAccountLock: mocks.withAccountLock };
+});
+
 vi.mock("../host-validation.js", () => ({
   // assertSafeSmtpTarget now returns the TLS-gate classification; the public
   // smtp.example.test in these tests is not private.
@@ -199,6 +216,7 @@ vi.mock("../host-validation.js", () => ({
 
 const account = {
   id: "acc-1",
+  lock_id: "1234567890",
   email_address: "sender@example.test",
   provider_profile: "generic-imap",
   host: "imap.example.test",
@@ -216,9 +234,13 @@ const account = {
 describe("sendMessage orchestration", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => fn(mockAccountLock()));
+    mocks.lockAssertLive.mockResolvedValue(undefined);
+    mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
     mocks.appenderAppend.mockResolvedValue({ uid: 42 });
     mocks.appenderList.mockResolvedValue([{ path: "Sent", specialUse: "\\Sent" }]);
     mocks.appenderLogout.mockResolvedValue(undefined);
+    mocks.appenderClose.mockImplementation(() => undefined);
     mocks.getAccount.mockResolvedValue(account);
   });
 
@@ -234,6 +256,12 @@ describe("sendMessage orchestration", () => {
 
     expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
     expect(mocks.appenderAppend).toHaveBeenCalledTimes(1);
+    expect(mocks.withAccountLock).toHaveBeenCalledWith(
+      expect.anything(),
+      account.lock_id,
+      expect.any(Function),
+      expect.objectContaining({ heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
+    );
 
     // The bytes delivered and the bytes appended must be byte-identical.
     const deliveredRaw = mocks.deliverSmtp.mock.calls[0][1];
@@ -246,6 +274,92 @@ describe("sendMessage orchestration", () => {
     expect(result.sentFolderPath).toBe("Sent");
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     expect(result.warnings).toEqual([]);
+  });
+
+  it("holds the per-account lock across SMTP delivery and Sent APPEND", async () => {
+    let lockHeld = false;
+    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => {
+      lockHeld = true;
+      try {
+        return await fn(mockAccountLock());
+      } finally {
+        lockHeld = false;
+      }
+    });
+    mocks.deliverSmtp.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+    });
+    mocks.appenderAppend.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+      return { uid: 42 };
+    });
+    mocks.appenderLogout.mockImplementationOnce(async () => {
+      expect(lockHeld).toBe(true);
+    });
+
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+    await sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    });
+
+    expect(lockHeld).toBe(false);
+  });
+
+  it("throws AccountBusyError before SMTP delivery when the account lock is held", async () => {
+    mocks.withAccountLock.mockResolvedValueOnce(null);
+    const { AccountBusyError } = await import("../errors.js");
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    await expect(
+      sendMessage({} as never, config, {
+        accountId: "acc-1",
+        to: [{ email: "rcpt@example.test" }],
+        subject: "Hi",
+        body: { format: "plain", text: "Body" }
+      })
+    ).rejects.toBeInstanceOf(AccountBusyError);
+
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.appenderAppend).not.toHaveBeenCalled();
+  });
+
+  it("fails before SMTP when lock liveness cannot be proven at the irreversible boundary", async () => {
+    mocks.lockAssertLive.mockRejectedValueOnce(new Error("lock session lost"));
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    await expect(sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    })).rejects.toThrow(/lock session lost/);
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.lockConfirmIrreversible).not.toHaveBeenCalled();
+  });
+
+  it("returns delivered with a warning when liveness is lost after SMTP confirmation", async () => {
+    mocks.lockAssertLive
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("heartbeat refresh exhausted"));
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const result = await sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    });
+    expect(result.delivered).toBe(true);
+    expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
+    expect(mocks.appenderAppend).not.toHaveBeenCalled();
+    expect(result.warnings.join(" ")).toMatch(/filing to Sent was skipped.*heartbeat refresh exhausted/i);
   });
 
   it("does NOT APPEND when delivery throws (nothing filed on a failed send)", async () => {
@@ -300,7 +414,19 @@ describe("sendMessage orchestration", () => {
   //    and, when that rejects (broken/timed-out socket), falls back to a hard
   //    close() so the socket can never leak. This fallback was previously untested.
   it("falls back to close() when the appender logout rejects (no leak, still delivered)", async () => {
+    let lockHeld = false;
+    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => {
+      lockHeld = true;
+      try {
+        return await fn(mockAccountLock());
+      } finally {
+        lockHeld = false;
+      }
+    });
     mocks.appenderLogout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
+    mocks.appenderClose.mockImplementationOnce(() => {
+      expect(lockHeld).toBe(true);
+    });
     const { sendMessage } = await import("../send.js");
     const cfg = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
@@ -314,5 +440,26 @@ describe("sendMessage orchestration", () => {
     expect(result.delivered).toBe(true);
     expect(mocks.appenderLogout).toHaveBeenCalledTimes(1);
     expect(mocks.appenderClose).toHaveBeenCalledTimes(1);
+    expect(lockHeld).toBe(false);
+  });
+
+  it("reports teardown failure as a warning after confirmed delivery instead of throwing", async () => {
+    mocks.appenderLogout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
+    mocks.appenderClose.mockImplementationOnce(() => {
+      throw new Error("socket close failed");
+    });
+    const { sendMessage } = await import("../send.js");
+    const cfg = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const result = await sendMessage({} as never, cfg, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    });
+
+    expect(result.delivered).toBe(true);
+    expect(result.appendedToSent).toBe(true);
+    expect(result.warnings.join(" ")).toMatch(/closing the Sent connection failed: socket close failed/i);
   });
 });

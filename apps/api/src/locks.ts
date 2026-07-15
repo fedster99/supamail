@@ -3,6 +3,30 @@ import type { PgClient, PgPool } from "./db.js";
 export interface AccountLock {
   lockId: string | number;
   client: PgClient;
+  /** Persist a fresh heartbeat and prove this exact Postgres session still owns
+   * the advisory lock. Throws before an irreversible boundary when liveness is
+   * unknown or lost. */
+  assertLive(): Promise<void>;
+  /** Mark that an irreversible provider action has been confirmed. From this
+   * point, liveness/unlock failures are diagnostics, never retry signals. */
+  confirmIrreversible(): void;
+}
+
+export interface AccountLockOptions {
+  /** Refresh cadence for `imap_accounts.last_heartbeat_at` while the lock is held.
+   * Required for operations that can approach the stale-reaper threshold; bounded
+   * operations and callers that persist their own heartbeat may omit it. */
+  heartbeatIntervalMs?: number;
+  /** Receive a diagnostic that happened only after an irreversible action was
+   * confirmed. Callers should add it to their success warnings. */
+  onPostIrreversibleWarning?: (warning: string) => void;
+}
+
+export class AccountLockLivenessError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message);
+    this.name = "AccountLockLivenessError";
+  }
 }
 
 const LOCK_SELF_TEST_TIMEOUT_MS = 5_000;
@@ -15,6 +39,107 @@ function generateTestLockId(): number {
     Math.random() * (LOCK_SELF_TEST_LOCK_ID_MAX - LOCK_SELF_TEST_LOCK_ID_MIN)
       + LOCK_SELF_TEST_LOCK_ID_MIN
   );
+}
+
+/** Keep at least three heartbeat opportunities inside the stale threshold, capped
+ * at one minute so ordinary five-minute production thresholds stay fresh. */
+export function accountLockHeartbeatIntervalMs(staleThresholdMs: number): number {
+  const threshold = Number.isFinite(staleThresholdMs) && staleThresholdMs > 0
+    ? staleThresholdMs
+    : 5 * 60_000;
+  return Math.max(1, Math.min(60_000, Math.floor(threshold / 3)));
+}
+
+async function persistAndValidateAccountLock(
+  client: PgClient,
+  lockId: string | number
+): Promise<void> {
+  let result: { rows: Array<{ heartbeat_persisted: boolean; lock_held: boolean }> };
+  try {
+    result = await client.query(
+      `
+      WITH refreshed AS (
+        UPDATE public.imap_accounts
+        SET last_heartbeat_at = now()
+        WHERE lock_id = $1
+        RETURNING 1
+      )
+      SELECT
+        EXISTS (SELECT 1 FROM refreshed) AS heartbeat_persisted,
+        EXISTS (
+          SELECT 1
+          FROM pg_locks pl
+          JOIN public.imap_accounts account
+            ON pl.classid::bigint = 0
+           AND pl.objid::bigint = account.lock_id
+          WHERE account.lock_id = $1
+            AND pl.locktype = 'advisory'
+            AND pl.granted = true
+            AND pl.pid = pg_backend_pid()
+        ) AS lock_held
+      `,
+      [lockId]
+    );
+  } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
+    throw new AccountLockLivenessError(
+      `Account lock heartbeat query failed for lock ${lockId}: ${details}`,
+      isTransientStartupDbError(error)
+    );
+  }
+
+  const row = result.rows[0];
+  if (!row?.heartbeat_persisted) {
+    throw new AccountLockLivenessError(
+      `Account lock heartbeat persistence failed for lock ${lockId}: account row not found`,
+      false
+    );
+  }
+  if (!row.lock_held) {
+    throw new AccountLockLivenessError(
+      `Account lock liveness failed for lock ${lockId}: current session no longer owns the advisory lock`,
+      false
+    );
+  }
+}
+
+async function persistAndValidateAccountLockWithRetry(
+  client: PgClient,
+  lockId: string | number,
+  maxAttempts = 3
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await persistAndValidateAccountLock(client, lockId);
+      return;
+    } catch (error) {
+      const retryable = error instanceof AccountLockLivenessError && error.retryable;
+      if (!retryable || attempt >= maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+    }
+  }
+}
+
+function asError(error: unknown, prefix: string): Error {
+  const details = error instanceof Error ? error.message : String(error);
+  return new Error(`${prefix}: ${details}`);
+}
+
+function postIrreversibleWarning(message: string): string {
+  return `Delivery was already confirmed; ${message}`;
+}
+
+async function validateAccountUnlock(
+  client: PgClient,
+  lockId: string | number
+): Promise<void> {
+  const result = await client.query<{ unlocked: boolean }>(
+    "SELECT pg_advisory_unlock($1::bigint) AS unlocked",
+    [lockId]
+  );
+  if (result.rows[0]?.unlocked !== true) {
+    throw new Error(`Postgres reported advisory unlock=false for lock ${lockId}`);
+  }
 }
 
 async function queryWithTimeout<T>(
@@ -35,35 +160,158 @@ async function queryWithTimeout<T>(
  * Run `fn` while holding a Postgres advisory lock on a dedicated connection.
  * The lock is released explicitly before the connection returns to the pool;
  * if the process exits, Postgres releases it when the session closes.
+ * The initial account heartbeat must persist before `fn` runs. Callers whose
+ * operation can approach the stale-reaper threshold must supply
+ * `heartbeatIntervalMs` so that heartbeat remains fresh for the full lock lifetime.
  *
  * Returns `null` when the lock is held by another session.
  */
 export async function withAccountLock<T>(
   pool: PgPool,
   lockId: string | number,
-  fn: (lock: AccountLock) => Promise<T>
+  fn: (lock: AccountLock) => Promise<T>,
+  options: AccountLockOptions = {}
 ): Promise<T | null> {
   const client = await pool.connect();
+  let releaseError: Error | undefined;
   try {
-    const result = await client.query<{ locked: boolean }>(
-      "SELECT pg_try_advisory_lock($1::bigint) AS locked",
-      [lockId]
-    );
+    let result: { rows: Array<{ locked: boolean }> };
+    try {
+      result = await client.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock($1::bigint) AS locked",
+        [lockId]
+      );
+    } catch (error) {
+      releaseError = asError(error, `Account lock acquisition failed for lock ${lockId}`);
+      throw releaseError;
+    }
     if (!result.rows[0]?.locked) {
       return null;
     }
 
+    let irreversibleConfirmed = false;
+    const emittedWarnings = new Set<string>();
+    const warnAfterIrreversible = (message: string) => {
+      const warning = postIrreversibleWarning(message);
+      if (emittedWarnings.has(warning)) return;
+      emittedWarnings.add(warning);
+      options.onPostIrreversibleWarning?.(warning);
+    };
+
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let heartbeatPending: Promise<void> | null = null;
+    let lastHeartbeatError: unknown = null;
+    const refreshHeartbeat = async (): Promise<void> => {
+      if (heartbeatPending) return await heartbeatPending;
+      const pending = persistAndValidateAccountLockWithRetry(client, lockId)
+        .then(() => {
+          lastHeartbeatError = null;
+        })
+        .catch((error) => {
+          lastHeartbeatError = error;
+          throw error;
+        })
+        .finally(() => {
+          if (heartbeatPending === pending) heartbeatPending = null;
+        });
+      heartbeatPending = pending;
+      return await pending;
+    };
+
+    const lock: AccountLock = {
+      lockId,
+      client,
+      assertLive: refreshHeartbeat,
+      confirmIrreversible: () => {
+        irreversibleConfirmed = true;
+      }
+    };
+
+    let callbackValue: T | undefined;
+    let callbackError: unknown;
+    let callbackFailed = false;
+    let unlockAttempted = false;
     try {
-      await client.query(
-        "UPDATE public.imap_accounts SET last_heartbeat_at = now() WHERE lock_id = $1",
-        [lockId]
-      ).catch(() => undefined);
-      return await fn({ lockId, client });
-    } finally {
-      await client.query("SELECT pg_advisory_unlock($1::bigint)", [lockId]).catch(() => undefined);
+      // Fail closed before any provider operation: stale-lock recovery relies on
+      // both the persisted heartbeat and this session's actual lock ownership.
+      await refreshHeartbeat();
+
+      const intervalMs = options.heartbeatIntervalMs;
+      if (intervalMs !== undefined) {
+        heartbeatTimer = setInterval(() => {
+          // Keep retrying on later ticks. A transient failure does not permanently
+          // disable refresh; phase-boundary assertLive() will synchronously retry.
+          void refreshHeartbeat().catch(() => undefined);
+        }, intervalMs);
+        heartbeatTimer.unref?.();
+      }
+
+      try {
+        callbackValue = await fn(lock);
+      } catch (error) {
+        callbackFailed = true;
+        callbackError = error;
+      } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        const pendingHeartbeat = heartbeatPending as Promise<void> | null;
+        if (pendingHeartbeat) await pendingHeartbeat.catch(() => undefined);
+      }
+
+      if (!callbackFailed && (options.heartbeatIntervalMs !== undefined || lastHeartbeatError)) {
+        try {
+          // Final synchronous proof catches a periodic failure that raced the end
+          // of the callback. Before confirmation it is fail-closed; after
+          // confirmation it is diagnostic only.
+          await refreshHeartbeat();
+        } catch (error) {
+          if (irreversibleConfirmed) {
+            warnAfterIrreversible(
+              `account-lock liveness could not be revalidated: ${error instanceof Error ? error.message : String(error)}`
+            );
+          } else {
+            callbackFailed = true;
+            callbackError = error;
+          }
+        }
+      } else if (irreversibleConfirmed && lastHeartbeatError) {
+        warnAfterIrreversible(
+          `account-lock heartbeat failed after confirmation: ${lastHeartbeatError instanceof Error ? lastHeartbeatError.message : String(lastHeartbeatError)}`
+        );
+      }
+
+      try {
+        unlockAttempted = true;
+        await validateAccountUnlock(client, lockId);
+      } catch (error) {
+        releaseError = asError(error, `Account lock release failed for lock ${lockId}`);
+        if (irreversibleConfirmed) {
+          warnAfterIrreversible(`the database lock client was evicted after unlock failed: ${releaseError.message}`);
+        } else if (!callbackFailed) {
+          callbackFailed = true;
+          callbackError = releaseError;
+        }
+      }
+
+      if (callbackFailed) throw callbackError;
+      return callbackValue as T;
+    } catch (error) {
+      // Initial heartbeat/liveness failure still needs an unlock attempt. If that
+      // attempt also fails, evict the session but preserve the original failure.
+      if (!unlockAttempted) {
+        try {
+          unlockAttempted = true;
+          await validateAccountUnlock(client, lockId);
+        } catch (unlockError) {
+          releaseError = asError(unlockError, `Account lock release failed for lock ${lockId}`);
+        }
+      }
+      throw error;
     }
   } finally {
-    client.release();
+    // Passing an error makes pg.Pool destroy this session. That is mandatory when
+    // unlock is false/throws: returning a possibly lock-owning client to the pool
+    // could deadlock later work on an invisible re-entrant lock.
+    client.release(releaseError);
   }
 }
 

@@ -5,7 +5,7 @@ import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
-import { withAccountLock } from "./locks.js";
+import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
 import { deleteMessage } from "./mailbox-mutations.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
@@ -482,20 +482,6 @@ export async function sendDraft(
   const account = await repository.getAccount(draft.accountId);
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.accountId}`);
 
-  // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
-  // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real body
-  // + HTML + formatting (and provider-composed attachments) regardless of whether
-  // the body has been lazily fetched into the mirror yet.
-  const { raw, truncated } = await getRawMime(pool, config, messageId);
-  if (truncated) {
-    // Fail closed: getRawMime caps at BODY_RAW_MAX_BYTES, so these bytes are
-    // incomplete — submitting them would deliver a corrupt/truncated MIME. Refuse
-    // before any SMTP submit. (send.ts can't hit this; it composes its own bytes.)
-    throw new Error(
-      `Draft ${messageId} raw MIME exceeds the fetch cap and would be truncated; refusing to send a corrupt message.`
-    );
-  }
-
   // Resolve SMTP creds + run the SSRF guard exactly as send.ts does.
   const creds = await resolveSmtpCreds(pool, config, account);
   const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
@@ -505,75 +491,123 @@ export async function sendDraft(
   // Envelope recipients come from the SYNCED header fields only (never the lazy
   // body): MAIL FROM = the account email, RCPT TO = the draft's To + Cc.
   const envelope = { from: account.email_address, to: [...draft.toEmails, ...draft.ccEmails] };
-
-  // Submit the EXACT draft bytes. STARTTLS enforcement matches the send path: a
-  // public host always requires TLS even under IMAP_ALLOW_PRIVATE_HOSTS; it relaxes
-  // only when the target resolved private/loopback.
-  await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
-
-  // Delivery succeeded; file the IDENTICAL bytes to Sent (mirrors send.ts). An
-  // APPEND failure here is non-fatal — the mail is already sent and the next sync
-  // recovers a copy if the provider auto-filed it.
   const warnings: string[] = [];
-  let appendedToSent = false;
-  let appendedUid: number | null = null;
-  let sentFolderPath: string | null = null;
-  let appender: SentFolderAppender | null = null;
-  try {
-    // Same per-account advisory lock as the draft APPEND, but here busy is non-fatal:
-    // the mail is already delivered, so if the worker holds the lock we just skip the
-    // Sent filing (the next sync mirrors the copy if the provider auto-filed it).
-    const appended = await withAccountLock(pool, account.lock_id, async () => {
-      appender = await SentFolderAppender.connect(pool, config, account);
-      const profile = getProviderProfile(account.provider_profile);
-      const mailboxes = await appender.list();
-      sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
-      return await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
-    });
-    if (appended === null) {
-      warnings.push(
-        "Delivered, but the account was busy syncing so filing to Sent was skipped. The next sync will mirror the copy if the provider auto-filed it."
-      );
-    } else {
-      appendedToSent = true;
-      appendedUid = appended.uid;
-    }
-  } catch (error) {
-    warnings.push(
-      `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
-    );
-  } finally {
-    if (appender) await closeImap(appender);
-  }
-
-  const send: SendResult = {
-    // The resent bytes carry the draft's ORIGINAL Message-ID (no recompose).
-    rfcMessageId: draft.rfcMessageId ?? "",
-    delivered: true,
-    appendedToSent,
-    appendedUid,
-    sentFolderPath,
-    warnings
+  const addWarning = (warning: string) => {
+    if (!warnings.includes(warning)) warnings.push(warning);
   };
 
-  // The mail is sent and filed to Sent; remove the draft so it doesn't linger.
-  // Hard-delete (reuse email-002) — a sent draft is gone, not trashed. CRITICAL:
-  // the send is IRREVERSIBLE and already succeeded, so the cleanup is best-effort
-  // — a delete failure (e.g. no UIDPLUS for a UID-scoped EXPUNGE) must NEVER turn a
-  // delivered send into a thrown failure (which would invite a duplicate re-send).
-  // We downgrade it to a warning and still report delivered; the leftover draft
-  // self-heals on the next Drafts sync. (Mirrors send.ts's best-effort Sent-APPEND.)
-  let draftDeleted = true;
-  try {
-    await deleteMessage(pool, config, messageId, { hard: true });
-  } catch (error) {
-    draftDeleted = false;
-    warnings.push(
-      `Delivered, but removing the draft from Drafts failed: ${error instanceof Error ? error.message : String(error)}. The leftover draft self-heals on the next sync.`
-    );
-  }
+  // The raw fetch can itself require IMAP, so acquire before it and keep the same
+  // account lock through SMTP delivery, Sent APPEND, appender teardown, and draft
+  // cleanup. Contention is proven-unsent: no provider verb has run yet.
+  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
+    // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
+    // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
+    // body + HTML + formatting regardless of lazy mirror-body state.
+    const { raw, truncated } = await getRawMime(pool, config, messageId);
+    if (truncated) {
+      // Fail closed before SMTP: the capped bytes would be a corrupt MIME message.
+      throw new Error(
+        `Draft ${messageId} raw MIME exceeds the fetch cap and would be truncated; refusing to send a corrupt message.`
+      );
+    }
 
-  return { send: { ...send, warnings }, deletedDraftId: messageId, draftDeleted, warnings };
+    // Re-prove heartbeat + session ownership immediately before crossing the
+    // irreversible SMTP boundary (the raw fetch may have taken time).
+    await lock.assertLive();
+    await deliverSmtp(creds, raw, envelope, config, {
+      isPrivateHost,
+      onPostDeliveryWarning: addWarning
+    });
+    lock.confirmIrreversible();
+
+    let appendedToSent = false;
+    let appendedUid: number | null = null;
+    let sentFolderPath: string | null = null;
+    let appender: SentFolderAppender | null = null;
+    let providerWorkAllowed = true;
+    try {
+      try {
+        await lock.assertLive();
+      } catch (error) {
+        providerWorkAllowed = false;
+        addWarning(
+          `Delivered, but filing to Sent and draft cleanup were skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
+        );
+      }
+
+      if (providerWorkAllowed) {
+        try {
+          appender = await SentFolderAppender.connect(pool, config, account);
+          const profile = getProviderProfile(account.provider_profile);
+          const mailboxes = await appender.list();
+          sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
+          const appended = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
+          appendedToSent = true;
+          appendedUid = appended.uid;
+        } catch (error) {
+          // SMTP is confirmed. Sent filing is best-effort and never becomes a
+          // thrown failure that could invite a duplicate send.
+          addWarning(
+            `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
+          );
+        }
+      }
+    } finally {
+      if (appender) {
+        try {
+          await closeImap(appender);
+        } catch (error) {
+          addWarning(
+            `Delivered, but closing the Sent connection failed: ${error instanceof Error ? error.message : String(error)}.`
+          );
+        }
+      }
+    }
+
+    const send: SendResult = {
+      // The resent bytes carry the draft's ORIGINAL Message-ID (no recompose).
+      rfcMessageId: draft.rfcMessageId ?? "",
+      delivered: true,
+      appendedToSent,
+      appendedUid,
+      sentFolderPath,
+      warnings
+    };
+
+    // Remove the sent draft while the same account lock remains held. This is
+    // best-effort after delivery; any mutation/teardown failure becomes a warning.
+    let draftDeleted = false;
+    if (providerWorkAllowed) {
+      try {
+        await lock.assertLive();
+      } catch (error) {
+        providerWorkAllowed = false;
+        addWarning(
+          `Delivered, but removing the draft from Drafts was skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
+        );
+      }
+    }
+    if (providerWorkAllowed) {
+      try {
+        await deleteMessage(pool, config, messageId, { hard: true });
+        draftDeleted = true;
+      } catch (error) {
+        addWarning(
+          `Delivered, but removing the draft from Drafts failed: ${error instanceof Error ? error.message : String(error)}. The leftover draft self-heals on the next sync.`
+        );
+      }
+    }
+
+    return { send: { ...send, warnings }, deletedDraftId: messageId, draftDeleted, warnings };
+  }, {
+    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
+    onPostIrreversibleWarning: addWarning
+  });
+
+  if (result === null) {
+    throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft send shortly`);
+  }
+  return result;
 }
 
 /**
