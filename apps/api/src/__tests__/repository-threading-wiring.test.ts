@@ -263,6 +263,30 @@ describe("repository threading evidence wiring", () => {
       evidence_key_sha256: createHash("sha256").update("acme/mail#42").digest("hex"),
       extractor_version: "mime_evidence_v1"
     })]);
+
+    await repository.storeBody({
+      messageId: MESSAGE_ID,
+      rawMime,
+      rawBytes: rawMime.byteLength,
+      rawTruncated: false,
+      bodyText: "body",
+      bodyHtml: null,
+      bodyPlain: "body",
+      selectedTextPart: "body",
+      selectedTextFormat: "plain",
+      headersJson: {},
+      mimeStructure: null,
+      parserWarnings: ["artifact_evidence_truncated"],
+      evidence: []
+    });
+    const finalBodyWrite = calls
+      .filter((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"))
+      .at(-1);
+    expect(finalBodyWrite?.params.slice(13, 16)).toEqual([
+      "mime_evidence_v1",
+      null,
+      false
+    ]);
   });
 
   it("requeues every live run when a complete body fingerprint changes", async () => {

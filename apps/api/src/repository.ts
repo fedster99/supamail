@@ -351,11 +351,11 @@ function prepareMessageEvidence(body: MessageBodyInput): PreparedMessageEvidence
       metadata: JSON.parse(metadataJson) as Record<string, string | number | boolean | null>
     });
   }
-  return [...rows.values()].sort((left, right) =>
-    `${left.kind}\u0000${left.namespace}\u0000${left.evidence_key_sha256}`.localeCompare(
-      `${right.kind}\u0000${right.namespace}\u0000${right.evidence_key_sha256}`
-    )
-  );
+  return [...rows.values()].sort((left, right) => {
+    const leftIdentity = `${left.kind}\u0000${left.namespace}\u0000${left.evidence_key_sha256}`;
+    const rightIdentity = `${right.kind}\u0000${right.namespace}\u0000${right.evidence_key_sha256}`;
+    return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
+  });
 }
 
 interface PurgeCandidate {
@@ -3041,7 +3041,9 @@ export class MirrorRepository {
 
   async storeBody(body: MessageBodyInput): Promise<void> {
     const preparedEvidence = body.rawTruncated ? [] : prepareMessageEvidence(body);
-    const structuredEvidenceSha256 = body.rawTruncated
+    const structuredEvidenceComplete = !body.rawTruncated
+      && !body.parserWarnings.includes("artifact_evidence_truncated");
+    const structuredEvidenceSha256 = !structuredEvidenceComplete
       ? null
       : createHash("sha256")
         .update(canonicalJsonForThreadingEvidence(preparedEvidence))
@@ -3186,7 +3188,7 @@ export class MirrorRepository {
           body.parserWarnings,
           MIME_EVIDENCE_EXTRACTOR_VERSION,
           structuredEvidenceSha256,
-          !body.rawTruncated
+          structuredEvidenceComplete
         ]
       );
 

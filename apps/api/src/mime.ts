@@ -7,10 +7,23 @@ type BodyTextFormat = "plain" | "html";
 const MAX_BODYSTRUCTURE_DEPTH = 64;
 const MAX_HTML_PARSE_BYTES = 1_048_576;
 const MAX_EXTRACTED_EVIDENCE = 100;
+const MAX_CALENDAR_EVIDENCE_BYTES = 1_048_576;
+const MAX_PROVIDER_RESOURCE_SCAN_CHARS = 2_000_000;
+const MAX_PROVIDER_URL_CANDIDATES = 1_000;
 
-function boundedText(value: string | null | undefined, maxLength: number): string | null {
+function boundedText(value: string | null | undefined, maxBytes: number): string | null {
   if (!value) return null;
-  return value.slice(0, maxLength);
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x1F || codePoint === 0x7F) continue;
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result || null;
 }
 
 function unfoldIcalendar(value: string): string[] {
@@ -29,12 +42,16 @@ function icalendarProperty(line: string): { name: string; value: string } | null
   };
 }
 
-function extractCalendarEvidence(content: Buffer): MessageEvidenceInput[] {
+function extractCalendarEvidence(content: Buffer): {
+  evidence: MessageEvidenceInput[];
+  truncated: boolean;
+} {
   const lines = unfoldIcalendar(content.toString("utf8"));
   const method = lines
     .map(icalendarProperty)
     .find((property) => property?.name === "METHOD")?.value.toUpperCase() ?? null;
   const evidence: MessageEvidenceInput[] = [];
+  let truncated = false;
   let component: "VEVENT" | "VTODO" | null = null;
   let properties = new Map<string, string>();
 
@@ -51,20 +68,24 @@ function extractCalendarEvidence(content: Buffer): MessageEvidenceInput[] {
         const recurrenceId = boundedText(properties.get("RECURRENCE-ID"), 512);
         const rawSequence = properties.get("SEQUENCE") ?? "0";
         const sequence = /^\d{1,9}$/.test(rawSequence) ? Number(rawSequence) : 0;
-        evidence.push({
-          kind: "calendar_instance",
-          namespace: "icalendar",
-          key: JSON.stringify([uid, recurrenceId]),
-          metadata: {
-            uid,
-            recurrenceId,
-            sequence,
-            dtstamp: boundedText(properties.get("DTSTAMP"), 512),
-            dtstart: boundedText(properties.get("DTSTART"), 512),
-            method: boundedText(method, 64),
-            component
-          }
-        });
+        if (evidence.length >= MAX_EXTRACTED_EVIDENCE) {
+          truncated = true;
+        } else {
+          evidence.push({
+            kind: "calendar_instance",
+            namespace: "icalendar",
+            key: JSON.stringify([uid, recurrenceId]),
+            metadata: {
+              uid,
+              recurrenceId,
+              sequence,
+              dtstamp: boundedText(properties.get("DTSTAMP"), 512),
+              dtstart: boundedText(properties.get("DTSTART"), 512),
+              method: boundedText(method, 64),
+              component
+            }
+          });
+        }
       }
       component = null;
       properties = new Map();
@@ -75,16 +96,38 @@ function extractCalendarEvidence(content: Buffer): MessageEvidenceInput[] {
     if (property && !properties.has(property.name)) properties.set(property.name, property.value);
   }
 
-  return evidence;
+  return { evidence, truncated };
 }
 
 function cleanUrlCandidate(value: string): string {
   return value.replace(/[)>\],.;!?]+$/, "").slice(0, 2_048);
 }
 
-function providerResourceEvidence(value: string): MessageEvidenceInput[] {
+function providerResourceEvidence(value: string): {
+  evidence: MessageEvidenceInput[];
+  truncated: boolean;
+} {
   const evidence: MessageEvidenceInput[] = [];
-  for (const match of value.matchAll(/https?:\/\/[^\s<>"']+/gi)) {
+  const identities = new Set<string>();
+  const scanValue = value.slice(0, MAX_PROVIDER_RESOURCE_SCAN_CHARS);
+  let truncated = value.length > scanValue.length;
+  let candidateCount = 0;
+  const push = (item: MessageEvidenceInput): void => {
+    const identity = `${item.kind}\u0000${item.namespace}\u0000${item.key}`;
+    if (identities.has(identity)) return;
+    if (evidence.length >= MAX_EXTRACTED_EVIDENCE) {
+      truncated = true;
+      return;
+    }
+    identities.add(identity);
+    evidence.push(item);
+  };
+  for (const match of scanValue.matchAll(/https?:\/\/[^\s<>"']{1,2048}/gi)) {
+    candidateCount += 1;
+    if (candidateCount > MAX_PROVIDER_URL_CANDIDATES) {
+      truncated = true;
+      break;
+    }
     let url: URL;
     try {
       url = new URL(cleanUrlCandidate(match[0]));
@@ -101,7 +144,7 @@ function providerResourceEvidence(value: string): MessageEvidenceInput[] {
         const repository = item[2]!.toLowerCase();
         const resourceType = item[3]!.toLowerCase() === "pull" ? "pull" : "issue";
         const number = Number(item[4]);
-        evidence.push({
+        push({
           kind: "provider_resource",
           namespace: resourceType === "pull" ? "github_pull" : "github_issue",
           key: `${owner}/${repository}#${number}`,
@@ -115,7 +158,7 @@ function providerResourceEvidence(value: string): MessageEvidenceInput[] {
       const item = path.match(/^\/(?:document|spreadsheets|presentation)\/d\/([A-Za-z0-9_-]{10,})(?:\/|$)/)
         ?? path.match(/^\/file\/d\/([A-Za-z0-9_-]{10,})(?:\/|$)/);
       if (item) {
-        evidence.push({
+        push({
           kind: "provider_resource",
           namespace: "google_drive_file",
           key: item[1]!,
@@ -129,7 +172,7 @@ function providerResourceEvidence(value: string): MessageEvidenceInput[] {
       const item = path.match(/^\/browse\/([A-Z][A-Z0-9_]*-[1-9]\d*)$/i);
       if (item) {
         const issueKey = item[1]!.toUpperCase();
-        evidence.push({
+        push({
           kind: "provider_resource",
           namespace: "jira_issue",
           key: `${host}/${issueKey}`,
@@ -144,7 +187,7 @@ function providerResourceEvidence(value: string): MessageEvidenceInput[] {
         /(?:^|\/)([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?:\/|$)/i
       )?.[1];
       if (envelopeId && /\/(?:documents?|envelopes?)(?:\/|$)/i.test(path)) {
-        evidence.push({
+        push({
           kind: "provider_resource",
           namespace: "docusign_envelope",
           key: envelopeId.toLowerCase(),
@@ -153,7 +196,7 @@ function providerResourceEvidence(value: string): MessageEvidenceInput[] {
       }
     }
   }
-  return evidence;
+  return { evidence, truncated };
 }
 
 export interface BodyTextPartChoice {
@@ -425,15 +468,26 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
         related: attachment.related === true
       }
     });
+    if (evidenceTruncated) break;
     const contentType = attachment.contentType.toLowerCase();
     if (contentType === "text/calendar" || contentType === "application/ics" || contentType === "application/icalendar") {
-      for (const calendarEvidence of extractCalendarEvidence(attachment.content)) {
+      if (attachment.content.length > MAX_CALENDAR_EVIDENCE_BYTES) {
+        evidenceTruncated = true;
+        break;
+      }
+      const calendarResult = extractCalendarEvidence(attachment.content);
+      for (const calendarEvidence of calendarResult.evidence) {
         pushEvidence(calendarEvidence);
       }
+      if (calendarResult.truncated) evidenceTruncated = true;
     }
   }
-  for (const resourceEvidence of providerResourceEvidence([bodyPlain, bodyHtml].filter(Boolean).join("\n"))) {
-    pushEvidence(resourceEvidence);
+  if (!evidenceTruncated) {
+    const resourceResult = providerResourceEvidence([bodyPlain, bodyHtml].filter(Boolean).join("\n"));
+    for (const resourceEvidence of resourceResult.evidence) {
+      pushEvidence(resourceEvidence);
+    }
+    if (resourceResult.truncated) evidenceTruncated = true;
   }
   if (evidenceTruncated) {
     parserWarnings.push("artifact_evidence_truncated");

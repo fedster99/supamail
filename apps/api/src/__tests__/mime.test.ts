@@ -278,4 +278,88 @@ describe("mime helpers", () => {
     expect(resources.filter((item) => item.namespace === "google_drive_file")).toHaveLength(1);
     expect(resources).toHaveLength(4);
   });
+
+  it("bounds provider-resource floods and marks the evidence incomplete", async () => {
+    const urls = Array.from(
+      { length: 150 },
+      (_, index) => `https://github.com/acme/mail/issues/${index + 1}`
+    );
+    const raw = Buffer.from(
+      [
+        "From: Alerts <alerts@example.com>",
+        "To: Alice <alice@example.com>",
+        "Subject: Resource flood",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        urls.join("\r\n")
+      ].join("\r\n")
+    );
+
+    const parsed = await parseRawMime(raw);
+
+    expect(parsed.evidence).toHaveLength(100);
+    expect(parsed.parserWarnings).toContain("artifact_evidence_truncated");
+  });
+
+  it("bounds calendar identifiers by UTF-8 bytes without splitting Unicode", async () => {
+    const calendar = [
+      "BEGIN:VCALENDAR",
+      "BEGIN:VEVENT",
+      `UID:${"😀".repeat(400)}\u0001`,
+      "END:VEVENT",
+      "END:VCALENDAR"
+    ].join("\r\n");
+    const raw = Buffer.from(
+      [
+        "From: Alice <alice@example.com>",
+        "To: Bob <bob@example.com>",
+        "Subject: Unicode calendar",
+        "MIME-Version: 1.0",
+        "Content-Type: text/calendar; charset=utf-8; name=invite.ics",
+        "Content-Disposition: attachment; filename=invite.ics",
+        "Content-Transfer-Encoding: base64",
+        "",
+        Buffer.from(calendar).toString("base64")
+      ].join("\r\n")
+    );
+
+    const parsed = await parseRawMime(raw);
+    const instance = parsed.evidence.find((item) => item.kind === "calendar_instance");
+    const uid = instance?.metadata.uid;
+
+    expect(typeof uid).toBe("string");
+    expect(Buffer.byteLength(String(uid), "utf8")).toBeLessThanOrEqual(1_024);
+    expect(String(uid)).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(String(uid).codePointAt(String(uid).length - 2)).toBe(0x1F600);
+    expect(Buffer.byteLength(instance?.key ?? "", "utf8")).toBeLessThanOrEqual(2_048);
+  });
+
+  it("does not parse oversized calendar payloads as complete evidence", async () => {
+    const calendar = [
+      "BEGIN:VCALENDAR",
+      "BEGIN:VEVENT",
+      "UID:oversized@example.com",
+      `DESCRIPTION:${"x".repeat(1_100_000)}`,
+      "END:VEVENT",
+      "END:VCALENDAR"
+    ].join("\r\n");
+    const raw = Buffer.from(
+      [
+        "From: Alice <alice@example.com>",
+        "To: Bob <bob@example.com>",
+        "Subject: Oversized calendar",
+        "MIME-Version: 1.0",
+        "Content-Type: text/calendar; charset=utf-8; name=invite.ics",
+        "Content-Disposition: attachment; filename=invite.ics",
+        "Content-Transfer-Encoding: base64",
+        "",
+        Buffer.from(calendar).toString("base64")
+      ].join("\r\n")
+    );
+
+    const parsed = await parseRawMime(raw);
+
+    expect(parsed.evidence.filter((item) => item.kind === "calendar_instance")).toHaveLength(0);
+    expect(parsed.parserWarnings).toContain("artifact_evidence_truncated");
+  });
 });
