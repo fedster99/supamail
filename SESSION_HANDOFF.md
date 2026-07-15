@@ -1,5 +1,23 @@
 # Session Handoff
 
+## 2026-07-15 — Production-sized threading closure evidence
+
+- A real v2 production shadow build expanded a 500-message seed page into a
+  legitimate 2,562-message reply component with 17,744,178 bytes (16.92 MiB)
+  of measured threading evidence. The 16 MiB default failed closed just below
+  that observed requirement; row, criteria-key, and evidence-byte enforcement
+  itself behaved correctly.
+- Branch `fedster99/raise-threading-closure-cap` raises only the default evidence
+  limit to 32 MiB; explicit overrides and the 512 MiB absolute ceiling remain.
+  A live-Postgres regression creates an approximately 16.93 MiB evidence page:
+  it failed against the old default with the exact evidence-limit exception and
+  passes after the change. The existing explicit 1 KiB hostile-input test still
+  proves fail-closed behavior.
+- `INSTALL_CMD=true ./init.sh` passes harness review, root typecheck, 662 fast
+  tests, and both production builds. `pnpm test:db:live` passes 171/171 live
+  tests and 118/118 conformance checks. Publication and the production shadow
+  build are the next actions.
+
 ## 2026-07-15 — Hierarchical folder priority regression
 
 - A production outreach canary showed that Rackspace's real `\\Sent` folder could
