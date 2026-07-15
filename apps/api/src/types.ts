@@ -392,8 +392,4 @@ export interface UpdateAccountSettingsInput {
 
 export interface UpdateAccountCredentialsInput {
   password: string;
-  host?: string;
-  port?: number;
-  secure?: boolean;
-  username?: string;
 }

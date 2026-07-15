@@ -699,28 +699,14 @@ export class MirrorRepository {
     accountId: string,
     input: UpdateAccountCredentialsInput
   ): Promise<AccountSummary | null> {
-    const current = await this.pool.query<{
-      host: string;
-      port: number;
-      secure: boolean;
-      lock_id: string;
-    }>(
-      `SELECT host, port, secure, lock_id
+    const current = await this.pool.query<{ lock_id: string }>(
+      `SELECT lock_id
        FROM public.imap_accounts
        WHERE id = $1`,
       [accountId]
     );
     const existing = current.rows[0];
     if (!existing) return null;
-
-    const host = input.host ?? existing.host;
-    const port = input.port ?? existing.port;
-    const secure = input.secure ?? existing.secure;
-    if (input.host !== undefined || input.port !== undefined || input.secure !== undefined) {
-      await assertSafeImapTarget(host, port, secure, {
-        allowPrivateHosts: this.config.IMAP_ALLOW_PRIVATE_HOSTS
-      });
-    }
 
     const encrypted = await encryptPassword(
       this.pool,
@@ -731,10 +717,6 @@ export class MirrorRepository {
       const result = await lock.client.query<AccountSummary>(
         `UPDATE public.imap_accounts
          SET encrypted_password = $2,
-             host = $3,
-             port = $4,
-             secure = $5,
-             username = COALESCE($6, username),
              sync_state = 'DEGRADED',
              sync_state_reason = 'CREDENTIALS_UPDATED_PENDING_SYNC',
              consecutive_failures = 0,
@@ -747,7 +729,7 @@ export class MirrorRepository {
              updated_at = now()
          WHERE id = $1
          RETURNING ${ACCOUNT_SUMMARY_COLUMNS}`,
-        [accountId, encrypted, host, port, secure, input.username ?? null]
+        [accountId, encrypted]
       );
       return result.rows[0] ?? null;
     });

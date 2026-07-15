@@ -169,12 +169,8 @@ const CREATE_ACCOUNT_SCHEMA = z.object({
 });
 
 const UPDATE_ACCOUNT_CREDENTIALS_SCHEMA = z.object({
-  password: z.string().min(1).max(1024),
-  host: z.string().min(1).max(255).optional(),
-  port: z.coerce.number().int().min(1).max(65535).optional(),
-  secure: z.boolean().optional(),
-  username: z.string().min(1).max(255).optional()
-});
+  password: z.string().min(1).max(1024)
+}).strict();
 
 const SEND_RECIPIENT_SCHEMA = z.object({
   email: z.string().email().max(255),

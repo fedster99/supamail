@@ -547,6 +547,20 @@ describe("API safety", () => {
     expect(repository.updateAccountCredentials).not.toHaveBeenCalled();
   });
 
+  it("rejects connection-coordinate changes on the credential endpoint", async () => {
+    const { app, repository } = buildApp();
+
+    const response = await app.request(`/accounts/${accountId}/credentials`, {
+      method: "PATCH",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ password: "new-app-password", host: "imap.other.test" })
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: "invalid_input" });
+    expect(repository.updateAccountCredentials).not.toHaveBeenCalled();
+  });
+
   it("gates POST /accounts/:id/send behind the API token", async () => {
     const { app, send } = buildApp();
 
