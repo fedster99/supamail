@@ -1,5 +1,20 @@
 # Session Handoff
 
+## 2026-07-15 — Hierarchical folder priority regression
+
+- A production outreach canary showed that Rackspace's real `\\Sent` folder could
+  remain due while unrelated `INBOX.*` child folders consumed the bounded hot
+  lane. The provider profile classified any path containing `inbox` as Inbox.
+- Branch `fedster99/fix-rackspace-folder-priority` now treats only the exact
+  Inbox role/path as priority 1, while preserving Sent as priority 5 and normal
+  descendants as round-robin priority 100. The generic profile uses the same
+  corrected semantics.
+- Regression coverage lives in `provider-profiles.test.ts` for Rackspace and
+  generic hierarchical paths. `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed:
+  typecheck, 655 fast tests, build, 158 live-DB tests, and 118 conformance checks.
+  Commit/merge, immutable-image publication, and downstream production re-pin
+  are the next actions.
+
 Last updated: 2026-07-15
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.

@@ -12,6 +12,22 @@ describe("provider profiles", () => {
     expect(profile.priorityForFolder("Sent Items")).toBeLessThan(profile.priorityForFolder("Archive"));
   });
 
+  it("does not mistake Rackspace child folders for the inbox", () => {
+    const profile = getProviderProfile("rackspace");
+
+    expect(profile.priorityForFolder("INBOX.Drafts", "\\Drafts")).toBe(100);
+    expect(profile.priorityForFolder("INBOX.Archive", "\\Archive")).toBe(100);
+    expect(profile.priorityForFolder("INBOX.INBOX.Sent", "\\Sent")).toBe(5);
+    expect(profile.priorityForFolder("INBOX.Sent")).toBe(5);
+  });
+
+  it("keeps hierarchical generic-IMAP child folders out of the inbox lane", () => {
+    const profile = getProviderProfile("generic-imap");
+
+    expect(profile.priorityForFolder("INBOX.Archive")).toBe(100);
+    expect(profile.priorityForFolder("INBOX.Sent")).toBe(5);
+  });
+
   it("excludes noisy folders but mirrors Drafts", () => {
     const profile = getProviderProfile("generic-imap");
     expect(profile.excludedReason("Trash")).toBe("excluded_trash");
