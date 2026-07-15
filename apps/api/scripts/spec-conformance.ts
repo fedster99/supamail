@@ -1689,7 +1689,8 @@ async function scenarioProgressRollup() {
         selectedTextFormat: "plain",
         headersJson: {},
         mimeStructure: null,
-        parserWarnings: []
+      parserWarnings: [],
+      evidence: []
       });
     }
 

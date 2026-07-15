@@ -566,7 +566,10 @@ export async function fetchFullMessageBody(
       selectedTextFormat: selected?.format ?? null,
       headersJson: Object.keys(parsed.headersJson).length > 0 ? parsed.headersJson : message.headers_json,
       mimeStructure,
-      parserWarnings: parsed.parserWarnings
+      parserWarnings: rawTruncated
+        ? [...parsed.parserWarnings, "artifact_evidence_omitted_raw_truncated"]
+        : parsed.parserWarnings,
+      evidence: rawTruncated ? [] : parsed.evidence
     };
   } finally {
     lock?.release();

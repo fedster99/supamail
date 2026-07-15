@@ -20,6 +20,10 @@ const conversationThreadingMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0014_conversation_threading.sql"
 );
+const messageEvidenceMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0016_message_evidence.sql"
+);
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -99,9 +103,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0015_threading_production_hardening");
+    expect(version).toBe("0016_message_evidence");
     expect(manifest).toEqual({
-      schemaVersion: "0015_threading_production_hardening",
+      schemaVersion: "0016_message_evidence",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -117,7 +121,8 @@ describe("initial schema", () => {
         { id: "0012_sync_events_retention_index", file: "0012_sync_events_retention_index.sql" },
         { id: "0013_body_head_trigram_index", file: "0013_body_head_trigram_index.sql" },
         { id: "0014_conversation_threading", file: "0014_conversation_threading.sql" },
-        { id: "0015_threading_production_hardening", file: "0015_threading_production_hardening.sql" }
+        { id: "0015_threading_production_hardening", file: "0015_threading_production_hardening.sql" },
+        { id: "0016_message_evidence", file: "0016_message_evidence.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -140,6 +145,23 @@ describe("initial schema", () => {
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_work_queue");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_operations");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_assignment_history");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_message_evidence");
+  });
+
+  it("stores bounded, private, joinable message evidence with extraction coverage", async () => {
+    const sql = await readFile(messageEvidenceMigrationPath, "utf8");
+
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_message_evidence");
+    expect(sql).toContain("structured_evidence_extractor_version text");
+    expect(sql).toContain("structured_evidence_sha256 text");
+    expect(sql).toContain("structured_evidence_complete boolean");
+    expect(sql).toContain("UNIQUE (message_id, extractor, kind, namespace, evidence_key_sha256)");
+    expect(sql).toContain("imap_message_evidence_join_idx");
+    expect(sql).toContain("octet_length(evidence_key) <= 2048");
+    expect(sql).toContain("octet_length(metadata::text) <= 16384");
+    expect(sql).toContain("ALTER TABLE public.imap_message_evidence ENABLE ROW LEVEL SECURITY");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_message_evidence FROM anon");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_message_evidence FROM authenticated");
   });
 
   it("adds safe versioned shadow-run conversation threading", async () => {

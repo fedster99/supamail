@@ -98,8 +98,37 @@ liveDb("threading-header ingestion", () => {
         references: "<ancestor@example.test>"
       },
       mimeStructure: null,
-      parserWarnings: []
+      parserWarnings: [],
+      evidence: [{
+        kind: "provider_resource",
+        namespace: "github_issue",
+        key: "supamail/supamail#42",
+        metadata: { provider: "github", number: 42 }
+      }]
     });
+
+    const storedEvidence = await pool.query<{
+      namespace: string;
+      evidence_key: string;
+      extractor_version: string;
+      complete: boolean;
+      digest: string | null;
+    }>(
+      `SELECT e.namespace, e.evidence_key, e.extractor_version,
+              b.structured_evidence_complete AS complete,
+              b.structured_evidence_sha256 AS digest
+       FROM public.imap_message_evidence e
+       JOIN public.imap_message_bodies b ON b.message_id = e.message_id
+       WHERE e.message_id = $1`,
+      [stored.id]
+    );
+    expect(storedEvidence.rows).toEqual([expect.objectContaining({
+      namespace: "github_issue",
+      evidence_key: "supamail/supamail#42",
+      extractor_version: "mime_evidence_v1",
+      complete: true,
+      digest: expect.stringMatching(/^[0-9a-f]{64}$/)
+    })]);
 
     // Flag/reconcile scans can observe the same incomplete metadata again.
     await mirror.upsertMessages(

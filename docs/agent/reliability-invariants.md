@@ -13,6 +13,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Store raw and normalized Message-ID separately.
 - Preserve provider message/thread ID namespaces; provider IDs are opaque and not globally unique.
 - A complete, non-truncated raw MIME fetch may store `raw_mime_sha256` as copy evidence. In `parsed_only` history, `parsed_delivery_sha256` may corroborate a copy only when the exact parsed body, MIME structure, parsed headers, envelope, sizes, and parser warnings agree. Never hash a truncated or materially incomplete body as if it proved delivery equality.
+- Decoded attachment SHA-256, iCalendar instance IDs, and strict provider resource IDs are neutral `imap_message_evidence`, not delivery or conversation assignments. Evidence is bounded/versioned, truncated extraction is incomplete, and semantic work-item clustering remains downstream of SupaMail.
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.
 - Attachment metadata is stored during sync; binary attachment fetching is not part of the current core path.
 - Body backlog draining is capped per tick so recent-body work cannot consume the whole lock window forever.

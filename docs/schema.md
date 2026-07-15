@@ -7,6 +7,7 @@ The mirror owns these neutral tables in `public`:
 - `imap_messages`
 - `imap_message_bodies`
 - `imap_attachments`
+- `imap_message_evidence`
 - `imap_sync_runs`
 - `imap_sync_events`
 - `imap_thread_runs`
@@ -26,6 +27,8 @@ RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked
 `imap_messages` stays metadata-oriented so list queries remain small. Full body data lives in `imap_message_bodies`.
 
 `imap_message_bodies.raw_mime` stores RFC822/MIME bytes. Parsed fields store plain text, HTML, normalized text, parsed headers, selected text part, parser warnings, and MIME structure snapshots. With `BODY_STORAGE_MODE=parsed_only`, bodies are still fetched and parsed but `raw_mime` is stored as NULL; `raw_bytes` and `raw_truncated` keep describing the fetched source.
+
+`0016_message_evidence` adds bounded structured evidence captured while decoded MIME is available (ADR 0025). `imap_message_evidence` records decoded attachment SHA-256 identities, iCalendar instances keyed by `UID` plus `RECURRENCE-ID`, and strict provider-scoped GitHub/Google Drive/Jira/DocuSign resource identities. Each row retains an explainable bounded key, fixed-size join digest, metadata, extractor, and extractor version; it stores no attachment bytes or arbitrary URLs. `imap_message_bodies.structured_evidence_*` records the deterministic evidence digest, extractor version, completion, and attempt time. Missing-version rows re-enter the existing bounded body lanes; truncated attempts are marked incomplete and do not loop forever. These records are neutral source evidence, never conversation or work-item assignments.
 
 Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY resets, or provider deletion indicate they are no longer visible.
 
