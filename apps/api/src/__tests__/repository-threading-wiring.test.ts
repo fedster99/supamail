@@ -185,6 +185,8 @@ describe("repository threading evidence wiring", () => {
     const stateLockIndex = calls.findIndex((call) => call.sql.includes("FOR SHARE"));
     const bodyWriteIndex = calls.findIndex((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"));
     expect(stateLockIndex).toBeLessThan(bodyWriteIndex);
+    expect(calls[bodyWriteIndex]?.sql).toContain("parsed_delivery_sha256 = NULL");
+    expect(calls[bodyWriteIndex]?.sql).toContain("authored_delivery_sha256 = NULL");
   });
 
   it("atomically replaces structured message evidence on body recomputation", async () => {

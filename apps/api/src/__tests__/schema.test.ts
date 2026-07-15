@@ -32,6 +32,10 @@ const threadingBodyFallbackIndexMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0018_threading_body_fallback_index.sql"
 );
+const authoredDeliveryEvidenceMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0019_authored_delivery_evidence.sql"
+);
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -111,9 +115,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0018_threading_body_fallback_index");
+    expect(version).toBe("0019_authored_delivery_evidence");
     expect(manifest).toEqual({
-      schemaVersion: "0018_threading_body_fallback_index",
+      schemaVersion: "0019_authored_delivery_evidence",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -132,7 +136,8 @@ describe("initial schema", () => {
         { id: "0015_threading_production_hardening", file: "0015_threading_production_hardening.sql" },
         { id: "0016_message_evidence", file: "0016_message_evidence.sql" },
         { id: "0017_threading_body_backfill_index", file: "0017_threading_body_backfill_index.sql" },
-        { id: "0018_threading_body_fallback_index", file: "0018_threading_body_fallback_index.sql" }
+        { id: "0018_threading_body_fallback_index", file: "0018_threading_body_fallback_index.sql" },
+        { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -158,6 +163,7 @@ describe("initial schema", () => {
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_message_evidence");
     expect(sql).toContain("imap_message_bodies_thread_digest_backfill_idx");
     expect(sql).toContain("imap_message_bodies_thread_digest_fallback_idx");
+    expect(sql).toContain("authored_delivery_sha256 text");
   });
 
   it("keeps sparse legacy body-digest repair on a bounded partial index", async () => {
@@ -176,6 +182,18 @@ describe("initial schema", () => {
     expect(sql).toContain("CREATE INDEX IF NOT EXISTS imap_message_bodies_thread_digest_fallback_idx");
     expect(sql).toContain("raw_mime_sha256 IS NULL");
     expect(sql).toContain("DROP INDEX IF EXISTS public.imap_message_bodies_thread_digest_backfill_idx");
+  });
+
+  it("stores transport-invariant authored delivery evidence with a threading trigger", async () => {
+    const sql = await readFile(authoredDeliveryEvidenceMigrationPath, "utf8");
+
+    expect(sql).toContain("authored_delivery_sha256 text");
+    expect(sql).toContain("structured_evidence_complete");
+    expect(sql).toContain("imap_thread_capture_authored_delivery_change");
+    expect(sql).toContain("imap_thread_invalidate_delivery_digests_from_body");
+    expect(sql).toContain("imap_thread_invalidate_delivery_digests_from_message");
+    expect(sql).toContain("authored_delivery_evidence_changed");
+    expect(sql).not.toContain("CREATE INDEX");
   });
 
   it("stores bounded, private, joinable message evidence with extraction coverage", async () => {

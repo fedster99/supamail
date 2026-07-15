@@ -3,6 +3,7 @@ import type { PgClient, PgPool } from "./db.js";
 import {
   THREADING_ALGORITHM_VERSION,
   computeThreadAssignments,
+  computeThreadAssignmentsV1,
   type ThreadingAssignment,
   type ThreadingMessageInput,
   type ThreadingOptions
@@ -19,6 +20,7 @@ const WRITE_CHUNK_SIZE = 1_000;
 const LIVE_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const DEFAULT_COMPARISON_STATEMENT_TIMEOUT_MS = 30_000;
 const RUN_FAIRNESS_SCHEDULE = ["active", "active", "standby", "active", "building"] as const;
+const DELIVERY_EVIDENCE_BRIDGE_REASON = "delivery_evidence_bridge";
 
 type RunStatus = "building" | "ready" | "active" | "standby" | "archived" | "failed" | "rolled_back";
 type RunStage = "body_evidence" | "strong" | "subject" | "catchup" | "ready";
@@ -114,6 +116,32 @@ interface ThreadingCriteria {
   deliveryKeys: Set<string>;
   referenceHashes: Set<string>;
   providerThreadHashes: Set<string>;
+}
+
+function deliveryEvidenceBridgeIds(
+  assignments: readonly ThreadingAssignment[],
+  inputs: readonly ThreadingMessageInput[]
+): string[] {
+  const inputsById = new Map(inputs.map((input) => [input.id, input]));
+  const groups = new Map<string, ThreadingAssignment[]>();
+  for (const assignment of assignments) {
+    if (!assignment.strict_message_id) continue;
+    const group = groups.get(assignment.strict_message_id) ?? [];
+    group.push(assignment);
+    groups.set(assignment.strict_message_id, group);
+  }
+
+  const ids = new Set<string>();
+  for (const group of groups.values()) {
+    const deliveryKeys = new Set(group.map((assignment) => assignment.delivery_key));
+    if (deliveryKeys.size < 2) continue;
+    for (const assignment of group) {
+      const input = inputsById.get(assignment.physical_message_id);
+      if (!input || input.authored_delivery_fingerprint) continue;
+      ids.add(assignment.physical_message_id);
+    }
+  }
+  return [...ids].sort(compareText);
 }
 
 interface ClosureLimits {
@@ -230,7 +258,8 @@ export type ThreadingAlgorithmExecutor = (
  * the prior executor must remain until no active/candidate/standby run uses it.
  */
 export const PRODUCTION_THREADING_ALGORITHMS: ReadonlyMap<number, ThreadingAlgorithmExecutor> = new Map([
-  [1, computeThreadAssignments]
+  [1, computeThreadAssignmentsV1],
+  [2, computeThreadAssignments]
 ]);
 
 export interface ThreadingRepositoryOptions {
@@ -1894,6 +1923,126 @@ export class ThreadingRepository {
   }
 
   private async backfillBodyEvidenceBatch(client: PgClient, accountId: string, limit: number): Promise<number> {
+    const bridged = await this.backfillQueuedDeliveryBridgeBatch(client, accountId, limit);
+    if (bridged >= limit) return bridged;
+    return bridged + await this.backfillLegacyBodyEvidenceBatch(client, accountId, limit - bridged);
+  }
+
+  private async backfillQueuedDeliveryBridgeBatch(
+    client: PgClient,
+    accountId: string,
+    limit: number
+  ): Promise<number> {
+    if (limit <= 0) return 0;
+    const queued = await client.query<{ message_id: string }>(
+      `SELECT queue.message_id
+       FROM public.imap_thread_work_queue queue
+       WHERE queue.account_id = $1
+         AND queue.reason = $2
+       GROUP BY queue.message_id
+       ORDER BY min(queue.enqueued_at), queue.message_id
+       LIMIT $3`,
+      [accountId, DELIVERY_EVIDENCE_BRIDGE_REASON, limit]
+    );
+    const queuedIds = queued.rows.map((row) => row.message_id);
+    if (queuedIds.length === 0) return 0;
+
+    const candidates = await client.query<{
+      message_id: string;
+      authored_delivery_sha256: string;
+    }>(
+      `SELECT body.message_id,
+              encode(extensions.digest(convert_to(jsonb_build_object(
+                'message_id', body.headers_json -> 'message-id',
+                'date', body.headers_json -> 'date',
+                'subject', message.subject,
+                'from_email', message.from_email,
+                'to_emails', message.to_emails,
+                'cc_emails', message.cc_emails,
+                'bcc_emails', message.bcc_emails,
+                'body_text', body.body_text,
+                'body_html', body.body_html,
+                'body_plain', body.body_plain,
+                'selected_text_part', body.selected_text_part,
+                'selected_text_format', body.selected_text_format,
+                'content_type', body.headers_json -> 'content-type',
+                'content_transfer_encoding', body.headers_json -> 'content-transfer-encoding',
+                'mime_version', body.headers_json -> 'mime-version',
+                'mime_structure', body.mime_structure,
+                'parser_warnings', body.parser_warnings,
+                'structured_evidence_sha256', body.structured_evidence_sha256
+              )::text, 'UTF8'), 'sha256'), 'hex') AS authored_delivery_sha256
+       FROM public.imap_message_bodies body
+       JOIN public.imap_messages message ON message.id = body.message_id
+       WHERE body.message_id = ANY($1::uuid[])
+         AND body.authored_delivery_sha256 IS NULL
+         AND NOT body.raw_truncated
+         AND body.raw_bytes > 0
+         AND message.from_email IS NOT NULL
+         AND body.headers_json ? 'message-id'
+         AND body.headers_json ? 'from'
+         AND body.headers_json ? 'date'
+         AND cardinality(
+           coalesce(message.to_emails, '{}'::text[]) ||
+           coalesce(message.cc_emails, '{}'::text[]) ||
+           coalesce(message.bcc_emails, '{}'::text[])
+         ) > 0
+         AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+         AND body.mime_structure IS NOT NULL
+         AND body.structured_evidence_complete
+         AND body.structured_evidence_sha256 IS NOT NULL
+       ORDER BY body.message_id
+       FOR UPDATE OF body`,
+      [queuedIds]
+    );
+
+    const eligibleIds = new Set(candidates.rows.map((candidate) => candidate.message_id));
+    const recheckIds = queuedIds.filter((id) => !eligibleIds.has(id));
+    if (recheckIds.length > 0) {
+      await client.query(
+        `UPDATE public.imap_thread_work_queue
+         SET reason = 'delivery_evidence_recheck',
+             attempts = 0,
+             available_at = now(),
+             last_error = NULL,
+             enqueued_at = now(),
+             updated_at = now()
+         WHERE account_id = $1
+           AND message_id = ANY($2::uuid[])
+           AND reason = $3`,
+        [accountId, recheckIds, DELIVERY_EVIDENCE_BRIDGE_REASON]
+      );
+    }
+    if (candidates.rows.length === 0) return 0;
+
+    const changed = await client.query<{ count: string }>(
+      `WITH candidates AS MATERIALIZED (
+         SELECT *
+         FROM jsonb_to_recordset($1::jsonb) AS candidate(
+           message_id uuid,
+           authored_delivery_sha256 text
+         )
+       ), repaired AS (
+         UPDATE public.imap_message_bodies body
+         SET authored_delivery_sha256 = candidates.authored_delivery_sha256
+         FROM candidates
+         WHERE body.message_id = candidates.message_id
+           AND body.message_id = ANY($2::uuid[])
+           AND body.authored_delivery_sha256 IS NULL
+         RETURNING body.message_id
+       )
+       SELECT count(*)::text AS count FROM repaired`,
+      [JSON.stringify(candidates.rows), candidates.rows.map((candidate) => candidate.message_id)]
+    );
+    return Number(changed.rows[0]?.count ?? 0);
+  }
+
+  private async backfillLegacyBodyEvidenceBatch(
+    client: PgClient,
+    accountId: string,
+    limit: number
+  ): Promise<number> {
+    if (limit <= 0) return 0;
     const candidates = await client.query<{
       message_id: string;
       raw_mime_sha256: string | null;
@@ -2010,6 +2159,26 @@ export class ThreadingRepository {
          JOIN public.imap_messages message ON message.id = body.message_id
          WHERE queue.account_id = $1
            AND (
+             (
+               queue.reason = $3
+               AND body.authored_delivery_sha256 IS NULL
+               AND NOT body.raw_truncated
+               AND body.raw_bytes > 0
+               AND message.from_email IS NOT NULL
+               AND body.headers_json ? 'message-id'
+               AND body.headers_json ? 'from'
+               AND body.headers_json ? 'date'
+               AND cardinality(
+                 coalesce(message.to_emails, '{}'::text[]) ||
+                 coalesce(message.cc_emails, '{}'::text[]) ||
+                 coalesce(message.bcc_emails, '{}'::text[])
+               ) > 0
+               AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+               AND body.mime_structure IS NOT NULL
+               AND body.structured_evidence_complete
+               AND body.structured_evidence_sha256 IS NOT NULL
+             )
+             OR
              (body.raw_mime_sha256 IS NULL AND body.raw_mime IS NOT NULL AND NOT body.raw_truncated)
              OR
              (
@@ -2030,7 +2199,7 @@ export class ThreadingRepository {
            )
          LIMIT 1
        ) AS exists`,
-      [accountId, [...LIVE_RUN_STATUSES]]
+      [accountId, [...LIVE_RUN_STATUSES], DELIVERY_EVIDENCE_BRIDGE_REASON]
     );
     return result.rows[0]?.exists ?? false;
   }
@@ -2422,6 +2591,7 @@ export class ThreadingRepository {
         m.internal_date, m.size_bytes::text AS size_bytes,
         body.raw_mime_sha256 AS raw_mime_hash,
         body.parsed_delivery_sha256 AS delivery_fingerprint,
+        body.authored_delivery_sha256 AS authored_delivery_fingerprint,
         m.subject, m.from_email,
         coalesce(m.to_emails, '{}'::text[]) AS to_emails,
         coalesce(m.cc_emails, '{}'::text[]) AS cc_emails,
@@ -2524,6 +2694,11 @@ export class ThreadingRepository {
         await this.enqueueSubjectWork(client, run, [...keys]);
       }
     }
+    await this.enqueueDeliveryEvidenceBridges(
+      client,
+      run,
+      deliveryEvidenceBridgeIds(assignments, inputs)
+    );
     return { operationId, generation, changed: changed.length };
   }
 
@@ -2678,6 +2853,45 @@ export class ThreadingRepository {
     );
   }
 
+  private async enqueueDeliveryEvidenceBridges(
+    client: PgClient,
+    run: ThreadRun,
+    ids: string[]
+  ): Promise<void> {
+    if (ids.length === 0) return;
+    await client.query(
+      `INSERT INTO public.imap_thread_work_queue (
+         run_id, message_id, account_id, reason, attempts, available_at,
+         last_error, enqueued_at, updated_at
+       )
+       SELECT $1, message.id, $2, $3, 0, now(), NULL, now(), now()
+       FROM public.imap_messages message
+       JOIN public.imap_message_bodies body ON body.message_id = message.id
+       WHERE message.id = ANY($4::uuid[])
+         AND message.account_id = $2
+         AND body.authored_delivery_sha256 IS NULL
+         AND NOT body.raw_truncated
+         AND body.raw_bytes > 0
+         AND message.from_email IS NOT NULL
+         AND body.headers_json ? 'message-id'
+         AND body.headers_json ? 'from'
+         AND body.headers_json ? 'date'
+         AND cardinality(
+           coalesce(message.to_emails, '{}'::text[]) ||
+           coalesce(message.cc_emails, '{}'::text[]) ||
+           coalesce(message.bcc_emails, '{}'::text[])
+         ) > 0
+         AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+         AND body.mime_structure IS NOT NULL
+         AND body.structured_evidence_complete
+         AND body.structured_evidence_sha256 IS NOT NULL
+       ON CONFLICT (run_id, message_id) DO UPDATE SET
+         reason = EXCLUDED.reason, attempts = 0, available_at = now(),
+         last_error = NULL, enqueued_at = now(), updated_at = now()`,
+      [run.id, run.account_id, DELIVERY_EVIDENCE_BRIDGE_REASON, ids]
+    );
+  }
+
   private async pruneSingletonSubjectWork(client: PgClient, run: ThreadRun, limit: number): Promise<number> {
     const result = await client.query<{ count: string }>(
       `WITH candidates AS MATERIALIZED (
@@ -2742,9 +2956,12 @@ export class ThreadingRepository {
     const result = await client.query<{ count: string }>(
       `WITH removed AS (
          DELETE FROM public.imap_thread_work_queue
-         WHERE run_id = $1 AND message_id = ANY($2::uuid[]) RETURNING 1
+         WHERE run_id = $1
+           AND message_id = ANY($2::uuid[])
+           AND reason <> $3
+         RETURNING 1
        ) SELECT count(*)::text AS count FROM removed`,
-      [runId, ids]
+      [runId, ids, DELIVERY_EVIDENCE_BRIDGE_REASON]
     );
     return Number(result.rows[0]?.count ?? 0);
   }

@@ -860,6 +860,413 @@ liveDb("ThreadingRepository live DB", () => {
     expect(new Set(evidence.rows.map((row) => row.parsed_delivery_sha256)).size).toBe(2);
   });
 
+  it("collapses a raw-backed copy with a parsed-only mirror through targeted authored evidence", async () => {
+    const accountId = await createAccount("cross-tier-delivery-copy");
+    const messageIds: string[] = [];
+    for (const [index, rawDigest] of ["d".repeat(64), null].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "INBOX" : "INBOX.INBOX",
+        subject: "Cross-tier mirror",
+        fromEmail: "alice@example.test",
+        toEmails: ["bob@example.test"],
+        rfcMessageId: "<cross-tier-mirror@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, 128, false,
+           'Exact mirror body', 'Exact mirror body', 'Exact mirror body', 'plain',
+           $3::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $4, true, now()
+         )`,
+        [
+          messageId,
+          rawDigest,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Bob <bob@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Cross-tier mirror",
+            "message-id": "<cross-tier-mirror@example.test>"
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(1);
+    expect((rows[0]?.evidence.collapsed_physical_ids as string[])).toHaveLength(2);
+    const repaired = await pool.query<{ authored_delivery_sha256: string | null }>(
+      `SELECT authored_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+    expect(repaired.rows.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(repaired.rows.map((row) => row.authored_delivery_sha256)).size).toBe(1);
+  });
+
+  it("collapses sent and received copies when only transport headers and wire sizes differ", async () => {
+    const accountId = await createAccount("transport-mutated-delivery-copy");
+    const messageIds: string[] = [];
+    for (const [index, rawDigest] of ["a".repeat(64), "b".repeat(64)].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        subject: "Self-sent test",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<transport-mutated@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, $3, false,
+           'Same authored body', 'Same authored body', 'Same authored body', 'plain',
+           $4::jsonb, $5::jsonb, '{}'::text[],
+           'test-v1', $6, true, now()
+         )`,
+        [
+          messageId,
+          rawDigest,
+          index === 0 ? 482 : 2_958,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Alice <alice@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Self-sent test",
+            "message-id": "<transport-mutated@example.test>",
+            "content-type": "text/plain; charset=us-ascii",
+            "mime-version": "1.0",
+            "content-transfer-encoding": "7bit",
+            ...(index === 0 ? {} : {
+              received: ["by inbound.example.test with ESMTPS"],
+              "authentication-results": "inbound.example.test; dkim=pass",
+              "return-path": "<alice@example.test>"
+            })
+          }),
+          JSON.stringify({
+            size: 18,
+            type: "text/plain",
+            encoding: "7bit",
+            parameters: { charset: "us-ascii" }
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(1);
+    const evidence = await pool.query<{ authored_delivery_sha256: string | null }>(
+      `SELECT authored_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+    expect(evidence.rows.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(evidence.rows.map((row) => row.authored_delivery_sha256)).size).toBe(1);
+  });
+
+  it("releases targeted delivery evidence work when its source becomes ineligible", async () => {
+    const accountId = await createAccount("stale-authored-delivery-work");
+    const messageIds: string[] = [];
+    for (const [index, rawDigest] of ["1".repeat(64), "2".repeat(64)].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        subject: "Targeted evidence becomes unavailable",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<stale-authored-work@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, 128, false,
+           'Same authored body', 'Same authored body', 'Same authored body', 'plain',
+           $3::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $4, true, now()
+         )`,
+        [
+          messageId,
+          rawDigest,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Alice <alice@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Targeted evidence becomes unavailable",
+            "message-id": "<stale-authored-work@example.test>"
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    let specialWork = 0;
+    for (let pass = 0; pass < 20 && specialWork === 0; pass += 1) {
+      await repository.drainAccount(accountId, { batchSize: 2, requestedBy: "live-test" });
+      const pending = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM public.imap_thread_work_queue
+         WHERE account_id = $1 AND reason = 'delivery_evidence_bridge'`,
+        [accountId]
+      );
+      specialWork = Number(pending.rows[0]?.count ?? 0);
+    }
+    expect(specialWork).toBeGreaterThan(0);
+
+    await pool.query(
+      `UPDATE public.imap_message_bodies
+       SET structured_evidence_complete = false,
+           structured_evidence_sha256 = NULL
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    expect(await projection(ready.runId as string)).toHaveLength(2);
+    const remaining = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_work_queue
+       WHERE account_id = $1 AND reason = 'delivery_evidence_bridge'`,
+      [accountId]
+    );
+    expect(remaining.rows[0]?.count).toBe("0");
+  });
+
+  it("invalidates authored delivery evidence when a stored body is replaced", async () => {
+    const accountId = await createAccount("replaced-authored-body");
+    const messageIds: string[] = [];
+    for (const [index, rawDigest] of ["3".repeat(64), "4".repeat(64)].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        subject: "Replace an authored body",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<replace-authored-body@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, 128, false,
+           'Original authored body', 'Original authored body', 'Original authored body', 'plain',
+           $3::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $4, true, now()
+         )`,
+        [
+          messageId,
+          rawDigest,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Alice <alice@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Replace an authored body",
+            "message-id": "<replace-authored-body@example.test>",
+            "content-type": "text/plain; charset=utf-8"
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
+
+    const replacementRaw = Buffer.from(
+      "Message-ID: <replace-authored-body@example.test>\r\n" +
+      "Date: Mon, 22 Jun 2026 18:23:13 +0000\r\n" +
+      "From: Alice <alice@example.test>\r\n" +
+      "To: Alice <alice@example.test>\r\n" +
+      "Subject: Replace an authored body\r\n" +
+      "Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+      "Different authored body"
+    );
+    await mirror.storeBody({
+      messageId: messageIds[1],
+      rawMime: replacementRaw,
+      rawBytes: replacementRaw.byteLength,
+      rawTruncated: false,
+      bodyText: "Different authored body",
+      bodyHtml: null,
+      bodyPlain: "Different authored body",
+      selectedTextPart: "Different authored body",
+      selectedTextFormat: "plain",
+      headersJson: {
+        "message-id": "<replace-authored-body@example.test>",
+        date: "Mon, 22 Jun 2026 18:23:13 +0000",
+        from: "Alice <alice@example.test>",
+        to: "Alice <alice@example.test>",
+        subject: "Replace an authored body",
+        "content-type": "text/plain; charset=utf-8"
+      },
+      mimeStructure: { type: "text/plain", parameters: { charset: "utf-8" } },
+      parserWarnings: [],
+      evidence: []
+    });
+    await drainUntilIdle(accountId);
+
+    const changed = await projection(ready.runId as string);
+    expect(new Set(changed.map((row) => row.delivery_key)).size).toBe(2);
+    const evidence = await pool.query<{ authored_delivery_sha256: string | null }>(
+      `SELECT authored_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+    expect(evidence.rows.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(evidence.rows.map((row) => row.authored_delivery_sha256)).size).toBe(2);
+  });
+
+  it("invalidates authored delivery evidence when authored envelope metadata changes", async () => {
+    const accountId = await createAccount("changed-authored-envelope");
+    const messageIds: string[] = [];
+    for (const [index, rawDigest] of ["5".repeat(64), "6".repeat(64)].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        subject: "Original envelope subject",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<changed-authored-envelope@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, 128, false,
+           'Same authored body', 'Same authored body', 'Same authored body', 'plain',
+           $3::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $4, true, now()
+         )`,
+        [
+          messageId,
+          rawDigest,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Alice <alice@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Original envelope subject",
+            "message-id": "<changed-authored-envelope@example.test>"
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
+
+    await pool.query(
+      "UPDATE public.imap_messages SET subject = 'Corrected envelope subject' WHERE id = $1",
+      [messageIds[1]]
+    );
+    await drainUntilIdle(accountId);
+
+    const changed = await projection(ready.runId as string);
+    expect(new Set(changed.map((row) => row.delivery_key)).size).toBe(2);
+    const evidence = await pool.query<{ authored_delivery_sha256: string | null }>(
+      `SELECT authored_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+    expect(evidence.rows.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(evidence.rows.map((row) => row.authored_delivery_sha256)).size).toBe(2);
+  });
+
+  it("keeps a reused Message-ID split when targeted authored digests disagree", async () => {
+    const accountId = await createAccount("cross-tier-message-id-reuse");
+    const messageIds: string[] = [];
+    for (const [index, bodyText] of ["First unrelated delivery", "Second unrelated delivery"].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "INBOX" : "Archive",
+        subject: "Reused Message-ID",
+        fromEmail: "alice@example.test",
+        toEmails: ["bob@example.test"],
+        rfcMessageId: "<reused-cross-tier@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, 128, false,
+           $3, $3, $3, 'plain',
+           $4::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $5, true, now()
+         )`,
+        [
+          messageId,
+          index === 0 ? "e".repeat(64) : null,
+          bodyText,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Bob <bob@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Reused Message-ID",
+            "message-id": "<reused-cross-tier@example.test>"
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(2);
+    const repaired = await pool.query<{ authored_delivery_sha256: string | null }>(
+      `SELECT authored_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+    expect(repaired.rows.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(repaired.rows.map((row) => row.authored_delivery_sha256)).size).toBe(2);
+  });
+
   it("does not derive a fallback delivery fingerprint when an exact raw digest exists", async () => {
     const accountId = await createAccount("raw-digest-needs-no-fallback");
     const messageId = await seedMessage(accountId, {
@@ -1113,7 +1520,7 @@ liveDb("ThreadingRepository live DB", () => {
       `INSERT INTO public.imap_thread_runs (
          account_id, algorithm_version, mode, status, stage,
          completed_at, activated_at, requested_by, reason
-       ) VALUES ($1, 2, 'initial', 'active', 'ready', now(), now(), 'live-test', 'future worker')
+       ) VALUES ($1, 3, 'initial', 'active', 'ready', now(), now(), 'live-test', 'future worker')
        RETURNING id`,
       [accountId]
     );
@@ -1134,7 +1541,7 @@ liveDb("ThreadingRepository live DB", () => {
     );
     expect(untouched.rows[0]).toEqual({ attempts: 0, operations: "0" });
     await expect(repository.listAccountsNeedingWork())
-      .rejects.toThrow(/active.*v2.*no retained executor/i);
+      .rejects.toThrow(/active.*v3.*no retained executor/i);
   });
 
   it("quantifies shadow-run merge disagreements before activation", async () => {
@@ -1377,20 +1784,20 @@ liveDb("ThreadingRepository live DB", () => {
       subject: "Versioned rollout",
       rfcMessageId: "<version-root@example.test>"
     });
-    const v1 = await drainUntilReady(accountId, { batchSize: 1 });
-    await activateReviewed(repository, accountId, v1.runId as string);
+    const v2 = await drainUntilReady(accountId, { batchSize: 1 });
+    await activateReviewed(repository, accountId, v2.runId as string);
 
-    const v2Repository = new ThreadingRepository(pool, {
-      currentAlgorithmVersion: 2,
+    const v3Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 3,
       algorithms: new Map([
-        [1, executorFor(1)],
-        [2, executorFor(2)]
+        [2, executorFor(2)],
+        [3, executorFor(3)]
       ])
     });
-    const v2RunId = await v2Repository.startRebuild(accountId, {
+    const v3RunId = await v3Repository.startRebuild(accountId, {
       batchSize: 1,
-      requestedBy: "v2-worker",
-      reason: "v2 shadow"
+      requestedBy: "v3-worker",
+      reason: "v3 shadow"
     });
 
     const duringBuild = await seedMessage(accountId, {
@@ -1402,14 +1809,14 @@ liveDb("ThreadingRepository live DB", () => {
     });
     await enqueueMessage(accountId, duringBuild);
     for (let pass = 0; pass < 100; pass += 1) {
-      await v2Repository.drainAccount(accountId, { batchSize: 1, requestedBy: "v2-worker" });
-      const status = await v2Repository.getRun(v2RunId);
+      await v3Repository.drainAccount(accountId, { batchSize: 1, requestedBy: "v3-worker" });
+      const status = await v3Repository.getRun(v3RunId);
       if (status.status === "ready") break;
     }
-    expect((await v2Repository.getRun(v2RunId)).status).toBe("ready");
-    expect(await projection(v1.runId as string)).toHaveLength(2);
+    expect((await v3Repository.getRun(v3RunId)).status).toBe("ready");
+    expect(await projection(v2.runId as string)).toHaveLength(2);
 
-    const activation = await activateReviewed(v2Repository, accountId, v2RunId, "v2-worker");
+    const activation = await activateReviewed(v3Repository, accountId, v3RunId, "v3-worker");
     const afterActivation = await seedMessage(accountId, {
       uid: 3,
       subject: "Re: Versioned rollout",
@@ -1418,14 +1825,14 @@ liveDb("ThreadingRepository live DB", () => {
       referencesHeader: "<version-root@example.test> <version-build-reply@example.test>"
     });
     await enqueueMessage(accountId, afterActivation);
-    await drainRepositoryUntilIdle(v2Repository, accountId, { batchSize: 1 });
-    expect(await projection(v1.runId as string)).toHaveLength(3);
-    expect(await projection(v2RunId)).toHaveLength(3);
+    await drainRepositoryUntilIdle(v3Repository, accountId, { batchSize: 1 });
+    expect(await projection(v2.runId as string)).toHaveLength(3);
+    expect(await projection(v3RunId)).toHaveLength(3);
 
-    await v2Repository.rollbackOperation(accountId, activation.operationId as string, "live-test");
+    await v3Repository.rollbackOperation(accountId, activation.operationId as string, "live-test");
     const active = await activeProjection(accountId);
     expect(active).toHaveLength(3);
-    expect(active.every((row) => row.run_id === v1.runId)).toBe(true);
+    expect(active.every((row) => row.run_id === v2.runId)).toBe(true);
   });
 
   it("fails rollout compatibility when a state-referenced run has no retained executor", async () => {
@@ -1435,25 +1842,25 @@ liveDb("ThreadingRepository live DB", () => {
       subject: "Retained executor",
       rfcMessageId: "<retained-executor@example.test>"
     });
-    const v1 = await drainUntilReady(accountId, { batchSize: 1 });
-    await activateReviewed(repository, accountId, v1.runId as string);
+    const v2 = await drainUntilReady(accountId, { batchSize: 1 });
+    await activateReviewed(repository, accountId, v2.runId as string);
 
-    const unsafeV2Repository = new ThreadingRepository(pool, {
-      currentAlgorithmVersion: 2,
-      algorithms: new Map([[2, executorFor(2)]])
+    const unsafeV3Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 3,
+      algorithms: new Map([[3, executorFor(3)]])
     });
-    await expect(unsafeV2Repository.assertRolloutCompatibility())
-      .rejects.toThrow(/active.*v1.*no retained executor/i);
-    await expect(unsafeV2Repository.startRebuild(accountId, { requestedBy: "unsafe-v2-cli" }))
-      .rejects.toThrow(/active.*v1.*no retained executor/i);
-    await expect(unsafeV2Repository.drainAccount(accountId, { requestedBy: "unsafe-v2-cli" }))
-      .rejects.toThrow(/active.*v1.*no retained executor/i);
+    await expect(unsafeV3Repository.assertRolloutCompatibility())
+      .rejects.toThrow(/active.*v2.*no retained executor/i);
+    await expect(unsafeV3Repository.startRebuild(accountId, { requestedBy: "unsafe-v3-cli" }))
+      .rejects.toThrow(/active.*v2.*no retained executor/i);
+    await expect(unsafeV3Repository.drainAccount(accountId, { requestedBy: "unsafe-v3-cli" }))
+      .rejects.toThrow(/active.*v2.*no retained executor/i);
 
-    const safeV2Repository = new ThreadingRepository(pool, {
-      currentAlgorithmVersion: 2,
-      algorithms: new Map([[1, executorFor(1)], [2, executorFor(2)]])
+    const safeV3Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 3,
+      algorithms: new Map([[2, executorFor(2)], [3, executorFor(3)]])
     });
-    await expect(safeV2Repository.assertRolloutCompatibility()).resolves.toBeUndefined();
+    await expect(safeV3Repository.assertRolloutCompatibility()).resolves.toBeUndefined();
   });
 
   it("refuses to let an older binary supersede a newer shadow candidate", async () => {
@@ -1465,13 +1872,13 @@ liveDb("ThreadingRepository live DB", () => {
     });
     const baseline = await drainUntilReady(accountId, { batchSize: 1 });
     await activateReviewed(repository, accountId, baseline.runId as string);
-    const v2Repository = new ThreadingRepository(pool, {
-      currentAlgorithmVersion: 2,
-      algorithms: new Map([[1, executorFor(1)], [2, executorFor(2)]])
+    const v3Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 3,
+      algorithms: new Map([[2, executorFor(2)], [3, executorFor(3)]])
     });
-    const newerRunId = await v2Repository.startRebuild(accountId, { requestedBy: "v2-worker" });
+    const newerRunId = await v3Repository.startRebuild(accountId, { requestedBy: "v3-worker" });
 
-    await expect(repository.startRebuild(accountId, { requestedBy: "old-v1-cli" }))
+    await expect(repository.startRebuild(accountId, { requestedBy: "old-v2-cli" }))
       .rejects.toBeInstanceOf(ThreadingVersionSkewError);
     const candidate = await pool.query<{ status: string; building_run_id: string }>(
       `SELECT run.status, state.building_run_id
