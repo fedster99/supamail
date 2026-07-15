@@ -825,6 +825,9 @@ function baseDeliveryKey(message: ParsedPhysicalMessage): string {
   if (message.messageId) {
     return `delivery:message-id:${sha256(`${message.input.account_id}\u0000${message.messageId}`)}`;
   }
+  if (message.copyFingerprint) {
+    return `delivery:fingerprint:${sha256(`${message.input.account_id}\u0000${message.copyFingerprint}`)}`;
+  }
   const rowIdentity = [
     message.input.account_id,
     message.input.folder_path ?? "",
@@ -859,9 +862,10 @@ function buildDeliveries(messages: ParsedPhysicalMessage[]): Delivery[] {
     baseGroups.set(key, group);
   }
 
-  // Provider message identities are strong enough to collapse directly. A
-  // strict Message-ID is only a copy candidate: when more than one physical row
-  // carries it, require an exact caller-supplied or raw-MIME fingerprint.
+  // Provider message identities collapse directly. A complete exact
+  // fingerprint also identifies copies when no valid Message-ID survives
+  // parsing. A strict Message-ID is only a copy candidate: when more than one
+  // physical row carries it, require an exact parsed or raw-MIME fingerprint.
   // Otherwise suffix each delivery with a deterministic variant key. This
   // prevents broken senders that reuse Message-ID from silently losing mail.
   const groups = new Map<string, ParsedPhysicalMessage[]>();

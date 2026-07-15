@@ -448,6 +448,58 @@ describe("protocol conversation graph", () => {
 });
 
 describe("delivery copies and ambiguous duplicate Message-ID values", () => {
+  it("collapses exact parsed copies when their Message-ID is malformed", () => {
+    const assignments = computeThreadAssignments([
+      message("malformed-copy-inbox", {
+        folder_path: "INBOX",
+        uid: 10,
+        rfc_message_id: "<>",
+        delivery_fingerprint: "same-complete-parsed-message"
+      }),
+      message("malformed-copy-mirror", {
+        folder_path: "INBOX.INBOX",
+        uid: 88,
+        rfc_message_id: "<>",
+        delivery_fingerprint: "same-complete-parsed-message"
+      }),
+      message("malformed-copy-other-account", {
+        account_id: "account-b",
+        rfc_message_id: "<>",
+        delivery_fingerprint: "same-complete-parsed-message"
+      })
+    ]);
+
+    const inbox = byId(assignments, "malformed-copy-inbox");
+    const mirror = byId(assignments, "malformed-copy-mirror");
+    expect(inbox.delivery_key).toBe(mirror.delivery_key);
+    expect(inbox.conversation_id).toBe(mirror.conversation_id);
+    expect(inbox.strict_message_id).toBeNull();
+    expect(inbox.delivery_key)
+      .not.toBe(byId(assignments, "malformed-copy-other-account").delivery_key);
+    expect(inbox.evidence.collapsed_physical_ids).toEqual([
+      "malformed-copy-inbox",
+      "malformed-copy-mirror"
+    ]);
+  });
+
+  it("does not let an exact fingerprint override conflicting valid Message-IDs", () => {
+    const assignments = computeThreadAssignments([
+      message("fingerprint-valid-a", {
+        rfc_message_id: "<valid-a@x>",
+        delivery_fingerprint: "same-complete-parsed-message"
+      }),
+      message("fingerprint-valid-b", {
+        rfc_message_id: "<valid-b@x>",
+        delivery_fingerprint: "same-complete-parsed-message"
+      })
+    ]);
+
+    expect(byId(assignments, "fingerprint-valid-a").delivery_key)
+      .not.toBe(byId(assignments, "fingerprint-valid-b").delivery_key);
+    expect(byId(assignments, "fingerprint-valid-a").conversation_id)
+      .not.toBe(byId(assignments, "fingerprint-valid-b").conversation_id);
+  });
+
   it("keeps persisted derived keys bounded for hostile opaque provider values", () => {
     const opaque = Array.from({ length: 8_000 }, (_, index) => String.fromCharCode(33 + (index % 90))).join("");
     const assignment = byId(computeThreadAssignments([
