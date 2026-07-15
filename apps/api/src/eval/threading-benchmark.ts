@@ -86,6 +86,49 @@ export const THREADING_BENCHMARK: readonly ThreadingBenchmarkCase[] = [
     conversationLabels: { "late-root": "c1", "late-child": "c1" }
   },
   {
+    id: "long_lived_explicit_chain_with_subject_reuse",
+    slice: "long_lived_conversation",
+    messages: [
+      message("long-root", {
+        rfc_message_id: "<long-root@x>",
+        subject: "Quarterly board update",
+        internal_date: "2020-01-01T12:00:00Z"
+      }),
+      message("long-middle", {
+        rfc_message_id: "<long-middle@x>",
+        references_header: "<long-root@x>",
+        subject: "Re: Quarterly board update",
+        from_email: "bob@example.test",
+        to_emails: ["alice@example.test"],
+        internal_date: "2023-01-01T12:00:00Z"
+      }),
+      message("long-latest", {
+        rfc_message_id: "<long-latest@x>",
+        references_header: "<long-root@x> <long-middle@x>",
+        subject: "Decision recorded: expansion approved",
+        internal_date: "2026-01-01T12:00:00Z"
+      }),
+      message("long-reused-subject", {
+        rfc_message_id: "<long-reused-subject@x>",
+        subject: "Quarterly board update",
+        internal_date: "2026-01-02T12:00:00Z"
+      })
+    ],
+    deliveryLabels: {
+      "long-root": "d1",
+      "long-middle": "d2",
+      "long-latest": "d3",
+      "long-reused-subject": "d4"
+    },
+    conversationLabels: {
+      "long-root": "c1",
+      "long-middle": "c1",
+      "long-latest": "c1",
+      "long-reused-subject": "c2"
+    },
+    dangerousFalseMergePairs: [["long-root", "long-reused-subject"]]
+  },
+  {
     id: "forward_is_new_conversation",
     slice: "forward",
     messages: [
