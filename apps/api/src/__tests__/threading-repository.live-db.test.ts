@@ -457,6 +457,153 @@ liveDb("ThreadingRepository live DB", () => {
     expect(Number(after.rows[0]?.count)).toBeLessThanOrEqual(10);
   });
 
+  it("retires singleton subject buckets even when older multi-message work sorts first", async () => {
+    const accountId = await createAccount("singleton-subject-lookahead");
+    let uid = 1;
+    for (let topic = 1; topic <= 5; topic += 1) {
+      await seedMessage(accountId, {
+        uid: uid++,
+        subject: `Queued pair ${topic}`,
+        fromEmail: `sender-${topic}@example.test`,
+        toEmails: [`recipient-${topic}@example.test`],
+        rfcMessageId: `<queued-pair-root-${topic}@example.test>`
+      });
+      await seedMessage(accountId, {
+        uid: uid++,
+        subject: `Re: Queued pair ${topic}`,
+        fromEmail: `recipient-${topic}@example.test`,
+        toEmails: [`sender-${topic}@example.test`],
+        rfcMessageId: `<queued-pair-reply-${topic}@example.test>`
+      });
+    }
+    for (let topic = 1; topic <= 5; topic += 1) {
+      await seedMessage(accountId, {
+        uid: uid++,
+        subject: `Re: Later singleton ${topic}`,
+        fromEmail: `singleton-${topic}@example.test`,
+        toEmails: [`recipient-${topic}@example.test`],
+        rfcMessageId: `<later-singleton-${topic}@example.test>`
+      });
+    }
+
+    let runId: string | null = null;
+    for (let pass = 0; pass < 30; pass += 1) {
+      const result = await repository.drainAccount(accountId, { batchSize: 5, requestedBy: "live-test" });
+      runId = result.runId;
+      if (result.stage === "subject") break;
+    }
+    expect(runId).not.toBeNull();
+
+    await pool.query(
+      `UPDATE public.imap_thread_subject_work work
+          SET enqueued_at = CASE WHEN member_counts.count > 1
+                                 THEN '2026-01-01T00:00:00Z'::timestamptz
+                                 ELSE '2026-01-02T00:00:00Z'::timestamptz END
+         FROM (
+           SELECT subject_key, count(*)::integer AS count
+           FROM public.imap_thread_assignments
+           WHERE run_id = $1
+           GROUP BY subject_key
+         ) member_counts
+        WHERE work.run_id = $1
+          AND work.subject_key = member_counts.subject_key`,
+      [runId]
+    );
+
+    await repository.drainAccount(accountId, { batchSize: 5, requestedBy: "live-test" });
+    const remaining = await pool.query<{ members: number; buckets: string }>(
+      `SELECT member_counts.count AS members, count(*)::text AS buckets
+       FROM public.imap_thread_subject_work work
+       JOIN (
+         SELECT subject_key, count(*)::integer AS count
+         FROM public.imap_thread_assignments
+         WHERE run_id = $1
+         GROUP BY subject_key
+       ) member_counts ON member_counts.subject_key = work.subject_key
+       WHERE work.run_id = $1
+       GROUP BY member_counts.count
+       ORDER BY member_counts.count`,
+      [runId]
+    );
+    expect(remaining.rows).toEqual([{ members: 2, buckets: "5" }]);
+  });
+
+  it("retires multi-message subject buckets with fewer than two eligible deliveries", async () => {
+    const accountId = await createAccount("inert-multi-subject-buckets");
+    const mirroredRaw = Buffer.from("identical mirrored delivery");
+    await seedMessage(accountId, {
+      uid: 1,
+      folder: "Sent",
+      subject: "Re: Mirrored notice",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<mirrored-notice@example.test>",
+      rawMime: mirroredRaw
+    });
+    await seedMessage(accountId, {
+      uid: 2,
+      folder: "INBOX",
+      subject: "Re: Mirrored notice",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<mirrored-notice@example.test>",
+      rawMime: mirroredRaw
+    });
+    await seedMessage(accountId, {
+      uid: 3,
+      subject: "Automated notice",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<automated-notice-root@example.test>"
+    });
+    await seedMessage(accountId, {
+      uid: 4,
+      subject: "Re: Automated notice",
+      fromEmail: "bob@example.test",
+      toEmails: ["alice@example.test"],
+      rfcMessageId: "<automated-notice-reply@example.test>",
+      headersJson: { "auto-submitted": "auto-generated" }
+    });
+    await seedMessage(accountId, {
+      uid: 5,
+      subject: "Actionable notice",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<actionable-notice-root@example.test>"
+    });
+    await seedMessage(accountId, {
+      uid: 6,
+      subject: "Re: Actionable notice",
+      fromEmail: "bob@example.test",
+      toEmails: ["alice@example.test"],
+      rfcMessageId: "<actionable-notice-reply@example.test>"
+    });
+
+    let runId: string | null = null;
+    for (let pass = 0; pass < 30; pass += 1) {
+      const result = await repository.drainAccount(accountId, { batchSize: 5, requestedBy: "live-test" });
+      runId = result.runId;
+      if (result.stage === "subject") break;
+    }
+    expect(runId).not.toBeNull();
+
+    const pruned = await repository.drainAccount(accountId, { batchSize: 5, requestedBy: "live-test" });
+    expect(pruned).toMatchObject({ queueItemsProcessed: 2, assignmentsChanged: 0 });
+    const remaining = await pool.query<{ subject_base: string; eligible_deliveries: string }>(
+      `SELECT min(assignment.subject_base) AS subject_base,
+              count(DISTINCT assignment.delivery_key)
+                FILTER (WHERE assignment.subject_fallback_eligible)::text AS eligible_deliveries
+       FROM public.imap_thread_subject_work work
+       JOIN public.imap_thread_assignments assignment
+         ON assignment.run_id = work.run_id
+        AND assignment.subject_key = work.subject_key
+       WHERE work.run_id = $1
+       GROUP BY work.subject_key`,
+      [runId]
+    );
+    expect(remaining.rows).toEqual([{ subject_base: "actionable notice", eligible_deliveries: "2" }]);
+  });
+
   it("skips an oversized common-subject bucket instead of risking a false merge", async () => {
     const accountId = await createAccount("common-subject-cap");
     await seedMessage(accountId, {
