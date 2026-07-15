@@ -11,6 +11,7 @@ describe("hand-labeled threading release benchmark", () => {
       "normal_reply",
       "missing_parent",
       "late_parent",
+      "long_lived_conversation",
       "forward",
       "malformed_header",
       "alias",
