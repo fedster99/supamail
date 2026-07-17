@@ -4,6 +4,8 @@ import {
   THREADING_ALGORITHM_VERSION,
   computeThreadAssignments,
   computeThreadAssignmentsV1,
+  computeThreadAssignmentsV2,
+  deliveryClosureFingerprints,
   type ThreadingAssignment,
   type ThreadingMessageInput,
   type ThreadingOptions
@@ -94,6 +96,7 @@ interface StoredAssignment {
   parent_delivery_key: string | null;
   reference_ids: string[];
   reference_hashes: string[];
+  delivery_fingerprint_hashes: string[];
   subject_base: string | null;
   subject_key: string | null;
   participant_edge_hashes: string[];
@@ -115,6 +118,7 @@ interface ThreadingCriteria {
   conversationIds: Set<string>;
   deliveryKeys: Set<string>;
   referenceHashes: Set<string>;
+  deliveryFingerprintHashes: Set<string>;
   providerThreadHashes: Set<string>;
 }
 
@@ -134,7 +138,10 @@ function deliveryEvidenceBridgeIds(
   const ids = new Set<string>();
   for (const group of groups.values()) {
     const deliveryKeys = new Set(group.map((assignment) => assignment.delivery_key));
-    if (deliveryKeys.size < 2) continue;
+    const metadataMatchNeedsCorroboration = group.some((assignment) =>
+      assignment.evidence.parse_warnings.includes("delivery_metadata_fingerprint_match")
+    );
+    if (deliveryKeys.size < 2 && !metadataMatchNeedsCorroboration) continue;
     for (const assignment of group) {
       const input = inputsById.get(assignment.physical_message_id);
       if (!input || input.authored_delivery_fingerprint) continue;
@@ -269,7 +276,8 @@ export type ThreadingAlgorithmExecutor = (
  */
 export const PRODUCTION_THREADING_ALGORITHMS: ReadonlyMap<number, ThreadingAlgorithmExecutor> = new Map([
   [1, computeThreadAssignmentsV1],
-  [2, computeThreadAssignments]
+  [2, computeThreadAssignmentsV2],
+  [3, computeThreadAssignments]
 ]);
 
 export interface ThreadingRepositoryOptions {
@@ -411,11 +419,34 @@ function participantEdges(
   return [...edges].sort(compareText);
 }
 
+function deliveryFingerprintHashes(
+  assignment: ThreadingAssignment,
+  inputsById: ReadonlyMap<string, ThreadingMessageInput>,
+  algorithmVersion: number
+): string[] {
+  const input = inputsById.get(assignment.physical_message_id);
+  if (!input) return [];
+  return deliveryClosureFingerprints(input, algorithmVersion)
+    .map((fingerprint) => sha256(`delivery-fingerprint\u0000${fingerprint}`))
+    .sort(compareText);
+}
+
+function addInputCriteria(
+  criteria: ThreadingCriteria,
+  input: ThreadingMessageInput,
+  algorithmVersion: number
+): void {
+  for (const fingerprint of deliveryClosureFingerprints(input, algorithmVersion)) {
+    criteria.deliveryFingerprintHashes.add(sha256(`delivery-fingerprint\u0000${fingerprint}`));
+  }
+}
+
 function emptyCriteria(): ThreadingCriteria {
   return {
     conversationIds: new Set(),
     deliveryKeys: new Set(),
     referenceHashes: new Set(),
+    deliveryFingerprintHashes: new Set(),
     providerThreadHashes: new Set()
   };
 }
@@ -431,6 +462,9 @@ function addStoredCriteria(criteria: ThreadingCriteria, assignment: StoredAssign
   addValue(criteria.referenceHashes, assignment.root_reference_hash);
   addValue(criteria.referenceHashes, assignment.parent_reference_hash);
   for (const reference of assignment.reference_hashes) addValue(criteria.referenceHashes, reference);
+  for (const fingerprint of assignment.delivery_fingerprint_hashes) {
+    addValue(criteria.deliveryFingerprintHashes, fingerprint);
+  }
   addValue(criteria.providerThreadHashes, assignment.provider_thread_hash);
 }
 
@@ -492,6 +526,7 @@ function assignmentRecord(
     reference_hashes: assignment.reference_ids
       .map((reference) => evidenceHash("message-id", reference) as string)
       .sort(compareText),
+    delivery_fingerprint_hashes: deliveryFingerprintHashes(assignment, inputsById, run.algorithm_version),
     subject_base: assignment.subject_base,
     subject_key: subjectKey,
     participant_edge_hashes: participantEdges(assignment, inputsById),
@@ -527,6 +562,7 @@ function snapshot(value: StoredAssignment): Record<string, unknown> {
     parent_delivery_key: value.parent_delivery_key,
     reference_ids: [...value.reference_ids],
     reference_hashes: [...value.reference_hashes],
+    delivery_fingerprint_hashes: [...value.delivery_fingerprint_hashes],
     subject_base: value.subject_base,
     subject_key: value.subject_key,
     participant_edge_hashes: [...value.participant_edge_hashes],
@@ -561,6 +597,7 @@ function restoreSnapshot(value: Record<string, unknown>, generation: string): As
     parent_delivery_key: nullable(value.parent_delivery_key),
     reference_ids: strings(value.reference_ids),
     reference_hashes: strings(value.reference_hashes),
+    delivery_fingerprint_hashes: strings(value.delivery_fingerprint_hashes),
     subject_base: nullable(value.subject_base),
     subject_key: nullable(value.subject_key),
     participant_edge_hashes: strings(value.participant_edge_hashes),
@@ -2510,7 +2547,10 @@ export class ThreadingRepository {
         }
         const inputs = await this.loadInputs(client, toLoad);
         const stored = await this.loadStoredAssignments(client, run.id, toLoad);
-        for (const input of inputs) loadedInputs.set(input.id, input);
+        for (const input of inputs) {
+          loadedInputs.set(input.id, input);
+          addInputCriteria(criteria, input, run.algorithm_version);
+        }
         for (const assignment of stored) loadedStored.set(assignment.message_id, assignment);
       }
       for (const assignment of loadedStored.values()) addStoredCriteria(criteria, assignment);
@@ -2519,7 +2559,8 @@ export class ThreadingRepository {
       }
 
       const criteriaKeyCount = criteria.conversationIds.size + criteria.deliveryKeys.size +
-        criteria.referenceHashes.size + criteria.providerThreadHashes.size;
+        criteria.referenceHashes.size + criteria.deliveryFingerprintHashes.size +
+        criteria.providerThreadHashes.size;
       if (criteriaKeyCount > limits.maxCriteriaKeys) {
         throw new ThreadingEvidenceLimitError("criteria", limits.maxCriteriaKeys);
       }
@@ -2529,7 +2570,7 @@ export class ThreadingRepository {
         SELECT message_id
         FROM public.imap_thread_assignments
         WHERE run_id = $1
-          AND NOT (message_id = ANY($6::uuid[]))
+          AND NOT (message_id = ANY($7::uuid[]))
           AND (
             conversation_id = ANY($2::text[])
             OR delivery_key = ANY($3::text[])
@@ -2538,9 +2579,10 @@ export class ThreadingRepository {
             OR parent_reference_hash = ANY($4::text[])
             OR reference_hashes && $4::text[]
             OR provider_thread_hash = ANY($5::text[])
+            OR delivery_fingerprint_hashes && $6::text[]
           )
         ORDER BY message_id
-        LIMIT $7
+        LIMIT $8
         `,
         [
           run.id,
@@ -2548,6 +2590,7 @@ export class ThreadingRepository {
           [...criteria.deliveryKeys],
           [...criteria.referenceHashes],
           [...criteria.providerThreadHashes],
+          [...criteria.deliveryFingerprintHashes],
           [...ids],
           remaining + 1
         ]
@@ -2631,6 +2674,7 @@ export class ThreadingRepository {
              strict_message_id, strict_message_id_hash, conversation_id,
              root_reference, root_reference_hash, parent_reference, parent_reference_hash,
              parent_delivery_key, reference_ids, reference_hashes,
+             delivery_fingerprint_hashes,
              subject_base, subject_key, participant_edge_hashes,
              provider_thread_key, provider_thread_hash, assignment_method,
              confidence, is_provisional, subject_fallback_eligible,
@@ -2729,7 +2773,8 @@ export class ThreadingRepository {
             strict_message_id text, strict_message_id_hash text, conversation_id text,
             root_reference text, root_reference_hash text,
             parent_reference text, parent_reference_hash text, parent_delivery_key text,
-            reference_ids text[], reference_hashes text[], subject_base text, subject_key text,
+            reference_ids text[], reference_hashes text[], delivery_fingerprint_hashes text[],
+            subject_base text, subject_key text,
             participant_edge_hashes text[], provider_thread_key text, provider_thread_hash text,
             assignment_method text, confidence text, is_provisional boolean,
             subject_fallback_eligible boolean, algorithm_version integer,
@@ -2741,6 +2786,7 @@ export class ThreadingRepository {
           strict_message_id, strict_message_id_hash, conversation_id,
           root_reference, root_reference_hash, parent_reference, parent_reference_hash,
           parent_delivery_key, reference_ids, reference_hashes,
+          delivery_fingerprint_hashes,
           subject_base, subject_key, participant_edge_hashes,
           provider_thread_key, provider_thread_hash, assignment_method,
           confidence, is_provisional, subject_fallback_eligible,
@@ -2750,6 +2796,7 @@ export class ThreadingRepository {
           strict_message_id, strict_message_id_hash, conversation_id,
           root_reference, root_reference_hash, parent_reference, parent_reference_hash,
           parent_delivery_key, reference_ids, reference_hashes,
+          delivery_fingerprint_hashes,
           subject_base, subject_key, participant_edge_hashes,
           provider_thread_key, provider_thread_hash, assignment_method,
           confidence, is_provisional, subject_fallback_eligible,
@@ -2768,6 +2815,7 @@ export class ThreadingRepository {
           parent_delivery_key = EXCLUDED.parent_delivery_key,
           reference_ids = EXCLUDED.reference_ids,
           reference_hashes = EXCLUDED.reference_hashes,
+          delivery_fingerprint_hashes = EXCLUDED.delivery_fingerprint_hashes,
           subject_base = EXCLUDED.subject_base,
           subject_key = EXCLUDED.subject_key,
           participant_edge_hashes = EXCLUDED.participant_edge_hashes,

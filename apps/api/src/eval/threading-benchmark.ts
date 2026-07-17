@@ -145,6 +145,43 @@ export const THREADING_BENCHMARK: readonly ThreadingBenchmarkCase[] = [
     dangerousFalseMergePairs: [["forward-source", "forward-copy"]]
   },
   {
+    id: "forward_with_inherited_headers_starts_a_new_branch",
+    slice: "inherited_forward_headers",
+    messages: [
+      message("inherited-forward-source", {
+        rfc_message_id: "<inherited-forward-source@x>",
+        subject: "Board packet"
+      }),
+      message("inherited-forward-outer", {
+        rfc_message_id: "<inherited-forward-outer@x>",
+        references_header: "<inherited-forward-source@x>",
+        in_reply_to: "<inherited-forward-source@x>",
+        subject: "Fwd: Board packet",
+        from_email: "bob@example.test",
+        to_emails: ["carol@example.test"]
+      }),
+      message("inherited-forward-reply", {
+        rfc_message_id: "<inherited-forward-reply@x>",
+        references_header: "<inherited-forward-source@x> <inherited-forward-outer@x>",
+        in_reply_to: "<inherited-forward-outer@x>",
+        subject: "Re: Fwd: Board packet",
+        from_email: "carol@example.test",
+        to_emails: ["bob@example.test"]
+      })
+    ],
+    deliveryLabels: {
+      "inherited-forward-source": "d1",
+      "inherited-forward-outer": "d2",
+      "inherited-forward-reply": "d3"
+    },
+    conversationLabels: {
+      "inherited-forward-source": "c1",
+      "inherited-forward-outer": "c2",
+      "inherited-forward-reply": "c2"
+    },
+    dangerousFalseMergePairs: [["inherited-forward-source", "inherited-forward-outer"]]
+  },
+  {
     id: "malformed_bare_parent",
     slice: "malformed_header",
     messages: [
@@ -268,6 +305,41 @@ export const THREADING_BENCHMARK: readonly ThreadingBenchmarkCase[] = [
     ],
     deliveryLabels: { "copy-inbox": "d1", "copy-archive": "d1" },
     conversationLabels: { "copy-inbox": "c1", "copy-archive": "c1" }
+  },
+  {
+    id: "exact_metadata_proves_cross_folder_mirror",
+    slice: "exact_metadata_mirror",
+    messages: [
+      message("metadata-inbox", {
+        rfc_message_id: "<metadata-mirror@x>",
+        folder_path: "INBOX"
+      }),
+      message("metadata-mirror", {
+        rfc_message_id: "<metadata-mirror@x>",
+        folder_path: "INBOX.INBOX"
+      })
+    ],
+    deliveryLabels: { "metadata-inbox": "d1", "metadata-mirror": "d1" },
+    conversationLabels: { "metadata-inbox": "c1", "metadata-mirror": "c1" }
+  },
+  {
+    id: "authored_conflict_vetoes_exact_metadata",
+    slice: "metadata_authored_conflict",
+    messages: [
+      message("metadata-conflict-a", {
+        rfc_message_id: "<metadata-conflict@x>",
+        folder_path: "INBOX",
+        authored_delivery_fingerprint: "authored-a"
+      }),
+      message("metadata-conflict-b", {
+        rfc_message_id: "<metadata-conflict@x>",
+        folder_path: "INBOX.INBOX",
+        authored_delivery_fingerprint: "authored-b"
+      })
+    ],
+    deliveryLabels: { "metadata-conflict-a": "d1", "metadata-conflict-b": "d2" },
+    conversationLabels: { "metadata-conflict-a": "c1", "metadata-conflict-b": "c2" },
+    dangerousFalseMergePairs: [["metadata-conflict-a", "metadata-conflict-b"]]
   },
   {
     id: "provider_identity_is_account_scoped",

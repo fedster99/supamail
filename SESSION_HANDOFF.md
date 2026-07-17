@@ -1,5 +1,22 @@
 # Session Handoff
 
+## 2026-07-17 — Threading v3 mirror and forward boundaries
+
+- Algorithm v3 adds a high-precision delivery fallback for measured mirrored
+  mailbox rows: strict Message-ID plus exact timestamp, byte size, subject,
+  sender, and all recipients, with candidates required to occupy distinct
+  folders. Same-folder reuse and conflicting authored digests remain split.
+  Eligible metadata matches request authored
+  corroboration before a shadow run can become ready.
+- A directly prefixed forward now starts a new protocol conversation even when
+  a client inherited reply/provider headers; replies to the forward can form
+  their own branch. Work-item clustering remains the layer for relating the
+  original and forwarded conversations.
+- Migration `0020_threading_fingerprint_closure` persists hashed raw, parsed,
+  authored, and exact-metadata tokens so bounded pages are recomputable and
+  agree with a full-account run. V1 and v2 executors remain registered for
+  active/standby rollback safety.
+
 ## 2026-07-15 — Credential replacement API
 
 - Branch `fedster99/supamail-credential-reconnect` adds authenticated
@@ -89,6 +106,7 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Node runtime is pinned to Node 24 via package engines, `.node-version`, `.nvmrc`, CI, Docker, Fly examples, and the web package.
 - Public mirror migrations now live under `apps/api/supabase/migrations/public/` with a manifest. `pnpm migrate`, CLI migration, and API `/migrate` apply public migrations only.
 - Public migration `0014_conversation_threading` adds provider delivery/thread provenance, complete-MIME copy hashes, thread run/state/assignment projections, a database evidence clock/write-barrier, per-run protocol and subject work, an active view, comparison certificates, operations, and retention-safe history without mailbox-wide DML. The normal worker builds/drains bounded account work after sync passes and prunes old terminal projections; `threads-rebuild` remains shadow, `threads-compare` certifies a specific candidate, confirmed `threads-activate` cuts readers over, and confirmed `threads-rollback` pauses processing pending a clean rebuild.
+- Public migration `0020_threading_fingerprint_closure` adds indexed, namespaced delivery-fingerprint hashes to the replaceable assignment projection. Bounded rebuild pages now close over shared raw/parsed/authored/exact-metadata evidence, preventing page-boundary false splits for mirrored automated messages with conflicting Message-ID evidence. Existing runs remain readable; a new shadow rebuild populates the evidence before comparison and activation.
 - `SUPAMAIL_MODE=worker|api|combined` selects the public core runtime. Docker defaults to the runtime entrypoint, and `combined` is available for the later hosted Fly process.
 - `apps/api/src/target-scheduler.ts` exposes the hosted multi-target scheduler contract: global cap, per-target cap default `1`, paused/stale target skips, failure isolation for async and sync target failures, and shutdown abort skips for work that has not started.
 - Public docs now include hosted cloud contracts and v1 IMAP auth scope. V1 hosted billing is documented as `$5/month` BYO Supabase subscription with a 7-day no-card trial and Stripe customer portal; Managed remains private beta/manual approval.

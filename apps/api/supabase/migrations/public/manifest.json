@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0019_authored_delivery_evidence",
+  "schemaVersion": "0020_threading_fingerprint_closure",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -76,6 +76,10 @@
     {
       "id": "0019_authored_delivery_evidence",
       "file": "0019_authored_delivery_evidence.sql"
+    },
+    {
+      "id": "0020_threading_fingerprint_closure",
+      "file": "0020_threading_fingerprint_closure.sql"
     }
   ]
 }

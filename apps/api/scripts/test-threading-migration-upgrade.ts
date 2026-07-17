@@ -19,6 +19,12 @@ const manifest = JSON.parse(
 ) as Manifest;
 const threadingIndex = manifest.migrations.findIndex((migration) => migration.id === "0014_conversation_threading");
 if (threadingIndex < 1) throw new Error("0014_conversation_threading must follow the legacy schema");
+const fingerprintClosureIndex = manifest.migrations.findIndex(
+  (migration) => migration.id === "0020_threading_fingerprint_closure"
+);
+if (fingerprintClosureIndex <= threadingIndex) {
+  throw new Error("0020_threading_fingerprint_closure must follow the threading schema");
+}
 
 const databaseName = `sm_thread_upgrade_${process.pid}_${randomUUID().slice(0, 8)}`.replace(/-/g, "_");
 const quotedDatabaseName = `"${databaseName}"`;
@@ -77,6 +83,37 @@ try {
     const threadingMigration = manifest.migrations[threadingIndex];
     await applyFiles([threadingMigration]);
     await applyFiles([threadingMigration]);
+    await applyFiles(manifest.migrations.slice(threadingIndex + 1, fingerprintClosureIndex));
+
+    const run = await target.query<{ id: string }>(
+      `INSERT INTO public.imap_thread_runs (
+         account_id, algorithm_version, mode, status, stage, requested_by, reason
+       ) VALUES ($1, 2, 'initial', 'building', 'strong', 'migration-test', 'pre-0020 fixture')
+       RETURNING id`,
+      [account.rows[0].id]
+    );
+    await target.query(
+      `INSERT INTO public.imap_thread_assignments (
+         run_id, message_id, account_id, delivery_key, conversation_id,
+         assignment_method, confidence, algorithm_version, input_hash, generation
+       )
+       SELECT $1, id, account_id, $2, $3,
+              'standalone', 'high', 2, $4, 1
+       FROM public.imap_messages
+       WHERE account_id = $5
+       ORDER BY id
+       LIMIT 1`,
+      [
+        run.rows[0].id,
+        "a".repeat(64),
+        `thread_${"b".repeat(32)}`,
+        "c".repeat(64),
+        account.rows[0].id
+      ]
+    );
+    const fingerprintClosureMigration = manifest.migrations[fingerprintClosureIndex];
+    await applyFiles([fingerprintClosureMigration]);
+    await applyFiles([fingerprintClosureMigration]);
     const elapsedMs = Math.round(performance.now() - startedAt);
 
     const result = await target.query<{
@@ -87,6 +124,9 @@ try {
       provider_values: string;
       body_hashes: string;
       invalid_constraints: string;
+      assignments: string;
+      empty_fingerprint_arrays: string;
+      fingerprint_constraint_not_valid: string;
     }>(
       `SELECT
          (SELECT count(*)::text FROM public.imap_messages WHERE account_id = $1) AS messages,
@@ -108,18 +148,30 @@ try {
             'imap_messages_provider_message_identity_check',
             'imap_messages_provider_thread_namespace_check',
             'imap_message_bodies_raw_mime_sha256_check'
-          ) AND convalidated) AS invalid_constraints`,
-      [account.rows[0].id]
+          ) AND convalidated) AS invalid_constraints,
+         (SELECT count(*)::text FROM public.imap_thread_assignments
+          WHERE run_id = $2) AS assignments,
+         (SELECT count(*)::text FROM public.imap_thread_assignments
+          WHERE run_id = $2 AND cardinality(delivery_fingerprint_hashes) = 0)
+          AS empty_fingerprint_arrays,
+         (SELECT count(*)::text FROM pg_constraint
+          WHERE conrelid = 'public.imap_thread_assignments'::regclass
+            AND conname = 'imap_thread_assignments_delivery_fingerprint_hashes_check'
+            AND NOT convalidated) AS fingerprint_constraint_not_valid`,
+      [account.rows[0].id, run.rows[0].id]
     );
     const observed = result.rows[0];
     const expected = {
       messages: "5000",
       bodies: "5000",
       states: "0",
-      runs: "0",
+      runs: "1",
       provider_values: "0",
       body_hashes: "0",
-      invalid_constraints: "0"
+      invalid_constraints: "0",
+      assignments: "1",
+      empty_fingerprint_arrays: "1",
+      fingerprint_constraint_not_valid: "1"
     };
     if (JSON.stringify(observed) !== JSON.stringify(expected)) {
       throw new Error(`Populated threading migration changed legacy data: ${JSON.stringify(observed)}`);

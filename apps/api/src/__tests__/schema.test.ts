@@ -36,6 +36,10 @@ const authoredDeliveryEvidenceMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0019_authored_delivery_evidence.sql"
 );
+const threadingFingerprintClosureMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0020_threading_fingerprint_closure.sql"
+);
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -115,9 +119,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0019_authored_delivery_evidence");
+    expect(version).toBe("0020_threading_fingerprint_closure");
     expect(manifest).toEqual({
-      schemaVersion: "0019_authored_delivery_evidence",
+      schemaVersion: "0020_threading_fingerprint_closure",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -137,7 +141,8 @@ describe("initial schema", () => {
         { id: "0016_message_evidence", file: "0016_message_evidence.sql" },
         { id: "0017_threading_body_backfill_index", file: "0017_threading_body_backfill_index.sql" },
         { id: "0018_threading_body_fallback_index", file: "0018_threading_body_fallback_index.sql" },
-        { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" }
+        { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" },
+        { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -164,6 +169,16 @@ describe("initial schema", () => {
     expect(sql).toContain("imap_message_bodies_thread_digest_backfill_idx");
     expect(sql).toContain("imap_message_bodies_thread_digest_fallback_idx");
     expect(sql).toContain("authored_delivery_sha256 text");
+    expect(sql).toContain("delivery_fingerprint_hashes text[]");
+  });
+
+  it("indexes delivery fingerprints for bounded threading closure", async () => {
+    const sql = await readFile(threadingFingerprintClosureMigrationPath, "utf8");
+
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS delivery_fingerprint_hashes text[]");
+    expect(sql).toContain("imap_thread_assignments_delivery_fingerprints_gin_idx");
+    expect(sql).toContain("USING gin (run_id, delivery_fingerprint_hashes)");
+    expect(sql).toContain("imap_thread_assignments_delivery_fingerprint_hashes_check");
   });
 
   it("keeps sparse legacy body-digest repair on a bounded partial index", async () => {
