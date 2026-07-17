@@ -68,8 +68,24 @@ includes the original Message-ID and Date, envelope, stable MIME headers, every
 parsed body variant, MIME structure, parser warnings, and the complete structured
 evidence digest (including decoded attachment identities). This safely collapses
 transport-mutated and raw/parsed-only mirrors while still splitting reused
-Message-IDs whose authored representations differ. The v1 executor remains
-registered for active and rollback projections.
+Message-IDs whose authored representations differ. The v1 and v2 executors
+remain registered for active and rollback projections.
+
+Algorithm v3 retains those rules and adds an exact-metadata mirror fallback.
+Same-Message-ID candidates collapse only when timestamp, byte size, normalized
+subject, sender, and all recipient fields match exactly and the components occupy
+distinct mailbox folders. A repeated candidate in one folder or more than one
+authored digest vetoes the fallback. Raw/full-parsed digest disagreement is not
+negative evidence because transport and storage representations can differ. A
+metadata match queues eligible authored corroboration before a shadow run
+becomes ready. This targets measured duplicate
+`INBOX`/`INBOX.INBOX` rows without weakening the reused-ID fail-closed rule.
+
+V3 also treats a directly prefixed forward as a new authored protocol
+conversation. Inherited `References`, `In-Reply-To`, and provider-thread evidence
+do not attach it to the original, while a later reply may attach to the forwarded
+outer message. The original and forwarded branches may still share a future
+work-item cluster; that broader relation is not protocol conversation truth.
 
 V2 queues every eligible row only after the same strict Message-ID has produced
 different delivery candidates. The next bounded preflight derives at most the
@@ -178,6 +194,11 @@ unrelated mail.
   tables. Existing mirrors backfill through bounded shadow runs.
 - Strict parsing and narrow fallback prefer false splits over dangerous false
   merges. Algorithm improvements require a version bump and deterministic rebuild.
+- Bounded rebuilds persist each physical row's bounded, namespaced delivery
+  fingerprint hashes and iteratively close over their indexed overlap. This is execution
+  completeness, not a new threading heuristic: it makes a paginated build agree
+  with the same algorithm run over the full account, including exact-metadata
+  mirror candidates that cross a page boundary.
 - Soft-deleted rows remain graph evidence. Before hard retention deletes a row,
   the purge path queues every surviving conversation neighbor and weak-subject
   bucket across every live run; oversized fan-out is retained rather than
@@ -192,10 +213,13 @@ unrelated mail.
 
 - Pure algorithm tests cover transitive chains from every seed, missing and late
   parents, malformed/conflicting headers, cycles, provider hints, duplicate
-  copies, forwards, automated mail, and subject reuse.
+  copies, forwards, automated mail, subject reuse, and the authored-conflict and
+  same-folder vetoes for exact-metadata evidence.
 - Live PostgreSQL tests cover bounded multi-batch shadow activation, incremental
   orphan repair, late subject roots, weak-merge invalidation, row/evidence caps,
-  complete MIME copy evidence, multi-version executor routing, persisted weighted
+  complete MIME copy evidence, authored corroboration that reverses a provisional
+  metadata merge, forward boundaries with replies, overlapping delivery
+  fingerprints across a one-message page boundary, retained v1/v2 executor routing, persisted weighted
   active/candidate/standby fairness and missing-executor startup/direct-path guards,
   persisted comparison drift, an in-flight legacy-writer activation barrier,
   activation and incremental rollback, purge invalidation, run retention,
@@ -219,3 +243,4 @@ unrelated mail.
 - JWZ message threading algorithm.
 - `apps/api/src/threading.ts`
 - `apps/api/supabase/migrations/public/0014_conversation_threading.sql`
+- `apps/api/supabase/migrations/public/0020_threading_fingerprint_closure.sql`
