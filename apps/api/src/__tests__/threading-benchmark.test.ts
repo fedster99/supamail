@@ -13,6 +13,7 @@ describe("hand-labeled threading release benchmark", () => {
       "late_parent",
       "long_lived_conversation",
       "forward",
+      "inherited_forward_headers",
       "malformed_header",
       "alias",
       "automated_reminder",
@@ -22,6 +23,8 @@ describe("hand-labeled threading release benchmark", () => {
       "verified_copy_reply_header_conflict",
       "dangerous_duplicate_message_id",
       "delivery_copy",
+      "exact_metadata_mirror",
+      "metadata_authored_conflict",
       "provider_identity",
       "synthetic_rain_style_regression"
     ]) {
@@ -29,7 +32,7 @@ describe("hand-labeled threading release benchmark", () => {
     }
   });
 
-  it("meets the v1 precision/recall gate with zero dangerous false merges", () => {
+  it("meets the release precision/recall gate with zero dangerous false merges", () => {
     const result = evaluateThreadingBenchmark();
 
     expect(result.cases).toBeGreaterThanOrEqual(14);

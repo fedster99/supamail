@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
  * used by incremental processing and deterministic backfills.
  */
 
-export const THREADING_ALGORITHM_VERSION = 2 as const;
+export const THREADING_ALGORITHM_VERSION = 3 as const;
 
 type HeaderValue = string | readonly string[] | null | undefined;
 
@@ -135,6 +135,7 @@ interface ParsedPhysicalMessage {
   providerThreadKey: string | null;
   copyFingerprint: string | null;
   copyFingerprints: string[];
+  metadataFingerprint: string | null;
   timestamp: number | null;
   subject: ParsedSubject;
   rawSubject: string | null;
@@ -634,14 +635,17 @@ function parseTimestamp(value: Date | string | number | null | undefined): numbe
   return null;
 }
 
-function parseSubject(value: string | null | undefined): ParsedSubject {
+function parseSubject(value: string | null | undefined, policyVersion: 1 | 2 | 3): ParsedSubject {
   let subject = value?.normalize("NFKC").replace(/\s+/g, " ").trim() ?? "";
   if (!subject) return { base: null, isReply: false, isForward: false };
 
   const boundedBase = (candidate: string): string | null =>
     Buffer.byteLength(candidate, "utf8") <= MAX_SUBJECT_BASE_BYTES ? candidate : null;
 
-  const directForward = /^(?:\[[^\]]{1,80}\]\s*)?(?:fw|fwd)\s*:/i.test(subject) ||
+  const forwardPrefix = policyVersion >= 3
+    ? /^(?:\[[^\]]{1,80}\]\s*)?(?:fw|fwd|wg|tr|rv|enc|转发|轉寄|転送)\s*:/i
+    : /^(?:\[[^\]]{1,80}\]\s*)?(?:fw|fwd)\s*:/i;
+  const directForward = forwardPrefix.test(subject) ||
     /^\[fwd:/i.test(subject) || /\(fwd\)\s*$/i.test(subject);
   if (directForward) {
     return { base: boundedBase(subject.toLocaleLowerCase("en-US")), isReply: false, isForward: true };
@@ -655,13 +659,23 @@ function parseSubject(value: string | null | undefined): ParsedSubject {
     subject = subject.slice(match[0].length).trim();
   }
 
-  const forwardedAfterReply = /^(?:\[[^\]]{1,80}\]\s*)?(?:fw|fwd)\s*:/i.test(subject) ||
+  const forwardedAfterReply = forwardPrefix.test(subject) ||
     /^\[fwd:/i.test(subject) || /\(fwd\)\s*$/i.test(subject);
   const normalizedBase = subject ? subject.toLocaleLowerCase("en-US") : null;
+  if (policyVersion <= 2) {
+    return {
+      base: normalizedBase ? boundedBase(normalizedBase) : null,
+      isReply: isReply && !forwardedAfterReply,
+      isForward: forwardedAfterReply
+    };
+  }
   return {
     base: normalizedBase ? boundedBase(normalizedBase) : null,
-    isReply: isReply && !forwardedAfterReply,
-    isForward: forwardedAfterReply
+    // "Re: Fwd: ..." is a reply to a new forwarded outer message, not a
+    // second forward action. Keeping it reply-shaped lets that new branch form
+    // its own conversation while the direct "Fwd:" root remains isolated.
+    isReply,
+    isForward: forwardedAfterReply && !isReply
   };
 }
 
@@ -721,7 +735,50 @@ function physicalCopyFingerprints(input: ThreadingMessageInput): string[] {
   return [...new Set(fingerprints)];
 }
 
-function parsePhysicalMessage(input: ThreadingMessageInput): ParsedPhysicalMessage {
+function canonicalNonnegativeInteger(value: string | number | bigint | null | undefined): string | null {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  try {
+    const integer = BigInt(value);
+    return integer >= 0n ? integer.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizedMailboxList(values: readonly string[] | null | undefined): string[] {
+  return (values ?? [])
+    .map(normalizeEmail)
+    .filter((value): value is string => Boolean(value))
+    .sort(binaryCompare);
+}
+
+function exactMetadataFingerprint(
+  input: ThreadingMessageInput,
+  messageId: string | null,
+  timestamp: number | null,
+  fromEmail: string | null
+): string | null {
+  const sizeBytes = canonicalNonnegativeInteger(input.size_bytes);
+  const subject = input.subject?.normalize("NFKC").replace(/\s+/g, " ").trim() ?? "";
+  const to = normalizedMailboxList(input.to_emails);
+  const cc = normalizedMailboxList(input.cc_emails);
+  const bcc = normalizedMailboxList(input.bcc_emails);
+  if (!messageId || timestamp === null || sizeBytes === null || !subject || !fromEmail ||
+      to.length + cc.length + bcc.length === 0) return null;
+  return `metadata:${sha256(stableStringify({
+    account_id: input.account_id,
+    message_id: messageId,
+    internal_date_ms: timestamp,
+    size_bytes: sizeBytes,
+    subject,
+    from_email: fromEmail,
+    to_emails: to,
+    cc_emails: cc,
+    bcc_emails: bcc
+  }))}`;
+}
+
+function parsePhysicalMessage(input: ThreadingMessageInput, policyVersion: 1 | 2 | 3): ParsedPhysicalMessage {
   const warnings = new Set<string>();
   const messageIdScan = reconcileHeaderTokenSources(
     input,
@@ -800,8 +857,13 @@ function parsePhysicalMessage(input: ThreadingMessageInput): ParsedPhysicalMessa
   }
 
   const timestamp = parseTimestamp(input.internal_date);
-  const parsedSubject = parseSubject(input.subject);
+  const parsedSubject = parseSubject(input.subject, policyVersion);
   const fromEmail = normalizeEmail(input.from_email);
+  if (policyVersion >= 3 && parsedSubject.isForward && referenceIds.length > 0) {
+    warnings.add("forward_reply_headers_not_conversation_edge");
+    referenceIds = [];
+    referenceSource = null;
+  }
 
   return {
     input,
@@ -821,6 +883,9 @@ function parsePhysicalMessage(input: ThreadingMessageInput): ParsedPhysicalMessa
     ),
     copyFingerprint: physicalCopyFingerprint(input),
     copyFingerprints: physicalCopyFingerprints(input),
+    metadataFingerprint: policyVersion >= 3
+      ? exactMetadataFingerprint(input, messageId, timestamp, fromEmail)
+      : null,
     timestamp,
     subject: parsedSubject,
     rawSubject: input.subject?.trim() || null,
@@ -830,6 +895,21 @@ function parsePhysicalMessage(input: ThreadingMessageInput): ParsedPhysicalMessa
     weakSubjectBlocked: malformedReplyHeaders,
     warnings: [...warnings].sort()
   };
+}
+
+/** Fixed-size evidence tokens used to close a bounded repository rebuild. */
+export function deliveryClosureFingerprints(
+  input: ThreadingMessageInput,
+  algorithmVersion: number = THREADING_ALGORITHM_VERSION
+): string[] {
+  if (algorithmVersion <= 1) {
+    const legacy = physicalCopyFingerprint(input);
+    return legacy ? [legacy] : [];
+  }
+  const parsed = parsePhysicalMessage(input, algorithmVersion >= 3 ? 3 : 2);
+  return parsed.metadataFingerprint
+    ? [...parsed.copyFingerprints, parsed.metadataFingerprint]
+    : [...parsed.copyFingerprints];
 }
 
 function baseDeliveryKey(message: ParsedPhysicalMessage): string {
@@ -951,13 +1031,202 @@ function sharedFingerprintComponents(messages: ParsedPhysicalMessage[]): ParsedP
   return [...components.values()].sort((left, right) => binaryCompare(left[0].stableKey, right[0].stableKey));
 }
 
-function componentFingerprintKey(messages: ParsedPhysicalMessage[]): string {
+function authoredFingerprint(message: ParsedPhysicalMessage): string | null {
+  return message.copyFingerprints.find((fingerprint) => fingerprint.startsWith("authored:")) ?? null;
+}
+
+function conflictAwareDeliveryComponents(messages: ParsedPhysicalMessage[]): ParsedPhysicalMessage[][] {
+  const ordered = [...messages].sort((left, right) => binaryCompare(left.stableKey, right.stableKey));
+  const parents = ordered.map((_, index) => index);
+  const componentSizes = ordered.map(() => 1);
+  const authored = ordered.map((message) => {
+    const value = authoredFingerprint(message);
+    return value ? new Set([value]) : new Set<string>();
+  });
+  const folders = ordered.map((message) => {
+    const value = message.input.folder_path?.trim();
+    return value ? new Set([value]) : new Set<string>();
+  });
+  const find = (index: number): number => {
+    let root = index;
+    while (parents[root] !== root) root = parents[root];
+    while (parents[index] !== index) {
+      const next = parents[index];
+      parents[index] = root;
+      index = next;
+    }
+    return root;
+  };
+  const union = (left: number, right: number): boolean => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot === rightRoot) return true;
+    const combinedAuthored = new Set([...authored[leftRoot], ...authored[rightRoot]]);
+    if (combinedAuthored.size > 1) return false;
+    const root = componentSizes[leftRoot] > componentSizes[rightRoot]
+      ? leftRoot
+      : componentSizes[rightRoot] > componentSizes[leftRoot]
+        ? rightRoot
+        : Math.min(leftRoot, rightRoot);
+    const child = root === leftRoot ? rightRoot : leftRoot;
+    parents[child] = root;
+    componentSizes[root] += componentSizes[child];
+    authored[root] = combinedAuthored;
+    for (const folder of folders[child]) folders[root].add(folder);
+    return true;
+  };
+
+  const fingerprintGroups = new Map<string, number[]>();
+  ordered.forEach((message, index) => {
+    for (const fingerprint of message.copyFingerprints) {
+      const group = fingerprintGroups.get(fingerprint) ?? [];
+      group.push(index);
+      fingerprintGroups.set(fingerprint, group);
+    }
+  });
+
+  // First join identical body evidence only within the same authored digest
+  // (or while every row lacks one). A missing authored digest may attach later,
+  // but it must never bridge two contradictory complete authored digests.
+  for (const indices of fingerprintGroups.values()) {
+    const buckets = new Map<string, number[]>();
+    for (const index of indices) {
+      const key = authoredFingerprint(ordered[index]) ?? "";
+      const bucket = buckets.get(key) ?? [];
+      bucket.push(index);
+      buckets.set(key, bucket);
+    }
+    for (const bucket of buckets.values()) {
+      for (let index = 1; index < bucket.length; index += 1) union(bucket[0], bucket[index]);
+    }
+  }
+
+  const authoredNeighbors = new Map<number, Map<string, number>>();
+  for (const indices of fingerprintGroups.values()) {
+    const roots = [...new Set(indices.map(find))];
+    const authoredRoots = new Map<string, number>();
+    for (const root of roots) {
+      const value = [...authored[root]][0];
+      if (value && !authoredRoots.has(value)) authoredRoots.set(value, root);
+    }
+    for (const root of roots.filter((candidate) => authored[candidate].size === 0)) {
+      const neighbors = authoredNeighbors.get(root) ?? new Map<string, number>();
+      // One witness proves compatibility; two distinct authored values prove a
+      // conflict. Retaining any more would turn a hostile collision family
+      // into quadratic memory and work without changing the decision.
+      for (const [value, authoredRoot] of authoredRoots) {
+        if (!neighbors.has(value)) neighbors.set(value, authoredRoot);
+        if (neighbors.size >= 2) break;
+      }
+      authoredNeighbors.set(root, neighbors);
+    }
+  }
+  const authoredConflictRoots = new Set<number>();
+  for (const [unresolvedRoot, neighborRoots] of authoredNeighbors) {
+    const root = find(unresolvedRoot);
+    if (authored[root].size > 0) continue;
+    const neighbors = [...new Set([...neighborRoots.values()].map(find))]
+      .filter((neighbor) => authored[neighbor].size === 1)
+      .sort((left, right) => left - right);
+    const authoredValues = new Set(neighbors.flatMap((neighbor) => [...authored[neighbor]]));
+    if (authoredValues.size === 1 && neighbors.length > 0) union(root, neighbors[0]);
+    else if (authoredValues.size > 1) authoredConflictRoots.add(root);
+  }
+  for (let index = 0; index < ordered.length; index += 1) {
+    if (authoredConflictRoots.has(find(index))) {
+      ordered[index].warnings.push("delivery_authored_fingerprint_conflict");
+    }
+  }
+
+  const metadataGroups = new Map<string, number[]>();
+  ordered.forEach((message, index) => {
+    if (!message.metadataFingerprint) return;
+    const group = metadataGroups.get(message.metadataFingerprint) ?? [];
+    group.push(index);
+    metadataGroups.set(message.metadataFingerprint, group);
+  });
+  for (const indices of metadataGroups.values()) {
+    const roots = [...new Set(indices.map(find))];
+    const authoredValues = new Set(roots.flatMap((root) => [...authored[find(root)]]));
+    const inheritedAuthoredConflict = roots.some((root) => authoredConflictRoots.has(find(root)));
+    const foldersSeen = new Set<string>();
+    const distinctMailboxCopies = roots.every((root) => {
+      const componentFolders = folders[find(root)];
+      if (componentFolders.size === 0) return false;
+      for (const folder of componentFolders) {
+        if (foldersSeen.has(folder)) return false;
+        foldersSeen.add(folder);
+      }
+      return true;
+    });
+    if (authoredValues.size <= 1 && !inheritedAuthoredConflict && distinctMailboxCopies) {
+      if (roots.length > 1) {
+        for (const index of indices) {
+          ordered[index].warnings.push("delivery_metadata_fingerprint_match");
+        }
+      }
+      for (let index = 1; index < roots.length; index += 1) union(roots[0], roots[index]);
+      continue;
+    }
+    if (!distinctMailboxCopies) {
+      for (const index of indices) {
+        ordered[index].warnings.push("delivery_metadata_same_folder_ignored");
+      }
+      continue;
+    }
+    if (inheritedAuthoredConflict) {
+      for (const index of indices) {
+        ordered[index].warnings.push("delivery_metadata_collision_authored_conflict");
+      }
+      continue;
+    }
+    for (const index of indices) {
+      ordered[index].warnings.push("delivery_metadata_collision_authored_conflict");
+    }
+    const buckets = new Map<string, number[]>();
+    for (const root of roots) {
+      const resolved = find(root);
+      const key = [...authored[resolved]][0] ?? "";
+      const bucket = buckets.get(key) ?? [];
+      bucket.push(resolved);
+      buckets.set(key, bucket);
+    }
+    for (const bucket of buckets.values()) {
+      for (let index = 1; index < bucket.length; index += 1) union(bucket[0], bucket[index]);
+    }
+  }
+
+  const components = new Map<number, ParsedPhysicalMessage[]>();
+  ordered.forEach((message, index) => {
+    const root = find(index);
+    const component = components.get(root) ?? [];
+    component.push(message);
+    components.set(root, component);
+  });
+  return [...components.values()].sort((left, right) => binaryCompare(left[0].stableKey, right[0].stableKey));
+}
+
+function componentFingerprintKey(messages: ParsedPhysicalMessage[], useMetadataFallback = false): string {
   const fingerprints = [...new Set(messages.flatMap((message) => message.copyFingerprints))].sort();
+  if (useMetadataFallback && messages.length > 1) {
+    const commonFingerprints = messages[0].copyFingerprints.filter((fingerprint) =>
+      messages.every((message) => message.copyFingerprints.includes(fingerprint))
+    );
+    const metadata = [...new Set(messages.flatMap((message) =>
+      message.metadataFingerprint ? [message.metadataFingerprint] : []
+    ))];
+    if (commonFingerprints.length === 0 && metadata.length === 1) {
+      return `metadata-fingerprint:${metadata[0]}`;
+    }
+  }
   if (fingerprints.length > 0) return `fingerprints:${fingerprints.join("\u0000")}`;
   return `physical:${messages[0].stableKey}`;
 }
 
-function buildSharedEvidenceDeliveryGroups(messages: ParsedPhysicalMessage[]): Map<string, ParsedPhysicalMessage[]> {
+function buildSharedEvidenceDeliveryGroups(
+  messages: ParsedPhysicalMessage[],
+  groupingVersion: 2 | 3
+): Map<string, ParsedPhysicalMessage[]> {
   const groups = new Map<string, ParsedPhysicalMessage[]>();
   const providerGroups = new Map<string, ParsedPhysicalMessage[]>();
   const messageIdGroups = new Map<string, ParsedPhysicalMessage[]>();
@@ -983,13 +1252,15 @@ function buildSharedEvidenceDeliveryGroups(messages: ParsedPhysicalMessage[]): M
 
   for (const [key, group] of providerGroups) groups.set(key, group);
   for (const [baseKey, candidates] of messageIdGroups) {
-    const components = sharedFingerprintComponents(candidates);
+    const components = groupingVersion >= 3
+      ? conflictAwareDeliveryComponents(candidates)
+      : sharedFingerprintComponents(candidates);
     if (components.length === 1) {
       groups.set(baseKey, components[0]);
       continue;
     }
     for (const component of components) {
-      const variant = componentFingerprintKey(component);
+      const variant = componentFingerprintKey(component, groupingVersion >= 3);
       groups.set(`delivery:variant:${sha256(`${baseKey}\u0000${variant}`)}`, component);
     }
   }
@@ -1004,11 +1275,11 @@ function buildSharedEvidenceDeliveryGroups(messages: ParsedPhysicalMessage[]): M
 
 function buildDeliveries(
   messages: ParsedPhysicalMessage[],
-  groupingVersion: 1 | 2
+  groupingVersion: 1 | 2 | 3
 ): Delivery[] {
   const groups = groupingVersion === 1
     ? buildLegacyDeliveryGroups(messages)
-    : buildSharedEvidenceDeliveryGroups(messages);
+    : buildSharedEvidenceDeliveryGroups(messages, groupingVersion);
 
   const deliveries: Delivery[] = [];
   for (const [key, unsorted] of groups) {
@@ -1167,11 +1438,11 @@ function threadAccount(
   inputs: ThreadingMessageInput[],
   options: Required<ThreadingOptions>,
   algorithmVersion: number,
-  groupingVersion: 1 | 2
+  groupingVersion: 1 | 2 | 3
 ): ThreadingAssignment[] {
   const accountId = inputs[0]?.account_id;
   if (!accountId) return [];
-  const parsed = inputs.map(parsePhysicalMessage);
+  const parsed = inputs.map((input) => parsePhysicalMessage(input, groupingVersion));
   const deliveries = buildDeliveries(parsed, groupingVersion);
 
   const tokenOwners = new Map<string, Delivery[]>();
@@ -1253,12 +1524,23 @@ function threadAccount(
     const rightDate = right.timestamp ?? Number.MAX_SAFE_INTEGER;
     return leftDate - rightDate || binaryCompare(left.key, right.key);
   });
+  const forwardBoundaryNodeKeys = groupingVersion >= 3
+    ? new Set(deliveries.filter((delivery) => delivery.subject.isForward)
+      .map((delivery) => delivery.nodeKey))
+    : new Set<string>();
 
   for (const delivery of orderedDeliveries) {
     let prior: GraphNode | null = null;
     for (const token of delivery.referenceIds) {
       const current = referenceNode(token, delivery);
-      if (prior && !current.parent && !attach(prior, current, false)) {
+      const crossesForwardBoundary = groupingVersion >= 3 && forwardBoundaryNodeKeys.has(current.key);
+      if (prior && crossesForwardBoundary) {
+        delivery.warnings = [...new Set([
+          ...delivery.warnings,
+          "forward_ancestry_not_conversation_edge"
+        ])].sort();
+      }
+      if (prior && !current.parent && !crossesForwardBoundary && !attach(prior, current, false)) {
         delivery.warnings = [...new Set([...delivery.warnings, "reference_cycle_ignored"])].sort();
       }
       prior = current;
@@ -1289,13 +1571,30 @@ function threadAccount(
   }
   const providerConnected = new Set<string>();
   const providerGroupSize = new Map<string, number>();
+  const forwardBoundaryComponents = groupingVersion >= 3
+    ? new Set(deliveries.filter((delivery) => delivery.subject.isForward)
+      .map((delivery) => sets.find(delivery.nodeKey)))
+    : new Set<string>();
   for (const group of providerGroups.values()) {
     const members = [...new Map(group.map((delivery) => [delivery.key, delivery])).values()]
       .sort((left, right) => binaryCompare(left.key, right.key));
-    for (const member of members) providerGroupSize.set(member.key, members.length);
-    if (members.length <= 1) continue;
+    const eligible = groupingVersion >= 3
+      ? members.filter((member) => !forwardBoundaryComponents.has(sets.find(member.nodeKey)))
+      : members;
+    const eligibleKeys = new Set(eligible.map((member) => member.key));
     for (const member of members) {
-      sets.union(members[0].nodeKey, member.nodeKey);
+      const included = eligibleKeys.has(member.key);
+      providerGroupSize.set(member.key, included ? eligible.length : 1);
+      if (!included) {
+        member.warnings = [...new Set([
+          ...member.warnings,
+          "forward_provider_thread_not_conversation_edge"
+        ])].sort();
+      }
+    }
+    if (eligible.length <= 1) continue;
+    for (const member of eligible) {
+      sets.union(eligible[0].nodeKey, member.nodeKey);
       providerConnected.add(member.key);
     }
   }
@@ -1520,7 +1819,7 @@ function computeThreadAssignmentsForVersion(
   messages: readonly ThreadingMessageInput[],
   options: ThreadingOptions,
   algorithmVersion: number,
-  groupingVersion: 1 | 2
+  groupingVersion: 1 | 2 | 3
 ): ThreadingAssignment[] {
   const physicalIds = new Set<string>();
   const accounts = new Map<string, ThreadingMessageInput[]>();
@@ -1554,6 +1853,14 @@ export function computeThreadAssignmentsV1(
   options: ThreadingOptions = {}
 ): ThreadingAssignment[] {
   return computeThreadAssignmentsForVersion(messages, options, 1, 1);
+}
+
+/** Retained verbatim v2 behavior for active, standby, and rollback runs. */
+export function computeThreadAssignmentsV2(
+  messages: readonly ThreadingMessageInput[],
+  options: ThreadingOptions = {}
+): ThreadingAssignment[] {
+  return computeThreadAssignmentsForVersion(messages, options, 2, 2);
 }
 
 /** Build deterministic assignments for any number of accounts. */

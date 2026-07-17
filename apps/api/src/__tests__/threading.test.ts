@@ -4,6 +4,7 @@ import {
   canonicalizeMessageId,
   computeThreadAssignments,
   computeThreadAssignmentsV1,
+  computeThreadAssignmentsV2,
   extractMessageIdTokens,
   type ThreadingAssignment,
   type ThreadingMessageInput
@@ -546,6 +547,145 @@ describe("delivery copies and ambiguous duplicate Message-ID values", () => {
     });
   });
 
+  it("collapses exact metadata copies when content evidence is absent", () => {
+    const inputs = [
+      message("metadata-copy-inbox", {
+        folder_path: "INBOX",
+        uid: 10,
+        rfc_message_id: "<metadata-copy@x>"
+      }),
+      message("metadata-copy-mirror", {
+        folder_path: "INBOX.INBOX",
+        uid: 88,
+        rfc_message_id: "<metadata-copy@x>"
+      })
+    ];
+    const assignments = computeThreadAssignments(inputs);
+
+    expect(byId(assignments, "metadata-copy-inbox").delivery_key)
+      .toBe(byId(assignments, "metadata-copy-mirror").delivery_key);
+    expect(byId(assignments, "metadata-copy-inbox").evidence.collapsed_physical_ids)
+      .toEqual(["metadata-copy-inbox", "metadata-copy-mirror"]);
+    expect(byId(assignments, "metadata-copy-inbox").evidence.parse_warnings)
+      .toContain("delivery_metadata_fingerprint_match");
+
+    const retainedV2 = computeThreadAssignmentsV2(inputs);
+    expect(byId(retainedV2, "metadata-copy-inbox").delivery_key)
+      .not.toBe(byId(retainedV2, "metadata-copy-mirror").delivery_key);
+  });
+
+  it("normalizes every exact-metadata field before comparing mirrored copies", () => {
+    const assignments = computeThreadAssignments([
+      message("normalized-metadata-inbox", {
+        folder_path: "INBOX",
+        uid: 10,
+        rfc_message_id: "<normalized-metadata@x>",
+        internal_date: new Date("2026-01-01T12:00:00.000Z"),
+        size_bytes: "001024",
+        subject: "  Ｐroject\u00a0Atlas  ",
+        from_email: " Alice@EXAMPLE.TEST ",
+        to_emails: ["second@EXAMPLE.TEST", "first@example.test"],
+        cc_emails: ["copy@EXAMPLE.TEST"]
+      }),
+      message("normalized-metadata-mirror", {
+        folder_path: "INBOX.INBOX",
+        uid: 88,
+        rfc_message_id: "<normalized-metadata@x>",
+        internal_date: "2026-01-01T12:00:00.000Z",
+        size_bytes: 1_024,
+        subject: "Project Atlas",
+        from_email: "Alice@example.test",
+        to_emails: ["first@example.test", "second@example.test"],
+        cc_emails: ["copy@example.test"]
+      })
+    ]);
+
+    expect(byId(assignments, "normalized-metadata-inbox").delivery_key)
+      .toBe(byId(assignments, "normalized-metadata-mirror").delivery_key);
+  });
+
+  it.each([
+    ["Message-ID", { rfc_message_id: null }],
+    ["timestamp", { internal_date: "not-a-date" }],
+    ["size", { size_bytes: -1 }],
+    ["subject", { subject: "   " }],
+    ["sender", { from_email: "   " }],
+    ["recipient", { to_emails: [], cc_emails: [], bcc_emails: [] }]
+  ] satisfies Array<[string, Partial<ThreadingMessageInput>]>) (
+    "fails closed when exact metadata is missing a required %s",
+    (_field, missing) => {
+      const assignments = computeThreadAssignments([
+        message("incomplete-metadata-inbox", {
+          folder_path: "INBOX",
+          rfc_message_id: "<incomplete-metadata@x>",
+          ...missing
+        }),
+        message("incomplete-metadata-mirror", {
+          folder_path: "INBOX.INBOX",
+          rfc_message_id: "<incomplete-metadata@x>",
+          ...missing
+        })
+      ]);
+
+      expect(byId(assignments, "incomplete-metadata-inbox").delivery_key)
+        .not.toBe(byId(assignments, "incomplete-metadata-mirror").delivery_key);
+    }
+  );
+
+  it("lets conflicting authored evidence veto an exact metadata match", () => {
+    const assignments = computeThreadAssignments([
+      message("metadata-collision-a", {
+        folder_path: "INBOX",
+        uid: 10,
+        rfc_message_id: "<metadata-collision@x>",
+        authored_delivery_fingerprint: "authored-content-a"
+      }),
+      message("metadata-collision-b", {
+        folder_path: "INBOX.INBOX",
+        uid: 88,
+        rfc_message_id: "<metadata-collision@x>",
+        authored_delivery_fingerprint: "authored-content-b"
+      })
+    ]);
+
+    expect(byId(assignments, "metadata-collision-a").delivery_key)
+      .not.toBe(byId(assignments, "metadata-collision-b").delivery_key);
+    expect(byId(assignments, "metadata-collision-a").evidence.parse_warnings)
+      .toContain("delivery_metadata_collision_authored_conflict");
+  });
+
+  it("does not let metadata choose one side of an inherited authored conflict", () => {
+    const assignments = computeThreadAssignments([
+      message("authored-side-a", {
+        folder_path: "INBOX",
+        rfc_message_id: "<inherited-authored-conflict@x>",
+        raw_mime_hash: "shared-with-bridge",
+        authored_delivery_fingerprint: "authored-a"
+      }),
+      message("authored-side-b", {
+        folder_path: "Archive",
+        rfc_message_id: "<inherited-authored-conflict@x>",
+        subject: "Different metadata",
+        delivery_fingerprint: "also-shared-with-bridge",
+        authored_delivery_fingerprint: "authored-b"
+      }),
+      message("digest-less-bridge", {
+        folder_path: "INBOX.INBOX",
+        rfc_message_id: "<inherited-authored-conflict@x>",
+        raw_mime_hash: "shared-with-bridge",
+        delivery_fingerprint: "also-shared-with-bridge"
+      })
+    ]);
+
+    const keys = ["authored-side-a", "authored-side-b", "digest-less-bridge"]
+      .map((id) => byId(assignments, id).delivery_key);
+    expect(new Set(keys).size).toBe(3);
+    expect(byId(assignments, "digest-less-bridge").evidence.parse_warnings)
+      .toContain("delivery_authored_fingerprint_conflict");
+    expect(byId(assignments, "digest-less-bridge").evidence.parse_warnings)
+      .toContain("delivery_metadata_collision_authored_conflict");
+  });
+
   it("collapses copies when exact parsed evidence bridges raw and parsed-only storage", () => {
     const inputs = [
       message("raw-copy", {
@@ -564,12 +704,17 @@ describe("delivery copies and ambiguous duplicate Message-ID values", () => {
     ];
     const assignments = computeThreadAssignments(inputs);
 
-    expect(THREADING_ALGORITHM_VERSION).toBe(2);
+    expect(THREADING_ALGORITHM_VERSION).toBe(3);
     expect(byId(assignments, "raw-copy").delivery_key)
       .toBe(byId(assignments, "parsed-only-copy").delivery_key);
     expect(byId(assignments, "raw-copy").evidence.collapsed_physical_ids)
       .toEqual(["parsed-only-copy", "raw-copy"]);
-    expect(assignments.every((assignment) => assignment.algorithm_version === 2)).toBe(true);
+    expect(assignments.every((assignment) => assignment.algorithm_version === 3)).toBe(true);
+
+    const retainedV2 = computeThreadAssignmentsV2(inputs);
+    expect(byId(retainedV2, "raw-copy").delivery_key)
+      .toBe(byId(retainedV2, "parsed-only-copy").delivery_key);
+    expect(retainedV2.every((assignment) => assignment.algorithm_version === 2)).toBe(true);
 
     const retainedV1 = computeThreadAssignmentsV1(inputs);
     expect(byId(retainedV1, "raw-copy").delivery_key)
@@ -703,6 +848,7 @@ describe("delivery copies and ambiguous duplicate Message-ID values", () => {
       provisional: true
     });
     expect(first.evidence.parse_warnings).toContain("ambiguous_message_id_owner");
+    expect(first.evidence.parse_warnings).toContain("delivery_metadata_same_folder_ignored");
   });
 
   it("does not merge separate replies through a reused Message-ID ambiguity", () => {
@@ -950,6 +1096,72 @@ describe("provider and conservative subject grouping", () => {
     expect(byId(assignments, "ambiguous-reply").method).toBe("standalone");
     expect(byId(assignments, "forward").method).toBe("standalone");
     expect(byId(assignments, "automated").method).toBe("standalone");
+  });
+
+  it("starts a new conversation for a forward even when it inherits reply headers", () => {
+    const inputs = [
+      message("forwarded-root", {
+        rfc_message_id: "<forwarded-root@x>",
+        provider_thread_namespace: "outlook",
+        provider_thread_id: "inherited-forward-thread",
+        subject: "Project Atlas"
+      }),
+      message("forwarded-outer", {
+        rfc_message_id: "<forwarded-outer@x>",
+        references_header: "<forwarded-root@x>",
+        in_reply_to: "<forwarded-root@x>",
+        provider_thread_namespace: "outlook",
+        provider_thread_id: "inherited-forward-thread",
+        subject: "Fwd: Project Atlas"
+      }),
+      message("forwarded-reply", {
+        rfc_message_id: "<forwarded-reply@x>",
+        references_header: "<forwarded-root@x> <forwarded-outer@x>",
+        in_reply_to: "<forwarded-outer@x>",
+        provider_thread_namespace: "outlook",
+        provider_thread_id: "inherited-forward-thread",
+        subject: "Re: Fwd: Project Atlas"
+      })
+    ];
+    const assignments = computeThreadAssignments(inputs);
+
+    expect(byId(assignments, "forwarded-root").conversation_id)
+      .not.toBe(byId(assignments, "forwarded-outer").conversation_id);
+    expect(byId(assignments, "forwarded-outer").conversation_id)
+      .toBe(byId(assignments, "forwarded-reply").conversation_id);
+    expect(byId(assignments, "forwarded-outer").reference_ids).toEqual([]);
+    expect(byId(assignments, "forwarded-outer").evidence.parse_warnings)
+      .toContain("forward_reply_headers_not_conversation_edge");
+    expect(byId(assignments, "forwarded-outer").evidence.parse_warnings)
+      .toContain("forward_provider_thread_not_conversation_edge");
+
+    const retainedV2 = computeThreadAssignmentsV2(inputs);
+    expect(byId(retainedV2, "forwarded-root").conversation_id)
+      .toBe(byId(retainedV2, "forwarded-outer").conversation_id);
+    expect(byId(retainedV2, "forwarded-outer").conversation_id)
+      .toBe(byId(retainedV2, "forwarded-reply").conversation_id);
+  });
+
+  it("recognizes localized forward prefixes as authored boundaries", () => {
+    const inputs = [
+      message("localized-root", { rfc_message_id: "<localized-root@x>" }),
+      message("localized-forward", {
+        rfc_message_id: "<localized-forward@x>",
+        references_header: "<localized-root@x>",
+        in_reply_to: "<localized-root@x>",
+        subject: "RV: Project Atlas"
+      })
+    ];
+
+    const assignments = computeThreadAssignments(inputs);
+    expect(byId(assignments, "localized-root").conversation_id)
+      .not.toBe(byId(assignments, "localized-forward").conversation_id);
+    expect(byId(assignments, "localized-forward").evidence.parse_warnings)
+      .toContain("forward_reply_headers_not_conversation_edge");
+
+    const retainedV2 = computeThreadAssignmentsV2(inputs);
+    expect(byId(retainedV2, "localized-root").conversation_id)
+      .toBe(byId(retainedV2, "localized-forward").conversation_id);
   });
 });
 

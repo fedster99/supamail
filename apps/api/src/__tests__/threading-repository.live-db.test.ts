@@ -12,9 +12,8 @@ import {
 } from "../threading-repository.js";
 import {
   computeThreadAssignments,
-  type ThreadingAssignment,
-  type ThreadingMessageInput,
-  type ThreadingOptions
+  computeThreadAssignmentsV1,
+  computeThreadAssignmentsV2
 } from "../threading.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
@@ -143,11 +142,12 @@ liveDb("ThreadingRepository live DB", () => {
 
   async function drainUntilReady(
     accountId: string,
-    options: { batchSize?: number; maxSubjectBucketMessages?: number } = {}
+    options: { batchSize?: number; maxSubjectBucketMessages?: number } = {},
+    target: ThreadingRepository = repository
   ): Promise<ThreadingRunResult> {
     let last: ThreadingRunResult | null = null;
     for (let pass = 0; pass < 200; pass += 1) {
-      last = await repository.drainAccount(accountId, { ...options, requestedBy: "live-test" });
+      last = await target.drainAccount(accountId, { ...options, requestedBy: "live-test" });
       if (last.ready && last.runStatus === "ready") return last;
     }
     throw new Error(`threading run did not become ready: ${JSON.stringify(last)}`);
@@ -241,14 +241,10 @@ liveDb("ThreadingRepository live DB", () => {
   }
 
   function executorFor(version: number) {
-    return (messages: readonly ThreadingMessageInput[], options?: ThreadingOptions): ThreadingAssignment[] =>
-      computeThreadAssignments(messages, options).map((assignment) => ({
-        ...assignment,
-        algorithm_version: version,
-        input_hash: createHash("sha256")
-          .update(`${assignment.input_hash}\u0000algorithm-version:${version}`)
-          .digest("hex")
-      }));
+    if (version === 1) return computeThreadAssignmentsV1;
+    if (version === 2) return computeThreadAssignmentsV2;
+    if (version === 3) return computeThreadAssignments;
+    throw new Error(`missing test threading executor v${version}`);
   }
 
   async function activateReviewed(
@@ -725,6 +721,16 @@ liveDb("ThreadingRepository live DB", () => {
     expect(material?.operationType).toBe("incremental");
     expect(await activeProjection(accountId)).toHaveLength(2);
 
+    // Operations written before migration 0020 do not contain the new array in
+    // their immutable JSON snapshot. Rollback must treat that absent field as
+    // an empty legacy value instead of rejecting or inventing evidence.
+    await pool.query(
+      `UPDATE public.imap_thread_assignment_history
+       SET previous_assignment = previous_assignment - 'delivery_fingerprint_hashes'
+       WHERE operation_id = $1 AND previous_assignment IS NOT NULL`,
+      [material?.operationId]
+    );
+
     const rollback = await repository.rollbackOperation(
       accountId,
       material?.operationId as string,
@@ -743,6 +749,17 @@ liveDb("ThreadingRepository live DB", () => {
       [accountId]
     );
     expect(raw.rows[0]?.count).toBe("2");
+    const restoredFingerprintState = await pool.query<{ count: string }>(
+      `SELECT cardinality(delivery_fingerprint_hashes)::text AS count
+       FROM public.imap_thread_assignments
+       WHERE run_id = $1 AND message_id = $2`,
+      [initial.runId, (await pool.query<{ id: string }>(
+        `SELECT id FROM public.imap_messages
+         WHERE account_id = $1 AND uid = 1 ORDER BY id LIMIT 1`,
+        [accountId]
+      )).rows[0]?.id]
+    );
+    expect(restoredFingerprintState.rows[0]?.count).toBe("0");
     const audit = await pool.query<{
       original_status: string;
       rollback_changes: string;
@@ -860,6 +877,175 @@ liveDb("ThreadingRepository live DB", () => {
       { raw_mime_sha256: createHash("sha256").update(rawMime).digest("hex") },
       { raw_mime_sha256: createHash("sha256").update(rawMime).digest("hex") }
     ]);
+  });
+
+  it("closes a bounded rebuild over copies that share one of several delivery fingerprints", async () => {
+    const accountId = await createAccount("overlapping-delivery-evidence");
+    const parsedDigest = "b".repeat(64);
+    const messageIds = await Promise.all([
+      seedMessage(accountId, {
+        uid: 1,
+        folder: "INBOX",
+        subject: "Overlapping fingerprint mirror",
+        fromEmail: "sender@example.test",
+        toEmails: ["recipient@example.test"],
+        rfcMessageId: "<explicit-copy@example.test>",
+        headersJson: {
+          "message-id": "<conflicting-copy@example.test>",
+          "list-unsubscribe": "<https://example.test/unsubscribe>"
+        }
+      }),
+      seedMessage(accountId, {
+        uid: 1,
+        folder: "INBOX.INBOX",
+        subject: "Overlapping fingerprint mirror",
+        fromEmail: "sender@example.test",
+        toEmails: ["recipient@example.test"],
+        rfcMessageId: "<explicit-copy@example.test>",
+        headersJson: {
+          "message-id": "<conflicting-copy@example.test>",
+          "list-unsubscribe": "<https://example.test/unsubscribe>"
+        }
+      })
+    ]);
+    await pool.query(
+      `INSERT INTO public.imap_message_bodies (
+         message_id, raw_mime_sha256, parsed_delivery_sha256,
+         raw_bytes, raw_truncated, headers_json
+       ) VALUES
+         ($1, $3, $4, 128, false, '{}'::jsonb),
+         ($2, NULL, $4, 128, false, '{}'::jsonb)`,
+      [messageIds[0], messageIds[1], "a".repeat(64), parsedDigest]
+    );
+
+    const ready = await drainUntilReady(accountId, { batchSize: 1 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.subject_fallback_eligible === false)).toBe(true);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(1);
+    expect(new Set(rows.map((row) => row.conversation_id)).size).toBe(1);
+    expect(rows.every((row) =>
+      (row.evidence.collapsed_physical_ids as string[]).length === 2
+    )).toBe(true);
+    const persistedFingerprints = await pool.query<{ count: string }>(
+      `SELECT cardinality(delivery_fingerprint_hashes)::text AS count
+       FROM public.imap_thread_assignments
+       WHERE run_id = $1
+       ORDER BY message_id`,
+      [ready.runId]
+    );
+    expect(persistedFingerprints.rows.map((row) => Number(row.count)).sort((left, right) => right - left))
+      .toEqual([2, 1]);
+  });
+
+  it("closes a bounded rebuild over exact metadata copies without body evidence", async () => {
+    const accountId = await createAccount("metadata-copy-closure");
+    await Promise.all([
+      seedMessage(accountId, {
+        uid: 1,
+        folder: "INBOX",
+        subject: "Metadata mirror",
+        fromEmail: "sender@example.test",
+        toEmails: ["recipient@example.test"],
+        rfcMessageId: "<metadata-mirror@example.test>",
+        internalDate: "2026-01-01T12:00:00.000Z"
+      }),
+      seedMessage(accountId, {
+        uid: 1,
+        folder: "INBOX.INBOX",
+        subject: "Metadata mirror",
+        fromEmail: "sender@example.test",
+        toEmails: ["recipient@example.test"],
+        rfcMessageId: "<metadata-mirror@example.test>",
+        internalDate: "2026-01-01T12:00:00.000Z"
+      })
+    ]);
+
+    const ready = await drainUntilReady(accountId, { batchSize: 1 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(1);
+    expect(new Set(rows.map((row) => row.conversation_id)).size).toBe(1);
+    expect(rows.every((row) =>
+      (row.evidence.collapsed_physical_ids as string[]).length === 2
+    )).toBe(true);
+  });
+
+  it("enforces the persisted fingerprint hash constraint and safe empty default", async () => {
+    const accountId = await createAccount("fingerprint-constraint");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Fingerprint constraint",
+      fromEmail: "sender@example.test",
+      toEmails: ["recipient@example.test"],
+      rfcMessageId: "<fingerprint-constraint@example.test>"
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 1 });
+
+    await expect(pool.query(
+      `UPDATE public.imap_thread_assignments
+       SET delivery_fingerprint_hashes = ARRAY['not-a-sha256']
+       WHERE run_id = $1`,
+      [ready.runId]
+    )).rejects.toMatchObject({ code: "23514" });
+    await pool.query(
+      `UPDATE public.imap_thread_assignments
+       SET delivery_fingerprint_hashes = DEFAULT
+       WHERE run_id = $1`,
+      [ready.runId]
+    );
+    const reset = await pool.query<{ count: string }>(
+      `SELECT cardinality(delivery_fingerprint_hashes)::text AS count
+       FROM public.imap_thread_assignments WHERE run_id = $1`,
+      [ready.runId]
+    );
+    expect(reset.rows[0]?.count).toBe("0");
+  });
+
+  it("counts delivery fingerprints toward the bounded closure criteria budget", async () => {
+    const accountId = await createAccount("fingerprint-criteria-budget");
+    await pool.query(
+      `WITH inserted AS (
+         INSERT INTO public.imap_messages (
+           account_id, folder_path, uidvalidity, uid, internal_date,
+           subject, from_email, to_emails, rfc_message_id,
+           message_id_normalized, window_status, size_bytes, headers_json
+         )
+         SELECT $1, 'INBOX', 101, value,
+                timestamptz '2026-01-01 00:00:00+00' + value * interval '1 second',
+                'Criteria ' || value, 'sender@example.test',
+                ARRAY['recipient@example.test'],
+                '<criteria-' || value || '@example.test>',
+                'criteria-' || value || '@example.test',
+                'IN_WINDOW', 1024, '{}'::jsonb
+         FROM generate_series(1, 501) AS value
+         RETURNING id, uid
+       )
+       INSERT INTO public.imap_message_bodies (
+         message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated, headers_json
+       )
+       SELECT id, NULL, lpad(to_hex(uid), 64, '0'), 1024, false, '{}'::jsonb
+       FROM inserted`,
+      [accountId]
+    );
+
+    let failure: unknown;
+    for (let pass = 0; pass < 5 && !failure; pass += 1) {
+      try {
+        await repository.drainAccount(accountId, {
+          batchSize: 501,
+          maxClosureCriteriaKeys: 1_000,
+          requestedBy: "live-test"
+        });
+      } catch (error) {
+        failure = error;
+      }
+    }
+    expect(failure).toMatchObject({
+      name: "ThreadingEvidenceLimitError",
+      kind: "criteria",
+      limit: 1_000
+    });
   });
 
   it("bounds legacy body hashing independently from the projection batch", async () => {
@@ -1358,7 +1544,7 @@ liveDb("ThreadingRepository live DB", () => {
     expect(new Set(evidence.rows.map((row) => row.authored_delivery_sha256)).size).toBe(2);
   });
 
-  it("keeps a reused Message-ID split when targeted authored digests disagree", async () => {
+  it("rechecks an exact metadata merge and splits it when authored digests disagree", async () => {
     const accountId = await createAccount("cross-tier-message-id-reuse");
     const messageIds: string[] = [];
     for (const [index, bodyText] of ["First unrelated delivery", "Second unrelated delivery"].entries()) {
@@ -1368,7 +1554,10 @@ liveDb("ThreadingRepository live DB", () => {
         subject: "Reused Message-ID",
         fromEmail: "alice@example.test",
         toEmails: ["bob@example.test"],
-        rfcMessageId: "<reused-cross-tier@example.test>"
+        rfcMessageId: "<reused-cross-tier@example.test>",
+        // All metadata proof fields intentionally match. V3 first treats this
+        // as a mirror candidate, then targeted authored evidence must veto it.
+        internalDate: "2026-01-01T12:00:00.000Z"
       });
       messageIds.push(messageId);
       await pool.query(
@@ -1507,6 +1696,9 @@ liveDb("ThreadingRepository live DB", () => {
     const sentCopy = await seedMessage(accountId, {
       uid: 1,
       folder: "Sent",
+      // Prevent v3's exact-metadata mirror proof from resolving this fixture;
+      // the test specifically exercises late raw-MIME evidence repair.
+      internalDate: "2026-01-01T12:00:01.000Z",
       subject: "Body-only delivery identity",
       fromEmail: "alice@example.test",
       toEmails: ["bob@example.test"],
@@ -1777,7 +1969,7 @@ liveDb("ThreadingRepository live DB", () => {
       `INSERT INTO public.imap_thread_runs (
          account_id, algorithm_version, mode, status, stage,
          completed_at, activated_at, requested_by, reason
-       ) VALUES ($1, 3, 'initial', 'active', 'ready', now(), now(), 'live-test', 'future worker')
+       ) VALUES ($1, 4, 'initial', 'active', 'ready', now(), now(), 'live-test', 'future worker')
        RETURNING id`,
       [accountId]
     );
@@ -1798,7 +1990,7 @@ liveDb("ThreadingRepository live DB", () => {
     );
     expect(untouched.rows[0]).toEqual({ attempts: 0, operations: "0" });
     await expect(repository.listAccountsNeedingWork())
-      .rejects.toThrow(/active.*v3.*no retained executor/i);
+      .rejects.toThrow(/active.*v4.*no retained executor/i);
   });
 
   it("quantifies shadow-run merge disagreements before activation", async () => {
@@ -2041,8 +2233,12 @@ liveDb("ThreadingRepository live DB", () => {
       subject: "Versioned rollout",
       rfcMessageId: "<version-root@example.test>"
     });
-    const v2 = await drainUntilReady(accountId, { batchSize: 1 });
-    await activateReviewed(repository, accountId, v2.runId as string);
+    const v2Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 2,
+      algorithms: new Map([[1, executorFor(1)], [2, executorFor(2)]])
+    });
+    const v2 = await drainUntilReady(accountId, { batchSize: 1 }, v2Repository);
+    await activateReviewed(v2Repository, accountId, v2.runId as string);
 
     const v3Repository = new ThreadingRepository(pool, {
       currentAlgorithmVersion: 3,
@@ -2099,8 +2295,12 @@ liveDb("ThreadingRepository live DB", () => {
       subject: "Retained executor",
       rfcMessageId: "<retained-executor@example.test>"
     });
-    const v2 = await drainUntilReady(accountId, { batchSize: 1 });
-    await activateReviewed(repository, accountId, v2.runId as string);
+    const v2Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 2,
+      algorithms: new Map([[1, executorFor(1)], [2, executorFor(2)]])
+    });
+    const v2 = await drainUntilReady(accountId, { batchSize: 1 }, v2Repository);
+    await activateReviewed(v2Repository, accountId, v2.runId as string);
 
     const unsafeV3Repository = new ThreadingRepository(pool, {
       currentAlgorithmVersion: 3,
@@ -2127,15 +2327,19 @@ liveDb("ThreadingRepository live DB", () => {
       subject: "Upgrade guard",
       rfcMessageId: "<upgrade-guard@example.test>"
     });
-    const baseline = await drainUntilReady(accountId, { batchSize: 1 });
-    await activateReviewed(repository, accountId, baseline.runId as string);
+    const v2Repository = new ThreadingRepository(pool, {
+      currentAlgorithmVersion: 2,
+      algorithms: new Map([[1, executorFor(1)], [2, executorFor(2)]])
+    });
+    const baseline = await drainUntilReady(accountId, { batchSize: 1 }, v2Repository);
+    await activateReviewed(v2Repository, accountId, baseline.runId as string);
     const v3Repository = new ThreadingRepository(pool, {
       currentAlgorithmVersion: 3,
       algorithms: new Map([[2, executorFor(2)], [3, executorFor(3)]])
     });
     const newerRunId = await v3Repository.startRebuild(accountId, { requestedBy: "v3-worker" });
 
-    await expect(repository.startRebuild(accountId, { requestedBy: "old-v2-cli" }))
+    await expect(v2Repository.startRebuild(accountId, { requestedBy: "old-v2-cli" }))
       .rejects.toBeInstanceOf(ThreadingVersionSkewError);
     const candidate = await pool.query<{ status: string; building_run_id: string }>(
       `SELECT run.status, state.building_run_id
