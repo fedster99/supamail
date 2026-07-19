@@ -1,5 +1,9 @@
-import { createHash } from "node:crypto";
-import { simpleParser } from "mailparser";
+import {
+  MailParser,
+  type AttachmentStream,
+  type Headers,
+  type MessageText
+} from "mailparser";
 import type { AttachmentMetadata, MessageEvidenceInput } from "./types.js";
 
 type BodyTextFormat = "plain" | "html";
@@ -406,6 +410,95 @@ export function htmlToText(html: string): string {
   );
 }
 
+interface StreamedAttachmentEvidence {
+  checksum: string;
+  contentType: string;
+  filename?: string;
+  contentDisposition?: string;
+  contentId?: string;
+  related?: boolean;
+  size: number;
+  calendarContent: Buffer | null;
+}
+
+async function streamMimeEvidence(rawMime: Buffer): Promise<{
+  headers: Headers;
+  text: string | null;
+  html: string | null;
+  attachments: StreamedAttachmentEvidence[];
+}> {
+  return await new Promise((resolve, reject) => {
+    const parser = new MailParser({
+      skipImageLinks: true,
+      skipTextLinks: true,
+      skipHtmlToText: true,
+      skipTextToHtml: true,
+      maxHtmlLengthToParse: MAX_HTML_PARSE_BYTES,
+      checksumAlgo: "sha256"
+    });
+    let headers: Headers = new Map();
+    let text: string | null = null;
+    let html: string | null = null;
+    const attachments: StreamedAttachmentEvidence[] = [];
+    let settled = false;
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      parser.destroy();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+
+    parser.once("error", fail);
+    parser.on("headers", (value) => {
+      headers = value;
+    });
+    parser.on("data", (data: AttachmentStream | MessageText) => {
+      if (data.type === "text") {
+        if (typeof data.text === "string") text = data.text;
+        if (typeof data.html === "string") html = data.html;
+        return;
+      }
+
+      const attachment = data;
+      const contentType = attachment.contentType.toLowerCase();
+      const isCalendar = contentType === "text/calendar"
+        || contentType === "application/ics"
+        || contentType === "application/icalendar";
+      const calendarChunks: Buffer[] = [];
+      let calendarBytes = 0;
+      attachment.content.on("data", (chunk: Buffer | string) => {
+        if (!isCalendar || calendarBytes > MAX_CALENDAR_EVIDENCE_BYTES) return;
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        calendarBytes += buffer.length;
+        if (calendarBytes <= MAX_CALENDAR_EVIDENCE_BYTES) calendarChunks.push(buffer);
+        else calendarChunks.length = 0;
+      });
+      attachment.content.once("error", fail);
+      attachment.content.once("end", () => {
+        attachments.push({
+          checksum: attachment.checksum,
+          contentType: attachment.contentType,
+          filename: attachment.filename,
+          contentDisposition: attachment.contentDisposition,
+          contentId: attachment.contentId,
+          related: attachment.related,
+          size: attachment.size,
+          calendarContent: isCalendar && calendarBytes <= MAX_CALENDAR_EVIDENCE_BYTES
+            ? Buffer.concat(calendarChunks, calendarBytes)
+            : null
+        });
+        attachment.release();
+      });
+    });
+    parser.once("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve({ headers, text, html, attachments });
+    });
+    parser.end(rawMime);
+  });
+}
+
 export async function parseRawMime(rawMime: Buffer): Promise<{
   bodyText: string | null;
   bodyHtml: string | null;
@@ -415,13 +508,7 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
   evidence: MessageEvidenceInput[];
 }> {
   const parserWarnings: string[] = [];
-  const parsed = await simpleParser(rawMime, {
-    skipImageLinks: true,
-    skipTextLinks: true,
-    skipHtmlToText: true,
-    skipTextToHtml: true,
-    maxHtmlLengthToParse: MAX_HTML_PARSE_BYTES
-  } as Parameters<typeof simpleParser>[1]);
+  const parsed = await streamMimeEvidence(rawMime);
   const headersJson: Record<string, unknown> = {};
 
   for (const [key, value] of parsed.headers) {
@@ -458,11 +545,11 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
     pushEvidence({
       kind: "attachment_content",
       namespace: "sha256",
-      key: createHash("sha256").update(attachment.content).digest("hex"),
+      key: attachment.checksum,
       metadata: {
         filename: boundedText(attachment.filename, 512),
         mimeType: boundedText(attachment.contentType, 255),
-        sizeBytes: attachment.content.length,
+        sizeBytes: attachment.size,
         disposition: boundedText(attachment.contentDisposition, 64),
         contentId: boundedText(attachment.contentId, 512),
         related: attachment.related === true
@@ -471,11 +558,11 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
     if (evidenceTruncated) break;
     const contentType = attachment.contentType.toLowerCase();
     if (contentType === "text/calendar" || contentType === "application/ics" || contentType === "application/icalendar") {
-      if (attachment.content.length > MAX_CALENDAR_EVIDENCE_BYTES) {
+      if (!attachment.calendarContent) {
         evidenceTruncated = true;
         break;
       }
-      const calendarResult = extractCalendarEvidence(attachment.content);
+      const calendarResult = extractCalendarEvidence(attachment.calendarContent);
       for (const calendarEvidence of calendarResult.evidence) {
         pushEvidence(calendarEvidence);
       }

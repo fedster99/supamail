@@ -146,6 +146,14 @@ active, candidate, and rollback runs can all remain caught up during rollout;
 the production registry is literal/versioned, and startup plus direct operator
 paths fail before processing if a state-referenced executor is missing. An older
 binary therefore neither ignores nor supersedes a newer candidate silently.
+The default activation policy remains explicit. A deployment whose downstream
+readers require conversations immediately may set
+`THREADING_AUTO_ACTIVATE_INITIAL=true`. That option applies only when the ready
+run is `mode='initial'` and there is no baseline projection: the worker calls the
+same atomic activation path, including physical-row coverage, evidence-clock,
+and empty-queue checks. It does not auto-activate rebuilds or algorithm upgrades;
+replacement activation continues to require a reviewed, passing comparison
+certificate.
 Run selection uses a persisted five-slot weighted schedule (three active, one
 standby, one building) so sustained active ingress preserves reader freshness
 without starving a shadow build or rollback projection across worker restarts.
@@ -206,6 +214,9 @@ unrelated mail.
 - Comparison scans have a database statement-time budget, and activation
   certificates become invalid after any evidence or projection generation
   change.
+- First-run auto-activation is deployment opt-in and deliberately narrower than
+  general shadow activation. Consumers can avoid an indefinite no-active-run
+  state without weakening reviewed replacement rollouts.
 - Work-item clustering, content similarity, CRM identity, and belief machinery
   remain outside the SupaMail core.
 
@@ -224,6 +235,8 @@ unrelated mail.
   persisted comparison drift, an in-flight legacy-writer activation barrier,
   activation and incremental rollback, purge invalidation, run retention,
   active-view isolation, read dedupe, and mutation fan-out.
+- Live PostgreSQL coverage proves the explicit first-run option activates only
+  a complete initial projection through the ordinary activation transaction.
 - A populated-upgrade harness loads 5,000 pre-0014 messages and parsed-only
   bodies, applies 0014 twice, and proves that the migration neither rewrites raw
   rows nor creates a partially active projection.

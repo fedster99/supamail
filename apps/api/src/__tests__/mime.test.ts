@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   extractAttachmentMetadata,
@@ -190,6 +190,38 @@ describe("mime helpers", () => {
     );
     const reparsed = await parseRawMime(quotedPrintable);
     expect(reparsed.evidence[0]?.key).toBe(parsed.evidence[0]?.key);
+  });
+
+  it("streams attachment evidence without concatenating decoded attachment buffers", async () => {
+    const attachment = Buffer.alloc(1024 * 1024, 97);
+    const raw = Buffer.from([
+      "From: a@example.com",
+      "To: b@example.com",
+      "MIME-Version: 1.0",
+      "Content-Type: multipart/mixed; boundary=x",
+      "",
+      "--x",
+      "Content-Type: text/plain",
+      "",
+      "hello",
+      "--x",
+      "Content-Type: application/octet-stream",
+      "Content-Disposition: attachment; filename=large.bin",
+      "Content-Transfer-Encoding: base64",
+      "",
+      attachment.toString("base64"),
+      "--x--",
+      ""
+    ].join("\r\n"));
+    const concat = vi.spyOn(Buffer, "concat");
+
+    try {
+      const parsed = await parseRawMime(raw);
+      expect(parsed.evidence).toHaveLength(1);
+      expect(concat.mock.calls.some(([, length]) => length === attachment.length)).toBe(false);
+    } finally {
+      concat.mockRestore();
+    }
   });
 
   it("identifies calendar revisions by UID plus recurrence instance", async () => {

@@ -1,5 +1,20 @@
 # Session Handoff
 
+## 2026-07-19 — Sync-run finalization and opt-in initial thread activation
+
+- `MirrorEngine.syncAccount` now terminalizes an opened durable run before
+  rethrowing unexpected account-lock/recovery/finalization exceptions, closing
+  the healthy-account phantom-`running` gap left by pool-checkout failures.
+- `THREADING_AUTO_ACTIVATE_INITIAL` is an opt-in worker setting. It uses the
+  existing atomic activation checks only for a first `mode='initial'` run;
+  rebuilds and upgrades remain explicit and comparison-gated.
+- MIME attachment evidence now hashes decoded bytes through `MailParser`'s
+  attachment stream, buffering only a capped calendar payload. The IMAP source
+  buffer is reused instead of copied, so deployments can raise their explicit
+  raw-fetch ceiling without retaining multiple large attachment buffers.
+- Focused unit and live-Postgres regressions cover these boundaries. This is a
+  maintainer-directed reliability repair, so the feature-list state is unchanged.
+
 ## 2026-07-17 — Threading v3 mirror and forward boundaries
 
 - Algorithm v3 adds a high-precision delivery fallback for measured mirrored

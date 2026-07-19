@@ -438,7 +438,8 @@ describe("worker conversation-threading lane", () => {
         SYNC_INTERVAL_MS: 60_000,
         SENT_SYNC_INTERVAL_MS: 30_000,
         STALE_HEARTBEAT_MS: 300_000,
-        SYNC_MAX_ACCOUNTS: 40
+        SYNC_MAX_ACCOUNTS: 40,
+        THREADING_AUTO_ACTIVATE_INITIAL: true
       } as AppConfig,
       pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
       engine: {
@@ -456,7 +457,10 @@ describe("worker conversation-threading lane", () => {
 
     try {
       await vi.advanceTimersByTimeAsync(0);
-      expect(drainAccount).toHaveBeenCalledWith("account-1", { requestedBy: "worker" });
+      expect(drainAccount).toHaveBeenCalledWith("account-1", {
+        requestedBy: "worker",
+        activateInitial: true
+      });
     } finally {
       runtime.stop();
       await runtime.done;
