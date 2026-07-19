@@ -36,7 +36,10 @@ interface WorkerEngine {
 
 interface WorkerThreading {
   assertRolloutCompatibility?(): Promise<void>;
-  listAccountsNeedingWork(limit?: number): Promise<string[]>;
+  listAccountsNeedingWork(
+    limit?: number,
+    options?: Pick<DrainThreadingOptions, "activateInitial">
+  ): Promise<string[]>;
   drainAccount(accountId: string, options?: DrainThreadingOptions): Promise<ThreadingRunResult>;
   pruneTerminalRuns?(options?: { olderThanDays?: number; batchSize?: number }): Promise<{
     runsDeleted: number;
@@ -323,9 +326,12 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
 
   async function drainThreadingLane(): Promise<void> {
     if (!threading || stopping) return;
+    const activateInitial = config.THREADING_AUTO_ACTIVATE_INITIAL === true;
     let accountIds: string[];
     try {
-      accountIds = await threading.listAccountsNeedingWork(config.SYNC_MAX_ACCOUNTS);
+      accountIds = await threading.listAccountsNeedingWork(config.SYNC_MAX_ACCOUNTS, {
+        activateInitial
+      });
     } catch (error) {
       console.error(JSON.stringify({
         event: "threading.tick.failed",
@@ -350,7 +356,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
         try {
           const result = await threading.drainAccount(accountId, {
             requestedBy: "worker",
-            activateInitial: config.THREADING_AUTO_ACTIVATE_INITIAL
+            activateInitial
           });
           processed += result.messagesConsidered;
           changed += result.assignmentsChanged;

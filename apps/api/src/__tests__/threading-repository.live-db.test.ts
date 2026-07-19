@@ -395,6 +395,31 @@ liveDb("ThreadingRepository live DB", () => {
     expect(rebuild.runId).not.toBe(baseline?.runId);
   });
 
+  it("rediscovers a ready first projection after auto-activation is interrupted", async () => {
+    const accountId = await createAccount("initial-auto-activation-retry");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Retry first activation",
+      rfcMessageId: "<initial-auto-activation-retry@example.test>"
+    });
+
+    const ready = await drainUntilReady(accountId, { batchSize: 1 });
+    expect(ready).toMatchObject({ runStatus: "ready", active: false, ready: true });
+    expect(await activeProjection(accountId)).toHaveLength(0);
+
+    expect(await repository.listAccountsNeedingWork(10)).not.toContain(accountId);
+    expect(await repository.listAccountsNeedingWork(10, { activateInitial: true })).toContain(accountId);
+
+    const activated = await repository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test-worker",
+      activateInitial: true
+    });
+    expect(activated).toMatchObject({ runStatus: "active", active: true, ready: true });
+    expect(await activeProjection(accountId)).toHaveLength(1);
+    expect(await repository.listAccountsNeedingWork(10, { activateInitial: true })).not.toContain(accountId);
+  });
+
   it("resolves missing parents incrementally without sweeping unrelated mail", async () => {
     const accountId = await createAccount("orphan-resolution");
     await seedMessage(accountId, {

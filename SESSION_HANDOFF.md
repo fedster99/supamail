@@ -7,14 +7,16 @@
   the healthy-account phantom-`running` gap left by pool-checkout failures.
 - `THREADING_AUTO_ACTIVATE_INITIAL` is an opt-in worker setting. It uses the
   existing atomic activation checks only for a first `mode='initial'` run;
+  the scheduler keeps a ready first run eligible until activation commits, while
   rebuilds and upgrades remain explicit and comparison-gated.
 - MIME attachment evidence now hashes decoded bytes through `MailParser`'s
   attachment stream, buffering only a capped calendar payload. In `parsed_only`
   mode the complete RFC822 source now streams directly from IMAP through raw
   byte counting/SHA-256 and MIME parsing; no full source buffer is requested or
   retained. `raw_mime` mode keeps its required buffered-storage behavior.
-- Focused unit and live-Postgres regressions cover these boundaries. This is a
-  maintainer-directed reliability repair, so the feature-list state is unchanged.
+- Focused unit and live-Postgres regressions cover these boundaries, including
+  rediscovery after an interrupted first activation. This is a maintainer-directed
+  reliability repair, so the feature-list state is unchanged.
 
 ## 2026-07-17 — Threading v3 mirror and forward boundaries
 

@@ -151,9 +151,11 @@ readers require conversations immediately may set
 `THREADING_AUTO_ACTIVATE_INITIAL=true`. That option applies only when the ready
 run is `mode='initial'` and there is no baseline projection: the worker calls the
 same atomic activation path, including physical-row coverage, evidence-clock,
-and empty-queue checks. It does not auto-activate rebuilds or algorithm upgrades;
-replacement activation continues to require a reviewed, passing comparison
-certificate.
+and empty-queue checks. Run selection keeps that ready initial projection
+eligible until activation commits, so a crash or transient account-lock race
+cannot strand the first projection. It does not auto-activate rebuilds or
+algorithm upgrades; replacement activation continues to require a reviewed,
+passing comparison certificate.
 Run selection uses a persisted five-slot weighted schedule (three active, one
 standby, one building) so sustained active ingress preserves reader freshness
 without starving a shadow build or rollback projection across worker restarts.
