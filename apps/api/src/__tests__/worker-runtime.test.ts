@@ -406,7 +406,9 @@ describe("worker conversation-threading lane", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(defaultThreading.constructed).toHaveBeenCalledTimes(1);
       expect(defaultThreading.assertRolloutCompatibility).toHaveBeenCalledTimes(1);
-      expect(defaultThreading.listAccountsNeedingWork).toHaveBeenCalledWith(40);
+      expect(defaultThreading.listAccountsNeedingWork).toHaveBeenCalledWith(40, {
+        activateInitial: false
+      });
     } finally {
       runtime.stop();
       await runtime.done;
@@ -433,6 +435,7 @@ describe("worker conversation-threading lane", () => {
       ready: true,
       active: true
     }));
+    const listAccountsNeedingWork = vi.fn(async () => ["account-1"]);
     const runtime = await startWorkerRuntime({
       config: {
         SYNC_INTERVAL_MS: 60_000,
@@ -447,7 +450,7 @@ describe("worker conversation-threading lane", () => {
         syncDueSentFolders: vi.fn(async () => [])
       },
       threading: {
-        listAccountsNeedingWork: vi.fn(async () => ["account-1"]),
+        listAccountsNeedingWork,
         drainAccount
       },
       repository: {
@@ -459,6 +462,9 @@ describe("worker conversation-threading lane", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(drainAccount).toHaveBeenCalledWith("account-1", {
         requestedBy: "worker",
+        activateInitial: true
+      });
+      expect(listAccountsNeedingWork).toHaveBeenCalledWith(40, {
         activateInitial: true
       });
     } finally {

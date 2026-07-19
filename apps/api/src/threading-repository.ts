@@ -728,7 +728,10 @@ export class ThreadingRepository {
     throw this.missingExecutor(run.role, run.run_id, run.algorithm_version, run.account_id);
   }
 
-  async listAccountsNeedingWork(limit = 10): Promise<string[]> {
+  async listAccountsNeedingWork(
+    limit = 10,
+    options: Pick<DrainThreadingOptions, "activateInitial"> = {}
+  ): Promise<string[]> {
     await this.assertRolloutCompatibility();
     const bounded = Math.max(1, Math.min(Number.isFinite(limit) ? Math.floor(limit) : 10, 1_000));
     const result = await this.pool.query<{ account_id: string }>(
@@ -812,6 +815,11 @@ export class ThreadingRepository {
                     WHERE sw.run_id = building.id AND sw.available_at <= now()
                   )
                   OR building.summary->>'coverage_verified' IS DISTINCT FROM 'true'
+                  OR (
+                    $4::boolean
+                    AND active.id IS NULL
+                    AND building.mode = 'initial'
+                  )
                 )
               )
             )
@@ -849,7 +857,12 @@ export class ThreadingRepository {
       ORDER BY account.updated_at, account.id
       LIMIT $1
       `,
-      [bounded, this.currentAlgorithmVersion, [...this.algorithms.keys()]]
+      [
+        bounded,
+        this.currentAlgorithmVersion,
+        [...this.algorithms.keys()],
+        options.activateInitial === true
+      ]
     );
     return result.rows.map((row) => row.account_id);
   }
