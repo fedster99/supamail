@@ -2,7 +2,14 @@ import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { connectImap } from "./imap-connect.js";
-import { extractAttachmentMetadata, normalizeMessageId, parseHeaders, parseRawMime, selectBodyTextPart } from "./mime.js";
+import {
+  extractAttachmentMetadata,
+  normalizeMessageId,
+  parseHeaders,
+  parseRawMime,
+  parseRawMimeStream,
+  selectBodyTextPart
+} from "./mime.js";
 import {
   MAX_SYNC_ATTACHMENTS_PER_FETCH,
   MAX_SYNC_FLAG_FETCH_BYTES,
@@ -474,6 +481,11 @@ async function streamToBuffer(stream: AsyncIterable<Buffer | Uint8Array | string
   return Buffer.concat(chunks);
 }
 
+// ImapFlow downloads a full message with sequential partial FETCH commands.
+// One MiB keeps memory bounded while avoiding hundreds of 64 KiB round trips
+// for a large RFC822 source.
+const FULL_MESSAGE_DOWNLOAD_CHUNK_BYTES = 1024 * 1024;
+
 /**
  * A message UID present at metadata-sync time is no longer in its folder at
  * body-fetch time — moved by a provider filter, or deleted. Terminal and benign:
@@ -521,11 +533,15 @@ export async function fetchFullMessageBody(
       }
     }
 
-    const fetched = await client.fetchOne(String(message.uid), {
-      source: { start: 0, maxLength: config.BODY_RAW_MAX_BYTES },
+    const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
+    const fetchQuery: Record<string, unknown> = {
       bodyStructure: true,
       headers: true
-    }, { uid: true });
+    };
+    if (!streamParsedOnly) {
+      fetchQuery.source = { start: 0, maxLength: config.BODY_RAW_MAX_BYTES };
+    }
+    const fetched = await client.fetchOne(String(message.uid), fetchQuery, { uid: true });
 
     // The UID can vanish between metadata sync and this body fetch (a filter moved
     // it to another folder, or it was deleted). Treat a gone UID as a terminal,
@@ -536,29 +552,51 @@ export async function fetchFullMessageBody(
       throw new MessageMovedError(String(message.uid), message.folder_path);
     }
 
-    let rawMime: Buffer = fetched.source
-      ? (Buffer.isBuffer(fetched.source) ? fetched.source : Buffer.from(fetched.source))
-      : Buffer.alloc(0);
-    if (rawMime.length === 0) {
+    let rawMime: Buffer = Buffer.alloc(0);
+    let rawBytes = 0;
+    let rawMimeSha256: string | null | undefined;
+    let parsed;
+    if (streamParsedOnly) {
       const downloaded = await client.download(String(message.uid), undefined, {
         uid: true,
-        maxBytes: config.BODY_RAW_MAX_BYTES
+        maxBytes: config.BODY_RAW_MAX_BYTES,
+        chunkSize: Math.min(FULL_MESSAGE_DOWNLOAD_CHUNK_BYTES, config.BODY_RAW_MAX_BYTES)
       });
       if (!downloaded || !downloaded.content) {
         throw new MessageMovedError(String(message.uid), message.folder_path);
       }
-      rawMime = await streamToBuffer(downloaded.content);
+      const streamed = await parseRawMimeStream(downloaded.content);
+      rawBytes = streamed.rawBytes;
+      rawMimeSha256 = streamed.rawMimeSha256;
+      parsed = streamed;
+    } else {
+      rawMime = fetched.source
+        ? (Buffer.isBuffer(fetched.source) ? fetched.source : Buffer.from(fetched.source))
+        : Buffer.alloc(0);
+      if (rawMime.length === 0) {
+        const downloaded = await client.download(String(message.uid), undefined, {
+          uid: true,
+          maxBytes: config.BODY_RAW_MAX_BYTES,
+          chunkSize: Math.min(FULL_MESSAGE_DOWNLOAD_CHUNK_BYTES, config.BODY_RAW_MAX_BYTES)
+        });
+        if (!downloaded || !downloaded.content) {
+          throw new MessageMovedError(String(message.uid), message.folder_path);
+        }
+        rawMime = await streamToBuffer(downloaded.content);
+      }
+      rawBytes = rawMime.length;
+      parsed = await parseRawMime(rawMime);
     }
 
-    const rawBytes = rawMime.length;
     const rawTruncated = rawBytes >= config.BODY_RAW_MAX_BYTES;
+    if (rawTruncated) rawMimeSha256 = null;
     const mimeStructure = fetched && fetched.bodyStructure ? fetched.bodyStructure : message.mime_structure;
     const selected = selectBodyTextPart(mimeStructure);
-    const parsed = await parseRawMime(rawMime);
 
     return {
       messageId: message.id,
       rawMime,
+      rawMimeSha256,
       rawBytes,
       rawTruncated,
       bodyText: parsed.bodyText,
