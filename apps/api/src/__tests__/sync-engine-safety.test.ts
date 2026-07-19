@@ -4,6 +4,35 @@ import { describe, expect, it, vi } from "vitest";
 import { isConnectionLostError, isMissingMailboxError, MirrorEngine } from "../sync-engine.js";
 
 describe("sync engine safety", () => {
+  it("terminalizes a sync run when account-lock acquisition throws", async () => {
+    const finishSyncRun = vi.fn(async () => undefined);
+    const repository = {
+      getAccount: vi.fn(async () => ({ id: "account-1", lock_id: "42" })),
+      startSyncRun: vi.fn(async () => "run-1"),
+      finishSyncRun
+    };
+    const pool = {
+      connect: vi.fn(async () => {
+        throw new Error("timeout exceeded when trying to connect");
+      })
+    };
+    const engine = new MirrorEngine({
+      pool: pool as never,
+      config: {} as never,
+      repository: repository as never
+    });
+
+    await expect(engine.syncAccount("account-1", "scheduled"))
+      .rejects.toThrow("timeout exceeded when trying to connect");
+
+    expect(finishSyncRun).toHaveBeenCalledOnce();
+    expect(finishSyncRun).toHaveBeenCalledWith(expect.objectContaining({
+      runId: "run-1",
+      outcome: "failed",
+      errors: [expect.stringContaining("timeout exceeded when trying to connect")]
+    }));
+  });
+
   it("passes the worker shutdown signal into an in-flight full sync", async () => {
     const abort = new AbortController();
     const repository = {

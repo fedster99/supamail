@@ -333,6 +333,68 @@ liveDb("ThreadingRepository live DB", () => {
     expect(await activeProjection(accountId)).toEqual(shadow);
   });
 
+  it("atomically activates the first projection when the worker explicitly opts in", async () => {
+    const accountId = await createAccount("initial-auto-activation");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "First projection",
+      rfcMessageId: "<initial-auto-activation@example.test>"
+    });
+
+    let last: ThreadingRunResult | null = null;
+    for (let pass = 0; pass < 200; pass += 1) {
+      last = await repository.drainAccount(accountId, {
+        batchSize: 1,
+        requestedBy: "live-test-worker",
+        activateInitial: true
+      });
+      if (last.active) break;
+    }
+
+    expect(last).toMatchObject({
+      runStatus: "active",
+      stage: "ready",
+      ready: true,
+      active: true
+    });
+    const active = await activeProjection(accountId);
+    expect(active).toHaveLength(1);
+    expect(active[0]?.run_id).toBe(last?.runId);
+  });
+
+  it("keeps rebuilds review-gated when initial auto-activation is enabled", async () => {
+    const accountId = await createAccount("rebuild-review-gate");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Reviewed baseline",
+      rfcMessageId: "<rebuild-review-gate@example.test>"
+    });
+
+    let baseline: ThreadingRunResult | null = null;
+    for (let pass = 0; pass < 200; pass += 1) {
+      baseline = await repository.drainAccount(accountId, {
+        batchSize: 1,
+        requestedBy: "live-test-worker",
+        activateInitial: true
+      });
+      if (baseline.active) break;
+    }
+    expect(baseline?.active).toBe(true);
+
+    const rebuild = await repository.rebuildAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test-worker",
+      reason: "verify review boundary",
+      activateInitial: true
+    });
+
+    expect(rebuild).toMatchObject({ runStatus: "ready", active: false, ready: true });
+    const active = await activeProjection(accountId);
+    expect(active).toHaveLength(1);
+    expect(active[0]?.run_id).toBe(baseline?.runId);
+    expect(rebuild.runId).not.toBe(baseline?.runId);
+  });
+
   it("resolves missing parents incrementally without sweeping unrelated mail", async () => {
     const accountId = await createAccount("orphan-resolution");
     await seedMessage(accountId, {

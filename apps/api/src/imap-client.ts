@@ -536,7 +536,9 @@ export async function fetchFullMessageBody(
       throw new MessageMovedError(String(message.uid), message.folder_path);
     }
 
-    let rawMime: Buffer = fetched.source ? Buffer.from(fetched.source) : Buffer.alloc(0);
+    let rawMime: Buffer = fetched.source
+      ? (Buffer.isBuffer(fetched.source) ? fetched.source : Buffer.from(fetched.source))
+      : Buffer.alloc(0);
     if (rawMime.length === 0) {
       const downloaded = await client.download(String(message.uid), undefined, {
         uid: true,

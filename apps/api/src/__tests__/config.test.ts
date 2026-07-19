@@ -46,6 +46,21 @@ describe("config sent-folder polling", () => {
   });
 });
 
+describe("config initial thread activation", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it("is opt-in and accepts an explicit true value", () => {
+    expect(getConfig(baseEnv).THREADING_AUTO_ACTIVATE_INITIAL).toBe(false);
+    resetConfigForTests();
+    expect(getConfig({
+      ...baseEnv,
+      THREADING_AUTO_ACTIVATE_INITIAL: "true"
+    }).THREADING_AUTO_ACTIVATE_INITIAL).toBe(true);
+  });
+});
+
 describe("config sync batch bounds", () => {
   beforeEach(() => {
     resetConfigForTests();

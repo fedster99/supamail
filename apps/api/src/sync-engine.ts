@@ -582,42 +582,64 @@ export class MirrorEngine {
       }
     });
 
-    let locked = await runLockedSync();
-    // The Sent lane is supplemental. If another worker owns the account, defer
-    // to the next Sent/full pass instead of spending its bounded deadline on
-    // stale-lock recovery or emitting a false lock-busy outage. Full/manual
-    // syncs retain the recovery and failure behavior below.
-    const yieldedBeforeLock = locked === null && options.sentOnly === true;
-    if (locked === null && !yieldedBeforeLock) {
-      const recovered = await clearOrphanedLockForAccount(
-        this.pool,
-        account.lock_id,
-        this.config.STALE_HEARTBEAT_MS
-      );
-      if (recovered) {
-        locked = await runLockedSync();
+    let runFinished = false;
+    try {
+      let locked = await runLockedSync();
+      // The Sent lane is supplemental. If another worker owns the account, defer
+      // to the next Sent/full pass instead of spending its bounded deadline on
+      // stale-lock recovery or emitting a false lock-busy outage. Full/manual
+      // syncs retain the recovery and failure behavior below.
+      const yieldedBeforeLock = locked === null && options.sentOnly === true;
+      if (locked === null && !yieldedBeforeLock) {
+        const recovered = await clearOrphanedLockForAccount(
+          this.pool,
+          account.lock_id,
+          this.config.STALE_HEARTBEAT_MS
+        );
+        if (recovered) {
+          locked = await runLockedSync();
+        }
       }
-    }
 
-    if (cancellationCleanupRequired) {
-      await this.repository.markAccountSyncYielded(account.id, {
-        deadlineAt: Date.now() + SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS,
-        expectedSyncOwner: syncOwner
-      }).catch(() => undefined);
-    }
+      if (cancellationCleanupRequired) {
+        await this.repository.markAccountSyncYielded(account.id, {
+          deadlineAt: Date.now() + SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS,
+          expectedSyncOwner: syncOwner
+        }).catch(() => undefined);
+      }
 
-    applyMetadataWriteStats(result, metadataWriteStats);
+      applyMetadataWriteStats(result, metadataWriteStats);
 
-    if (locked === null && !yieldedBeforeLock) {
-      result.outcome = "failed";
-      result.errors.push("Account lock busy");
-      await this.repository.updateSyncRunStatus(runId, "failed", "Account lock busy");
+      if (locked === null && !yieldedBeforeLock) {
+        result.outcome = "failed";
+        result.errors.push("Account lock busy");
+        await this.repository.updateSyncRunStatus(runId, "failed", "Account lock busy");
+        runFinished = true;
+        return result;
+      }
+
+      await this.repository.finishSyncRun(result);
+      runFinished = true;
+      await this.hooks.onSyncRunCompleted?.(result);
       return result;
+    } catch (error) {
+      if (!runFinished) {
+        const message = sanitizeErrorReason(describeSyncError(error));
+        result.outcome = "failed";
+        if (!result.errors.includes(message)) result.errors.push(message);
+        applyMetadataWriteStats(result, metadataWriteStats);
+        try {
+          await this.repository.finishSyncRun(result);
+          runFinished = true;
+        } catch (finalizationError) {
+          throw new AggregateError(
+            [error, finalizationError],
+            `Sync run ${runId} escaped and could not be terminalized`
+          );
+        }
+      }
+      throw error;
     }
-
-    await this.repository.finishSyncRun(result);
-    await this.hooks.onSyncRunCompleted?.(result);
-    return result;
   }
 
   async fetchBody(messageId: string, force = false): Promise<boolean> {

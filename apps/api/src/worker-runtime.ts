@@ -5,7 +5,11 @@ import { closePool, getPool, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
-import { ThreadingRepository, type ThreadingRunResult } from "./threading-repository.js";
+import {
+  ThreadingRepository,
+  type DrainThreadingOptions,
+  type ThreadingRunResult
+} from "./threading-repository.js";
 import { metadataRowsPerSecond } from "./sync-engine.js";
 
 const THREADING_STEPS_PER_ACCOUNT_TICK = 10;
@@ -33,7 +37,7 @@ interface WorkerEngine {
 interface WorkerThreading {
   assertRolloutCompatibility?(): Promise<void>;
   listAccountsNeedingWork(limit?: number): Promise<string[]>;
-  drainAccount(accountId: string, options?: { requestedBy?: string }): Promise<ThreadingRunResult>;
+  drainAccount(accountId: string, options?: DrainThreadingOptions): Promise<ThreadingRunResult>;
   pruneTerminalRuns?(options?: { olderThanDays?: number; batchSize?: number }): Promise<{
     runsDeleted: number;
     assignmentsDeleted: number;
@@ -344,7 +348,10 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
         if (stopping || performance.now() >= laneDeadline) break;
         if (!unfinished.has(accountId)) continue;
         try {
-          const result = await threading.drainAccount(accountId, { requestedBy: "worker" });
+          const result = await threading.drainAccount(accountId, {
+            requestedBy: "worker",
+            activateInitial: config.THREADING_AUTO_ACTIVATE_INITIAL
+          });
           processed += result.messagesConsidered;
           changed += result.assignmentsChanged;
           if (result.busy) {

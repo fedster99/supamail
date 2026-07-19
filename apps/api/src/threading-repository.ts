@@ -236,6 +236,9 @@ export interface DrainThreadingOptions {
   maxClosureCriteriaKeys?: number;
   maxSubjectBucketMessages?: number;
   requestedBy?: string;
+  /** Activate only a completed first projection. Upgrades and rebuilds still
+   * require the normal reviewed comparison-certificate workflow. */
+  activateInitial?: boolean;
 }
 
 export interface RebuildThreadingOptions extends DrainThreadingOptions {
@@ -1089,7 +1092,29 @@ export class ThreadingRepository {
         }
       });
 
-    return result ?? { ...this.emptyResult(accountId), busy: true };
+    const drained = result ?? { ...this.emptyResult(accountId), busy: true };
+    if (
+      !options.activateInitial ||
+      !drained.ready ||
+      drained.active ||
+      drained.runStatus !== "ready" ||
+      !drained.runId
+    ) {
+      return drained;
+    }
+
+    const readyRun = await this.getRun(drained.runId);
+    if (readyRun.mode !== "initial") return drained;
+    const activated = await this.activateRun(accountId, drained.runId, {
+      requestedBy: options.requestedBy ?? "thread-worker",
+      reason: "automatic initial conversation activation"
+    });
+    return {
+      ...activated,
+      messagesConsidered: drained.messagesConsidered,
+      assignmentsChanged: drained.assignmentsChanged,
+      queueItemsProcessed: drained.queueItemsProcessed
+    };
   }
 
   async processAccount(accountId: string, options: DrainThreadingOptions = {}): Promise<ThreadingRunResult> {
@@ -1523,16 +1548,23 @@ export class ThreadingRepository {
     return result;
   }
 
-  async getRun(runId: string): Promise<{ id: string; status: RunStatus; stage: RunStage; lastError: string | null }> {
+  async getRun(runId: string): Promise<{
+    id: string;
+    mode: RunMode;
+    status: RunStatus;
+    stage: RunStage;
+    lastError: string | null;
+  }> {
     const result = await this.pool.query<{
       id: string;
+      mode: RunMode;
       status: RunStatus;
       stage: RunStage;
       last_error: string | null;
-    }>("SELECT id, status, stage, last_error FROM public.imap_thread_runs WHERE id = $1", [runId]);
+    }>("SELECT id, mode, status, stage, last_error FROM public.imap_thread_runs WHERE id = $1", [runId]);
     const row = result.rows[0];
     if (!row) throw new Error(`Threading run not found: ${runId}`);
-    return { id: row.id, status: row.status, stage: row.stage, lastError: row.last_error };
+    return { id: row.id, mode: row.mode, status: row.status, stage: row.stage, lastError: row.last_error };
   }
 
   /**
