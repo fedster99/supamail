@@ -3161,7 +3161,9 @@ export class MirrorRepository {
       );
       const rawMimeSha256 = body.rawTruncated
         ? null
-        : createHash("sha256").update(body.rawMime).digest("hex");
+        : body.rawMimeSha256 === undefined
+          ? createHash("sha256").update(body.rawMime).digest("hex")
+          : body.rawMimeSha256;
       const learnedDeliveryEvidence = rawMimeSha256 !== message.raw_mime_sha256;
       const bodyHeadersChanged = canonicalJsonForThreadingEvidence(message.body_headers_json ?? {})
         !== canonicalJsonForThreadingEvidence(body.headersJson);

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   MailParser,
   type AttachmentStream,
@@ -421,7 +423,18 @@ interface StreamedAttachmentEvidence {
   calendarContent: Buffer | null;
 }
 
-async function streamMimeEvidence(rawMime: Buffer): Promise<{
+type MimeSource = Buffer | AsyncIterable<Buffer | Uint8Array | string>;
+
+interface ParsedMimeContent {
+  bodyText: string | null;
+  bodyHtml: string | null;
+  bodyPlain: string | null;
+  headersJson: Record<string, unknown>;
+  parserWarnings: string[];
+  evidence: MessageEvidenceInput[];
+}
+
+async function streamMimeEvidence(source: MimeSource): Promise<{
   headers: Headers;
   text: string | null;
   html: string | null;
@@ -495,20 +508,24 @@ async function streamMimeEvidence(rawMime: Buffer): Promise<{
       settled = true;
       resolve({ headers, text, html, attachments });
     });
-    parser.end(rawMime);
+    if (Buffer.isBuffer(source)) {
+      parser.end(source);
+      return;
+    }
+
+    void (async () => {
+      for await (const chunk of source) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (!parser.write(buffer)) await once(parser, "drain");
+      }
+      parser.end();
+    })().catch(fail);
   });
 }
 
-export async function parseRawMime(rawMime: Buffer): Promise<{
-  bodyText: string | null;
-  bodyHtml: string | null;
-  bodyPlain: string | null;
-  headersJson: Record<string, unknown>;
-  parserWarnings: string[];
-  evidence: MessageEvidenceInput[];
-}> {
+async function parseRawMimeSource(source: MimeSource): Promise<ParsedMimeContent> {
   const parserWarnings: string[] = [];
-  const parsed = await streamMimeEvidence(rawMime);
+  const parsed = await streamMimeEvidence(source);
   const headersJson: Record<string, unknown> = {};
 
   for (const [key, value] of parsed.headers) {
@@ -587,5 +604,31 @@ export async function parseRawMime(rawMime: Buffer): Promise<{
     headersJson,
     parserWarnings,
     evidence
+  };
+}
+
+export async function parseRawMime(rawMime: Buffer): Promise<ParsedMimeContent> {
+  return await parseRawMimeSource(rawMime);
+}
+
+export async function parseRawMimeStream(
+  source: AsyncIterable<Buffer | Uint8Array | string>
+): Promise<ParsedMimeContent & { rawBytes: number; rawMimeSha256: string }> {
+  const hash = createHash("sha256");
+  let rawBytes = 0;
+  async function* tracked(): AsyncIterable<Buffer> {
+    for await (const chunk of source) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      rawBytes += buffer.length;
+      hash.update(buffer);
+      yield buffer;
+    }
+  }
+
+  const parsed = await parseRawMimeSource(tracked());
+  return {
+    ...parsed,
+    rawBytes,
+    rawMimeSha256: hash.digest("hex")
   };
 }

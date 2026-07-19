@@ -9,9 +9,10 @@
   existing atomic activation checks only for a first `mode='initial'` run;
   rebuilds and upgrades remain explicit and comparison-gated.
 - MIME attachment evidence now hashes decoded bytes through `MailParser`'s
-  attachment stream, buffering only a capped calendar payload. The IMAP source
-  buffer is reused instead of copied, so deployments can raise their explicit
-  raw-fetch ceiling without retaining multiple large attachment buffers.
+  attachment stream, buffering only a capped calendar payload. In `parsed_only`
+  mode the complete RFC822 source now streams directly from IMAP through raw
+  byte counting/SHA-256 and MIME parsing; no full source buffer is requested or
+  retained. `raw_mime` mode keeps its required buffered-storage behavior.
 - Focused unit and live-Postgres regressions cover these boundaries. This is a
   maintainer-directed reliability repair, so the feature-list state is unchanged.
 

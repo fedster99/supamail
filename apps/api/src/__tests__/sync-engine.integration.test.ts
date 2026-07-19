@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { closePool, getPool } from "../db.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
@@ -1239,15 +1240,20 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const h = await setupIntegration("G-parsed-only-bodies", { BODY_STORAGE_MODE: "parsed_only" });
     activeAccountIds.push(h.account.id);
     await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const fixtureMessage = makeTextMessage({
+      uid: 1,
+      subject: "parsed",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "parsed-only body"
+    });
     const folders: FixtureFolder[] = [
       {
         path: "INBOX",
         delimiter: "/",
         specialUse: "\\Inbox",
         uidValidity: 410,
-        messages: [
-          makeTextMessage({ uid: 1, subject: "parsed", from: "a@x.test", to: "u@x.test", body: "parsed-only body" })
-        ]
+        messages: [fixtureMessage]
       }
     ];
 
@@ -1260,13 +1266,15 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const body = (
       await h.pool.query<{
         raw_mime: Buffer | null;
+        raw_mime_sha256: string | null;
         raw_bytes: string;
         raw_truncated: boolean;
         body_text: string | null;
         body_plain: string | null;
       }>(
         `
-        SELECT b.raw_mime, b.raw_bytes::text, b.raw_truncated, b.body_text, b.body_plain
+        SELECT b.raw_mime, b.raw_mime_sha256, b.raw_bytes::text,
+               b.raw_truncated, b.body_text, b.body_plain
         FROM public.imap_message_bodies b
         JOIN public.imap_messages m ON m.id = b.message_id
         WHERE m.account_id = $1
@@ -1275,6 +1283,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       )
     ).rows[0];
     expect(body.raw_mime).toBeNull();
+    expect(body.raw_mime_sha256).toBe(createHash("sha256").update(fixtureMessage.raw).digest("hex"));
     expect(Number(body.raw_bytes)).toBeGreaterThan(0);
     expect(body.raw_truncated).toBe(false);
     expect(`${body.body_text ?? ""}${body.body_plain ?? ""}`).toContain("parsed-only body");

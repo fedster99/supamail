@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 import {
   fetchFullMessageBody,
@@ -173,6 +174,45 @@ describe("fetchFullMessageBody mailbox locking", () => {
     expect(body.rawTruncated).toBe(true);
     expect(body.evidence).toEqual([]);
     expect(body.parserWarnings).toContain("artifact_evidence_omitted_raw_truncated");
+  });
+
+  it("streams parsed-only MIME without requesting or retaining a source buffer", async () => {
+    const fixture = makeTextMessage({
+      uid: 1273,
+      subject: "Stream me",
+      from: "a@example.test",
+      to: "b@example.test",
+      body: "parsed-only body"
+    });
+    const client = new FixtureImapClient([{
+      path: "INBOX.Notes",
+      delimiter: ".",
+      uidValidity: 1,
+      messages: [fixture]
+    }]);
+    const fetchOne = vi.spyOn(client, "fetchOne");
+    const download = vi.spyOn(client, "download");
+
+    const body = await fetchFullMessageBody(
+      client,
+      {
+        BODY_RAW_MAX_BYTES: 25 * 1024 * 1024,
+        BODY_STORAGE_MODE: "parsed_only"
+      } as unknown as AppConfig,
+      notesMessage
+    );
+
+    expect(fetchOne.mock.calls[0]?.[1]).not.toHaveProperty("source");
+    expect(download).toHaveBeenCalledOnce();
+    expect(download).toHaveBeenCalledWith("1273", undefined, {
+      uid: true,
+      maxBytes: 25 * 1024 * 1024,
+      chunkSize: 1024 * 1024
+    });
+    expect(body.rawMime).toHaveLength(0);
+    expect(body.rawBytes).toBe(fixture.raw.length);
+    expect(body.rawMimeSha256).toBe(createHash("sha256").update(fixture.raw).digest("hex"));
+    expect(body.bodyText).toContain("parsed-only body");
   });
 
   it("reuses the selected mailbox without re-locking when skipMailboxLock is set (no nested-lock deadlock)", async () => {

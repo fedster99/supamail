@@ -210,6 +210,8 @@ export interface ImapMessage {
 export interface MessageBodyInput {
   messageId: string;
   rawMime: Buffer;
+  /** Precomputed while streaming when raw MIME retention is disabled. */
+  rawMimeSha256?: string | null;
   rawBytes: number;
   rawTruncated: boolean;
   bodyText: string | null;
