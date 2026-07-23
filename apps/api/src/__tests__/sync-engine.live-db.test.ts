@@ -2046,6 +2046,51 @@ liveDb("live DB reliability lane", () => {
     expect(types).not.toContain("PRUNE_TEST_OLD");
   });
 
+  it("records partial, retryable, and terminal health transitions", async () => {
+    const h = await setupIntegration("live-health-transitions");
+    activeAccountIds.push(h.account.id);
+
+    await h.repository.markAccountSyncPartial(h.account.id, "ROUND_ROBIN_FOLDER_FAILED");
+    await h.repository.markAccountSyncFailed(h.account.id, "NETWORK_TIMEOUT");
+    await h.repository.markAccountSyncAuthFailed(h.account.id, "invalid credentials");
+
+    const transitions = await h.pool.query<{
+      previous_state: string;
+      next_state: string;
+      next_reason: string | null;
+    }>(
+      `
+      SELECT
+        payload->>'previous_state' AS previous_state,
+        payload->>'next_state' AS next_state,
+        payload->>'next_reason' AS next_reason
+      FROM public.imap_sync_events
+      WHERE account_id = $1
+        AND event_type = 'SYNC_HEALTH_CHANGED'
+      ORDER BY occurred_at
+      `,
+      [h.account.id]
+    );
+
+    expect(transitions.rows).toEqual([
+      {
+        previous_state: "INITIAL_SYNC",
+        next_state: "DEGRADED",
+        next_reason: "ROUND_ROBIN_FOLDER_FAILED"
+      },
+      {
+        previous_state: "DEGRADED",
+        next_state: "DEGRADED",
+        next_reason: "NETWORK_TIMEOUT"
+      },
+      {
+        previous_state: "DEGRADED",
+        next_state: "BROKEN",
+        next_reason: "AUTH_ERROR: invalid credentials"
+      }
+    ]);
+  });
+
   it("degrades on a recent UIDVALIDITY reset, then returns HEALTHY once the reset ages out", async () => {
     const h = await setupIntegration("live-reset-degraded", { RECENT_UIDVALIDITY_RESET_DEGRADED_MS: 60 * 60_000 });
     activeAccountIds.push(h.account.id);
@@ -2075,6 +2120,10 @@ liveDb("live DB reliability lane", () => {
         "SELECT sync_state, sync_state_reason FROM public.imap_accounts WHERE id = $1",
         [h.account.id]
       )).rows[0];
+    await h.pool.query(
+      "DELETE FROM public.imap_sync_events WHERE account_id = $1 AND event_type = 'SYNC_HEALTH_CHANGED'",
+      [h.account.id]
+    );
 
     // A reset within the window → DEGRADED with the reset reason (not straight HEALTHY).
     await makeCleanWithReset("now()");
@@ -2090,6 +2139,31 @@ liveDb("live DB reliability lane", () => {
     const aged = await readState();
     expect(aged.sync_state).toBe("HEALTHY");
     expect(aged.sync_state_reason).toBeNull();
+
+    const transitions = await h.pool.query<{ payload: Record<string, string | null> }>(
+      `
+      SELECT payload
+      FROM public.imap_sync_events
+      WHERE account_id = $1
+        AND event_type = 'SYNC_HEALTH_CHANGED'
+      ORDER BY occurred_at
+      `,
+      [h.account.id]
+    );
+    expect(transitions.rows.map((row) => row.payload)).toEqual([
+      {
+        previous_state: "INITIAL_SYNC",
+        previous_reason: "INITIAL_SYNC_IN_PROGRESS",
+        next_state: "DEGRADED",
+        next_reason: "RECENT_UIDVALIDITY_RESET"
+      },
+      {
+        previous_state: "DEGRADED",
+        previous_reason: "RECENT_UIDVALIDITY_RESET",
+        next_state: "HEALTHY",
+        next_reason: null
+      }
+    ]);
   });
 });
 
