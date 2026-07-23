@@ -1,7 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
-import { normalizeFlags } from "../repository.js";
+import { describe, expect, it, vi } from "vitest";
+import type { AppConfig } from "../config.js";
+import type { PgPool } from "../db.js";
+import { MirrorRepository, normalizeFlags } from "../repository.js";
+import type { AccountSummary } from "../types.js";
 
 describe("repository safety", () => {
   it("normalizes IMAP flags for stable diffing", () => {
@@ -139,7 +142,7 @@ describe("repository safety", () => {
     expect(source).toContain("!manuallyTracked");
   });
 
-  it("updates only mutable account lane settings", async () => {
+  it("updates only mutable account settings", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("updateAccountSettings");
@@ -147,7 +150,29 @@ describe("repository safety", () => {
     expect(source).toContain("archive_refresh_interval = COALESCE($3::text, archive_refresh_interval)");
     expect(source).toContain("archive_flag_sync = COALESCE($4::boolean, archive_flag_sync)");
     expect(source).toContain("max_backfill_rate = COALESCE($5::text, max_backfill_rate)");
+    expect(source).toContain("body_fetch_policy = COALESCE($6::text, body_fetch_policy)");
     expect(source).not.toContain("live_window_days =");
+  });
+
+  it("persists a body fetch policy and returns the updated account", async () => {
+    const updated = {
+      id: "00000000-0000-4000-8000-000000000001",
+      body_fetch_policy: "immediate"
+    } as AccountSummary;
+    const query = vi.fn(async () => ({ rows: [updated] }));
+    const repository = new MirrorRepository(
+      { query } as unknown as PgPool,
+      {} as AppConfig
+    );
+
+    await expect(repository.updateAccountSettings(updated.id, {
+      bodyFetchPolicy: "immediate"
+    })).resolves.toBe(updated);
+
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("body_fetch_policy = COALESCE($6::text, body_fetch_policy)"),
+      [updated.id, null, null, null, null, "immediate"]
+    );
   });
 
   it("rejects account settings patches that try to mutate live_window_days", async () => {

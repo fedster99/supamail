@@ -4,6 +4,7 @@ import { closePool, getPool } from "../db.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { MirrorImapClient } from "../imap-client.js";
 import { resetConfigForTests } from "../config.js";
+import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
 import {
   backdateMissingSince,
@@ -2671,6 +2672,332 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         expect.objectContaining({ path: "Archive", headers_pct: 100, bodies_pct: 50 })
       ])
     });
+  });
+
+  it("Scenario R — account body progress follows current live rows and rejects truncated bodies", async () => {
+    const h = await setupIntegration("R-row-accurate-body-progress", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET historical_backfill_mode = 'off' WHERE id = $1",
+      [h.account.id]
+    );
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 72_001,
+        messages: [
+          makeTextMessage({ uid: 1, subject: "initial", from: "a@x.test", to: "u@x.test", body: "one" })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders });
+
+    expect((await engine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+
+    const initialMessageId = (
+      await h.pool.query<{ id: string }>(
+        `
+        SELECT id
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = 'INBOX'
+          AND uid = 1
+        `,
+        [h.account.id]
+      )
+    ).rows[0].id;
+    const initialRawMime = Buffer.from("Subject: initial\r\n\r\none");
+    await h.repository.storeBody({
+      messageId: initialMessageId,
+      rawMime: initialRawMime,
+      rawBytes: initialRawMime.length,
+      rawTruncated: false,
+      bodyText: "one",
+      bodyHtml: null,
+      bodyPlain: "one",
+      selectedTextPart: "1",
+      selectedTextFormat: "plain",
+      headersJson: {},
+      mimeStructure: null,
+      parserWarnings: [],
+      evidence: []
+    });
+
+    folders[0].messages.push(
+      makeTextMessage({ uid: 2, subject: "after snapshot", from: "b@x.test", to: "u@x.test", body: "two" })
+    );
+    await dueAllFolders(h.pool, h.account.id);
+    expect((await engine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+
+    const addedMessageId = (
+      await h.pool.query<{ id: string }>(
+        `
+        SELECT id
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = 'INBOX'
+          AND uid = 2
+        `,
+        [h.account.id]
+      )
+    ).rows[0].id;
+    const truncatedRawMime = Buffer.from("Subject: after snapshot\r\n\r\ntwo");
+    await h.repository.storeBody({
+      messageId: addedMessageId,
+      rawMime: truncatedRawMime,
+      rawBytes: truncatedRawMime.length,
+      rawTruncated: true,
+      bodyText: "two",
+      bodyHtml: null,
+      bodyPlain: "two",
+      selectedTextPart: "1",
+      selectedTextFormat: "plain",
+      headersJson: {},
+      mimeStructure: null,
+      parserWarnings: ["raw_mime_truncated"],
+      evidence: []
+    });
+
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_folders (
+        account_id, path, tracked, sync_priority, status, missing_since,
+        initial_sync_complete, live_window_target_count
+      )
+      VALUES
+        ($1, 'Untracked', false, 100, 'ACTIVE', NULL, true, 1),
+        ($1, 'MissingSince', true, 100, 'ACTIVE', now(), true, 1),
+        ($1, 'Pending', true, 100, 'PENDING_VERIFICATION', NULL, true, 1)
+      `,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_messages (
+        account_id, folder_path, uidvalidity, uid, internal_date,
+        subject, body_fetched_at, deleted_in_provider, window_status
+      )
+      VALUES
+        ($1, 'INBOX', 72001, 3, now(), 'parsed-only complete', now(), false, 'IN_WINDOW'),
+        ($1, 'INBOX', 72001, 4, now(), 'marker without body', now(), false, 'IN_WINDOW'),
+        ($1, 'INBOX', 72001, 5, now(), 'provider deleted', NULL, true, 'IN_WINDOW'),
+        ($1, 'INBOX', 72001, 6, now(), 'historical', NULL, false, 'HISTORICAL'),
+        ($1, 'Untracked', 72002, 1, now(), 'untracked', NULL, false, 'IN_WINDOW'),
+        ($1, 'MissingSince', 72003, 1, now(), 'missing since', NULL, false, 'IN_WINDOW'),
+        ($1, 'Pending', 72004, 1, now(), 'pending verification', NULL, false, 'IN_WINDOW')
+      `,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_message_bodies (
+        message_id, raw_mime, raw_bytes, raw_truncated, body_text
+      )
+      SELECT id, NULL, 20, false, 'parsed-only complete'
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = 'INBOX'
+        AND uidvalidity = 72001
+        AND uid = 3
+      `,
+      [h.account.id]
+    );
+
+    const folderProgress = (
+      await h.pool.query<{
+        headers_synced_count: number;
+        bodies_fetched_count: number;
+        live_window_target_count: number | null;
+      }>(
+        `
+        SELECT headers_synced_count, bodies_fetched_count, live_window_target_count
+        FROM public.imap_folders
+        WHERE account_id = $1
+          AND path = 'INBOX'
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(folderProgress).toEqual({
+      headers_synced_count: 2,
+      bodies_fetched_count: 2,
+      live_window_target_count: 1
+    });
+
+    const progress = (
+      await h.pool.query<{
+        live_headers_synced_count: number;
+        live_headers_target_count: number;
+        live_headers_complete_pct: number;
+        priority_bodies_fetched_count: number;
+        priority_bodies_target_count: number;
+        priority_bodies_complete_pct: number;
+        live_bodies_fetched_count: number;
+        live_bodies_target_count: number;
+        live_bodies_complete_pct: number;
+      }>(
+        `
+        SELECT
+          live_headers_synced_count,
+          live_headers_target_count,
+          live_headers_complete_pct,
+          priority_bodies_fetched_count,
+          priority_bodies_target_count,
+          priority_bodies_complete_pct,
+          live_bodies_fetched_count,
+          live_bodies_target_count,
+          live_bodies_complete_pct
+        FROM public.imap_account_progress
+        WHERE account_id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(progress).toEqual({
+      live_headers_synced_count: 1,
+      live_headers_target_count: 3,
+      live_headers_complete_pct: 33,
+      priority_bodies_fetched_count: 2,
+      priority_bodies_target_count: 4,
+      priority_bodies_complete_pct: 50,
+      live_bodies_fetched_count: 2,
+      live_bodies_target_count: 4,
+      live_bodies_complete_pct: 50
+    });
+
+    const details = await h.repository.getAccountDetails(h.account.id);
+    expect(details?.folders).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "INBOX",
+        bodies_fetched_count: 2,
+        live_bodies_fetched_count: 2,
+        live_bodies_target_count: 4,
+        bodies_pct: 50
+      }),
+      expect.objectContaining({
+        path: "Untracked",
+        live_bodies_fetched_count: 0,
+        live_bodies_target_count: 1,
+        bodies_pct: 0
+      }),
+      expect.objectContaining({
+        path: "MissingSince",
+        live_bodies_fetched_count: 0,
+        live_bodies_target_count: 1,
+        bodies_pct: 0
+      }),
+      expect.objectContaining({
+        path: "Pending",
+        live_bodies_fetched_count: 0,
+        live_bodies_target_count: 1,
+        bodies_pct: 0
+      })
+    ]));
+  });
+
+  it("Scenario S — settings PATCH makes an existing non-priority live body eligible on the next sync", async () => {
+    const h = await setupIntegration("S-live-body-policy-transition", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+
+    await h.repository.updateAccountSettings(h.account.id, {
+      bodyFetchPolicy: "priority_then_backfill",
+      historicalBackfillMode: "off"
+    });
+
+    const folders: FixtureFolder[] = [
+      {
+        path: "Archive",
+        delimiter: "/",
+        uidValidity: 73_001,
+        messages: [
+          makeTextMessage({
+            uid: 1,
+            subject: "non-priority backlog",
+            from: "a@x.test",
+            to: "u@x.test",
+            body: "fetch after policy change"
+          })
+        ]
+      }
+    ];
+    const engine = h.buildEngine({ folders });
+
+    const first = await engine.syncAccount(h.account.id, "manual");
+    expect(first.outcome).toBe("success");
+    expect(first.bodiesFetched).toBe(0);
+
+    const before = await h.pool.query<{ count: string }>(
+      `
+      SELECT count(*)::text AS count
+      FROM public.imap_message_bodies b
+      JOIN public.imap_messages m ON m.id = b.message_id
+      WHERE m.account_id = $1
+      `,
+      [h.account.id]
+    );
+    expect(before.rows[0].count).toBe("0");
+
+    const app = createApiApp({
+      apiToken: "api-token",
+      adminToken: null,
+      repository: h.repository,
+      engine,
+      applyMigration: async () => undefined,
+      send: (async () => {
+        throw new Error("not used");
+      }) as never,
+      search: (async () => {
+        throw new Error("not used");
+      }) as never,
+      drafts: {} as never,
+      mutations: {} as never,
+      content: {} as never
+    });
+    const headers = {
+      authorization: "Bearer api-token",
+      "content-type": "application/json"
+    };
+
+    const patch = await app.request(`/accounts/${h.account.id}/settings`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ bodyFetchPolicy: "immediate" })
+    });
+    expect(patch.status).toBe(200);
+    await expect(patch.json()).resolves.toMatchObject({
+      account: { body_fetch_policy: "immediate" }
+    });
+
+    const sync = await app.request(`/accounts/${h.account.id}/sync`, {
+      method: "POST",
+      headers
+    });
+    expect(sync.status).toBe(200);
+    await expect(sync.json()).resolves.toMatchObject({
+      result: {
+        outcome: "success",
+        bodiesFetched: 1
+      }
+    });
+
+    const after = await h.pool.query<{ count: string }>(
+      `
+      SELECT count(*)::text AS count
+      FROM public.imap_message_bodies b
+      JOIN public.imap_messages m ON m.id = b.message_id
+      WHERE m.account_id = $1
+      `,
+      [h.account.id]
+    );
+    expect(after.rows[0].count).toBe("1");
   });
 });
 

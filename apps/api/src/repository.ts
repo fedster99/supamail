@@ -612,43 +612,63 @@ export class MirrorRepository {
 
     const folders = await this.pool.query<FolderProgress>(
       `
+      WITH live_body_progress AS (
+        SELECT
+          m.folder_path,
+          count(*)::int AS live_bodies_target_count,
+          count(*) FILTER (
+            WHERE b.message_id IS NOT NULL
+              AND NOT b.raw_truncated
+          )::int AS live_bodies_fetched_count
+        FROM public.imap_messages m
+        LEFT JOIN public.imap_message_bodies b
+          ON b.message_id = m.id
+        WHERE m.account_id = $1
+          AND m.deleted_in_provider = false
+          AND m.window_status = 'IN_WINDOW'
+        GROUP BY m.folder_path
+      )
       SELECT
-        id,
-        path,
-        tracked,
-        status,
-        sync_priority,
-        headers_synced_count,
-        bodies_fetched_count,
-        live_window_target_count,
-        historical_target_count,
+        f.id,
+        f.path,
+        f.tracked,
+        f.status,
+        f.sync_priority,
+        f.headers_synced_count,
+        f.bodies_fetched_count,
+        f.live_window_target_count,
+        f.historical_target_count,
+        COALESCE(b.live_bodies_fetched_count, 0) AS live_bodies_fetched_count,
+        COALESCE(b.live_bodies_target_count, 0) AS live_bodies_target_count,
         CASE
-          WHEN COALESCE(live_window_target_count, 0) > 0
-            THEN LEAST(100, round((LEAST(headers_synced_count, live_window_target_count)::numeric / live_window_target_count::numeric) * 100)::int)
-          WHEN live_window_target_count IS NOT NULL THEN 100
+          WHEN COALESCE(f.live_window_target_count, 0) > 0
+            THEN LEAST(100, round((LEAST(f.headers_synced_count, f.live_window_target_count)::numeric / f.live_window_target_count::numeric) * 100)::int)
+          WHEN f.live_window_target_count IS NOT NULL THEN 100
           ELSE 0
         END AS headers_pct,
         CASE
-          WHEN COALESCE(live_window_target_count, 0) > 0
-            THEN LEAST(100, round((LEAST(bodies_fetched_count, live_window_target_count)::numeric / live_window_target_count::numeric) * 100)::int)
-          WHEN live_window_target_count IS NOT NULL THEN 100
+          WHEN COALESCE(b.live_bodies_target_count, 0) > 0
+            THEN round((b.live_bodies_fetched_count::numeric / b.live_bodies_target_count::numeric) * 100)::int
+          WHEN f.live_window_target_count IS NOT NULL THEN 100
           ELSE 0
         END AS bodies_pct,
         CASE
-          WHEN COALESCE(historical_target_count, 0) > 0
-            THEN LEAST(100, round((GREATEST(headers_synced_count - COALESCE(live_window_target_count, 0), 0)::numeric / historical_target_count::numeric) * 100)::int)
-          WHEN historical_target_count IS NOT NULL THEN 100
+          WHEN COALESCE(f.historical_target_count, 0) > 0
+            THEN LEAST(100, round((GREATEST(f.headers_synced_count - COALESCE(f.live_window_target_count, 0), 0)::numeric / f.historical_target_count::numeric) * 100)::int)
+          WHEN f.historical_target_count IS NOT NULL THEN 100
           ELSE 0
         END AS historical_headers_pct,
         CASE
-          WHEN COALESCE(historical_target_count, 0) > 0
-            THEN LEAST(100, round((GREATEST(bodies_fetched_count - COALESCE(live_window_target_count, 0), 0)::numeric / historical_target_count::numeric) * 100)::int)
-          WHEN historical_target_count IS NOT NULL THEN 100
+          WHEN COALESCE(f.historical_target_count, 0) > 0
+            THEN LEAST(100, round((GREATEST(f.bodies_fetched_count - COALESCE(f.live_window_target_count, 0), 0)::numeric / f.historical_target_count::numeric) * 100)::int)
+          WHEN f.historical_target_count IS NOT NULL THEN 100
           ELSE 0
         END AS historical_bodies_pct
-      FROM public.imap_folders
-      WHERE account_id = $1
-      ORDER BY sync_priority, path
+      FROM public.imap_folders f
+      LEFT JOIN live_body_progress b
+        ON b.folder_path = f.path
+      WHERE f.account_id = $1
+      ORDER BY f.sync_priority, f.path
       `,
       [id]
     );
@@ -661,7 +681,8 @@ export class MirrorRepository {
 
   async updateAccountSettings(accountId: string, input: UpdateAccountSettingsInput): Promise<AccountSummary | null> {
     if (
-      input.historicalBackfillMode === undefined
+      input.bodyFetchPolicy === undefined
+      && input.historicalBackfillMode === undefined
       && input.archiveRefreshInterval === undefined
       && input.archiveFlagSync === undefined
       && input.maxBackfillRate === undefined
@@ -680,7 +701,8 @@ export class MirrorRepository {
         historical_backfill_mode = COALESCE($2::text, historical_backfill_mode),
         archive_refresh_interval = COALESCE($3::text, archive_refresh_interval),
         archive_flag_sync = COALESCE($4::boolean, archive_flag_sync),
-        max_backfill_rate = COALESCE($5::text, max_backfill_rate)
+        max_backfill_rate = COALESCE($5::text, max_backfill_rate),
+        body_fetch_policy = COALESCE($6::text, body_fetch_policy)
       WHERE id = $1
       RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
       `,
@@ -689,7 +711,8 @@ export class MirrorRepository {
         input.historicalBackfillMode ?? null,
         input.archiveRefreshInterval ?? null,
         input.archiveFlagSync ?? null,
-        input.maxBackfillRate ?? null
+        input.maxBackfillRate ?? null,
+        input.bodyFetchPolicy ?? null
       ]
     );
     return result.rows[0] ?? null;

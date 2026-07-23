@@ -17,7 +17,9 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Full MIME/body data belongs in `imap_message_bodies`; message list rows stay metadata-oriented.
 - Attachment metadata is stored during sync; binary attachment fetching is not part of the current core path.
 - Body backlog draining is capped per tick so recent-body work cannot consume the whole lock window forever.
-- Progress counters live on `imap_folders` and must be updated in the same write path as the underlying header/body state they summarize.
+- Current live and priority body coverage must derive from active `IN_WINDOW` `imap_messages` in tracked folders whose `missing_since` is NULL and whose status is neither `MISSING` nor `PENDING_VERIFICATION`, excluding provider-deleted rows. A body is complete only when its `imap_message_bodies` row exists and `raw_truncated = false`.
+- A truncated body remains incomplete coverage but must not enter an automatic retry loop. Use explicit body refetch only after correcting the cause; raise `BODY_RAW_MAX_BYTES` first when the configured cap caused truncation.
+- Progress counters live on `imap_folders` and must be updated in the same write path as the underlying header/body state they summarize. They are cumulative telemetry, not the source of truth for current live or priority body completeness.
 
 ## Conversation Threading
 
@@ -112,7 +114,9 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Initial sync SEARCH/FETCH work is bounded by `INITIAL_SYNC_BATCH_TIMEOUT_MS`; a timeout aborts the IMAP client and must not advance the initial-sync watermark.
 - A failed initial sync batch must not advance watermarks.
 - `live_window_days` is immutable after account creation in v0.1; changing it requires a future window-status migration story.
-- `imap_account_progress` is a roll-up view over folder counters. It is a read model, not an independent source of truth.
+- `PATCH /accounts/:id/settings` may change `bodyFetchPolicy` only to `immediate`, `lazy`, or `priority_then_backfill`. The endpoint stays strict and rejects invalid, empty, or unknown input.
+- `immediate` includes every active live-window message in the automatic body lane. `lazy` disables automatic backlog fetch. `priority_then_backfill` includes only priority folders and does not promise later live-body coverage for current non-priority folders.
+- `imap_account_progress` is a read model. Live and priority body fields come from current message/body rows; header and historical fields still use cumulative folder counters. Per-folder `live_bodies_fetched_count`, `live_bodies_target_count`, and `bodies_pct` use current nondeleted `IN_WINDOW` rows and complete non-truncated body rows for every returned folder. Because the folder list includes inactive folders, its targets need not sum to the active account target. Migration `0021_row_accurate_body_progress` adds `imap_messages_live_body_progress_idx` on `(account_id, folder_path, id)` for active `IN_WINDOW` rows. Large existing mirrors must prebuild that exact index concurrently before applying the transactional migration.
 - Account sync runs as three ordered lanes under one advisory lock: hot metadata/reconcile, capped live body backlog, then history.
 - History lane work must never run before hot sync or the live body lane, and it must stop when the cooperative lock budget is exhausted.
 - Historical backfill uses the folder `backfill_*` state and `last_archive_refresh_at`; it snapshots older-than-window UIDs and walks them newest-first in resumable batches.

@@ -17,7 +17,7 @@ The grilling resolved both into a single coherent plan: ship the reliability har
 
 To the user / API consumer:
 
-> Your email shows up in the database within minutes. Bodies for INBOX and Sent are usually current within hours. Bodies for older folders fill in over days, then weeks for the deep archive. We never lose an email. Search reliability scales with body completeness, and progress columns tell you what to trust at any moment.
+> Your email shows up in the database within minutes. Live bodies follow the account policy: `immediate` covers all tracked live folders, while `priority_then_backfill` covers only priority folders. Historical backfill handles older-than-window mail separately. Search reliability scales with body completeness, and progress columns describe the current evidence you can trust.
 
 To agents / contributors:
 
@@ -53,19 +53,37 @@ A new account is considered "onboarded" when live-window metadata (headers + env
 - Search lives downstream of SupaMail. SupaMail's job is to surface completeness clearly so search consumers can degrade gracefully. SupaMail does not implement search.
 - `live_window_days` is immutable after account creation in v0.1. Changing it requires a migration story we haven't built.
 
-### D4: Progress signal — incremental per-folder counters, per-account roll-up via view
+### D4: Progress signal — cumulative telemetry plus row-accurate live coverage
 
-Per-folder counters live as **columns on `imap_folders`** — `headers_synced_count`, `bodies_fetched_count`, `live_window_target_count`, `historical_target_count` — updated incrementally:
+Per-folder counters live as **columns on `imap_folders`** — `headers_synced_count`, `bodies_fetched_count`, `live_window_target_count`, `historical_target_count` — and are updated incrementally:
 
 - `headers_synced_count` increments in `repository.upsertMessages` when a NEW row is inserted (the `ON CONFLICT` path is a no-op for the counter).
-- `bodies_fetched_count` increments in `repository.storeBody`.
+- `bodies_fetched_count` increments in `repository.storeBody`, including a stored truncated fetch.
 - `live_window_target_count` is set in `setInitialSyncSnapshot` (size of the snapshot UID set).
 - `historical_target_count` is set when the history lane records its initial snapshot for the folder (PR-8).
 - On a UIDVALIDITY reset, `handleUidValidityReset` zeros the live counts and clears live/history targets — the folder rebuilds from scratch.
 
-The per-account roll-up is a Postgres **VIEW** (not a materialized view) that runs cheap `SUM()` aggregates across the folder rows. No refresh management. Costs one extra index-friendly scan per `GET /accounts/:id` call, which is acceptable for the request volume this surface sees.
+These counters are cumulative telemetry. They remain the basis for live-header
+and historical progress, but they are not proof of current live body
+completeness.
+
+ADR 0027 refines the live and priority body fields. The
+`imap_account_progress` Postgres **VIEW** derives their targets from current
+`imap_messages` rows that are `IN_WINDOW`, not deleted at the provider, and in
+tracked folders whose `missing_since` is NULL and whose status is neither
+`MISSING` nor `PENDING_VERIFICATION`. It counts a fetched body only when the
+matching `imap_message_bodies` row exists and `raw_truncated = false`. Priority
+coverage also requires `sync_priority <= 10`. Migration
+`0021_row_accurate_body_progress` adds the partial
+`imap_messages_live_body_progress_idx` for this account/folder/message access
+path. Large existing mirrors must prebuild that exact index concurrently before
+applying the transactional migration. The view requires no refresh management.
 
 Both per-folder and per-account values are exposed via `GET /accounts/:id`.
+Each folder adds row-current `live_bodies_fetched_count` and
+`live_bodies_target_count`; `bodies_pct` uses those fields instead of the
+cumulative body counter. Folder rows also cover inactive folders, so their
+targets do not always sum to the active account target.
 
 API surface:
 
@@ -137,6 +155,13 @@ Type-safe columns, not JSONB. SQL `CHECK` constraints document and enforce allow
 No daily token-bucket counter. The natural rate limit is the IMAP throttle + lock budget + tick interval; provider-side throttling handles the rest. `aggressive` is honest about what it actually means.
 
 `live_window_days` is **immutable after account creation in v0.1**. The API rejects PATCH to this field. A future migration may add change support; for now, just lock it in.
+
+`body_fetch_policy` predates these five history-lane columns, but ADR 0027 makes
+it mutable through the same settings endpoint. `PATCH /accounts/:id/settings`
+accepts `bodyFetchPolicy` as `immediate`, `lazy`, or
+`priority_then_backfill`. The last option fetches only priority-folder bodies
+from the current live window; it does not defer the remaining current folders
+to the older-than-window history lane.
 
 ### D7: Stuck-degraded escalation — new column, retryable BROKEN
 
@@ -265,6 +290,14 @@ FROM public.imap_accounts a;
 
 Computed columns: `live_headers_complete_pct`, `priority_bodies_complete_pct`, `live_bodies_complete_pct`, `historical_headers_complete_pct`, `historical_bodies_complete_pct`, `estimated_full_sync_at`.
 
+Migration `0021_row_accurate_body_progress` replaces this view so live and
+priority body counts come from active live message/body rows. Folder counters
+continue to supply header and historical fields. Truncated body rows count as
+incomplete and do not cause automatic retry loops. The migration adds
+`imap_messages_live_body_progress_idx` on `(account_id, folder_path, id)` for
+active `IN_WINDOW` rows. Large existing mirrors must prebuild this exact index
+concurrently before the transactional migration runs.
+
 ## Code Changes Summary
 
 By module, what changes:
@@ -272,7 +305,7 @@ By module, what changes:
 - **`apps/api/src/config.ts`** — `FOLDER_COUNT_WARN_THRESHOLD` (50) and `FOLDER_COUNT_ENFORCE_THRESHOLD` (200) are now wired. `INITIAL_SYNC_BATCH_TIMEOUT_MS`, `MAX_BODY_BATCHES_PER_TICK`, `MAX_LOCK_HOLD_MS`, and the stuck-degraded thresholds are also wired (see D5, D7, and D8).
 - **`apps/api/src/sync-engine.ts`** — thread `deadline` into hot/body/history phases with the two-tier semantics from D5. Add `isMissingMailboxError(err)` helper alongside `isAuthError`, preferring `err.serverResponseCode` over message regex. Wrap `runInitialSyncBatch` in `withOperationDeadline` (D8). Add missing-mailbox detection in `syncFolder`'s catch (D10). Add the history lane as a new method called after `fetchBodyBacklog`, sliced by `max_backfill_rate`. Thread `hitLockBudget` flag through `SyncResult`. `fetchBodyBacklog` becomes deadline-aware and capped at `MAX_BODY_BATCHES_PER_TICK`. **Landed through PR-8.**
 - **`apps/api/src/repository.ts`** — update `markAccountSyncSucceeded`/`Partial` to write `last_priority_sync_succeeded_at`; update `markAccountSyncFailed` to add the `STUCK_DEGRADED_24H` / `STUCK_DEGRADED_TERMINAL` branches, including the `backoff_until = now() + interval '1 hour'` write on retryable escalation. Update `getRunnableAccounts`'s WHERE clause to allow `BROKEN` accounts whose reason is `STUCK_DEGRADED_24H` (composing with the existing `backoff_until` filter). Update `upsertDiscoveredFolders` and `markAccountSyncSucceeded` for folder-count cap thresholds (D9). Update `getFoldersDueForSync` to skip `PENDING_VERIFICATION` and discovery to revive it (D10 partial). Add `markFolderPendingVerification` and manual folder opt-in for PR-5. Later PRs update `upsertMessages`, `storeBody`, `setInitialSyncSnapshot`, `handleUidValidityReset`, add history backlog methods, and add archive refresh.
-- **`apps/api/src/api.ts`** — extend `GET /accounts/:id` to return the progress columns. Add `POST /accounts/:id/folders/track`. Add `PATCH /accounts/:id/settings` for the new tunables (rejecting `live_window_days`).
+- **`apps/api/src/api.ts`** — extend `GET /accounts/:id` to return the progress columns. Add `POST /accounts/:id/folders/track`. Add `PATCH /accounts/:id/settings` for the account tunables, including mutable `bodyFetchPolicy`, while rejecting `live_window_days`.
 - **`apps/api/src/types.ts`** — extend `ImapAccount`, `ImapFolder`, `SyncResult` with the new fields.
 - **`apps/api/scripts/spec-conformance.ts`** — add scenarios G-M (see §Test Plan).
 
@@ -312,6 +345,8 @@ New scenarios:
 - **K — PENDING_VERIFICATION fix.** Fixture missing-mailbox error → folder transitions to PENDING_VERIFICATION, `next_folder_discovery_at` set to now, `getFoldersDueForSync` skips it on the next call. Then re-LIST it → folder back to PENDING then ACTIVE on the cycle after.
 - **L — Three-lane priority ordering.** Backlog of body fetches + history work; assert hot folders sync first, body backlog drains second, history runs third, history is skipped when body budget exhausted.
 - **M — Progress columns roll up.** Mirror a fixture with partial body completion across folders; assert per-folder counters in `imap_folders` and per-account percentages in `imap_account_progress` view match expected.
+- **R — Current live body coverage.** Add a message after the initial live snapshot, store one complete body and one truncated body, and assert that live and priority targets follow the two current rows while only the complete row counts as fetched. The cumulative folder counter may report both stores; it must not make the current coverage percentage 100.
+- **S — Mutable body policy.** Keep one current message in a non-priority folder under `priority_then_backfill`, change the account to `immediate` through the settings API, and assert that the next sync stores its body.
 
 Existing scenarios A-F continue to gate.
 
@@ -338,7 +373,7 @@ Things this plan does NOT solve. Each becomes a candidate for a follow-on issue.
 
 - **`live_window_days` change after onboarding.** Locked to creation-time in v0.1. A migration story (re-classifying `window_status` for newly in-window or newly out-of-window messages, handling the historical lane's relationship to the moving boundary) is deferred to v0.2.
 - **`estimated_full_sync_at` accuracy.** Best-effort. Documented as approximate. We do not commit to a tight bound. May move backward when the provider rate-limits.
-- **Counter drift correction.** D4's incremental counters can drift if a bug causes them to skip an update, double-count, or if a transaction is partially applied. Source of truth recovery is a `SELECT count(*) FROM imap_messages WHERE folder_id = ?` resync — accurate but O(messages) per folder. v0.1 ships without an automatic drift detector; if drift is observed in production we add a periodic resync job. Each counter update is inside the same transaction as the underlying insert/update, so the common bug modes (mid-tx crash, partial batch) preserve consistency.
+- **Counter drift correction.** D4's incremental counters can drift if a bug causes them to skip an update or double-count. Current live and priority body coverage is no longer exposed to that drift because it reads current message/body rows. Header and historical telemetry still uses the counters. Source-of-truth recovery for those fields is an account/folder row recount, which is accurate but O(messages). v0.1 ships without an automatic drift detector. Each counter update is inside the same transaction as the underlying insert/update, so the common bug modes (mid-transaction crash and partial batch) preserve consistency.
 
 - **Per-folder body-fetch priority overrides.** v0.1 uses `sync_priority` (folder-level) for body lane ordering. A future "this folder's bodies are critical, fetch first" override could be a per-folder JSONB column. Not in scope.
 - **On-demand body refresh for a single folder/slice.** The user mentioned "if user searches/opens an old folder/message, we can refresh that slice on demand" — this is a separate API endpoint outside the engine's scheduling. Not in scope for v0.1.

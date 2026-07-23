@@ -1,5 +1,32 @@
 # Session Handoff
 
+## 2026-07-23 — Mutable live-body policy and row-accurate coverage
+
+- Branch `fedster99/live-body-coverage-policy` lets an existing account change
+  `bodyFetchPolicy` through `PATCH /accounts/:id/settings`. The accepted values
+  are `immediate`, `lazy`, and `priority_then_backfill`; strict invalid, empty,
+  and unknown input remains rejected.
+- Public migration `0021_row_accurate_body_progress` replaces
+  `imap_account_progress`. Live and priority body targets now come from current
+  active `IN_WINDOW` message rows, and only a matching non-truncated body row
+  counts as complete. Cumulative folder counters remain telemetry.
+- A truncated body remains incomplete but does not enter an automatic retry
+  loop. Explicit body refetch is useful after the cause is corrected; a
+  cap-limited message needs a higher `BODY_RAW_MAX_BYTES` first. The migration
+  adds the partial `imap_messages_live_body_progress_idx`; large existing
+  mirrors must prebuild that exact index concurrently before applying the
+  transactional migration.
+- `GET /accounts/:id` now gives each folder row-current
+  `live_bodies_fetched_count`, `live_bodies_target_count`, and `bodies_pct`.
+  The cumulative body counter remains available as telemetry. Inactive folder
+  targets need not sum to the active account target.
+- The public API tracer test failed first with `400` instead of `200`, then
+  passed after implementation. Row-accuracy tests also failed first against the
+  old counter view. The full gate then passed typecheck, 685 fast tests, both
+  production builds, 186 live database tests including Scenarios R and S, and
+  118 spec-conformance checks. The local shell emitted the expected Node 26
+  warning while the repository pins Node 24.
+
 ## 2026-07-23 — OSS GitHub presentation
 
 - Branch `agent/readme-design` gives the public repository a factual visual
@@ -116,12 +143,17 @@
   Commit/merge, immutable-image publication, and downstream production re-pin
   are the next actions.
 
-Last updated: 2026-07-15
+Last updated: 2026-07-23
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 
 ## Current Branch
 
+- Active branch `fedster99/live-body-coverage-policy` makes
+  `body_fetch_policy` mutable for existing accounts and replaces counter-derived
+  live/priority body coverage with current-row evidence. ADR 0027 records the
+  contract. This change adds one view-replacement migration and one partial
+  live-body progress index.
 - Active branch `fedster99/fix-reconcile-health-after-repair` separates observed reconcile gaps from unresolved reconcile state. A pass that fully tombstones provider-missing rows or backfills missing-in-DB UIDs now finishes clean and can return the account to `HEALTHY`; the run still records its bounded gap count. Missing-in-DB overflow is detected with a 5,001st sentinel row, remains degraded, and retries on the next full-sync cadence. ADR 0026 records the contract; no migration or public API change is required.
 - Local branch `fedster99/smtp-account-lock-v2` is rebased onto current
   `origin/main` at `88c025d` and is intentionally uncommitted/unpushed. It closes
@@ -172,8 +204,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - PR-3 of the reliability hardening sequence is implemented: `imap_accounts.last_priority_sync_succeeded_at` records priority success, long-stuck `DEGRADED` accounts escalate to retryable `BROKEN` with `STUCK_DEGRADED_24H`, hourly retry uses `backoff_until`, seven-day terminal cutoff uses `STUCK_DEGRADED_TERMINAL`, and ADR 0009 documents the decision.
 - PR-4 of the reliability hardening sequence is implemented: `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, `FOLDER_COUNT_ENFORCE_THRESHOLD` tracks only priority folders and marks the account `DEGRADED` with `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG`, `folder_count_cap_override` lets operators raise the enforce threshold, and `PENDING_VERIFICATION` is now a scheduler-excluded folder state that discovery can revive.
 - PR-5 of the reliability hardening sequence is implemented: missing-mailbox errors are detected from structured IMAP response codes or fallback message patterns, affected folders move to `PENDING_VERIFICATION`, `next_folder_discovery_at` is forced to `now()`, `FOLDER_PENDING_VERIFICATION` events are logged, reappeared folders recover through discovery, and `POST /accounts/:id/folders/track` opts one existing non-provider-excluded folder back into sync past the folder-count cap.
-- PR-6 of the reliability hardening sequence is implemented: `0004_account_lane_settings` adds `live_window_days`, `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate` to `imap_accounts` with defaults and CHECK constraints; account summaries expose the settings; `PATCH /accounts/:id/settings` updates the mutable historical/archive/backfill-rate settings and rejects `live_window_days` changes. PR-8 wires the historical/archive/backfill-rate settings into the engine.
-- PR-7 of the reliability hardening sequence is implemented: `0005_progress_rollup` adds incremental folder progress counters and the `security_invoker` `imap_account_progress` view; `repository.upsertMessages`, `storeBody`, `setInitialSyncSnapshot`, and `handleUidValidityReset` maintain the counters; `GET /accounts/:id` returns account-level progress and per-folder progress rows. `estimated_full_sync_at` is exposed as nullable and remains null until a rate model exists.
+- PR-6 of the reliability hardening sequence is implemented: `0004_account_lane_settings` adds `live_window_days`, `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate` to `imap_accounts` with defaults and CHECK constraints; account summaries expose the settings; `PATCH /accounts/:id/settings` updates `bodyFetchPolicy` plus the mutable historical/archive/backfill-rate settings and rejects `live_window_days` changes. PR-8 wires the historical/archive/backfill-rate settings into the engine.
+- PR-7 of the reliability hardening sequence is implemented: `0005_progress_rollup` adds incremental folder progress counters and the `security_invoker` `imap_account_progress` view; `repository.upsertMessages`, `storeBody`, `setInitialSyncSnapshot`, and `handleUidValidityReset` maintain the counters; `GET /accounts/:id` returns account-level progress and per-folder progress rows. Migration `0021_row_accurate_body_progress` refines the view so current active message/body rows define live and priority body completeness, while cumulative counters remain telemetry. `estimated_full_sync_at` is exposed as nullable and remains null until a rate model exists.
 - Issue #2 historical backfill is passing: `0006_history_lane_state` adds `imap_folders.last_archive_refresh_at`; `MirrorEngine.syncAccount` runs hot sync, capped live body fetch, then a history lane under the same account lock; `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate` are consumed by the engine; historical metadata and optional bodies use folder `backfill_*` state and roll into the PR-7 progress view. ADR 0012 documents the decision. PR #20 added acceptance coverage for multi-cycle batching/resume, idempotent re-walks, UIDVALIDITY reset during backfill, and default-settings backfill; PR #21 marked the tracker `passing`.
 - Partial issue #3 provider compatibility work exists: `docs/imap-compatibility.md` defines the minimum IMAP capability contract, provider matrix, manual smoke checklist, and automated coverage split; provider profiles expose quirk metadata; the live DB gate includes deterministic Dovecot/cPanel-style and Cyrus/Rackspace-style fixture coverage plus empty LIST, large MIME body cap, fallback raw-body download cap, and transient disconnect checks. `pnpm smoke:greenmail` covers GreenMail's real IMAP/SMTP path, and `pnpm smoke:dovecot` covers Dovecot's real IMAP path with seeded Maildir folders. ADR 0013 documents the decision. Do not infer issue #3 completion from this without revalidating the GitHub acceptance criteria.
 - `README.md` and `docs/agent/reliability-invariants.md` document the default sync edges: 90-day live window, 1-2 minute new-mail polling, 15-minute folder discovery, about 6-hour per-folder reconcile/delete detection, 7-day folder-missing grace, 10 priority and 5 round-robin folders per cycle, 100 live bodies per tick, 25 MB MIME cap, 10-minute lock budget, and 20-account default cap.
@@ -190,6 +222,15 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Verification To Date
 
+- Live-body policy and coverage (2026-07-23): the public API tracer test first
+  failed because `PATCH /accounts/:id/settings` returned `400` for
+  `bodyFetchPolicy`; it passed after the typed API/repository update. The old
+  progress view also reported false 100 percent coverage in the new
+  real-Postgres regression. `INSTALL_CMD=true RUN_LIVE_DB=1 ./init.sh` passed:
+  harness review, root typecheck, 685 fast tests, both production builds, 186
+  live database tests including Scenarios R and S, and 118/118
+  spec-conformance checks. `git diff --check` passed. The expected local Node 26
+  engine warning appeared because the repository pins Node 24.
 - Reconcile post-repair health fix (2026-07-14): the provider-delete regression first proved the old behavior by ending `DEGRADED` with `RECONCILE_GAPS_FOUND` despite a successful tombstone. The missing-in-DB overflow and early-retry regressions also failed before their implementations. After the fix, the focused live-DB slice passed all four repair/health tests. Under Node 24, `pnpm harness:check`, `pnpm typecheck`, `pnpm test` (636 fast tests), `pnpm build`, and `pnpm test:db:live` passed. The live gate preserved the populated migration fixture, applied migrations twice, passed all 155 live-DB tests, and passed 118/118 spec-conformance assertions.
 - SMTP account-lock repair after rebasing onto current `origin/main` on
   2026-07-15: review hardening added draft/direct cross-contention, an explicit
@@ -263,7 +304,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Folder-count caps warn first, then enforce by tracking only priority folders; the cap uses the latest provider LIST count so provider-side pruning recovers automatically.
 - `PENDING_VERIFICATION` is reserved for missing-mailbox verification and is excluded from normal folder scheduling; missing-mailbox errors force near-term folder discovery.
 - Per-account historical-backfill lane settings are typed columns on `imap_accounts`; `live_window_days` is immutable after account creation in v0.1, and the history lane consumes the mutable historical/archive/backfill-rate settings.
-- Progress counters are maintained on `imap_folders` in the same write paths as header/body state; `imap_account_progress` is a read model and `GET /accounts/:id` is the API surface for downstream completeness checks.
+- Existing accounts may change `body_fetch_policy` through `PATCH /accounts/:id/settings`. `priority_then_backfill` covers current priority folders only; it does not defer current non-priority bodies to the history lane.
+- Progress counters are maintained on `imap_folders` in the same write paths as header/body state and remain cumulative telemetry. `imap_account_progress` derives live and priority body coverage from current active `IN_WINDOW` messages and complete, non-truncated body rows; `GET /accounts/:id` is the API surface for downstream completeness checks.
 - The history lane is the third phase under the same account lock, after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks newest-first through `backfill_*` watermarks, and stops when the cooperative lock budget or `max_backfill_rate` says to stop. History progress does not determine account health.
 - Generic IMAP support means a minimum protocol contract validated by provider shape and recorded in the compatibility matrix. Provider-specific quirks must stay in provider profiles or profile-driven hooks, not scattered sync-engine conditionals.
 - Hosted cloud must consume a pinned public core image digest/SHA and apply only public mirror migrations to customer BYO databases.
@@ -282,6 +324,10 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Next Best Actions
 
+- Review and land the feature-branch PR for
+  `fedster99/live-body-coverage-policy`. Publish a new immutable public-core
+  image only after human merge, then update downstream Signal through its
+  public-core prebuild and re-pin flow.
 - Review and land `fedster99/fix-reconcile-health-after-repair`, publish its immutable image, then re-pin downstream consumers. Confirm ordinary provider delete/move drift records a nonzero gap count without leaving a fully repaired account stuck `DEGRADED`.
 - Review and land `fedster99/fix-imap-abort-race`, publish its immutable image, then re-pin downstream consumers and canary the Sent/full-sweep deadline boundary. Confirm there are no further `Already logged out`, `process.uncaughtException`, or Render restart events.
 - Keep this file updated at the end of substantial sessions.

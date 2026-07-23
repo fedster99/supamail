@@ -237,7 +237,20 @@ operator commands, read
 
 - `immediate`: fetch body rows for every in-window message during sync.
 - `lazy`: fetch bodies only when `refetch-body` or the API endpoint is called.
-- `priority_then_backfill`: fetch bodies for priority folders such as INBOX and Sent during normal sync. This is the default.
+- `priority_then_backfill`: fetch bodies for priority folders such as INBOX and Sent during normal sync. This is the default. It does not later fetch current messages from non-priority folders.
+
+An existing account can change this policy through
+`PATCH /accounts/:id/settings`:
+
+```json
+{
+  "bodyFetchPolicy": "immediate"
+}
+```
+
+The new value takes effect on the next normal body-lane pass. Use `immediate`
+when the product requires complete live-window bodies across all tracked
+folders.
 
 Historical backfill is controlled per account through `PATCH /accounts/:id/settings`:
 
@@ -246,7 +259,40 @@ Historical backfill is controlled per account through `PATCH /accounts/:id/setti
 - `historicalBackfillMode: "metadata_and_bodies"` mirrors older headers and fetches older bodies in the history lane.
 - `maxBackfillRate` controls history batches per sync tick: `small`, `normal`, or `aggressive`.
 
-IMAP headers arrive much faster than full MIME bodies. SupaMail exposes progress percentages so downstream search, agent, or UI consumers can decide how much body completeness they need before trusting deep search results.
+IMAP headers arrive much faster than full MIME bodies. SupaMail exposes progress
+percentages so downstream search, agent, or UI consumers can decide how much
+body completeness they need before trusting deep search results.
+
+Live and priority body percentages describe current active `IN_WINDOW`
+messages. The target includes messages in tracked, non-missing folders that are
+not deleted at the provider. A body is complete only when its
+`imap_message_bodies` row exists and `raw_truncated` is false. A complete
+`parsed_only` row counts even though `raw_mime` is NULL.
+
+The cumulative folder counters remain useful telemetry, but they are not the
+source of truth for current live body coverage. A truncated row stays visible as
+incomplete and does not retry forever automatically. Use
+`POST /messages/:id/refetch-body` only after the cause is corrected. For
+example, raise `BODY_RAW_MAX_BYTES` before you retry a message that exceeded the
+configured cap.
+
+`GET /accounts/:id` applies the same completeness test within each returned
+folder. Each folder row adds `live_bodies_fetched_count` and
+`live_bodies_target_count`, and its `bodies_pct` uses those current row counts.
+Folder rows still report untracked, missing, and pending folders, so their
+targets do not always sum to the active account target. The older
+`bodies_fetched_count` remains cumulative telemetry.
+
+Migration `0021_row_accurate_body_progress` adds the partial
+`imap_messages_live_body_progress_idx`. On a large existing mirror, create this
+exact index concurrently before you apply the transactional migration:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_live_body_progress_idx
+  ON public.imap_messages (account_id, folder_path, id)
+  WHERE deleted_in_provider = false
+    AND window_status = 'IN_WINDOW';
+```
 
 SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.
 
