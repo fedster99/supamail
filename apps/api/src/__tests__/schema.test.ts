@@ -57,9 +57,11 @@ describe("initial schema", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS threading_payload_sha256 text");
     expect(sql).toContain("octet_length(search_extract) <= 32768");
     expect(sql).toContain("imap_threading_payload_sha256");
-    expect(sql).toContain("search_extract_fts tsvector");
+    expect(sql).toContain("FUNCTION public.imap_search_extract_fts");
     expect(sql).toContain("imap_message_bodies_search_extract_fts_gin");
-    expect(sql).toContain("imap_message_bodies_search_extract_trgm_idx");
+    expect(sql).toContain("USING gin (public.imap_search_extract_fts(search_extract))");
+    expect(sql).not.toContain("search_extract_fts tsvector");
+    expect(sql).not.toContain("search_extract_trgm");
     expect(sql).toContain("m.body_fetched_at IS NOT NULL");
     expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_search_extract");
     expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_threading_payload_sha256");
@@ -197,7 +199,7 @@ describe("initial schema", () => {
     expect(sql).toContain("authored_delivery_sha256 text");
     expect(sql).toContain("delivery_fingerprint_hashes text[]");
     expect(sql).toContain("current_live_body_progress AS");
-    expect(sql).toContain("search_extract_fts tsvector");
+    expect(sql).toContain("FUNCTION public.imap_search_extract_fts");
   });
 
   it("indexes delivery fingerprints for bounded threading closure", async () => {

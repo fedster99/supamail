@@ -22,9 +22,10 @@ a mailbox re-sync.
   (`bodyText`: plain MIME preferred, otherwise HTML converted to text), capped
   at exactly 32 KiB of UTF-8 without splitting a code point. HTML, raw MIME,
   attachment bytes, and headers do not enter the extract.
-- `imap_message_bodies.search_extract` and its generated
-  `search_extract_fts` are Postgres evidence, not full payload. FTS, body
-  filters, snippets, and the bounded body trigram index use this extract.
+- `imap_message_bodies.search_extract` is Postgres evidence, not full payload.
+  FTS, body filters, and snippets use this extract. A GIN expression index
+  avoids retaining a second stored copy as a generated `tsvector`; fuzzy recall
+  remains on the existing bounded header trigram indexes.
 - Sync commits the search extract, recovered threading headers, structured
   evidence, a SHA-256 over every parsed payload variant, and the
   raw/parsed/authored delivery digests in one transaction before invoking
@@ -46,8 +47,8 @@ a mailbox re-sync.
   sequence.
 - Migration `0022_content_extract_body_store` backfills existing extracts from
   `body_text` (with `body_plain` as the legacy fallback) and the compact
-  threading payload digest from all parsed variants. It adds the new FTS and
-  trigram indexes and keeps compatibility triggers for pre-0022 rolling-deploy
+  threading payload digest from all parsed variants. It adds the new FTS
+  expression index and keeps compatibility triggers for pre-0022 rolling-deploy
   writers. It does not delete the older body indexes or payload columns.
 - An evidence row alone is not body completion. Live and priority coverage also
   require `body_fetched_at IS NOT NULL` and `raw_truncated = false`.
@@ -63,9 +64,16 @@ no object-storage provider, hosted search backend, retention policy, or
 multi-tenant behavior. Those belong outside public core or in separately
 accepted work.
 
-Existing mirrors pay bounded extract/threading-digest backfills and two new
-index builds when they apply migration 0022. Full payload columns and their old
+Existing mirrors pay bounded extract/threading-digest backfills and one new
+index build when they apply migration 0022. Full payload columns and their old
 indexes remain for compatibility; removal is not part of this seam.
+
+The 32 KiB prefix is an explicit storage/recall tradeoff, not an assumption that
+all mail is shorter. In a measured 43,129-body corpus, 1,659 bodies (3.85%)
+exceeded the bound. The extract-only search evaluation therefore runs through
+the same truncation function, and terms present only after the prefix are
+intentionally outside the retained search contract. Keeping the prefix simple
+also avoids over-representing quoted history commonly found at message tails.
 
 ## Verification
 

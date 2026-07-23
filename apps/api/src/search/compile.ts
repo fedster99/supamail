@@ -139,8 +139,8 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
     }
     case "body": {
       const p = pb.add(filter.value);
-      const match = `b.search_extract_fts @@ websearch_to_tsquery('english', public.f_unaccent(${p}))`;
-      return filter.negated ? `(b.search_extract_fts IS NULL OR NOT (${match}))` : match;
+      const match = `public.imap_search_extract_fts(b.search_extract) @@ websearch_to_tsquery('english', public.f_unaccent(${p}))`;
+      return filter.negated ? `(b.search_extract IS NULL OR NOT (${match}))` : match;
     }
     case "folder": {
       if (filter.value.endsWith("/*")) {
@@ -257,7 +257,7 @@ export function compileSearch(
 
   const lexHeader = tsq ? `ts_rank_cd(m.header_fts, ${tsq})` : "0";
   const lexBody = tsq
-    ? `(CASE WHEN b.search_extract_fts IS NOT NULL THEN ts_rank_cd(b.search_extract_fts, ${tsq}, 2) ELSE 0 END)`
+    ? `(CASE WHEN b.search_extract IS NOT NULL THEN ts_rank_cd(public.imap_search_extract_fts(b.search_extract), ${tsq}, 2) ELSE 0 END)`
     : "0";
 
   // ── Recall branches (RECALL ONLY; ranked strictly below exact matches) ───────
@@ -299,7 +299,7 @@ export function compileSearch(
     : null;
   const semHeader = expandedTsq ? `ts_rank_cd(m.header_fts, ${expandedTsq})` : "0";
   const semBody = expandedTsq
-    ? `(CASE WHEN b.search_extract_fts IS NOT NULL THEN ts_rank_cd(b.search_extract_fts, ${expandedTsq}, 2) ELSE 0 END)`
+    ? `(CASE WHEN b.search_extract IS NOT NULL THEN ts_rank_cd(public.imap_search_extract_fts(b.search_extract), ${expandedTsq}, 2) ELSE 0 END)`
     : "0";
 
   // Non-FTS scoping, applied in EVERY candidate branch so the partial FTS/trigram
@@ -393,7 +393,8 @@ grouped AS (
     ${semBody} AS sem_body`;
 
   // Candidate retrieval. A single OR across imap_messages.header_fts and
-  // imap_message_bodies.search_extract_fts cannot use either GIN — the planner
+  // The header and extract FTS expressions cannot use either GIN across one OR —
+  // the planner
   // seq-scans BOTH
   // tables (~23s at 22k rows). Instead collect candidate ids per-index via UNION
   // (header GIN ∪ body GIN ∪ trigram ∪ concept), then hydrate + score the bounded
@@ -402,21 +403,21 @@ grouped AS (
   let candCte: string;
   if (tsq) {
     // Cap each branch's candidate pool by recency. The scorer (ts_rank_cd over
-    // search_extract_fts, fuzz_sim, etc.) runs per candidate, so a common/short term that
+    // extract FTS rank, fuzz_sim, etc.) runs per candidate, so a common/short term that
     // matches thousands of rows would be slow to score even though retrieval is
     // index-fast. A bounded most-recent pool keeps scoring interactive; exact
     // matches are usually few (under the cap) so they are unaffected.
     const cap = (sel: string): string => `(${sel}\n     ORDER BY m.internal_date DESC LIMIT 400)`;
     const idBranches: string[] = [
       cap(`SELECT m.id FROM public.imap_messages m WHERE ${scopeSql} AND m.header_fts @@ ${tsq}`),
-      cap(`SELECT bb.message_id AS id FROM public.imap_message_bodies bb JOIN public.imap_messages m ON m.id = bb.message_id WHERE ${scopeSql} AND bb.search_extract_fts @@ ${tsq}`)
+      cap(`SELECT bb.message_id AS id FROM public.imap_message_bodies bb JOIN public.imap_messages m ON m.id = bb.message_id WHERE ${scopeSql} AND public.imap_search_extract_fts(bb.search_extract) @@ ${tsq}`)
     ];
     if (fuzzyIdGate) {
       idBranches.push(cap(`SELECT m.id FROM public.imap_messages m WHERE ${scopeSql} AND ${fuzzyIdGate}`));
     }
     if (expandedTsq) {
       idBranches.push(cap(`SELECT m.id FROM public.imap_messages m WHERE ${scopeSql} AND m.header_fts @@ ${expandedTsq}`));
-      idBranches.push(cap(`SELECT bb.message_id AS id FROM public.imap_message_bodies bb JOIN public.imap_messages m ON m.id = bb.message_id WHERE ${scopeSql} AND bb.search_extract_fts @@ ${expandedTsq}`));
+      idBranches.push(cap(`SELECT bb.message_id AS id FROM public.imap_message_bodies bb JOIN public.imap_messages m ON m.id = bb.message_id WHERE ${scopeSql} AND public.imap_search_extract_fts(bb.search_extract) @@ ${expandedTsq}`));
     }
     const candWhere = structured.length > 0 ? `\n  WHERE ${structured.join("\n    AND ")}` : "";
     candCte = `cand_ids AS (

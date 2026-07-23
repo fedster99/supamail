@@ -127,23 +127,22 @@ SET threading_payload_sha256 = public.imap_threading_payload_sha256(
 WHERE threading_payload_sha256 IS NULL
   AND coalesce(body_text, body_plain, selected_text_part, body_html) IS NOT NULL;
 
-ALTER TABLE public.imap_message_bodies
-  ADD COLUMN IF NOT EXISTS search_extract_fts tsvector
-  GENERATED ALWAYS AS (
-    setweight(
-      to_tsvector('english', public.f_unaccent(coalesce(search_extract, ''))),
-      'D'
-    )
-  ) STORED;
+CREATE OR REPLACE FUNCTION public.imap_search_extract_fts(value text)
+RETURNS tsvector
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = ''
+AS $$
+  SELECT setweight(
+    to_tsvector('english', public.f_unaccent(coalesce(value, ''))),
+    'D'
+  )
+$$;
 
 CREATE INDEX IF NOT EXISTS imap_message_bodies_search_extract_fts_gin
   ON public.imap_message_bodies
-  USING gin (search_extract_fts)
-  WHERE search_extract_fts IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS imap_message_bodies_search_extract_trgm_idx
-  ON public.imap_message_bodies
-  USING gin (search_extract extensions.gin_trgm_ops);
+  USING gin (public.imap_search_extract_fts(search_extract));
 
 -- Since 0022, parsed/authored digests are computed from decoded MIME before the
 -- payload write. Invalidate them only when their compact evidence changes; a

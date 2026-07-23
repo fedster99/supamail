@@ -29,8 +29,8 @@ RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked
 default OSS full-payload store.
 
 `0022_content_extract_body_store` adds `search_extract`, a maximum 32 KiB UTF-8
-prefix of the parser's selected normalized plain text, plus its generated FTS
-column and bounded trigram index. It also adds
+prefix of the parser's selected normalized plain text, plus an FTS expression
+index that does not store a duplicate generated vector. It also adds
 `threading_payload_sha256`, a compact digest over every parsed body variant.
 Sync commits this extract, payload digest, recovered threading headers,
 structured evidence, and delivery digests before invoking the selected
@@ -93,9 +93,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_live_body_progress_idx
 `0013_body_head_trigram_index` adds exact substring support over the same bounded 128 KB body head. Consumers must use `left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)` verbatim so PostgreSQL can select the expression GIN; natural-language lexical search continues to use `body_fts`.
 
 Migration `0022` supersedes those body-payload sources for current readers:
-natural-language FTS, body filters, snippets, and exact body substring indexes
-use only `search_extract` / `search_extract_fts`. The 0008/0013 columns and
-indexes remain in place for additive migration compatibility.
+natural-language FTS, body filters, and snippets use only `search_extract`
+through `imap_search_extract_fts(search_extract)`. The 0008/0013 columns and
+indexes remain in place for additive migration compatibility; current fuzzy
+recall uses the existing bounded header trigram indexes.
 
 `0014_conversation_threading` adds the durable conversation projection (ADR 0024). It preserves three separate identities:
 

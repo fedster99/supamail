@@ -144,7 +144,7 @@ liveDb("search layer live DB", () => {
     expect(result.rows).toHaveLength(1);
   });
 
-  it("populates the generated tsvector columns", async () => {
+  it("populates header FTS and derives extract FTS through the indexed expression", async () => {
     const header = await pool.query<{ has_header: boolean }>(
       "SELECT header_fts IS NOT NULL AS has_header FROM public.imap_messages WHERE id = $1",
       [idByUid.get(1)]
@@ -152,7 +152,7 @@ liveDb("search layer live DB", () => {
     expect(header.rows[0].has_header).toBe(true);
 
     const body = await pool.query<{ has_body: boolean }>(
-      "SELECT search_extract_fts IS NOT NULL AS has_body FROM public.imap_message_bodies WHERE message_id = $1",
+      "SELECT public.imap_search_extract_fts(search_extract) <> ''::tsvector AS has_body FROM public.imap_message_bodies WHERE message_id = $1",
       [idByUid.get(1)]
     );
     expect(body.rows[0].has_body).toBe(true);
