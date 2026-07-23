@@ -15,6 +15,8 @@
   fast tests, and both production builds; the live-DB gate was intentionally
   skipped because no runtime, schema, or reliability behavior changed. The
   local shell emitted the expected Node 26 warning while the repo pins Node 24.
+- PR #94 is ready for review. Its GitHub-rendered README was checked at 375,
+  768, and 1280 pixel widths with no overflow or broken assets.
 
 ## 2026-07-23 — OSS GitHub hygiene and tracker reconciliation
 
