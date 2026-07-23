@@ -1,120 +1,91 @@
-# SupaMail
+<p align="center">
+  <img src=".github/assets/supamail-readme-hero.svg" alt="SupaMail mirrors an IMAP mailbox through its sync engine into Postgres, with SQL, CLI, and MCP access." width="100%">
+</p>
 
-[![CI](https://github.com/fedster99/supamail/actions/workflows/ci.yml/badge.svg)](https://github.com/fedster99/supamail/actions/workflows/ci.yml)
+<p align="center">
+  <strong>Mirror an IMAP mailbox into Postgres, then build with SQL, TypeScript, or MCP.</strong>
+</p>
 
-Reliable IMAP sync for Supabase.
+<p align="center">
+  <a href="https://github.com/fedster99/supamail/actions/workflows/ci.yml"><img src="https://github.com/fedster99/supamail/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f5f1e8.svg?labelColor=0b0d0c" alt="MIT License"></a>
+  <a href=".nvmrc"><img src="https://img.shields.io/badge/node-24-b7ff52.svg?labelColor=0b0d0c" alt="Node 24"></a>
+</p>
 
-SupaMail turns any IMAP inbox into queryable Supabase tables. It runs a worker/API, connects to your mailboxes, and keeps folders, messages, flags, full MIME bodies, attachment metadata, and sync health up to date in Postgres.
+<p align="center">
+  <a href="#quickstart-supabase--flyio">Quickstart</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#agent-and-cli-access">Agent access</a> ·
+  <a href="docs/imap-compatibility.md">Compatibility</a> ·
+  <a href="docs/deployment-options.md">Deploy</a>
+</p>
 
-The simplest low-cost deployment is Supabase + Fly.io: Supabase hosts the database, Fly runs the always-on worker, and your app reads email from its own tables. The API is optional and can run as a separate Fly app when you need remote control endpoints.
+SupaMail is the self-hosted sync layer between an IMAP mailbox and your
+application. It keeps folders, messages, flags, MIME bodies, attachment
+metadata, conversation threads, and sync health queryable in Postgres. Use
+Supabase for a convenient database layer, or bring a standard Postgres
+deployment.
 
-## Background
+> SupaMail is intentionally the boring infrastructure underneath search,
+> automations, internal tools, and email agents. It does not send mail or embed
+> an AI model.
 
-I kept running into the same annoying problem at work.
+## What you get
 
-Every new AI email tool integrates with Gmail. Some integrate with Outlook. But if your inbox is on any other email provider, you are usually out of luck. In my case, it was Rackspace.
+| | |
+| --- | --- |
+| **Mailbox mirror** | Initial and incremental sync for folders, headers, flags, MIME bodies, and attachment metadata |
+| **Reliability** | UIDVALIDITY recovery, reconciliation, retries, backoff, health, lag, and progress |
+| **Conversation model** | Durable account-scoped threading with mirrored-copy deduplication |
+| **Developer access** | Postgres tables, a machine-readable CLI, a token-protected API, and five read-only local MCP tools |
 
-And that makes sense. IMAP is old. It is messy. It has folders, weird cursors, UIDVALIDITY resets, flags, MIME bodies, provider quirks, silent failures, and a thousand tiny ways to miss an email.
+## How it works
 
-But email is too valuable to leave locked behind whatever provider you happen to use.
+IMAP remains the source of truth; Postgres becomes the durable mailbox mirror
+your application reads. Account-level advisory locks serialize sync work.
+Per-folder cursors and UIDVALIDITY track change, while reconciliation catches
+gaps so missing messages do not silently become permanent.
 
-So I built SupaMail.
-
-It syncs any IMAP inbox into Supabase. Reliably. Full messages, folders, flags, bodies, attachments metadata, sync health, all of it.
-
-The point is simple: once email is in Supabase, you can build whatever you want on top of it.
-
-AI agents. Internal tools. CRM workflows. Search. Alerts. Automations.
-
-SupaMail is the boring sync layer that makes the fun stuff possible.
-
-## What You Get
-
-- IMAP accounts and folder state
-- Initial and incremental message sync
-- UIDVALIDITY reset handling
-- Reconciliation for provider deletes and missing messages
-- Flags, headers, threading headers, and MIME structure
-- Durable, account-scoped conversation threading with mirrored-copy deduplication
-- Raw RFC822/MIME bodies (retention configurable via `BODY_STORAGE_MODE`)
-- Parsed text, HTML, normalized text, and parser metadata
-- Attachment and inline-part metadata
-- Sync runs, sync events, health, lag, retries, and backoff
-- Structured metadata write-service and worker-tick throughput metrics
-- Per-folder and per-account progress percentages for headers and body completeness
-- Folder-count safeguards for unusually large mailboxes
-- Reactive rediscovery when a provider reports a mailbox no longer exists
-- Provider profiles for generic IMAP and provider-specific quirks
-
-## How It Works
-
-```text
-IMAP mailbox -> SupaMail worker/API -> Supabase/Postgres -> your app
-```
-
-SupaMail treats Postgres as the durable mailbox mirror. IMAP is the provider; Supabase is where your application reads from. Conversation membership is a deterministic, rebuildable projection over the mirrored headers; it never rewrites the observed message rows.
-
-Account-level advisory locks keep sync operations serialized. Folder state tracks UID cursors and UIDVALIDITY. Reconciliation catches gaps so missing messages do not silently become permanent.
-
-## Default Sync Edges
-
-These are the current defaults, tuned for a small always-on worker:
-
-- Live sync window: 90 days
-- Inbox/new-mail detection: about 1-2 minutes
-- Sent-folder metadata detection: about 30-60 seconds (lightweight lane; configurable)
-- Folder discovery: every 15 minutes
-- Message delete/move detection: about 6 hours per folder
-- Folder deletion grace period: 7 days
-- Priority folders per cycle: 10
-- Non-priority folders per cycle: 5
-- Body fetch cap: up to 100 bodies per worker tick
-- Max raw MIME body: 25 MB
-- Account lock budget: 10 minutes
-- Default account cap: 20 accounts
-
-Historical/deep-archive backfill is separate from the live-window health path. Treat live health as the fresh-mail reliability signal, not proof that every older message has already been mirrored.
-
-## Repository Layout
-
-- `apps/api`: TypeScript/Node worker, API, CLI, tests, Supabase migration, Docker, and Fly configs.
-- `apps/web`: Next.js landing site.
-- `docs`: reliability contract, deployment notes, architecture decisions, and agent operating docs.
-- `SESSION_HANDOFF.md`: tracked restart notes for future coding agents.
+The default worker prioritizes fresh mail and recent bodies. Historical archive
+backfill runs separately, so live health describes the fresh-mail path rather
+than claiming every old message is already mirrored.
 
 ## Quickstart: Supabase + Fly.io
 
-1. Create a Supabase project.
-2. Use the direct/session-affine Postgres connection string for `DATABASE_URL`.
-3. Deploy the worker from the repository root with `apps/api/fly.worker.toml.example`.
-4. Set environment variables.
-5. Run migrations.
-6. Add an IMAP account.
+The simplest low-cost deployment uses Supabase for Postgres and Fly.io for the
+always-on worker. Clone the repository, install dependencies, and set these
+variables:
 
-Required environment variables:
-
-```bash
+```dotenv
 DATABASE_URL=postgresql://...
 IMAP_ENCRYPTION_KEY=...
 API_TOKEN=...
 BODY_FETCH_POLICY=priority_then_backfill
 ```
 
-Apply the schema:
+Use a direct Supabase Postgres URL or the Supavisor session pooler on port
+`5432`. Do not use the transaction pooler on port `6543`: advisory locks require
+session affinity.
+
+Then apply the schema:
 
 ```bash
+pnpm install
 pnpm migrate
 ```
 
-or, if you need to run SQL manually, apply the public migration files in manifest order:
+Deploy the worker from the repository root with
+`apps/api/fly.worker.toml.example`, then add a mailbox below. The API is
+optional; run it separately only when you need remote control endpoints.
+
+If you need to run SQL manually, apply the public migration files in manifest
+order:
 
 ```bash
 for file in apps/api/supabase/migrations/public/*.sql; do
   psql "$DATABASE_URL" -f "$file"
 done
 ```
-
-Important: use a direct Supabase Postgres URL or the Supavisor session pooler on port `5432`. Do not use the transaction pooler on port `6543`. SupaMail uses advisory locks, and advisory locks need session affinity.
 
 See [docs/fly-supabase.md](docs/fly-supabase.md) for the full Fly.io + Supabase setup.
 
@@ -246,67 +217,19 @@ identity rules, sync-trust semantics, and MCP client guidance.
 
 ## Conversation Threading
 
-SupaMail keeps three identities separate:
+SupaMail keeps physical mailbox rows, deliveries, and conversations as separate
+identities. It conservatively deduplicates mirrored copies, builds conversations
+from RFC reply ancestry and bounded provider evidence, and stores the result as a
+versioned projection without rewriting observed message rows.
 
-- A **physical mailbox row** is one `(account, folder, UIDVALIDITY, UID)` occurrence.
-- A **delivery** is one email that may have physical copies in several folders.
-- A **conversation** is the transitive reply graph containing one or more deliveries.
+`read_thread` and the `thread` CLI command expose the durable
+`conversation_id`. Search returns one best result per conversation by default,
+so mirrored folder copies do not inflate results.
 
-Threading is deliberately conservative. Exact provider delivery identities and verified copy fingerprints deduplicate physical copies. Raw-MIME, complete parsed-representation, and transport-invariant authored-representation hashes are independent evidence tokens; copies with the same strict Message-ID collapse when any token matches. The authored token handles Sent/Inbox copies whose receiving server added trace/authentication headers or changed wire size: it still requires identical authored headers, envelope, parsed bodies, MIME structure, parser outcome, and complete structured/attachment evidence. The bounded worker derives it after distinct delivery candidates are observed or when an exact-metadata match needs corroboration; a mismatch remains split. V3 may recover a cross-folder mirror only when strict Message-ID, timestamp, byte size, normalized subject, sender, and every recipient match exactly; same-folder reuse and conflicting authored digests remain split. Valid RFC `References` ancestry is preferred; the first valid `In-Reply-To` is used only when `References` has no usable Message-ID. A referenced Message-ID that has not arrived yet becomes a provisional parent, so siblings stay together and a later parent converges into the same graph. A directly prefixed forward starts a new protocol conversation even when a client inherited reply or provider-thread headers; replies to that forwarded outer may form their own branch. Namespaced, account-scoped provider thread IDs are otherwise a secondary grouping hint.
-
-Subject matching is only a last resort: an otherwise standalone `Re:` can join exactly one recent root when the base subject and reciprocal participants match exactly. Forwards, list/bulk mail, automated replies, ambiguous candidates, and content similarity never trigger this fallback. Weak evidence runs only over one exact, bounded subject bucket; an oversized common subject is recorded and skipped rather than guessed.
-
-Assignments live in versioned `imap_thread_runs`, with one `imap_thread_assignments` row per physical message and run. Metadata/body changes fan out to every active, standby, ready, and building run. Initial builds, rebuilds, and upgrades remain invisible shadow projections until they are complete and caught up. By default every shadow waits for explicit review and atomic activation. A deployment may set `THREADING_AUTO_ACTIVATE_INITIAL=true` to activate only the first projection after the same coverage, evidence-revision, and empty-queue checks pass; the scheduler keeps that ready first run eligible until the active pointer is durably set. Rebuilds and upgrades still require explicit review, and replacement activation still requires a passing comparison certificate. Operators can run the same deterministic machinery directly:
-
-```bash
-pnpm --filter @supamail/api exec tsx src/cli.ts threads-drain \
-  --account-id <account-uuid>
-
-pnpm --filter @supamail/api exec tsx src/cli.ts threads-rebuild \
-  --account-id <account-uuid> \
-  --reason "algorithm upgrade"
-
-pnpm --filter @supamail/api exec tsx src/cli.ts threads-compare \
-  --account-id <account-uuid> \
-  --baseline-run-id <active-run-uuid> \
-  --candidate-run-id <ready-run-uuid>
-
-pnpm --filter @supamail/api exec tsx src/cli.ts threads-activate \
-  --account-id <account-uuid> \
-  --run-id <ready-run-uuid> \
-  --comparison-id <passed-comparison-uuid> \
-  --reason "benchmark passed" \
-  --confirm
-
-pnpm --filter @supamail/api exec tsx src/cli.ts threads-rollback \
-  --account-id <account-uuid> \
-  --operation-id <latest-operation-uuid> \
-  --confirm
-
-pnpm --filter @supamail/api exec tsx src/cli.ts threads-prune \
-  --older-than-days 30 \
-  --batch-size 100 \
-  --confirm
-```
-
-`threads-rebuild` never switches readers by itself. `threads-compare` stores a
-quality certificate for the exact baseline/candidate generations and mirror
-evidence revision. Any later mail invalidates it. Activation requires a passed
-certificate when replacing an active run, verifies full physical-row coverage
-and empty catch-up queues, then swaps one account-scoped active-run pointer.
-Rollback is audited and pauses automatic work until a clean shadow rebuild is
-activated. A database trigger provides the evidence clock and queue fan-out even
-during a rolling deploy with an older sync worker. Daily retention prunes old
-terminal projection runs in bounded batches but keeps operations, comparisons,
-and incremental before/after history. A persisted weighted scheduler gives the
-active projection three of every five available turns while reserving bounded
-progress for the rollback standby and shadow build. Production executors live in
-an explicit version registry; worker startup and direct drain/rebuild commands
-fail fast if any state-referenced run has no retained executor.
-
-`read_thread` and the `thread` CLI command expose the durable `conversation_id`. Search returns one best result per conversation by default and counts one representative per delivery, so mirrored copies do not inflate results. Whole-thread mailbox mutations intentionally fan out to every live physical row.
-
-This is protocol conversation threading only. SupaMail does not infer that separate conversations concern the same task, document, or decision, and it has no work-item, CRM, belief, or epistemic clustering layer.
+This is protocol-level conversation threading, not semantic grouping. For the
+evidence rules, rebuild/compare/activate lifecycle, rollback guarantees, and
+operator commands, read
+[ADR 0024: Durable conversation threading](docs/architecture/decisions/0024-durable-conversation-threading.md).
 
 ## Body Sync
 

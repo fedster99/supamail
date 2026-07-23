@@ -1,5 +1,27 @@
 # Session Handoff
 
+## 2026-07-23 — OSS GitHub presentation
+
+- Branch `agent/readme-design` gives the public repository a factual visual
+  identity: a repository-owned SVG explains the IMAP → SupaMail → Postgres →
+  SQL/CLI/MCP loop without provider, maturity, popularity, or storage claims.
+- The README now leads with the value proposition, restrained trust badges,
+  compact navigation, grouped capabilities, and the quickstart. Deep
+  conversation-threading internals are summarized and linked to ADR 0024.
+- This is documentation and presentation only. Runtime, schema, migration, API,
+  compatibility, and deployment behavior are unchanged.
+- `INSTALL_CMD=true ./init.sh`, SVG XML validation, relative-link target checks,
+  and `git diff --check` passed. The init gate ran harness review, typecheck, 682
+  fast tests, and both production builds; the live-DB gate was intentionally
+  skipped because no runtime, schema, or reliability behavior changed. The
+  local shell emitted the expected Node 26 warning while the repo pins Node 24.
+- PR #94 is ready for review. Its GitHub-rendered README was checked at 375,
+  768, and 1280 pixel widths with no overflow or broken assets.
+- The README hero was then aligned to the current `www.supamail.dev` landing
+  system: warm paper, ink black, Supabase green, editorial serif headline,
+  JetBrains-style mono labels, the `~` brand mark, and one terminal surface.
+  Product claims and README structure remain unchanged.
+
 ## 2026-07-23 — OSS GitHub hygiene and tracker reconciliation
 
 - Revalidated issues #4 and #7 against `main`: the local stdio MCP server and
