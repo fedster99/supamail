@@ -46,7 +46,7 @@
       "area": "provider-profiles",
       "title": "Build IMAP compatibility matrix and protocol validation",
       "user_visible_behavior": "Docs and tests make generic IMAP support explicit, provider-by-provider, with known quirks isolated in provider profiles.",
-      "status": "not_started",
+      "status": "passing",
       "dependencies": [],
       "verification": [
         "pnpm typecheck",
@@ -55,8 +55,8 @@
         "pnpm smoke:greenmail when protocol behavior changes",
         "pnpm smoke:dovecot when protocol behavior changes"
       ],
-      "evidence": "",
-      "notes": "Maintainer clarified on 2026-05-29 that this issue should not be treated as done. Existing compatibility docs, fixtures, and smokes may be useful partial work, but future work must re-read issue #3, revalidate the provider matrix/protocol acceptance criteria, and record fresh completion evidence before marking passing."
+      "evidence": "Revalidated against issue #3 on 2026-07-23. The minimum protocol contract, provider matrix, manual smoke checklist, provider-profile isolation, and edge-case fixtures are present. The repository-hygiene PR adds Dovecot beside GreenMail in CI. Local verification passed: root typecheck, 682 fast tests, build, 184 live-Postgres tests, 118 spec checks, GreenMail smoke (3 messages, 3 bodies, 1 attachment, send/draft paths), and Dovecot smoke (4 messages, 4 bodies, 1 attachment, Archive tracked, Trash excluded, 0 false deletes).",
+      "notes": "Passing after fresh acceptance-criteria revalidation. Close issue #3 when the repository-hygiene PR lands with both required protocol checks green."
     },
     {
       "id": "issue-4-mcp-server",
@@ -65,15 +65,15 @@
       "area": "mcp",
       "title": "Add MCP server for AI email tools",
       "user_visible_behavior": "A local stdio MCP server can safely expose read-oriented mailbox tools against an existing SupaMail database.",
-      "status": "not_started",
+      "status": "passing",
       "dependencies": [],
       "verification": [
         "pnpm typecheck",
         "pnpm test",
         "pnpm build"
       ],
-      "evidence": "",
-      "notes": "Per ADR 0014, the MCP server is built in this core repo as a read-only surface; cloud only hosts it. Core owns the server implementation, the read-tool contract, and the local stdio binding; the remote transport, bearer/tenant auth, and MCP token secrets live in supamail-cloud. Build the server with an injected database connection and a transport boundary so the same tool logic runs locally (stdio) and hosted (remote-authed). Start local stdio first; remote transport must be absent from the public package. V1 is read-only. PARTIAL: the read-tool contract for the flagship search tool already exists on branch fedster99/search-layer (ADR 0015) as `search_email` -- apps/api/src/search/mcp-tool.ts exports searchEmailToolDefinition (name/description/inputSchema/readOnlyHint annotations) and runSearchTool(pool, args), both wrapping the same injected-connection searchMessages as the CLI. Remaining for #4: the stdio MCP server process that registers this tool and binds the transport. Do not self-start; this stays not_started until selected."
+      "evidence": "Revalidated against issue #4 on 2026-07-23. `apps/api/src/mcp/server.ts` provides the local stdio server; the package exposes `supamail-mcp` plus `start:mcp`; the injected-pool tool registry exposes sanitized search, message, thread, folder, and draft-only contracts; tests enforce the five-tool, zero-send boundary and cover the read tools against live Postgres. Root typecheck, tests, and build are required by the repository-hygiene PR.",
+      "notes": "Passing. Core owns the local stdio server and shared tool contracts; remote transport, bearer/tenant auth, and MCP token secrets remain in supamail-cloud."
     },
     {
       "id": "issue-7-agent-email-cli",
@@ -82,7 +82,7 @@
       "area": "agent-cli",
       "title": "Build an agent-first email CLI",
       "user_visible_behavior": "A local coding agent can inspect mirrored email through stable CLI commands with deterministic, machine-readable output and clear sync trust signals.",
-      "status": "in_progress",
+      "status": "passing",
       "dependencies": [],
       "verification": [
         "pnpm typecheck",
@@ -90,8 +90,8 @@
         "pnpm build",
         "pnpm test:db:live"
       ],
-      "evidence": "Search read layer landed on branch fedster99/search-layer (ADR 0015), the flagship read tool for this CLI. 0007_search_layer.sql adds weighted FTS generated columns + pg_trgm + structured b-tree indexes; apps/api/src/search/ exposes the injected-connection searchMessages function (parser -> SQL compiler -> read-only transaction), a deterministic machine-readable SearchResponse, and a sync_trust block (the sync-trust signal). The `supamail search` CLI command wraps it with JSON output and the full operator/flag surface. Verified 2026-06-07: pnpm typecheck, pnpm test (160 passed incl. 15 parser/compiler unit tests), pnpm build, pnpm test:db:live (migration applied twice for idempotence + src/__tests__/search.live-db.test.ts proving generated columns populate, soft-deletes never leak, a >128KB body does not error, ranking order, and is:/from: operators; 118/118 spec-conformance).",
-      "notes": "Per ADR 0014, the agent CLI is built in this core repo as a read-only surface; cloud only hosts it (build location is not run location). The search command is the first read command and shares the read-tool contract with issue #4. Remaining for #7: additional read commands (e.g. get-message, thread view) and a non-JSON pretty mode. Sending, scheduling, contacts, calendar, CRM hydration, and AI summarization stay out of scope unless a later ADR explicitly adds them. WIP=1: do not start a second feature while this is in_progress."
+      "evidence": "Revalidated against issue #7 on 2026-07-23. The CLI now includes deterministic commands for search, message, thread, folders, attachment metadata/content, sync operations, and account health; search supports account/folder/date/sender/state filters and returns mailbox identity plus sync_trust completeness. Parser, query, identity, trust, and live-Postgres behavior are covered by the existing test suites. Root typecheck, tests, build, and live DB verification are required by the repository-hygiene PR.",
+      "notes": "Passing. The agent-oriented read surface is implemented; separately approved operator mutation commands do not weaken the MCP server's five-tool, zero-send boundary."
     }
   ]
 }

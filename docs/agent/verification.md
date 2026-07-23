@@ -65,8 +65,13 @@ GitHub branch protection on `main` requires pull requests and these passing chec
 
 - `Quality`
 - `Live DB Reliability`
+- `GreenMail SMTP/IMAP Smoke`
+- `Dovecot IMAP Smoke`
 
-`Quality` runs install, typecheck, `pnpm test`, and build. `Live DB Reliability` runs `pnpm test:db:live`. Required status checks are strict, so the PR branch must be up to date with `main` before merging.
+`Quality` runs install, typecheck, `pnpm test`, and build. `Live DB Reliability`
+runs `pnpm test:db:live`. The two protocol smokes exercise distinct real IMAP
+server implementations. Required status checks are strict, so the PR branch
+must be up to date with `main` before merging.
 
 ## Evidence
 

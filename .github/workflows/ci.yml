@@ -89,3 +89,39 @@ jobs:
       - run: docker version
       - run: pnpm migrate
       - run: pnpm smoke:greenmail
+
+  dovecot-smoke:
+    name: Dovecot IMAP Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      IMAP_ENCRYPTION_KEY: dovecot-ci-encryption-key
+      IMAP_ALLOW_PRIVATE_HOSTS: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: docker version
+      - run: pnpm migrate
+      - run: pnpm smoke:dovecot
