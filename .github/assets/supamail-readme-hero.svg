@@ -1,86 +1,82 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="520" viewBox="0 0 1440 520" role="img" aria-labelledby="title desc">
-  <title id="title">SupaMail architecture</title>
-  <desc id="desc">SupaMail mirrors IMAP mailboxes into Postgres and exposes the data through SQL, a CLI, and a local MCP server.</desc>
-  <defs>
-    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
-      <path d="M32 0H0V32" fill="none" stroke="#273127" stroke-width="1"/>
-    </pattern>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity=".28"/>
-    </filter>
-  </defs>
+  <title id="title">SupaMail open-source mailbox mirror</title>
+  <desc id="desc">SupaMail mirrors an IMAP mailbox into Postgres for access through SQL, a CLI, and a local MCP server.</desc>
 
-  <rect width="1440" height="520" rx="28" fill="#0b0d0c"/>
-  <rect width="1440" height="520" rx="28" fill="url(#grid)" opacity=".58"/>
-  <circle cx="1340" cy="-14" r="270" fill="#b7ff52" opacity=".05"/>
-  <circle cx="104" cy="528" r="230" fill="#b7ff52" opacity=".04"/>
+  <rect width="1440" height="520" fill="#f4f5f2"/>
+  <path d="M0 1h1440M0 519h1440" stroke="#e6e8e2"/>
 
-  <g transform="translate(72 62)">
-    <rect width="36" height="36" rx="8" fill="#b7ff52"/>
-    <path d="M9 12h18v3L18 21 9 15v-3Zm0 5.5 9 6 9-6V26H9v-8.5Z" fill="#0b0d0c"/>
-    <text x="52" y="29" fill="#f5f1e8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="30" font-weight="700" letter-spacing="-1">SupaMail</text>
-    <text x="0" y="83" fill="#f5f1e8" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="46" font-weight="700" letter-spacing="-1.8">Your mailbox, in Postgres.</text>
-    <text x="0" y="118" fill="#aeb7ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="19">A reliable, self-hosted IMAP sync engine for apps and agents.</text>
+  <g transform="translate(72 54)">
+    <rect width="28" height="28" rx="7" fill="#14110d"/>
+    <text x="14" y="19" text-anchor="middle" fill="#3ecf8e" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="14" font-weight="600">~</text>
+    <text x="40" y="19" fill="#14110d" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="15" font-weight="600">supamail</text>
   </g>
 
-  <g transform="translate(72 242)" filter="url(#shadow)">
-    <g>
-      <rect width="246" height="156" rx="18" fill="#151a16" stroke="#3d493f"/>
-      <text x="24" y="35" fill="#89948a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" letter-spacing="1.5">SOURCE</text>
-      <path d="M24 59h36v27H24z" fill="none" stroke="#b7ff52" stroke-width="2"/>
-      <path d="m25 61 17 13 17-13" fill="none" stroke="#b7ff52" stroke-width="2"/>
-      <text x="76" y="79" fill="#f5f1e8" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21" font-weight="650">IMAP mailbox</text>
-      <text x="24" y="119" fill="#aeb7ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15">Folders · messages · flags</text>
-      <text x="24" y="141" fill="#aeb7ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15">MIME bodies · attachments</text>
-    </g>
+  <g transform="translate(72 126)">
+    <circle cx="4" cy="5" r="4" fill="#3ecf8e"/>
+    <text x="18" y="10" fill="#7a7263" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="12" letter-spacing=".9">OPEN-SOURCE IMAP SYNC</text>
 
-    <path d="M258 78h42" stroke="#b7ff52" stroke-width="2"/>
-    <path d="m294 72 8 6-8 6" fill="none" stroke="#b7ff52" stroke-width="2"/>
+    <text x="0" y="80" fill="#14110d" font-family="'Instrument Serif', Georgia, 'Times New Roman', serif" font-size="58" font-weight="400" letter-spacing="-1.2">Your email is now</text>
+    <text x="0" y="143" fill="#1f9d61" font-family="'Instrument Serif', Georgia, 'Times New Roman', serif" font-size="64" font-weight="400" font-style="italic" letter-spacing="-1.5">queryable.</text>
 
-    <g transform="translate(314)">
-      <rect width="332" height="156" rx="18" fill="#b7ff52"/>
-      <text x="24" y="35" fill="#394b21" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="700" letter-spacing="1.5">SUPAMAIL CORE</text>
-      <text x="24" y="76" fill="#0b0d0c" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="22" font-weight="750">Incremental sync engine</text>
-      <text x="24" y="108" fill="#263319" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15">Reconciliation · retries · health</text>
-      <text x="24" y="132" fill="#263319" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15">Durable conversation projection</text>
-    </g>
+    <text x="0" y="195" fill="#403a31" font-family="'IBM Plex Sans', Arial, sans-serif" font-size="18">Mirror an IMAP mailbox into Postgres, then build</text>
+    <text x="0" y="223" fill="#403a31" font-family="'IBM Plex Sans', Arial, sans-serif" font-size="18">with SQL, TypeScript, or MCP.</text>
 
-    <path d="M658 78h42" stroke="#b7ff52" stroke-width="2"/>
-    <path d="m694 72 8 6-8 6" fill="none" stroke="#b7ff52" stroke-width="2"/>
-
-    <g transform="translate(714)">
-      <rect width="250" height="156" rx="18" fill="#151a16" stroke="#3d493f"/>
-      <text x="24" y="35" fill="#89948a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" letter-spacing="1.5">MIRROR</text>
-      <ellipse cx="47" cy="67" rx="22" ry="8" fill="none" stroke="#b7ff52" stroke-width="2"/>
-      <path d="M25 67v27c0 4 10 8 22 8s22-4 22-8V67M25 80c0 4 10 8 22 8s22-4 22-8" fill="none" stroke="#b7ff52" stroke-width="2"/>
-      <text x="84" y="78" fill="#f5f1e8" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21" font-weight="650">Postgres</text>
-      <text x="24" y="126" fill="#aeb7ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15">Queryable mailbox tables</text>
-    </g>
-
-    <path d="M976 78h42" stroke="#b7ff52" stroke-width="2"/>
-    <path d="m1012 72 8 6-8 6" fill="none" stroke="#b7ff52" stroke-width="2"/>
-
-    <g transform="translate(1032)">
-      <rect width="264" height="156" rx="18" fill="#151a16" stroke="#3d493f"/>
-      <text x="24" y="35" fill="#89948a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" letter-spacing="1.5">BUILD WITH</text>
-      <g transform="translate(24 59)">
-        <rect width="62" height="38" rx="8" fill="#232a24"/>
-        <text x="31" y="25" text-anchor="middle" fill="#f5f1e8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700">SQL</text>
-        <rect x="72" width="62" height="38" rx="8" fill="#232a24"/>
-        <text x="103" y="25" text-anchor="middle" fill="#f5f1e8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700">CLI</text>
-        <rect x="144" width="72" height="38" rx="8" fill="#232a24"/>
-        <text x="180" y="25" text-anchor="middle" fill="#b7ff52" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700">MCP</text>
-      </g>
-      <text x="24" y="126" fill="#aeb7ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15">Read-only agent access</text>
+    <g transform="translate(0 272)" font-family="'JetBrains Mono', Menlo, Consolas, monospace" font-size="12">
+      <text x="0" y="0" fill="#1f9d61">●</text>
+      <text x="18" y="0" fill="#7a7263">SELF-HOSTED</text>
+      <text x="126" y="0" fill="#1f9d61">●</text>
+      <text x="144" y="0" fill="#7a7263">MIT</text>
+      <text x="194" y="0" fill="#1f9d61">●</text>
+      <text x="212" y="0" fill="#7a7263">TYPESCRIPT + NODE.JS</text>
     </g>
   </g>
 
-  <g transform="translate(72 448)">
-    <circle cx="6" cy="6" r="6" fill="#b7ff52"/>
-    <text x="22" y="12" fill="#aeb7ad" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">SELF-HOSTED</text>
-    <circle cx="166" cy="6" r="6" fill="#b7ff52"/>
-    <text x="182" y="12" fill="#aeb7ad" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">MIT LICENSED</text>
-    <circle cx="336" cy="6" r="6" fill="#b7ff52"/>
-    <text x="352" y="12" fill="#aeb7ad" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">TYPESCRIPT + NODE.JS</text>
+  <g transform="translate(704 72)">
+    <rect width="664" height="376" rx="12" fill="#13120e"/>
+    <rect x=".5" y=".5" width="663" height="375" rx="11.5" fill="none" stroke="#27251e"/>
+
+    <g transform="translate(28 30)" font-family="'JetBrains Mono', Menlo, Consolas, monospace">
+      <text x="0" y="13" fill="#b89ce0" font-size="12">~/supamail</text>
+      <text x="82" y="13" fill="#3ecf8e" font-size="12">(main)</text>
+      <text x="130" y="13" fill="#3ecf8e" font-size="12">$</text>
+      <text x="146" y="13" fill="#ebe6d6" font-size="12">mailbox mirror</text>
+
+      <line x1="0" y1="38" x2="608" y2="38" stroke="#28261f"/>
+
+      <text x="0" y="73" fill="#7d7867" font-size="11" letter-spacing=".8">SOURCE</text>
+      <text x="226" y="73" fill="#7d7867" font-size="11" letter-spacing=".8">SYNC ENGINE</text>
+      <text x="466" y="73" fill="#7d7867" font-size="11" letter-spacing=".8">MIRROR</text>
+
+      <text x="0" y="111" fill="#ebe6d6" font-size="19" font-weight="600">IMAP mailbox</text>
+      <text x="226" y="111" fill="#7fdc9a" font-size="19" font-weight="600">SupaMail core</text>
+      <text x="466" y="111" fill="#ebe6d6" font-size="19" font-weight="600">Postgres</text>
+
+      <path d="M154 103h46" stroke="#3ecf8e" stroke-width="1.5"/>
+      <path d="m194 98 7 5-7 5" fill="none" stroke="#3ecf8e" stroke-width="1.5"/>
+      <path d="M396 103h44" stroke="#3ecf8e" stroke-width="1.5"/>
+      <path d="m434 98 7 5-7 5" fill="none" stroke="#3ecf8e" stroke-width="1.5"/>
+
+      <text x="0" y="143" fill="#8c877a" font-size="12">folders · messages</text>
+      <text x="0" y="165" fill="#8c877a" font-size="12">flags · MIME bodies</text>
+
+      <text x="226" y="143" fill="#8c877a" font-size="12">incremental sync</text>
+      <text x="226" y="165" fill="#8c877a" font-size="12">retries · health</text>
+
+      <text x="466" y="143" fill="#8c877a" font-size="12">durable tables</text>
+      <text x="466" y="165" fill="#8c877a" font-size="12">conversation view</text>
+
+      <line x1="0" y1="198" x2="608" y2="198" stroke="#28261f"/>
+
+      <text x="0" y="232" fill="#7d7867" font-size="11" letter-spacing=".8">READ THE MIRROR YOUR WAY</text>
+
+      <text x="0" y="269" fill="#e689a8" font-size="14">SQL</text>
+      <text x="42" y="269" fill="#7d7867" font-size="14">select subject from imap_messages;</text>
+
+      <text x="0" y="300" fill="#e8c46a" font-size="14">CLI</text>
+      <text x="42" y="300" fill="#7d7867" font-size="14">search · message · thread · folders</text>
+
+      <text x="0" y="331" fill="#7fdc9a" font-size="14">MCP</text>
+      <text x="42" y="331" fill="#7d7867" font-size="14">five local, read-only agent tools</text>
+    </g>
   </g>
 </svg>

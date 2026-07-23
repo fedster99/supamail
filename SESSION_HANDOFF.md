@@ -17,6 +17,10 @@
   local shell emitted the expected Node 26 warning while the repo pins Node 24.
 - PR #94 is ready for review. Its GitHub-rendered README was checked at 375,
   768, and 1280 pixel widths with no overflow or broken assets.
+- The README hero was then aligned to the current `www.supamail.dev` landing
+  system: warm paper, ink black, Supabase green, editorial serif headline,
+  JetBrains-style mono labels, the `~` brand mark, and one terminal surface.
+  Product claims and README structure remain unchanged.
 
 ## 2026-07-23 — OSS GitHub hygiene and tracker reconciliation
 
