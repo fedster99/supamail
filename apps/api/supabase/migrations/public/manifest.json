@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0020_threading_fingerprint_closure",
+  "schemaVersion": "0021_row_accurate_body_progress",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -80,6 +80,10 @@
     {
       "id": "0020_threading_fingerprint_closure",
       "file": "0020_threading_fingerprint_closure.sql"
+    },
+    {
+      "id": "0021_row_accurate_body_progress",
+      "file": "0021_row_accurate_body_progress.sql"
     }
   ]
 }

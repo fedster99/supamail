@@ -40,6 +40,10 @@ const threadingFingerprintClosureMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0020_threading_fingerprint_closure.sql"
 );
+const rowAccurateBodyProgressMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0021_row_accurate_body_progress.sql"
+);
 
 describe("initial schema", () => {
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -119,9 +123,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0020_threading_fingerprint_closure");
+    expect(version).toBe("0021_row_accurate_body_progress");
     expect(manifest).toEqual({
-      schemaVersion: "0020_threading_fingerprint_closure",
+      schemaVersion: "0021_row_accurate_body_progress",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -142,7 +146,8 @@ describe("initial schema", () => {
         { id: "0017_threading_body_backfill_index", file: "0017_threading_body_backfill_index.sql" },
         { id: "0018_threading_body_fallback_index", file: "0018_threading_body_fallback_index.sql" },
         { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" },
-        { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" }
+        { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" },
+        { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -170,6 +175,7 @@ describe("initial schema", () => {
     expect(sql).toContain("imap_message_bodies_thread_digest_fallback_idx");
     expect(sql).toContain("authored_delivery_sha256 text");
     expect(sql).toContain("delivery_fingerprint_hashes text[]");
+    expect(sql).toContain("current_live_body_progress AS");
   });
 
   it("indexes delivery fingerprints for bounded threading closure", async () => {
@@ -445,6 +451,35 @@ describe("initial schema", () => {
     expect(sql).toContain("live_headers_complete_pct");
     expect(sql).toContain("priority_bodies_complete_pct");
     expect(sql).toContain("historical_bodies_complete_pct");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM anon");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM authenticated");
+    expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
+  });
+
+  it("replaces account body progress with current complete live rows while preserving view security", async () => {
+    const sql = await readFile(rowAccurateBodyProgressMigrationPath, "utf8");
+
+    expect(sql).toContain("CREATE OR REPLACE VIEW public.imap_account_progress");
+    expect(sql).toContain("WITH (security_invoker = true)");
+    expect(sql).toContain("active_body_folder_progress AS");
+    expect(sql).toContain("current_live_body_progress AS");
+    expect(sql).toContain("CREATE INDEX IF NOT EXISTS imap_messages_live_body_progress_idx");
+    expect(sql).toContain("ON public.imap_messages (account_id, folder_path, id)");
+    expect(sql).toContain("WHERE deleted_in_provider = false");
+    expect(sql).toContain("AND window_status = 'IN_WINDOW'");
+    expect(sql).toContain("JOIN public.imap_folders f");
+    expect(sql).toContain("LEFT JOIN public.imap_message_bodies b");
+    expect(sql.match(/f\.tracked = true/g)).toHaveLength(3);
+    expect(sql.match(/f\.missing_since IS NULL/g)).toHaveLength(2);
+    expect(sql.match(/f\.status NOT IN \('MISSING', 'PENDING_VERIFICATION'\)/g)).toHaveLength(2);
+    expect(sql).toContain("WHERE f.tracked = true\n    AND f.status != 'MISSING'");
+    expect(sql).toContain("m.deleted_in_provider = false");
+    expect(sql).toContain("m.window_status = 'IN_WINDOW'");
+    expect(sql).toContain("b.message_id IS NOT NULL");
+    expect(sql).toContain("NOT b.raw_truncated");
+    expect(sql).not.toMatch(/CREATE INDEX[\s\S]*?ON public\.imap_message_bodies/);
+    expect(sql).not.toContain("DROP VIEW");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM anon");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM authenticated");
     expect(sql).not.toContain("stripe");

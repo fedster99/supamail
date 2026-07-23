@@ -13,7 +13,7 @@ SupaMail owns a conservative mailbox mirror:
 - Postgres is the source of truth for mirrored state; IMAP is the provider being observed.
 - The hot mirror window is based on IMAP `INTERNALDATE`, not the RFC `Date` header.
 - Metadata, folder state, flags, body fetch state, sync events, and health are durable.
-- Full MIME bodies are fetched according to account policy and always behind the same account lock.
+- Full MIME bodies are fetched according to a mutable account policy and always behind the same account lock.
 - Multi-folder moves are normal. A message that leaves one folder may still appear elsewhere with a different folder-scoped UID identity.
 - Physical mailbox rows, duplicate delivery copies, and protocol conversations are separate identities. Conversation assignment is derived and replaceable; it does not redefine mailbox-row identity.
 - Mailbox identity is not CRM identity. SupaMail does not resolve people, companies, handles, relationships, or hydrated activities.
@@ -63,8 +63,8 @@ SupaMail owns a conservative mailbox mirror:
 | Backoff should be conservative and jittered. | Implemented | Transient failures use jittered exponential backoff; stored backoff resets only after stable success. |
 | Retention must preserve recoverable reconcile tombstones. | Implemented | Expiry marks old rows `EXPIRED`; purge only removes strict trapdoor reasons, never `RECONCILE_MISSING`. |
 | Account count should be capped for this architecture. | Implemented | `SYNC_MAX_ACCOUNTS` enforced at account creation and worker startup. |
-| Body fetches should be lazy and lock-guarded. | Implemented | Body backlog/fetch uses the same account lock and stores full MIME/parser output separately from metadata. `BODY_STORAGE_MODE=parsed_only` streams the IMAP download through raw byte counting/SHA-256 and MIME parsing without retaining the source; the default `raw_mime` mode buffers only because raw persistence requires it. |
-| Body completeness should be observable because downstream search reliability depends on it. | Implemented | Folder progress counters and `imap_account_progress` expose live-header, priority-body, live-body, and historical completion percentages; spec-conformance Scenario M proves the roll-up. |
+| Body fetches should be policy-controlled and lock-guarded. | Implemented | Body backlog/fetch uses the same account lock and stores full MIME/parser output separately from metadata. `PATCH /accounts/:id/settings` can change `bodyFetchPolicy` to `immediate`, `lazy`, or `priority_then_backfill` for an existing account. `BODY_STORAGE_MODE=parsed_only` streams the IMAP download through raw byte counting/SHA-256 and MIME parsing without retaining the source; the default `raw_mime` mode buffers only because raw persistence requires it. |
+| Body completeness should be observable because downstream search reliability depends on it. | Implemented | `imap_account_progress` derives live and priority body coverage from current active `IN_WINDOW` messages and counts only non-truncated body rows as complete. Cumulative folder counters remain telemetry for headers and history rather than proof of current live-body coverage. Scenario M proves the roll-up contract; real-Postgres Scenario R proves post-snapshot rows and truncated bodies cannot produce false full coverage. |
 | Historical backfill should not starve fresh mail. | Implemented | The engine runs hot, body, then history lanes under one advisory lock; history is resumable through folder `backfill_*` state and skipped when the body lane exhausts the lock budget. An already-fetched history batch persists under a separate bounded database deadline before yielding at the safe boundary, so the cooperative lock budget cannot turn completed IMAP work into repeated failures. Spec-conformance Scenario L and the history safe-boundary integration regression prove ordering and budget behavior. |
 | Attachment metadata belongs in the mirror, not necessarily attachment binaries. | Implemented | MIME `BODYSTRUCTURE` is parsed into attachment metadata during sync; binary attachment retrieval is outside the current core path. Decoded full-body parsing hashes attachment streams and buffers only bounded calendar payloads, then stores SHA-256/calendar/provider-resource evidence rather than attachment bytes. |
 | Structured artifact evidence must remain separate from conversation and work-item truth. | Implemented | `0016_message_evidence` stores versioned neutral evidence and extraction coverage. SupaMail does not cluster tasks: attachment identity, calendar occurrence, and provider resource keys cannot alter `conversation_id`. |
@@ -99,6 +99,30 @@ Between full sync cycles, a separate due-based Sent lane refreshes metadata at `
 Flag scans and reconciles are also due-based and budgeted. Agents should not change this into "scan every folder every cycle" behavior; that is exactly the folder-explosion failure mode the old spec was trying to prevent.
 
 Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. Backfill *completeness* does not gate `sync_state` health (an account is not DEGRADED for incomplete history), though a history-lane *error* surfaces in the sync run outcome like other lane errors. Progress consumers should read `imap_account_progress` and per-folder progress rows.
+
+The live body lane reads `body_fetch_policy` on each account run. `immediate`
+includes all active live-window messages, `lazy` leaves automatic backlog
+fetching off, and `priority_then_backfill` includes only folders at the priority
+cutoff. The last name does not promise later live-body coverage for current
+non-priority folders; the history lane is separate and only handles
+older-than-window mail.
+
+Live and priority body coverage is a current evidence claim. Its denominator is
+active `IN_WINDOW` messages in tracked folders whose `missing_since` is NULL and
+whose status is neither `MISSING` nor `PENDING_VERIFICATION`, excluding
+provider-deleted rows. Its numerator requires a matching
+`imap_message_bodies` row with `raw_truncated = false`. Truncated rows remain
+incomplete but do not enter an automatic retry loop. Explicit refetch is useful
+only after the cause is corrected; a cap-limited message requires a higher
+`BODY_RAW_MAX_BYTES` first. Per-folder `live_bodies_fetched_count`,
+`live_bodies_target_count`, and `bodies_pct` use the same completeness test
+within each returned folder. They also report untracked, missing, and pending
+folders, which the active account roll-up excludes. Folder targets therefore do
+not always sum to the account target. Migration
+`0021_row_accurate_body_progress` adds the partial
+`imap_messages_live_body_progress_idx`; large existing mirrors must prebuild
+that exact index concurrently before applying the transactional migration.
+Cumulative folder counters remain operational telemetry.
 
 ### IMAP Connection And Lock Discipline
 

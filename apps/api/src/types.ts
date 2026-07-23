@@ -111,6 +111,8 @@ export interface FolderProgress {
   bodies_fetched_count: number;
   live_window_target_count: number | null;
   historical_target_count: number | null;
+  live_bodies_fetched_count: number;
+  live_bodies_target_count: number;
   headers_pct: number;
   bodies_pct: number;
   historical_headers_pct: number;
@@ -386,6 +388,7 @@ export interface SendResult {
 }
 
 export interface UpdateAccountSettingsInput {
+  bodyFetchPolicy?: BodyFetchPolicy;
   historicalBackfillMode?: HistoricalBackfillMode;
   archiveRefreshInterval?: ArchiveRefreshInterval;
   archiveFlagSync?: boolean;

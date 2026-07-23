@@ -168,6 +168,7 @@ function buildApp(options: {
       consecutive_successes: 0
     }))),
     updateAccountSettings: vi.fn(options.updateAccountSettings ?? (async (_accountId, input) => makeAccount({
+      body_fetch_policy: input.bodyFetchPolicy ?? "lazy",
       historical_backfill_mode: input.historicalBackfillMode ?? "metadata_and_bodies",
       archive_refresh_interval: input.archiveRefreshInterval ?? "monthly",
       archive_flag_sync: input.archiveFlagSync ?? false,
@@ -420,6 +421,8 @@ describe("API safety", () => {
           bodies_fetched_count: 2,
           live_window_target_count: 3,
           historical_target_count: null,
+          live_bodies_fetched_count: 2,
+          live_bodies_target_count: 3,
           headers_pct: 100,
           bodies_pct: 67,
           historical_headers_pct: 0,
@@ -484,6 +487,20 @@ describe("API safety", () => {
     expect(invalid.status).toBe(400);
     expect(repository.updateAccountSettings).not.toHaveBeenCalled();
 
+    for (const body of [
+      { bodyFetchPolicy: "eventually" },
+      {},
+      { unknownSetting: true }
+    ]) {
+      const rejected = await app.request(`/accounts/${accountId}/settings`, {
+        method: "PATCH",
+        headers: { ...auth(), "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      expect(rejected.status).toBe(400);
+    }
+    expect(repository.updateAccountSettings).not.toHaveBeenCalled();
+
     const valid = await app.request(`/accounts/${accountId}/settings`, {
       method: "PATCH",
       headers: { ...auth(), "content-type": "application/json" },
@@ -510,6 +527,34 @@ describe("API safety", () => {
       archiveFlagSync: true,
       maxBackfillRate: "aggressive"
     });
+  });
+
+  it("updates an account body fetch policy through PATCH /accounts/:id/settings", async () => {
+    const policies = ["immediate", "lazy", "priority_then_backfill"] as const;
+
+    for (const bodyFetchPolicy of policies) {
+      const { app, repository } = buildApp();
+      const response = await app.request(`/accounts/${accountId}/settings`, {
+        method: "PATCH",
+        headers: { ...auth(), "content-type": "application/json" },
+        body: JSON.stringify({ bodyFetchPolicy })
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        account: {
+          id: accountId,
+          body_fetch_policy: bodyFetchPolicy
+        }
+      });
+      expect(repository.updateAccountSettings).toHaveBeenCalledWith(accountId, {
+        bodyFetchPolicy,
+        historicalBackfillMode: undefined,
+        archiveRefreshInterval: undefined,
+        archiveFlagSync: undefined,
+        maxBackfillRate: undefined
+      });
+    }
   });
 
   it("replaces rejected account credentials and returns a pending-sync health state", async () => {

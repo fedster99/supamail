@@ -337,6 +337,7 @@ const RENAME_FOLDER_SCHEMA = z.object({
 });
 
 const MUTABLE_ACCOUNT_SETTING_KEYS = [
+  "bodyFetchPolicy",
   "historicalBackfillMode",
   "archiveRefreshInterval",
   "archiveFlagSync",
@@ -344,6 +345,7 @@ const MUTABLE_ACCOUNT_SETTING_KEYS = [
 ] as const;
 
 const ACCOUNT_SETTINGS_SCHEMA = z.object({
+  bodyFetchPolicy: z.enum(["immediate", "lazy", "priority_then_backfill"]).optional(),
   historicalBackfillMode: z.enum(["off", "metadata_only", "metadata_and_bodies"]).optional(),
   archiveRefreshInterval: z.enum(["never", "monthly", "weekly"]).optional(),
   archiveFlagSync: z.boolean().optional(),
@@ -617,6 +619,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const raw = await parseJsonBody(c);
     const parsed = ACCOUNT_SETTINGS_SCHEMA.parse(raw);
     const input: UpdateAccountSettingsInput = {
+      bodyFetchPolicy: parsed.bodyFetchPolicy,
       historicalBackfillMode: parsed.historicalBackfillMode,
       archiveRefreshInterval: parsed.archiveRefreshInterval,
       archiveFlagSync: parsed.archiveFlagSync,
