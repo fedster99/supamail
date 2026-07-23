@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible SupaMail problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove credentials, tokens, private messages, and customer data before submitting.
+        Security vulnerabilities belong in the private Security reporting flow.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Provide the smallest reliable sequence of steps.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: SupaMail version
+      description: Commit SHA or container image tag.
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: IMAP provider or server
+      description: For example Dovecot, Fastmail, Rackspace, or an anonymized generic host.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste only the minimal relevant logs, with secrets and message data removed.
+      render: shell

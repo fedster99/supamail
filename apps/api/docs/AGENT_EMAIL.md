@@ -8,6 +8,36 @@ Five tools. **Zero send.** Nothing here ever sends, appends, moves, deletes, or
 mutates mail — the only optional write any tool performs is producing a draft
 object you hand back to the user.
 
+## Connect an MCP client
+
+Install dependencies and build the server:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+Then add a stdio server to your MCP client's configuration, replacing the
+repository and database placeholders:
+
+```json
+{
+  "mcpServers": {
+    "supamail": {
+      "command": "node",
+      "args": ["/absolute/path/to/supamail/apps/api/dist/mcp/server.js"],
+      "env": {
+        "DATABASE_URL": "postgresql://user:password@host:5432/database",
+        "IMAP_ENCRYPTION_KEY": "the-same-key-used-by-your-worker"
+      }
+    }
+  }
+}
+```
+
+The process communicates only over stdin/stdout. It does not open a remote
+listener; hosted transport and authentication belong to SupaMail Cloud.
+
 ## The loop: orient → search → read → draft
 
 1. **Orient** — `list_folders` shows the folders that **contain mail** for an

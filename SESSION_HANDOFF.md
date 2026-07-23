@@ -1,5 +1,21 @@
 # Session Handoff
 
+## 2026-07-23 — OSS GitHub hygiene and tracker reconciliation
+
+- Revalidated issues #4 and #7 against `main`: the local stdio MCP server and
+  agent-oriented CLI are implemented, so their feature-list states are now
+  `passing` and the stale GitHub issues can close.
+- Revalidated issue #3. Its protocol contract, provider matrix, fixtures, and
+  GreenMail/Dovecot smokes exist. The repository-hygiene PR adds a Dovecot job
+  beside GreenMail, closing the remaining acceptance gap. Fresh local
+  verification passed both real-server smokes, so #3 is now `passing`; close the
+  GitHub issue when the PR lands with both required checks green.
+- Public docs now describe the shipped CLI/MCP surface accurately. Added
+  lightweight security, contribution, and bug-report guidance.
+- GitHub-only cleanup covers stale merged branches, obsolete PR #27, repository
+  topics/features, merge settings, and security automation. No public-core
+  runtime, schema, migration, or image behavior changed.
+
 ## 2026-07-19 — Sync-run finalization and opt-in initial thread activation
 
 - `MirrorEngine.syncAccount` now terminalizes an opened durable run before
@@ -249,5 +265,8 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 - Keep this file updated at the end of substantial sessions.
 - If a session includes private provider/customer details, summarize only safe facts here and keep private detail in `.context/`.
 - When repo layout, scripts, CI, deploy config, schema paths, startup flow, task boundaries, or verification lanes change, update the relevant docs and note the docs / harness decision in the PR body.
-- GitHub issues #3, #4, and #7 are open. Do not mark #3 passing from historical verification notes alone; re-read the issue body and revalidate acceptance criteria when the maintainer selects that task. Issues #4 (MCP) and #7 (agent CLI) are scoped by ADR 0014 as core-built, read-only surfaces that cloud only hosts; #7 remains a future roadmap item after, or coordinated with, the #4 MCP read-tool contract.
+- GitHub issue #3 remains open until its new Dovecot CI gate lands.
+  Issues #4 (MCP) and #7 (agent CLI) were revalidated as implemented on
+  2026-07-23 and should remain closed. Their core/cloud boundary is still
+  governed by ADR 0014.
 - Next hosted setup step lives in private `supamail-cloud`: BYO Supabase onboarding (`cloud-004`) is the next selectable hosted feature, followed by the full paid hosted smoke (`cloud-005`).

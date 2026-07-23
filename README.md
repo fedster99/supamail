@@ -217,6 +217,33 @@ from imap_accounts a
 join imap_account_progress p on p.account_id = a.id;
 ```
 
+## Agent and CLI Access
+
+SupaMail includes a machine-readable CLI and a local stdio MCP server over the
+same Postgres mirror.
+
+Common CLI reads:
+
+```bash
+pnpm --filter @supamail/api exec tsx src/cli.ts search "from:alice@example.com is:unread"
+pnpm --filter @supamail/api exec tsx src/cli.ts message <message-id>
+pnpm --filter @supamail/api exec tsx src/cli.ts thread <message-id>
+pnpm --filter @supamail/api exec tsx src/cli.ts folders --account <account-id>
+```
+
+The MCP server exposes five agent tools: `search_email`, `read_message`,
+`read_thread`, `list_folders`, and `draft_reply`. It uses local stdio transport,
+reads the same `DATABASE_URL`, and has no remote listener or send capability.
+
+```bash
+pnpm build
+DATABASE_URL=postgresql://... \
+pnpm --filter @supamail/api start:mcp
+```
+
+See [the Agent Email Guide](apps/api/docs/AGENT_EMAIL.md) for tool contracts,
+identity rules, sync-trust semantics, and MCP client guidance.
+
 ## Conversation Threading
 
 SupaMail keeps three identities separate:
@@ -427,6 +454,12 @@ pnpm --filter @supamail/api smoke:load
 
 ## Project Status
 
-SupaMail is early and intentionally focused on the mailbox protocol layer. No calendar, contacts, CRM, identity hydration, work-item clustering, or AI features are included in the core.
+SupaMail is early and intentionally focused on the mailbox protocol and
+agent-access layers. No calendar, contacts, CRM, identity hydration, work-item
+clustering, hosted tenant orchestration, or embedded AI features are included
+in the core.
 
-The repo is independent from the app it came from. It excludes CRM hydration, person/company identity resolution, handle mapping, identity/belief code, MCP routes, Trigger.dev coupling, and internal dashboard logic.
+The repo is independent from the app it came from. It includes the reusable
+local CLI and MCP tool contracts, while hosted authentication, billing,
+multi-tenancy, remote MCP transport, and support operations remain outside the
+open-source core.
