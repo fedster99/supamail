@@ -71,13 +71,16 @@ ADR 0027 refines the live and priority body fields. The
 `imap_account_progress` Postgres **VIEW** derives their targets from current
 `imap_messages` rows that are `IN_WINDOW`, not deleted at the provider, and in
 tracked folders whose `missing_since` is NULL and whose status is neither
-`MISSING` nor `PENDING_VERIFICATION`. It counts a fetched body only when the
-matching `imap_message_bodies` row exists and `raw_truncated = false`. Priority
+`MISSING` nor `PENDING_VERIFICATION`. It counts a fetched body only when
+`body_fetched_at` marks a successful body store, the matching
+`imap_message_bodies` evidence row exists, and `raw_truncated = false`. Priority
 coverage also requires `sync_priority <= 10`. Migration
 `0021_row_accurate_body_progress` adds the partial
 `imap_messages_live_body_progress_idx` for this account/folder/message access
 path. Large existing mirrors must prebuild that exact index concurrently before
-applying the transactional migration. The view requires no refresh management.
+applying the transactional migration. Migration
+`0022_content_extract_body_store` adds the store-completion requirement. The
+view requires no refresh management.
 
 Both per-folder and per-account values are exposed via `GET /accounts/:id`.
 Each folder adds row-current `live_bodies_fetched_count` and

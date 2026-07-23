@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0021_row_accurate_body_progress",
+  "schemaVersion": "0022_content_extract_body_store",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -84,6 +84,10 @@
     {
       "id": "0021_row_accurate_body_progress",
       "file": "0021_row_accurate_body_progress.sql"
+    },
+    {
+      "id": "0022_content_extract_body_store",
+      "file": "0022_content_extract_body_store.sql"
     }
   ]
 }

@@ -1,5 +1,26 @@
 # Session Handoff
 
+## 2026-07-23 — Content extract and body-store seam
+
+- Branch `fedster99/content-body-store-seam` adds public migration
+  `0022_content_extract_body_store`: a 32 KiB UTF-8 `search_extract`, generated
+  FTS/trigram indexes, and `threading_payload_sha256` over every parsed body
+  variant. Existing body rows are backfilled without a mailbox rebuild.
+- Sync now commits search/threading evidence before an injected `BodyStore`
+  receives raw MIME and parsed payload. `DatabaseBodyStore` remains the OSS
+  default and preserves `BODY_STORAGE_MODE`, including `parsed_only`.
+- Search matches, body filters, ranking, snippets, and substring candidates use
+  the extract. Thread delivery evidence can be recomputed after envelope
+  corrections from compact evidence without reading payload columns. Body
+  progress becomes complete only after the store succeeds.
+- ADR 0028 records the exact extract input/bound, ordering invariant,
+  compatibility behavior, and excluded hosted/storage-provider decisions.
+- Verification passed 691 fast tests, 188 live-Postgres tests, 118/118
+  spec-conformance checks, typecheck, and both builds. Search eval remained
+  nDCG@10 `0.9441428692051971`, Recall@10 `0.953125`, MRR `0.96875`, with all
+  four junk guards passing. The expected Node 26 warning appeared locally
+  because the repository pins Node 24.
+
 ## 2026-07-23 — Mutable live-body policy and row-accurate coverage
 
 - Branch `fedster99/live-body-coverage-policy` lets an existing account change
@@ -149,6 +170,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Current Branch
 
+- Active branch `fedster99/content-body-store-seam` implements ADR 0028's
+  evidence-first content seam. The cloud image re-pin is deliberately deferred
+  to a separate private-repo task.
 - Active branch `fedster99/live-body-coverage-policy` makes
   `body_fetch_policy` mutable for existing accounts and replaces counter-derived
   live/priority body coverage with current-row evidence. ADR 0027 records the

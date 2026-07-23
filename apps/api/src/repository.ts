@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { AppConfig } from "./config.js";
+import { buildSearchExtract } from "./body-store.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError } from "./errors.js";
@@ -362,6 +363,52 @@ function prepareMessageEvidence(body: MessageBodyInput): PreparedMessageEvidence
   });
 }
 
+interface BodyThreadingEnvelope {
+  subject: string | null;
+  from_email: string | null;
+  to_emails: string[] | null;
+  cc_emails: string[] | null;
+  bcc_emails: string[] | null;
+  size_bytes: number | string | null;
+}
+
+function threadingPayloadSha256(body: MessageBodyInput): string | null {
+  if (
+    body.rawTruncated
+    || (body.bodyText ?? body.bodyPlain ?? body.selectedTextPart ?? body.bodyHtml) === null
+  ) {
+    return null;
+  }
+  const encode = (value: string | null): string =>
+    value === null ? "-:" : `${Buffer.byteLength(value, "utf8")}:${value}`;
+  return createHash("sha256")
+    .update([
+      body.bodyText,
+      body.bodyHtml,
+      body.bodyPlain,
+      body.selectedTextPart,
+      body.selectedTextFormat
+    ].map(encode).join(""))
+    .digest("hex");
+}
+
+function hasBodyThreadingEnvelope(
+  message: BodyThreadingEnvelope,
+  body: MessageBodyInput,
+  payloadSha256: string | null
+): boolean {
+  return body.rawBytes > 0
+    && message.from_email !== null
+    && body.headersJson["message-id"] !== undefined
+    && body.headersJson.from !== undefined
+    && [
+      ...(message.to_emails ?? []),
+      ...(message.cc_emails ?? []),
+      ...(message.bcc_emails ?? [])
+    ].length > 0
+    && payloadSha256 !== null;
+}
+
 interface PurgeCandidate {
   id: string;
   account_id: string;
@@ -617,7 +664,8 @@ export class MirrorRepository {
           m.folder_path,
           count(*)::int AS live_bodies_target_count,
           count(*) FILTER (
-            WHERE b.message_id IS NOT NULL
+            WHERE m.body_fetched_at IS NOT NULL
+              AND b.message_id IS NOT NULL
               AND NOT b.raw_truncated
           )::int AS live_bodies_fetched_count
         FROM public.imap_messages m
@@ -3126,7 +3174,18 @@ export class MirrorRepository {
     }
   }
 
+  /** Backward-compatible convenience for callers that use the OSS database store directly. */
   async storeBody(body: MessageBodyInput): Promise<void> {
+    await this.storeBodyEvidence(body);
+    await this.storeBodyPayload(body);
+    await this.completeBodyStorage(body.messageId);
+  }
+
+  /**
+   * Commit every search/threading input before any body-store implementation
+   * receives the full payload.
+   */
+  async storeBodyEvidence(body: MessageBodyInput): Promise<void> {
     const preparedEvidence = body.rawTruncated ? [] : prepareMessageEvidence(body);
     const structuredEvidenceComplete = !body.rawTruncated
       && !body.parserWarnings.includes("artifact_evidence_truncated");
@@ -3155,12 +3214,23 @@ export class MirrorRepository {
         references_header: string | null;
         headers_json: Record<string, unknown>;
         raw_mime_sha256: string | null;
+        parsed_delivery_sha256: string | null;
+        authored_delivery_sha256: string | null;
         body_headers_json: Record<string, unknown> | null;
+        subject: string | null;
+        from_email: string | null;
+        to_emails: string[] | null;
+        cc_emails: string[] | null;
+        bcc_emails: string[] | null;
+        size_bytes: string | null;
       }>(
         `
         SELECT account_id, folder_path, body_fetched_at,
                rfc_message_id, in_reply_to, references_header,
-               m.headers_json, b.raw_mime_sha256,
+               m.headers_json, m.subject, m.from_email, m.to_emails,
+               m.cc_emails, m.bcc_emails, m.size_bytes::text AS size_bytes,
+               b.raw_mime_sha256, b.parsed_delivery_sha256,
+               b.authored_delivery_sha256,
                b.headers_json AS body_headers_json
         FROM public.imap_messages m
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
@@ -3187,7 +3257,75 @@ export class MirrorRepository {
         : body.rawMimeSha256 === undefined
           ? createHash("sha256").update(body.rawMime).digest("hex")
           : body.rawMimeSha256;
-      const learnedDeliveryEvidence = rawMimeSha256 !== message.raw_mime_sha256;
+      const payloadSha256 = threadingPayloadSha256(body);
+      const hasThreadingEnvelope = hasBodyThreadingEnvelope(message, body, payloadSha256);
+      const digests = await client.query<{
+        parsed_delivery_sha256: string | null;
+        authored_delivery_sha256: string | null;
+      }>(
+        `SELECT
+           CASE WHEN $13::boolean
+             THEN encode(extensions.digest(convert_to(jsonb_build_object(
+               'subject', $1::text,
+               'from_email', $2::text,
+               'to_emails', $3::text[],
+               'cc_emails', $4::text[],
+               'bcc_emails', $5::text[],
+               'size_bytes', $6::bigint,
+               'raw_bytes', $7::bigint,
+               'threading_payload_sha256', $8::text,
+               'headers_json', $9::jsonb,
+               'mime_structure', $10::jsonb,
+               'parser_warnings', $11::text[]
+             )::text, 'UTF8'), 'sha256'), 'hex')
+             ELSE NULL
+           END AS parsed_delivery_sha256,
+           CASE WHEN $14::boolean
+             THEN encode(extensions.digest(convert_to(jsonb_build_object(
+               'message_id', $9::jsonb -> 'message-id',
+               'date', $9::jsonb -> 'date',
+               'subject', $1::text,
+               'from_email', $2::text,
+               'to_emails', $3::text[],
+               'cc_emails', $4::text[],
+               'bcc_emails', $5::text[],
+               'threading_payload_sha256', $8::text,
+               'content_type', $9::jsonb -> 'content-type',
+               'content_transfer_encoding', $9::jsonb -> 'content-transfer-encoding',
+               'mime_version', $9::jsonb -> 'mime-version',
+               'mime_structure', $10::jsonb,
+               'parser_warnings', $11::text[],
+               'structured_evidence_sha256', $12::text
+             )::text, 'UTF8'), 'sha256'), 'hex')
+             ELSE NULL
+           END AS authored_delivery_sha256`,
+        [
+          message.subject,
+          message.from_email,
+          message.to_emails,
+          message.cc_emails,
+          message.bcc_emails,
+          message.size_bytes,
+          body.rawBytes,
+          payloadSha256,
+          JSON.stringify(body.headersJson),
+          JSON.stringify(body.mimeStructure),
+          body.parserWarnings,
+          structuredEvidenceSha256,
+          !body.rawTruncated && rawMimeSha256 === null && hasThreadingEnvelope,
+          !body.rawTruncated
+            && hasThreadingEnvelope
+            && body.headersJson.date !== undefined
+            && body.mimeStructure !== null
+            && structuredEvidenceComplete
+            && structuredEvidenceSha256 !== null
+        ]
+      );
+      const parsedSha256 = digests.rows[0]?.parsed_delivery_sha256 ?? null;
+      const authoredSha256 = digests.rows[0]?.authored_delivery_sha256 ?? null;
+      const learnedDeliveryEvidence = rawMimeSha256 !== message.raw_mime_sha256
+        || parsedSha256 !== message.parsed_delivery_sha256
+        || authoredSha256 !== message.authored_delivery_sha256;
       const bodyHeadersChanged = canonicalJsonForThreadingEvidence(message.body_headers_json ?? {})
         !== canonicalJsonForThreadingEvidence(body.headersJson);
 
@@ -3217,6 +3355,8 @@ export class MirrorRepository {
           message_id,
           raw_mime,
           raw_mime_sha256,
+          parsed_delivery_sha256,
+          authored_delivery_sha256,
           raw_bytes,
           raw_truncated,
           body_text,
@@ -3231,28 +3371,24 @@ export class MirrorRepository {
           structured_evidence_sha256,
           structured_evidence_complete,
           structured_evidence_extracted_at,
+          threading_payload_sha256,
+          search_extract,
           fetched_at,
           created_at,
           updated_at
         )
         VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-          $14, $15, $16, now(),
+          $1, NULL, $2, $3, $4, $5, $6, NULL, NULL, NULL, NULL, NULL,
+          $7, $8, $9, $10, $11, $12, now(), $13, $14,
           now(), now(), now()
         )
         ON CONFLICT (message_id)
         DO UPDATE SET
-          raw_mime = EXCLUDED.raw_mime,
           raw_mime_sha256 = EXCLUDED.raw_mime_sha256,
-          parsed_delivery_sha256 = NULL,
-          authored_delivery_sha256 = NULL,
+          parsed_delivery_sha256 = EXCLUDED.parsed_delivery_sha256,
+          authored_delivery_sha256 = EXCLUDED.authored_delivery_sha256,
           raw_bytes = EXCLUDED.raw_bytes,
           raw_truncated = EXCLUDED.raw_truncated,
-          body_text = EXCLUDED.body_text,
-          body_html = EXCLUDED.body_html,
-          body_plain = EXCLUDED.body_plain,
-          selected_text_part = EXCLUDED.selected_text_part,
-          selected_text_format = EXCLUDED.selected_text_format,
           headers_json = EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
           parser_warnings = EXCLUDED.parser_warnings,
@@ -3260,26 +3396,26 @@ export class MirrorRepository {
           structured_evidence_sha256 = EXCLUDED.structured_evidence_sha256,
           structured_evidence_complete = EXCLUDED.structured_evidence_complete,
           structured_evidence_extracted_at = EXCLUDED.structured_evidence_extracted_at,
+          threading_payload_sha256 = EXCLUDED.threading_payload_sha256,
+          search_extract = EXCLUDED.search_extract,
           fetched_at = now(),
           updated_at = now()
         `,
         [
           body.messageId,
-          this.config.BODY_STORAGE_MODE === "parsed_only" ? null : body.rawMime,
           rawMimeSha256,
+          parsedSha256,
+          authoredSha256,
           body.rawBytes,
           body.rawTruncated,
-          body.bodyText,
-          body.bodyHtml,
-          body.bodyPlain,
-          body.selectedTextPart,
-          body.selectedTextFormat,
           JSON.stringify(body.headersJson),
           JSON.stringify(body.mimeStructure ?? null),
           body.parserWarnings,
           MIME_EVIDENCE_EXTRACTOR_VERSION,
           structuredEvidenceSha256,
-          structuredEvidenceComplete
+          structuredEvidenceComplete,
+          payloadSha256,
+          buildSearchExtract(body.bodyText)
         ]
       );
 
@@ -3362,13 +3498,85 @@ export class MirrorRepository {
         );
       }
 
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Persist only the full body payload; search and threading never read these fields. */
+  async storeBodyPayload(body: MessageBodyInput): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const stored = await client.query(
+        `
+        UPDATE public.imap_message_bodies
+        SET raw_mime = $2,
+            body_text = $3,
+            body_html = $4,
+            body_plain = $5,
+            selected_text_part = $6,
+            selected_text_format = $7,
+            fetched_at = now(),
+            updated_at = now()
+        WHERE message_id = $1
+        RETURNING message_id
+        `,
+        [
+          body.messageId,
+          this.config.BODY_STORAGE_MODE === "parsed_only" ? null : body.rawMime,
+          body.bodyText,
+          body.bodyHtml,
+          body.bodyPlain,
+          body.selectedTextPart,
+          body.selectedTextFormat
+        ]
+      );
+      if (stored.rowCount !== 1) {
+        throw new Error(`Body evidence must be stored before body payload: ${body.messageId}`);
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Mark the body readable only after the selected BodyStore succeeds. */
+  async completeBodyStorage(messageId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const target = await client.query<{
+        account_id: string;
+        folder_path: string;
+        body_fetched_at: Date | null;
+      }>(
+        `
+        SELECT account_id, folder_path, body_fetched_at
+        FROM public.imap_messages
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [messageId]
+      );
+      const message = target.rows[0];
+      if (!message) throw new Error(`Message not found after body storage: ${messageId}`);
+
       await client.query(
         `
         UPDATE public.imap_messages
         SET body_fetched_at = now()
         WHERE id = $1
         `,
-        [body.messageId]
+        [messageId]
       );
 
       if (!message.body_fetched_at) {

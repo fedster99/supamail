@@ -44,8 +44,28 @@ const rowAccurateBodyProgressMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0021_row_accurate_body_progress.sql"
 );
+const contentExtractBodyStoreMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0022_content_extract_body_store.sql"
+);
 
 describe("initial schema", () => {
+  it("adds a bounded search extract without moving full body payloads into metadata", async () => {
+    const sql = await readFile(contentExtractBodyStoreMigrationPath, "utf8");
+
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS search_extract text");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS threading_payload_sha256 text");
+    expect(sql).toContain("octet_length(search_extract) <= 32768");
+    expect(sql).toContain("imap_threading_payload_sha256");
+    expect(sql).toContain("search_extract_fts tsvector");
+    expect(sql).toContain("imap_message_bodies_search_extract_fts_gin");
+    expect(sql).toContain("imap_message_bodies_search_extract_trgm_idx");
+    expect(sql).toContain("m.body_fetched_at IS NOT NULL");
+    expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_search_extract");
+    expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_threading_payload_sha256");
+    expect(sql).not.toMatch(/stripe|tenant|turbopuffer|storage_key/i);
+  });
+
   it("contains the neutral mirror tables and raw body storage", async () => {
     const sql = await readFile(publicMigrationPath, "utf8");
 
@@ -123,9 +143,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0021_row_accurate_body_progress");
+    expect(version).toBe("0022_content_extract_body_store");
     expect(manifest).toEqual({
-      schemaVersion: "0021_row_accurate_body_progress",
+      schemaVersion: "0022_content_extract_body_store",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -147,7 +167,8 @@ describe("initial schema", () => {
         { id: "0018_threading_body_fallback_index", file: "0018_threading_body_fallback_index.sql" },
         { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" },
         { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" },
-        { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" }
+        { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" },
+        { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -176,6 +197,7 @@ describe("initial schema", () => {
     expect(sql).toContain("authored_delivery_sha256 text");
     expect(sql).toContain("delivery_fingerprint_hashes text[]");
     expect(sql).toContain("current_live_body_progress AS");
+    expect(sql).toContain("search_extract_fts tsvector");
   });
 
   it("indexes delivery fingerprints for bounded threading closure", async () => {

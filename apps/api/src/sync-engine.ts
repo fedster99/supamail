@@ -1,5 +1,6 @@
 import type { AppConfig } from "./config.js";
 import { getConfig, getWindowCutoff, isWithinBackfillWindow } from "./config.js";
+import { DatabaseBodyStore, type BodyStore } from "./body-store.js";
 import type { PgPool } from "./db.js";
 import { getPool } from "./db.js";
 import { performance } from "node:perf_hooks";
@@ -260,6 +261,7 @@ export interface MirrorEngineOptions {
   pool?: PgPool;
   config?: AppConfig;
   repository?: MirrorRepository;
+  bodyStore?: BodyStore;
   hooks?: MirrorHooks;
   clientFactory?: (
     account: ImapAccount,
@@ -271,6 +273,7 @@ export class MirrorEngine {
   private readonly pool: PgPool;
   private readonly config: AppConfig;
   private readonly repository: MirrorRepository;
+  private readonly bodyStore: BodyStore;
   private readonly hooks: MirrorHooks;
   private readonly clientFactory: (
     account: ImapAccount,
@@ -281,6 +284,7 @@ export class MirrorEngine {
     this.pool = options.pool ?? getPool();
     this.config = options.config ?? getConfig();
     this.repository = options.repository ?? new MirrorRepository(this.pool, this.config);
+    this.bodyStore = options.bodyStore ?? new DatabaseBodyStore(this.repository);
     this.hooks = options.hooks ?? {};
     this.clientFactory = options.clientFactory
       ?? ((account, clientOptions) => createImapClient(this.pool, this.config, account, clientOptions));
@@ -1749,7 +1753,9 @@ export class MirrorEngine {
       }
       throw error;
     }
-    await this.repository.storeBody(body);
+    await this.repository.storeBodyEvidence(body);
+    await this.bodyStore.store(body);
+    await this.repository.completeBodyStorage(body.messageId);
     await this.hooks.onBodyFetched?.(message, body);
   }
 }

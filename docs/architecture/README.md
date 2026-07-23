@@ -12,6 +12,7 @@ SupaMail is a small, stateful email mirror packaged as a monorepo. IMAP is the p
 - `apps/api/src/locks.ts`: session-scoped advisory lock behavior and stale lock recovery.
 - `apps/api/src/imap-client.ts`: ImapFlow adapter, throttling, metadata fetch, UID search, and full body fetch.
 - `apps/api/src/mime.ts`: MIME parsing, normalized text, header extraction, and attachment metadata helpers.
+- `apps/api/src/body-store.ts`: bounded search-extract contract and the pluggable full-payload store, with database bodies as the OSS default.
 - `apps/api/src/threading.ts`: pure, deterministic delivery deduplication and conversation-graph algorithm.
 - `apps/api/src/threading-repository.ts`: versioned executor registry and shadow-run state machine, bounded per-run queues/closures, persisted comparison certificates, atomic activation, audit history, retention, and guarded rollback.
 - `apps/api/supabase/migrations/public/`: ordered public mirror migrations and manifest.

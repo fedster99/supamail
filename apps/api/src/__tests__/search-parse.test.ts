@@ -207,6 +207,19 @@ describe("email-005 structured filters", () => {
 });
 
 describe("compileSearch", () => {
+  it("retrieves and ranks body text from the bounded search extract only", () => {
+    const compiled = compileSearch("invoice", [], {
+      ...baseCompileOptions,
+      hasText: true,
+      snippet: true
+    });
+
+    expect(compiled.text).toContain("b.search_extract_fts");
+    expect(compiled.text).toContain("b2.search_extract");
+    expect(compiled.text).not.toContain("b.body_fts");
+    expect(compiled.text).not.toMatch(/coalesce\(b2\.body_text,\s*b2\.body_plain,\s*b2\.selected_text_part,\s*page\.subject/);
+  });
+
   it("deduplicates deliveries before account-scoped conversation grouping", () => {
     const compiled = compileSearch("", [], baseCompileOptions);
 

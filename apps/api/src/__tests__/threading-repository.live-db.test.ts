@@ -333,6 +333,93 @@ liveDb("ThreadingRepository live DB", () => {
     expect(await activeProjection(accountId)).toEqual(shadow);
   });
 
+  it("threads physical copies from committed evidence after the body payload is unreadable", async () => {
+    const accountId = await createAccount("evidence-without-payload");
+    const messageId = "<evidence-without-payload@example.test>";
+    const first = await seedMessage(accountId, {
+      uid: 1,
+      folder: "INBOX",
+      subject: "Evidence seam",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: messageId
+    });
+    const second = await seedMessage(accountId, {
+      uid: 2,
+      folder: "Sent",
+      subject: "Evidence seam",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: messageId
+    });
+    const rawMime = Buffer.from(
+      `Message-ID: ${messageId}\r\n` +
+      "Date: Thu, 15 Jan 2026 12:00:00 +0000\r\n" +
+      "From: alice@example.test\r\n" +
+      "To: bob@example.test\r\n" +
+      "Subject: Evidence seam\r\n\r\n" +
+      "threading evidence survives"
+    );
+    for (const id of [first, second]) {
+      await mirror.storeBody({
+        messageId: id,
+        rawMime,
+        rawBytes: rawMime.byteLength,
+        rawTruncated: false,
+        bodyText: "threading evidence survives",
+        bodyHtml: null,
+        bodyPlain: "threading evidence survives",
+        selectedTextPart: "1",
+        selectedTextFormat: "plain",
+        headersJson: {
+          "message-id": messageId,
+          date: "Thu, 15 Jan 2026 12:00:00 +0000",
+          from: "alice@example.test",
+          to: "bob@example.test",
+          subject: "Evidence seam"
+        },
+        mimeStructure: { type: "text", subtype: "plain" },
+        parserWarnings: [],
+        evidence: []
+      });
+    }
+
+    await pool.query(
+      `UPDATE public.imap_message_bodies
+       SET raw_mime = NULL,
+           body_text = NULL,
+           body_html = NULL,
+           body_plain = NULL,
+           selected_text_part = NULL,
+           selected_text_format = NULL
+       WHERE message_id = ANY($1::uuid[])`,
+      [[first, second]]
+    );
+    const evidence = await pool.query<{
+      search_extract: string | null;
+      raw_mime_sha256: string | null;
+      threading_payload_sha256: string | null;
+    }>(
+      `SELECT search_extract, raw_mime_sha256, threading_payload_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])
+       ORDER BY message_id`,
+      [[first, second]]
+    );
+    expect(evidence.rows).toHaveLength(2);
+    expect(evidence.rows.every((row) =>
+      row.search_extract === "threading evidence survives"
+      && /^[0-9a-f]{64}$/.test(row.raw_mime_sha256 ?? "")
+      && /^[0-9a-f]{64}$/.test(row.threading_payload_sha256 ?? "")
+    )).toBe(true);
+
+    const ready = await drainUntilReady(accountId, { batchSize: 1 });
+    const rows = await projection(ready.runId as string);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(1);
+    expect(new Set(rows.map((row) => row.conversation_id)).size).toBe(1);
+  });
+
   it("atomically activates the first projection when the worker explicitly opts in", async () => {
     const accountId = await createAccount("initial-auto-activation");
     await seedMessage(accountId, {
