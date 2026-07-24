@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { buildSearchExtract } from "../body-store.js";
 import type { PgPool } from "../db.js";
 import { searchMessages } from "../search/search.js";
 import type { SearchResult } from "../search/types.js";
@@ -178,9 +179,17 @@ export async function seedCorpus(pool: PgPool, accountEmail: string): Promise<Se
     uid += 1;
 
     await pool.query(
-      `INSERT INTO public.imap_message_bodies (message_id, raw_mime, raw_bytes, raw_truncated, body_text)
-       VALUES ($1, $2, $3, false, $4)`,
-      [id, Buffer.from(message.body), message.body.length, message.body]
+      `INSERT INTO public.imap_message_bodies (
+         message_id, raw_mime, raw_bytes, raw_truncated, body_text, search_extract
+       )
+       VALUES ($1, $2, $3, false, $4, $5)`,
+      [
+        id,
+        Buffer.from(message.body),
+        Buffer.byteLength(message.body, "utf8"),
+        message.body,
+        buildSearchExtract(message.body)
+      ]
     );
     await pool.query("UPDATE public.imap_messages SET body_fetched_at = now() WHERE id = $1", [id]);
 

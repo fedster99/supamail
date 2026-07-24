@@ -32,6 +32,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0025-structured-message-evidence.md`: Decoded MIME yields bounded attachment/calendar/provider-resource evidence for downstream use without introducing semantic work-item clustering into SupaMail.
 - `0026-post-repair-reconcile-health.md`: Reconcile gap counts describe observed drift, while account health describes the post-repair mirror state.
 - `0027-mutable-body-policy-row-accurate-coverage.md`: Existing accounts can change live body policy, while current complete message rows define live and priority body coverage.
+- `0028-content-extract-body-store-seam.md`: A 32 KiB plain-text extract and threading evidence commit before the pluggable body store receives the full payload.
 
 ## Status Values
 

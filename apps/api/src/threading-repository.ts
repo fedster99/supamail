@@ -2059,11 +2059,7 @@ export class ThreadingRepository {
                 'to_emails', message.to_emails,
                 'cc_emails', message.cc_emails,
                 'bcc_emails', message.bcc_emails,
-                'body_text', body.body_text,
-                'body_html', body.body_html,
-                'body_plain', body.body_plain,
-                'selected_text_part', body.selected_text_part,
-                'selected_text_format', body.selected_text_format,
+                'threading_payload_sha256', body.threading_payload_sha256,
                 'content_type', body.headers_json -> 'content-type',
                 'content_transfer_encoding', body.headers_json -> 'content-transfer-encoding',
                 'mime_version', body.headers_json -> 'mime-version',
@@ -2086,7 +2082,7 @@ export class ThreadingRepository {
            coalesce(message.cc_emails, '{}'::text[]) ||
            coalesce(message.bcc_emails, '{}'::text[])
          ) > 0
-         AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+         AND body.threading_payload_sha256 IS NOT NULL
          AND body.mime_structure IS NOT NULL
          AND body.structured_evidence_complete
          AND body.structured_evidence_sha256 IS NOT NULL
@@ -2169,7 +2165,7 @@ export class ThreadingRepository {
                      coalesce(message.cc_emails, '{}'::text[]) ||
                      coalesce(message.bcc_emails, '{}'::text[])
                    ) > 0
-                   AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+                   AND body.threading_payload_sha256 IS NOT NULL
                   THEN encode(extensions.digest(convert_to(jsonb_build_object(
                     'subject', message.subject,
                     'from_email', message.from_email,
@@ -2178,11 +2174,7 @@ export class ThreadingRepository {
                     'bcc_emails', message.bcc_emails,
                     'size_bytes', message.size_bytes,
                     'raw_bytes', body.raw_bytes,
-                    'body_text', body.body_text,
-                    'body_html', body.body_html,
-                    'body_plain', body.body_plain,
-                    'selected_text_part', body.selected_text_part,
-                    'selected_text_format', body.selected_text_format,
+                    'threading_payload_sha256', body.threading_payload_sha256,
                     'headers_json', body.headers_json,
                     'mime_structure', body.mime_structure,
                     'parser_warnings', body.parser_warnings
@@ -2208,7 +2200,7 @@ export class ThreadingRepository {
                  coalesce(message.cc_emails, '{}'::text[]) ||
                  coalesce(message.bcc_emails, '{}'::text[])
                ) > 0
-               AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+               AND body.threading_payload_sha256 IS NOT NULL
              )
            )
          ORDER BY body.message_id
@@ -2272,7 +2264,7 @@ export class ThreadingRepository {
                  coalesce(message.cc_emails, '{}'::text[]) ||
                  coalesce(message.bcc_emails, '{}'::text[])
                ) > 0
-               AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+               AND body.threading_payload_sha256 IS NOT NULL
                AND body.mime_structure IS NOT NULL
                AND body.structured_evidence_complete
                AND body.structured_evidence_sha256 IS NOT NULL
@@ -2293,7 +2285,7 @@ export class ThreadingRepository {
                  coalesce(message.cc_emails, '{}'::text[]) ||
                  coalesce(message.bcc_emails, '{}'::text[])
                ) > 0
-               AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+               AND body.threading_payload_sha256 IS NOT NULL
              )
            )
          LIMIT 1
@@ -2991,7 +2983,7 @@ export class ThreadingRepository {
            coalesce(message.cc_emails, '{}'::text[]) ||
            coalesce(message.bcc_emails, '{}'::text[])
          ) > 0
-         AND coalesce(body.body_text, body.body_plain, body.selected_text_part, body.body_html) IS NOT NULL
+         AND body.threading_payload_sha256 IS NOT NULL
          AND body.mime_structure IS NOT NULL
          AND body.structured_evidence_complete
          AND body.structured_evidence_sha256 IS NOT NULL

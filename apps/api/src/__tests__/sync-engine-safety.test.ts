@@ -97,6 +97,17 @@ describe("sync engine safety", () => {
     expect(source).toContain("markBodyFetchAttempted(message.id)");
   });
 
+  it("commits the search extract and threading evidence before handing off the body payload", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+    const evidenceWrite = source.indexOf("await this.repository.storeBodyEvidence(body)");
+    const payloadWrite = source.indexOf("await this.bodyStore.store(body)");
+    const completionWrite = source.indexOf("await this.repository.completeBodyStorage(body.messageId)");
+
+    expect(evidenceWrite).toBeGreaterThan(-1);
+    expect(payloadWrite).toBeGreaterThan(evidenceWrite);
+    expect(completionWrite).toBeGreaterThan(payloadWrite);
+  });
+
   it("reconciles only the active sync window", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 

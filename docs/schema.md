@@ -24,9 +24,31 @@ The mirror owns these neutral tables in `public`:
 
 RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked when those Supabase roles exist. `imap_account_progress` and `imap_thread_active_assignments` are `security_invoker` views and also revoke public/browser-role access. The worker/API should use a direct Postgres connection string, not the browser-facing Supabase Data API.
 
-`imap_messages` stays metadata-oriented so list queries remain small. Full body data lives in `imap_message_bodies`.
+`imap_messages` stays metadata-oriented so list queries remain small.
+`imap_message_bodies` keeps the lightweight content evidence row and is the
+default OSS full-payload store.
 
-`imap_message_bodies.raw_mime` stores RFC822/MIME bytes. Parsed fields store plain text, HTML, normalized text, parsed headers, selected text part, parser warnings, and MIME structure snapshots. With `BODY_STORAGE_MODE=parsed_only`, bodies are still fetched and parsed but `raw_mime` is stored as NULL; `raw_bytes` and `raw_truncated` keep describing the fetched source. A body row is complete for live coverage only when `raw_truncated = false`. A truncated row remains incomplete but does not enter an automatic body-fetch retry loop. Callers can request an explicit refetch after correcting the cause; a message above the configured cap requires a higher `BODY_RAW_MAX_BYTES` first.
+`0022_content_extract_body_store` adds `search_extract`, a maximum 32 KiB UTF-8
+prefix of the parser's selected normalized plain text, plus an FTS expression
+index that does not store a duplicate generated vector. It also adds
+`threading_payload_sha256`, a compact digest over every parsed body variant.
+Sync commits this extract, payload digest, recovered threading headers,
+structured evidence, and delivery digests before invoking the selected
+`BodyStore`. Search and threading read only that retained evidence. The
+migration backfills existing extracts from `body_text` with `body_plain` as a
+legacy fallback and computes the threading digest from the existing parsed
+columns.
+
+`DatabaseBodyStore` remains the OSS default. `imap_message_bodies.raw_mime`
+stores RFC822/MIME bytes, while the full-payload fields store plain text, HTML,
+and selected part data. With `BODY_STORAGE_MODE=parsed_only`, bodies are still
+fetched and parsed but `raw_mime` is stored as NULL; `raw_bytes` and
+`raw_truncated` keep describing the fetched source. An evidence row becomes a
+complete readable body only after the store succeeds and
+`imap_messages.body_fetched_at` is set. A truncated row remains incomplete but
+does not enter an automatic body-fetch retry loop. Callers can request an
+explicit refetch after correcting the cause; a message above the configured cap
+requires a higher `BODY_RAW_MAX_BYTES` first.
 
 `0017_threading_body_backfill_index` keeps the legacy delivery-fingerprint repair lane bounded after most rows have been repaired. Its partial `message_id` index contains only complete bodies still missing a usable raw-MIME or parsed-delivery digest; successful repairs leave the index automatically, so later worker passes do not walk the full body table to find a sparse backlog.
 
@@ -48,7 +70,7 @@ Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY
 
 Historical backfill uses the folder-level `backfill_in_progress`, `backfill_target_max_uid`, `backfill_oldest_uid_synced`, `backfill_since_date`, and `last_archive_refresh_at` fields. The history lane snapshots UIDs older than the live window, walks them newest-first in resumable batches, stores metadata as `window_status = 'HISTORICAL'`, and fetches historical bodies when `historical_backfill_mode = 'metadata_and_bodies'`.
 
-`0021_row_accurate_body_progress` replaces `imap_account_progress`. Live and priority body targets now come from active `IN_WINDOW` `imap_messages` joined to tracked `imap_folders` whose `missing_since` is NULL and whose status is neither `MISSING` nor `PENDING_VERIFICATION`; provider-deleted rows are excluded. A fetched body counts only when an `imap_message_bodies` row exists and `raw_truncated = false`. Priority coverage applies the existing `sync_priority <= 10` cutoff. Live-header and historical percentages continue to use the cumulative folder counters.
+`0021_row_accurate_body_progress` replaces `imap_account_progress`. Live and priority body targets now come from active `IN_WINDOW` `imap_messages` joined to tracked `imap_folders` whose `missing_since` is NULL and whose status is neither `MISSING` nor `PENDING_VERIFICATION`; provider-deleted rows are excluded. Migration `0022` tightens completion for the two-stage store: a fetched body counts only when `body_fetched_at` is set, an `imap_message_bodies` row exists, and `raw_truncated = false`. Priority coverage applies the existing `sync_priority <= 10` cutoff. Live-header and historical percentages continue to use the cumulative folder counters.
 
 `GET /accounts/:id` exposes the account percentages plus a nullable `estimated_full_sync_at`; the estimate remains null until a durable rate model exists. Each folder row also exposes row-current `live_bodies_fetched_count` and `live_bodies_target_count`. Its `bodies_pct` uses those fields instead of the cumulative `bodies_fetched_count`. Folder rows cover every returned folder, including untracked, missing, and pending folders. The account roll-up includes only active eligible folders, so folder targets do not always sum to the account target.
 
@@ -70,13 +92,19 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_live_body_progress_idx
 
 `0013_body_head_trigram_index` adds exact substring support over the same bounded 128 KB body head. Consumers must use `left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)` verbatim so PostgreSQL can select the expression GIN; natural-language lexical search continues to use `body_fts`.
 
+Migration `0022` supersedes those body-payload sources for current readers:
+natural-language FTS, body filters, and snippets use only `search_extract`
+through `imap_search_extract_fts(search_extract)`. The 0008/0013 columns and
+indexes remain in place for additive migration compatibility; current fuzzy
+recall uses the existing bounded header trigram indexes.
+
 `0014_conversation_threading` adds the durable conversation projection (ADR 0024). It preserves three separate identities:
 
 - `imap_messages` remains one physical mailbox row, unique by account, folder, UIDVALIDITY, and UID.
 - `imap_thread_assignments.delivery_key` groups verified physical copies of one delivered email.
 - `imap_thread_assignments.conversation_id` groups deliveries connected by the reply graph.
 
-`imap_messages.provider_message_id` and `provider_message_id_namespace` preserve a provider's delivery identity; `provider_thread_id_namespace` records the provenance of the existing provider conversation hint. `imap_message_bodies.raw_mime_sha256` stores a digest only for a complete, non-truncated MIME fetch. `0015_threading_production_hardening` adds `parsed_delivery_sha256`, a bounded-worker-derived digest over the exact parsed body, MIME structure, parsed headers, envelope, sizes, and parser warnings for historical `parsed_only` rows. These inputs corroborate true copies without trusting Message-ID alone.
+`imap_messages.provider_message_id` and `provider_message_id_namespace` preserve a provider's delivery identity; `provider_thread_id_namespace` records the provenance of the existing provider conversation hint. `imap_message_bodies.raw_mime_sha256` stores a digest only for a complete, non-truncated MIME fetch. `0015_threading_production_hardening` adds `parsed_delivery_sha256`, a digest over the exact parsed body, MIME structure, parsed headers, envelope, sizes, and parser warnings for historical `parsed_only` rows. Migration `0022` first captures every parsed body variant in `threading_payload_sha256`, then computes current raw, parsed fallback, and authored digests synchronously before payload storage. The bounded worker remains for legacy repair and can recompute envelope-dependent projections from the compact digest without reading payload columns. These inputs corroborate true copies without trusting Message-ID alone.
 
 Threading algorithm v2 retains raw, full-parsed, and authored-representation digests as separate evidence tokens. Within one strict Message-ID candidate group, sharing any token collapses physical rows. Rows with a reused Message-ID but no shared token remain split. Algorithms v1 and v2 stay executable for active/standby rollback safety while v3 builds as a separate shadow run.
 

@@ -1,4 +1,5 @@
 export * from "./config.js";
+export * from "./body-store.js";
 export * from "./content.js";
 export * from "./crypto.js";
 export * from "./db.js";

@@ -155,6 +155,8 @@ describe("repository threading evidence wiring", () => {
               references_header: null,
               headers_json: {},
               raw_mime_sha256: rawHash,
+              parsed_delivery_sha256: null,
+              authored_delivery_sha256: null,
               body_headers_json: { "x-z": "last", "x-a": "first" }
             }],
             rowCount: 1
@@ -165,7 +167,7 @@ describe("repository threading evidence wiring", () => {
     };
     const repository = repositoryWithClient(client);
 
-    await repository.storeBody({
+    await repository.storeBodyEvidence({
       messageId: MESSAGE_ID,
       rawMime,
       rawBytes: rawMime.byteLength,
@@ -185,8 +187,8 @@ describe("repository threading evidence wiring", () => {
     const stateLockIndex = calls.findIndex((call) => call.sql.includes("FOR SHARE"));
     const bodyWriteIndex = calls.findIndex((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"));
     expect(stateLockIndex).toBeLessThan(bodyWriteIndex);
-    expect(calls[bodyWriteIndex]?.sql).toContain("parsed_delivery_sha256 = NULL");
-    expect(calls[bodyWriteIndex]?.sql).toContain("authored_delivery_sha256 = NULL");
+    expect(calls[bodyWriteIndex]?.sql).toContain("parsed_delivery_sha256 = EXCLUDED.parsed_delivery_sha256");
+    expect(calls[bodyWriteIndex]?.sql).toContain("authored_delivery_sha256 = EXCLUDED.authored_delivery_sha256");
   });
 
   it("atomically replaces structured message evidence on body recomputation", async () => {
@@ -215,6 +217,8 @@ describe("repository threading evidence wiring", () => {
               references_header: null,
               headers_json: {},
               raw_mime_sha256: null,
+              parsed_delivery_sha256: null,
+              authored_delivery_sha256: null,
               body_headers_json: {}
             }],
             rowCount: 1
@@ -228,7 +232,7 @@ describe("repository threading evidence wiring", () => {
     };
     const repository = repositoryWithClient(client);
 
-    await repository.storeBody({
+    await repository.storeBodyEvidence({
       messageId: MESSAGE_ID,
       rawMime,
       rawBytes: rawMime.byteLength,
@@ -266,7 +270,7 @@ describe("repository threading evidence wiring", () => {
       extractor_version: "mime_evidence_v1"
     })]);
 
-    await repository.storeBody({
+    await repository.storeBodyEvidence({
       messageId: MESSAGE_ID,
       rawMime,
       rawBytes: rawMime.byteLength,
@@ -284,7 +288,7 @@ describe("repository threading evidence wiring", () => {
     const finalBodyWrite = calls
       .filter((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"))
       .at(-1);
-    expect(finalBodyWrite?.params.slice(13, 16)).toEqual([
+    expect(finalBodyWrite?.params.slice(9, 12)).toEqual([
       "mime_evidence_v1",
       null,
       false
@@ -316,6 +320,8 @@ describe("repository threading evidence wiring", () => {
               references_header: null,
               headers_json: {},
               raw_mime_sha256: "0".repeat(64),
+              parsed_delivery_sha256: null,
+              authored_delivery_sha256: null,
               body_headers_json: {}
             }],
             rowCount: 1
@@ -326,7 +332,7 @@ describe("repository threading evidence wiring", () => {
     };
     const repository = repositoryWithClient(client);
 
-    await repository.storeBody({
+    await repository.storeBodyEvidence({
       messageId: MESSAGE_ID,
       rawMime,
       rawBytes: rawMime.byteLength,

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { closePool, getPool } from "../db.js";
+import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { MirrorImapClient } from "../imap-client.js";
 import { resetConfigForTests } from "../config.js";
@@ -1288,6 +1289,93 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(body.raw_bytes)).toBeGreaterThan(0);
     expect(body.raw_truncated).toBe(false);
     expect(`${body.body_text ?? ""}${body.body_plain ?? ""}`).toContain("parsed-only body");
+  });
+
+  it("commits bounded search and threading evidence before invoking the body store", async () => {
+    const h = await setupIntegration("G-body-store-seam");
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 411,
+      messages: [makeTextMessage({
+        uid: 1,
+        subject: "seam",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "searchable before payload storage"
+      })]
+    }];
+    const databaseStore = new DatabaseBodyStore(h.repository);
+    const observedFetchedCounts: number[] = [];
+    const observed: Array<{
+      search_extract: string | null;
+      raw_mime: Buffer | null;
+      body_text: string | null;
+      raw_mime_sha256: string | null;
+      threading_payload_sha256: string | null;
+      body_fetched_at: Date | null;
+    }> = [];
+    const bodyStore: BodyStore = {
+      async store(body) {
+        const state = await h.pool.query<{
+          search_extract: string | null;
+          raw_mime: Buffer | null;
+          body_text: string | null;
+          raw_mime_sha256: string | null;
+          threading_payload_sha256: string | null;
+          body_fetched_at: Date | null;
+        }>(
+          `SELECT b.search_extract, b.raw_mime, b.body_text,
+                  b.raw_mime_sha256, b.threading_payload_sha256,
+                  m.body_fetched_at
+           FROM public.imap_message_bodies b
+           JOIN public.imap_messages m ON m.id = b.message_id
+           WHERE b.message_id = $1`,
+          [body.messageId]
+        );
+        observed.push(state.rows[0]);
+        const progress = await h.pool.query<{ live_bodies_fetched_count: number }>(
+          `SELECT live_bodies_fetched_count
+           FROM public.imap_account_progress
+           WHERE account_id = $1`,
+          [h.account.id]
+        );
+        observedFetchedCounts.push(progress.rows[0]?.live_bodies_fetched_count ?? -1);
+        await databaseStore.store(body);
+      }
+    };
+
+    const result = await h.buildEngine({ folders, bodyStore }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(observed).toEqual([{
+      search_extract: "searchable before payload storage",
+      raw_mime: null,
+      body_text: null,
+      raw_mime_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      threading_payload_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      body_fetched_at: null
+    }]);
+    expect(observedFetchedCounts).toEqual([0]);
+    const completed = await h.pool.query<{
+      has_raw: boolean;
+      body_text: string | null;
+      body_fetched_at: Date | null;
+    }>(
+      `SELECT b.raw_mime IS NOT NULL AS has_raw, b.body_text, m.body_fetched_at
+       FROM public.imap_message_bodies b
+       JOIN public.imap_messages m ON m.id = b.message_id
+       WHERE m.account_id = $1`,
+      [h.account.id]
+    );
+    expect(completed.rows[0]).toMatchObject({
+      has_raw: true,
+      body_text: "searchable before payload storage",
+      body_fetched_at: expect.any(Date)
+    });
   });
 
   it("Scenario H — initial sync timeout aborts IMAP without advancing the watermark", async () => {
