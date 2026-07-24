@@ -1972,6 +1972,31 @@ export class MirrorRepository {
     }
   }
 
+  async advanceInitialSyncLiveHead(
+    folderId: string,
+    lastUid: number,
+    expectedUidValidity: number,
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
+  ): Promise<void> {
+    const query = `
+      UPDATE public.imap_folders
+      SET last_uid = GREATEST(COALESCE(last_uid, 0), $2),
+          last_progress_at = now()
+      WHERE id = $1
+        AND uidvalidity = $3
+      RETURNING id
+    `;
+    const values = [folderId, lastUid, expectedUidValidity];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ id: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ id: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
+    if (result.rows.length !== 1) {
+      throw new Error(`Initial sync live head lost folder generation ${folderId}`);
+    }
+  }
+
   async markFolderSynced(folderId: string, patch: {
     uidValidity: number;
     uidNext?: number;

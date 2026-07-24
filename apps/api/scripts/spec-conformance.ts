@@ -206,20 +206,55 @@ async function scenarioInitialSyncWatermark() {
       `complete=${folderAfter1.initial_sync_complete}`
     );
 
-    // Cycle 2: should pick up UIDs 102, 103 next. Force due.
+    // New mail must not wait behind the frozen snapshot.
+    folders[0].messages.push(
+      makeTextMessage({
+        uid: 106,
+        subject: "arrived during initial sync",
+        from: "fresh@x.test",
+        to: "u@x.test",
+        body: "fresh"
+      })
+    );
+
+    // Cycle 2: should mirror live UID 106 and advance history through 102, 103.
     await dueAllFolders(pool, account.id);
     const cycle2 = await engine.syncAccount(account.id, "manual");
     const folderAfter2 = (
       await pool.query<{
         initial_sync_complete: boolean;
         initial_sync_oldest_uid_synced: string | null;
+        last_uid: string | null;
+        live_uid_count: string;
       }>(
-        `SELECT initial_sync_complete, initial_sync_oldest_uid_synced
-         FROM public.imap_folders WHERE account_id=$1 AND path='INBOX'`,
+        `SELECT
+           f.initial_sync_complete,
+           f.initial_sync_oldest_uid_synced,
+           f.last_uid,
+           count(m.id)::text AS live_uid_count
+         FROM public.imap_folders f
+         LEFT JOIN public.imap_messages m
+           ON m.account_id = f.account_id
+          AND m.folder_path = f.path
+          AND m.uidvalidity = f.uidvalidity
+          AND m.uid = 106
+         WHERE f.account_id = $1
+           AND f.path = 'INBOX'
+         GROUP BY f.id`,
         [account.id]
       )
     ).rows[0];
     assert(cycle2.outcome === "success", "cycle 2 succeeds", cycle2.errors.join("|"));
+    assert(
+      Number(folderAfter2.live_uid_count) === 1,
+      "cycle 2: new UID 106 is mirrored before the snapshot completes",
+      `live_uid_count=${folderAfter2.live_uid_count}`
+    );
+    assert(
+      Number(folderAfter2.last_uid) === 106,
+      "cycle 2: independent live-head watermark advances to 106",
+      `last_uid=${folderAfter2.last_uid}`
+    );
     assert(
       Number(folderAfter2.initial_sync_oldest_uid_synced) === 102,
       "cycle 2: watermark advanced to 102",
@@ -252,19 +287,19 @@ async function scenarioInitialSyncWatermark() {
       `complete=${folderAfter3.initial_sync_complete}`
     );
     assert(
-      Number(folderAfter3.last_uid) === 105,
-      "cycle 3: last_uid = targetMaxUid = 105",
+      Number(folderAfter3.last_uid) === 106,
+      "cycle 3: completion preserves live-head last_uid = 106",
       `last_uid=${folderAfter3.last_uid}`
     );
 
-    // All 5 messages mirrored.
+    // All 5 snapshot messages plus the live arrival are mirrored.
     const msgCount = await pool.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM public.imap_messages WHERE account_id=$1 AND folder_path='INBOX'`,
       [account.id]
     );
     assert(
-      Number(msgCount.rows[0].count) === 5,
-      "all 5 INBOX messages mirrored across 3 cycles",
+      Number(msgCount.rows[0].count) === 6,
+      "all 5 snapshot messages and the live arrival mirror across 3 cycles",
       `count=${msgCount.rows[0].count}`
     );
   } finally {

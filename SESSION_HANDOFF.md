@@ -1,5 +1,24 @@
 # Session Handoff
 
+## 2026-07-25 — Initial-sync live-head freshness
+
+- Branch `fedster99/initial-sync-live-head` keeps new mail current while a
+  folder's frozen initial snapshot is still backfilling. Each initial-sync
+  cycle now processes one bounded live-head batch above the snapshot, then one
+  newest-first snapshot batch.
+- The live head uses the existing monotonic `last_uid`; the frozen snapshot and
+  historical watermark remain independent. Completion preserves the larger
+  live cursor. No schema migration is required.
+- The real-Postgres regression failed first because a new UID remained absent
+  until snapshot completion, then passed after the fix. Final verification
+  passed 691 fast tests, both production builds, 189 live-Postgres tests, and
+  120/120 spec-conformance checks. One intermediate full gate hit unrelated
+  threading-suite timing failures; the immediate clean rerun passed all 49
+  threading tests.
+- Next: review and merge the public PR, wait for the immutable core image, then
+  re-pin the private hosted runtime and repeat the controlled new-mail
+  freshness proof.
+
 ## 2026-07-23 — Content extract and body-store seam
 
 - Branch `fedster99/content-body-store-seam` adds public migration
@@ -165,7 +184,7 @@
   Commit/merge, immutable-image publication, and downstream production re-pin
   are the next actions.
 
-Last updated: 2026-07-23
+Last updated: 2026-07-25
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 

@@ -201,6 +201,12 @@ The spec's "stuck DEGRADED for 24h → BROKEN" transition is implemented around 
 
 Mechanical: `INITIAL_SYNC_BATCH_TIMEOUT_MS` is in config (default `5 * 60_000`). Initial sync snapshot SEARCH, bounded SEARCH, and ≤1 batch FETCH use the existing `withOperationDeadline` helper. On timeout: abort IMAP via `client.close()`, throw, treat as transient failure in the outer `syncFolder` catch, and do NOT advance `initial_sync_oldest_uid_synced`. Identical handling to `INCREMENTAL_TOTAL_TIMEOUT_MS`.
 
+Each unfinished initial-sync cycle also processes one bounded live-head batch
+above the frozen snapshot maximum before it advances one historical snapshot
+batch. The live head uses monotonic `last_uid`; it never moves the snapshot
+maximum or the newest-first historical watermark. This keeps new mail current
+without allowing continuous arrivals to reset historical progress.
+
 ### D9: Folder-count cap — warn at 50, enforce at 200, priority-only tracking
 
 Two thresholds:

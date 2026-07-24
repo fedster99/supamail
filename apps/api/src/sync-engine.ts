@@ -1229,9 +1229,9 @@ export class MirrorEngine {
     }
   }
 
-  // Spec §10.4: process ONE batch per cycle, newest-first, advancing the
-  // watermark only after a successful upsert. Multi-cycle runs gives big
-  // mailboxes resumability and prevents one folder from monopolising a tick.
+  // Spec §10.4: process one bounded live-head batch, then one snapshot batch
+  // newest-first. Separate watermarks keep new mail current without moving the
+  // frozen snapshot or starving its resumable backfill.
   private async runInitialSyncBatch(
     account: ImapAccount,
     folder: ImapFolder,
@@ -1249,6 +1249,7 @@ export class MirrorEngine {
     let oldestSynced: number | null = folder.initial_sync_oldest_uid_synced
       ? Number(folder.initial_sync_oldest_uid_synced)
       : null;
+    let liveHeadUid = folder.last_uid ? Number(folder.last_uid) : 0;
 
     // First pass for this folder: take the snapshot.
     if (targetMaxUid === null || oldestSynced === null) {
@@ -1299,7 +1300,60 @@ export class MirrorEngine {
       "initial sync SEARCH",
       () => searchUidsSince(client, windowCutoff)
     );
-    const inSnapshot = [...new Set(candidates)]
+    const sortedCandidates = [...new Set(candidates)].sort((a, b) => a - b);
+    let messagesUpserted = 0;
+
+    const liveBatch = sortedCandidates
+      .filter((uid) => uid > targetMaxUid! && uid > liveHeadUid)
+      .slice(0, this.config.INCREMENTAL_SYNC_BATCH_SIZE);
+    if (liveBatch.length > 0) {
+      const liveMetadata = await this.withInitialSyncDeadline(
+        client,
+        initialSyncDeadline,
+        "initial sync live-head FETCH",
+        () => fetchMessageMetadata(
+          client,
+          liveBatch,
+          this.config.INCREMENTAL_SYNC_BATCH_SIZE
+        )
+      );
+      this.assertDeadlineAvailable(
+        client,
+        initialSyncDeadline,
+        "INITIAL_SYNC_BATCH_TIMEOUT_MS",
+        "initial sync live-head write"
+      );
+      const liveMessages = await this.upsertMetadataBatch(
+        metadataWriteStats,
+        account.id,
+        folder,
+        uidValidity,
+        liveMetadata,
+        windowCutoff,
+        { deadlineAt: initialSyncDeadline, signal }
+      );
+      messagesUpserted += liveMessages.length;
+      for (const message of liveMessages) {
+        await this.hooks.onMessageUpsert?.(message);
+      }
+
+      liveHeadUid = liveBatch[liveBatch.length - 1];
+      this.assertDeadlineAvailable(
+        client,
+        initialSyncDeadline,
+        "INITIAL_SYNC_BATCH_TIMEOUT_MS",
+        "initial sync live-head watermark"
+      );
+      await this.repository.advanceInitialSyncLiveHead(
+        folder.id,
+        liveHeadUid,
+        uidValidity,
+        { deadlineAt: initialSyncDeadline, signal }
+      );
+    }
+
+    const completionLastUid = Math.max(targetMaxUid, liveHeadUid);
+    const inSnapshot = sortedCandidates
       .filter((uid) => uid <= targetMaxUid!)
       .sort((a, b) => a - b);
 
@@ -1308,10 +1362,10 @@ export class MirrorEngine {
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
-        lastUid: targetMaxUid,
+        lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
-      return { messagesUpserted: 0 };
+      return { messagesUpserted };
     }
 
     // Collect up to one batch of UIDs strictly less than the watermark,
@@ -1330,10 +1384,10 @@ export class MirrorEngine {
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
-        lastUid: targetMaxUid,
+        lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
-      return { messagesUpserted: 0 };
+      return { messagesUpserted };
     }
 
     const batch = descending.slice().reverse(); // ascending order for FETCH
@@ -1358,6 +1412,7 @@ export class MirrorEngine {
       windowCutoff,
       { deadlineAt: initialSyncDeadline, signal }
     );
+    messagesUpserted += messages.length;
     for (const message of messages) {
       await this.hooks.onMessageUpsert?.(message);
     }
@@ -1383,12 +1438,12 @@ export class MirrorEngine {
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
-        lastUid: targetMaxUid,
+        lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
     }
 
-    return { messagesUpserted: messages.length };
+    return { messagesUpserted };
   }
 
   private historyBatchLimit(account: ImapAccount): number {

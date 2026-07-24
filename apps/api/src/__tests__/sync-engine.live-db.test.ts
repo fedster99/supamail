@@ -1086,6 +1086,11 @@ liveDb("live DB reliability lane", () => {
       101,
       oldUidValidity
     )).rejects.toThrow(/lost folder generation/);
+    await expect(h.repository.advanceInitialSyncLiveHead(
+      folder.id,
+      101,
+      oldUidValidity
+    )).rejects.toThrow(/lost folder generation/);
     await expect(h.repository.advanceHistoryBackfillWatermark(
       folder.id,
       99,
