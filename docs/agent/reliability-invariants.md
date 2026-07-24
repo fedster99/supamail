@@ -110,7 +110,11 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Default architecture cap is 20 accounts.
 - The real active cutoff currently comes from global `WINDOW_DAYS`; do not claim per-account `live_window_days` changes the sync cutoff until that path is implemented.
 - Treat historical/deep-archive backfill as separate from the live-window health path. Issue #2 is open, so do not describe deep archive completeness as done without revalidating the issue acceptance criteria.
-- Initial sync is folder-level, snapshot-based, newest-first, and resumable.
+- Initial sync is folder-level, snapshot-based, newest-first, and resumable. Its
+  snapshot maximum stays frozen, while each cycle first mirrors one bounded
+  live-head batch above that maximum through an independent monotonic
+  `last_uid`; continuous arrivals must not reset or postpone historical
+  snapshot progress.
 - Initial sync SEARCH/FETCH work is bounded by `INITIAL_SYNC_BATCH_TIMEOUT_MS`; a timeout aborts the IMAP client and must not advance the initial-sync watermark.
 - A failed initial sync batch must not advance watermarks.
 - `live_window_days` is immutable after account creation in v0.1; changing it requires a future window-status migration story.

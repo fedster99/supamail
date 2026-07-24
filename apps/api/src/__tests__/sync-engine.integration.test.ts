@@ -544,6 +544,98 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(count.count)).toBe(5);
   });
 
+  it("mirrors new mail while the initial snapshot is still backfilling", async () => {
+    const h = await setupIntegration("initial-live-head");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INCREMENTAL_SYNC_BATCH_SIZE: 1 }
+    });
+
+    await engine.syncAccount(h.account.id, "manual");
+    folders[0].messages.push(
+      makeTextMessage({
+        uid: 106,
+        subject: "arrived during initial sync",
+        from: "fresh@x.test",
+        to: "u@x.test",
+        body: "fresh"
+      })
+    );
+    folders[0].messages.push(
+      makeTextMessage({
+        uid: 107,
+        subject: "second arrival during initial sync",
+        from: "fresh-2@x.test",
+        to: "u@x.test",
+        body: "fresh again"
+      })
+    );
+
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "manual");
+
+    const duringBackfill = (
+      await h.pool.query<{
+        initial_sync_complete: boolean;
+        initial_sync_oldest_uid_synced: string | null;
+        last_uid: string | null;
+        mirrored_live_uid: string | null;
+      }>(
+        `SELECT
+           f.initial_sync_complete,
+           f.initial_sync_oldest_uid_synced,
+           f.last_uid,
+           m.uid::text AS mirrored_live_uid
+         FROM public.imap_folders f
+         LEFT JOIN public.imap_messages m
+           ON m.account_id = f.account_id
+          AND m.folder_path = f.path
+          AND m.uidvalidity = f.uidvalidity
+          AND m.uid = 106
+         WHERE f.account_id = $1
+           AND f.path = 'INBOX'`,
+        [h.account.id]
+      )
+    ).rows[0];
+
+    expect(duringBackfill.initial_sync_complete).toBe(false);
+    expect(Number(duringBackfill.initial_sync_oldest_uid_synced)).toBe(102);
+    expect(Number(duringBackfill.last_uid)).toBe(106);
+    expect(Number(duringBackfill.mirrored_live_uid)).toBe(106);
+
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "manual");
+
+    const afterCompletion = (
+      await h.pool.query<{
+        initial_sync_complete: boolean;
+        last_uid: string | null;
+        mirrored_live_uids: string;
+      }>(
+        `SELECT
+           f.initial_sync_complete,
+           f.last_uid,
+           count(m.id)::text AS mirrored_live_uids
+         FROM public.imap_folders f
+         LEFT JOIN public.imap_messages m
+           ON m.account_id = f.account_id
+          AND m.folder_path = f.path
+          AND m.uidvalidity = f.uidvalidity
+          AND m.uid IN (106, 107)
+         WHERE f.account_id = $1
+           AND f.path = 'INBOX'
+         GROUP BY f.id`,
+        [h.account.id]
+      )
+    ).rows[0];
+
+    expect(afterCompletion.initial_sync_complete).toBe(true);
+    expect(Number(afterCompletion.last_uid)).toBe(107);
+    expect(Number(afterCompletion.mirrored_live_uids)).toBe(2);
+  });
+
   it("Scenario B — reconcile backfills missing-in-DB UIDs (spec §10.7 step 3)", async () => {
     const h = await setupIntegration("B");
     activeAccountIds.push(h.account.id);
