@@ -696,7 +696,12 @@ export class MirrorRepository {
         END AS headers_pct,
         CASE
           WHEN COALESCE(b.live_bodies_target_count, 0) > 0
-            THEN round((b.live_bodies_fetched_count::numeric / b.live_bodies_target_count::numeric) * 100)::int
+            THEN CASE
+              WHEN b.live_bodies_fetched_count >= b.live_bodies_target_count THEN 100
+              ELSE floor(
+                (b.live_bodies_fetched_count::numeric / b.live_bodies_target_count::numeric) * 100
+              )::int
+            END
           WHEN f.live_window_target_count IS NOT NULL THEN 100
           ELSE 0
         END AS bodies_pct,

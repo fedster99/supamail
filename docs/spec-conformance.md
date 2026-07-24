@@ -118,7 +118,9 @@ only after the cause is corrected; a cap-limited message requires a higher
 `live_bodies_target_count`, and `bodies_pct` use the same completeness test
 within each returned folder. They also report untracked, missing, and pending
 folders, which the active account roll-up excludes. Folder targets therefore do
-not always sum to the account target. Migration
+not always sum to the account target. Live, priority, and per-folder current
+body percentages report 100 only when the fetched count reaches the target;
+incomplete ratios are floored. Migration
 `0021_row_accurate_body_progress` adds the partial
 `imap_messages_live_body_progress_idx`; large existing mirrors must prebuild
 that exact index concurrently before applying the transactional migration.

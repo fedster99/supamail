@@ -45,9 +45,11 @@ messages are still incomplete.
 - `GET /accounts/:id` exposes row-current
   `live_bodies_fetched_count` and `live_bodies_target_count` for each folder.
   Per-folder `bodies_pct` uses those fields instead of the cumulative body
-  counter. Folder rows include untracked, missing, and pending folders, while
-  the account roll-up excludes them. Their targets therefore need not sum to
-  the account target.
+  counter. Live and priority account percentages and per-folder current body
+  percentages equal 100 only when the fetched count reaches the target;
+  incomplete ratios are floored. Folder rows include untracked, missing, and
+  pending folders, while the account roll-up excludes them. Their targets
+  therefore need not sum to the account target.
 - Incremental folder counters remain cumulative telemetry and continue to
   support header and historical progress. They are not the source of truth for
   current live or priority body completeness.

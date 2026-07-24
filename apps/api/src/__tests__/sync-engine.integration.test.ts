@@ -2987,6 +2987,97 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         bodies_pct: 0
       })
     ]));
+
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_message_bodies (
+        message_id, raw_mime, raw_bytes, raw_truncated, body_text
+      )
+      SELECT id, NULL, 20, false, 'marker repaired'
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = 'INBOX'
+        AND uidvalidity = 72001
+        AND uid = 4
+      `,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_messages (
+        account_id, folder_path, uidvalidity, uid, internal_date,
+        subject, body_fetched_at, deleted_in_provider, window_status
+      )
+      SELECT
+        $1,
+        'INBOX',
+        72001,
+        uid,
+        now(),
+        'rounding boundary ' || uid,
+        now(),
+        false,
+        'IN_WINDOW'
+      FROM generate_series(7, 202) AS uid
+      `,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_message_bodies (
+        message_id, raw_mime, raw_bytes, raw_truncated, body_text
+      )
+      SELECT id, NULL, 20, false, 'rounding boundary complete'
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = 'INBOX'
+        AND uidvalidity = 72001
+        AND uid BETWEEN 7 AND 202
+      `,
+      [h.account.id]
+    );
+
+    const roundingBoundaryProgress = (
+      await h.pool.query<{
+        priority_bodies_fetched_count: number;
+        priority_bodies_target_count: number;
+        priority_bodies_complete_pct: number;
+        live_bodies_fetched_count: number;
+        live_bodies_target_count: number;
+        live_bodies_complete_pct: number;
+      }>(
+        `
+        SELECT
+          priority_bodies_fetched_count,
+          priority_bodies_target_count,
+          priority_bodies_complete_pct,
+          live_bodies_fetched_count,
+          live_bodies_target_count,
+          live_bodies_complete_pct
+        FROM public.imap_account_progress
+        WHERE account_id = $1
+        `,
+        [h.account.id]
+      )
+    ).rows[0];
+    expect(roundingBoundaryProgress).toEqual({
+      priority_bodies_fetched_count: 199,
+      priority_bodies_target_count: 200,
+      priority_bodies_complete_pct: 99,
+      live_bodies_fetched_count: 199,
+      live_bodies_target_count: 200,
+      live_bodies_complete_pct: 99
+    });
+
+    const roundingBoundaryDetails = await h.repository.getAccountDetails(h.account.id);
+    expect(roundingBoundaryDetails?.folders).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "INBOX",
+        live_bodies_fetched_count: 199,
+        live_bodies_target_count: 200,
+        bodies_pct: 99
+      })
+    ]));
   });
 
   it("Scenario S — settings PATCH makes an existing non-priority live body eligible on the next sync", async () => {

@@ -48,6 +48,10 @@ const contentExtractBodyStoreMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0022_content_extract_body_store.sql"
 );
+const exactBodyCompletionPercentagesMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0023_exact_body_completion_percentages.sql"
+);
 
 describe("initial schema", () => {
   it("adds a bounded search extract without moving full body payloads into metadata", async () => {
@@ -145,9 +149,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0022_content_extract_body_store");
+    expect(version).toBe("0023_exact_body_completion_percentages");
     expect(manifest).toEqual({
-      schemaVersion: "0022_content_extract_body_store",
+      schemaVersion: "0023_exact_body_completion_percentages",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -170,7 +174,11 @@ describe("initial schema", () => {
         { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" },
         { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" },
         { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" },
-        { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" }
+        { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" },
+        {
+          id: "0023_exact_body_completion_percentages",
+          file: "0023_exact_body_completion_percentages.sql"
+        }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -200,6 +208,17 @@ describe("initial schema", () => {
     expect(sql).toContain("delivery_fingerprint_hashes text[]");
     expect(sql).toContain("current_live_body_progress AS");
     expect(sql).toContain("FUNCTION public.imap_search_extract_fts");
+  });
+
+  it("keeps incomplete body percentages below 100", async () => {
+    const sql = await readFile(exactBodyCompletionPercentagesMigrationPath, "utf8");
+
+    expect(sql).toContain("CREATE OR REPLACE VIEW public.imap_account_progress");
+    expect(sql).toContain("b.priority_bodies_fetched_count >= b.priority_bodies_target_count");
+    expect(sql).toContain("b.live_bodies_fetched_count >= b.live_bodies_target_count");
+    expect(sql.match(/ELSE floor\(/g)).toHaveLength(2);
+    expect(sql).not.toContain("stripe");
+    expect(sql).not.toContain("tenant");
   });
 
   it("indexes delivery fingerprints for bounded threading closure", async () => {
