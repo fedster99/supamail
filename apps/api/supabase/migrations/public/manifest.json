@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0022_content_extract_body_store",
+  "schemaVersion": "0023_exact_body_completion_percentages",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -88,6 +88,10 @@
     {
       "id": "0022_content_extract_body_store",
       "file": "0022_content_extract_body_store.sql"
+    },
+    {
+      "id": "0023_exact_body_completion_percentages",
+      "file": "0023_exact_body_completion_percentages.sql"
     }
   ]
 }

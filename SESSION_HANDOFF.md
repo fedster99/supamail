@@ -1,5 +1,16 @@
 # Session Handoff
 
+## 2026-07-24 — Exact body completion percentages
+
+- Branch `fedster99/fix-body-progress-rounding` makes 100% an exact completion
+  claim for live and priority account progress and per-folder current body
+  progress. Incomplete ratios are floored, so 199 fetched bodies out of 200
+  reports 99%, not 100%.
+- Public migration `0023_exact_body_completion_percentages` replaces
+  `imap_account_progress`; the repository applies the same rule to folder rows.
+  A real-Postgres Scenario R regression covers priority, live, and folder
+  progress at the rounding boundary.
+
 ## 2026-07-23 — Content extract and body-store seam
 
 - Branch `fedster99/content-body-store-seam` adds public migration
@@ -165,20 +176,16 @@
   Commit/merge, immutable-image publication, and downstream production re-pin
   are the next actions.
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 
 ## Current Branch
 
-- Active branch `fedster99/content-body-store-seam` implements ADR 0028's
-  evidence-first content seam. The cloud image re-pin is deliberately deferred
-  to a separate private-repo task.
-- Active branch `fedster99/live-body-coverage-policy` makes
-  `body_fetch_policy` mutable for existing accounts and replaces counter-derived
-  live/priority body coverage with current-row evidence. ADR 0027 records the
-  contract. This change adds one view-replacement migration and one partial
-  live-body progress index.
+- Active branch `fedster99/fix-body-progress-rounding` makes 100% an exact
+  completion claim for live and priority account progress and per-folder
+  current body progress. Migration `0023` floors incomplete ratios while
+  preserving the integer API fields.
 - Active branch `fedster99/fix-reconcile-health-after-repair` separates observed reconcile gaps from unresolved reconcile state. A pass that fully tombstones provider-missing rows or backfills missing-in-DB UIDs now finishes clean and can return the account to `HEALTHY`; the run still records its bounded gap count. Missing-in-DB overflow is detected with a 5,001st sentinel row, remains degraded, and retries on the next full-sync cadence. ADR 0026 records the contract; no migration or public API change is required.
 - Local branch `fedster99/smtp-account-lock-v2` is rebased onto current
   `origin/main` at `88c025d` and is intentionally uncommitted/unpushed. It closes
@@ -349,10 +356,9 @@ This is the tracked restart point for future agents. Keep it concise, factual, a
 
 ## Next Best Actions
 
-- Review and land the feature-branch PR for
-  `fedster99/live-body-coverage-policy`. Publish a new immutable public-core
-  image only after human merge, then update downstream Signal through its
-  public-core prebuild and re-pin flow.
+- Review and land `fedster99/fix-body-progress-rounding`. Publish a new
+  immutable public-core image only after human merge, then update downstream
+  Signal through its public-core prebuild and re-pin flow.
 - Review and land `fedster99/fix-reconcile-health-after-repair`, publish its immutable image, then re-pin downstream consumers. Confirm ordinary provider delete/move drift records a nonzero gap count without leaving a fully repaired account stuck `DEGRADED`.
 - Review and land `fedster99/fix-imap-abort-race`, publish its immutable image, then re-pin downstream consumers and canary the Sent/full-sweep deadline boundary. Confirm there are no further `Already logged out`, `process.uncaughtException`, or Render restart events.
 - Keep this file updated at the end of substantial sessions.

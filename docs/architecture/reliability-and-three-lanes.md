@@ -85,8 +85,10 @@ view requires no refresh management.
 Both per-folder and per-account values are exposed via `GET /accounts/:id`.
 Each folder adds row-current `live_bodies_fetched_count` and
 `live_bodies_target_count`; `bodies_pct` uses those fields instead of the
-cumulative body counter. Folder rows also cover inactive folders, so their
-targets do not always sum to the active account target.
+cumulative body counter. Live and priority account percentages and per-folder
+current body percentages equal 100 only when the fetched count reaches the
+target; incomplete ratios are floored. Folder rows also cover inactive folders,
+so their targets do not always sum to the active account target.
 
 API surface:
 
