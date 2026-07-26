@@ -166,15 +166,16 @@ merely because its queues happen to be empty. Singleton subject buckets are
 retired in bounded batches, and the ordinary worker advances at most ten
 independent steps per account under a 20-second threading-lane budget.
 
-Every incremental changing operation snapshots previous/current assignments in
-`imap_thread_assignment_history`; a latest-operation guard makes incremental
-rollback safe. Build snapshots are already isolated projections, so their
-bounded operation summaries are retained without duplicating every assignment
-as JSON history. Activation rollback swaps the pointer back only while the
-standby run is still caught up. Both rollback paths pause automatic processing
-until an operator completes and activates a clean rebuild. Old terminal
-projection runs are pruned in bounded batches; operations, comparisons, and
-incremental history intentionally survive message and projection retention.
+Only the latest material change to the active run keeps previous/current
+assignments in `imap_thread_assignment_history`. The next material active
+change replaces that history in the same transaction. Candidate and standby
+runs keep compact operation summaries but no per-message history because
+incremental rollback cannot target them. Activation and successful rollback
+clear obsolete assignment history; compact operations and comparison
+certificates remain as the durable audit record. Activation rollback swaps the
+pointer back only while the standby run is still caught up. Both rollback paths
+pause automatic processing until an operator completes and activates a clean
+rebuild. Old terminal projection runs are pruned in bounded batches.
 
 Mirror writes take a shared lock on the small account thread-state row. Build,
 activation, and rollback take it exclusively, so activation cannot certify

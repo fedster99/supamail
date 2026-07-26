@@ -1362,6 +1362,10 @@ export class ThreadingRepository {
             generation: await this.currentGeneration(client, runId)
           }
         });
+        // Activation rollback swaps run pointers. Per-message history from the
+        // former active run can no longer be used and must not grow as an
+        // unbounded audit log.
+        await this.clearAssignmentHistory(client, accountId);
         await client.query("COMMIT");
         return this.resultForRun(accountId, { ...run, status: "active" }, {
           operationId: operation,
@@ -1454,6 +1458,7 @@ export class ThreadingRepository {
             "UPDATE public.imap_thread_operations SET status = 'rolled_back', rolled_back_at = now() WHERE id = $1",
             [operationId]
           );
+          await this.clearAssignmentHistory(client, accountId);
           await client.query("COMMIT");
           return this.resultForRun(accountId, { ...run, status: "rolled_back" }, {
             operationId: rollbackId,
@@ -1492,27 +1497,14 @@ export class ThreadingRepository {
         const generation = (BigInt(await this.currentGeneration(client, run.id)) + 1n).toString();
         const restores: AssignmentRecord[] = [];
         const deletes: string[] = [];
-        const rollbackHistory: Array<HistoryEntry> = [];
         for (const entry of history.rows) {
           const existing = currentById.get(entry.message_id);
           if (!existing) throw new Error(`Current assignment missing for ${entry.message_id}; refusing a partial rollback`);
           if (entry.previous_assignment) {
             const restored = restoreSnapshot(entry.previous_assignment, generation);
             restores.push(restored);
-            rollbackHistory.push({
-              message_id: entry.message_id,
-              change_type: "update",
-              previous_assignment: snapshot(existing),
-              next_assignment: snapshot(restored)
-            });
           } else {
             deletes.push(entry.message_id);
-            rollbackHistory.push({
-              message_id: entry.message_id,
-              change_type: "delete",
-              previous_assignment: snapshot(existing),
-              next_assignment: null
-            });
           }
         }
         const rollbackId = await this.insertOperation(client, {
@@ -1532,11 +1524,13 @@ export class ThreadingRepository {
             [run.id, deletes]
           );
         }
-        await this.insertHistory(client, rollbackId, run, rollbackHistory);
         await client.query(
           "UPDATE public.imap_thread_operations SET status = 'rolled_back', rolled_back_at = now() WHERE id = $1",
           [operationId]
         );
+        // A rollback operation is not itself rollbackable. Its compact
+        // operation row remains for audit; the large snapshots do not.
+        await this.clearAssignmentHistory(client, accountId);
         await client.query(
           `UPDATE public.imap_thread_state
            SET paused_at = now(), pause_reason = $2 WHERE account_id = $1`,
@@ -1582,7 +1576,7 @@ export class ThreadingRepository {
 
   /**
    * Remove old projection state in bounded batches while retaining immutable
-   * operations, comparison certificates, and assignment history for audit.
+   * operations and comparison certificates for audit.
    */
   async pruneTerminalRuns(options: {
     olderThanDays?: number;
@@ -2765,8 +2759,10 @@ export class ThreadingRepository {
       await this.upsertAssignments(client, changed);
       // Build rows are themselves a disposable, versioned snapshot; duplicating
       // every one into JSON history on every rebuild is pure write amplification.
-      // Incremental deltas remain fully reversible and retain before/after audit.
-      if (options.operationType === "incremental") {
+      // Only the latest material change to the active projection is
+      // rollbackable. Keep that one reversible delta, not an unbounded audit
+      // log. Candidate and standby projections cannot use incremental rollback.
+      if (options.operationType === "incremental" && run.status === "active") {
         await this.insertHistory(
           client,
           operationId,
@@ -2781,6 +2777,7 @@ export class ThreadingRepository {
             };
           })
         );
+        await this.retainOnlyOperationHistory(client, run.account_id, operationId);
       }
       if (options.enqueueSubjectWork) {
         const keys = new Set<string>();
@@ -2894,6 +2891,25 @@ export class ThreadingRepository {
         [operationId, run.id, run.account_id, JSON.stringify(batch)]
       );
     }
+  }
+
+  private async retainOnlyOperationHistory(
+    client: PgClient,
+    accountId: string,
+    operationId: string
+  ): Promise<void> {
+    await client.query(
+      `DELETE FROM public.imap_thread_assignment_history
+       WHERE account_id = $1 AND operation_id <> $2`,
+      [accountId, operationId]
+    );
+  }
+
+  private async clearAssignmentHistory(client: PgClient, accountId: string): Promise<void> {
+    await client.query(
+      "DELETE FROM public.imap_thread_assignment_history WHERE account_id = $1",
+      [accountId]
+    );
   }
 
   private async insertOperation(

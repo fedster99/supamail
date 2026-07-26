@@ -937,25 +937,94 @@ liveDb("ThreadingRepository live DB", () => {
     const audit = await pool.query<{
       original_status: string;
       rollback_changes: string;
-      deleted_assignments: string;
+      reverses_operation_id: string;
+      retained_history: string;
     }>(
       `SELECT original.status AS original_status,
+              rollback.summary->>'assignments_changed' AS rollback_changes,
+              rollback.reverses_operation_id::text AS reverses_operation_id,
               (SELECT count(*)::text FROM public.imap_thread_assignment_history h
-               WHERE h.operation_id = $2) AS rollback_changes,
-              (SELECT count(*)::text FROM public.imap_thread_assignment_history h
-               WHERE h.operation_id = $2 AND h.change_type = 'delete') AS deleted_assignments
+               WHERE h.account_id = $3) AS retained_history
        FROM public.imap_thread_operations original
+       JOIN public.imap_thread_operations rollback ON rollback.id = $2
        WHERE original.id = $1`,
-      [material?.operationId, rollback.operationId]
+      [material?.operationId, rollback.operationId, accountId]
     );
     expect(audit.rows[0]).toEqual({
       original_status: "rolled_back",
       rollback_changes: "2",
-      deleted_assignments: "1"
+      reverses_operation_id: material?.operationId,
+      retained_history: "0"
     });
   });
 
-  it("preserves audit history and recomputes survivors when retention purges a thread member", async () => {
+  it("retains full assignment history only for the latest active incremental operation", async () => {
+    const accountId = await createAccount("bounded-incremental-history");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Initial message",
+      rfcMessageId: "<bounded-history-initial@example.test>"
+    });
+    const initial = await drainUntilReady(accountId, { batchSize: 1 });
+    await activateReviewed(repository, accountId, initial.runId as string);
+
+    const firstArrival = await seedMessage(accountId, {
+      uid: 2,
+      subject: "First arrival",
+      rfcMessageId: "<bounded-history-first@example.test>"
+    });
+    await enqueueMessage(accountId, firstArrival);
+    const firstResults = await drainUntilIdle(accountId);
+    const firstMaterial = [...firstResults].reverse().find((result) => result.assignmentsChanged > 0);
+    expect(firstMaterial?.operationType).toBe("incremental");
+
+    const secondArrival = await seedMessage(accountId, {
+      uid: 3,
+      subject: "Second arrival",
+      rfcMessageId: "<bounded-history-second@example.test>"
+    });
+    await enqueueMessage(accountId, secondArrival);
+    const secondResults = await drainUntilIdle(accountId);
+    const secondMaterial = [...secondResults].reverse().find((result) => result.assignmentsChanged > 0);
+    expect(secondMaterial?.operationType).toBe("incremental");
+    expect(secondMaterial?.operationId).not.toBe(firstMaterial?.operationId);
+
+    const retained = await pool.query<{ operation_id: string; changes: string }>(
+      `SELECT operation_id, count(*)::text AS changes
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1
+       GROUP BY operation_id
+       ORDER BY operation_id`,
+      [accountId]
+    );
+    expect(retained.rows).toEqual([{
+      operation_id: secondMaterial?.operationId as string,
+      changes: "1"
+    }]);
+
+    const rollback = await repository.rollbackOperation(
+      accountId,
+      secondMaterial?.operationId as string,
+      "live-test"
+    );
+    expect(rollback).toMatchObject({
+      operationType: "rollback",
+      assignmentsChanged: 1,
+      active: true,
+      ready: true
+    });
+    expect(await activeProjection(accountId)).toHaveLength(2);
+
+    const historyAfterRollback = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    expect(historyAfterRollback.rows[0]?.count).toBe("0");
+  });
+
+  it("preserves retained rollback history and recomputes survivors when retention purges a thread member", async () => {
     const accountId = await createAccount("purge-invalidation");
     const root = await seedMessage(accountId, {
       uid: 1,
@@ -2232,19 +2301,40 @@ liveDb("ThreadingRepository live DB", () => {
 
   it("keeps a same-version standby caught up so rollout rollback survives new mail", async () => {
     const accountId = await createAccount("standby-catchup");
-    await seedMessage(accountId, {
+    const root = await seedMessage(accountId, {
       uid: 1,
       subject: "Rollout",
       rfcMessageId: "<rollout-root@example.test>"
     });
     const baseline = await drainUntilReady(accountId, { batchSize: 1 });
     await activateReviewed(repository, accountId, baseline.runId as string);
+
+    await pool.query(
+      "UPDATE public.imap_messages SET subject = 'Rollout evidence' WHERE id = $1",
+      [root]
+    );
+    await drainUntilIdle(accountId);
+    const historyBeforeActivation = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    expect(Number(historyBeforeActivation.rows[0]?.count)).toBeGreaterThan(0);
+
     const candidate = await repository.rebuildAccount(accountId, {
       batchSize: 1,
       requestedBy: "live-test",
       reason: "same-version rollout"
     });
     const activation = await activateReviewed(repository, accountId, candidate.runId as string);
+    const historyAfterActivation = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    expect(historyAfterActivation.rows[0]?.count).toBe("0");
 
     const reply = await seedMessage(accountId, {
       uid: 2,
@@ -2266,10 +2356,25 @@ liveDb("ThreadingRepository live DB", () => {
     );
     expect(counts.rows.every((row) => row.assignments === "2")).toBe(true);
 
+    const liveHistory = await pool.query<{ run_id: string }>(
+      `SELECT DISTINCT run_id
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    expect(liveHistory.rows).toEqual([{ run_id: candidate.runId as string }]);
+
     await repository.rollbackOperation(accountId, activation.operationId as string, "live-test");
     const active = await activeProjection(accountId);
     expect(active).toHaveLength(2);
     expect(active.every((row) => row.run_id === baseline.runId)).toBe(true);
+    const historyAfterRollback = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    expect(historyAfterRollback.rows[0]?.count).toBe("0");
   });
 
   it("dissolves an old weak subject merge when the bucket later exceeds its safety cap", async () => {
