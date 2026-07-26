@@ -1,5 +1,23 @@
 # Session Handoff
 
+## 2026-07-26 — Bounded threading rollback history
+
+- Branch `fedster99/bound-threading-history` stops
+  `imap_thread_assignment_history` from growing as a permanent audit log.
+  Only the latest material change to the active run keeps a full reversible
+  delta. Its transaction removes older deltas.
+- Candidate and standby changes keep compact operation rows only. Activation
+  and successful rollback clear obsolete full snapshots. Existing rollback
+  guards and fail-closed behavior remain.
+- No schema migration is required. Existing accumulated history is removed by
+  the next material active change, activation, or rollback. Wide assignment
+  rows are a separate measured optimization.
+- Verification passed typecheck, 691 fast tests, both builds, one complete
+  190-test live-Postgres gate, and 120/120 conformance checks. After adding
+  direct activation/standby cleanup assertions, the complete 50-test threading
+  live-Postgres suite also passed. One intermediate full rerun hit the existing
+  drain-order timing flake; no bounded-history assertion failed.
+
 ## 2026-07-25 — Initial-sync live-head freshness
 
 - Branch `fedster99/initial-sync-live-head` keeps new mail current while a

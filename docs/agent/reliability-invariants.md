@@ -46,8 +46,8 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - The ordinary worker may execute up to ten independently bounded projection steps per account per tick, under a 20-second lane budget. Preserve both caps so large builds progress without delaying mailbox sync.
 - Activation requires complete physical-row coverage and empty catch-up queues, then swaps the active-run pointer atomically. A worker must reject a run newer than its compiled algorithm version without updating it.
 - Incremental drain and full rebuild must call the same pure, versioned algorithm. Repeating a computation over unchanged inputs must not create a material generation.
-- Material assignment changes require an operation row and per-message before/after history. Incremental rollback may reverse only the latest material operation in the active run. Activation rollback requires a caught-up standby. Both must record a rollback operation and pause automatic work pending a clean rebuild.
-- Assignment history must survive hard message and projection-run retention. Missing history or a missing current assignment makes rollback fail closed.
+- Material assignment changes require a compact operation row. Only the latest material change in the active run keeps per-message before/after history; the next active change replaces it transactionally. Candidate and standby changes must not create rollback history. Incremental rollback may reverse only that retained operation. Activation rollback requires a caught-up standby. Both must record a compact rollback operation, clear obsolete assignment history, and pause automatic work pending a clean rebuild.
+- The one retained rollback delta must survive hard message and projection-run retention until it is replaced, activated away, or rolled back. Missing history or a missing current assignment makes rollback fail closed.
 - Thread work uses its own account-scoped session advisory lock. It does not authorize an IMAP command and must not borrow or weaken the IMAP account-lock contract.
 
 ## Concurrency And Connections
