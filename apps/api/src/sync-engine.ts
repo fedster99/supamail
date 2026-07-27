@@ -6,10 +6,14 @@ import { getPool } from "./db.js";
 import { performance } from "node:perf_hooks";
 import {
   fetchFullMessageBody,
+  fetchFullMessageBodyBatch,
   fetchMessageFlags,
   fetchMessageMetadata,
   iterateAllUids,
   MessageMovedError,
+  PARSED_BODY_BATCH_MAX_MESSAGES,
+  PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
+  PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
@@ -17,6 +21,7 @@ import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import type { MetadataWriteOptions } from "./repository.js";
+import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
 import type {
   ImapAccount,
   ImapFolder,
@@ -49,7 +54,6 @@ const AUTH_ERROR_PATTERNS = [
 const HISTORY_METADATA_COMMIT_GRACE_MS = 30_000;
 const SYNC_STATE_WRITE_GRACE_MS = 30_000;
 const SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS = 1_000;
-
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
 const MISSING_MAILBOX_PATTERNS = [
   /\bNONEXISTENT\b/i,
@@ -105,6 +109,14 @@ export function metadataRowsPerSecond(rowsCommitted: number, durationMs: number)
   if (!Number.isFinite(rowsCommitted) || rowsCommitted < 0) return null;
   if (!Number.isFinite(durationMs) || durationMs <= 0) return null;
   return Math.round((rowsCommitted * 1000 / durationMs) * 100) / 100;
+}
+
+export function bodyBacklogReadLimit(batchSize: number, batchesRemaining: number): number {
+  const wholeBatches = Math.min(
+    batchesRemaining,
+    Math.max(1, Math.floor(MAX_SYNC_BATCH_SIZE / batchSize))
+  );
+  return batchSize * wholeBatches;
 }
 
 function applyMetadataWriteStats(result: SyncResult, stats: MetadataWriteStats): void {
@@ -1675,15 +1687,17 @@ export class MirrorEngine {
 
       let bodiesFetched = 0;
       if (account.historical_backfill_mode === "metadata_and_bodies") {
-        for (const message of messages.filter((row) => !row.body_fetched_at)) {
-          if (this.isLockBudgetExpired(lockDeadline)) {
-            break;
+        // We already hold the mailbox lock for `folder` here; skip re-locking
+        // inside the body helpers so imapflow's non-reentrant lock cannot
+        // deadlock.
+        bodiesFetched = await this.fetchAndStoreBodies(
+          client,
+          messages.filter((row) => !row.body_fetched_at),
+          {
+            skipMailboxLock: true,
+            shouldStop: () => this.isLockBudgetExpired(lockDeadline)
           }
-          // We already hold the mailbox lock for `folder` here; skip re-locking inside
-          // fetchFullMessageBody so it doesn't deadlock on imapflow's non-reentrant lock.
-          await this.fetchAndStoreBody(client, message, true);
-          bodiesFetched += 1;
-        }
+        );
       }
 
       const progressDeadline = Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS;
@@ -1730,14 +1744,9 @@ export class MirrorEngine {
       return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
     }
 
-    let fetched = 0;
-    for (const message of backlog) {
-      if (this.isLockBudgetExpired(lockDeadline)) {
-        return { messagesUpserted: 0, bodiesFetched: fetched, processed: fetched > 0, hitLockBudget: true };
-      }
-      await this.fetchAndStoreBody(client, message);
-      fetched += 1;
-    }
+    const fetched = await this.fetchAndStoreBodies(client, backlog, {
+      shouldStop: () => this.isLockBudgetExpired(lockDeadline)
+    });
 
     return {
       messagesUpserted: 0,
@@ -1754,29 +1763,147 @@ export class MirrorEngine {
   ): Promise<{ fetched: number; hitLockBudget: boolean }> {
     let fetched = 0;
     let hitLockBudget = false;
+    let batchesRemaining = this.config.MAX_BODY_BATCHES_PER_TICK;
 
-    for (let batch = 0; batch < this.config.MAX_BODY_BATCHES_PER_TICK; batch += 1) {
+    while (batchesRemaining > 0) {
       if (this.isLockBudgetExpired(lockDeadline)) {
         hitLockBudget = true;
         break;
       }
 
-      const backlog = await this.repository.getBodyBacklog(account, this.config.BODY_BACKFILL_BATCH_SIZE);
+      const readLimit = bodyBacklogReadLimit(
+        this.config.BODY_BACKFILL_BATCH_SIZE,
+        batchesRemaining
+      );
+      const backlog = await this.repository.getBodyBacklog(account, readLimit);
       if (backlog.length === 0) break;
 
-      for (const message of backlog) {
-        await this.fetchAndStoreBody(client, message);
-        fetched += 1;
+      for (
+        let offset = 0;
+        offset < backlog.length && batchesRemaining > 0;
+        offset += this.config.BODY_BACKFILL_BATCH_SIZE
+      ) {
+        const logicalBatch = backlog.slice(
+          offset,
+          offset + this.config.BODY_BACKFILL_BATCH_SIZE
+        );
+
+        fetched += await this.fetchAndStoreBodies(client, logicalBatch);
+
+        batchesRemaining -= 1;
+        if (this.isLockBudgetExpired(lockDeadline)) {
+          hitLockBudget = true;
+          break;
+        }
       }
 
-      if (backlog.length < this.config.BODY_BACKFILL_BATCH_SIZE) break;
-      if (this.isLockBudgetExpired(lockDeadline)) {
-        hitLockBudget = true;
-        break;
-      }
+      if (hitLockBudget || backlog.length < readLimit) break;
     }
 
     return { fetched, hitLockBudget };
+  }
+
+  private parsedBodyBatchAt(backlog: ImapMessage[], start: number): ImapMessage[] {
+    if (this.config.BODY_STORAGE_MODE !== "parsed_only") return [];
+    const first = backlog[start];
+    if (!this.isSmallCompleteBody(first)) return [];
+
+    const messages: ImapMessage[] = [];
+    let totalSourceBytes = 0;
+    for (
+      let index = start;
+      index < backlog.length && messages.length < PARSED_BODY_BATCH_MAX_MESSAGES;
+      index += 1
+    ) {
+      const message = backlog[index];
+      if (message.folder_path !== first.folder_path || !this.isSmallCompleteBody(message)) break;
+      const sourceBytes = Number(message.size_bytes);
+      if (totalSourceBytes + sourceBytes > PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES) break;
+      messages.push(message);
+      totalSourceBytes += sourceBytes;
+    }
+    return messages;
+  }
+
+  private isSmallCompleteBody(message: ImapMessage): boolean {
+    const size = Number(message.size_bytes);
+    return Number.isSafeInteger(size)
+      && size > 0
+      && size <= this.config.BODY_RAW_MAX_BYTES
+      && size <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES;
+  }
+
+  private async fetchAndStoreBodyBatch(
+    client: MirrorImapClient,
+    messages: ImapMessage[],
+    skipMailboxLock = false
+  ): Promise<number> {
+    const result = await fetchFullMessageBodyBatch(
+      client,
+      this.config,
+      messages,
+      { skipMailboxLock }
+    );
+    let processed = 0;
+    for (const { message, body } of result.bodies) {
+      await this.commitBody(message, body);
+      processed += 1;
+    }
+    for (const message of result.missingMessages) {
+      // A successful set FETCH can still omit a response or its source. That
+      // is not enough evidence to tombstone the row. Retry the exact UID
+      // through the individual path, which marks MOVED_OUT only when the
+      // dedicated download confirms that the message is gone.
+      await this.fetchAndStoreBody(client, message, skipMailboxLock);
+      processed += 1;
+    }
+    return processed;
+  }
+
+  private async fetchAndStoreBodies(
+    client: MirrorImapClient,
+    messages: ImapMessage[],
+    options: {
+      skipMailboxLock?: boolean;
+      shouldStop?: () => boolean;
+    } = {}
+  ): Promise<number> {
+    const ordered = this.config.BODY_STORAGE_MODE === "parsed_only"
+      ? this.groupBodiesByFolder(messages)
+      : messages;
+    let processed = 0;
+
+    for (let index = 0; index < ordered.length;) {
+      if (options.shouldStop?.()) break;
+      const batchMessages = this.parsedBodyBatchAt(ordered, index);
+      if (batchMessages.length > 1) {
+        processed += await this.fetchAndStoreBodyBatch(
+          client,
+          batchMessages,
+          options.skipMailboxLock
+        );
+        index += batchMessages.length;
+        continue;
+      }
+
+      await this.fetchAndStoreBody(client, ordered[index], options.skipMailboxLock);
+      processed += 1;
+      index += 1;
+    }
+    return processed;
+  }
+
+  private groupBodiesByFolder(messages: ImapMessage[]): ImapMessage[] {
+    const byFolder = new Map<string, ImapMessage[]>();
+    for (const message of messages) {
+      const folder = byFolder.get(message.folder_path);
+      if (folder) {
+        folder.push(message);
+      } else {
+        byFolder.set(message.folder_path, [message]);
+      }
+    }
+    return [...byFolder.values()].flat();
   }
 
   private async fetchAndStoreBody(
@@ -1789,25 +1916,35 @@ export class MirrorEngine {
       body = await fetchFullMessageBody(client, this.config, message, { skipMailboxLock });
     } catch (error) {
       if (error instanceof MessageMovedError) {
-        // The UID vanished between metadata sync and body fetch. Get it out of the
-        // backlog without re-throwing into the account-level catch (which bricks the
-        // account to BROKEN and re-loops every backfill) — but scope the tombstone by
-        // window, because only IN_WINDOW rows self-heal.
-        if (message.window_status === "IN_WINDOW") {
-          // A later metadata sync's ON CONFLICT resets deleted_in_provider, so a rare
-          // transient false-negative recovers. Safe to soft-delete MOVED_OUT.
-          await this.repository.markMessageMovedOut(message.id);
-        } else {
-          // HISTORICAL/EXPIRED rows are never re-observed (backfill walks strictly
-          // backward) and reconcile is IN_WINDOW-only, so a tombstone here would be
-          // unrecoverable. Mark the body fetch attempted instead — non-destructive,
-          // and it still leaves getHistoryBacklog (which filters body_fetched_at IS NULL).
-          await this.repository.markBodyFetchAttempted(message.id);
-        }
+        await this.recordMovedBody(message);
         return;
       }
       throw error;
     }
+    await this.commitBody(message, body);
+  }
+
+  private async recordMovedBody(message: ImapMessage): Promise<void> {
+    // The UID vanished between metadata sync and body fetch. Get it out of the
+    // backlog without re-throwing into the account-level catch (which bricks the
+    // account to BROKEN and re-loops every backfill) — but scope the tombstone by
+    // window, because only IN_WINDOW rows self-heal.
+    if (message.window_status === "IN_WINDOW") {
+      // A later metadata sync's ON CONFLICT resets deleted_in_provider, so a rare
+      // transient false-negative recovers. Safe to soft-delete MOVED_OUT.
+      await this.repository.markMessageMovedOut(message.id);
+    } else {
+      // HISTORICAL/EXPIRED rows are never re-observed (backfill walks strictly
+      // backward) and reconcile is IN_WINDOW-only, so tombstoning would be
+      // unrecoverable. Mark the body fetch attempted instead — non-destructive.
+      await this.repository.markBodyFetchAttempted(message.id);
+    }
+  }
+
+  private async commitBody(
+    message: ImapMessage,
+    body: Awaited<ReturnType<typeof fetchFullMessageBody>>
+  ): Promise<void> {
     await this.repository.storeBodyEvidence(body);
     await this.bodyStore.store(body);
     await this.repository.completeBodyStorage(body.messageId);

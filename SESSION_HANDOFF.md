@@ -1,5 +1,33 @@
 # Session Handoff
 
+## 2026-07-27 — Single-worker parsed-body throughput
+
+- Branch `fedster99/single-worker-body-throughput` batches small
+  `parsed_only` bodies on one IMAP connection. One UID-set FETCH covers at
+  most 10 same-folder messages, 4 MiB per message, and 8 MiB of aggregate
+  source. Unknown, large, singleton, cap-limited, missing, or size-mismatched
+  messages use the individual streaming path.
+- The bounded FETCH and MIME parse finish before storage. Each message still
+  commits search/threading evidence, then `BodyStore`, then completion. A
+  storage failure leaves that message retryable. A missing batch response gets
+  an individual download before any `MOVED_OUT` decision.
+- The live body lane reads several configured batches with one bounded
+  database query. Parsed bodies are grouped by folder inside that selected
+  set. Inline and queued historical body work use the same batching helper.
+  No schema migration is required.
+- A controlled 40-message benchmark with 20 ms command latency reduced IMAP
+  body commands from 80 to 4 and median fetch/parse time from 1.73 seconds to
+  0.105 seconds (16.46x). A 10-message, 7.5 MiB aggregate source probe added
+  11.6 MiB peak RSS.
+- Final verification passed 700 fast tests, both builds, 197 live-Postgres
+  tests, 120/120 conformance checks, GreenMail in `parsed_only` (3 messages,
+  3 bodies, 1 attachment), and Dovecot in `parsed_only` (4 messages, 4 bodies,
+  1 attachment). The expected local Node 26 warning appeared because the repo
+  pins Node 24.
+- Next: review the public PR, merge only with Federico's explicit approval,
+  wait for the immutable core image, then re-pin and canary the hosted runtime
+  in a separate private-cloud PR.
+
 ## 2026-07-26 — Bounded threading rollback history
 
 - Branch `fedster99/bound-threading-history` stops

@@ -1,9 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { isConnectionLostError, isMissingMailboxError, MirrorEngine } from "../sync-engine.js";
+import {
+  bodyBacklogReadLimit,
+  isConnectionLostError,
+  isMissingMailboxError,
+  MirrorEngine
+} from "../sync-engine.js";
 
 describe("sync engine safety", () => {
+  it("combines only whole configured body batches under the 500-row read cap", () => {
+    expect(bodyBacklogReadLimit(10, 4)).toBe(40);
+    expect(bodyBacklogReadLimit(200, 3)).toBe(400);
+    expect(bodyBacklogReadLimit(500, 3)).toBe(500);
+  });
+
   it("terminalizes a sync run when account-lock acquisition throws", async () => {
     const finishSyncRun = vi.fn(async () => undefined);
     const repository = {

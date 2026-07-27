@@ -66,8 +66,23 @@ export class FixtureImapClient implements MirrorImapClient {
     const messages = this.selectedMessages(range);
     const metadataRequested = Boolean(query.envelope || query.headers || query.bodyStructure);
     const flagsRequested = query.flags === true;
+    const sourceRequest = typeof query.source === "object" && query.source !== null
+      ? query.source as { maxLength?: unknown }
+      : null;
+    const maxSourceLength = typeof sourceRequest?.maxLength === "number"
+      ? sourceRequest.maxLength
+      : undefined;
 
     for (const message of messages) {
+      if (sourceRequest) {
+        yield {
+          ...this.toFetchMessage(message),
+          source: maxSourceLength === undefined
+            ? message.raw
+            : message.raw.subarray(0, maxSourceLength)
+        };
+        continue;
+      }
       yield metadataRequested
         ? this.toFetchMessage(message)
         : flagsRequested
@@ -103,7 +118,7 @@ export class FixtureImapClient implements MirrorImapClient {
     void part;
     const uid = Number(range);
     const message = this.messagesForCurrentMailbox().find((candidate) => candidate.uid === uid);
-    if (!message) throw new Error(`Fixture message not found: ${range}`);
+    if (!message) return {};
     const maxBytes = typeof options.maxBytes === "number" ? options.maxBytes : undefined;
     const raw = maxBytes === undefined ? message.raw : message.raw.subarray(0, maxBytes);
 

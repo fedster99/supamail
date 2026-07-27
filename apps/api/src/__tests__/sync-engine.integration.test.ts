@@ -1265,11 +1265,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     ];
 
+    const backlogSpy = vi.spyOn(h.repository, "getBodyBacklog");
     const engine = h.buildEngine({ folders });
     const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
     expect(result.bodiesFetched).toBe(4);
+    expect(backlogSpy).toHaveBeenCalledTimes(1);
+    expect(backlogSpy.mock.calls[0]?.[1]).toBe(4);
 
     const bodyCount = await h.pool.query<{ count: string }>(
       `
@@ -1280,6 +1283,454 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id]
     );
     expect(Number(bodyCount.rows[0].count)).toBe(4);
+  });
+
+  it("batches small parsed-only bodies through one UID FETCH command", async () => {
+    const h = await setupIntegration("G-body-batch", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 401,
+        messages: Array.from({ length: 3 }, (_, index) => makeTextMessage({
+          uid: index + 1,
+          subject: `batched-body-${index + 1}`,
+          from: "a@x.test",
+          to: "u@x.test",
+          body: `batched-body-${index + 1}`
+        }))
+      }
+    ];
+
+    let sourceFetches = 0;
+    let downloads = 0;
+    class CountingBodyBatchClient extends FixtureImapClient {
+      async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ) {
+        if (query.source && Array.isArray(range)) {
+          sourceFetches += 1;
+          for (const uid of range) {
+            const fetched = await super.fetchOne(String(uid), query, options);
+            if (fetched) yield fetched;
+          }
+          return;
+        }
+        for await (const message of super.fetch(range, query)) {
+          yield message;
+        }
+      }
+
+      async download(
+        range: string,
+        part?: string,
+        options?: Record<string, unknown>
+      ) {
+        downloads += 1;
+        return await super.download(range, part, options);
+      }
+    }
+
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => new CountingBodyBatchClient(folders)
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(3);
+    expect(sourceFetches).toBe(1);
+    expect(downloads).toBe(0);
+  });
+
+  it("groups an interleaved logical backlog by folder before parsed-only body fetch", async () => {
+    const h = await setupIntegration("G-body-batch-folders", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 4,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [
+      {
+        path: "Folder-A",
+        delimiter: "/",
+        uidValidity: 404,
+        messages: [4, 2].map((uid) => makeTextMessage({
+          uid,
+          subject: `folder-a-${uid}`,
+          from: "a@x.test",
+          to: "u@x.test",
+          body: `folder-a-${uid}`
+        }))
+      },
+      {
+        path: "Folder-B",
+        delimiter: "/",
+        uidValidity: 405,
+        messages: [3, 1].map((uid) => makeTextMessage({
+          uid,
+          subject: `folder-b-${uid}`,
+          from: "a@x.test",
+          to: "u@x.test",
+          body: `folder-b-${uid}`
+        }))
+      }
+    ];
+
+    const sourceRanges: number[][] = [];
+    let downloads = 0;
+    class CountingFolderBatchClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (query.source && Array.isArray(range)) sourceRanges.push(range);
+        yield* super.fetch(range, query);
+      }
+
+      override async download(
+        range: string,
+        part?: string,
+        options?: Record<string, unknown>
+      ) {
+        downloads += 1;
+        return await super.download(range, part, options);
+      }
+    }
+
+    const result = await h.buildEngine({
+      folders,
+      clientFactory: async () => new CountingFolderBatchClient(folders)
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(4);
+    expect(sourceRanges).toHaveLength(2);
+    expect(sourceRanges.every((range) => range.length === 2)).toBe(true);
+    expect(downloads).toBe(0);
+  });
+
+  it("commits returned batch bodies and retries exactly the UIDs missing from FETCH", async () => {
+    const h = await setupIntegration("G-body-batch-missing", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 402,
+      messages: Array.from({ length: 3 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `missing-batch-body-${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: `missing-batch-body-${index + 1}`
+      }))
+    }];
+
+    class MissingBatchUidClient extends FixtureImapClient {
+      downloads: string[] = [];
+
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (query.source && Array.isArray(range)) {
+          yield* super.fetch(range.filter((uid) => uid !== 2), query);
+          return;
+        }
+        yield* super.fetch(range, query);
+      }
+
+      override async download(
+        range: string,
+        part?: string,
+        options?: Record<string, unknown>
+      ) {
+        this.downloads.push(range);
+        return await super.download(range, part, options);
+      }
+    }
+
+    const client = new MissingBatchUidClient(folders);
+    const result = await h.buildEngine({
+      folders,
+      clientFactory: async () => client
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(3);
+    expect(client.downloads).toEqual(["2"]);
+    const rows = await h.pool.query<{
+      uid: string;
+      body_fetched_at: Date | null;
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT uid::text, body_fetched_at, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1
+       ORDER BY uid`,
+      [h.account.id]
+    );
+    expect(rows.rows.map((row) => ({
+      uid: row.uid,
+      fetched: row.body_fetched_at !== null,
+      deleted: row.deleted_in_provider
+    }))).toEqual([
+      { uid: "1", fetched: true, deleted: false },
+      { uid: "2", fetched: true, deleted: false },
+      { uid: "3", fetched: true, deleted: false }
+    ]);
+  });
+
+  it("marks only a truly gone UID moved after a batch omission and individual retry", async () => {
+    const h = await setupIntegration("G-body-batch-gone", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 406,
+      messages: Array.from({ length: 3 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `gone-batch-body-${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: `gone-batch-body-${index + 1}`
+      }))
+    }];
+
+    class GoneBatchUidClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (query.source && Array.isArray(range)) {
+          yield* super.fetch(range.filter((uid) => uid !== 2), query);
+          return;
+        }
+        yield* super.fetch(range, query);
+      }
+
+      override async download(
+        range: string,
+        part?: string,
+        options?: Record<string, unknown>
+      ) {
+        if (range === "2") return {};
+        return await super.download(range, part, options);
+      }
+    }
+
+    const result = await h.buildEngine({
+      folders,
+      clientFactory: async () => new GoneBatchUidClient(folders)
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    const rows = await h.pool.query<{
+      uid: string;
+      body_fetched_at: Date | null;
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT uid::text, body_fetched_at, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1
+       ORDER BY uid`,
+      [h.account.id]
+    );
+    expect(rows.rows.map((row) => ({
+      uid: row.uid,
+      fetched: row.body_fetched_at !== null,
+      deleted: row.deleted_in_provider
+    }))).toEqual([
+      { uid: "1", fetched: true, deleted: false },
+      { uid: "2", fetched: false, deleted: true },
+      { uid: "3", fetched: true, deleted: false }
+    ]);
+  });
+
+  it("retries a parsed-only batch after body storage fails without losing fetched evidence", async () => {
+    const h = await setupIntegration("G-body-batch-store-retry", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 407,
+      messages: Array.from({ length: 3 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `store-retry-body-${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: `store-retry-body-${index + 1}`
+      }))
+    }];
+    const databaseStore = new DatabaseBodyStore(h.repository);
+    let storeCalls = 0;
+    const failingStore: BodyStore = {
+      async store(body) {
+        storeCalls += 1;
+        if (storeCalls === 2) throw new Error("injected body store failure");
+        await databaseStore.store(body);
+      }
+    };
+
+    const failed = await h.buildEngine({
+      folders,
+      bodyStore: failingStore
+    }).syncAccount(h.account.id, "manual");
+
+    expect(failed.outcome).toBe("failed");
+    const afterFailure = await h.pool.query<{
+      uid: string;
+      body_fetched_at: Date | null;
+      search_extract: string | null;
+      body_text: string | null;
+    }>(
+      `SELECT m.uid::text, m.body_fetched_at, b.search_extract, b.body_text
+       FROM public.imap_messages m
+       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+       WHERE m.account_id = $1
+       ORDER BY m.uid`,
+      [h.account.id]
+    );
+    expect(afterFailure.rows.map((row) => ({
+      uid: row.uid,
+      fetched: row.body_fetched_at !== null,
+      evidence: row.search_extract,
+      payload: row.body_text
+    }))).toEqual([
+      {
+        uid: "1",
+        fetched: true,
+        evidence: "store-retry-body-1",
+        payload: "store-retry-body-1"
+      },
+      {
+        uid: "2",
+        fetched: false,
+        evidence: "store-retry-body-2",
+        payload: null
+      },
+      {
+        uid: "3",
+        fetched: false,
+        evidence: null,
+        payload: null
+      }
+    ]);
+
+    const retried = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    expect(retried.outcome).toBe("success");
+    const completed = await h.pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_messages
+       WHERE account_id = $1 AND body_fetched_at IS NOT NULL`,
+      [h.account.id]
+    );
+    expect(Number(completed.rows[0].count)).toBe(3);
+  });
+
+  it("streams parsed-only bodies that exceed the bounded batch source cap", async () => {
+    const h = await setupIntegration("G-body-batch-cap", {
+      BODY_STORAGE_MODE: "parsed_only",
+      BODY_RAW_MAX_BYTES: 64,
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 2,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 403,
+      messages: Array.from({ length: 2 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `large-body-${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "x".repeat(256)
+      }))
+    }];
+
+    let sourceFetches = 0;
+    let downloads = 0;
+    class CountingStreamingFallbackClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (query.source && Array.isArray(range)) sourceFetches += 1;
+        yield* super.fetch(range, query);
+      }
+
+      override async download(
+        range: string,
+        part?: string,
+        options?: Record<string, unknown>
+      ) {
+        downloads += 1;
+        return await super.download(range, part, options);
+      }
+    }
+
+    const result = await h.buildEngine({
+      folders,
+      clientFactory: async () => new CountingStreamingFallbackClient(folders)
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.bodiesFetched).toBe(2);
+    expect(sourceFetches).toBe(0);
+    expect(downloads).toBe(2);
   });
 
   it("collapses a lost IMAP connection into one error instead of failing every remaining folder", async () => {
@@ -2202,6 +2653,103 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ).rows[0];
     expect(skippedHistory.historical_target_count).toBeNull();
     expect(Number(skippedHistory.historical_message_count)).toBe(0);
+  });
+
+  it("batches small parsed-only bodies during inline historical backfill", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const h = await setupIntegration("history-body-batch", {
+      BODY_STORAGE_MODE: "parsed_only",
+      BODY_BACKFILL_BATCH_SIZE: 2,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_BODY_BATCHES_PER_TICK: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          archive_refresh_interval = 'monthly',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_003,
+      messages: [
+        makeTextMessage({
+          uid: 1,
+          subject: "old-1",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "old-1",
+          internalDate: oldDate
+        }),
+        makeTextMessage({
+          uid: 2,
+          subject: "old-2",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "old-2",
+          internalDate: oldDate
+        }),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: new Date()
+        })
+      ]
+    }];
+
+    const sourceRanges: number[][] = [];
+    let downloads = 0;
+    class CountingHistoryBodyClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (query.source && Array.isArray(range)) sourceRanges.push(range);
+        yield* super.fetch(range, query);
+      }
+
+      override async download(
+        range: string,
+        part?: string,
+        options?: Record<string, unknown>
+      ) {
+        downloads += 1;
+        return await super.download(range, part, options);
+      }
+    }
+
+    const result = await h.buildEngine({
+      folders,
+      clientFactory: async () => new CountingHistoryBodyClient(folders)
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(sourceRanges).toEqual([[1, 2]]);
+    expect(downloads).toBe(1);
+    const historyBodies = await h.pool.query<{ count: string }>(
+      `
+      SELECT count(*)::text AS count
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND window_status = 'HISTORICAL'
+        AND body_fetched_at IS NOT NULL
+      `,
+      [h.account.id]
+    );
+    expect(Number(historyBodies.rows[0].count)).toBe(2);
   });
 
   it("finishes an in-flight history batch at the safe boundary after the lock budget expires", async () => {

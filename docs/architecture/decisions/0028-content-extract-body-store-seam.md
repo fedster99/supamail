@@ -39,6 +39,13 @@ a mailbox re-sync.
 - After the evidence transaction commits, the injected `BodyStore` receives the
   full `MessageBodyInput`. Only after it succeeds does the repository set
   `imap_messages.body_fetched_at` and advance the folder body counter.
+- In `parsed_only`, the body lane can request at most 10 known-complete,
+  same-folder messages of at most 4 MiB each with one UID-set FETCH, with an
+  8 MiB aggregate source cap. The fetch and parse complete before body storage,
+  so storage latency never pauses an active IMAP command. The loop issues no
+  nested IMAP command. Larger, unknown-size, singleton, and cap-limited messages
+  use the streaming download path. This fast path does not change the evidence
+  → store → completion order.
 - `DatabaseBodyStore` is the OSS default. It stores parsed text, HTML, selected
   part data, and raw MIME exactly as before; `BODY_STORAGE_MODE=parsed_only`
   continues to store `raw_mime = NULL`.
@@ -58,6 +65,12 @@ a mailbox re-sync.
 Search indexes and conversation projections can be rebuilt without reading a
 body payload. A body-store failure leaves useful search/threading evidence but
 keeps the message in the normal body backlog; retries are idempotent.
+
+For a 40-body tick, the worker reads the database backlog
+once and uses four bounded UID-set FETCH commands instead of 40 preflight
+FETCHes plus 40 downloads. The single-message fallback also avoids the old
+parsed-only preflight FETCH. This improves one connection without adding
+parallel body writes or weakening crash recovery.
 
 The database store remains byte-compatible for OSS users. This ADR introduces
 no object-storage provider, hosted search backend, retention policy, or
@@ -98,3 +111,4 @@ also avoids over-representing quoted history commonly found at message tails.
 - `apps/api/supabase/migrations/public/0022_content_extract_body_store.sql`
 - `docs/architecture/decisions/0015-search-layer.md`
 - `docs/architecture/decisions/0024-durable-conversation-threading.md`
+- [ImapFlow fetching API](https://imapflow.com/docs/api/imapflow-client/#fetchrange-query-options)

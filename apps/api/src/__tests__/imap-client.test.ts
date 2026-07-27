@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 import {
   fetchFullMessageBody,
+  fetchFullMessageBodyBatch,
   fetchMessageFlags,
   fetchMessageMetadata,
   MessageMovedError,
@@ -13,6 +14,7 @@ import {
   searchAllUids,
   searchUidsBefore,
   searchUidsSince,
+  ThrottledImapClient,
   type FetchMessage,
   type MirrorImapClient
 } from "../imap-client.js";
@@ -202,7 +204,7 @@ describe("fetchFullMessageBody mailbox locking", () => {
       notesMessage
     );
 
-    expect(fetchOne.mock.calls[0]?.[1]).not.toHaveProperty("source");
+    expect(fetchOne).not.toHaveBeenCalled();
     expect(download).toHaveBeenCalledOnce();
     expect(download).toHaveBeenCalledWith("1273", undefined, {
       uid: true,
@@ -213,6 +215,51 @@ describe("fetchFullMessageBody mailbox locking", () => {
     expect(body.rawBytes).toBe(fixture.raw.length);
     expect(body.rawMimeSha256).toBe(createHash("sha256").update(fixture.raw).digest("hex"));
     expect(body.bodyText).toContain("parsed-only body");
+  });
+
+  it("treats a known complete parsed-only source at the byte cap consistently", async () => {
+    const fixtures = [1273, 1274].map((uid) => makeTextMessage({
+      uid,
+      subject: "Exact cap",
+      from: "a@example.test",
+      to: "b@example.test",
+      body: "exact-cap-body"
+    }));
+    const rows = fixtures.map((fixture) => ({
+      ...notesMessage,
+      id: `m${fixture.uid}`,
+      uid: String(fixture.uid),
+      size_bytes: fixture.raw.length,
+      mime_structure: fixture.bodyStructure
+    }));
+    const config = {
+      BODY_RAW_MAX_BYTES: fixtures[0].raw.length,
+      BODY_STORAGE_MODE: "parsed_only"
+    } as unknown as AppConfig;
+
+    const individual = await fetchFullMessageBody(
+      new FixtureImapClient([{
+        path: "INBOX.Notes",
+        delimiter: ".",
+        uidValidity: 1,
+        messages: [fixtures[0]]
+      }]),
+      config,
+      rows[0]
+    );
+    const batch = await fetchFullMessageBodyBatch(
+      new FixtureImapClient([{
+        path: "INBOX.Notes",
+        delimiter: ".",
+        uidValidity: 1,
+        messages: fixtures
+      }]),
+      config,
+      rows
+    );
+
+    expect(individual.rawTruncated).toBe(false);
+    expect(batch.bodies.map(({ body }) => body.rawTruncated)).toEqual([false, false]);
   });
 
   it("reuses the selected mailbox without re-locking when skipMailboxLock is set (no nested-lock deadlock)", async () => {
@@ -267,6 +314,233 @@ describe("fetchFullMessageBody mailbox locking", () => {
     await expect(
       fetchFullMessageBody(client, bodyConfig, notesMessage)
     ).rejects.toBeInstanceOf(MessageMovedError);
+  });
+
+  it("throws MessageMovedError for a gone parsed-only UID without a preflight FETCH", async () => {
+    const client = new FixtureImapClient([{
+      path: "INBOX.Notes",
+      delimiter: ".",
+      uidValidity: 1,
+      messages: []
+    }]);
+
+    await expect(fetchFullMessageBody(
+      client,
+      {
+        BODY_RAW_MAX_BYTES: 25 * 1024 * 1024,
+        BODY_STORAGE_MODE: "parsed_only"
+      } as unknown as AppConfig,
+      notesMessage
+    )).rejects.toBeInstanceOf(MessageMovedError);
+  });
+});
+
+describe("ThrottledImapClient fetch cancellation", () => {
+  it("forwards an early consumer return to the underlying IMAP iterator", async () => {
+    const iteratorReturn = vi.fn(async () => ({ done: true, value: undefined }));
+    const rawIterator = {
+      next: vi.fn(async () => ({ done: false, value: { uid: 1 } })),
+      return: iteratorReturn,
+      [Symbol.asyncIterator]() {
+        return this;
+      }
+    };
+    const rawClient = {
+      fetch: vi.fn(() => rawIterator),
+      close: vi.fn()
+    };
+    const client = new ThrottledImapClient(
+      rawClient as never,
+      1_000,
+      1_000
+    );
+
+    for await (const _message of client.fetch([1, 2], { source: true }, { uid: true })) {
+      break;
+    }
+
+    expect(iteratorReturn).toHaveBeenCalledOnce();
+    expect(rawClient.close).not.toHaveBeenCalled();
+  });
+
+  it("closes the connection when the underlying iterator cannot cancel", async () => {
+    const rawIterator = {
+      next: vi.fn(async () => ({ done: false, value: { uid: 1 } })),
+      return: vi.fn(async () => {
+        throw new Error("cancel failed");
+      }),
+      [Symbol.asyncIterator]() {
+        return this;
+      }
+    };
+    const rawClient = {
+      fetch: vi.fn(() => rawIterator),
+      close: vi.fn()
+    };
+    const client = new ThrottledImapClient(
+      rawClient as never,
+      1_000,
+      1_000
+    );
+
+    for await (const _message of client.fetch([1, 2], { source: true }, { uid: true })) {
+      break;
+    }
+
+    expect(rawClient.close).toHaveBeenCalledOnce();
+  });
+});
+
+describe("fetchFullMessageBodyBatch", () => {
+  const rawByUid = new Map([
+    [1273, makeTextMessage({
+      uid: 1273,
+      subject: "First",
+      from: "a@example.test",
+      to: "b@example.test",
+      body: "first body"
+    }).raw],
+    [1274, makeTextMessage({
+      uid: 1274,
+      subject: "Second",
+      from: "a@example.test",
+      to: "b@example.test",
+      body: "second body"
+    }).raw]
+  ]);
+  const messages = [1273, 1274].map((uid) => ({
+    id: `m${uid}`,
+    account_id: "a1",
+    uid,
+    folder_path: "INBOX.Notes",
+    uidvalidity: 1,
+    size_bytes: rawByUid.get(uid)?.length ?? 0,
+    mime_structure: { part: "1", type: "text/plain" },
+    headers_json: {}
+  })) as unknown as ImapMessage[];
+
+  function batchClient(returnedUids = [1273, 1274]) {
+    const fetchCalls: Array<{
+      range: string | number[] | Record<string, unknown>;
+      query: Record<string, unknown>;
+      options?: Record<string, unknown>;
+    }> = [];
+    let lockCalls = 0;
+    let releaseCalls = 0;
+    let mailbox: MirrorImapClient["mailbox"] = null;
+    const client = {
+      get mailbox() {
+        return mailbox;
+      },
+      async getMailboxLock(path: string) {
+        lockCalls += 1;
+        mailbox = { path, uidValidity: 1 };
+        return {
+          release() {
+            releaseCalls += 1;
+          }
+        };
+      },
+      async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ) {
+        fetchCalls.push({ range, query, options });
+        for (const uid of returnedUids) {
+          yield { uid, source: rawByUid.get(uid) };
+        }
+      }
+    } as unknown as MirrorImapClient;
+    return {
+      client,
+      fetchCalls,
+      lockCalls: () => lockCalls,
+      releaseCalls: () => releaseCalls
+    };
+  }
+
+  it("uses one UID FETCH and yields independently parsed bodies", async () => {
+    const { client, fetchCalls, lockCalls, releaseCalls } = batchClient();
+    const result = await fetchFullMessageBodyBatch(
+      client,
+      {
+        BODY_RAW_MAX_BYTES: 4 * 1024 * 1024,
+        BODY_STORAGE_MODE: "parsed_only"
+      } as unknown as AppConfig,
+      messages
+    );
+    const bodies = result.bodies;
+
+    expect(lockCalls()).toBe(1);
+    expect(releaseCalls()).toBe(1);
+    expect(fetchCalls).toEqual([{
+      range: [1273, 1274],
+      query: {
+        source: {
+          start: 0,
+          maxLength: 4 * 1024 * 1024
+        }
+      },
+      options: { uid: true }
+    }]);
+    expect(bodies.map(({ message }) => message.id)).toEqual(["m1273", "m1274"]);
+    expect(bodies.map(({ body }) => body.bodyText)).toEqual([
+      expect.stringContaining("first body"),
+      expect.stringContaining("second body")
+    ]);
+    expect(bodies.every(({ body }) => body.rawMime.length === 0)).toBe(true);
+    expect(result.missingMessages).toEqual([]);
+  });
+
+  it("returns the exact missing UID set alongside the fetched bodies", async () => {
+    const { client } = batchClient([1273]);
+    const result = await fetchFullMessageBodyBatch(
+      client,
+      {
+        BODY_RAW_MAX_BYTES: 4 * 1024 * 1024,
+        BODY_STORAGE_MODE: "parsed_only"
+      } as unknown as AppConfig,
+      messages
+    );
+
+    expect(result.bodies.map(({ message }) => message.id)).toEqual(["m1273"]);
+    expect(result.missingMessages.map((message) => message.id)).toEqual(["m1274"]);
+  });
+
+  it("returns a source-size mismatch for individual streaming retry", async () => {
+    const { client } = batchClient();
+    const mismatched = messages.map((message, index) => (
+      index === 0 ? { ...message, size_bytes: Number(message.size_bytes) - 1 } : message
+    ));
+    const result = await fetchFullMessageBodyBatch(
+      client,
+      {
+        BODY_RAW_MAX_BYTES: 4 * 1024 * 1024,
+        BODY_STORAGE_MODE: "parsed_only"
+      } as unknown as AppConfig,
+      mismatched
+    );
+
+    expect(result.bodies.map(({ message }) => message.id)).toEqual(["m1274"]);
+    expect(result.missingMessages.map((message) => message.id)).toEqual(["m1273"]);
+  });
+
+  it("rejects an unsafe source size before acquiring the mailbox lock", async () => {
+    const { client, lockCalls } = batchClient();
+    const oversized = messages.map((message, index) => (
+      index === 0 ? { ...message, size_bytes: 4 * 1024 * 1024 + 1 } : message
+    ));
+
+    await expect(fetchFullMessageBodyBatch(
+      client,
+      {
+        BODY_RAW_MAX_BYTES: 25 * 1024 * 1024,
+        BODY_STORAGE_MODE: "parsed_only"
+      } as unknown as AppConfig,
+      oversized
+    )).rejects.toThrow("body batch UID 1273 has unsafe source size");
+    expect(lockCalls()).toBe(0);
   });
 });
 

@@ -105,7 +105,8 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
   - Inbox remains first in bounded full-sweep priority selection. Sent stays at priority 5 and receives a supplemental lightweight refresh on its separate cadence.
   - Body fetch is capped at up to 100 live bodies per worker tick.
-  - Raw MIME fetch is capped at 25 MB per message by default. `parsed_only` must stream the full-message download through byte counting, SHA-256, and MIME parsing without requesting or retaining an IMAP source buffer; `raw_mime` may buffer because persistence explicitly requires the bytes.
+  - Raw MIME fetch is capped at 25 MB per message by default. In `parsed_only`, a known-complete message up to 4 MiB can use the bounded UID-set fast path. One FETCH covers at most 10 same-folder messages and at most 8 MiB of aggregate source. The fetch and parse complete before body storage, and the loop issues no nested IMAP commands. Larger, unknown-size, and cap-limited messages must use the streaming full-message download. `raw_mime` may buffer because persistence explicitly requires the bytes.
+  - For every body path, commit search/threading evidence first, then call `BodyStore`, then mark body completion. A batch failure can leave earlier messages complete, but every uncommitted message must remain retryable.
   - Account lock budget is 10 minutes.
   - Default architecture cap is 20 accounts.
 - The real active cutoff currently comes from global `WINDOW_DAYS`; do not claim per-account `live_window_days` changes the sync cutoff until that path is implemented.
