@@ -1,6 +1,6 @@
 # Session Handoff
 
-## 2026-07-27 — Single-worker parsed-body throughput
+## 2026-07-27 — Single-worker parsed-body throughput (PR #102)
 
 - Branch `fedster99/single-worker-body-throughput` batches small
   `parsed_only` bodies on one IMAP connection. One UID-set FETCH covers at
