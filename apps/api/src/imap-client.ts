@@ -67,7 +67,7 @@ export interface FetchMessage {
 }
 
 export interface DownloadResult {
-  content: AsyncIterable<Buffer | Uint8Array | string>;
+  content?: AsyncIterable<Buffer | Uint8Array | string>;
 }
 
 export interface MirrorImapClient {
@@ -150,10 +150,24 @@ export class ThrottledImapClient implements MirrorImapClient {
       options as never
     ) as AsyncIterable<FetchMessage>)[Symbol.asyncIterator]();
 
-    while (true) {
-      const item = await this.withCommandTimeout("fetch", () => iterator.next());
-      if (item.done) break;
-      yield item.value;
+    let completed = false;
+    try {
+      while (true) {
+        const item = await this.withCommandTimeout("fetch", () => iterator.next());
+        if (item.done) {
+          completed = true;
+          break;
+        }
+        yield item.value;
+      }
+    } finally {
+      if (!completed && iterator.return) {
+        try {
+          await this.withCommandTimeout("fetch cancel", () => iterator.return!());
+        } catch {
+          this.client.close();
+        }
+      }
     }
   }
 
@@ -505,6 +519,168 @@ export class MessageMovedError extends Error {
   }
 }
 
+export const PARSED_BODY_BATCH_MAX_MESSAGES = 10;
+export const PARSED_BODY_BATCH_MAX_SOURCE_BYTES = 4 * 1024 * 1024;
+export const PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024;
+
+export interface BodyBatchFetchResult {
+  bodies: Array<{ message: ImapMessage; body: MessageBodyInput }>;
+  missingMessages: ImapMessage[];
+}
+
+function isParsedOnlySourceTruncated(
+  rawBytes: number,
+  message: ImapMessage,
+  configuredCap: number
+): boolean {
+  const expectedBytes = Number(message.size_bytes);
+  if (
+    Number.isSafeInteger(expectedBytes)
+    && expectedBytes > 0
+    && expectedBytes <= configuredCap
+  ) {
+    return rawBytes !== expectedBytes;
+  }
+  return rawBytes >= configuredCap;
+}
+
+/**
+ * Fetches several small parsed-only bodies with one UID FETCH command.
+ *
+ * ImapFlow backpressures its FETCH iterator one response at a time. This
+ * function drains the bounded FETCH before returning so body storage never
+ * pauses an active IMAP command. Larger messages continue through download(),
+ * which streams in chunks and never retains the full source.
+ */
+export async function fetchFullMessageBodyBatch(
+  client: MirrorImapClient,
+  config: AppConfig,
+  messages: ImapMessage[],
+  options: { skipMailboxLock?: boolean } = {}
+): Promise<BodyBatchFetchResult> {
+  if (messages.length === 0) return { bodies: [], missingMessages: [] };
+  if (config.BODY_STORAGE_MODE !== "parsed_only") {
+    throw new Error("body batch fetch requires BODY_STORAGE_MODE=parsed_only");
+  }
+  if (messages.length > PARSED_BODY_BATCH_MAX_MESSAGES) {
+    throw new Error(
+      `body batch fetch exceeds ${PARSED_BODY_BATCH_MAX_MESSAGES} messages`
+    );
+  }
+
+  const folderPath = messages[0].folder_path;
+  if (messages.some((message) => message.folder_path !== folderPath)) {
+    throw new Error("body batch fetch requires one mailbox folder");
+  }
+
+  const requestedByUid = new Map<number, ImapMessage>();
+  const sourceLimit = Math.min(
+    config.BODY_RAW_MAX_BYTES,
+    PARSED_BODY_BATCH_MAX_SOURCE_BYTES
+  );
+  let totalSourceBytes = 0;
+  for (const message of messages) {
+    const uid = Number(message.uid);
+    if (!Number.isSafeInteger(uid) || uid <= 0) {
+      throw new Error(`invalid body batch UID: ${message.uid}`);
+    }
+    if (requestedByUid.has(uid)) {
+      throw new Error(`duplicate body batch UID: ${message.uid}`);
+    }
+    const size = Number(message.size_bytes);
+    if (!Number.isSafeInteger(size) || size <= 0 || size > sourceLimit) {
+      throw new Error(`body batch UID ${message.uid} has unsafe source size`);
+    }
+    totalSourceBytes += size;
+    requestedByUid.set(uid, message);
+  }
+  if (totalSourceBytes > PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES) {
+    throw new Error("body batch fetch exceeds aggregate source limit");
+  }
+
+  const lock = options.skipMailboxLock ? null : await client.getMailboxLock(folderPath);
+  try {
+    const mailbox = client.mailbox;
+    if (!mailbox || mailbox.path !== folderPath) {
+      throw new Error(`body batch fetch expected ${folderPath} to be selected`);
+    }
+    const serverUidValidity = Number(mailbox.uidValidity);
+    for (const message of messages) {
+      if (serverUidValidity !== Number(message.uidvalidity)) {
+        throw new Error("UIDVALIDITY changed before body batch fetch");
+      }
+    }
+
+    const seen = new Set<number>();
+    const bodies: BodyBatchFetchResult["bodies"] = [];
+    for await (const fetched of client.fetch(
+      [...requestedByUid.keys()],
+      {
+        source: {
+          start: 0,
+          maxLength: sourceLimit
+        }
+      },
+      { uid: true }
+    )) {
+      const uid = Number(fetched.uid);
+      const message = requestedByUid.get(uid);
+      if (!message || seen.has(uid) || !fetched.source) continue;
+      const source = Buffer.isBuffer(fetched.source)
+        ? fetched.source
+        : Buffer.from(fetched.source);
+      // RFC822.SIZE selected this message for the bounded batch. If the server
+      // returns a different byte count, do not trust the estimate or retain the
+      // parsed result in this batch. The caller retries it through the individual
+      // streaming path after the set FETCH has drained.
+      if (source.length !== Number(message.size_bytes)) continue;
+      seen.add(uid);
+
+      const parsed = await parseRawMimeStream((async function* () {
+        yield source;
+      })());
+      const rawTruncated = isParsedOnlySourceTruncated(
+        parsed.rawBytes,
+        message,
+        config.BODY_RAW_MAX_BYTES
+      );
+      const mimeStructure = message.mime_structure;
+      const selected = selectBodyTextPart(mimeStructure);
+
+      bodies.push({
+        message,
+        body: {
+          messageId: message.id,
+          rawMime: Buffer.alloc(0),
+          rawMimeSha256: rawTruncated ? null : parsed.rawMimeSha256,
+          rawBytes: parsed.rawBytes,
+          rawTruncated,
+          bodyText: parsed.bodyText,
+          bodyHtml: parsed.bodyHtml,
+          bodyPlain: parsed.bodyPlain,
+          selectedTextPart: selected?.part ?? null,
+          selectedTextFormat: selected?.format ?? null,
+          headersJson: Object.keys(parsed.headersJson).length > 0
+            ? parsed.headersJson
+            : message.headers_json,
+          mimeStructure,
+          parserWarnings: rawTruncated
+            ? [...parsed.parserWarnings, "artifact_evidence_omitted_raw_truncated"]
+            : parsed.parserWarnings,
+          evidence: rawTruncated ? [] : parsed.evidence
+        }
+      });
+    }
+
+    return {
+      bodies,
+      missingMessages: messages.filter((message) => !seen.has(Number(message.uid)))
+    };
+  } finally {
+    lock?.release();
+  }
+}
+
 export async function fetchFullMessageBody(
   client: MirrorImapClient,
   config: AppConfig,
@@ -534,22 +710,25 @@ export async function fetchFullMessageBody(
     }
 
     const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
-    const fetchQuery: Record<string, unknown> = {
-      bodyStructure: true,
-      headers: true
-    };
+    let fetched: FetchMessage | false | null = null;
     if (!streamParsedOnly) {
-      fetchQuery.source = { start: 0, maxLength: config.BODY_RAW_MAX_BYTES };
-    }
-    const fetched = await client.fetchOne(String(message.uid), fetchQuery, { uid: true });
+      fetched = await client.fetchOne(
+        String(message.uid),
+        {
+          bodyStructure: true,
+          headers: true,
+          source: { start: 0, maxLength: config.BODY_RAW_MAX_BYTES }
+        },
+        { uid: true }
+      );
 
-    // The UID can vanish between metadata sync and this body fetch (a filter moved
-    // it to another folder, or it was deleted). Treat a gone UID as a terminal,
-    // benign "moved out" so the caller soft-deletes it instead of crashing the body
-    // lane (fetchOne returns false; the download fallback would otherwise stream
-    // `false.content` and throw straight to the account-level catch).
-    if (!fetched) {
-      throw new MessageMovedError(String(message.uid), message.folder_path);
+      // The UID can vanish between metadata sync and this body fetch (a filter moved
+      // it to another folder, or it was deleted). Treat a gone UID as a terminal,
+      // benign "moved out" so the caller soft-deletes it instead of crashing the body
+      // lane.
+      if (!fetched) {
+        throw new MessageMovedError(String(message.uid), message.folder_path);
+      }
     }
 
     let rawMime: Buffer = Buffer.alloc(0);
@@ -570,7 +749,7 @@ export async function fetchFullMessageBody(
       rawMimeSha256 = streamed.rawMimeSha256;
       parsed = streamed;
     } else {
-      rawMime = fetched.source
+      rawMime = fetched?.source
         ? (Buffer.isBuffer(fetched.source) ? fetched.source : Buffer.from(fetched.source))
         : Buffer.alloc(0);
       if (rawMime.length === 0) {
@@ -588,9 +767,11 @@ export async function fetchFullMessageBody(
       parsed = await parseRawMime(rawMime);
     }
 
-    const rawTruncated = rawBytes >= config.BODY_RAW_MAX_BYTES;
+    const rawTruncated = streamParsedOnly
+      ? isParsedOnlySourceTruncated(rawBytes, message, config.BODY_RAW_MAX_BYTES)
+      : rawBytes >= config.BODY_RAW_MAX_BYTES;
     if (rawTruncated) rawMimeSha256 = null;
-    const mimeStructure = fetched && fetched.bodyStructure ? fetched.bodyStructure : message.mime_structure;
+    const mimeStructure = fetched?.bodyStructure ?? message.mime_structure;
     const selected = selectBodyTextPart(mimeStructure);
 
     return {

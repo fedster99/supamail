@@ -165,6 +165,9 @@ export class ContentImapClient {
   ): Promise<Buffer> {
     return this.withUidScope(folderPath, uidValidity, async () => {
       const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
+      if (!result.content) {
+        throw new NotFoundError(`Message UID ${uid} is no longer present in ${folderPath}`);
+      }
       return await streamToBuffer(result.content);
     });
   }
@@ -189,6 +192,9 @@ export class ContentImapClient {
     try {
       this.assertUidValidity(folderPath, uidValidity);
       const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
+      if (!result.content) {
+        throw new NotFoundError(`Message UID ${uid} is no longer present in ${folderPath}`);
+      }
       return { stream: result.content as Readable, release: () => lock.release() };
     } catch (err) {
       lock.release();
@@ -210,6 +216,9 @@ export class ContentImapClient {
         return Buffer.from((fetched as { source: Buffer }).source);
       }
       const result = await this.client.download(String(uid), undefined, { uid: true, maxBytes });
+      if (!result.content) {
+        throw new NotFoundError(`Message UID ${uid} is no longer present in ${folderPath}`);
+      }
       return await streamToBuffer(result.content);
     });
   }
