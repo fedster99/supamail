@@ -1,5 +1,26 @@
 # Session Handoff
 
+## 2026-07-28 — Dependency security remediation
+
+- Branch `fedster99/fix-dependency-alerts` clears the 43 open GitHub
+  Dependabot alerts (two critical) present on `main`. The investigation began
+  with 42 alerts; GitHub added a PostCSS alert during final review, and the
+  branch already resolves it with PostCSS 8.5.24. The original lockfile
+  reproduced 47 vulnerable dependency paths through `pnpm audit`; the updated
+  graph reports no known vulnerabilities.
+- Direct upgrades move Vitest to the patched v3 line, Next.js to patched 15.5,
+  Hono and its Node adapter to their patched releases, and refresh IMAPFlow,
+  Mailparser, and Nodemailer so their mail/link parsing dependency graph is
+  patched.
+- Root pnpm overrides keep vulnerable transitive versions out of the lockfile:
+  the MCP SDK's Hono adapter, Vitest's Vite/esbuild toolchain, Next.js's
+  PostCSS/Sharp toolchain, and AJV's `fast-uri`.
+- Node 24 verification passed frozen install, audit, root typecheck, 701 fast
+  tests (including a real HTTP listener lifecycle check for the Hono Node
+  adapter), both production builds, 197 live-Postgres tests, 120/120
+  conformance checks, GreenMail SMTP/IMAP smoke, and Dovecot IMAP smoke. No
+  application, schema, migration, protocol, or feature-list behavior changed.
+
 ## 2026-07-27 — Single-worker parsed-body throughput (PR #102)
 
 - Branch `fedster99/single-worker-body-throughput` batches small
