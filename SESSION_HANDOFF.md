@@ -1,5 +1,25 @@
 # Session Handoff
 
+## 2026-07-28 — Public security and privacy model
+
+- Branch `fedster99/publish-cloud-security-model` publishes one explicit model
+  for self-hosted OSS and hosted SupaMail Cloud. It documents credential and
+  bearer-token handling, hosted secret separation, the exact AES-256-GCM body
+  envelope and per-Tenant HKDF derivation, rollout safety, threat boundaries,
+  and known plaintext surfaces.
+- The model states that self-hosted database bodies remain readable to the
+  self-hosted operator and that hosted Cloud is application-layer encrypted,
+  not zero knowledge. It separates behavior proved by public source/tests from
+  private hosted deployment evidence.
+- `README.md`, `SECURITY.md`, the architecture map, hosted boundary, and hosted
+  contracts link to the model. Runtime, schema, migration, API, and deployment
+  behavior are unchanged. No feature-list state changed.
+- Docs-only verification passed `pnpm harness:check`, `git diff --check`, a
+  trailing-whitespace scan, and relative Markdown link validation. The
+  published compatibility vector also passed the hosted runtime's focused
+  cross-reader vector test. The expected local Node 26 warning appeared because
+  the repo pins Node 24.
+
 ## 2026-07-27 — Single-worker parsed-body throughput (PR #102)
 
 - Branch `fedster99/single-worker-body-throughput` batches small
@@ -230,7 +250,7 @@
   Commit/merge, immutable-image publication, and downstream production re-pin
   are the next actions.
 
-Last updated: 2026-07-25
+Last updated: 2026-07-28
 
 This is the tracked restart point for future agents. Keep it concise, factual, and safe to publish. Put private local notes, credentials, customer/provider probes, and one-off scratch work in `.context/` instead.
 

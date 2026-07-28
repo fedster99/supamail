@@ -32,6 +32,7 @@ The worker and API share the same repository and account-locking model. Any IMAP
 - Public reliability contract: `docs/spec-conformance.md`
 - Schema overview: `docs/schema.md`
 - Deployment options: `docs/deployment-options.md`, `docs/fly-supabase.md`
+- Security and privacy model: `docs/security-model.md`
 - Hosted product boundary: `docs/hosted-product-boundary.md`
 - Hosted cloud contracts: `docs/hosted-cloud-contracts.md`
 - IMAP auth scope: `docs/imap-auth-v1.md`

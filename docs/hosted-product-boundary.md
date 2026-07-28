@@ -18,3 +18,8 @@ Self-hosting docs should stay focused on a user operating their own SupaMail wor
 The public core may expose contracts that the hosted product consumes, such as public mirror migrations, Docker images, runtime entrypoints, and scheduler types. It must not store hosted control-plane migrations or secrets.
 
 For Supabase OAuth integrations in the hosted product, refresh tokens must be encrypted before storage. The encryption key belongs in Fly/Vercel secrets only; plaintext refresh tokens must not appear in the control-plane database, public docs, logs, PRs, or example env files.
+
+The hosted source remains private, but its security claims must be public and
+specific. The [Security and Privacy Model](security-model.md) publishes the key
+separation, body-object encryption format, threat model, non-goals, and limits
+without publishing secret values or private multi-Tenant orchestration code.

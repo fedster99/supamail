@@ -16,6 +16,7 @@
   <a href="#quickstart-supabase--flyio">Quickstart</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#agent-and-cli-access">Agent access</a> ·
+  <a href="docs/security-model.md">Security</a> ·
   <a href="docs/imap-compatibility.md">Compatibility</a> ·
   <a href="docs/deployment-options.md">Deploy</a>
 </p>
@@ -49,6 +50,23 @@ gaps so missing messages do not silently become permanent.
 The default worker prioritizes fresh mail and recent bodies. Historical archive
 backfill runs separately, so live health describes the fresh-mail path rather
 than claiming every old message is already mirrored.
+
+## Security and privacy
+
+Mailbox passwords are encrypted with AES-256-GCM in Node before Postgres sees
+them. Keys and API tokens are runtime secrets; real values do not belong in the
+repository or browser bundle.
+
+Self-hosted body content remains readable to the self-hosted database operator.
+Hosted SupaMail Cloud adds a separate application-layer envelope for complete
+body objects before private Storage upload. Headers, metadata, and hosted search
+representations remain readable to the systems that provide sync and search, so
+the hosted product does not claim zero knowledge.
+
+Read the public [Security and Privacy Model](docs/security-model.md) for the
+exact key separation, body-object format, threat model, rollout rules, and known
+limits. Use [the private reporting process](SECURITY.md) for suspected
+vulnerabilities.
 
 ## Quickstart: Supabase + Fly.io
 
