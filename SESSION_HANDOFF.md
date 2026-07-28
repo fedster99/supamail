@@ -2,8 +2,10 @@
 
 ## 2026-07-28 — Dependency security remediation
 
-- Branch `fedster99/fix-dependency-alerts` clears the 42 open GitHub
-  Dependabot alerts (two critical) present on `main`. The original lockfile
+- Branch `fedster99/fix-dependency-alerts` clears the 43 open GitHub
+  Dependabot alerts (two critical) present on `main`. The investigation began
+  with 42 alerts; GitHub added a PostCSS alert during final review, and the
+  branch already resolves it with PostCSS 8.5.24. The original lockfile
   reproduced 47 vulnerable dependency paths through `pnpm audit`; the updated
   graph reports no known vulnerabilities.
 - Direct upgrades move Vitest to the patched v3 line, Next.js to patched 15.5,
