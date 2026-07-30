@@ -19,7 +19,7 @@
   `not_delivered` outcome.
 - The private Cloud layer must store an operation before SMTP, retry only
   `not_delivered`, and never submit again after `unknown`.
-- Verification passed the harness check, API typecheck, 725 fast tests on
+- Verification passed the harness check, API typecheck, 726 fast tests on
   Vitest 3.2.7, the API build, the root build, and the GreenMail SMTP/IMAP
   smoke with live send and draft delivery. The local shell used Node 26 while
   the repository pins Node 24.

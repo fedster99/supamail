@@ -7,6 +7,7 @@ const servers: Array<ReturnType<typeof createServer>> = [];
 async function smtpServer({
   loseFinalResponse = false,
   truncatePositiveFinalResponse = false,
+  withholdFinalResponse = false,
   withholdGreeting = false,
 } = {}) {
   let acceptedMessages = 0;
@@ -31,6 +32,7 @@ async function smtpServer({
             socket.end("250 2.0.0 queued");
             return;
           }
+          if (withholdFinalResponse) return;
           readingData = false;
           socket.write("250 2.0.0 queued\r\n");
           continue;
@@ -78,7 +80,7 @@ describe("SMTP outcome boundary", () => {
   );
   const envelope = { from: "sender@example.test", to: ["rcpt@example.test"] };
   const config = {
-    CONNECT_TIMEOUT_MS: 1_000,
+    CONNECT_TIMEOUT_MS: 100,
     IMAP_COMMAND_TIMEOUT_MS: 1_000,
   } as never;
 
@@ -165,6 +167,35 @@ describe("SMTP outcome boundary", () => {
     ).catch((value) => value);
 
     expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("unknown");
+    expect(server.acceptedMessages()).toBe(1);
+  });
+
+  it("reports unknown when the server accepts DATA then withholds the final response", async () => {
+    const server = await smtpServer({ withholdFinalResponse: true });
+    const error = await deliverSmtp(
+      {
+        host: "127.0.0.1",
+        port: server.port,
+        secure: false,
+        username: "sender",
+        password: "secret",
+      },
+      raw,
+      envelope,
+      {
+        CONNECT_TIMEOUT_MS: 1_000,
+        IMAP_COMMAND_TIMEOUT_MS: 100,
+      } as never,
+      { isPrivateHost: true }
+    ).catch((value) => value);
+
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.cause).toMatchObject({
+      code: "ETIMEDOUT",
+      command: "CONN",
+      message: "Timeout",
+    });
     expect(error.outcome).toBe("unknown");
     expect(server.acceptedMessages()).toBe(1);
   });
