@@ -20,10 +20,21 @@ deployment adapter.
 - Public core defines an explicit `MetadataProtectionAdapter`.
 - The adapter receives the relation kind, Mailbox Account UUID, stable record
   identity, and the relation's sensitive values.
+- A protected adapter must bind the relation kind, Mailbox Account UUID, stable
+  record identity, envelope version, and key version into its authenticated
+  associated data. A mismatch must make reveal fail.
 - Before a durable write, the adapter returns the normal column values, one
   opaque row envelope, its format and key versions, and optional opaque
   exact-match tokens.
+- The returned normal-column projection must contain exactly the input fields.
+  Public core rejects omitted or added fields before it writes the row.
+- A field used by a public-core equality or uniqueness operation must have a
+  stable projection that preserves that operation. This includes the
+  case-insensitive Mailbox Account email key and the 64-character structured
+  evidence hash.
 - After a durable read, the adapter reconstructs the sensitive values.
+- A reveal result must contain every field requested by public core. Public
+  core fails closed when a field is missing.
 - Public core stores the envelope and tokens. It does not derive keys, encrypt
   data, decrypt data, or interpret token names or values.
 - The default adapter is an identity adapter. It stores the current readable

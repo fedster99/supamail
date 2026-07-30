@@ -25,7 +25,7 @@ function token(value: unknown): string | null {
  */
 class OpaqueTestAdapter implements MetadataProtectionAdapter {
   async protect(
-    _context: MetadataProtectionContext,
+    context: MetadataProtectionContext,
     values: MetadataValues
   ): Promise<MetadataProtectionProjection> {
     const stored: MetadataValues =
@@ -51,7 +51,7 @@ class OpaqueTestAdapter implements MetadataProtectionAdapter {
     }
     return {
       values: stored,
-      protectedMetadata: Buffer.from(JSON.stringify(values)),
+      protectedMetadata: Buffer.from(JSON.stringify({ context, values })),
       envelopeVersion: 1,
       keyVersion: 1,
       tokens: { test: token(values) ?? "" }
@@ -59,11 +59,30 @@ class OpaqueTestAdapter implements MetadataProtectionAdapter {
   }
 
   async reveal(
-    _context: MetadataProtectionContext,
+    context: MetadataProtectionContext,
     stored: MetadataProtectionProjection
   ): Promise<MetadataValues> {
-    if (!stored.protectedMetadata) throw new Error("test adapter requires an opaque envelope");
-    return JSON.parse(stored.protectedMetadata.toString("utf8")) as MetadataValues;
+    if (!stored.protectedMetadata) return { ...stored.values };
+    const envelope = JSON.parse(stored.protectedMetadata.toString("utf8")) as {
+      context: MetadataProtectionContext;
+      values: MetadataValues;
+    };
+    if (JSON.stringify(envelope.context) !== JSON.stringify(context)) {
+      throw new Error("test adapter context mismatch");
+    }
+    return envelope.values;
+  }
+}
+
+class PartialBodyRevealAdapter extends OpaqueTestAdapter {
+  override async reveal(
+    context: MetadataProtectionContext,
+    stored: MetadataProtectionProjection
+  ): Promise<MetadataValues> {
+    const values = await super.reveal(context, stored);
+    if (context.kind !== "message_body") return values;
+    const { search_extract: _omitted, ...partial } = values;
+    return partial;
   }
 }
 
@@ -105,14 +124,14 @@ liveDb("metadata-protection repository seam", () => {
       internalDate: new Date("2026-01-02T03:04:05.000Z"),
       sizeBytes: 256,
       flags: [],
-      rfcMessageId: null,
-      messageIdNormalized: null,
+      rfcMessageId: "<private-message@example.test>",
+      messageIdNormalized: "private-message@example.test",
       providerMessageId: null,
       providerMessageIdNamespace: null,
       providerThreadId: null,
       providerThreadIdNamespace: null,
-      inReplyTo: null,
-      referencesHeader: null,
+      inReplyTo: "<private-parent@example.test>",
+      referencesHeader: "<private-root@example.test>",
       subject: "Private subject",
       fromEmail: "sender@example.test",
       fromName: "Sender",
@@ -132,6 +151,29 @@ liveDb("metadata-protection repository seam", () => {
         partNumber: "2"
       }]
     };
+    const readableRepository = new MirrorRepository(pool, getConfig());
+    const [readableMessage] = await readableRepository.upsertMessages(
+      accountId,
+      folder,
+      1,
+      [metadata],
+      new Date("2025-01-01T00:00:00.000Z")
+    );
+    const readableStoredMessage = await pool.query<{
+      rfc_message_id: string | null;
+      in_reply_to: string | null;
+      references_header: string | null;
+    }>(
+      `SELECT rfc_message_id, in_reply_to, references_header
+       FROM public.imap_messages WHERE id = $1`,
+      [readableMessage.id]
+    );
+    expect(readableStoredMessage.rows[0]).toEqual({
+      rfc_message_id: metadata.rfcMessageId,
+      in_reply_to: metadata.inReplyTo,
+      references_header: metadata.referencesHeader
+    });
+
     const repository = new MirrorRepository(pool, getConfig(), new OpaqueTestAdapter());
     const [message] = await repository.upsertMessages(
       accountId,
@@ -140,6 +182,7 @@ liveDb("metadata-protection repository seam", () => {
       [metadata],
       new Date("2025-01-01T00:00:00.000Z")
     );
+    expect(message.id).toBe(readableMessage.id);
 
     expect(message.subject).toBe(metadata.subject);
     await expect(repository.getMessage(message.id)).resolves.toMatchObject({
@@ -150,15 +193,22 @@ liveDb("metadata-protection repository seam", () => {
     const storedMessage = await pool.query<{
       subject: string | null;
       from_email: string | null;
+      rfc_message_id: string | null;
+      in_reply_to: string | null;
+      references_header: string | null;
       protected_metadata: Buffer | null;
     }>(
-      `SELECT subject, from_email, protected_metadata
+      `SELECT subject, from_email, rfc_message_id, in_reply_to,
+              references_header, protected_metadata
        FROM public.imap_messages WHERE id = $1`,
       [message.id]
     );
     expect(storedMessage.rows[0]).toMatchObject({
       subject: null,
-      from_email: null
+      from_email: null,
+      rfc_message_id: null,
+      in_reply_to: null,
+      references_header: null
     });
     expect(storedMessage.rows[0].protected_metadata).toBeInstanceOf(Buffer);
 
@@ -227,6 +277,27 @@ liveDb("metadata-protection repository seam", () => {
     expect(storedEvidence.rows[0].metadata).toEqual({});
     expect(storedEvidence.rows[0].protected_metadata).toBeInstanceOf(Buffer);
 
+    const partialRevealRepository = new MirrorRepository(
+      pool,
+      getConfig(),
+      new PartialBodyRevealAdapter()
+    );
+    await expect(partialRevealRepository.storeBodyEvidence({
+      messageId: message.id,
+      rawMime: Buffer.from("Message-ID: <protected@example.test>\r\n\r\nprivate body"),
+      rawBytes: 57,
+      rawTruncated: false,
+      bodyText: "private body",
+      bodyHtml: null,
+      bodyPlain: "private body",
+      selectedTextPart: "private body",
+      selectedTextFormat: "plain",
+      headersJson: { "message-id": "<protected@example.test>" },
+      mimeStructure: null,
+      parserWarnings: ["private warning"],
+      evidence: []
+    })).rejects.toThrow("must contain every requested field");
+
     await repository.upsertMessages(
       accountId,
       folder,
@@ -235,8 +306,8 @@ liveDb("metadata-protection repository seam", () => {
       new Date("2025-01-01T00:00:00.000Z")
     );
     await expect(repository.getMessage(message.id)).resolves.toMatchObject({
-      rfc_message_id: "<protected@example.test>",
-      message_id_normalized: "protected@example.test"
+      rfc_message_id: metadata.rfcMessageId,
+      message_id_normalized: metadata.messageIdNormalized
     });
   });
 });

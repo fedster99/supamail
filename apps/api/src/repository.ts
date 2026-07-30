@@ -8,6 +8,8 @@ import { AccountBusyError } from "./errors.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import { withAccountLock } from "./locks.js";
 import {
+  assertMetadataProtectionProjection,
+  assertRevealedMetadataValues,
   plaintextMetadataProtection,
   protectedMetadataColumns,
   storedMetadataProjection,
@@ -650,6 +652,7 @@ export class MirrorRepository {
       { kind, accountId, recordId },
       values
     );
+    assertMetadataProtectionProjection(projection, Object.keys(values));
     return {
       values: projection.values,
       columns: protectedMetadataColumns(projection)
@@ -684,6 +687,7 @@ export class MirrorRepository {
         storedMetadataProjection(row, selectMetadataValues(row, fields))
       );
     }
+    assertRevealedMetadataValues(revealed, fields);
     const result = { ...(row as unknown as Record<string, unknown>) };
     for (const field of fields) {
       if (Object.hasOwn(revealed, field)) result[field] = revealed[field];
@@ -2658,14 +2662,14 @@ export class MirrorRepository {
         ON CONFLICT (account_id, folder_path, uidvalidity, uid)
         DO UPDATE SET
           folder_id = EXCLUDED.folder_id,
-          rfc_message_id = COALESCE(EXCLUDED.rfc_message_id, public.imap_messages.rfc_message_id),
-          message_id_normalized = COALESCE(EXCLUDED.message_id_normalized, public.imap_messages.message_id_normalized),
+          rfc_message_id = EXCLUDED.rfc_message_id,
+          message_id_normalized = EXCLUDED.message_id_normalized,
           provider_message_id = EXCLUDED.provider_message_id,
           provider_message_id_namespace = EXCLUDED.provider_message_id_namespace,
           provider_thread_id = EXCLUDED.provider_thread_id,
           provider_thread_id_namespace = EXCLUDED.provider_thread_id_namespace,
-          in_reply_to = COALESCE(EXCLUDED.in_reply_to, public.imap_messages.in_reply_to),
-          references_header = COALESCE(EXCLUDED.references_header, public.imap_messages.references_header),
+          in_reply_to = EXCLUDED.in_reply_to,
+          references_header = EXCLUDED.references_header,
           internal_date = EXCLUDED.internal_date,
           size_bytes = EXCLUDED.size_bytes,
           subject = EXCLUDED.subject,
@@ -3580,14 +3584,9 @@ export class MirrorRepository {
       if (!storedMessage) throw new Error(`Message not found for body storage: ${body.messageId}`);
       const message = await this.revealMessage(storedMessage);
       const storedBodyValues = {
-        raw_mime_sha256:
-          storedMessage.body_raw_mime_sha256 ?? storedMessage.raw_mime_sha256,
-        parsed_delivery_sha256:
-          storedMessage.body_parsed_delivery_sha256
-          ?? storedMessage.parsed_delivery_sha256,
-        authored_delivery_sha256:
-          storedMessage.body_authored_delivery_sha256
-          ?? storedMessage.authored_delivery_sha256,
+        raw_mime_sha256: storedMessage.body_raw_mime_sha256,
+        parsed_delivery_sha256: storedMessage.body_parsed_delivery_sha256,
+        authored_delivery_sha256: storedMessage.body_authored_delivery_sha256,
         headers_json: storedMessage.body_headers_json ?? {},
         mime_structure: storedMessage.body_mime_structure,
         parser_warnings: storedMessage.body_parser_warnings ?? [],
@@ -3613,6 +3612,7 @@ export class MirrorRepository {
             storedBodyValues
           )
         );
+      assertRevealedMetadataValues(revealedBody, MESSAGE_BODY_PROTECTED_FIELDS);
 
       const recoveredHeaders: Record<string, unknown> = {};
       for (const key of THREADING_BODY_HEADER_KEYS) {
@@ -3891,39 +3891,41 @@ export class MirrorRepository {
       );
 
       if (!body.rawTruncated) {
-        const existingEvidence = await client.query<{
-          id: string;
-          message_id: string;
-          extractor: string;
-          kind: string;
-          namespace: string;
-          evidence_key: string;
-          evidence_key_sha256: string;
-          metadata: Record<string, unknown>;
-        } & ProtectedMetadataColumns>(
-          `
-          SELECT id, message_id, extractor, kind, namespace,
-                 evidence_key, evidence_key_sha256, metadata,
-                 protected_metadata, protected_metadata_version,
-                 protected_metadata_key_version, protected_metadata_tokens
-          FROM public.imap_message_evidence
-          WHERE message_id = $1 AND extractor = $2
-          `,
-          [body.messageId, MIME_EVIDENCE_EXTRACTOR]
-        );
         const existingEvidenceByIdentity = new Map<string, string>();
-        for (const row of existingEvidence.rows) {
-          const revealed = await this.revealMetadata(
-            row,
-            "message_evidence",
-            ownerAccountId,
-            row.id,
-            ["evidence_key", "evidence_key_sha256", "metadata"]
+        if (preparedEvidence.length > 0) {
+          const existingEvidence = await client.query<{
+            id: string;
+            message_id: string;
+            extractor: string;
+            kind: string;
+            namespace: string;
+            evidence_key: string;
+            evidence_key_sha256: string;
+            metadata: Record<string, unknown>;
+          } & ProtectedMetadataColumns>(
+            `
+            SELECT id, message_id, extractor, kind, namespace,
+                   evidence_key, evidence_key_sha256, metadata,
+                   protected_metadata, protected_metadata_version,
+                   protected_metadata_key_version, protected_metadata_tokens
+            FROM public.imap_message_evidence
+            WHERE message_id = $1 AND extractor = $2
+            `,
+            [body.messageId, MIME_EVIDENCE_EXTRACTOR]
           );
-          existingEvidenceByIdentity.set(
-            `${revealed.kind}\u0000${revealed.namespace}\u0000${revealed.evidence_key_sha256}`,
-            row.id
-          );
+          for (const row of existingEvidence.rows) {
+            const revealed = await this.revealMetadata(
+              row,
+              "message_evidence",
+              ownerAccountId,
+              row.id,
+              ["evidence_key", "evidence_key_sha256", "metadata"]
+            );
+            existingEvidenceByIdentity.set(
+              `${revealed.kind}\u0000${revealed.namespace}\u0000${revealed.evidence_key_sha256}`,
+              row.id
+            );
+          }
         }
         const protectedEvidence = await Promise.all(preparedEvidence.map(async (evidence) => {
           const identity =

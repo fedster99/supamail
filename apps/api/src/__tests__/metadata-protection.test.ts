@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   PlaintextMetadataProtectionAdapter,
   assertMetadataProtectionProjection,
+  assertRevealedMetadataValues,
   protectedMetadataColumns,
   storedMetadataProjection
 } from "../metadata-protection.js";
@@ -97,5 +98,31 @@ describe("metadata protection seam", () => {
       keyVersion: null,
       tokens: { invalid: 1 } as never
     })).toThrow("token values must be strings");
+
+    expect(() => assertMetadataProtectionProjection({
+      values: { subject: null },
+      protectedMetadata: null,
+      envelopeVersion: null,
+      keyVersion: null,
+      tokens: null
+    }, ["subject", "from_email"])).toThrow("must contain exactly the input fields");
+
+    expect(() => assertMetadataProtectionProjection({
+      values: { subject: null, id: "injected" },
+      protectedMetadata: null,
+      envelopeVersion: null,
+      keyVersion: null,
+      tokens: null
+    }, ["subject"])).toThrow("must contain exactly the input fields");
+
+    expect(() => assertRevealedMetadataValues(
+      { subject: "token" },
+      ["subject", "from_email"]
+    )).toThrow("must contain every requested field");
+
+    expect(() => assertRevealedMetadataValues(
+      [] as never,
+      ["subject"]
+    )).toThrow("must be a plain object");
   });
 });

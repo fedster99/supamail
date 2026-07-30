@@ -25,6 +25,8 @@ export interface MetadataProtectionProjection {
   /**
    * Values that public core persists in the normal relation columns.
    * They must satisfy the relation's existing nullability and CHECK constraints.
+   * Fields used for equality or uniqueness must also use stable projections that
+   * preserve those database semantics.
    */
   values: MetadataValues;
   /** Opaque application-layer ciphertext. Null means readable identity storage. */
@@ -39,6 +41,10 @@ export interface MetadataProtectionProjection {
 }
 
 export interface MetadataProtectionAdapter {
+  /**
+   * A protected adapter must authenticate kind, accountId, recordId, envelope
+   * version, and key version as unambiguous associated data.
+   */
   protect(
     context: MetadataProtectionContext,
     values: MetadataValues
@@ -92,8 +98,26 @@ const POSTGRES_SMALLINT_MAX = 32_767;
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
 
 export function assertMetadataProtectionProjection(
-  projection: MetadataProtectionProjection
+  projection: MetadataProtectionProjection,
+  expectedFields?: readonly string[]
 ): void {
+  const valuesPrototype = projection.values === null || typeof projection.values !== "object"
+    ? null
+    : Object.getPrototypeOf(projection.values);
+  if (projection.values === null
+    || Array.isArray(projection.values)
+    || typeof projection.values !== "object"
+    || (valuesPrototype !== Object.prototype && valuesPrototype !== null)) {
+    throw new Error("metadata protection values must be a plain object");
+  }
+  if (expectedFields) {
+    const actualFields = Object.keys(projection.values).sort();
+    const requiredFields = [...expectedFields].sort();
+    if (actualFields.length !== requiredFields.length
+      || actualFields.some((field, index) => field !== requiredFields[index])) {
+      throw new Error("metadata protection values must contain exactly the input fields");
+    }
+  }
   const hasEnvelope = projection.protectedMetadata !== null;
   if (hasEnvelope !== (projection.envelopeVersion !== null)
     || hasEnvelope !== (projection.keyVersion !== null)) {
@@ -118,6 +142,24 @@ export function assertMetadataProtectionProjection(
   if (projection.tokens !== null
     && Object.values(projection.tokens).some((value) => typeof value !== "string")) {
     throw new Error("metadata protection token values must be strings");
+  }
+}
+
+export function assertRevealedMetadataValues(
+  values: MetadataValues,
+  requiredFields: readonly string[]
+): void {
+  const valuesPrototype = values === null || typeof values !== "object"
+    ? null
+    : Object.getPrototypeOf(values);
+  if (values === null
+    || Array.isArray(values)
+    || typeof values !== "object"
+    || (valuesPrototype !== Object.prototype && valuesPrototype !== null)) {
+    throw new Error("revealed metadata values must be a plain object");
+  }
+  if (requiredFields.some((field) => !Object.hasOwn(values, field))) {
+    throw new Error("revealed metadata values must contain every requested field");
   }
 }
 

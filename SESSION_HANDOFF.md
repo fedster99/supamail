@@ -24,6 +24,14 @@
   an envelope, skip decryption when a first body-evidence row does not exist,
   preserve legacy partial-row response behavior, and enforce the actual
   PostgreSQL `smallint`/`integer` version bounds.
+- The final pre-merge review removed a plaintext-retention path during
+  readable-to-protected message upgrades. It also makes adapter writes and
+  reveals fail closed on missing or injected fields, records the required
+  authenticated context and stable equality semantics, preserves SQL `NULL`
+  body digests, and avoids an evidence lookup when no evidence exists.
+- The live protected-storage test now starts with a readable message, upgrades
+  the same stable rows through a context-bound opaque adapter, and proves that
+  the old threading headers do not remain readable.
 - Node 24 verification passed `pnpm harness:check`, root typecheck, 706 fast
   tests, both builds, 198 live-Postgres tests, migration apply twice, and
   120/120 spec-conformance checks. The live protected-storage test uses a
