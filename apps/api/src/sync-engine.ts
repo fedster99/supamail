@@ -19,6 +19,7 @@ import {
 } from "./imap-client.js";
 import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
+import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import type { MetadataWriteOptions } from "./repository.js";
 import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
@@ -274,6 +275,7 @@ export interface MirrorEngineOptions {
   config?: AppConfig;
   repository?: MirrorRepository;
   bodyStore?: BodyStore;
+  metadataProtection?: MetadataProtectionAdapter;
   hooks?: MirrorHooks;
   clientFactory?: (
     account: ImapAccount,
@@ -295,7 +297,8 @@ export class MirrorEngine {
   constructor(options: MirrorEngineOptions = {}) {
     this.pool = options.pool ?? getPool();
     this.config = options.config ?? getConfig();
-    this.repository = options.repository ?? new MirrorRepository(this.pool, this.config);
+    this.repository = options.repository
+      ?? new MirrorRepository(this.pool, this.config, options.metadataProtection);
     this.bodyStore = options.bodyStore ?? new DatabaseBodyStore(this.repository);
     this.hooks = options.hooks ?? {};
     this.clientFactory = options.clientFactory

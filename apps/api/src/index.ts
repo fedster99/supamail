@@ -8,6 +8,7 @@ export * from "./imap-client.js";
 export * from "./locks.js";
 export * from "./mailbox-mutations.js";
 export * from "./mcp/index.js";
+export * from "./metadata-protection.js";
 export * from "./mime.js";
 export * from "./provider-profiles.js";
 export * from "./repository.js";

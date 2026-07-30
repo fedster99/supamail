@@ -69,8 +69,16 @@ function repositoryStub(
       if (normalized.startsWith("SELECT id") && normalized.includes("FROM public.imap_folders")) {
         return { rows: [{ id: folder.id, uidvalidity: folderUidValidity }] };
       }
-      if (normalized.startsWith("SELECT uid::text AS uid")) {
-        return { rows: existingUids.map((uid) => ({ uid: String(uid) })) };
+      if (normalized.startsWith("SELECT *")
+        && normalized.includes("FROM public.imap_messages")
+        && normalized.includes("FOR UPDATE")) {
+        return {
+          rows: existingUids.map((uid) => ({
+            id: `00000000-0000-4000-8000-${String(uid).padStart(12, "0")}`,
+            account_id: "00000000-0000-4000-8000-000000000001",
+            uid: String(uid)
+          }))
+        };
       }
       if (normalized.includes("INSERT INTO public.imap_messages")) {
         const input = JSON.parse(queryParams[0] as string) as Array<{ uid: number }>;

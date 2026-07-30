@@ -5,6 +5,7 @@ import { closePool, getPool, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
+import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import {
   ThreadingRepository,
   type DrainThreadingOptions,
@@ -105,6 +106,7 @@ export interface WorkerRuntimeOptions {
   /** `null` disables the derived-threading lane (primarily for isolated tests). */
   threading?: WorkerThreading | null;
   repository?: MirrorRepository;
+  metadataProtection?: MetadataProtectionAdapter;
   installProcessHandlers?: boolean;
   /** Injectable only for embedded runtimes/tests; defaults to the Node process emitter. */
   processEvents?: WorkerProcessEvents;
@@ -251,7 +253,8 @@ export function logSyncTick(
 export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Promise<WorkerRuntime> {
   const config = options.config ?? getConfig();
   const pool = options.pool ?? getPool();
-  const repository = options.repository ?? new MirrorRepository(pool, config);
+  const repository = options.repository
+    ?? new MirrorRepository(pool, config, options.metadataProtection);
   const engine = options.engine ?? new MirrorEngine({ pool, config, repository });
   const threading = options.threading === undefined
     ? new ThreadingRepository(pool)
