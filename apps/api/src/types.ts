@@ -380,6 +380,12 @@ export interface SendResult {
   /** The Message-ID actually stamped on the delivered + filed bytes. */
   rfcMessageId: string;
   delivered: boolean;
+  /** Recipients accepted by the SMTP provider. */
+  accepted: string[];
+  /** Recipients rejected while at least one other recipient was accepted. */
+  rejected: string[];
+  /** The provider's final SMTP response, when available. */
+  smtpResponse: string | null;
   appendedToSent: boolean;
   /** From UIDPLUS APPENDUID when available, else null. */
   appendedUid: number | null;

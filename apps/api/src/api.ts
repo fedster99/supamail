@@ -15,6 +15,7 @@ import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { sendMessage } from "./send.js";
+import { SmtpDeliveryError } from "./smtp-client.js";
 import { searchMessages, type SearchRequest, type SearchResponse } from "./search/index.js";
 import {
   cleanMessageBody,
@@ -506,6 +507,20 @@ export function createApiApp(options: ApiAppOptions): Hono {
       // not a 500 — the client should retry shortly.
       c.header("Retry-After", "5");
       return c.json({ error: "account_busy", message: err.message }, 503);
+    }
+    if (err instanceof SmtpDeliveryError) {
+      if (err.outcome === "not_delivered") {
+        return c.json({
+          error: "delivery_failed",
+          outcome: err.outcome,
+          message: "The mail server did not accept the email."
+        }, 502);
+      }
+      return c.json({
+        error: "delivery_unknown",
+        outcome: err.outcome,
+        message: "The mail server may have accepted the email. Do not resend it."
+      }, 409);
     }
     if (err instanceof FolderTrackingRejectedError) {
       return c.json({ error: err.code, message: err.message }, 400);

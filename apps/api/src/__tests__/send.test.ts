@@ -154,7 +154,11 @@ describe("buildSendEnvelope", () => {
 // Hoisted spies let us assert delivery happens before APPEND and that the SAME
 // composed bytes are both delivered and filed.
 const mocks = vi.hoisted(() => ({
-  deliverSmtp: vi.fn(async (_creds: unknown, _raw: Buffer, _envelope: unknown, _config: unknown) => undefined),
+  deliverSmtp: vi.fn(async (_creds: unknown, _raw: Buffer, _envelope: unknown, _config: unknown) => ({
+    accepted: ["rcpt@example.test"],
+    rejected: [],
+    response: "250 queued"
+  })),
   appenderAppend: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({ uid: 42 as number | null })),
   appenderList: vi.fn(async () => [{ path: "Sent", specialUse: "\\Sent" }]),
   appenderLogout: vi.fn(async () => undefined),
@@ -273,6 +277,9 @@ describe("sendMessage orchestration", () => {
     expect(result.appendedUid).toBe(42);
     expect(result.sentFolderPath).toBe("Sent");
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
+    expect(result.accepted).toEqual(["rcpt@example.test"]);
+    expect(result.rejected).toEqual([]);
+    expect(result.smtpResponse).toBe("250 queued");
     expect(result.warnings).toEqual([]);
   });
 
@@ -288,6 +295,7 @@ describe("sendMessage orchestration", () => {
     });
     mocks.deliverSmtp.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
+      return { accepted: ["rcpt@example.test"], rejected: [], response: "250 queued" };
     });
     mocks.appenderAppend.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
@@ -330,15 +338,19 @@ describe("sendMessage orchestration", () => {
 
   it("fails before SMTP when lock liveness cannot be proven at the irreversible boundary", async () => {
     mocks.lockAssertLive.mockRejectedValueOnce(new Error("lock session lost"));
+    const { SmtpDeliveryError } = await import("../smtp-client.js");
     const { sendMessage } = await import("../send.js");
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
-    await expect(sendMessage({} as never, config, {
+    const error = await sendMessage({} as never, config, {
       accountId: "acc-1",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
-    })).rejects.toThrow(/lock session lost/);
+    }).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+    expect(error.message).toMatch(/lock session lost/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.lockConfirmIrreversible).not.toHaveBeenCalled();
   });
@@ -378,6 +390,47 @@ describe("sendMessage orchestration", () => {
     expect(mocks.appenderAppend).not.toHaveBeenCalled();
   });
 
+  it("preserves an unknown SMTP outcome for the durable Cloud caller", async () => {
+    const { SmtpDeliveryError } = await import("../smtp-client.js");
+    const unknown = new SmtpDeliveryError("unknown", "response lost");
+    mocks.deliverSmtp.mockRejectedValueOnce(unknown);
+    const { sendMessage } = await import("../send.js");
+    const config = {
+      IMAP_ENCRYPTION_KEY: "0123456789abcdef",
+      IMAP_ALLOW_PRIVATE_HOSTS: false
+    } as never;
+
+    await expect(sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    })).rejects.toBe(unknown);
+    expect(mocks.appenderAppend).not.toHaveBeenCalled();
+  });
+
+  it("marks an unexpected failure after SMTP acceptance as unknown", async () => {
+    mocks.lockConfirmIrreversible.mockImplementationOnce(() => {
+      throw new Error("local confirmation failed");
+    });
+    const { SmtpDeliveryError } = await import("../smtp-client.js");
+    const { sendMessage } = await import("../send.js");
+    const config = {
+      IMAP_ENCRYPTION_KEY: "0123456789abcdef",
+      IMAP_ALLOW_PRIVATE_HOSTS: false
+    } as never;
+
+    const error = await sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    }).catch((value) => value);
+
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("unknown");
+  });
+
   it("records a warning (does not throw) when delivery succeeds but APPEND fails", async () => {
     mocks.appenderAppend.mockRejectedValueOnce(new Error("append refused"));
     const { sendMessage } = await import("../send.js");
@@ -396,17 +449,19 @@ describe("sendMessage orchestration", () => {
 
   it("throws for an unknown account before any delivery", async () => {
     mocks.getAccount.mockResolvedValueOnce(null);
+    const { SmtpDeliveryError } = await import("../smtp-client.js");
     const { sendMessage } = await import("../send.js");
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
-    await expect(
-      sendMessage({} as never, config, {
+    const error = await sendMessage({} as never, config, {
         accountId: "missing",
         to: [{ email: "rcpt@example.test" }],
         subject: "Hi",
         body: { format: "plain", text: "Body" }
-      })
-    ).rejects.toThrow(/Account not found/);
+      }).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+    expect(error.message).toMatch(/Account not found/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
   });
 

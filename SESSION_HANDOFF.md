@@ -1,5 +1,29 @@
 # Session Handoff
 
+## 2026-07-31 — Explicit SMTP delivery outcomes
+
+- Branch `fedster99/fix-smtp-outcome-contract` replaces the false retry
+  guarantee from a stable RFC Message-ID. A stable ID helps reconciliation,
+  but it does not stop a provider from accepting the same message twice.
+- SMTP delivery now returns its accepted recipients, rejected recipients, and
+  final response. Failures use `not_delivered` only for a complete SMTP 4xx or
+  5xx reply or a proven failure before submission. A partial positive reply,
+  lost final reply, or unqualified connection loss is `unknown`.
+- Real local SMTP integration tests accept DATA and then either drop the final
+  reply or send an unterminated positive reply. They prove the server received
+  one message while the core reports `unknown`.
+- The HTTP API and CLI expose the stable delivery outcome without provider
+  details. Pre-SMTP errors from send and draft-send also carry the typed
+  `not_delivered` outcome.
+- The private Cloud layer must store an operation before SMTP, retry only
+  `not_delivered`, and never submit again after `unknown`.
+- Verification passed the harness check, API typecheck, 713 fast tests on
+  Vitest 3.2.7, the API build, the root build, and the GreenMail SMTP/IMAP
+  smoke with live send and draft delivery. The local shell used Node 26 while
+  the repository pins Node 24.
+- Next: review the public PR. Merge only with Federico's explicit approval.
+  Then wait for the immutable core image and pin it in the Cloud PR.
+
 ## 2026-07-30 — Neutral metadata-protection seam
 
 - Branch `fedster99/metadata-protection-adapter` adds the public-core half of

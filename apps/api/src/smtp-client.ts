@@ -211,6 +211,78 @@ export interface SmtpEnvelope {
   to: string[];
 }
 
+export interface SmtpDeliveryReceipt {
+  accepted: string[];
+  rejected: string[];
+  response: string | null;
+}
+
+export type SmtpDeliveryOutcome = "not_delivered" | "unknown";
+
+/**
+ * A failed SMTP submission with an explicit delivery outcome.
+ *
+ * `not_delivered` means the provider did not accept responsibility, so a caller
+ * may retry. `unknown` means the submission result cannot be proved and the
+ * provider may have accepted the message. A caller must not resubmit it.
+ */
+export class SmtpDeliveryError extends Error {
+  readonly outcome: SmtpDeliveryOutcome;
+
+  constructor(outcome: SmtpDeliveryOutcome, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SmtpDeliveryError";
+    this.outcome = outcome;
+  }
+}
+
+interface NodemailerSmtpError {
+  code?: unknown;
+  command?: unknown;
+  responseCode?: unknown;
+  syscall?: unknown;
+}
+
+function classifySmtpFailure(error: unknown): SmtpDeliveryOutcome {
+  if (!error || typeof error !== "object") return "unknown";
+  const smtpError = error as NodemailerSmtpError;
+
+  // Only a complete negative reply is definitive. Nodemailer can attach a
+  // partial positive responseCode when a socket closes before the final CRLF.
+  // That server may already have accepted DATA.
+  if (
+    typeof smtpError.responseCode === "number" &&
+    smtpError.responseCode >= 400 &&
+    smtpError.responseCode <= 599
+  ) {
+    return "not_delivered";
+  }
+
+  const code = typeof smtpError.code === "string" ? smtpError.code.toUpperCase() : "";
+  const syscall = typeof smtpError.syscall === "string" ? smtpError.syscall.toLowerCase() : "";
+  // These failures prove that SMTP submission did not start.
+  if (["EAUTH", "ETLS", "EDNS", "EREQUIRETLS"].includes(code)) return "not_delivered";
+  if (code === "ESOCKET" && ["connect", "getaddrinfo"].includes(syscall)) {
+    return "not_delivered";
+  }
+
+  const command = typeof smtpError.command === "string" ? smtpError.command.toUpperCase() : "";
+  if (command === "DATA" || command === "CONN") return "unknown";
+  if (command) return "not_delivered";
+
+  // Preserve at-most-once behavior when Nodemailer cannot identify the stage.
+  return "unknown";
+}
+
+function recipientStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((recipient) =>
+    typeof recipient === "string"
+      ? recipient
+      : String((recipient as { address?: unknown })?.address ?? recipient)
+  );
+}
+
 /**
  * Submit the EXACT composed `raw` bytes over SMTP. Using `raw:` ships byte-for-byte
  * what we also APPEND to Sent. `secure=true` is implicit TLS (465); otherwise we
@@ -230,7 +302,7 @@ export async function deliverSmtp(
   envelope: SmtpEnvelope,
   config: AppConfig,
   opts: { isPrivateHost?: boolean; onPostDeliveryWarning?: (warning: string) => void } = {}
-): Promise<void> {
+): Promise<SmtpDeliveryReceipt> {
   // Require STARTTLS for any non-implicit-TLS target, UNLESS the resolved host is
   // actually private/loopback (dev/self-hosted GreenMail). The IMAP_ALLOW_PRIVATE_
   // HOSTS opt-in alone no longer drops TLS for a public host.
@@ -248,10 +320,14 @@ export async function deliverSmtp(
   });
 
   let deliveryError: unknown;
-  let delivered = false;
+  let receipt: SmtpDeliveryReceipt | null = null;
   try {
-    await transporter.sendMail({ envelope, raw });
-    delivered = true;
+    const info = await transporter.sendMail({ envelope, raw });
+    receipt = {
+      accepted: recipientStrings(info.accepted),
+      rejected: recipientStrings(info.rejected),
+      response: typeof info.response === "string" ? info.response : null
+    };
   } catch (error) {
     deliveryError = error;
   }
@@ -259,7 +335,7 @@ export async function deliverSmtp(
   try {
     await transporter.close();
   } catch (error) {
-    if (delivered) {
+    if (receipt) {
       opts.onPostDeliveryWarning?.(
         `Delivered, but closing the SMTP transport failed: ${error instanceof Error ? error.message : String(error)}.`
       );
@@ -268,7 +344,14 @@ export async function deliverSmtp(
     // a close failure must never overwrite the causally useful SMTP error.
   }
 
-  if (deliveryError) throw deliveryError;
+  if (deliveryError) {
+    throw new SmtpDeliveryError(
+      classifySmtpFailure(deliveryError),
+      deliveryError instanceof Error ? deliveryError.message : "SMTP delivery failed",
+      { cause: deliveryError }
+    );
+  }
+  return receipt!;
 }
 
 /** Build the SMTP envelope (MAIL FROM + every recipient, including Bcc). */

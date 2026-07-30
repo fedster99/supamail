@@ -11,7 +11,8 @@ import {
   buildRawMime,
   buildSendEnvelope,
   deliverSmtp,
-  resolveSmtpCreds
+  resolveSmtpCreds,
+  SmtpDeliveryError
 } from "./smtp-client.js";
 import type { SendRequest, SendResult } from "./types.js";
 
@@ -32,18 +33,46 @@ import type { SendRequest, SendResult } from "./types.js";
  * NOT roll back the delivered mail (irreversible) — it is recorded as a warning
  * and the next sync still mirrors the Sent copy if the provider auto-filed it.
  *
- * IDEMPOTENCY (review decision 2): POST /send is NOT retry-safe on its own. When
- * `req.messageId` is absent, buildRawMime stamps a fresh random Message-ID each
- * call, so a timeout-then-retry re-delivers a DUPLICATE with a different
- * Message-ID (undedupeable). A caller that needs at-most-once delivery MUST supply
- * a stable `req.messageId` (then a re-send files the same id and the synced Sent
- * copy dedups). The full idempotency-key ledger is intentionally deferred to the
- * cloud wrapper (email-001 design §2.9 / ADR 0017) — no new OSS infra here.
+ * IDEMPOTENCY: this primitive does not retry and is not retry-safe on its own.
+ * A stable `req.messageId` gives a caller a reconciliation key, but it does not
+ * stop SMTP from accepting the same bytes twice. `deliverSmtp` therefore returns
+ * the provider receipt or throws `SmtpDeliveryError` with `not_delivered` or
+ * `unknown`. A durable caller may retry only `not_delivered`; it must reconcile
+ * `unknown` and never submit it again. The Cloud wrapper owns that durable ledger.
  */
 export async function sendMessage(
   pool: PgPool,
   config: AppConfig,
   req: SendRequest
+): Promise<SendResult> {
+  let deliveryConfirmed = false;
+  try {
+    return await sendMessageAttempt(pool, config, req, () => {
+      deliveryConfirmed = true;
+    });
+  } catch (error) {
+    if (error instanceof SmtpDeliveryError) throw error;
+    if (
+      !deliveryConfirmed &&
+      ["AccountBusyError", "HostValidationError"].includes(
+        error instanceof Error ? error.name : ""
+      )
+    ) {
+      throw error;
+    }
+    throw new SmtpDeliveryError(
+      deliveryConfirmed ? "unknown" : "not_delivered",
+      error instanceof Error ? error.message : "Mail delivery failed",
+      { cause: error }
+    );
+  }
+}
+
+async function sendMessageAttempt(
+  pool: PgPool,
+  config: AppConfig,
+  req: SendRequest,
+  confirmDelivery: () => void
 ): Promise<SendResult> {
   const repository = new MirrorRepository(pool, config);
   const account = await repository.getAccount(req.accountId);
@@ -78,10 +107,11 @@ export async function sendMessage(
 
     // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
     // it relaxes only when the target actually resolved private/loopback.
-    await deliverSmtp(creds, raw, envelope, config, {
+    const delivery = await deliverSmtp(creds, raw, envelope, config, {
       isPrivateHost,
       onPostDeliveryWarning: addWarning
     });
+    confirmDelivery();
     lock.confirmIrreversible();
 
     // Delivery succeeded; file the identical bytes to Sent while the account lock
@@ -136,6 +166,9 @@ export async function sendMessage(
     return {
       rfcMessageId: messageId,
       delivered: true as const,
+      accepted: delivery.accepted,
+      rejected: delivery.rejected,
+      smtpResponse: delivery.response,
       appendedToSent,
       appendedUid,
       sentFolderPath,

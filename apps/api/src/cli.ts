@@ -4,6 +4,7 @@ import { basename } from "node:path";
 import { Command } from "commander";
 import { getConfig } from "./config.js";
 import { AccountBusyError } from "./errors.js";
+import { SmtpDeliveryError } from "./smtp-client.js";
 import {
   cleanMessageBody,
   downloadAttachment,
@@ -781,6 +782,25 @@ try {
     // A send or draft write collided with the account lock — transient and
     // guaranteed to have failed before direct SMTP delivery.
     console.error("Account is busy syncing — retry in a few seconds.");
+    process.exitCode = 1;
+  } else if (
+    error instanceof SmtpDeliveryError ||
+    (
+      error instanceof Error &&
+      error.name === "SmtpDeliveryError" &&
+      ["not_delivered", "unknown"].includes(
+        (error as { outcome?: string }).outcome ?? ""
+      )
+    )
+  ) {
+    const outcome = (error as SmtpDeliveryError).outcome;
+    process.stderr.write(`${JSON.stringify({
+      error: outcome === "unknown" ? "delivery_unknown" : "delivery_failed",
+      outcome,
+      message: outcome === "unknown"
+        ? "The mail server may have accepted the email. Do not resend it."
+        : "The mail server did not accept the email."
+    })}\n`);
     process.exitCode = 1;
   } else {
     throw error;
