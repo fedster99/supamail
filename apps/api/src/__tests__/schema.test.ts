@@ -48,6 +48,10 @@ const contentExtractBodyStoreMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0022_content_extract_body_store.sql"
 );
+const metadataProtectionSeamMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0023_metadata_protection_seam.sql"
+);
 
 describe("initial schema", () => {
   it("adds a bounded search extract without moving full body payloads into metadata", async () => {
@@ -66,6 +70,28 @@ describe("initial schema", () => {
     expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_search_extract");
     expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_threading_payload_sha256");
     expect(sql).not.toMatch(/stripe|tenant|turbopuffer|storage_key/i);
+  });
+
+  it("adds neutral protected metadata storage without Cloud key logic", async () => {
+    const sql = await readFile(metadataProtectionSeamMigrationPath, "utf8");
+
+    for (const table of [
+      "imap_accounts",
+      "imap_messages",
+      "imap_message_bodies",
+      "imap_attachments",
+      "imap_message_evidence",
+      "imap_thread_assignments",
+      "imap_thread_assignment_history"
+    ]) {
+      expect(sql).toContain(`ALTER TABLE public.${table}`);
+    }
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata bytea");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_version smallint");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_key_version integer");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_tokens jsonb");
+    expect(sql).toContain("jsonb_typeof(protected_metadata_tokens) = ''object''");
+    expect(sql).not.toMatch(/tenant_id|hkdf|aes-256|kms|turbopuffer|metadata_root_key/i);
   });
 
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -145,9 +171,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0022_content_extract_body_store");
+    expect(version).toBe("0023_metadata_protection_seam");
     expect(manifest).toEqual({
-      schemaVersion: "0022_content_extract_body_store",
+      schemaVersion: "0023_metadata_protection_seam",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -170,7 +196,8 @@ describe("initial schema", () => {
         { id: "0019_authored_delivery_evidence", file: "0019_authored_delivery_evidence.sql" },
         { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" },
         { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" },
-        { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" }
+        { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" },
+        { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -200,6 +227,7 @@ describe("initial schema", () => {
     expect(sql).toContain("delivery_fingerprint_hashes text[]");
     expect(sql).toContain("current_live_body_progress AS");
     expect(sql).toContain("FUNCTION public.imap_search_extract_fts");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata bytea");
   });
 
   it("indexes delivery fingerprints for bounded threading closure", async () => {

@@ -28,6 +28,16 @@ RLS is enabled on all mirror tables and `anon`/`authenticated` access is revoked
 `imap_message_bodies` keeps the lightweight content evidence row and is the
 default OSS full-payload store.
 
+`0023_metadata_protection_seam` adds nullable, provider-neutral storage for one
+opaque metadata envelope and optional exact-match tokens on accounts, messages,
+message-body evidence, attachments, structured evidence, thread assignments,
+and retained thread-assignment history. Public core does not derive keys or
+interpret the opaque values. Its identity adapter keeps the normal columns
+readable and leaves the new columns `NULL`, so OSS and BYO Supabase behavior
+does not change. A deployment that injects a protected adapter owns its field
+policy, key custody, token purposes, migration, and activation checks. The
+columns alone do not provide encryption.
+
 `0022_content_extract_body_store` adds `search_extract`, a maximum 32 KiB UTF-8
 prefix of the parser's selected normalized plain text, plus an FTS expression
 index that does not store a duplicate generated vector. It also adds

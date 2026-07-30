@@ -154,9 +154,9 @@ describe("repository threading evidence wiring", () => {
               in_reply_to: null,
               references_header: null,
               headers_json: {},
-              raw_mime_sha256: rawHash,
-              parsed_delivery_sha256: null,
-              authored_delivery_sha256: null,
+              body_raw_mime_sha256: rawHash,
+              body_parsed_delivery_sha256: null,
+              body_authored_delivery_sha256: null,
               body_headers_json: { "x-z": "last", "x-a": "first" }
             }],
             rowCount: 1
@@ -184,6 +184,10 @@ describe("repository threading evidence wiring", () => {
     });
 
     expect(calls.some((call) => call.sql.startsWith("INSERT INTO public.imap_thread_work_queue"))).toBe(false);
+    expect(calls.some((call) => (
+      call.sql.startsWith("SELECT id, message_id")
+      && call.sql.includes("FROM public.imap_message_evidence")
+    ))).toBe(false);
     const stateLockIndex = calls.findIndex((call) => call.sql.includes("FOR SHARE"));
     const bodyWriteIndex = calls.findIndex((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"));
     expect(stateLockIndex).toBeLessThan(bodyWriteIndex);
@@ -216,9 +220,9 @@ describe("repository threading evidence wiring", () => {
               in_reply_to: null,
               references_header: null,
               headers_json: {},
-              raw_mime_sha256: null,
-              parsed_delivery_sha256: null,
-              authored_delivery_sha256: null,
+              body_raw_mime_sha256: null,
+              body_parsed_delivery_sha256: null,
+              body_authored_delivery_sha256: null,
               body_headers_json: {}
             }],
             rowCount: 1
@@ -319,9 +323,9 @@ describe("repository threading evidence wiring", () => {
               in_reply_to: null,
               references_header: null,
               headers_json: {},
-              raw_mime_sha256: "0".repeat(64),
-              parsed_delivery_sha256: null,
-              authored_delivery_sha256: null,
+              body_raw_mime_sha256: "0".repeat(64),
+              body_parsed_delivery_sha256: null,
+              body_authored_delivery_sha256: null,
               body_headers_json: {}
             }],
             rowCount: 1

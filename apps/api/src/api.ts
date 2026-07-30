@@ -11,6 +11,7 @@ import { getConfig, type AppConfig } from "./config.js";
 import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "./errors.js";
 import { HostValidationError } from "./host-validation.js";
+import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import { sendMessage } from "./send.js";
@@ -146,6 +147,7 @@ interface StartApiServerOptions {
   pool?: PgPool;
   repository?: MirrorRepository;
   engine?: MirrorEngine;
+  metadataProtection?: MetadataProtectionAdapter;
 }
 
 const UUID_SCHEMA = z.string().uuid();
@@ -921,7 +923,8 @@ export function createApiApp(options: ApiAppOptions): Hono {
 export function startApiServer(options: StartApiServerOptions = {}): ReturnType<typeof serve> {
   const config = options.config ?? getConfig();
   const pool = options.pool ?? getPool();
-  const repository = options.repository ?? new MirrorRepository(pool, config);
+  const repository = options.repository
+    ?? new MirrorRepository(pool, config, options.metadataProtection);
   const engine = options.engine ?? new MirrorEngine({ pool, config, repository });
   const app = createApiApp({
     apiToken: config.API_TOKEN,

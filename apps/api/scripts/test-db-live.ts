@@ -168,6 +168,7 @@ async function main(): Promise<void> {
       "src/__tests__/sync-engine.live-db.test.ts",
       "src/__tests__/threading-repository.live-db.test.ts",
       "src/__tests__/repository-threading-headers.live-db.test.ts",
+      "src/__tests__/metadata-protection.live-db.test.ts",
       "src/__tests__/search.live-db.test.ts",
       "src/__tests__/search-quality.live-db.test.ts",
       "src/__tests__/search-eval-threading.live-db.test.ts",

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { AppConfig } from "./config.js";
 import { buildSearchExtract } from "./body-store.js";
@@ -7,6 +7,17 @@ import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError } from "./errors.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import { withAccountLock } from "./locks.js";
+import {
+  assertMetadataProtectionProjection,
+  assertRevealedMetadataValues,
+  plaintextMetadataProtection,
+  protectedMetadataColumns,
+  storedMetadataProjection,
+  type MetadataProtectionAdapter,
+  type MetadataRecordKind,
+  type MetadataValues,
+  type ProtectedMetadataColumns
+} from "./metadata-protection.js";
 import { normalizeMessageId } from "./mime.js";
 import { autodiscoverProfile, getProviderProfile } from "./provider-profiles.js";
 import {
@@ -66,6 +77,59 @@ const THREADING_BODY_HEADER_KEYS = [
   "thread-index",
   "thread-topic"
 ] as const;
+
+const ACCOUNT_PROTECTED_FIELDS = [
+  "email_address",
+  "username",
+  "smtp_username"
+] as const;
+
+const ACCOUNT_SUMMARY_PROTECTED_FIELDS = ["email_address"] as const;
+
+const MESSAGE_PROTECTED_FIELDS = [
+  "rfc_message_id",
+  "message_id_normalized",
+  "provider_message_id",
+  "provider_message_id_namespace",
+  "provider_thread_id",
+  "provider_thread_id_namespace",
+  "in_reply_to",
+  "references_header",
+  "subject",
+  "from_email",
+  "from_name",
+  "to_emails",
+  "to_names",
+  "cc_emails",
+  "cc_names",
+  "bcc_emails",
+  "headers_json",
+  "mime_structure"
+] as const;
+
+const MESSAGE_BODY_PROTECTED_FIELDS = [
+  "raw_mime_sha256",
+  "parsed_delivery_sha256",
+  "authored_delivery_sha256",
+  "headers_json",
+  "mime_structure",
+  "parser_warnings",
+  "structured_evidence_sha256",
+  "threading_payload_sha256",
+  "search_extract"
+] as const;
+
+function selectMetadataValues(
+  source: object,
+  fields: readonly string[]
+): MetadataValues {
+  const record = source as Record<string, unknown>;
+  return Object.fromEntries(
+    fields
+      .filter((field) => Object.hasOwn(record, field))
+      .map((field) => [field, record[field]])
+  );
+}
 
 const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
 
@@ -515,6 +579,10 @@ const ACCOUNT_SUMMARY_COLUMNS = `
   next_folder_discovery_at,
   folder_count_cap_override,
   last_heartbeat_at,
+  protected_metadata,
+  protected_metadata_version,
+  protected_metadata_key_version,
+  protected_metadata_tokens,
   created_at,
   updated_at
 `;
@@ -543,6 +611,10 @@ const ACCOUNT_DETAILS_COLUMNS = `
   a.next_folder_discovery_at,
   a.folder_count_cap_override,
   a.last_heartbeat_at,
+  a.protected_metadata,
+  a.protected_metadata_version,
+  a.protected_metadata_key_version,
+  a.protected_metadata_tokens,
   a.created_at,
   a.updated_at,
   p.live_headers_synced_count,
@@ -566,8 +638,90 @@ const ACCOUNT_DETAILS_COLUMNS = `
 export class MirrorRepository {
   constructor(
     private readonly pool: PgPool,
-    private readonly config: AppConfig
+    private readonly config: AppConfig,
+    private readonly metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
   ) {}
+
+  private async protectMetadata(
+    kind: MetadataRecordKind,
+    accountId: string,
+    recordId: string,
+    values: MetadataValues
+  ) {
+    const projection = await this.metadataProtection.protect(
+      { kind, accountId, recordId },
+      values
+    );
+    assertMetadataProtectionProjection(projection, Object.keys(values));
+    return {
+      values: projection.values,
+      columns: protectedMetadataColumns(projection)
+    };
+  }
+
+  private async revealMetadata<T extends ProtectedMetadataColumns>(
+    row: T,
+    kind: MetadataRecordKind,
+    accountId: string,
+    recordId: string,
+    fields: readonly string[]
+  ): Promise<T> {
+    let revealed: MetadataValues;
+    const usesPlaintextStorage = this.metadataProtection === plaintextMetadataProtection
+      && row.protected_metadata == null
+      && row.protected_metadata_version == null
+      && row.protected_metadata_key_version == null
+      && row.protected_metadata_tokens == null;
+    if (usesPlaintextStorage
+      && !Object.hasOwn(row, "protected_metadata")
+      && !Object.hasOwn(row, "protected_metadata_version")
+      && !Object.hasOwn(row, "protected_metadata_key_version")
+      && !Object.hasOwn(row, "protected_metadata_tokens")) {
+      return row;
+    }
+    if (usesPlaintextStorage) {
+      revealed = selectMetadataValues(row, fields);
+    } else {
+      revealed = await this.metadataProtection.reveal(
+        { kind, accountId, recordId },
+        storedMetadataProjection(row, selectMetadataValues(row, fields))
+      );
+    }
+    assertRevealedMetadataValues(revealed, fields);
+    const result = { ...(row as unknown as Record<string, unknown>) };
+    for (const field of fields) {
+      if (Object.hasOwn(revealed, field)) result[field] = revealed[field];
+    }
+    delete result.protected_metadata;
+    delete result.protected_metadata_version;
+    delete result.protected_metadata_key_version;
+    delete result.protected_metadata_tokens;
+    return result as unknown as T;
+  }
+
+  private async revealAccountSummary<T extends AccountSummary & ProtectedMetadataColumns>(
+    row: T
+  ): Promise<T> {
+    return this.revealMetadata(
+      row,
+      "account",
+      row.id,
+      row.id,
+      ACCOUNT_SUMMARY_PROTECTED_FIELDS
+    );
+  }
+
+  private async revealAccount<T extends ImapAccount & ProtectedMetadataColumns>(
+    row: T
+  ): Promise<T> {
+    return this.revealMetadata(row, "account", row.id, row.id, ACCOUNT_PROTECTED_FIELDS);
+  }
+
+  private async revealMessage<T extends ImapMessage & ProtectedMetadataColumns>(
+    row: T
+  ): Promise<T> {
+    return this.revealMetadata(row, "message", row.account_id, row.id, MESSAGE_PROTECTED_FIELDS);
+  }
 
   async createAccount(input: CreateAccountInput): Promise<AccountSummary> {
     // IMAP coordinate resolution (email-008) — the explicit > named-preset >
@@ -590,7 +744,14 @@ export class MirrorRepository {
     const encryptedSmtp = input.smtpPassword
       ? await encryptPassword(this.pool, input.smtpPassword, this.config.IMAP_ENCRYPTION_KEY)
       : null;
-    const result = await this.pool.query<AccountSummary>(
+    const accountId = randomUUID();
+    const protectedAccount = await this.protectMetadata("account", accountId, accountId, {
+      email_address: input.emailAddress,
+      username: input.username,
+      smtp_username: input.smtpUsername ?? null
+    });
+    const protectedColumns = protectedAccount.columns;
+    const result = await this.pool.query<AccountSummary & ProtectedMetadataColumns>(
       `
       INSERT INTO public.imap_accounts (
         email_address,
@@ -605,47 +766,62 @@ export class MirrorRepository {
         smtp_secure,
         smtp_username,
         encrypted_smtp_password,
-        body_fetch_policy
+        body_fetch_policy,
+        id,
+        protected_metadata,
+        protected_metadata_version,
+        protected_metadata_key_version,
+        protected_metadata_tokens
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+        $15, $16, $17, $18
+      )
       RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
       `,
       [
-        input.emailAddress,
+        protectedAccount.values.email_address,
         providerProfile,
         host,
         port,
         secure,
-        input.username,
+        protectedAccount.values.username,
         encrypted,
         input.smtpHost ?? null,
         input.smtpPort ?? null,
         input.smtpSecure ?? null,
-        input.smtpUsername ?? null,
+        protectedAccount.values.smtp_username,
         encryptedSmtp,
-        input.bodyFetchPolicy ?? this.config.BODY_FETCH_POLICY
+        input.bodyFetchPolicy ?? this.config.BODY_FETCH_POLICY,
+        accountId,
+        protectedColumns.protected_metadata,
+        protectedColumns.protected_metadata_version,
+        protectedColumns.protected_metadata_key_version,
+        protectedColumns.protected_metadata_tokens
       ]
     );
-    return result.rows[0];
+    return await this.revealAccountSummary(result.rows[0]);
   }
 
   async listAccounts(): Promise<AccountSummary[]> {
-    const result = await this.pool.query<AccountSummary>(
+    const result = await this.pool.query<AccountSummary & ProtectedMetadataColumns>(
       `SELECT ${ACCOUNT_SUMMARY_COLUMNS} FROM public.imap_accounts ORDER BY email_address`
     );
-    return result.rows;
+    return await Promise.all(result.rows.map((row) => this.revealAccountSummary(row)));
   }
 
   async getAccount(id: string): Promise<ImapAccount | null> {
-    const result = await this.pool.query<ImapAccount>(
+    const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
       "SELECT * FROM public.imap_accounts WHERE id = $1",
       [id]
     );
-    return result.rows[0] ?? null;
+    return result.rows[0] ? await this.revealAccount(result.rows[0]) : null;
   }
 
   async getAccountDetails(id: string): Promise<AccountDetails | null> {
-    const accountResult = await this.pool.query<AccountSummary & Omit<AccountProgress, "account_id">>(
+    const accountResult = await this.pool.query<
+      AccountSummary & Omit<AccountProgress, "account_id"> & ProtectedMetadataColumns
+    >(
       `
       SELECT ${ACCOUNT_DETAILS_COLUMNS}
       FROM public.imap_accounts a
@@ -654,8 +830,9 @@ export class MirrorRepository {
       `,
       [id]
     );
-    const account = accountResult.rows[0];
-    if (!account) return null;
+    const storedAccount = accountResult.rows[0];
+    if (!storedAccount) return null;
+    const account = await this.revealAccountSummary(storedAccount);
 
     const folders = await this.pool.query<FolderProgress>(
       `
@@ -735,14 +912,14 @@ export class MirrorRepository {
       && input.archiveFlagSync === undefined
       && input.maxBackfillRate === undefined
     ) {
-      const existing = await this.pool.query<AccountSummary>(
+      const existing = await this.pool.query<AccountSummary & ProtectedMetadataColumns>(
         `SELECT ${ACCOUNT_SUMMARY_COLUMNS} FROM public.imap_accounts WHERE id = $1`,
         [accountId]
       );
-      return existing.rows[0] ?? null;
+      return existing.rows[0] ? await this.revealAccountSummary(existing.rows[0]) : null;
     }
 
-    const result = await this.pool.query<AccountSummary>(
+    const result = await this.pool.query<AccountSummary & ProtectedMetadataColumns>(
       `
       UPDATE public.imap_accounts
       SET
@@ -763,7 +940,7 @@ export class MirrorRepository {
         input.bodyFetchPolicy ?? null
       ]
     );
-    return result.rows[0] ?? null;
+    return result.rows[0] ? await this.revealAccountSummary(result.rows[0]) : null;
   }
 
   async updateAccountCredentials(
@@ -785,7 +962,7 @@ export class MirrorRepository {
       this.config.IMAP_ENCRYPTION_KEY
     );
     const updated = await withAccountLock(this.pool, existing.lock_id, async (lock) => {
-      const result = await lock.client.query<AccountSummary>(
+      const result = await lock.client.query<AccountSummary & ProtectedMetadataColumns>(
         `UPDATE public.imap_accounts
          SET encrypted_password = $2,
              sync_state = 'DEGRADED',
@@ -810,7 +987,7 @@ export class MirrorRepository {
         `Account ${accountId} is busy syncing; retry credential replacement shortly`
       );
     }
-    return updated;
+    return updated ? await this.revealAccountSummary(updated) : null;
   }
 
   async getRunnableAccounts(
@@ -830,7 +1007,7 @@ export class MirrorRepository {
             AND (sf.next_sync_due_at IS NULL OR sf.next_sync_due_at <= now())
         )`
       : "";
-    const result = await this.pool.query<ImapAccount>(
+    const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
       `
       SELECT *
       FROM public.imap_accounts
@@ -871,7 +1048,7 @@ export class MirrorRepository {
       `,
       [effectiveLimit, this.config.STALE_HEARTBEAT_MS]
     );
-    return result.rows;
+    return await Promise.all(result.rows.map((row) => this.revealAccount(row)));
   }
 
   async startSyncRun(accountId: string, triggerType: SyncTriggerType): Promise<string> {
@@ -2291,10 +2468,10 @@ export class MirrorRepository {
       // Combining both reads into one SELECT can retain a pre-wait snapshot and
       // double-count an overlapping UID inserted by the transaction ahead of us.
       await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
-      const existing = await queryWithDeadline<{ uid: string }>(
+      const existing = await queryWithDeadline<ImapMessage & ProtectedMetadataColumns>(
         client,
         `
-        SELECT uid::text AS uid
+        SELECT *
         FROM public.imap_messages
         WHERE account_id = $1
           AND folder_path = $2
@@ -2307,43 +2484,80 @@ export class MirrorRepository {
         metadataWriteDeadline.remainingMs
       );
       const existingUids = new Set(existing.rows.map((row) => Number(row.uid)));
+      const revealedExisting = await Promise.all(
+        existing.rows.map((row) => this.revealMessage(row))
+      );
+      const existingMessagesByUid = new Map(
+        revealedExisting.map((row) => [Number(row.uid), row])
+      );
+      const messageIdsByUid = new Map(
+        existing.rows.map((row) => [Number(row.uid), row.id])
+      );
+      for (const message of messages) {
+        if (!messageIdsByUid.get(message.uid)) messageIdsByUid.set(message.uid, randomUUID());
+      }
 
       const rowsByUid = new Map<number, ImapMessage>();
       for (const writeBatch of writeBatches) {
-        const input = writeBatch.map((message, ordinal) => ({
-          ordinal,
-          uid: message.uid,
-          rfc_message_id: message.rfcMessageId,
-          message_id_normalized: message.messageIdNormalized,
-          provider_message_id: message.providerMessageId,
-          provider_message_id_namespace: message.providerMessageIdNamespace,
-          provider_thread_id: message.providerThreadId,
-          provider_thread_id_namespace: message.providerThreadIdNamespace,
-          in_reply_to: message.inReplyTo,
-          references_header: message.referencesHeader,
-          internal_date: message.internalDate.toISOString(),
-          size_bytes: message.sizeBytes,
-          subject: message.subject,
-          from_email: message.fromEmail,
-          from_name: message.fromName,
-          to_emails: message.toEmails,
-          to_names: message.toNames,
-          cc_emails: message.ccEmails,
-          cc_names: message.ccNames,
-          bcc_emails: message.bccEmails,
-          flags: message.flags,
-          headers_json: message.headersJson,
-          mime_structure: message.mimeStructure ?? null,
-          window_status: message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW"
+        const input = await Promise.all(writeBatch.map(async (message, ordinal) => {
+          const messageId = messageIdsByUid.get(message.uid);
+          if (!messageId) throw new Error(`Metadata batch lost message id for UID ${message.uid}`);
+          const previous = existingMessagesByUid.get(message.uid);
+          const protectedMessage = await this.protectMetadata(
+            "message",
+            accountId,
+            messageId,
+            {
+              rfc_message_id: message.rfcMessageId ?? previous?.rfc_message_id ?? null,
+              message_id_normalized:
+                message.messageIdNormalized ?? previous?.message_id_normalized ?? null,
+              provider_message_id: message.providerMessageId,
+              provider_message_id_namespace: message.providerMessageIdNamespace,
+              provider_thread_id: message.providerThreadId,
+              provider_thread_id_namespace: message.providerThreadIdNamespace,
+              in_reply_to: message.inReplyTo ?? previous?.in_reply_to ?? null,
+              references_header:
+                message.referencesHeader ?? previous?.references_header ?? null,
+              subject: message.subject,
+              from_email: message.fromEmail,
+              from_name: message.fromName,
+              to_emails: message.toEmails,
+              to_names: message.toNames,
+              cc_emails: message.ccEmails,
+              cc_names: message.ccNames,
+              bcc_emails: message.bccEmails,
+              headers_json: message.headersJson,
+              mime_structure: message.mimeStructure ?? null
+            }
+          );
+          return {
+            ordinal,
+            id: messageId,
+            uid: message.uid,
+            ...protectedMessage.values,
+            internal_date: message.internalDate.toISOString(),
+            size_bytes: message.sizeBytes,
+            flags: message.flags,
+            window_status: message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW",
+            protected_metadata_base64:
+              protectedMessage.columns.protected_metadata?.toString("base64") ?? null,
+            protected_metadata_version:
+              protectedMessage.columns.protected_metadata_version,
+            protected_metadata_key_version:
+              protectedMessage.columns.protected_metadata_key_version,
+            protected_metadata_tokens:
+              protectedMessage.columns.protected_metadata_tokens
+          };
         }));
         await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
-        const result = await queryWithDeadline<ImapMessage>(
+        const result = await queryWithDeadline<ImapMessage & ProtectedMetadataColumns>(
           client,
           `
         WITH input AS (
           SELECT *
           FROM jsonb_to_recordset($1::jsonb) AS message (
             ordinal integer,
+            id uuid,
             uid bigint,
             rfc_message_id text,
             message_id_normalized text,
@@ -2366,10 +2580,15 @@ export class MirrorRepository {
             flags text[],
             headers_json jsonb,
             mime_structure jsonb,
-            window_status text
+            window_status text,
+            protected_metadata_base64 text,
+            protected_metadata_version smallint,
+            protected_metadata_key_version integer,
+            protected_metadata_tokens jsonb
           )
         )
         INSERT INTO public.imap_messages (
+          id,
           account_id,
           folder_id,
           folder_path,
@@ -2396,9 +2615,14 @@ export class MirrorRepository {
           flags,
           headers_json,
           mime_structure,
-          window_status
+          window_status,
+          protected_metadata,
+          protected_metadata_version,
+          protected_metadata_key_version,
+          protected_metadata_tokens
         )
         SELECT
+          input.id,
           $2::uuid,
           $3::uuid,
           $4::text,
@@ -2425,20 +2649,27 @@ export class MirrorRepository {
           input.flags,
           input.headers_json,
           input.mime_structure,
-          input.window_status
+          input.window_status,
+          CASE
+            WHEN input.protected_metadata_base64 IS NULL THEN NULL
+            ELSE decode(input.protected_metadata_base64, 'base64')
+          END,
+          input.protected_metadata_version,
+          input.protected_metadata_key_version,
+          input.protected_metadata_tokens
         FROM input
         ORDER BY input.ordinal
         ON CONFLICT (account_id, folder_path, uidvalidity, uid)
         DO UPDATE SET
           folder_id = EXCLUDED.folder_id,
-          rfc_message_id = COALESCE(EXCLUDED.rfc_message_id, public.imap_messages.rfc_message_id),
-          message_id_normalized = COALESCE(EXCLUDED.message_id_normalized, public.imap_messages.message_id_normalized),
+          rfc_message_id = EXCLUDED.rfc_message_id,
+          message_id_normalized = EXCLUDED.message_id_normalized,
           provider_message_id = EXCLUDED.provider_message_id,
           provider_message_id_namespace = EXCLUDED.provider_message_id_namespace,
           provider_thread_id = EXCLUDED.provider_thread_id,
           provider_thread_id_namespace = EXCLUDED.provider_thread_id_namespace,
-          in_reply_to = COALESCE(EXCLUDED.in_reply_to, public.imap_messages.in_reply_to),
-          references_header = COALESCE(EXCLUDED.references_header, public.imap_messages.references_header),
+          in_reply_to = EXCLUDED.in_reply_to,
+          references_header = EXCLUDED.references_header,
           internal_date = EXCLUDED.internal_date,
           size_bytes = EXCLUDED.size_bytes,
           subject = EXCLUDED.subject,
@@ -2452,6 +2683,10 @@ export class MirrorRepository {
           flags = CASE WHEN $6::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
           headers_json = EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
+          protected_metadata = EXCLUDED.protected_metadata,
+          protected_metadata_version = EXCLUDED.protected_metadata_version,
+          protected_metadata_key_version = EXCLUDED.protected_metadata_key_version,
+          protected_metadata_tokens = EXCLUDED.protected_metadata_tokens,
           deleted_in_provider = false,
           provider_deleted_at = NULL,
           deleted_reason = NULL
@@ -2473,9 +2708,12 @@ export class MirrorRepository {
             `Metadata batch wrote ${result.rows.length}/${writeBatch.length} requested messages`
           );
         }
-        for (const row of result.rows) rowsByUid.set(Number(row.uid), row);
+        const revealedRows = await Promise.all(
+          result.rows.map((row) => this.revealMessage(row))
+        );
+        for (const row of revealedRows) rowsByUid.set(Number(row.uid), row);
 
-        const attachmentsByIdentity = new Map<string, {
+        const attachmentSources = new Map<string, {
           message_id: string;
           filename: string | null;
           mime_type: string | null;
@@ -2488,7 +2726,7 @@ export class MirrorRepository {
           const row = rowsByUid.get(message.uid);
           if (!row) throw new Error(`Metadata batch lost message UID ${message.uid}`);
           for (const attachment of message.attachments) {
-            attachmentsByIdentity.set(`${row.id}\u0000${attachment.partNumber}`, {
+            attachmentSources.set(`${row.id}\u0000${attachment.partNumber}`, {
               message_id: row.id,
               filename: attachment.filename,
               mime_type: attachment.mimeType,
@@ -2499,6 +2737,51 @@ export class MirrorRepository {
             });
           }
         }
+        const existingAttachments = attachmentSources.size === 0
+          ? []
+          : await queryWithDeadline<{ id: string; message_id: string; part_number: string }>(
+            client,
+            `
+            SELECT id, message_id, part_number
+            FROM public.imap_attachments
+            WHERE message_id = ANY($1::uuid[])
+            `,
+            [[...new Set([...attachmentSources.values()].map((value) => value.message_id))]],
+            deadlineAt,
+            metadataWriteDeadline.remainingMs
+          ).then((value) => value.rows);
+        const attachmentIdsByIdentity = new Map(
+          existingAttachments.map((row) => [
+            `${row.message_id}\u0000${row.part_number}`,
+            row.id
+          ])
+        );
+        const attachmentsByIdentity = new Map<string, Record<string, unknown>>();
+        for (const [identity, attachment] of attachmentSources) {
+          const attachmentId = attachmentIdsByIdentity.get(identity) ?? randomUUID();
+          const protectedAttachment = await this.protectMetadata(
+            "attachment",
+            accountId,
+            attachmentId,
+            {
+              filename: attachment.filename,
+              content_id: attachment.content_id
+            }
+          );
+          attachmentsByIdentity.set(identity, {
+            id: attachmentId,
+            ...attachment,
+            ...protectedAttachment.values,
+            protected_metadata_base64:
+              protectedAttachment.columns.protected_metadata?.toString("base64") ?? null,
+            protected_metadata_version:
+              protectedAttachment.columns.protected_metadata_version,
+            protected_metadata_key_version:
+              protectedAttachment.columns.protected_metadata_key_version,
+            protected_metadata_tokens:
+              protectedAttachment.columns.protected_metadata_tokens
+          });
+        }
         if (attachmentsByIdentity.size > 0) {
           await metadataWriteDeadline.refreshTimeout(client, deadlineAt);
           const attachmentResult = await queryWithDeadline<{ id: string }>(
@@ -2507,32 +2790,50 @@ export class MirrorRepository {
           WITH input AS (
             SELECT *
             FROM jsonb_to_recordset($1::jsonb) AS attachment (
+              id uuid,
               message_id uuid,
               filename text,
               mime_type text,
               size_bytes bigint,
               part_number text,
               content_id text,
-              disposition text
+              disposition text,
+              protected_metadata_base64 text,
+              protected_metadata_version smallint,
+              protected_metadata_key_version integer,
+              protected_metadata_tokens jsonb
             )
           )
           INSERT INTO public.imap_attachments (
+            id,
             message_id,
             filename,
             mime_type,
             size_bytes,
             part_number,
             content_id,
-            disposition
+            disposition,
+            protected_metadata,
+            protected_metadata_version,
+            protected_metadata_key_version,
+            protected_metadata_tokens
           )
           SELECT
+            input.id,
             input.message_id,
             input.filename,
             input.mime_type,
             input.size_bytes,
             input.part_number,
             input.content_id,
-            input.disposition
+            input.disposition,
+            CASE
+              WHEN input.protected_metadata_base64 IS NULL THEN NULL
+              ELSE decode(input.protected_metadata_base64, 'base64')
+            END,
+            input.protected_metadata_version,
+            input.protected_metadata_key_version,
+            input.protected_metadata_tokens
           FROM input
           ON CONFLICT (message_id, part_number)
           DO UPDATE SET
@@ -2540,7 +2841,11 @@ export class MirrorRepository {
             mime_type = EXCLUDED.mime_type,
             size_bytes = EXCLUDED.size_bytes,
             content_id = EXCLUDED.content_id,
-            disposition = EXCLUDED.disposition
+            disposition = EXCLUDED.disposition,
+            protected_metadata = EXCLUDED.protected_metadata,
+            protected_metadata_version = EXCLUDED.protected_metadata_version,
+            protected_metadata_key_version = EXCLUDED.protected_metadata_key_version,
+            protected_metadata_tokens = EXCLUDED.protected_metadata_tokens
           RETURNING id
           `,
             [JSON.stringify([...attachmentsByIdentity.values()])],
@@ -3132,8 +3437,11 @@ export class MirrorRepository {
   }
 
   async getMessage(id: string): Promise<ImapMessage | null> {
-    const result = await this.pool.query<ImapMessage>("SELECT * FROM public.imap_messages WHERE id = $1", [id]);
-    return result.rows[0] ?? null;
+    const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
+      "SELECT * FROM public.imap_messages WHERE id = $1",
+      [id]
+    );
+    return result.rows[0] ? await this.revealMessage(result.rows[0]) : null;
   }
 
   /**
@@ -3230,41 +3538,81 @@ export class MirrorRepository {
       if (!ownerAccountId) throw new Error(`Message not found for body storage: ${body.messageId}`);
       await this.lockThreadStateForMirrorWrite(client, ownerAccountId);
 
-      const target = await client.query<{
-        account_id: string;
-        folder_path: string;
-        body_fetched_at: Date | null;
-        rfc_message_id: string | null;
-        in_reply_to: string | null;
-        references_header: string | null;
-        headers_json: Record<string, unknown>;
-        raw_mime_sha256: string | null;
-        parsed_delivery_sha256: string | null;
-        authored_delivery_sha256: string | null;
+      const target = await client.query<
+        ImapMessage & ProtectedMetadataColumns & {
+        body_raw_mime_sha256: string | null;
+        body_message_id: string | null;
+        body_parsed_delivery_sha256: string | null;
+        body_authored_delivery_sha256: string | null;
+        raw_mime_sha256?: string | null;
+        parsed_delivery_sha256?: string | null;
+        authored_delivery_sha256?: string | null;
         body_headers_json: Record<string, unknown> | null;
-        subject: string | null;
-        from_email: string | null;
-        to_emails: string[] | null;
-        cc_emails: string[] | null;
-        bcc_emails: string[] | null;
-        size_bytes: string | null;
+        body_mime_structure: unknown;
+        body_parser_warnings: string[] | null;
+        body_structured_evidence_sha256: string | null;
+        body_threading_payload_sha256: string | null;
+        body_search_extract: string | null;
+        body_protected_metadata: Buffer | null;
+        body_protected_metadata_version: number | null;
+        body_protected_metadata_key_version: number | null;
+        body_protected_metadata_tokens: Record<string, string> | null;
       }>(
         `
-        SELECT account_id, folder_path, body_fetched_at,
-               rfc_message_id, in_reply_to, references_header,
-               m.headers_json, m.subject, m.from_email, m.to_emails,
-               m.cc_emails, m.bcc_emails, m.size_bytes::text AS size_bytes,
-               b.raw_mime_sha256, b.parsed_delivery_sha256,
-               b.authored_delivery_sha256,
-               b.headers_json AS body_headers_json
+        SELECT m.*,
+               b.message_id AS body_message_id,
+               b.raw_mime_sha256 AS body_raw_mime_sha256,
+               b.parsed_delivery_sha256 AS body_parsed_delivery_sha256,
+               b.authored_delivery_sha256 AS body_authored_delivery_sha256,
+               b.headers_json AS body_headers_json,
+               b.mime_structure AS body_mime_structure,
+               b.parser_warnings AS body_parser_warnings,
+               b.structured_evidence_sha256 AS body_structured_evidence_sha256,
+               b.threading_payload_sha256 AS body_threading_payload_sha256,
+               b.search_extract AS body_search_extract,
+               b.protected_metadata AS body_protected_metadata,
+               b.protected_metadata_version AS body_protected_metadata_version,
+               b.protected_metadata_key_version AS body_protected_metadata_key_version,
+               b.protected_metadata_tokens AS body_protected_metadata_tokens
         FROM public.imap_messages m
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
         WHERE m.id = $1 FOR UPDATE OF m
         `,
         [body.messageId]
       );
-      const message = target.rows[0];
-      if (!message) throw new Error(`Message not found for body storage: ${body.messageId}`);
+      const storedMessage = target.rows[0];
+      if (!storedMessage) throw new Error(`Message not found for body storage: ${body.messageId}`);
+      const message = await this.revealMessage(storedMessage);
+      const storedBodyValues = {
+        raw_mime_sha256: storedMessage.body_raw_mime_sha256,
+        parsed_delivery_sha256: storedMessage.body_parsed_delivery_sha256,
+        authored_delivery_sha256: storedMessage.body_authored_delivery_sha256,
+        headers_json: storedMessage.body_headers_json ?? {},
+        mime_structure: storedMessage.body_mime_structure,
+        parser_warnings: storedMessage.body_parser_warnings ?? [],
+        structured_evidence_sha256: storedMessage.body_structured_evidence_sha256,
+        threading_payload_sha256: storedMessage.body_threading_payload_sha256,
+        search_extract: storedMessage.body_search_extract
+      };
+      const revealedBody = storedMessage.body_message_id === null
+        ? storedBodyValues
+        : await this.metadataProtection.reveal(
+          {
+            kind: "message_body",
+            accountId: ownerAccountId,
+            recordId: body.messageId
+          },
+          storedMetadataProjection(
+            {
+              protected_metadata: storedMessage.body_protected_metadata,
+              protected_metadata_version: storedMessage.body_protected_metadata_version,
+              protected_metadata_key_version: storedMessage.body_protected_metadata_key_version,
+              protected_metadata_tokens: storedMessage.body_protected_metadata_tokens
+            },
+            storedBodyValues
+          )
+        );
+      assertRevealedMetadataValues(revealedBody, MESSAGE_BODY_PROTECTED_FIELDS);
 
       const recoveredHeaders: Record<string, unknown> = {};
       for (const key of THREADING_BODY_HEADER_KEYS) {
@@ -3348,32 +3696,118 @@ export class MirrorRepository {
       );
       const parsedSha256 = digests.rows[0]?.parsed_delivery_sha256 ?? null;
       const authoredSha256 = digests.rows[0]?.authored_delivery_sha256 ?? null;
-      const learnedDeliveryEvidence = rawMimeSha256 !== message.raw_mime_sha256
-        || parsedSha256 !== message.parsed_delivery_sha256
-        || authoredSha256 !== message.authored_delivery_sha256;
-      const bodyHeadersChanged = canonicalJsonForThreadingEvidence(message.body_headers_json ?? {})
+      const learnedDeliveryEvidence = rawMimeSha256 !== revealedBody.raw_mime_sha256
+        || parsedSha256 !== revealedBody.parsed_delivery_sha256
+        || authoredSha256 !== revealedBody.authored_delivery_sha256;
+      const bodyHeadersChanged = canonicalJsonForThreadingEvidence(revealedBody.headers_json ?? {})
         !== canonicalJsonForThreadingEvidence(body.headersJson);
 
       if (learnedThreadingEvidence) {
+        const nextMessageValues = {
+          ...selectMetadataValues(message, MESSAGE_PROTECTED_FIELDS),
+          rfc_message_id: message.rfc_message_id ?? recoveredMessageId,
+          message_id_normalized:
+            message.message_id_normalized ?? normalizeMessageId(recoveredMessageId),
+          in_reply_to: message.in_reply_to ?? recoveredInReplyTo,
+          references_header: message.references_header ?? recoveredReferences,
+          headers_json: { ...message.headers_json, ...recoveredHeaders }
+        };
+        const protectedMessage = await this.protectMetadata(
+          "message",
+          ownerAccountId,
+          body.messageId,
+          nextMessageValues
+        );
+        const messageWrite = {
+          ...protectedMessage.values,
+          protected_metadata_base64:
+            protectedMessage.columns.protected_metadata?.toString("base64") ?? null,
+          protected_metadata_version:
+            protectedMessage.columns.protected_metadata_version,
+          protected_metadata_key_version:
+            protectedMessage.columns.protected_metadata_key_version,
+          protected_metadata_tokens:
+            protectedMessage.columns.protected_metadata_tokens
+        };
         await client.query(
-          `UPDATE public.imap_messages SET
-             rfc_message_id = COALESCE(rfc_message_id, $2),
-             message_id_normalized = COALESCE(message_id_normalized, $3),
-             in_reply_to = COALESCE(in_reply_to, $4),
-             references_header = COALESCE(references_header, $5),
-             headers_json = headers_json || $6::jsonb
-           WHERE id = $1`,
-          [
-            body.messageId,
-            recoveredMessageId,
-            normalizeMessageId(recoveredMessageId),
-            recoveredInReplyTo,
-            recoveredReferences,
-            JSON.stringify(recoveredHeaders)
-          ]
+          `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_record($2::jsonb) AS value (
+              rfc_message_id text,
+              message_id_normalized text,
+              provider_message_id text,
+              provider_message_id_namespace text,
+              provider_thread_id text,
+              provider_thread_id_namespace text,
+              in_reply_to text,
+              references_header text,
+              subject text,
+              from_email text,
+              from_name text,
+              to_emails text[],
+              to_names text[],
+              cc_emails text[],
+              cc_names text[],
+              bcc_emails text[],
+              headers_json jsonb,
+              mime_structure jsonb,
+              protected_metadata_base64 text,
+              protected_metadata_version smallint,
+              protected_metadata_key_version integer,
+              protected_metadata_tokens jsonb
+            )
+          )
+          UPDATE public.imap_messages SET
+            rfc_message_id = input.rfc_message_id,
+            message_id_normalized = input.message_id_normalized,
+            provider_message_id = input.provider_message_id,
+            provider_message_id_namespace = input.provider_message_id_namespace,
+            provider_thread_id = input.provider_thread_id,
+            provider_thread_id_namespace = input.provider_thread_id_namespace,
+            in_reply_to = input.in_reply_to,
+            references_header = input.references_header,
+            subject = input.subject,
+            from_email = input.from_email,
+            from_name = input.from_name,
+            to_emails = input.to_emails,
+            to_names = input.to_names,
+            cc_emails = input.cc_emails,
+            cc_names = input.cc_names,
+            bcc_emails = input.bcc_emails,
+            headers_json = input.headers_json,
+            mime_structure = input.mime_structure,
+            protected_metadata = CASE
+              WHEN input.protected_metadata_base64 IS NULL THEN NULL
+              ELSE decode(input.protected_metadata_base64, 'base64')
+            END,
+            protected_metadata_version = input.protected_metadata_version,
+            protected_metadata_key_version = input.protected_metadata_key_version,
+            protected_metadata_tokens = input.protected_metadata_tokens
+          FROM input
+          WHERE public.imap_messages.id = $1
+          `,
+          [body.messageId, JSON.stringify(messageWrite)]
         );
       }
 
+      const protectedBody = await this.protectMetadata(
+        "message_body",
+        ownerAccountId,
+        body.messageId,
+        {
+          raw_mime_sha256: rawMimeSha256,
+          parsed_delivery_sha256: parsedSha256,
+          authored_delivery_sha256: authoredSha256,
+          headers_json: body.headersJson,
+          mime_structure: body.mimeStructure ?? null,
+          parser_warnings: body.parserWarnings,
+          structured_evidence_sha256: structuredEvidenceSha256,
+          threading_payload_sha256: payloadSha256,
+          search_extract: buildSearchExtract(body.bodyText)
+        }
+      );
+      const protectedBodyColumns = protectedBody.columns;
       await client.query(
         `
         INSERT INTO public.imap_message_bodies (
@@ -3398,6 +3832,10 @@ export class MirrorRepository {
           structured_evidence_extracted_at,
           threading_payload_sha256,
           search_extract,
+          protected_metadata,
+          protected_metadata_version,
+          protected_metadata_key_version,
+          protected_metadata_tokens,
           fetched_at,
           created_at,
           updated_at
@@ -3405,7 +3843,7 @@ export class MirrorRepository {
         VALUES (
           $1, NULL, $2, $3, $4, $5, $6, NULL, NULL, NULL, NULL, NULL,
           $7, $8, $9, $10, $11, $12, now(), $13, $14,
-          now(), now(), now()
+          $15, $16, $17, $18, now(), now(), now()
         )
         ON CONFLICT (message_id)
         DO UPDATE SET
@@ -3423,32 +3861,105 @@ export class MirrorRepository {
           structured_evidence_extracted_at = EXCLUDED.structured_evidence_extracted_at,
           threading_payload_sha256 = EXCLUDED.threading_payload_sha256,
           search_extract = EXCLUDED.search_extract,
+          protected_metadata = EXCLUDED.protected_metadata,
+          protected_metadata_version = EXCLUDED.protected_metadata_version,
+          protected_metadata_key_version = EXCLUDED.protected_metadata_key_version,
+          protected_metadata_tokens = EXCLUDED.protected_metadata_tokens,
           fetched_at = now(),
           updated_at = now()
         `,
         [
           body.messageId,
-          rawMimeSha256,
-          parsedSha256,
-          authoredSha256,
+          protectedBody.values.raw_mime_sha256,
+          protectedBody.values.parsed_delivery_sha256,
+          protectedBody.values.authored_delivery_sha256,
           body.rawBytes,
           body.rawTruncated,
-          JSON.stringify(body.headersJson),
-          JSON.stringify(body.mimeStructure ?? null),
-          body.parserWarnings,
+          JSON.stringify(protectedBody.values.headers_json),
+          JSON.stringify(protectedBody.values.mime_structure ?? null),
+          protectedBody.values.parser_warnings,
           MIME_EVIDENCE_EXTRACTOR_VERSION,
-          structuredEvidenceSha256,
+          protectedBody.values.structured_evidence_sha256,
           structuredEvidenceComplete,
-          payloadSha256,
-          buildSearchExtract(body.bodyText)
+          protectedBody.values.threading_payload_sha256,
+          protectedBody.values.search_extract,
+          protectedBodyColumns.protected_metadata,
+          protectedBodyColumns.protected_metadata_version,
+          protectedBodyColumns.protected_metadata_key_version,
+          protectedBodyColumns.protected_metadata_tokens
         ]
       );
 
       if (!body.rawTruncated) {
+        const existingEvidenceByIdentity = new Map<string, string>();
         if (preparedEvidence.length > 0) {
+          const existingEvidence = await client.query<{
+            id: string;
+            message_id: string;
+            extractor: string;
+            kind: string;
+            namespace: string;
+            evidence_key: string;
+            evidence_key_sha256: string;
+            metadata: Record<string, unknown>;
+          } & ProtectedMetadataColumns>(
+            `
+            SELECT id, message_id, extractor, kind, namespace,
+                   evidence_key, evidence_key_sha256, metadata,
+                   protected_metadata, protected_metadata_version,
+                   protected_metadata_key_version, protected_metadata_tokens
+            FROM public.imap_message_evidence
+            WHERE message_id = $1 AND extractor = $2
+            `,
+            [body.messageId, MIME_EVIDENCE_EXTRACTOR]
+          );
+          for (const row of existingEvidence.rows) {
+            const revealed = await this.revealMetadata(
+              row,
+              "message_evidence",
+              ownerAccountId,
+              row.id,
+              ["evidence_key", "evidence_key_sha256", "metadata"]
+            );
+            existingEvidenceByIdentity.set(
+              `${revealed.kind}\u0000${revealed.namespace}\u0000${revealed.evidence_key_sha256}`,
+              row.id
+            );
+          }
+        }
+        const protectedEvidence = await Promise.all(preparedEvidence.map(async (evidence) => {
+          const identity =
+            `${evidence.kind}\u0000${evidence.namespace}\u0000${evidence.evidence_key_sha256}`;
+          const evidenceId = existingEvidenceByIdentity.get(identity) ?? randomUUID();
+          const projection = await this.protectMetadata(
+            "message_evidence",
+            ownerAccountId,
+            evidenceId,
+            {
+              evidence_key: evidence.evidence_key,
+              evidence_key_sha256: evidence.evidence_key_sha256,
+              metadata: evidence.metadata
+            }
+          );
+          return {
+            id: evidenceId,
+            ...evidence,
+            ...projection.values,
+            protected_metadata_base64:
+              projection.columns.protected_metadata?.toString("base64") ?? null,
+            protected_metadata_version:
+              projection.columns.protected_metadata_version,
+            protected_metadata_key_version:
+              projection.columns.protected_metadata_key_version,
+            protected_metadata_tokens:
+              projection.columns.protected_metadata_tokens
+          };
+        }));
+        if (protectedEvidence.length > 0) {
           await client.query(
             `
             INSERT INTO public.imap_message_evidence (
+              id,
               message_id,
               extractor,
               extractor_version,
@@ -3457,10 +3968,15 @@ export class MirrorRepository {
               evidence_key,
               evidence_key_sha256,
               metadata,
+              protected_metadata,
+              protected_metadata_version,
+              protected_metadata_key_version,
+              protected_metadata_tokens,
               created_at,
               updated_at
             )
             SELECT
+              input.id,
               input.message_id,
               input.extractor,
               input.extractor_version,
@@ -3469,9 +3985,17 @@ export class MirrorRepository {
               input.evidence_key,
               input.evidence_key_sha256,
               input.metadata,
+              CASE
+                WHEN input.protected_metadata_base64 IS NULL THEN NULL
+                ELSE decode(input.protected_metadata_base64, 'base64')
+              END,
+              input.protected_metadata_version,
+              input.protected_metadata_key_version,
+              input.protected_metadata_tokens,
               now(),
               now()
             FROM jsonb_to_recordset($1::jsonb) AS input (
+              id uuid,
               message_id uuid,
               extractor text,
               extractor_version text,
@@ -3479,16 +4003,24 @@ export class MirrorRepository {
               namespace text,
               evidence_key text,
               evidence_key_sha256 text,
-              metadata jsonb
+              metadata jsonb,
+              protected_metadata_base64 text,
+              protected_metadata_version smallint,
+              protected_metadata_key_version integer,
+              protected_metadata_tokens jsonb
             )
             ON CONFLICT (message_id, extractor, kind, namespace, evidence_key_sha256)
             DO UPDATE SET
               extractor_version = EXCLUDED.extractor_version,
               evidence_key = EXCLUDED.evidence_key,
               metadata = EXCLUDED.metadata,
+              protected_metadata = EXCLUDED.protected_metadata,
+              protected_metadata_version = EXCLUDED.protected_metadata_version,
+              protected_metadata_key_version = EXCLUDED.protected_metadata_key_version,
+              protected_metadata_tokens = EXCLUDED.protected_metadata_tokens,
               updated_at = now()
             `,
-            [JSON.stringify(preparedEvidence)]
+            [JSON.stringify(protectedEvidence)]
           );
         }
         await client.query(
@@ -3508,7 +4040,7 @@ export class MirrorRepository {
                 AND current_evidence.evidence_key_sha256 = existing.evidence_key_sha256
             )
           `,
-          [body.messageId, MIME_EVIDENCE_EXTRACTOR, JSON.stringify(preparedEvidence)]
+          [body.messageId, MIME_EVIDENCE_EXTRACTOR, JSON.stringify(protectedEvidence)]
         );
       }
 
@@ -3705,7 +4237,7 @@ export class MirrorRepository {
     folder: ImapFolder,
     limit: number
   ): Promise<ImapMessage[]> {
-    const result = await this.pool.query<ImapMessage>(
+    const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
       `
       SELECT m.*
       FROM public.imap_messages m
@@ -3723,7 +4255,7 @@ export class MirrorRepository {
       `,
       [accountId, folder.path, limit, MIME_EVIDENCE_EXTRACTOR_VERSION]
     );
-    return result.rows;
+    return await Promise.all(result.rows.map((row) => this.revealMessage(row)));
   }
 
   async setHistoryBackfillSnapshot(
@@ -3835,7 +4367,7 @@ export class MirrorRepository {
     const params: unknown[] = [account.id, limit, MIME_EVIDENCE_EXTRACTOR_VERSION];
     if (policy === "priority_then_backfill") params.push(this.config.PRIORITY_CUTOFF);
 
-    const result = await this.pool.query<ImapMessage>(
+    const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
       `
       SELECT m.*
       FROM public.imap_messages m
@@ -3862,7 +4394,7 @@ export class MirrorRepository {
       `,
       params
     );
-    return result.rows;
+    return await Promise.all(result.rows.map((row) => this.revealMessage(row)));
   }
 
   async logEvent(

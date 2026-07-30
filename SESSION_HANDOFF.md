@@ -1,5 +1,46 @@
 # Session Handoff
 
+## 2026-07-30 — Neutral metadata-protection seam
+
+- Branch `fedster99/metadata-protection-adapter` adds the public-core half of
+  the Managed metadata-protection boundary. It defines an injectable neutral
+  adapter, a readable identity default, and migration
+  `0023_metadata_protection_seam`.
+- The migration adds nullable opaque envelope, envelope-version, key-version,
+  and exact-token columns to accounts, messages, message-body evidence,
+  attachments, structured evidence, thread assignments, and retained
+  assignment history. It adds no Tenant, hosted key, encryption algorithm, or
+  search-provider logic.
+- `MirrorRepository` routes account and sync-owned message, attachment, body
+  evidence, and structured-evidence writes through the adapter. It reveals
+  those rows on repository reads and removes internal envelope columns from
+  returned objects. The identity adapter keeps OSS and BYO Supabase readable
+  and leaves the new columns `NULL`.
+- ADR 0029 records the ownership boundary and activation rule. The seam alone
+  does not provide encryption. Managed Hosting must not activate it until the
+  private Cloud key/envelope implementation and every search, threading,
+  dashboard, MCP, and REST path are protected.
+- Review fixes merge retained protected Message-ID/reply values before replacing
+  an envelope, skip decryption when a first body-evidence row does not exist,
+  preserve legacy partial-row response behavior, and enforce the actual
+  PostgreSQL `smallint`/`integer` version bounds.
+- The final pre-merge review removed a plaintext-retention path during
+  readable-to-protected message upgrades. It also makes adapter writes and
+  reveals fail closed on missing or injected fields, records the required
+  authenticated context and stable equality semantics, preserves SQL `NULL`
+  body digests, and avoids an evidence lookup when no evidence exists.
+- The live protected-storage test now starts with a readable message, upgrades
+  the same stable rows through a context-bound opaque adapter, and proves that
+  the old threading headers do not remain readable.
+- Node 24 verification passed `pnpm harness:check`, root typecheck, 706 fast
+  tests, both builds, 198 live-Postgres tests, migration apply twice, and
+  120/120 spec-conformance checks. The live protected-storage test uses a
+  strict opaque test adapter and proves that later metadata sync retains
+  body-recovered Message-ID data.
+- Next: review and merge the public PR only with Federico's explicit approval.
+  Then wait for the immutable image and implement the private Cloud crypto and
+  storage PR before any activation.
+
 ## 2026-07-28 — Dependency security remediation
 
 - Branch `fedster99/fix-dependency-alerts` clears the 43 open GitHub
