@@ -215,6 +215,20 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     expect(error.outcome).toBe("not_delivered");
   });
 
+  it("marks a greeting timeout as not delivered", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("Greeting never received"), {
+        code: "ETIMEDOUT",
+        command: "CONN"
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+  });
+
   it("keeps an unqualified connection failure unknown", async () => {
     transport.sendMail.mockRejectedValueOnce(
       Object.assign(new Error("connection lost"), {

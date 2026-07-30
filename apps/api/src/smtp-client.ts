@@ -260,13 +260,14 @@ function classifySmtpFailure(error: unknown): SmtpDeliveryOutcome {
 
   const code = typeof smtpError.code === "string" ? smtpError.code.toUpperCase() : "";
   const syscall = typeof smtpError.syscall === "string" ? smtpError.syscall.toLowerCase() : "";
+  const command = typeof smtpError.command === "string" ? smtpError.command.toUpperCase() : "";
   // These failures prove that SMTP submission did not start.
   if (["EAUTH", "ETLS", "EDNS", "EREQUIRETLS"].includes(code)) return "not_delivered";
   if (code === "ESOCKET" && ["connect", "getaddrinfo"].includes(syscall)) {
     return "not_delivered";
   }
+  if (code === "ETIMEDOUT" && command === "CONN") return "not_delivered";
 
-  const command = typeof smtpError.command === "string" ? smtpError.command.toUpperCase() : "";
   if (command === "DATA" || command === "CONN") return "unknown";
   if (command) return "not_delivered";
 

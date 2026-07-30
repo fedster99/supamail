@@ -11,13 +11,15 @@
   lost final reply, or unqualified connection loss is `unknown`.
 - Real local SMTP integration tests accept DATA and then either drop the final
   reply or send an unterminated positive reply. They prove the server received
-  one message while the core reports `unknown`.
+  one message while the core reports `unknown`. A server that accepts TCP but
+  never sends its greeting proves zero accepted messages and reports
+  `not_delivered`.
 - The HTTP API and CLI expose the stable delivery outcome without provider
   details. Pre-SMTP errors from send and draft-send also carry the typed
   `not_delivered` outcome.
 - The private Cloud layer must store an operation before SMTP, retry only
   `not_delivered`, and never submit again after `unknown`.
-- Verification passed the harness check, API typecheck, 713 fast tests on
+- Verification passed the harness check, API typecheck, 725 fast tests on
   Vitest 3.2.7, the API build, the root build, and the GreenMail SMTP/IMAP
   smoke with live send and draft delivery. The local shell used Node 26 while
   the repository pins Node 24.

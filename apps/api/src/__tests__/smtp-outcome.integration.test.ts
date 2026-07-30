@@ -7,11 +7,13 @@ const servers: Array<ReturnType<typeof createServer>> = [];
 async function smtpServer({
   loseFinalResponse = false,
   truncatePositiveFinalResponse = false,
+  withholdGreeting = false,
 } = {}) {
   let acceptedMessages = 0;
   const server = createServer((socket: Socket) => {
     let buffer = "";
     let readingData = false;
+    if (withholdGreeting) return;
     socket.write("220 localhost ESMTP\r\n");
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
@@ -98,6 +100,31 @@ describe("SMTP outcome boundary", () => {
 
     expect(receipt.accepted).toEqual(["rcpt@example.test"]);
     expect(server.acceptedMessages()).toBe(1);
+  });
+
+  it("reports not delivered when the server never sends its greeting", async () => {
+    const server = await smtpServer({ withholdGreeting: true });
+    const error = await deliverSmtp(
+      {
+        host: "127.0.0.1",
+        port: server.port,
+        secure: false,
+        username: "sender",
+        password: "secret",
+      },
+      raw,
+      envelope,
+      config,
+      { isPrivateHost: true }
+    ).catch((value) => value);
+
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.cause).toMatchObject({
+      code: "ETIMEDOUT",
+      command: "CONN",
+    });
+    expect(error.outcome).toBe("not_delivered");
+    expect(server.acceptedMessages()).toBe(0);
   });
 
   it("reports unknown when the server accepts DATA but loses the final response", async () => {
