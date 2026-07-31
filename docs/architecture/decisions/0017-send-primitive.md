@@ -89,9 +89,9 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
 
 The single-tenant HTTP door (`POST /accounts/:id/send`, behind the existing
 `API_TOKEN` bearer) and the CLI verbs (`send` / `reply`, both requiring an
-explicit `--confirm`) are the OSS human-in-the-loop gates. Idempotency and the
-two-phase human-confirm token are cloud responsibilities (a fast-follow), not in
-this PR.
+explicit `--confirm`) are the OSS human-in-the-loop gates. Hosted Cloud owns its
+send permission and durable idempotency ledger. Those concerns do not enter the
+single-tenant core schema.
 
 This supersedes the **scope** (not the spirit) of ADR 0014/0016 for the new
 modules only: 0014's read-only agent surface and 0016's produce-only drafter
@@ -113,14 +113,26 @@ that surface, exactly as 0014 required any write capability to be a new decision
 - Once SMTP delivery is confirmed, Sent-appender logout/fallback-close failures
   are warnings in the delivered result, never thrown failures that invite a
   duplicate re-send.
-- Nodemailer transport close follows the same phase rule: `sendMail` failure still
-  throws, but `transporter.close()` failure after acceptance is reported through
-  the delivered result's warnings and never overwrites confirmation.
-- Double-send protection in v1 is the explicit `--confirm` (CLI) / single call
-  (HTTP); the `imap_send_attempts` idempotency ledger is a fast-follow.
+- Nodemailer transport close follows the same phase rule: `sendMail` failure
+  throws a typed outcome, but `transporter.close()` failure after acceptance is
+  reported through the delivered result's warnings and never overwrites
+  confirmation.
+- Core returns accepted recipients, rejected recipients, and the final SMTP
+  response. Only a complete SMTP 4xx or 5xx reply is a provider rejection. A
+  partial positive reply, a lost final reply, or an unqualified connection loss
+  has outcome `unknown`. A proven failure before submission, such as DNS,
+  authentication, TLS, connection setup, compose, or account lookup, has outcome
+  `not_delivered`.
+- SMTP connection and greeting setup keep the short `CONNECT_TIMEOUT_MS`.
+  Waiting for the final DATA response uses `SMTP_COMMAND_TIMEOUT_MS`, which
+  defaults to 10 minutes as required by RFC 5321. It does not reuse the
+  one-minute IMAP command timeout. A shorter final-response timeout can create a
+  false `unknown` result and invite a duplicate send.
+- Core does not retry. Cloud owns the durable operation ledger and Sent
+  reconciliation because it owns tenant-scoped hosted state.
 - The cloud re-pin inherits the primitive via `@supamail/api`; the cloud adds
-  tenant scoping (RLS over the `app.tenant_id` DSN) and the human-confirm MCP
-  tools — it never edits `imap_*` schema or the engine.
+  tenant scoping, send permission checks, and the durable operation ledger. It
+  never edits `imap_*` schema or the engine.
 
 ## Verification
 
@@ -135,13 +147,16 @@ that surface, exactly as 0014 required any write capability to be a new decision
   pre/post-confirmation liveness fault injection, deliver-before-append ordering,
   and post-delivery APPEND/close warning paths. `smtp-client.test.ts` separately
   proves transport-close failure cannot overwrite SMTP acceptance or the original
-  SMTP error.
+  SMTP error. `smtp-outcome.integration.test.ts` uses a local SMTP server to prove
+  that loss of the final response after accepted DATA returns `unknown`.
 - `send.live-db.test.ts` proves against real Postgres sessions that a competing
   advisory-lock owner prevents delivery, direct and draft sends contend on the
   same lock, the lock remains held through graceful/fallback teardown, and a
   heartbeat keeps a long send safe from stale-lock recovery before final release.
   It also proves a fault-injected false unlock evicts the client and releases the
   lock for another real session.
+- `smtp-outcome.integration.test.ts` delays a valid final `250` beyond the IMAP
+  command timeout and proves the independent SMTP timeout waits for it.
 - `host-validation.test.ts` covers `assertSafeSmtpTarget` SSRF rejection.
 - The GreenMail smoke (`scripts/greenmail-smoke.ts`) submits → APPENDs to Sent →
   syncs → asserts the mirrored Sent row is FETCHable (requires Docker).
@@ -150,13 +165,14 @@ that surface, exactly as 0014 required any write capability to be a new decision
 
 A whole-stack review hardened four send-path edges:
 
-- **Idempotency (documented, not built here).** `POST /send` is NOT retry-safe on its
-  own: when `req.messageId` is absent, `buildRawMime` stamps a fresh random Message-ID
-  each call, so a timeout-then-retry re-delivers a DUPLICATE with a different
-  Message-ID (undedupeable). A caller needing at-most-once delivery MUST supply a
-  stable `req.messageId` (a re-send then files the same id and the synced Sent copy
-  dedups). The full idempotency-key ledger stays a CLOUD/fast-follow concern
-  (email-001 design §2.9) — no new OSS infra. Documented in `send.ts`.
+- **SMTP outcome contract.** `POST /send` is not retry-safe on its own. A stable
+  Message-ID is only a reconciliation key; it does not stop SMTP from accepting
+  the same message twice. `deliverSmtp` returns the accepted/rejected recipient
+  receipt. It wraps failures in `SmtpDeliveryError`: proven non-delivery is
+  `not_delivered`; an ambiguous final result is `unknown`. The HTTP API and CLI
+  expose this outcome without provider details. Callers may retry only
+  `not_delivered`. The Cloud wrapper owns the tenant-scoped idempotency ledger
+  and never resubmits `unknown`.
 - **STARTTLS decoupled from the private-hosts opt-in.** `deliverSmtp`'s
   `requireTLS` no longer keys off `IMAP_ALLOW_PRIVATE_HOSTS`. A non-implicit-TLS host
   that resolved PUBLIC keeps `requireTLS=true` even when the opt-in is set (so a
@@ -193,3 +209,5 @@ A whole-stack review hardened four send-path edges:
 - `apps/api/src/send.ts`, `apps/api/src/smtp-client.ts`,
   `apps/api/supabase/migrations/public/0009_smtp_send.sql`.
 - RFC 5322 §3.6.4 (message threading: In-Reply-To / References).
+- RFC 5321 §4.5.3.2.6 (10-minute timeout for the final DATA response).
+- RFC 1047 (the final-response synchronization gap and duplicate mail).

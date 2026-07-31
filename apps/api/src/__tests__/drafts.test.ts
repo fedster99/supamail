@@ -33,7 +33,11 @@ const mocks = vi.hoisted(() => ({
     source: "fetch" as const,
     truncated: false
   })),
-  deliverSmtp: vi.fn(async (_creds: unknown, _raw: Buffer, _envelope: unknown, _config: unknown, _opts?: unknown) => undefined),
+  deliverSmtp: vi.fn(async (_creds: unknown, _raw: Buffer, _envelope: unknown, _config: unknown, _opts?: unknown) => ({
+    accepted: ["rcpt@example.test"],
+    rejected: [],
+    response: "250 queued"
+  })),
   resolveSmtpCreds: vi.fn(async (_pool: unknown, _config: unknown, _account: unknown) => ({
     host: "smtp.example.test",
     port: 587,
@@ -131,7 +135,11 @@ beforeEach(() => {
     source: "fetch",
     truncated: false
   });
-  mocks.deliverSmtp.mockResolvedValue(undefined);
+  mocks.deliverSmtp.mockResolvedValue({
+    accepted: ["rcpt@example.test"],
+    rejected: [],
+    response: "250 queued"
+  });
   mocks.resolveSmtpCreds.mockResolvedValue({
     host: "smtp.example.test", port: 587, secure: false, username: "user@example.test", password: "secret"
   });
@@ -429,7 +437,15 @@ describe("sendDraft", () => {
     const deliverOrder = mocks.deliverSmtp.mock.invocationCallOrder[0];
     const deleteOrder = mocks.deleteMessage.mock.invocationCallOrder[0];
     expect(deliverOrder).toBeLessThan(deleteOrder);
-    expect(result).toMatchObject({ deletedDraftId: "draft-1", send: { delivered: true } });
+    expect(result).toMatchObject({
+      deletedDraftId: "draft-1",
+      send: {
+        delivered: true,
+        accepted: ["rcpt@example.test"],
+        rejected: [],
+        smtpResponse: "250 queued"
+      }
+    });
   });
 
   it("SENT bytes CONTAIN the draft body — the regression that caused the empty send", async () => {
@@ -482,7 +498,11 @@ describe("sendDraft", () => {
       messageId: "draft-1", raw: Buffer.from("From: user@example.test\r\n\r\npartial"), source: "fetch", truncated: true
     });
     const { sendDraft } = await import("../drafts.js");
-    await expect(sendDraft(pool, config, "draft-1")).rejects.toThrow(/truncated/i);
+    const { SmtpDeliveryError } = await import("../smtp-client.js");
+    const error = await sendDraft(pool, config, "draft-1").catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+    expect(error.message).toMatch(/truncated/i);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
@@ -492,7 +512,11 @@ describe("sendDraft", () => {
     // e.g. a UIDVALIDITY mismatch, or the draft vanished from the Drafts folder.
     mocks.getRawMime.mockRejectedValueOnce(new Error("UIDVALIDITY changed for Drafts"));
     const { sendDraft } = await import("../drafts.js");
-    await expect(sendDraft(pool, config, "draft-1")).rejects.toThrow(/UIDVALIDITY/);
+    const { SmtpDeliveryError } = await import("../smtp-client.js");
+    const error = await sendDraft(pool, config, "draft-1").catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+    expect(error.message).toMatch(/UIDVALIDITY/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
@@ -542,6 +566,7 @@ describe("sendDraft", () => {
     });
     mocks.deliverSmtp.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
+      return { accepted: ["rcpt@example.test"], rejected: [], response: "250 queued" };
     });
     mocks.append.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);

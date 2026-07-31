@@ -15,7 +15,11 @@ import type { SendRequest } from "../types.js";
  */
 
 const transport = vi.hoisted(() => ({
-  sendMail: vi.fn(async () => undefined),
+  sendMail: vi.fn(async () => ({
+    accepted: ["rcpt@example.test"],
+    rejected: [] as string[],
+    response: "250 2.0.0 queued"
+  })),
   close: vi.fn()
 }));
 const createTransport = vi.hoisted(() =>
@@ -93,12 +97,20 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     password: "p"
   };
   const envelope = { from: "sender@example.test", to: ["rcpt@example.test"] };
-  const config = { CONNECT_TIMEOUT_MS: 1000, IMAP_COMMAND_TIMEOUT_MS: 1000 } as never;
+  const config = {
+    CONNECT_TIMEOUT_MS: 1_000,
+    IMAP_COMMAND_TIMEOUT_MS: 1_000,
+    SMTP_COMMAND_TIMEOUT_MS: 600_000
+  } as never;
 
   beforeEach(() => {
     createTransport.mockClear();
     transport.sendMail.mockReset();
-    transport.sendMail.mockResolvedValue(undefined);
+    transport.sendMail.mockResolvedValue({
+      accepted: ["rcpt@example.test"],
+      rejected: [] as string[],
+      response: "250 2.0.0 queued"
+    });
     transport.close.mockReset();
     transport.close.mockImplementation(() => undefined);
   });
@@ -108,6 +120,14 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     await deliverSmtp(creds, Buffer.from("raw"), envelope, config);
     expect(createTransport).toHaveBeenCalledTimes(1);
     expect(createTransport.mock.calls[0][0]).toMatchObject({ requireTLS: true, secure: false });
+  });
+
+  it("uses the SMTP timeout while it waits for the final delivery response", async () => {
+    const { deliverSmtp } = await import("../smtp-client.js");
+    await deliverSmtp(creds, Buffer.from("raw"), envelope, config);
+    expect(createTransport.mock.calls[0][0]).toMatchObject({
+      socketTimeout: 600_000
+    });
   });
 
   it("keeps requireTLS=true for a PUBLIC host even when isPrivateHost=false is explicit (the opt-in must NOT drop TLS)", async () => {
@@ -146,5 +166,107 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     });
     const { deliverSmtp } = await import("../smtp-client.js");
     await expect(deliverSmtp(creds, Buffer.from("raw"), envelope, config)).rejects.toThrow(/SMTP rejected message/);
+  });
+
+  it("returns the accepted and rejected recipients from SMTP", async () => {
+    transport.sendMail.mockResolvedValueOnce({
+      accepted: ["one@example.test"],
+      rejected: ["two@example.test"],
+      response: "250 2.0.0 queued"
+    });
+    const { deliverSmtp } = await import("../smtp-client.js");
+
+    await expect(deliverSmtp(creds, Buffer.from("raw"), envelope, config)).resolves.toEqual({
+      accepted: ["one@example.test"],
+      rejected: ["two@example.test"],
+      response: "250 2.0.0 queued"
+    });
+  });
+
+  it("marks an explicit SMTP rejection as not delivered", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("550 rejected"), {
+        code: "EENVELOPE",
+        command: "RCPT TO",
+        responseCode: 550
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+  });
+
+  it("marks a lost response after DATA as unknown", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("socket timed out"), {
+        code: "ETIMEDOUT",
+        command: "DATA"
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("unknown");
+  });
+
+  it("marks a proven pre-connect socket failure as not delivered", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("connection refused"), {
+        code: "ESOCKET",
+        command: "CONN",
+        syscall: "connect"
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+  });
+
+  it("marks a greeting timeout as not delivered", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("Greeting never received"), {
+        code: "ETIMEDOUT",
+        command: "CONN"
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("not_delivered");
+  });
+
+  it("keeps an unqualified connection failure unknown", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("connection lost"), {
+        code: "ECONNECTION",
+        command: "CONN"
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("unknown");
+  });
+
+  it("keeps a partial positive response unknown", async () => {
+    transport.sendMail.mockRejectedValueOnce(
+      Object.assign(new Error("connection closed after partial reply"), {
+        code: "ECONNECTION",
+        command: "CONN",
+        responseCode: 250
+      })
+    );
+    const { deliverSmtp, SmtpDeliveryError } = await import("../smtp-client.js");
+
+    const error = await deliverSmtp(creds, Buffer.from("raw"), envelope, config).catch((value) => value);
+    expect(error).toBeInstanceOf(SmtpDeliveryError);
+    expect(error.outcome).toBe("unknown");
   });
 });

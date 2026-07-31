@@ -9,7 +9,14 @@ import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
 import { deleteMessage } from "./mailbox-mutations.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
-import { SentFolderAppender, buildRawMime, deliverSmtp, domainOf, resolveSmtpCreds } from "./smtp-client.js";
+import {
+  SentFolderAppender,
+  SmtpDeliveryError,
+  buildRawMime,
+  deliverSmtp,
+  domainOf,
+  resolveSmtpCreds
+} from "./smtp-client.js";
 import type { ImapAccount, SendRequest, SendResult } from "./types.js";
 
 /**
@@ -472,6 +479,38 @@ export async function sendDraft(
   config: AppConfig,
   messageId: string
 ): Promise<SendDraftResult> {
+  let deliveryConfirmed = false;
+  try {
+    return await sendDraftAttempt(pool, config, messageId, () => {
+      deliveryConfirmed = true;
+    });
+  } catch (error) {
+    if (error instanceof SmtpDeliveryError) throw error;
+    if (
+      !deliveryConfirmed &&
+      [
+        "AccountBusyError",
+        "HostValidationError",
+        "NoRecipientsError",
+        "NotFoundError"
+      ].includes(error instanceof Error ? error.name : "")
+    ) {
+      throw error;
+    }
+    throw new SmtpDeliveryError(
+      deliveryConfirmed ? "unknown" : "not_delivered",
+      error instanceof Error ? error.message : "Mail delivery failed",
+      { cause: error }
+    );
+  }
+}
+
+async function sendDraftAttempt(
+  pool: PgPool,
+  config: AppConfig,
+  messageId: string,
+  confirmDelivery: () => void
+): Promise<SendDraftResult> {
   const draft = await getDraft(pool, config, messageId);
   if (!draft) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (draft.toEmails.length === 0) {
@@ -514,10 +553,11 @@ export async function sendDraft(
     // Re-prove heartbeat + session ownership immediately before crossing the
     // irreversible SMTP boundary (the raw fetch may have taken time).
     await lock.assertLive();
-    await deliverSmtp(creds, raw, envelope, config, {
+    const delivery = await deliverSmtp(creds, raw, envelope, config, {
       isPrivateHost,
       onPostDeliveryWarning: addWarning
     });
+    confirmDelivery();
     lock.confirmIrreversible();
 
     let appendedToSent = false;
@@ -568,6 +608,9 @@ export async function sendDraft(
       // The resent bytes carry the draft's ORIGINAL Message-ID (no recompose).
       rfcMessageId: draft.rfcMessageId ?? "",
       delivered: true,
+      accepted: delivery.accepted,
+      rejected: delivery.rejected,
+      smtpResponse: delivery.response,
       appendedToSent,
       appendedUid,
       sentFolderPath,

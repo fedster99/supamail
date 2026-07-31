@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SmtpDeliveryError } from "../smtp-client.js";
 
 /**
  * Behavioral coverage for the CLI verbs (email-001/002/003/004). cli.ts is a
@@ -200,6 +201,32 @@ describe("the --confirm send gate", () => {
     expect(libs.sendDraft).toHaveBeenCalledTimes(1);
     expect(libs.sendDraft.mock.calls[0][2]).toBe("d1");
   });
+
+  it.each(["not_delivered", "unknown"] as const)(
+    "prints a machine-readable %s delivery outcome",
+    async (outcome) => {
+      libs.sendMessage.mockRejectedValueOnce(
+        new SmtpDeliveryError(outcome, "private provider detail")
+      );
+
+      await runCli(
+        "send",
+        "--account-id",
+        "acc-1",
+        "--to",
+        "rcpt@example.test",
+        "--subject",
+        "Hi",
+        "--body",
+        "Hello",
+        "--confirm"
+      );
+
+      expect(process.exitCode).toBe(1);
+      expect(JSON.parse(stderr)).toMatchObject({ outcome });
+      expect(stderr).not.toContain("private provider detail");
+    }
+  );
 });
 
 describe("attachment flag → SendAttachment shape", () => {

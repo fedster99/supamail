@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
 import { MailboxCapabilityError, MailboxMutationError } from "../mailbox-mutations.js";
+import { SmtpDeliveryError } from "../smtp-client.js";
 import type {
   AccountDetails,
   AccountSummary,
@@ -149,6 +150,7 @@ function buildApp(options: {
   listAccounts?: () => Promise<AccountSummary[]>;
   applyMigration?: () => Promise<void>;
   send?: (req: unknown) => Promise<unknown>;
+  draftSend?: (messageId: string) => Promise<unknown>;
 } = {}) {
   const account = options.account === undefined ? makeAccount() : options.account;
   const accountDetails = options.accountDetails === undefined
@@ -203,10 +205,10 @@ function buildApp(options: {
     update: vi.fn(async (id: string) => ({
       accountId, draftsFolderPath: "Drafts", rfcMessageId: "<draft2@example.test>", appendedUid: 6, replacedMessageId: id
     })),
-    send: vi.fn(async (id: string) => ({
+    send: vi.fn(options.draftSend ?? (async (id: string) => ({
       send: { rfcMessageId: "<sent@example.test>", delivered: true, appendedToSent: true, appendedUid: 1, sentFolderPath: "Sent", warnings: [] },
       deletedDraftId: id
-    })),
+    }))),
     delete: vi.fn(async (id: string) => ({ messageId: id, fromFolder: "Drafts" }))
   };
   const mutations = {
@@ -682,6 +684,59 @@ describe("API safety", () => {
     await expect(res.json()).resolves.toMatchObject({ error: "account_busy" });
     expect(send).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    ["not_delivered", 502, "delivery_failed"],
+    ["unknown", 409, "delivery_unknown"],
+  ] as const)(
+    "maps a direct-send %s outcome without provider details",
+    async (outcome, status, code) => {
+      const { app } = buildApp({
+        send: async () => {
+          throw new SmtpDeliveryError(outcome, "private provider detail");
+        }
+      });
+
+      const res = await app.request(`/accounts/${accountId}/send`, {
+        method: "POST",
+        headers: { ...auth(), "content-type": "application/json" },
+        body: JSON.stringify({
+          to: [{ email: "x@example.test" }],
+          subject: "Hi",
+          body: { format: "plain", text: "y" }
+        })
+      });
+
+      expect(res.status).toBe(status);
+      const body = await res.json();
+      expect(body).toMatchObject({ error: code, outcome });
+      expect(JSON.stringify(body)).not.toContain("private provider detail");
+    }
+  );
+
+  it.each([
+    ["not_delivered", 502, "delivery_failed"],
+    ["unknown", 409, "delivery_unknown"],
+  ] as const)(
+    "maps a draft-send %s outcome without provider details",
+    async (outcome, status, code) => {
+      const { app } = buildApp({
+        draftSend: async () => {
+          throw new SmtpDeliveryError(outcome, "private provider detail");
+        }
+      });
+
+      const res = await app.request(`/drafts/${messageId}/send`, {
+        method: "POST",
+        headers: auth()
+      });
+
+      expect(res.status).toBe(status);
+      const body = await res.json();
+      expect(body).toMatchObject({ error: code, outcome });
+      expect(JSON.stringify(body)).not.toContain("private provider detail");
+    }
+  );
 
   it("gates the draft routes behind the API token", async () => {
     const { app, drafts } = buildApp();
