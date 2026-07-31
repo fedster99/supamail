@@ -58,6 +58,11 @@ const config = {
   STALE_HEARTBEAT_MS: 200
 } as AppConfig;
 const ACCOUNT_EMAIL = `send-lock-live-${process.pid}@example.test`;
+const SMTP_RECEIPT = {
+  accepted: ["recipient@example.test"],
+  rejected: [],
+  response: "250 OK"
+};
 
 liveDb("send account lock (live DB)", () => {
   let pool: ReturnType<typeof getPool>;
@@ -111,7 +116,7 @@ liveDb("send account lock (live DB)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.deliverSmtp.mockResolvedValue(undefined);
+    mocks.deliverSmtp.mockResolvedValue(SMTP_RECEIPT);
     mocks.appenderAppend.mockResolvedValue({ uid: 42 });
     mocks.appenderList.mockResolvedValue([{ path: "Sent", specialUse: "\\Sent" }]);
     mocks.appenderLogout.mockResolvedValue(undefined);
@@ -160,6 +165,7 @@ liveDb("send account lock (live DB)", () => {
   it("keeps the real session lock held through delivery, APPEND, graceful teardown, then releases it", async () => {
     mocks.deliverSmtp.mockImplementationOnce(async () => {
       expect(await anotherSessionCanAcquireLock()).toBe(false);
+      return SMTP_RECEIPT;
     });
     mocks.appenderAppend.mockImplementationOnce(async () => {
       expect(await anotherSessionCanAcquireLock()).toBe(false);
@@ -216,6 +222,7 @@ liveDb("send account lock (live DB)", () => {
     mocks.deliverSmtp.mockImplementationOnce(async () => {
       deliveryEntered();
       await deliveryMayFinish;
+      return SMTP_RECEIPT;
     });
 
     const { sendMessage } = await import("../send.js");
@@ -250,6 +257,7 @@ liveDb("send account lock (live DB)", () => {
     mocks.deliverSmtp.mockImplementationOnce(async () => {
       draftDeliveryEntered();
       await draftDeliveryMayFinish;
+      return SMTP_RECEIPT;
     });
 
     const { sendDraft } = await import("../drafts.js");
