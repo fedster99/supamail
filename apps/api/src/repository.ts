@@ -31,6 +31,7 @@ import {
   splitFlagWriteBatches,
   splitMetadataWriteBatches
 } from "./sync-limits.js";
+import { diagnosticErrorCode, sanitizeErrorReason } from "./sync-diagnostics.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -55,7 +56,6 @@ import type {
 const BROKEN_FAILURE_THRESHOLD = 10;
 const BACKOFF_FLOOR_MS = 1_000;
 const BACKOFF_CEILING_MS = 5 * 60_000;
-const ERROR_REASON_MAX_LEN = 1000;
 const MANUAL_TRACK_OVERRIDE_NOTE = "manual_track_override";
 const MISSING_MAILBOX_VERIFICATION_NOTE = "missing_mailbox_pending_verification";
 const DEFAULT_METADATA_WRITE_TIMEOUT_MS = 5 * 60_000;
@@ -133,7 +133,6 @@ function selectMetadataValues(
   );
 }
 
-const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
 
 const METADATA_WRITE_TIMEOUT_ERROR = "metadata write deadline exceeded";
 const FLAG_SCAN_TIMEOUT_ERROR = "FLAG_SCAN_TOTAL_TIMEOUT_MS exceeded during flag scan write";
@@ -486,41 +485,7 @@ interface PurgeQueueTarget {
   account_id: string;
 }
 
-export function sanitizeErrorReason(error: string): string {
-  return error
-    .replace(CREDENTIAL_LEAK_PATTERN, "$1 [REDACTED]")
-    .replace(/[\x00-\x1F\x7F]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, ERROR_REASON_MAX_LEN);
-}
-
-/**
- * Return a bounded operational code for durable sync diagnostics.
- * Provider text remains transient because it can contain mailbox metadata.
- */
-export function diagnosticErrorCode(error: string): string {
-  const normalized = sanitizeErrorReason(error);
-  if (/AUTH_ERROR|AUTHENTICAT|INVALID CREDENTIAL|LOGIN FAILED/i.test(normalized)) {
-    return "AUTH_ERROR";
-  }
-  if (/RATE.?LIMIT|THROTTL|TOO MANY REQUESTS/i.test(normalized)) {
-    return "RATE_LIMITED";
-  }
-  if (/TIMEOUT|TIMED OUT|DEADLINE EXCEEDED/i.test(normalized)) {
-    return "SYNC_TIMEOUT";
-  }
-  if (/CERTIFICATE|\bTLS\b|\bSSL\b/i.test(normalized)) {
-    return "TLS_ERROR";
-  }
-  if (/MAILBOX.*(?:MISSING|NOT FOUND|DOES NOT EXIST)|NO SUCH MAILBOX|NONEXISTENT/i.test(normalized)) {
-    return "MAILBOX_MISSING";
-  }
-  if (/ECONN|ENOTFOUND|EAI_AGAIN|CONNECTION|DISCONNECT/i.test(normalized)) {
-    return "CONNECTION_ERROR";
-  }
-  return "SYNC_ERROR";
-}
+export { diagnosticErrorCode, sanitizeErrorReason } from "./sync-diagnostics.js";
 
 /** Resolved IMAP connection coordinates + the chosen provider profile id for a new
  * account (the twin of {@link import("./smtp-client.js").ResolvedSmtpCreds}). */

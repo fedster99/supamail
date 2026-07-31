@@ -3,7 +3,8 @@ import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
 import { closePool, getPool, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
-import { diagnosticErrorCode, MirrorRepository } from "./repository.js";
+import { MirrorRepository } from "./repository.js";
+import { diagnosticErrorCode } from "./sync-diagnostics.js";
 import { MirrorEngine } from "./sync-engine.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import {
@@ -199,8 +200,8 @@ function loggedOutcome(result: WorkerSyncResult) {
 /**
  * Emit severity-correct per-account outcomes for log backends such as Render while
  * retaining the aggregate tick event used for throughput and duration analysis.
- * Sanitize again at the logging boundary so an injected/alternate WorkerEngine cannot
- * bypass the same credential and control-character policy used by MirrorEngine.
+ * Classify again at the logging boundary so an injected or alternate WorkerEngine
+ * cannot put provider text into the log backend.
  */
 export function logSyncTick(
   results: WorkerSyncResult[],
