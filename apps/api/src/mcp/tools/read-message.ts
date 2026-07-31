@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import {
-  ATTACHMENTS_AGG,
+  loadMessageAttachments,
   mapMessageRow,
   syncTrustFor,
   toolError,
@@ -12,6 +12,13 @@ import {
   type ToolEntry
 } from "../shared.js";
 import type { SyncTrust } from "../../search/index.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "../../metadata-protection.js";
 
 /**
  * Zod schema for `read_message`. The handler validates raw tool arguments
@@ -32,7 +39,7 @@ export const readMessageRequestSchema = z
  * caller asks). Bodies come from the LEFT JOIN (I2); attachments are aggregated
  * by the subquery (all dispositions, incl. inline — I9).
  */
-interface ReadMessageRow extends MessageDetailRow {
+interface ReadMessageRow extends MessageDetailRow, ProtectedMetadataColumns {
   headers_json: Record<string, unknown> | null;
 }
 
@@ -109,7 +116,8 @@ export const readMessageDefinition: ToolDefinition = {
  */
 export async function runReadMessage(
   pool: PgPool,
-  args: unknown
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<(MessageDetail & { sync_trust: SyncTrust }) | ReturnType<typeof toolError>> {
   const request = readMessageRequestSchema.parse(args);
   const includeHeaders = request.include_headers ?? false;
@@ -132,25 +140,38 @@ export async function runReadMessage(
         m.window_status,
         m.internal_date,
         m.headers_json,
+        m.protected_metadata,
+        m.protected_metadata_version,
+        m.protected_metadata_key_version,
+        m.protected_metadata_tokens,
         b.body_text,
         b.body_plain,
-        b.selected_text_part,
-        ${ATTACHMENTS_AGG}
+        b.selected_text_part
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
       `,
       [request.message_id]
     );
-    return result.rows[0] ?? null;
+    const row = result.rows[0] ?? null;
+    if (!row) return null;
+    const attachments = await loadMessageAttachments(client, [row.id], metadataProtection);
+    return { ...row, attachments: attachments.get(row.id) ?? [] };
   });
 
   if (!row) {
     return toolError("not_found", `No mirrored message with id ${request.message_id}.`, "call search_email to locate the message id");
   }
 
-  const headers = includeHeaders ? projectHeaders(row.headers_json) : undefined;
-  const detail = mapMessageRow(row, { includeQuoted, headers });
+  const revealed = await revealMetadataRecord(
+    metadataProtection,
+    { kind: "message", accountId: row.account_id, recordId: row.id },
+    row,
+    METADATA_PROTECTED_FIELDS.message
+  );
+  const served = { ...revealed, provider_thread_id: row.provider_thread_id };
+  const headers = includeHeaders ? projectHeaders(served.headers_json) : undefined;
+  const detail = mapMessageRow(served, { includeQuoted, headers });
   const sync_trust = await syncTrustFor(pool, [row.account_id]);
 
   return { ...detail, sync_trust };

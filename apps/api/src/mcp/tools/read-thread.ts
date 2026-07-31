@@ -4,7 +4,14 @@ import type { SyncTrust } from "../../search/index.js";
 import { buildSyncTrust } from "../../search/index.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
 import type { MessageAttachment, MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
-import { ATTACHMENTS_AGG, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
+import { loadMessageAttachments, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "../../metadata-protection.js";
 
 /**
  * `read_thread` — reassemble a conversation from the mirror and return every
@@ -71,15 +78,18 @@ const THREAD_SELECT = `
   m.flags,
   m.window_status,
   m.internal_date,
+  m.protected_metadata,
+  m.protected_metadata_version,
+  m.protected_metadata_key_version,
+  m.protected_metadata_tokens,
   b.body_text,
   b.body_plain,
   b.selected_text_part,
-  ${ATTACHMENTS_AGG},
   stats.total_count AS thread_total_count,
   stats.participants AS thread_participants
 `;
 
-type ThreadRow = MessageDetailRow & {
+type ThreadRow = MessageDetailRow & ProtectedMetadataColumns & {
   conversation_id: string | null;
   thread_total_count: number | string | null;
   thread_participants: string[] | null;
@@ -393,7 +403,11 @@ async function fetchThreadRows(
   return summarizeFetchedRows(result.rows);
 }
 
-export async function runReadThread(pool: PgPool, args: unknown): Promise<ReadThreadResult | ReturnType<typeof toolError>> {
+export async function runReadThread(
+  pool: PgPool,
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<ReadThreadResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
     input = readThreadRequestSchema.parse(args ?? {});
@@ -501,7 +515,21 @@ export async function runReadThread(pool: PgPool, args: unknown): Promise<ReadTh
     // sync_trust computed inside the open tx (buildSyncTrust) to avoid a second connection; syncTrustFor is the standalone equivalent.
     const syncTrust = await buildSyncTrust(client, accountIds);
 
-    const rows = fetched.rows;
+    const attachments = await loadMessageAttachments(
+      client,
+      fetched.rows.map((row) => row.id),
+      metadataProtection
+    );
+    const rows = await Promise.all(fetched.rows.map(async (row) => ({
+      ...await revealMetadataRecord(
+        metadataProtection,
+        { kind: "message", accountId: row.account_id, recordId: row.id },
+        row,
+        METADATA_PROTECTED_FIELDS.message
+      ),
+      provider_thread_id: row.provider_thread_id,
+      attachments: attachments.get(row.id) ?? []
+    })));
     const totalCount = fetched.totalCount;
     // SQL already keeps the newest messages; retain a defensive cap for injected
     // test clients and restore no additional database work in production.
@@ -528,7 +556,7 @@ export async function runReadThread(pool: PgPool, args: unknown): Promise<ReadTh
         conversation_id: resolvedConversationId,
         provider_thread_id: providerThreadId,
         subject,
-        participants: fetched.participants,
+        participants: collectParticipants(rows),
         message_count: totalCount
       },
       messages,

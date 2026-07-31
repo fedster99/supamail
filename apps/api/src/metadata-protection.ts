@@ -8,6 +8,43 @@ export const METADATA_RECORD_KINDS = [
   "thread_assignment_history"
 ] as const;
 
+export const METADATA_PROTECTED_FIELDS = Object.freeze({
+  account: ["email_address", "username", "smtp_username"],
+  accountSummary: ["email_address"],
+  message: [
+    "rfc_message_id",
+    "message_id_normalized",
+    "provider_message_id",
+    "provider_message_id_namespace",
+    "provider_thread_id",
+    "provider_thread_id_namespace",
+    "in_reply_to",
+    "references_header",
+    "subject",
+    "from_email",
+    "from_name",
+    "to_emails",
+    "to_names",
+    "cc_emails",
+    "cc_names",
+    "bcc_emails",
+    "headers_json",
+    "mime_structure"
+  ],
+  messageBody: [
+    "raw_mime_sha256",
+    "parsed_delivery_sha256",
+    "authored_delivery_sha256",
+    "headers_json",
+    "mime_structure",
+    "parser_warnings",
+    "structured_evidence_sha256",
+    "threading_payload_sha256",
+    "search_extract"
+  ],
+  attachment: ["filename", "content_id"]
+} as const);
+
 export type MetadataRecordKind = typeof METADATA_RECORD_KINDS[number];
 export type MetadataValues = Record<string, unknown>;
 
@@ -46,6 +83,8 @@ export interface MetadataProtectionProjection {
 }
 
 export interface MetadataProtectionAdapter {
+  /** Durable write mode. A plaintext-mode adapter may still read protected rows during migration. */
+  readonly storageMode?: "plaintext" | "protected";
   /**
    * A protected adapter must authenticate kind, accountId, recordId, envelope
    * version, and key version as unambiguous associated data.
@@ -78,6 +117,7 @@ export const EMPTY_PROTECTED_METADATA_COLUMNS: ProtectedMetadataColumns = Object
 });
 
 export class PlaintextMetadataProtectionAdapter implements MetadataProtectionAdapter {
+  readonly storageMode = "plaintext" as const;
   async protect(
     _context: MetadataProtectionContext,
     values: MetadataValues
@@ -109,7 +149,9 @@ export const plaintextMetadataProtection = new PlaintextMetadataProtectionAdapte
 
 export function isPlaintextMetadataProtectionAdapter(
   adapter: MetadataProtectionAdapter
-): adapter is PlaintextMetadataProtectionAdapter {
+): boolean {
+  if (adapter.storageMode === "plaintext") return true;
+  if (adapter.storageMode === "protected") return false;
   return adapter instanceof PlaintextMetadataProtectionAdapter;
 }
 
@@ -231,4 +273,29 @@ export function storedMetadataProjection(
   };
   assertMetadataProtectionProjection(projection);
   return projection;
+}
+
+/**
+ * Reveal one durable row after a read. Public serving helpers use this shared
+ * boundary so Cloud can inject protection without wrapping arbitrary SQL.
+ */
+export async function revealMetadataRecord<T extends ProtectedMetadataColumns>(
+  adapter: MetadataProtectionAdapter,
+  context: MetadataProtectionContext,
+  row: T,
+  fields: readonly string[]
+): Promise<T> {
+  const record = row as unknown as Record<string, unknown>;
+  const values = Object.fromEntries(fields.map((field) => [field, record[field]]));
+  const revealed = usesPlaintextMetadataStorage(adapter, row)
+    ? values
+    : await adapter.reveal(context, storedMetadataProjection(row, values));
+  assertRevealedMetadataValues(revealed, fields);
+  const result = { ...record };
+  for (const field of fields) result[field] = revealed[field];
+  delete result.protected_metadata;
+  delete result.protected_metadata_version;
+  delete result.protected_metadata_key_version;
+  delete result.protected_metadata_tokens;
+  return result as unknown as T;
 }

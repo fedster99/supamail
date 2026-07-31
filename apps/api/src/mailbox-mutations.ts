@@ -6,6 +6,13 @@ import { closeImap, connectImap, uidValidityMatches, uidValidityMismatchMessage 
 import { loadMessageAndAccount } from "./message-loader.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "./metadata-protection.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
 
@@ -357,7 +364,8 @@ export async function setMessageFlags(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  change: FlagChange
+  change: FlagChange,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<FlagResult> {
   const add = (change.add ?? []).map(toImapFlag);
   const remove = (change.remove ?? []).map(toImapFlag);
@@ -365,7 +373,7 @@ export async function setMessageFlags(
     throw new Error("setMessageFlags requires at least one flag to add or remove");
   }
 
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
@@ -396,12 +404,13 @@ export async function moveMessage(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  destination: string
+  destination: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<MoveResult> {
   if (!destination || destination.trim().length === 0) {
     throw new Error("moveMessage requires a non-empty destination folder");
   }
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
@@ -434,9 +443,13 @@ export async function deleteMessage(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  options: { hard?: boolean } = {}
+  options: { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteResult> {
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(
+    pool,
+    config,
+    options.metadataProtection ?? plaintextMetadataProtection
+  );
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
@@ -485,7 +498,7 @@ interface ThreadMemberRow {
   uid: string;
 }
 
-type ThreadTargetSeedRow = ThreadSeedRow & { conversation_id: string | null };
+type ThreadTargetSeedRow = ThreadSeedRow & ProtectedMetadataColumns & { conversation_id: string | null };
 
 /**
  * Resolve every live (not deleted-in-provider) physical message row in the
@@ -496,7 +509,8 @@ type ThreadTargetSeedRow = ThreadSeedRow & { conversation_id: string | null };
  */
 async function resolveThreadTargets(
   pool: PgPool,
-  messageId: string
+  messageId: string,
+  metadataProtection: MetadataProtectionAdapter
 ): Promise<{ accountId: string; targets: ResolvedMessageTarget[]; truncated: boolean }> {
   const client: PgClient = await pool.connect();
   try {
@@ -508,6 +522,8 @@ async function resolveThreadTargets(
       `
       SELECT m.id, m.provider_thread_id, m.rfc_message_id, m.message_id_normalized,
              m.in_reply_to, m.references_header, m.account_id,
+             m.protected_metadata, m.protected_metadata_version,
+             m.protected_metadata_key_version, m.protected_metadata_tokens,
              assignment.conversation_id
       FROM public.imap_messages m
       LEFT JOIN public.imap_thread_active_assignments assignment
@@ -518,8 +534,14 @@ async function resolveThreadTargets(
       `,
       [messageId]
     );
-    const seed = seedResult.rows[0];
-    if (!seed) throw new NotFoundError(`Message not found: ${messageId}`);
+    const storedSeed = seedResult.rows[0];
+    if (!storedSeed) throw new NotFoundError(`Message not found: ${messageId}`);
+    const seed = storedSeed.conversation_id ? storedSeed : await revealMetadataRecord(
+      metadataProtection,
+      { kind: "message", accountId: storedSeed.account_id, recordId: storedSeed.id },
+      storedSeed,
+      METADATA_PROTECTED_FIELDS.message
+    );
 
     // Fetch MAX_THREAD_FANOUT + 1 so a full result tells us the thread was
     // truncated (the +1 row is dropped). Stored conversations intentionally do
@@ -599,7 +621,8 @@ export async function setThreadFlags(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  change: FlagChange
+  change: FlagChange,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<ThreadFlagResult> {
   const add = (change.add ?? []).map(toImapFlag);
   const remove = (change.remove ?? []).map(toImapFlag);
@@ -607,8 +630,8 @@ export async function setThreadFlags(
     throw new Error("setThreadFlags requires at least one flag to add or remove");
   }
 
-  const repository = new MirrorRepository(pool, config);
-  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
+  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
@@ -659,13 +682,14 @@ export async function moveThread(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  destination: string
+  destination: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<ThreadMoveResult> {
   if (!destination || destination.trim().length === 0) {
     throw new Error("moveThread requires a non-empty destination folder");
   }
-  const repository = new MirrorRepository(pool, config);
-  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
+  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
@@ -699,10 +723,11 @@ export async function createFolder(
   pool: PgPool,
   config: AppConfig,
   accountId: string,
-  path: string
+  path: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<FolderMutationResult> {
   if (!path || path.trim().length === 0) throw new Error("createFolder requires a non-empty path");
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
@@ -720,10 +745,11 @@ export async function renameFolder(
   config: AppConfig,
   accountId: string,
   path: string,
-  newPath: string
+  newPath: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<FolderMutationResult> {
   if (!path || !newPath) throw new Error("renameFolder requires both path and newPath");
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
@@ -740,10 +766,11 @@ export async function deleteFolder(
   pool: PgPool,
   config: AppConfig,
   accountId: string,
-  path: string
+  path: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<FolderMutationResult> {
   if (!path || path.trim().length === 0) throw new Error("deleteFolder requires a non-empty path");
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found: ${accountId}`);
 

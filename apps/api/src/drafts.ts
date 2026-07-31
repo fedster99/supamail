@@ -18,6 +18,13 @@ import {
   resolveSmtpCreds
 } from "./smtp-client.js";
 import type { ImapAccount, SendRequest, SendResult } from "./types.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "./metadata-protection.js";
 
 /**
  * Full draft CRUD saved to the provider Drafts folder (email-003, ADR 0019).
@@ -224,11 +231,12 @@ async function appendDraft(
 export async function createDraft(
   pool: PgPool,
   config: AppConfig,
-  input: DraftInput
+  input: DraftInput,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<CreateDraftResult> {
   rejectBcc(input);
   rejectAttachments(input);
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
 
@@ -243,7 +251,7 @@ export async function createDraft(
 }
 
 /** A mirrored Drafts-folder row, joined with its stored body for the get view. */
-interface DraftRow {
+interface DraftRow extends ProtectedMetadataColumns {
   id: string;
   account_id: string;
   folder_path: string;
@@ -316,7 +324,7 @@ export async function listDrafts(
   pool: PgPool,
   config: AppConfig,
   accountId: string,
-  options: { limit?: number } = {}
+  options: { limit?: number; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DraftSummary[]> {
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
   const client = await pool.connect();
@@ -328,6 +336,8 @@ export async function listDrafts(
         m.id, m.account_id, m.folder_path, m.uid, m.rfc_message_id, m.subject,
         m.from_email, m.to_emails, m.cc_emails, m.flags, m.in_reply_to,
         m.references_header, m.internal_date,
+        m.protected_metadata, m.protected_metadata_version,
+        m.protected_metadata_key_version, m.protected_metadata_tokens,
         NULL::text AS body_text, NULL::text AS body_html, NULL::text AS body_plain,
         NULL::text AS selected_text_part, NULL::text AS selected_text_format
       FROM public.imap_messages m
@@ -342,7 +352,15 @@ export async function listDrafts(
       `,
       [accountId, paths, limit]
     );
-    return result.rows.map(toSummary);
+    const metadataProtection = options.metadataProtection ?? plaintextMetadataProtection;
+    return Promise.all(result.rows.map(async (row) => toSummary(
+      await revealMetadataRecord(
+        metadataProtection,
+        { kind: "message", accountId: row.account_id, recordId: row.id },
+        row,
+        METADATA_PROTECTED_FIELDS.message
+      )
+    )));
   } finally {
     client.release();
   }
@@ -355,7 +373,8 @@ export async function listDrafts(
 export async function getDraft(
   pool: PgPool,
   config: AppConfig,
-  messageId: string
+  messageId: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<DraftDetail | null> {
   const client = await pool.connect();
   try {
@@ -365,6 +384,8 @@ export async function getDraft(
         m.id, m.account_id, m.folder_path, m.uid, m.rfc_message_id, m.subject,
         m.from_email, m.to_emails, m.cc_emails, m.flags, m.in_reply_to,
         m.references_header, m.internal_date,
+        m.protected_metadata, m.protected_metadata_version,
+        m.protected_metadata_key_version, m.protected_metadata_tokens,
         b.body_text, b.body_html, b.body_plain, b.selected_text_part, b.selected_text_format
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
@@ -373,8 +394,14 @@ export async function getDraft(
       `,
       [messageId]
     );
-    const row = result.rows[0];
-    if (!row) return null;
+    const storedRow = result.rows[0];
+    if (!storedRow) return null;
+    const row = await revealMetadataRecord(
+      metadataProtection,
+      { kind: "message", accountId: storedRow.account_id, recordId: storedRow.id },
+      storedRow,
+      METADATA_PROTECTED_FIELDS.message
+    );
 
     const paths = await draftFolderPaths(client, row.account_id);
     const isDraftFolder = paths.includes(row.folder_path);
@@ -412,11 +439,12 @@ export async function updateDraft(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  input: Omit<DraftInput, "accountId">
+  input: Omit<DraftInput, "accountId">,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<UpdateDraftResult> {
   rejectBcc(input);
   rejectAttachments(input);
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const existing = await repository.getMessage(messageId);
   if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (existing.deleted_in_provider) throw new Error(`Draft ${messageId} is already deleted in the provider`);
@@ -433,7 +461,7 @@ export async function updateDraft(
   const warnings: string[] = [];
   let replacedDraftDeleted = true;
   try {
-    await deleteMessage(pool, config, messageId, { hard: true });
+    await deleteMessage(pool, config, messageId, { hard: true, metadataProtection });
   } catch (error) {
     replacedDraftDeleted = false;
     warnings.push(
@@ -477,11 +505,12 @@ export async function updateDraft(
 export async function sendDraft(
   pool: PgPool,
   config: AppConfig,
-  messageId: string
+  messageId: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<SendDraftResult> {
   let deliveryConfirmed = false;
   try {
-    return await sendDraftAttempt(pool, config, messageId, () => {
+    return await sendDraftAttempt(pool, config, messageId, metadataProtection, () => {
       deliveryConfirmed = true;
     });
   } catch (error) {
@@ -509,15 +538,16 @@ async function sendDraftAttempt(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
+  metadataProtection: MetadataProtectionAdapter,
   confirmDelivery: () => void
 ): Promise<SendDraftResult> {
-  const draft = await getDraft(pool, config, messageId);
+  const draft = await getDraft(pool, config, messageId, metadataProtection);
   if (!draft) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (draft.toEmails.length === 0) {
     throw new NoRecipientsError(`Draft ${messageId} has no recipients; add a To address before sending`);
   }
 
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(draft.accountId);
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.accountId}`);
 
@@ -542,7 +572,7 @@ async function sendDraftAttempt(
     // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
     // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
     // body + HTML + formatting regardless of lazy mirror-body state.
-    const { raw, truncated } = await getRawMime(pool, config, messageId);
+    const { raw, truncated } = await getRawMime(pool, config, messageId, metadataProtection);
     if (truncated) {
       // Fail closed before SMTP: the capped bytes would be a corrupt MIME message.
       throw new Error(
@@ -632,7 +662,7 @@ async function sendDraftAttempt(
     }
     if (providerWorkAllowed) {
       try {
-        await deleteMessage(pool, config, messageId, { hard: true });
+        await deleteMessage(pool, config, messageId, { hard: true, metadataProtection });
         draftDeleted = true;
       } catch (error) {
         addWarning(
@@ -661,8 +691,8 @@ export async function deleteDraft(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  options: { hard?: boolean } = {}
+  options: { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
-  const result = await deleteMessage(pool, config, messageId, { hard: options.hard });
+  const result = await deleteMessage(pool, config, messageId, options);
   return { messageId: result.messageId, fromFolder: result.fromFolder };
 }

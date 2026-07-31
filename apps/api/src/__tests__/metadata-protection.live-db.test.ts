@@ -9,6 +9,10 @@ import type {
   MetadataValues
 } from "../metadata-protection.js";
 import { MirrorRepository } from "../repository.js";
+import { getMessageHeaders, listAttachments } from "../content.js";
+import { runDraftReply } from "../mcp/tools/draft-reply.js";
+import { runReadMessage } from "../mcp/tools/read-message.js";
+import { runReadThread } from "../mcp/tools/read-thread.js";
 import type { ImapFolder, MessageMetadata } from "../types.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
@@ -174,7 +178,8 @@ liveDb("metadata-protection repository seam", () => {
       references_header: metadata.referencesHeader
     });
 
-    const repository = new MirrorRepository(pool, getConfig(), new OpaqueTestAdapter());
+    const adapter = new OpaqueTestAdapter();
+    const repository = new MirrorRepository(pool, getConfig(), adapter);
     const [message] = await repository.upsertMessages(
       accountId,
       folder,
@@ -276,6 +281,45 @@ liveDb("metadata-protection repository seam", () => {
     expect(storedEvidence.rows[0].evidence_key).toMatch(/^[0-9a-f]{64}$/);
     expect(storedEvidence.rows[0].metadata).toEqual({});
     expect(storedEvidence.rows[0].protected_metadata).toBeInstanceOf(Buffer);
+
+    await expect(runReadMessage(pool, {
+      message_id: message.id,
+      include_headers: true
+    }, adapter)).resolves.toMatchObject({
+      subject: metadata.subject,
+      from: { email: metadata.fromEmail },
+      headers: { "message-id": "<protected@example.test>" },
+      attachments: [expect.objectContaining({ filename: "private.pdf" })]
+    });
+    await expect(runReadThread(pool, {
+      message_id: message.id
+    }, adapter)).resolves.toMatchObject({
+      messages: [expect.objectContaining({
+        subject: metadata.subject,
+        attachments: [expect.objectContaining({ filename: "private.pdf" })]
+      })]
+    });
+    await expect(listAttachments(pool, getConfig(), message.id, adapter)).resolves.toEqual([
+      expect.objectContaining({
+        filename: "private.pdf",
+        contentId: "<private-part@example.test>"
+      })
+    ]);
+    await expect(getMessageHeaders(pool, getConfig(), message.id, {
+      metadataProtection: adapter
+    })).resolves.toMatchObject({
+      headers: { "message-id": "<protected@example.test>" },
+      source: "mirror"
+    });
+    await expect(runDraftReply(pool, {
+      source_message_id: message.id,
+      body: "Reply",
+      reply_all: false
+    }, adapter)).resolves.toMatchObject({
+      from: { email },
+      to: [{ email: metadata.fromEmail, name: metadata.fromName }],
+      subject: "Re: Private subject"
+    });
 
     const partialRevealRepository = new MirrorRepository(
       pool,

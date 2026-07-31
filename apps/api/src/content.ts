@@ -8,6 +8,13 @@ import { cleanBody } from "./mcp/shared.js";
 import { loadMessageAndAccount } from "./message-loader.js";
 import { MirrorRepository } from "./repository.js";
 import type { ImapAccount } from "./types.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "./metadata-protection.js";
 
 /**
  * Attachment bytes / raw MIME / headers / clean-body read surface (email-004,
@@ -92,9 +99,25 @@ export interface CleanBodyResultDetail {
   truncated: boolean;
 }
 
-interface AttachmentRow {
+interface MessageHeadersRow extends ProtectedMetadataColumns {
+  id: string;
+  account_id: string;
+  headers_json: Record<string, unknown> | null;
+  body_headers: Record<string, unknown> | null;
+  body_protected_metadata: Buffer | null;
+  body_protected_metadata_version: number | null;
+  body_protected_metadata_key_version: number | null;
+  body_protected_metadata_tokens: Record<string, string> | null;
+}
+
+interface BodyHeadersProjection extends ProtectedMetadataColumns {
+  headers_json: Record<string, unknown> | null;
+}
+
+interface AttachmentRow extends ProtectedMetadataColumns {
   id: string;
   message_id: string;
+  account_id: string;
   filename: string | null;
   mime_type: string | null;
   size_bytes: string | null;
@@ -263,20 +286,34 @@ async function streamToBuffer(stream: AsyncIterable<Buffer | Uint8Array | string
 export async function listAttachments(
   pool: PgPool,
   config: AppConfig,
-  messageId: string
+  messageId: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<AttachmentInfo[]> {
   const client = await pool.connect();
   try {
     const result = await client.query<AttachmentRow>(
       `
-      SELECT id, message_id, filename, mime_type, size_bytes, part_number, content_id, disposition
-      FROM public.imap_attachments
-      WHERE message_id = $1
-      ORDER BY NULLIF(regexp_replace(coalesce(part_number, ''), '[^0-9]', '', 'g'), '')::bigint NULLS LAST, part_number
+      SELECT attachment.id, attachment.message_id, message.account_id,
+             attachment.filename, attachment.mime_type, attachment.size_bytes,
+             attachment.part_number, attachment.content_id, attachment.disposition,
+             attachment.protected_metadata, attachment.protected_metadata_version,
+             attachment.protected_metadata_key_version, attachment.protected_metadata_tokens
+      FROM public.imap_attachments attachment
+      JOIN public.imap_messages message ON message.id = attachment.message_id
+      WHERE attachment.message_id = $1
+      ORDER BY NULLIF(regexp_replace(coalesce(attachment.part_number, ''), '[^0-9]', '', 'g'), '')::bigint NULLS LAST,
+               attachment.part_number
       `,
       [messageId]
     );
-    return result.rows.map(toAttachmentInfo);
+    return Promise.all(result.rows.map(async (row) => toAttachmentInfo(
+      await revealMetadataRecord(
+        metadataProtection,
+        { kind: "attachment", accountId: row.account_id, recordId: row.id },
+        row,
+        METADATA_PROTECTED_FIELDS.attachment
+      )
+    )));
   } finally {
     client.release();
   }
@@ -286,20 +323,31 @@ export async function listAttachments(
 export async function getAttachmentMetadata(
   pool: PgPool,
   config: AppConfig,
-  attachmentId: string
+  attachmentId: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<AttachmentInfo | null> {
   const client = await pool.connect();
   try {
     const result = await client.query<AttachmentRow>(
       `
-      SELECT id, message_id, filename, mime_type, size_bytes, part_number, content_id, disposition
-      FROM public.imap_attachments
-      WHERE id = $1
+      SELECT attachment.id, attachment.message_id, message.account_id,
+             attachment.filename, attachment.mime_type, attachment.size_bytes,
+             attachment.part_number, attachment.content_id, attachment.disposition,
+             attachment.protected_metadata, attachment.protected_metadata_version,
+             attachment.protected_metadata_key_version, attachment.protected_metadata_tokens
+      FROM public.imap_attachments attachment
+      JOIN public.imap_messages message ON message.id = attachment.message_id
+      WHERE attachment.id = $1
       `,
       [attachmentId]
     );
     const row = result.rows[0];
-    return row ? toAttachmentInfo(row) : null;
+    return row ? toAttachmentInfo(await revealMetadataRecord(
+      metadataProtection,
+      { kind: "attachment", accountId: row.account_id, recordId: row.id },
+      row,
+      METADATA_PROTECTED_FIELDS.attachment
+    )) : null;
   } finally {
     client.release();
   }
@@ -315,9 +363,10 @@ export async function getAttachmentMetadata(
 export async function downloadAttachment(
   pool: PgPool,
   config: AppConfig,
-  attachmentId: string
+  attachmentId: string,
+  opts: { metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<AttachmentDownload> {
-  const { stream, close, ...meta } = await downloadAttachmentStream(pool, config, attachmentId);
+  const { stream, close, ...meta } = await downloadAttachmentStream(pool, config, attachmentId, opts);
   try {
     const content = await streamToBuffer(stream);
     return { ...meta, content };
@@ -339,9 +388,10 @@ export async function downloadAttachmentStream(
   pool: PgPool,
   config: AppConfig,
   attachmentId: string,
-  opts: { maxBytes?: number } = {}
+  opts: { maxBytes?: number; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<AttachmentDownloadStream> {
-  const meta = await getAttachmentMetadata(pool, config, attachmentId);
+  const metadataProtection = opts.metadataProtection ?? plaintextMetadataProtection;
+  const meta = await getAttachmentMetadata(pool, config, attachmentId, metadataProtection);
   if (!meta) throw new NotFoundError(`Attachment not found: ${attachmentId}`);
   if (!meta.partNumber) {
     throw new UnfetchableContentError(
@@ -350,7 +400,7 @@ export async function downloadAttachmentStream(
   }
 
   const maxBytes = opts.maxBytes ?? config.BODY_RAW_MAX_BYTES;
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, meta.messageId);
 
   const reader = await ContentImapClient.connect(pool, config, account);
@@ -410,7 +460,8 @@ export async function downloadAttachmentStream(
 export async function getRawMime(
   pool: PgPool,
   config: AppConfig,
-  messageId: string
+  messageId: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<RawMimeResult> {
   const stored = await pool.connect();
   let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean } | undefined;
@@ -433,7 +484,7 @@ export async function getRawMime(
   }
 
   // raw_mime not stored (parsed_only) or no body row yet → on-demand FETCH.
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId);
   const reader = await ContentImapClient.connect(pool, config, account);
   try {
@@ -485,17 +536,22 @@ export async function getMessageHeaders(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  options: { basic?: boolean } = {}
+  options: { basic?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<MessageHeadersResult> {
+  const metadataProtection = options.metadataProtection ?? plaintextMetadataProtection;
   const client = await pool.connect();
-  let row: { headers_json: Record<string, unknown> | null; body_headers: Record<string, unknown> | null } | undefined;
+  let row: MessageHeadersRow | undefined;
   try {
-    const result = await client.query<{
-      headers_json: Record<string, unknown> | null;
-      body_headers: Record<string, unknown> | null;
-    }>(
+    const result = await client.query<MessageHeadersRow>(
       `
-      SELECT m.headers_json, b.headers_json AS body_headers
+      SELECT m.id, m.account_id, m.headers_json,
+             m.protected_metadata, m.protected_metadata_version,
+             m.protected_metadata_key_version, m.protected_metadata_tokens,
+             b.headers_json AS body_headers,
+             b.protected_metadata AS body_protected_metadata,
+             b.protected_metadata_version AS body_protected_metadata_version,
+             b.protected_metadata_key_version AS body_protected_metadata_key_version,
+             b.protected_metadata_tokens AS body_protected_metadata_tokens
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
@@ -508,16 +564,42 @@ export async function getMessageHeaders(
   }
   if (!row) throw new NotFoundError(`Message not found: ${messageId}`);
 
+  const message = await revealMetadataRecord(
+    metadataProtection,
+    { kind: "message", accountId: row.account_id, recordId: row.id },
+    row,
+    METADATA_PROTECTED_FIELDS.message
+  );
+  const bodyProjection: BodyHeadersProjection = {
+    headers_json: row.body_headers,
+    protected_metadata: row.body_protected_metadata,
+    protected_metadata_version: row.body_protected_metadata_version,
+    protected_metadata_key_version: row.body_protected_metadata_key_version,
+    protected_metadata_tokens: row.body_protected_metadata_tokens
+  };
+  const body = row.body_protected_metadata == null
+    && row.body_protected_metadata_version == null
+    && row.body_protected_metadata_key_version == null
+    && row.body_protected_metadata_tokens == null
+    && row.body_headers == null
+    ? bodyProjection
+    : await revealMetadataRecord(
+      metadataProtection,
+      { kind: "message_body", accountId: row.account_id, recordId: row.id },
+      bodyProjection,
+      METADATA_PROTECTED_FIELDS.messageBody
+    );
+
   // Prefer the body's fully-parsed headers (whole-message parse); fall back to the
   // message row's envelope headers_json (always present from metadata sync).
-  const merged = { ...projectHeaders(row.headers_json), ...projectHeaders(row.body_headers) };
+  const merged = { ...projectHeaders(message.headers_json), ...projectHeaders(body.headers_json) };
   let source: "mirror" | "fetch" = "mirror";
   let headers = merged;
 
   if (Object.keys(headers).length === 0) {
     // Nothing stored — on-demand FETCH + parse the source headers.
     const { parseHeaders } = await import("./mime.js");
-    const repository = new MirrorRepository(pool, config);
+    const repository = new MirrorRepository(pool, config, metadataProtection);
     const { message, account } = await loadMessageAndAccount(repository, messageId);
     const reader = await ContentImapClient.connect(pool, config, account);
     try {

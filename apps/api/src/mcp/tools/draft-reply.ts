@@ -2,6 +2,13 @@ import { z } from "zod";
 import type { PgPool } from "../../db.js";
 import { DEFAULT_MAX_BODY_CHARS, cleanBody, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "../../metadata-protection.js";
 
 /**
  * draft_reply — PRODUCE ONLY, NEVER SENDS (ADR 0016). Reads one source message
@@ -26,7 +33,7 @@ export const draftReplyRequestSchema = z
   .strict();
 
 /** The DB row this tool selects: the source message + its coalesced body. */
-interface SourceRow {
+interface SourceRow extends ProtectedMetadataColumns {
   id: string;
   account_id: string;
   provider_thread_id: string | null;
@@ -42,6 +49,10 @@ interface SourceRow {
   cc_names: (string | null)[] | null;
   internal_date: Date;
   account_email: string;
+  account_protected_metadata: Buffer | null;
+  account_protected_metadata_version: number | null;
+  account_protected_metadata_key_version: number | null;
+  account_protected_metadata_tokens: Record<string, string> | null;
   body_text: string | null;
   body_plain: string | null;
   selected_text_part: string | null;
@@ -189,7 +200,11 @@ function quoteOriginal(row: SourceRow): string {
   return `${attribution}\n${quoted}`;
 }
 
-export async function runDraftReply(pool: PgPool, args: unknown): Promise<DraftReply | ReturnType<typeof toolError>> {
+export async function runDraftReply(
+  pool: PgPool,
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<DraftReply | ReturnType<typeof toolError>> {
   const request = draftReplyRequestSchema.parse(args);
 
   const row = await withReadOnlyTx(pool, async (client) => {
@@ -210,7 +225,15 @@ export async function runDraftReply(pool: PgPool, args: unknown): Promise<DraftR
         m.cc_emails,
         m.cc_names,
         m.internal_date,
+        m.protected_metadata,
+        m.protected_metadata_version,
+        m.protected_metadata_key_version,
+        m.protected_metadata_tokens,
         a.email_address AS account_email,
+        a.protected_metadata AS account_protected_metadata,
+        a.protected_metadata_version AS account_protected_metadata_version,
+        a.protected_metadata_key_version AS account_protected_metadata_key_version,
+        a.protected_metadata_tokens AS account_protected_metadata_tokens,
         b.body_text,
         b.body_plain,
         b.selected_text_part
@@ -233,37 +256,61 @@ export async function runDraftReply(pool: PgPool, args: unknown): Promise<DraftR
     );
   }
 
+  const revealedMessage = await revealMetadataRecord(
+    metadataProtection,
+    { kind: "message", accountId: row.account_id, recordId: row.id },
+    row,
+    METADATA_PROTECTED_FIELDS.message
+  );
+  const revealedAccount = await revealMetadataRecord(
+    metadataProtection,
+    { kind: "account", accountId: row.account_id, recordId: row.account_id },
+    {
+      email_address: row.account_email,
+      protected_metadata: row.account_protected_metadata,
+      protected_metadata_version: row.account_protected_metadata_version,
+      protected_metadata_key_version: row.account_protected_metadata_key_version,
+      protected_metadata_tokens: row.account_protected_metadata_tokens
+    },
+    METADATA_PROTECTED_FIELDS.accountSummary
+  );
+  const source = {
+    ...revealedMessage,
+    provider_thread_id: row.provider_thread_id,
+    account_email: revealedAccount.email_address
+  };
+
   const warnings: string[] = [];
 
   const headers: DraftReply["headers"] = { "X-SupaMail-Draft": "produced-not-sent" };
-  if (row.rfc_message_id) {
-    headers["In-Reply-To"] = row.rfc_message_id;
+  if (source.rfc_message_id) {
+    headers["In-Reply-To"] = source.rfc_message_id;
   } else {
     warnings.push("Source message has no Message-ID; In-Reply-To omitted and threading may be unreliable.");
   }
-  const references = buildReferences(row);
+  const references = buildReferences(source);
   if (references) headers.References = references;
 
-  const to: DraftRecipient[] = row.from_email
-    ? [row.from_name ? { email: row.from_email, name: row.from_name } : { email: row.from_email }]
+  const to: DraftRecipient[] = source.from_email
+    ? [source.from_name ? { email: source.from_email, name: source.from_name } : { email: source.from_email }]
     : [];
   if (to.length === 0) {
     warnings.push("Source message has no sender address; To is empty.");
   }
 
-  const cc = request.reply_all === true ? buildCc(row) : [];
+  const cc = request.reply_all === true ? buildCc(source) : [];
 
-  const quoted = quoteOriginal(row);
+  const quoted = quoteOriginal(source);
   const text = `${request.body}\n\n${quoted}`;
 
   return {
-    draftId: `drf_${row.id}`,
-    from: { email: row.account_email, name: null },
+    draftId: `drf_${source.id}`,
+    from: { email: source.account_email, name: null },
     to,
     cc,
-    subject: reSubject(row.subject),
+    subject: reSubject(source.subject),
     headers,
-    threadId: row.provider_thread_id,
+    threadId: source.provider_thread_id,
     body: { format: "plain", text },
     warnings
   };
