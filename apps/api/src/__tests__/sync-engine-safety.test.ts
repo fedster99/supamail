@@ -203,11 +203,17 @@ describe("sync engine safety", () => {
 
     expect(diagnosticErrorCode("provider timed out while reading INBOX/private"))
       .toBe("SYNC_TIMEOUT");
+    expect(diagnosticErrorCode("LOGIN failed for owner@example.test"))
+      .toBe("AUTH_ERROR");
+    expect(diagnosticErrorCode("[Error] [code=ELOGIN] [AUTH] Command failed"))
+      .toBe("AUTH_ERROR");
     expect(diagnosticErrorCode("server said too many requests for user@example.test"))
       .toBe("RATE_LIMITED");
     expect(diagnosticErrorCode("certificate verify failed for mail.example.test"))
       .toBe("TLS_ERROR");
     expect(diagnosticErrorCode("No such mailbox: Private Clients"))
+      .toBe("MAILBOX_MISSING");
+    expect(diagnosticErrorCode("Mailbox Private Clients is missing"))
       .toBe("MAILBOX_MISSING");
     expect(diagnosticErrorCode("ECONNRESET from mail.example.test"))
       .toBe("CONNECTION_ERROR");

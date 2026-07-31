@@ -10,6 +10,8 @@ const AUTH_ERROR_PATTERNS = [
   /login failed/i,
   /auth(?:enticate)? failed/i,
   /AUTHENTICATIONFAILED/i,
+  /\[AUTH\]/i,
+  /\bELOGIN\b/i,
   /\bNO LOGIN\b/i,
   /\b535\b/,
 ];
@@ -17,6 +19,7 @@ const AUTH_ERROR_PATTERNS = [
 const MISSING_MAILBOX_PATTERNS = [
   /\bNONEXISTENT\b/i,
   /\bTRYCREATE\b/i,
+  /mailbox.*missing/i,
   /does not exist/i,
   /no such mailbox/i,
   /mailbox not found/i,
@@ -41,8 +44,10 @@ export function isMissingMailboxDiagnosticText(error: string): boolean {
 
 /** Return a fixed operational code. Never return provider text. */
 export function diagnosticErrorCode(error: string): string {
+  // Classify authentication before credential redaction. Redaction intentionally
+  // removes text after LOGIN/AUTHENTICATE and can otherwise hide the signal.
+  if (isAuthDiagnosticText(error)) return "AUTH_ERROR";
   const normalized = sanitizeErrorReason(error);
-  if (isAuthDiagnosticText(normalized)) return "AUTH_ERROR";
   if (/RATE.?LIMIT|THROTTL|TOO MANY REQUESTS/i.test(normalized)) return "RATE_LIMITED";
   if (/TIMEOUT|TIMED OUT|DEADLINE EXCEEDED/i.test(normalized)) return "SYNC_TIMEOUT";
   if (/CERTIFICATE|\bTLS\b|\bSSL\b/i.test(normalized)) return "TLS_ERROR";
