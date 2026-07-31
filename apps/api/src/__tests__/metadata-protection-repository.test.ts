@@ -7,7 +7,9 @@ import type {
   MetadataProtectionProjection,
   MetadataValues
 } from "../metadata-protection.js";
+import { plaintextMetadataProtection } from "../metadata-protection.js";
 import { MirrorRepository } from "../repository.js";
+import { threadingFailureReason } from "../threading-repository.js";
 
 vi.mock("../host-validation.js", () => ({
   assertSafeImapTarget: vi.fn(async () => undefined)
@@ -146,5 +148,14 @@ describe("MirrorRepository metadata protection", () => {
     });
 
     expect(insertParams[18]).toBe("plaintext");
+  });
+
+  it("keeps threading failure text only for readable storage", () => {
+    const error = new Error("Private Clients for owner@example.test failed");
+
+    expect(threadingFailureReason(error, new RecordingProtectionAdapter()))
+      .toBe("THREADING_ERROR");
+    expect(threadingFailureReason(error, plaintextMetadataProtection))
+      .toContain("Private Clients");
   });
 });
