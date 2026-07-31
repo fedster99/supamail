@@ -324,7 +324,7 @@ export async function deliverSmtp(
     auth: { user: creds.username, pass: creds.password },
     connectionTimeout: config.CONNECT_TIMEOUT_MS,
     greetingTimeout: config.CONNECT_TIMEOUT_MS,
-    socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS,
+    socketTimeout: config.SMTP_COMMAND_TIMEOUT_MS,
     logger: false
   });
 

@@ -123,6 +123,11 @@ that surface, exactly as 0014 required any write capability to be a new decision
   has outcome `unknown`. A proven failure before submission, such as DNS,
   authentication, TLS, connection setup, compose, or account lookup, has outcome
   `not_delivered`.
+- SMTP connection and greeting setup keep the short `CONNECT_TIMEOUT_MS`.
+  Waiting for the final DATA response uses `SMTP_COMMAND_TIMEOUT_MS`, which
+  defaults to 10 minutes as required by RFC 5321. It does not reuse the
+  one-minute IMAP command timeout. A shorter final-response timeout can create a
+  false `unknown` result and invite a duplicate send.
 - Core does not retry. Cloud owns the durable operation ledger and Sent
   reconciliation because it owns tenant-scoped hosted state.
 - The cloud re-pin inherits the primitive via `@supamail/api`; the cloud adds
@@ -150,6 +155,8 @@ that surface, exactly as 0014 required any write capability to be a new decision
   heartbeat keeps a long send safe from stale-lock recovery before final release.
   It also proves a fault-injected false unlock evicts the client and releases the
   lock for another real session.
+- `smtp-outcome.integration.test.ts` delays a valid final `250` beyond the IMAP
+  command timeout and proves the independent SMTP timeout waits for it.
 - `host-validation.test.ts` covers `assertSafeSmtpTarget` SSRF rejection.
 - The GreenMail smoke (`scripts/greenmail-smoke.ts`) submits → APPENDs to Sent →
   syncs → asserts the mirrored Sent row is FETCHable (requires Docker).
@@ -202,3 +209,5 @@ A whole-stack review hardened four send-path edges:
 - `apps/api/src/send.ts`, `apps/api/src/smtp-client.ts`,
   `apps/api/supabase/migrations/public/0009_smtp_send.sql`.
 - RFC 5322 §3.6.4 (message threading: In-Reply-To / References).
+- RFC 5321 §4.5.3.2.6 (10-minute timeout for the final DATA response).
+- RFC 1047 (the final-response synchronization gap and duplicate mail).

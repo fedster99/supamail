@@ -5,6 +5,7 @@ import { deliverSmtp, SmtpDeliveryError } from "../smtp-client.js";
 const servers: Array<ReturnType<typeof createServer>> = [];
 
 async function smtpServer({
+  finalResponseDelayMs = 0,
   loseFinalResponse = false,
   truncatePositiveFinalResponse = false,
   withholdFinalResponse = false,
@@ -34,6 +35,10 @@ async function smtpServer({
           }
           if (withholdFinalResponse) return;
           readingData = false;
+          if (finalResponseDelayMs > 0) {
+            setTimeout(() => socket.write("250 2.0.0 queued\r\n"), finalResponseDelayMs);
+            return;
+          }
           socket.write("250 2.0.0 queued\r\n");
           continue;
         }
@@ -82,6 +87,7 @@ describe("SMTP outcome boundary", () => {
   const config = {
     CONNECT_TIMEOUT_MS: 100,
     IMAP_COMMAND_TIMEOUT_MS: 1_000,
+    SMTP_COMMAND_TIMEOUT_MS: 1_000,
   } as never;
 
   it("returns a receipt after the server confirms DATA", async () => {
@@ -101,6 +107,30 @@ describe("SMTP outcome boundary", () => {
     );
 
     expect(receipt.accepted).toEqual(["rcpt@example.test"]);
+    expect(server.acceptedMessages()).toBe(1);
+  });
+
+  it("waits beyond the IMAP command timeout for a valid final SMTP response", async () => {
+    const server = await smtpServer({ finalResponseDelayMs: 120 });
+    const receipt = await deliverSmtp(
+      {
+        host: "127.0.0.1",
+        port: server.port,
+        secure: false,
+        username: "sender",
+        password: "secret",
+      },
+      raw,
+      envelope,
+      {
+        CONNECT_TIMEOUT_MS: 100,
+        IMAP_COMMAND_TIMEOUT_MS: 50,
+        SMTP_COMMAND_TIMEOUT_MS: 500,
+      } as never,
+      { isPrivateHost: true }
+    );
+
+    expect(receipt.response).toBe("250 2.0.0 queued");
     expect(server.acceptedMessages()).toBe(1);
   });
 
@@ -186,6 +216,7 @@ describe("SMTP outcome boundary", () => {
       {
         CONNECT_TIMEOUT_MS: 1_000,
         IMAP_COMMAND_TIMEOUT_MS: 100,
+        SMTP_COMMAND_TIMEOUT_MS: 100,
       } as never,
       { isPrivateHost: true }
     ).catch((value) => value);

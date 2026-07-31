@@ -46,6 +46,16 @@ describe("config sent-folder polling", () => {
   });
 });
 
+describe("config SMTP delivery timeout", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it("waits up to ten minutes for the final SMTP delivery response", () => {
+    expect(getConfig(baseEnv).SMTP_COMMAND_TIMEOUT_MS).toBe(10 * 60_000);
+  });
+});
+
 describe("config initial thread activation", () => {
   beforeEach(() => {
     resetConfigForTests();

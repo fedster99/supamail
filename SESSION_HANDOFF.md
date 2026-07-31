@@ -14,15 +14,20 @@
   one message while the core reports `unknown`. A server that accepts TCP but
   never sends its greeting proves zero accepted messages and reports
   `not_delivered`.
+- SMTP now uses its own final-response timeout. It defaults to the RFC 5321
+  value of 10 minutes instead of the one-minute IMAP command timeout. A delayed
+  final-reply test proves that a slow valid `250` response returns one success
+  and does not create a false unknown result.
 - The HTTP API and CLI expose the stable delivery outcome without provider
   details. Pre-SMTP errors from send and draft-send also carry the typed
   `not_delivered` outcome.
 - The private Cloud layer must store an operation before SMTP, retry only
-  `not_delivered`, and never submit again after `unknown`.
-- Verification passed the harness check, API typecheck, 726 fast tests on
-  Vitest 3.2.7, the API build, the root build, and the GreenMail SMTP/IMAP
-  smoke with live send and draft delivery. The local shell used Node 26 while
-  the repository pins Node 24.
+  `not_delivered`, and never submit again after `unknown`. Its stale-operation
+  threshold must remain longer than the public core SMTP timeout.
+- Verification passed the harness check, typecheck, 729 fast tests, both
+  builds, 198 live Postgres tests, 120 conformance checks, and the GreenMail
+  SMTP/IMAP smoke with live send and draft delivery. The local shell used Node
+  26 while the repository pins Node 24.
 - Next: review the public PR. Merge only with Federico's explicit approval.
   Then wait for the immutable core image and pin it in the Cloud PR.
 

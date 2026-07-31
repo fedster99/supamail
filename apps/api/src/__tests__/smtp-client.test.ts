@@ -97,7 +97,11 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     password: "p"
   };
   const envelope = { from: "sender@example.test", to: ["rcpt@example.test"] };
-  const config = { CONNECT_TIMEOUT_MS: 1000, IMAP_COMMAND_TIMEOUT_MS: 1000 } as never;
+  const config = {
+    CONNECT_TIMEOUT_MS: 1_000,
+    IMAP_COMMAND_TIMEOUT_MS: 1_000,
+    SMTP_COMMAND_TIMEOUT_MS: 600_000
+  } as never;
 
   beforeEach(() => {
     createTransport.mockClear();
@@ -116,6 +120,14 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     await deliverSmtp(creds, Buffer.from("raw"), envelope, config);
     expect(createTransport).toHaveBeenCalledTimes(1);
     expect(createTransport.mock.calls[0][0]).toMatchObject({ requireTLS: true, secure: false });
+  });
+
+  it("uses the SMTP timeout while it waits for the final delivery response", async () => {
+    const { deliverSmtp } = await import("../smtp-client.js");
+    await deliverSmtp(creds, Buffer.from("raw"), envelope, config);
+    expect(createTransport.mock.calls[0][0]).toMatchObject({
+      socketTimeout: 600_000
+    });
   });
 
   it("keeps requireTLS=true for a PUBLIC host even when isPrivateHost=false is explicit (the opt-in must NOT drop TLS)", async () => {

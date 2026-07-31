@@ -69,6 +69,7 @@ const envSchema = z.object({
   RECONCILE_TOTAL_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),
   CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   IMAP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  SMTP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(10 * 60_000),
   IMAP_MAX_COMMANDS_PER_MINUTE: z.coerce.number().int().positive().default(200),
   MAX_LOCK_HOLD_MS: z.coerce.number().int().positive().default(10 * 60_000),
   STALE_HEARTBEAT_MS: z.coerce.number().int().positive().default(5 * 60_000),
