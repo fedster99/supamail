@@ -513,7 +513,7 @@ export async function runReadThread(
     }
 
     // sync_trust computed inside the open tx (buildSyncTrust) to avoid a second connection; syncTrustFor is the standalone equivalent.
-    const syncTrust = await buildSyncTrust(client, accountIds);
+    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
 
     const attachments = await loadMessageAttachments(
       client,

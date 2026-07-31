@@ -313,6 +313,13 @@ export function toolError(
  * `buildSyncTrust` so tools attach the same honest mirror-completeness signal as
  * search. `null` means "every account in this database". Runs read-only.
  */
-export async function syncTrustFor(pool: PgPool, accountIds: string[] | null): Promise<SyncTrust> {
-  return withReadOnlyTx(pool, (client) => buildSyncTrust(client, accountIds));
+export async function syncTrustFor(
+  pool: PgPool,
+  accountIds: string[] | null,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<SyncTrust> {
+  return withReadOnlyTx(
+    pool,
+    (client) => buildSyncTrust(client, accountIds, metadataProtection)
+  );
 }

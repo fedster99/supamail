@@ -2,6 +2,10 @@ import { z } from "zod";
 import type { PgPool } from "../db.js";
 import { searchMessages } from "./search.js";
 import type { SearchRequest, SearchResponse } from "./types.js";
+import {
+  plaintextMetadataProtection,
+  type MetadataProtectionAdapter
+} from "../metadata-protection.js";
 
 /**
  * Zod schema for the search request. The MCP tool and the CLI both validate
@@ -172,7 +176,11 @@ export const searchEmailToolDefinition = {
  * same function. Returns the typed {@link SearchResponse}; the transport layer
  * formats it for the wire.
  */
-export async function runSearchTool(pool: PgPool, args: unknown): Promise<SearchResponse> {
+export async function runSearchTool(
+  pool: PgPool,
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<SearchResponse> {
   const request = searchRequestSchema.parse(args) as SearchRequest;
-  return searchMessages(pool, request);
+  return searchMessages(pool, request, metadataProtection);
 }
