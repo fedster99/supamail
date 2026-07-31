@@ -52,6 +52,10 @@ const metadataProtectionSeamMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0023_metadata_protection_seam.sql"
 );
+const metadataProtectionModeMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0024_metadata_protection_mode.sql"
+);
 
 describe("initial schema", () => {
   it("adds a bounded search extract without moving full body payloads into metadata", async () => {
@@ -91,6 +95,17 @@ describe("initial schema", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_key_version integer");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_tokens jsonb");
     expect(sql).toContain("jsonb_typeof(protected_metadata_tokens) = ''object''");
+    expect(sql).not.toMatch(/tenant_id|hkdf|aes-256|kms|turbopuffer|metadata_root_key/i);
+  });
+
+  it("adds an indexed adapter-mode marker and rejects token-only storage", async () => {
+    const sql = await readFile(metadataProtectionModeMigrationPath, "utf8");
+
+    expect(sql).toContain("metadata_protection_mode text NOT NULL DEFAULT 'plaintext'");
+    expect(sql).toContain("metadata_protection_mode IN ('plaintext', 'protected')");
+    expect(sql).toContain("imap_accounts_metadata_protection_mode_idx");
+    expect(sql).toContain("protected_metadata IS NOT NULL");
+    expect(sql).toContain("OR protected_metadata_tokens IS NULL");
     expect(sql).not.toMatch(/tenant_id|hkdf|aes-256|kms|turbopuffer|metadata_root_key/i);
   });
 
@@ -171,9 +186,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0023_metadata_protection_seam");
+    expect(version).toBe("0024_metadata_protection_mode");
     expect(manifest).toEqual({
-      schemaVersion: "0023_metadata_protection_seam",
+      schemaVersion: "0024_metadata_protection_mode",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -197,7 +212,8 @@ describe("initial schema", () => {
         { id: "0020_threading_fingerprint_closure", file: "0020_threading_fingerprint_closure.sql" },
         { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" },
         { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" },
-        { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" }
+        { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" },
+        { id: "0024_metadata_protection_mode", file: "0024_metadata_protection_mode.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");

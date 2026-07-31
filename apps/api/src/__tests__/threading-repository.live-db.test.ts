@@ -2,6 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { getConfig } from "../config.js";
 import { closePool, getPool } from "../db.js";
+import type {
+  MetadataProtectionAdapter,
+  MetadataProtectionContext,
+  MetadataProtectionOperationOptions,
+  MetadataProtectionProjection,
+  MetadataValues
+} from "../metadata-protection.js";
+import { protectedMetadataColumns } from "../metadata-protection.js";
 import { MirrorRepository } from "../repository.js";
 import {
   ThreadingClosureLimitError,
@@ -13,11 +21,213 @@ import {
 import {
   computeThreadAssignments,
   computeThreadAssignmentsV1,
-  computeThreadAssignmentsV2
+  computeThreadAssignmentsV2,
+  deliveryClosureFingerprints
 } from "../threading.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
 const liveDb = LIVE_DB_AVAILABLE ? describe : describe.skip;
+
+class OpaqueThreadingAdapter implements MetadataProtectionAdapter {
+  readonly writes: Array<{ context: MetadataProtectionContext; values: MetadataValues }> = [];
+
+  #projectAssignment(values: MetadataValues): MetadataValues {
+    const readableFields = new Set([
+      "run_id",
+      "message_id",
+      "account_id",
+      "assignment_method",
+      "confidence",
+      "is_provisional",
+      "subject_fallback_eligible",
+      "algorithm_version",
+      "generation"
+    ]);
+    return Object.fromEntries(
+      Object.entries(values).map(([field, value]) => {
+        if (readableFields.has(field) || value === null) return [field, value];
+        if (Array.isArray(value)) {
+          return [field, value.map((entry) => createHash("sha256").update(String(entry)).digest("hex"))];
+        }
+        if (field === "evidence") return [field, {}];
+        if (field === "conversation_id") {
+          return [field, `thread_${createHash("sha256").update(String(value)).digest("hex").slice(0, 32)}`];
+        }
+        return [field, createHash("sha256").update(JSON.stringify(value)).digest("hex")];
+      })
+    );
+  }
+
+  async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues
+  ): Promise<MetadataProtectionProjection> {
+    this.writes.push({ context, values });
+    const projected = context.kind === "thread_assignment_history"
+      ? {
+          previous_assignment: values.previous_assignment === null
+            ? null
+            : this.#projectAssignment(values.previous_assignment as MetadataValues),
+          next_assignment: values.next_assignment === null
+            ? null
+            : this.#projectAssignment(values.next_assignment as MetadataValues)
+        }
+      : context.kind === "message"
+        ? Object.fromEntries(Object.entries(values).map(([field, value]) => {
+            if (value === null) return [field, null];
+            if (field === "headers_json") return [field, {}];
+            if (field === "mime_structure") return [field, null];
+            if (Array.isArray(value)) return [field, []];
+            if (field.endsWith("_namespace")) return [field, value];
+            return [field, createHash("sha256").update(JSON.stringify(value)).digest("hex")];
+          }))
+        : context.kind === "message_body"
+          ? Object.fromEntries(Object.entries(values).map(([field, value]) => {
+              if (value === null) return [field, null];
+              if (field === "headers_json") return [field, {}];
+              if (field === "mime_structure" || field === "search_extract") return [field, null];
+              if (field === "parser_warnings") return [field, []];
+              return [field, createHash("sha256").update(JSON.stringify(value)).digest("hex")];
+            }))
+        : this.#projectAssignment(values);
+    return {
+      values: projected,
+      protectedMetadata: Buffer.from(JSON.stringify({ context, values })),
+      envelopeVersion: 1,
+      keyVersion: 1,
+      tokens: { test: createHash("sha256").update(JSON.stringify(values)).digest("hex") }
+    };
+  }
+
+  async reveal(
+    context: MetadataProtectionContext,
+    stored: MetadataProtectionProjection
+  ): Promise<MetadataValues> {
+    if (!stored.protectedMetadata) return { ...stored.values };
+    const envelope = JSON.parse(stored.protectedMetadata.toString("utf8")) as {
+      context: MetadataProtectionContext;
+      values: MetadataValues;
+    };
+    if (JSON.stringify(envelope.context) !== JSON.stringify(context)) {
+      throw new Error("test adapter context mismatch");
+    }
+    return envelope.values;
+  }
+}
+
+class IncompleteThreadAssignmentAdapter extends OpaqueThreadingAdapter {
+  override async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues
+  ): Promise<MetadataProtectionProjection> {
+    const projection = await super.protect(context, values);
+    if (context.kind === "thread_assignment") delete projection.values.subject_key;
+    return projection;
+  }
+}
+
+class IncompleteThreadHistoryRevealAdapter extends OpaqueThreadingAdapter {
+  override async reveal(
+    context: MetadataProtectionContext,
+    stored: MetadataProtectionProjection
+  ): Promise<MetadataValues> {
+    const values = await super.reveal(context, stored);
+    if (context.kind === "thread_assignment_history") delete values.next_assignment;
+    return values;
+  }
+}
+
+class PageTwoIncompleteThreadHistoryRevealAdapter extends OpaqueThreadingAdapter {
+  historyReveals = 0;
+
+  override async reveal(
+    context: MetadataProtectionContext,
+    stored: MetadataProtectionProjection
+  ): Promise<MetadataValues> {
+    const values = await super.reveal(context, stored);
+    if (context.kind !== "thread_assignment_history") return values;
+    this.historyReveals += 1;
+    if (this.historyReveals > 32) delete values.next_assignment;
+    return values;
+  }
+}
+
+class HangingThreadAssignmentAdapter extends OpaqueThreadingAdapter {
+  override async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues
+  ): Promise<MetadataProtectionProjection> {
+    if (context.kind === "thread_assignment") {
+      return new Promise<MetadataProtectionProjection>(() => undefined);
+    }
+    return super.protect(context, values);
+  }
+}
+
+class NonCooperativeThreadAssignmentAdapter extends OpaqueThreadingAdapter {
+  active = 0;
+  started = 0;
+
+  override async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues
+  ): Promise<MetadataProtectionProjection> {
+    if (context.kind !== "thread_assignment") return super.protect(context, values);
+    this.active += 1;
+    this.started += 1;
+    return new Promise<MetadataProtectionProjection>(() => undefined);
+  }
+}
+
+class LargeThreadAssignmentEnvelopeAdapter extends OpaqueThreadingAdapter {
+  override async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues
+  ): Promise<MetadataProtectionProjection> {
+    const projection = await super.protect(context, values);
+    if (context.kind !== "thread_assignment" || !projection.protectedMetadata) return projection;
+    const envelope = JSON.parse(projection.protectedMetadata.toString("utf8")) as Record<string, unknown>;
+    return {
+      ...projection,
+      protectedMetadata: Buffer.from(JSON.stringify({
+        ...envelope,
+        padding: "x".repeat(400_000)
+      }))
+    };
+  }
+}
+
+class SlowThreadAssignmentAdapter extends OpaqueThreadingAdapter {
+  active = 0;
+  maxActive = 0;
+
+  override async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues,
+    options?: MetadataProtectionOperationOptions
+  ): Promise<MetadataProtectionProjection> {
+    if (context.kind !== "thread_assignment") return super.protect(context, values);
+    this.active += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const signal = options?.signal;
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, 30);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(signal?.reason);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      return await super.protect(context, values);
+    } finally {
+      this.active -= 1;
+    }
+  }
+}
 
 interface SeedMessage {
   uid: number;
@@ -74,6 +284,13 @@ liveDb("ThreadingRepository live DB", () => {
     const accountId = result.rows[0].id;
     accountIds.add(accountId);
     return accountId;
+  }
+
+  async function markMetadataProtected(accountId: string): Promise<void> {
+    await pool.query(
+      "UPDATE public.imap_accounts SET metadata_protection_mode = 'protected' WHERE id = $1",
+      [accountId]
+    );
   }
 
   async function seedMessage(accountId: string, message: SeedMessage): Promise<string> {
@@ -140,9 +357,181 @@ liveDb("ThreadingRepository live DB", () => {
     return id;
   }
 
+  async function protectMessageInput(
+    adapter: MetadataProtectionAdapter,
+    accountId: string,
+    messageId: string
+  ): Promise<void> {
+    const fields = [
+      "rfc_message_id",
+      "message_id_normalized",
+      "provider_message_id",
+      "provider_message_id_namespace",
+      "provider_thread_id",
+      "provider_thread_id_namespace",
+      "in_reply_to",
+      "references_header",
+      "subject",
+      "from_email",
+      "from_name",
+      "to_emails",
+      "to_names",
+      "cc_emails",
+      "cc_names",
+      "bcc_emails",
+      "headers_json",
+      "mime_structure"
+    ] as const;
+    const stored = await pool.query<Record<string, unknown>>(
+      `SELECT ${fields.join(", ")} FROM public.imap_messages WHERE id = $1`,
+      [messageId]
+    );
+    const values = Object.fromEntries(fields.map((field) => [field, stored.rows[0]?.[field]]));
+    const projection = await adapter.protect(
+      { kind: "message", accountId, recordId: messageId },
+      values
+    );
+    const columns = protectedMetadataColumns(projection);
+    await pool.query(
+      `UPDATE public.imap_messages SET
+         rfc_message_id = value.rfc_message_id,
+         message_id_normalized = value.message_id_normalized,
+         provider_message_id = value.provider_message_id,
+         provider_message_id_namespace = value.provider_message_id_namespace,
+         provider_thread_id = value.provider_thread_id,
+         provider_thread_id_namespace = value.provider_thread_id_namespace,
+         in_reply_to = value.in_reply_to,
+         references_header = value.references_header,
+         subject = value.subject,
+         from_email = value.from_email,
+         from_name = value.from_name,
+         to_emails = value.to_emails,
+         to_names = value.to_names,
+         cc_emails = value.cc_emails,
+         cc_names = value.cc_names,
+         bcc_emails = value.bcc_emails,
+         headers_json = value.headers_json,
+         mime_structure = value.mime_structure,
+         protected_metadata = CASE
+           WHEN value.protected_metadata_base64 IS NULL THEN NULL
+           ELSE decode(value.protected_metadata_base64, 'base64')
+         END,
+         protected_metadata_version = value.protected_metadata_version,
+         protected_metadata_key_version = value.protected_metadata_key_version,
+         protected_metadata_tokens = value.protected_metadata_tokens
+       FROM jsonb_to_record($2::jsonb) AS value(
+         rfc_message_id text,
+         message_id_normalized text,
+         provider_message_id text,
+         provider_message_id_namespace text,
+         provider_thread_id text,
+         provider_thread_id_namespace text,
+         in_reply_to text,
+         references_header text,
+         subject text,
+         from_email text,
+         from_name text,
+         to_emails text[],
+         to_names text[],
+         cc_emails text[],
+         cc_names text[],
+         bcc_emails text[],
+         headers_json jsonb,
+         mime_structure jsonb,
+         protected_metadata_base64 text,
+         protected_metadata_version smallint,
+         protected_metadata_key_version integer,
+         protected_metadata_tokens jsonb
+       )
+       WHERE id = $1`,
+      [messageId, JSON.stringify({
+        ...projection.values,
+        protected_metadata_base64: columns.protected_metadata?.toString("base64") ?? null,
+        protected_metadata_version: columns.protected_metadata_version,
+        protected_metadata_key_version: columns.protected_metadata_key_version,
+        protected_metadata_tokens: columns.protected_metadata_tokens
+      })]
+    );
+    await markMetadataProtected(accountId);
+  }
+
+  async function protectBodyInput(
+    adapter: MetadataProtectionAdapter,
+    accountId: string,
+    messageId: string
+  ): Promise<void> {
+    const fields = [
+      "raw_mime_sha256",
+      "parsed_delivery_sha256",
+      "authored_delivery_sha256",
+      "headers_json",
+      "mime_structure",
+      "parser_warnings",
+      "structured_evidence_sha256",
+      "threading_payload_sha256",
+      "search_extract"
+    ] as const;
+    const stored = await pool.query<Record<string, unknown>>(
+      `SELECT ${fields.join(", ")} FROM public.imap_message_bodies WHERE message_id = $1`,
+      [messageId]
+    );
+    const values = Object.fromEntries(fields.map((field) => [field, stored.rows[0]?.[field]]));
+    const projection = await adapter.protect(
+      { kind: "message_body", accountId, recordId: messageId },
+      values
+    );
+    const columns = protectedMetadataColumns(projection);
+    await pool.query(
+      `UPDATE public.imap_message_bodies SET
+         raw_mime_sha256 = value.raw_mime_sha256,
+         parsed_delivery_sha256 = value.parsed_delivery_sha256,
+         authored_delivery_sha256 = value.authored_delivery_sha256,
+         headers_json = value.headers_json,
+         mime_structure = value.mime_structure,
+         parser_warnings = value.parser_warnings,
+         structured_evidence_sha256 = value.structured_evidence_sha256,
+         threading_payload_sha256 = value.threading_payload_sha256,
+         search_extract = value.search_extract,
+         protected_metadata = CASE
+           WHEN value.protected_metadata_base64 IS NULL THEN NULL
+           ELSE decode(value.protected_metadata_base64, 'base64')
+         END,
+         protected_metadata_version = value.protected_metadata_version,
+         protected_metadata_key_version = value.protected_metadata_key_version,
+         protected_metadata_tokens = value.protected_metadata_tokens
+       FROM jsonb_to_record($2::jsonb) AS value(
+         raw_mime_sha256 text,
+         parsed_delivery_sha256 text,
+         authored_delivery_sha256 text,
+         headers_json jsonb,
+         mime_structure jsonb,
+         parser_warnings text[],
+         structured_evidence_sha256 text,
+         threading_payload_sha256 text,
+         search_extract text,
+         protected_metadata_base64 text,
+         protected_metadata_version smallint,
+         protected_metadata_key_version integer,
+         protected_metadata_tokens jsonb
+       )
+       WHERE message_id = $1`,
+      [messageId, JSON.stringify({
+        ...projection.values,
+        protected_metadata_base64: columns.protected_metadata?.toString("base64") ?? null,
+        protected_metadata_version: columns.protected_metadata_version,
+        protected_metadata_key_version: columns.protected_metadata_key_version,
+        protected_metadata_tokens: columns.protected_metadata_tokens
+      })]
+    );
+  }
+
   async function drainUntilReady(
     accountId: string,
-    options: { batchSize?: number; maxSubjectBucketMessages?: number } = {},
+    options: {
+      batchSize?: number;
+      maxSubjectBucketMessages?: number;
+      maxClosureEvidenceBytes?: number;
+    } = {},
     target: ThreadingRepository = repository
   ): Promise<ThreadingRunResult> {
     let last: ThreadingRunResult | null = null;
@@ -331,6 +720,741 @@ liveDb("ThreadingRepository live DB", () => {
     );
     expect(activated).toMatchObject({ runStatus: "active", ready: true, active: true });
     expect(await activeProjection(accountId)).toEqual(shadow);
+  });
+
+  it("stores threading assignments through the metadata-protection adapter", async () => {
+    const accountId = await createAccount("protected-thread-assignment");
+    const rawMime = Buffer.from(
+      "Message-ID: <protected-thread@example.test>\r\nSubject: Protected thread\r\n\r\nbody"
+    );
+    const rawMimeHash = createHash("sha256").update(rawMime).digest("hex");
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Protected thread",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<protected-thread@example.test>",
+      rawMime
+    });
+    const adapter = new OpaqueThreadingAdapter();
+    await protectMessageInput(adapter, accountId, messageId);
+    await protectBodyInput(adapter, accountId, messageId);
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+
+    const result = await drainUntilReady(accountId, {}, protectedRepository);
+    const stored = await pool.query<{
+      strict_message_id: string | null;
+      protected_metadata: Buffer | null;
+      protected_metadata_version: number | null;
+      protected_metadata_key_version: number | null;
+      protected_metadata_tokens: Record<string, string> | null;
+    }>(
+      `SELECT strict_message_id, protected_metadata,
+              protected_metadata_version, protected_metadata_key_version,
+              protected_metadata_tokens
+       FROM public.imap_thread_assignments
+       WHERE run_id = $1 AND message_id = $2`,
+      [result.runId, messageId]
+    );
+
+    expect(adapter.writes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        context: {
+          kind: "thread_assignment",
+          accountId,
+          recordId: `${result.runId}:${messageId}`
+        },
+        values: expect.objectContaining({
+          strict_message_id: "protected-thread@example.test",
+          delivery_fingerprint_hashes: expect.arrayContaining(
+            deliveryClosureFingerprints({
+              id: messageId,
+              account_id: accountId,
+              folder_path: "INBOX",
+              uidvalidity: "101",
+              uid: "1",
+              internal_date: "2026-01-01T12:00:00.000Z",
+              size_bytes: rawMime.byteLength,
+              raw_mime_hash: rawMimeHash,
+              rfc_message_id: "<protected-thread@example.test>",
+              subject: "Protected thread",
+              from_email: "alice@example.test",
+              to_emails: ["bob@example.test"],
+              cc_emails: [],
+              bcc_emails: [],
+              headers_json: {}
+            }).map((fingerprint) =>
+              createHash("sha256")
+                .update(`delivery-fingerprint\u0000${fingerprint}`)
+                .digest("hex")
+            )
+          )
+        })
+      })
+    ]));
+    expect(stored.rows[0]?.strict_message_id).not.toBe("protected-thread@example.test");
+    expect(stored.rows[0]?.protected_metadata).not.toBeNull();
+    expect(stored.rows[0]?.protected_metadata_version).toBe(1);
+    expect(stored.rows[0]?.protected_metadata_key_version).toBe(1);
+    expect(stored.rows[0]?.protected_metadata_tokens).toHaveProperty("test");
+
+    await enqueueMessage(accountId, messageId);
+    const unchanged = await drainRepositoryUntilIdle(protectedRepository, accountId);
+    expect(unchanged.every((step) => step.assignmentsChanged === 0)).toBe(true);
+  });
+
+  it("blocks a protected adapter until the account migration activates its mode", async () => {
+    const accountId = await createAccount("protected-mode-not-active");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Readable projection",
+      rfcMessageId: "<readable-projection@example.test>"
+    });
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new OpaqueThreadingAdapter()
+    });
+
+    await expect(protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    })).rejects.toThrow(
+      "metadata protection mode is plaintext; finish migration before adapter activation"
+    );
+  });
+
+  it("does not repair body evidence outside the protection adapter", async () => {
+    const accountId = await createAccount("protected-body-repair");
+    const rawMime = Buffer.from(
+      "Message-ID: <protected-repair@example.test>\r\nSubject: Protected repair\r\n\r\nbody"
+    );
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Protected repair",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<protected-repair@example.test>",
+      rawMime,
+      rawMimeSha256: null
+    });
+    const adapter = new OpaqueThreadingAdapter();
+    await protectMessageInput(adapter, accountId, messageId);
+    await protectBodyInput(adapter, accountId, messageId);
+    const before = await pool.query<{
+      protected_metadata: Buffer;
+    }>(
+      "SELECT protected_metadata FROM public.imap_message_bodies WHERE message_id = $1",
+      [messageId]
+    );
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+
+    const result = await drainUntilReady(accountId, {}, protectedRepository);
+    const after = await pool.query<{
+      raw_mime_sha256: string | null;
+      protected_metadata: Buffer;
+    }>(
+      `SELECT raw_mime_sha256, protected_metadata
+       FROM public.imap_message_bodies
+       WHERE message_id = $1`,
+      [messageId]
+    );
+
+    expect(result.runStatus).toBe("ready");
+    expect(after.rows[0]?.raw_mime_sha256).toBeNull();
+    expect(after.rows[0]?.protected_metadata).toEqual(before.rows[0]?.protected_metadata);
+  });
+
+  it("measures revealed threading evidence instead of unrelated encrypted fields", async () => {
+    const accountId = await createAccount("protected-evidence-limit");
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Small threading input",
+      rfcMessageId: "<small-protected-input@example.test>"
+    });
+    await pool.query(
+      `INSERT INTO public.imap_message_bodies (
+         message_id, raw_bytes, raw_truncated, headers_json, search_extract
+       ) VALUES ($1, 0, false, '{}'::jsonb, $2)`,
+      [messageId, "unrelated".repeat(3_000)]
+    );
+    const adapter = new OpaqueThreadingAdapter();
+    await protectMessageInput(adapter, accountId, messageId);
+    await protectBodyInput(adapter, accountId, messageId);
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+
+    await expect(drainUntilReady(accountId, {
+      batchSize: 1,
+      maxClosureEvidenceBytes: 1_024
+    }, protectedRepository)).resolves.toMatchObject({
+      runStatus: "ready",
+      ready: true
+    });
+  });
+
+  it("counts every variable threading field after a protected reveal", async () => {
+    const accountId = await createAccount("protected-variable-evidence-limit");
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      folder: `Folder-${"x".repeat(2_000)}`,
+      rfcMessageId: "<large-folder-evidence@example.test>"
+    });
+    const adapter = new OpaqueThreadingAdapter();
+    await protectMessageInput(adapter, accountId, messageId);
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+
+    await expect(drainUntilReady(accountId, {
+      batchSize: 1,
+      maxClosureEvidenceBytes: 1_024
+    }, protectedRepository)).rejects.toBeInstanceOf(ThreadingEvidenceLimitError);
+  });
+
+  it("fails closed when protected input is read without its adapter", async () => {
+    const accountId = await createAccount("missing-protection-adapter");
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Missing adapter",
+      rfcMessageId: "<missing-adapter@example.test>"
+    });
+    const adapter = new OpaqueThreadingAdapter();
+    await protectMessageInput(adapter, accountId, messageId);
+
+    await expect(repository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    })).rejects.toThrow("protected threading metadata requires its protection adapter");
+    await expect(repository.activateRun(
+      accountId,
+      randomUUID(),
+      { requestedBy: "live-test" }
+    )).rejects.toThrow("protected threading metadata requires its protection adapter");
+    await expect(repository.compareRuns(
+      accountId,
+      randomUUID(),
+      randomUUID()
+    )).rejects.toThrow("protected threading metadata requires its protection adapter");
+    const assignments = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_thread_assignments WHERE account_id = $1",
+      [accountId]
+    );
+
+    expect(assignments.rows[0]?.count).toBe("0");
+  });
+
+  it("releases threading locks when the protection adapter stalls", async () => {
+    const accountId = await createAccount("stalled-protection-adapter");
+    await markMetadataProtected(accountId);
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Stalled adapter",
+      rfcMessageId: "<stalled-adapter@example.test>"
+    });
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new HangingThreadAssignmentAdapter(),
+      metadataProtectionTimeoutMs: 50
+    });
+    await protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    });
+    await protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    });
+
+    await expect(protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    })).rejects.toThrow("metadata protection operation timed out");
+    const lockClient = await pool.connect();
+    try {
+      const unlocked = await lockClient.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+        [`supamail.threading:${accountId}`]
+      );
+      expect(unlocked.rows[0]?.locked).toBe(true);
+      await lockClient.query(
+        "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+        [`supamail.threading:${accountId}`]
+      );
+    } finally {
+      lockClient.release();
+    }
+  });
+
+  it("applies one aggregate adapter deadline to a bounded threading step", async () => {
+    const accountId = await createAccount("aggregate-protection-deadline");
+    await markMetadataProtected(accountId);
+    for (let uid = 1; uid <= 20; uid += 1) {
+      await seedMessage(accountId, {
+        uid,
+        subject: `Slow ${uid}`,
+        rfcMessageId: `<slow-${uid}@example.test>`
+      });
+    }
+    const adapter = new SlowThreadAssignmentAdapter();
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter,
+      metadataProtectionTimeoutMs: 50
+    });
+    await protectedRepository.drainAccount(accountId, {
+      batchSize: 20,
+      requestedBy: "live-test"
+    });
+    await protectedRepository.drainAccount(accountId, {
+      batchSize: 20,
+      requestedBy: "live-test"
+    });
+
+    await expect(protectedRepository.drainAccount(accountId, {
+      batchSize: 20,
+      requestedBy: "live-test"
+    })).rejects.toThrow("metadata protection operation timed out");
+    expect(adapter.maxActive).toBeLessThanOrEqual(16);
+    const assignments = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_thread_assignments WHERE account_id = $1",
+      [accountId]
+    );
+    expect(assignments.rows[0]?.count).toBe("0");
+  });
+
+  it("does not charge database time to the metadata protection deadline", async () => {
+    const accountId = await createAccount("database-before-protection-deadline");
+    await markMetadataProtected(accountId);
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Slow compatibility query",
+      rfcMessageId: "<slow-compatibility-query@example.test>"
+    });
+    const delayedPool = {
+      connect: pool.connect.bind(pool),
+      query: async (text: string, values?: unknown[]) => {
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        return pool.query(text, values);
+      }
+    } as unknown as typeof pool;
+    const protectedRepository = new ThreadingRepository(delayedPool, {
+      metadataProtection: new OpaqueThreadingAdapter(),
+      metadataProtectionTimeoutMs: 25
+    });
+
+    await expect(drainUntilReady(
+      accountId,
+      { batchSize: 1 },
+      protectedRepository
+    )).resolves.toMatchObject({ runStatus: "ready", ready: true });
+  });
+
+  it("retains permits for non-cooperative adapter calls after repeated timeouts", async () => {
+    const adapter = new NonCooperativeThreadAssignmentAdapter();
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter,
+      metadataProtectionTimeoutMs: 50
+    });
+    const accountIdsForTimeout: string[] = [];
+    for (let accountIndex = 0; accountIndex < 3; accountIndex += 1) {
+      const accountId = await createAccount(`non-cooperative-adapter-${accountIndex}`);
+      accountIdsForTimeout.push(accountId);
+      await markMetadataProtected(accountId);
+      for (let uid = 1; uid <= 20; uid += 1) {
+        await seedMessage(accountId, {
+          uid,
+          subject: `Non-cooperative ${accountIndex}-${uid}`,
+          rfcMessageId: `<non-cooperative-${accountIndex}-${uid}@example.test>`
+        });
+      }
+      await protectedRepository.drainAccount(accountId, {
+        batchSize: 20,
+        requestedBy: "live-test"
+      });
+      await protectedRepository.drainAccount(accountId, {
+        batchSize: 20,
+        requestedBy: "live-test"
+      });
+    }
+
+    for (const accountId of accountIdsForTimeout) {
+      await expect(protectedRepository.drainAccount(accountId, {
+        batchSize: 20,
+        requestedBy: "live-test"
+      })).rejects.toThrow("metadata protection operation timed out");
+    }
+
+    expect(adapter.started).toBe(16);
+    expect(adapter.active).toBe(16);
+  });
+
+  it("does not retain large protected assignment envelopes in closure memory", async () => {
+    const accountId = await createAccount("large-protected-assignment-envelope");
+    await markMetadataProtected(accountId);
+    const messageId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Small revealed assignment",
+      rfcMessageId: "<large-protected-assignment-envelope@example.test>"
+    });
+    const adapter = new LargeThreadAssignmentEnvelopeAdapter();
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+    const ready = await drainUntilReady(
+      accountId,
+      { batchSize: 1, maxClosureEvidenceBytes: 2_048 },
+      protectedRepository
+    );
+    const stored = await pool.query<{ bytes: number }>(
+      `SELECT octet_length(protected_metadata)::integer AS bytes
+       FROM public.imap_thread_assignments
+       WHERE run_id = $1 AND message_id = $2`,
+      [ready.runId, messageId]
+    );
+    expect(stored.rows[0]?.bytes).toBeGreaterThan(400_000);
+
+    await enqueueMessage(accountId, messageId);
+    await expect(protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      maxClosureEvidenceBytes: 2_048,
+      requestedBy: "live-test"
+    })).resolves.toMatchObject({ assignmentsChanged: 0 });
+  });
+
+  it("rolls back a threading write when the protected projection is incomplete", async () => {
+    const accountId = await createAccount("incomplete-protected-thread");
+    await markMetadataProtected(accountId);
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Incomplete projection",
+      rfcMessageId: "<incomplete-projection@example.test>"
+    });
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new IncompleteThreadAssignmentAdapter()
+    });
+
+    await protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    });
+    await protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    });
+    await expect(protectedRepository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    })).rejects.toThrow("metadata protection values must contain exactly the input fields");
+    const assignments = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_thread_assignments WHERE account_id = $1",
+      [accountId]
+    );
+    expect(assignments.rows[0]?.count).toBe("0");
+  });
+
+  it("uses protected threading tokens for incremental closure and rollback history", async () => {
+    const accountId = await createAccount("protected-thread-incremental");
+    await markMetadataProtected(accountId);
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Protected decision",
+      rfcMessageId: "<protected-root@example.test>"
+    });
+    const adapter = new OpaqueThreadingAdapter();
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 1 }, protectedRepository);
+    await activateReviewed(protectedRepository, accountId, ready.runId as string);
+    const beforeIncremental = await activeProjection(accountId);
+
+    const reply = await seedMessage(accountId, {
+      uid: 2,
+      subject: "Re: Protected decision",
+      rfcMessageId: "<protected-reply@example.test>",
+      inReplyTo: "<protected-root@example.test>",
+      referencesHeader: "<protected-root@example.test>"
+    });
+    await enqueueMessage(accountId, reply);
+    const results = await drainRepositoryUntilIdle(protectedRepository, accountId);
+    const material = [...results].reverse().find((result) => result.assignmentsChanged > 0);
+    expect(material?.operationType).toBe("incremental");
+
+    const assignments = await pool.query<{
+      conversation_id: string;
+      strict_message_id: string | null;
+      protected_metadata: Buffer | null;
+    }>(
+      `SELECT conversation_id, strict_message_id, protected_metadata
+       FROM public.imap_thread_active_assignments
+       WHERE account_id = $1
+       ORDER BY message_id`,
+      [accountId]
+    );
+    expect(assignments.rows).toHaveLength(2);
+    expect(new Set(assignments.rows.map((row) => row.conversation_id)).size).toBe(1);
+    expect(assignments.rows.map((row) => row.strict_message_id)).not.toContain("protected-root@example.test");
+    expect(assignments.rows.every((row) => row.protected_metadata !== null)).toBe(true);
+
+    const history = await pool.query<{
+      previous_assignment: Record<string, unknown> | null;
+      next_assignment: Record<string, unknown> | null;
+      protected_metadata: Buffer | null;
+    }>(
+      `SELECT previous_assignment, next_assignment, protected_metadata
+       FROM public.imap_thread_assignment_history
+       WHERE operation_id = $1
+       ORDER BY message_id`,
+      [material?.operationId]
+    );
+    expect(history.rows.length).toBe(material?.assignmentsChanged);
+    expect(history.rows.every((row) => row.protected_metadata !== null)).toBe(true);
+    expect(JSON.stringify(history.rows)).not.toContain("protected-root@example.test");
+    expect(adapter.writes.some((write) => write.context.kind === "thread_assignment_history")).toBe(true);
+    await expect(pool.query(
+      `UPDATE public.imap_thread_assignments
+       SET protected_metadata = NULL,
+           protected_metadata_tokens = '{}'::jsonb
+       WHERE account_id = $1
+         AND protected_metadata IS NOT NULL`,
+      [accountId]
+    )).rejects.toThrow();
+    await expect(pool.query(
+      `UPDATE public.imap_thread_assignment_history
+       SET protected_metadata = NULL,
+           protected_metadata_tokens = '{}'::jsonb
+       WHERE operation_id = $1`,
+      [material?.operationId]
+    )).rejects.toThrow();
+
+    const beforeRejectedRollback = await activeProjection(accountId);
+    await expect(new ThreadingRepository(pool, {
+      metadataProtection: new IncompleteThreadHistoryRevealAdapter()
+    }).rollbackOperation(
+      accountId,
+      material?.operationId as string,
+      "live-test"
+    )).rejects.toThrow("revealed metadata values must contain every requested field");
+    expect(await activeProjection(accountId)).toEqual(beforeRejectedRollback);
+
+    const rollback = await protectedRepository.rollbackOperation(
+      accountId,
+      material?.operationId as string,
+      "live-test"
+    );
+    expect(rollback).toMatchObject({ operationType: "rollback", active: true, ready: true });
+    const afterRollback = await activeProjection(accountId);
+    expect(afterRollback.map(({ generation: _generation, ...row }) => row))
+      .toEqual(beforeIncremental.map(({ generation: _generation, ...row }) => row));
+    const operation = await pool.query<{ status: string }>(
+      "SELECT status FROM public.imap_thread_operations WHERE id = $1",
+      [material?.operationId]
+    );
+    expect(operation.rows[0]).toEqual({ status: "rolled_back" });
+    const retainedHistory = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_assignment_history
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    expect(retainedHistory.rows[0]?.count).toBe("0");
+  });
+
+  it("rolls back protected assignment history across bounded pages", async () => {
+    const accountId = await createAccount("paged-protected-rollback");
+    await markMetadataProtected(accountId);
+    for (let uid = 1; uid <= 40; uid += 1) {
+      await seedMessage(accountId, {
+        uid,
+        subject: `Protected root ${uid}`,
+        rfcMessageId: `<protected-root-${uid}@example.test>`
+      });
+    }
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new OpaqueThreadingAdapter()
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 40 }, protectedRepository);
+    await activateReviewed(protectedRepository, accountId, ready.runId as string);
+    const beforeIncremental = await activeProjection(accountId);
+
+    for (let uid = 41; uid <= 80; uid += 1) {
+      const rootUid = uid - 40;
+      const reply = await seedMessage(accountId, {
+        uid,
+        subject: `Re: Protected root ${rootUid}`,
+        rfcMessageId: `<protected-reply-${rootUid}@example.test>`,
+        inReplyTo: `<protected-root-${rootUid}@example.test>`,
+        referencesHeader: `<protected-root-${rootUid}@example.test>`
+      });
+      await enqueueMessage(accountId, reply);
+    }
+    const results = await drainRepositoryUntilIdle(protectedRepository, accountId, {
+      batchSize: 40
+    });
+    const material = [...results].reverse().find((result) => result.assignmentsChanged >= 40);
+    expect(material?.operationType).toBe("incremental");
+    const history = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_assignment_history
+       WHERE operation_id = $1`,
+      [material?.operationId]
+    );
+    expect(Number(history.rows[0]?.count)).toBeGreaterThan(32);
+
+    const afterIncremental = await activeProjection(accountId);
+    const pageTwoIncompleteAdapter = new PageTwoIncompleteThreadHistoryRevealAdapter();
+    await expect(new ThreadingRepository(pool, {
+      metadataProtection: pageTwoIncompleteAdapter
+    }).rollbackOperation(
+      accountId,
+      material?.operationId as string,
+      "live-test"
+    )).rejects.toThrow("revealed metadata values must contain every requested field");
+    expect(pageTwoIncompleteAdapter.historyReveals).toBeGreaterThan(32);
+    expect(await activeProjection(accountId)).toEqual(afterIncremental);
+
+    await expect(protectedRepository.rollbackOperation(
+      accountId,
+      material?.operationId as string,
+      "live-test"
+    )).resolves.toMatchObject({
+      operationType: "rollback",
+      assignmentsChanged: Number(history.rows[0]?.count)
+    });
+    const afterRollback = await activeProjection(accountId);
+    expect(afterRollback.map(({ generation: _generation, ...row }) => row))
+      .toEqual(beforeIncremental.map(({ generation: _generation, ...row }) => row));
+  });
+
+  it("keeps subject fallback functional with protected subject tokens", async () => {
+    const accountId = await createAccount("protected-subject-fallback");
+    await markMetadataProtected(accountId);
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Re: Protected budget",
+      fromEmail: "bob@example.test",
+      toEmails: ["alice@example.test"],
+      rfcMessageId: "<protected-budget-reply@example.test>",
+      internalDate: "2026-02-02T12:00:00.000Z"
+    });
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new OpaqueThreadingAdapter()
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 1 }, protectedRepository);
+    await activateReviewed(protectedRepository, accountId, ready.runId as string);
+
+    const root = await seedMessage(accountId, {
+      uid: 2,
+      subject: "Protected budget",
+      fromEmail: "alice@example.test",
+      toEmails: ["bob@example.test"],
+      rfcMessageId: "<protected-budget-root@example.test>",
+      internalDate: "2026-02-01T12:00:00.000Z"
+    });
+    await enqueueMessage(accountId, root);
+    await drainRepositoryUntilIdle(protectedRepository, accountId);
+
+    const rows = await activeProjection(accountId);
+    expect(new Set(rows.map((row) => row.conversation_id)).size).toBe(1);
+    expect(rows.every((row) => row.assignment_method === "subject_fallback")).toBe(true);
+  });
+
+  it("uses protected reference tokens to resolve an existing orphan family", async () => {
+    const accountId = await createAccount("protected-orphan-resolution");
+    await markMetadataProtected(accountId);
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new OpaqueThreadingAdapter()
+    });
+    const firstSibling = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Re: Protected missing decision",
+      rfcMessageId: "<protected-sibling-1@example.test>",
+      inReplyTo: "<protected-missing-parent@example.test>",
+      referencesHeader: "<protected-missing-parent@example.test>"
+    });
+    const secondSibling = await seedMessage(accountId, {
+      uid: 2,
+      subject: "Re: Protected missing decision",
+      rfcMessageId: "<protected-sibling-2@example.test>",
+      inReplyTo: "<protected-missing-parent@example.test>",
+      referencesHeader: "<protected-missing-parent@example.test>"
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 1 }, protectedRepository);
+    await activateReviewed(protectedRepository, accountId, ready.runId as string);
+    expect((await activeProjection(accountId)).every((row) => row.is_provisional)).toBe(true);
+
+    const parent = await seedMessage(accountId, {
+      uid: 3,
+      subject: "Protected missing decision",
+      rfcMessageId: "<protected-missing-parent@example.test>"
+    });
+    await enqueueMessage(accountId, parent);
+    const operations = await drainRepositoryUntilIdle(protectedRepository, accountId);
+
+    const family = await activeProjection(accountId);
+    expect(family).toHaveLength(3);
+    expect(family.every((row) => !row.is_provisional)).toBe(true);
+    expect(Math.max(...operations.map((result) => result.messagesConsidered))).toBe(3);
+    expect(firstSibling).not.toBe(secondSibling);
+  });
+
+  it("uses protected provider-thread tokens for incremental closure", async () => {
+    const accountId = await createAccount("protected-provider-thread");
+    await markMetadataProtected(accountId);
+    await seedMessage(accountId, {
+      uid: 1,
+      rfcMessageId: "<provider-first@example.test>",
+      providerThreadId: "shared-provider-thread",
+      providerThreadNamespace: "gmail"
+    });
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new OpaqueThreadingAdapter()
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 1 }, protectedRepository);
+    await activateReviewed(protectedRepository, accountId, ready.runId as string);
+
+    const second = await seedMessage(accountId, {
+      uid: 2,
+      rfcMessageId: "<provider-second@example.test>",
+      providerThreadId: "shared-provider-thread",
+      providerThreadNamespace: "gmail"
+    });
+    await enqueueMessage(accountId, second);
+    const operations = await drainRepositoryUntilIdle(protectedRepository, accountId);
+
+    expect(Math.max(...operations.map((step) => step.messagesConsidered))).toBe(2);
+    expect(new Set((await activeProjection(accountId)).map((row) => row.conversation_id)).size).toBe(1);
+  });
+
+  it("uses protected delivery-fingerprint tokens for incremental closure", async () => {
+    const accountId = await createAccount("protected-delivery-fingerprint");
+    await markMetadataProtected(accountId);
+    const rawMime = Buffer.from("From: alice@example.test\r\nTo: bob@example.test\r\n\r\nsame delivery");
+    await seedMessage(accountId, {
+      uid: 1,
+      folder: "INBOX",
+      rawMime
+    });
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: new OpaqueThreadingAdapter()
+    });
+    const ready = await drainUntilReady(accountId, { batchSize: 1 }, protectedRepository);
+    await activateReviewed(protectedRepository, accountId, ready.runId as string);
+
+    const copy = await seedMessage(accountId, {
+      uid: 2,
+      folder: "Sent",
+      rawMime
+    });
+    await enqueueMessage(accountId, copy);
+    const operations = await drainRepositoryUntilIdle(protectedRepository, accountId);
+
+    expect(Math.max(...operations.map((step) => step.messagesConsidered))).toBe(2);
+    const rows = await activeProjection(accountId);
+    expect(new Set(rows.map((row) => row.delivery_key)).size).toBe(1);
+    expect(new Set(rows.map((row) => row.conversation_id)).size).toBe(1);
   });
 
   it("threads physical copies from committed evidence after the body payload is unreadable", async () => {
@@ -1562,6 +2686,104 @@ liveDb("ThreadingRepository live DB", () => {
     expect(new Set(evidence.rows.map((row) => row.authored_delivery_sha256)).size).toBe(1);
   });
 
+  it("fails closed when protected authored evidence needs legacy repair", async () => {
+    const accountId = await createAccount("protected-authored-bridge");
+    const messageIds: string[] = [];
+    const adapter = new OpaqueThreadingAdapter();
+    for (const [index, rawDigest] of ["a".repeat(64), "b".repeat(64)].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        subject: "Protected authored bridge",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<protected-authored-bridge@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime_sha256, raw_bytes, raw_truncated,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at,
+           threading_payload_sha256
+         ) VALUES (
+           $1, $2, 128, false, $3::jsonb,
+           '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $4, true, now(), $5
+         )`,
+        [
+          messageId,
+          rawDigest,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Alice <alice@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Protected authored bridge",
+            "message-id": "<protected-authored-bridge@example.test>"
+          }),
+          "f".repeat(64),
+          "e".repeat(64)
+        ]
+      );
+      await protectMessageInput(adapter, accountId, messageId);
+      await protectBodyInput(adapter, accountId, messageId);
+    }
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+
+    await expect(drainUntilReady(
+      accountId,
+      { batchSize: 2 },
+      protectedRepository
+    )).rejects.toThrow(
+      "protected metadata has incomplete authored-delivery evidence; repair it before activation"
+    );
+    const stored = await pool.query<{ authored_delivery_sha256: string | null }>(
+      `SELECT authored_delivery_sha256
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+
+    expect(stored.rows.every((row) => row.authored_delivery_sha256 === null)).toBe(true);
+    expect(adapter.writes.some((write) =>
+      write.context.kind === "message_body"
+      && typeof write.values.authored_delivery_sha256 === "string"
+    )).toBe(false);
+  });
+
+  it("does not block protected rows that cannot produce authored evidence", async () => {
+    const accountId = await createAccount("protected-ineligible-authored-bridge");
+    const adapter = new OpaqueThreadingAdapter();
+    for (const [index, rawMime] of [Buffer.from("aaa"), Buffer.from("bbb")].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        internalDate: "2026-06-22T18:23:13.000Z",
+        subject: "Protected ineligible bridge",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<protected-ineligible-bridge@example.test>",
+        rawMime,
+        rawTruncated: true,
+        rawMimeSha256: null
+      });
+      await protectMessageInput(adapter, accountId, messageId);
+      await protectBodyInput(adapter, accountId, messageId);
+    }
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+
+    await expect(drainUntilReady(
+      accountId,
+      { batchSize: 2 },
+      protectedRepository
+    )).resolves.toMatchObject({ runStatus: "ready", ready: true });
+  });
+
   it("releases targeted delivery evidence work when its source becomes ineligible", async () => {
     const accountId = await createAccount("stale-authored-delivery-work");
     const messageIds: string[] = [];
@@ -1633,6 +2855,114 @@ liveDb("ThreadingRepository live DB", () => {
       [accountId]
     );
     expect(remaining.rows[0]?.count).toBe("0");
+  });
+
+  it("rechecks retained protected delivery evidence work after eligibility changes", async () => {
+    const accountId = await createAccount("retained-protected-authored-work");
+    const messageIds: string[] = [];
+    for (const [index, rawDigest] of ["5".repeat(64), "6".repeat(64)].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        folder: index === 0 ? "Sent" : "INBOX",
+        subject: "Retained protected authored work",
+        fromEmail: "alice@example.test",
+        toEmails: ["alice@example.test"],
+        rfcMessageId: "<retained-protected-authored-work@example.test>"
+      });
+      messageIds.push(messageId);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated,
+           body_text, body_plain, selected_text_part, selected_text_format,
+           headers_json, mime_structure, parser_warnings,
+           structured_evidence_extractor_version, structured_evidence_sha256,
+           structured_evidence_complete, structured_evidence_extracted_at
+         ) VALUES (
+           $1, NULL, $2, 128, false,
+           'Same authored body', 'Same authored body', 'Same authored body', 'plain',
+           $3::jsonb, '{"type":"text/plain"}'::jsonb, '{}'::text[],
+           'test-v1', $4, true, now()
+         )`,
+        [
+          messageId,
+          rawDigest,
+          JSON.stringify({
+            from: "Alice <alice@example.test>",
+            to: "Alice <alice@example.test>",
+            date: "2026-06-22T18:23:13.000Z",
+            subject: "Retained protected authored work",
+            "message-id": "<retained-protected-authored-work@example.test>"
+          }),
+          "f".repeat(64)
+        ]
+      );
+    }
+
+    let specialWork = 0;
+    for (let pass = 0; pass < 20 && specialWork === 0; pass += 1) {
+      await repository.drainAccount(accountId, { batchSize: 2, requestedBy: "live-test" });
+      const pending = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+         FROM public.imap_thread_work_queue
+         WHERE account_id = $1 AND reason = 'delivery_evidence_bridge'`,
+        [accountId]
+      );
+      specialWork = Number(pending.rows[0]?.count ?? 0);
+    }
+    expect(specialWork).toBeGreaterThan(0);
+
+    const adapter = new OpaqueThreadingAdapter();
+    for (const messageId of messageIds) {
+      await protectMessageInput(adapter, accountId, messageId);
+      await protectBodyInput(adapter, accountId, messageId);
+    }
+    const protectedRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter
+    });
+    let protectedGapRejected = false;
+    for (let pass = 0; pass < 20 && !protectedGapRejected; pass += 1) {
+      try {
+        await protectedRepository.drainAccount(accountId, {
+          batchSize: 2,
+          requestedBy: "live-test"
+        });
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe(
+          "protected metadata has incomplete authored-delivery evidence; repair it before activation"
+        );
+        protectedGapRejected = true;
+      }
+    }
+    expect(protectedGapRejected).toBe(true);
+
+    await pool.query(
+      `UPDATE public.imap_message_bodies
+       SET structured_evidence_complete = false,
+           structured_evidence_sha256 = NULL
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+    for (const messageId of messageIds) {
+      await protectBodyInput(adapter, accountId, messageId);
+    }
+    await pool.query(
+      `UPDATE public.imap_thread_runs
+       SET available_at = now()
+       WHERE account_id = $1 AND status = 'building'`,
+      [accountId]
+    );
+    await pool.query(
+      `UPDATE public.imap_thread_work_queue
+       SET available_at = now()
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    await expect(drainUntilReady(
+      accountId,
+      { batchSize: 2 },
+      protectedRepository
+    )).resolves.toMatchObject({ runStatus: "ready", ready: true });
   });
 
   it("invalidates authored delivery evidence when a stored body is replaced", async () => {

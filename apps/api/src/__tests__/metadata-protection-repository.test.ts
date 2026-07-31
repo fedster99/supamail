@@ -101,8 +101,48 @@ describe("MirrorRepository metadata protection", () => {
       3,
       { email: "opaque-token" }
     ]);
+    expect(insertParams[18]).toBe("protected");
     expect(account.email_address).toBe("owner@example.com");
     expect(account).not.toHaveProperty("protected_metadata");
     expect(account).not.toHaveProperty("protected_metadata_tokens");
+  });
+
+  it("marks accounts as plaintext when no protection adapter is configured", async () => {
+    let insertParams: unknown[] = [];
+    const pool = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("count(*)")) return { rows: [{ count: "0" }] };
+        if (sql.includes("INSERT INTO public.imap_accounts")) {
+          insertParams = params;
+          return {
+            rows: [{
+              id: params[13],
+              email_address: params[0],
+              protected_metadata: params[14],
+              protected_metadata_version: params[15],
+              protected_metadata_key_version: params[16],
+              protected_metadata_tokens: params[17]
+            }]
+          };
+        }
+        return { rows: [] };
+      })
+    } as unknown as PgPool;
+    const repository = new MirrorRepository(pool, {
+      SYNC_MAX_ACCOUNTS: 10,
+      BODY_FETCH_POLICY: "lazy",
+      IMAP_ENCRYPTION_KEY: "0123456789abcdef"
+    } as AppConfig);
+
+    await repository.createAccount({
+      emailAddress: "owner@example.com",
+      host: "imap.example.com",
+      port: 993,
+      secure: true,
+      username: "owner@example.com",
+      password: "not-stored-in-plaintext"
+    });
+
+    expect(insertParams[18]).toBe("plaintext");
   });
 });

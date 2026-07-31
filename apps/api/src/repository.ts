@@ -10,9 +10,11 @@ import { withAccountLock } from "./locks.js";
 import {
   assertMetadataProtectionProjection,
   assertRevealedMetadataValues,
+  isPlaintextMetadataProtectionAdapter,
   plaintextMetadataProtection,
   protectedMetadataColumns,
   storedMetadataProjection,
+  usesPlaintextMetadataStorage,
   type MetadataProtectionAdapter,
   type MetadataRecordKind,
   type MetadataValues,
@@ -667,11 +669,7 @@ export class MirrorRepository {
     fields: readonly string[]
   ): Promise<T> {
     let revealed: MetadataValues;
-    const usesPlaintextStorage = this.metadataProtection === plaintextMetadataProtection
-      && row.protected_metadata == null
-      && row.protected_metadata_version == null
-      && row.protected_metadata_key_version == null
-      && row.protected_metadata_tokens == null;
+    const usesPlaintextStorage = usesPlaintextMetadataStorage(this.metadataProtection, row);
     if (usesPlaintextStorage
       && !Object.hasOwn(row, "protected_metadata")
       && !Object.hasOwn(row, "protected_metadata_version")
@@ -771,11 +769,12 @@ export class MirrorRepository {
         protected_metadata,
         protected_metadata_version,
         protected_metadata_key_version,
-        protected_metadata_tokens
+        protected_metadata_tokens,
+        metadata_protection_mode
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-        $15, $16, $17, $18
+        $15, $16, $17, $18, $19
       )
       RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
       `,
@@ -797,7 +796,8 @@ export class MirrorRepository {
         protectedColumns.protected_metadata,
         protectedColumns.protected_metadata_version,
         protectedColumns.protected_metadata_key_version,
-        protectedColumns.protected_metadata_tokens
+        protectedColumns.protected_metadata_tokens,
+        isPlaintextMetadataProtectionAdapter(this.metadataProtection) ? "plaintext" : "protected"
       ]
     );
     return await this.revealAccountSummary(result.rows[0]);
