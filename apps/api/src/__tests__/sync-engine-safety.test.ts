@@ -165,10 +165,9 @@ describe("sync engine safety", () => {
     // Back-compat: plain strings still pattern-match.
     expect(isAuthError("535 5.7.8 authentication failed")).toBe(true);
 
-    // The persisted reason keeps the server's why, not just "Command failed" — and it
-    // must SURVIVE sanitizeErrorReason, whose credential redaction truncates from the
-    // first LOGIN/AUTHENTICATE token onward (markers must precede the server text).
-    const { sanitizeErrorReason } = await import("../repository.js");
+    // The transient description keeps the server's classification for local
+    // troubleshooting. Durable state reduces it to a fixed operational code.
+    const { diagnosticErrorCode, sanitizeErrorReason } = await import("../repository.js");
     const described = describeSyncError(Object.assign(new Error("Command failed"), {
       code: "ELOGIN",
       authenticationFailed: true,
@@ -188,6 +187,7 @@ describe("sync engine safety", () => {
     expect(sanitized).toContain("[status=NO]");
     expect(sanitized).toContain("[AUTH]");
     expect(sanitized).not.toContain("LOGIN failed.");
+    expect(diagnosticErrorCode(described)).toBe("AUTH_ERROR");
 
     class ProviderFailure extends Error {}
     expect(describeSyncError(new ProviderFailure("provider exploded"))).toContain("[ProviderFailure]");
@@ -196,6 +196,31 @@ describe("sync engine safety", () => {
     expect(source).toContain("isAuthError(error)");
     expect(source).toContain("const message = describeSyncError(error)");
     expect(source).toContain("markAccountSyncAuthFailed");
+  });
+
+  it("classifies durable sync diagnostics without retaining provider text", async () => {
+    const { diagnosticErrorCode } = await import("../repository.js");
+
+    expect(diagnosticErrorCode("provider timed out while reading INBOX/private"))
+      .toBe("SYNC_TIMEOUT");
+    expect(diagnosticErrorCode("LOGIN failed for owner@example.test"))
+      .toBe("AUTH_ERROR");
+    expect(diagnosticErrorCode("[Error] [code=ELOGIN] [AUTH] Command failed"))
+      .toBe("AUTH_ERROR");
+    expect(diagnosticErrorCode("server said too many requests for user@example.test"))
+      .toBe("RATE_LIMITED");
+    expect(diagnosticErrorCode("certificate verify failed for mail.example.test"))
+      .toBe("TLS_ERROR");
+    expect(diagnosticErrorCode("No such mailbox: Private Clients"))
+      .toBe("MAILBOX_MISSING");
+    expect(diagnosticErrorCode("Mailbox Private Clients is missing"))
+      .toBe("MAILBOX_MISSING");
+    expect(diagnosticErrorCode("ECONNRESET from mail.example.test"))
+      .toBe("CONNECTION_ERROR");
+    expect(diagnosticErrorCode("provider transient disconnect in Private Clients"))
+      .toBe("CONNECTION_ERROR");
+    expect(diagnosticErrorCode("subject leaked in an unknown provider response"))
+      .toBe("SYNC_ERROR");
   });
 
   it("detects missing-mailbox errors before forcing folder rediscovery", async () => {

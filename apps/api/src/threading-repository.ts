@@ -856,6 +856,15 @@ function sanitizedFailure(error: unknown): string {
     .slice(0, 1_000);
 }
 
+export function threadingFailureReason(
+  error: unknown,
+  metadataProtection: MetadataProtectionAdapter
+): string {
+  return isPlaintextMetadataProtectionAdapter(metadataProtection)
+    ? sanitizedFailure(error)
+    : "THREADING_ERROR";
+}
+
 function boundedNonNegativeInteger(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   if (!Number.isFinite(value)) throw new Error("threading comparison thresholds must be finite numbers");
@@ -4223,7 +4232,7 @@ export class ThreadingRepository {
     requestedBy: string,
     canSubdivide: boolean
   ): Promise<void> {
-    const reason = sanitizedFailure(error);
+    const reason = threadingFailureReason(error, this.metadataProtection);
     const adaptiveBatchSize = canSubdivide && messageIds.length > 1 && (
       error instanceof ThreadingClosureLimitError || error instanceof ThreadingEvidenceLimitError
     )

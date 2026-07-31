@@ -423,8 +423,8 @@ async function scenarioAuthError() {
     ).rows[0];
     assert(row.sync_state === "BROKEN", "account immediately BROKEN", `sync_state=${row.sync_state}`);
     assert(
-      /^AUTH_ERROR:/.test(row.sync_state_reason),
-      "sync_state_reason starts with AUTH_ERROR:",
+      row.sync_state_reason === "AUTH_ERROR",
+      "sync_state_reason is the fixed AUTH_ERROR code",
       `reason=${row.sync_state_reason}`
     );
     assert(row.current_backoff_ms === 0, "no backoff applied (auth is non-retryable)", `backoff=${row.current_backoff_ms}`);
@@ -509,8 +509,8 @@ async function scenarioUidValidityCap() {
       `state=${row.sync_state}`
     );
     assert(
-      /UIDVALIDITY_RESET_LIMIT_EXCEEDED/.test(row.sync_state_reason ?? ""),
-      "reason mentions UIDVALIDITY_RESET_LIMIT_EXCEEDED",
+      row.sync_state_reason === "SYNC_ERROR",
+      "reason uses the fixed SYNC_ERROR code",
       `reason=${row.sync_state_reason}`
     );
 

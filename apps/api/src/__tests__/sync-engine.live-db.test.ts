@@ -131,6 +131,37 @@ liveDb("live DB reliability lane", () => {
     await closePool();
   });
 
+  it("stores only a fixed code in pending-folder event diagnostics", async () => {
+    const h = await setupIntegration("live-folder-diagnostic-code");
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    expect(account).not.toBeNull();
+    const [folder] = await h.repository.upsertDiscoveredFolders(account!, [{
+      path: "Private Clients",
+      delimiter: "/",
+    }]);
+
+    const privateReason = "No such mailbox: Private Clients for owner@example.test";
+    await h.repository.markFolderPendingVerification(
+      h.account.id,
+      folder.id,
+      folder.path,
+      privateReason,
+    );
+
+    const event = await h.pool.query<{ payload: { reason: string } }>(
+      `SELECT payload
+       FROM public.imap_sync_events
+       WHERE account_id = $1 AND event_type = 'FOLDER_PENDING_VERIFICATION'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [h.account.id],
+    );
+    expect(event.rows[0]?.payload).toEqual({ reason: "MAILBOX_MISSING" });
+    expect(JSON.stringify(event.rows[0]?.payload)).not.toContain("Private Clients");
+    expect(JSON.stringify(event.rows[0]?.payload)).not.toContain("owner@example.test");
+  });
+
   it("serializes concurrent syncs with the account advisory lock", async () => {
     const h = await setupIntegration("live-lock", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);
@@ -261,7 +292,7 @@ liveDb("live DB reliability lane", () => {
       );
       expect(orphanRun.rows[0].status).toBe("failed");
       expect(orphanRun.rows[0].finished_at).not.toBeNull();
-      expect(orphanRun.rows[0].error).toMatch(/reaped/);
+      expect(orphanRun.rows[0].error).toBe("WORKER_REAPED");
     } finally {
       await releaseKilledClient(locker);
     }
@@ -398,7 +429,7 @@ liveDb("live DB reliability lane", () => {
     );
     expect(orphanRun.rows[0].status).toBe("failed");
     expect(orphanRun.rows[0].finished_at).not.toBeNull();
-    expect(orphanRun.rows[0].error).toMatch(/reaped/);
+    expect(orphanRun.rows[0].error).toBe("WORKER_REAPED");
 
     // Live account is untouched: still syncing, run still open.
     const liveAccountRow = await h.pool.query<{ currently_syncing: boolean }>(

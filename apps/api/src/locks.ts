@@ -563,7 +563,7 @@ export async function clearOrphanedLockForAccount(
       UPDATE public.imap_sync_runs r
       SET status = 'failed',
           finished_at = now(),
-          error = COALESCE(r.error, 'reaped: worker stopped without finishing the run')
+          error = COALESCE(r.error, 'WORKER_REAPED')
       FROM public.imap_accounts a
       WHERE r.account_id = a.id
         AND a.lock_id = $1
@@ -639,7 +639,7 @@ export async function clearOrphanedLocks(
       UPDATE public.imap_sync_runs r
       SET status = 'failed',
           finished_at = now(),
-          error = COALESCE(r.error, 'reaped: worker stopped without finishing the run')
+          error = COALESCE(r.error, 'WORKER_REAPED')
       FROM public.imap_accounts a
       WHERE r.account_id = a.id
         AND r.status = 'running'

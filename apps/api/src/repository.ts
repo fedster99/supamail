@@ -31,6 +31,7 @@ import {
   splitFlagWriteBatches,
   splitMetadataWriteBatches
 } from "./sync-limits.js";
+import { diagnosticErrorCode, sanitizeErrorReason } from "./sync-diagnostics.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -55,7 +56,6 @@ import type {
 const BROKEN_FAILURE_THRESHOLD = 10;
 const BACKOFF_FLOOR_MS = 1_000;
 const BACKOFF_CEILING_MS = 5 * 60_000;
-const ERROR_REASON_MAX_LEN = 1000;
 const MANUAL_TRACK_OVERRIDE_NOTE = "manual_track_override";
 const MISSING_MAILBOX_VERIFICATION_NOTE = "missing_mailbox_pending_verification";
 const DEFAULT_METADATA_WRITE_TIMEOUT_MS = 5 * 60_000;
@@ -133,7 +133,6 @@ function selectMetadataValues(
   );
 }
 
-const CREDENTIAL_LEAK_PATTERN = /\b(LOGIN|AUTHENTICATE|PLAIN|XOAUTH2?)\b[\s\S]*$/i;
 
 const METADATA_WRITE_TIMEOUT_ERROR = "metadata write deadline exceeded";
 const FLAG_SCAN_TIMEOUT_ERROR = "FLAG_SCAN_TOTAL_TIMEOUT_MS exceeded during flag scan write";
@@ -486,14 +485,7 @@ interface PurgeQueueTarget {
   account_id: string;
 }
 
-export function sanitizeErrorReason(error: string): string {
-  return error
-    .replace(CREDENTIAL_LEAK_PATTERN, "$1 [REDACTED]")
-    .replace(/[\x00-\x1F\x7F]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, ERROR_REASON_MAX_LEN);
-}
+export { diagnosticErrorCode, sanitizeErrorReason } from "./sync-diagnostics.js";
 
 /** Resolved IMAP connection coordinates + the chosen provider profile id for a new
  * account (the twin of {@link import("./smtp-client.js").ResolvedSmtpCreds}). */
@@ -1064,7 +1056,7 @@ export class MirrorRepository {
   }
 
   async finishSyncRun(result: SyncResult): Promise<void> {
-    const sanitizedErrors = result.errors.map(sanitizeErrorReason);
+    const diagnosticCodes = [...new Set(result.errors.map(diagnosticErrorCode))];
     await this.pool.query(
       `
       UPDATE public.imap_sync_runs
@@ -1088,9 +1080,9 @@ export class MirrorRepository {
         result.bodiesFetched,
         result.flagsUpdated,
         result.reconcileGapsFound,
-        sanitizedErrors[0] ?? null,
+        diagnosticCodes[0] ?? null,
         JSON.stringify({
-          errors: sanitizedErrors,
+          errors: diagnosticCodes,
           hitLockBudget: result.hitLockBudget,
           metadataRowsCommitted: result.metadataRowsCommitted ?? 0,
           metadataWriteDurationMs: result.metadataWriteDurationMs ?? 0,
@@ -1109,7 +1101,7 @@ export class MirrorRepository {
       SET status = $2, finished_at = CASE WHEN $2 != 'running' THEN now() ELSE finished_at END, error = $3
       WHERE id = $1
       `,
-      [runId, status, error ? sanitizeErrorReason(error) : null]
+      [runId, status, error ? diagnosticErrorCode(error) : null]
     );
   }
 
@@ -1358,7 +1350,7 @@ export class MirrorRepository {
         AND ($4::text IS NULL OR sync_started_by = $4)
       RETURNING id
       `,
-      [accountId, sanitizeErrorReason(error), countsTowardBackoff, options.expectedSyncOwner ?? null],
+      [accountId, diagnosticErrorCode(error), countsTowardBackoff, options.expectedSyncOwner ?? null],
       options
     );
     if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
@@ -1392,7 +1384,7 @@ export class MirrorRepository {
         AND ($3::text IS NULL OR sync_started_by = $3)
       RETURNING id
       `,
-      [accountId, sanitizeErrorReason(`AUTH_ERROR: ${error}`), options.expectedSyncOwner ?? null],
+      [accountId, diagnosticErrorCode(`AUTH_ERROR: ${error}`), options.expectedSyncOwner ?? null],
       options
     );
     if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
@@ -1489,7 +1481,7 @@ export class MirrorRepository {
       `,
       [
         accountId,
-        sanitizeErrorReason(error),
+        diagnosticErrorCode(error),
         BROKEN_FAILURE_THRESHOLD,
         BACKOFF_FLOOR_MS,
         BACKOFF_CEILING_MS,
@@ -1892,7 +1884,7 @@ export class MirrorRepository {
     folderPath: string,
     reason: string
   ): Promise<void> {
-    const sanitizedReason = sanitizeErrorReason(reason);
+    const diagnosticCode = diagnosticErrorCode(reason);
     const client = await this.pool.connect();
     await client.query("BEGIN");
     try {
@@ -1934,7 +1926,7 @@ export class MirrorRepository {
         [
           accountId,
           folderPath,
-          JSON.stringify({ reason: sanitizedReason })
+          JSON.stringify({ reason: diagnosticCode })
         ]
       );
       await client.query("COMMIT");
@@ -2359,7 +2351,7 @@ export class MirrorRepository {
         backoff_until = NULL
       WHERE id = $1
       `,
-      [accountId, sanitizeErrorReason(reason)]
+      [accountId, diagnosticErrorCode(reason)]
     );
   }
 

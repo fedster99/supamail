@@ -53,11 +53,11 @@ describe("repository safety", () => {
     expect(source).toContain("RECENT_UIDVALIDITY_RESET");
   });
 
-  it("sanitizes sync run errors before persistence", async () => {
+  it("stores fixed sync diagnostic codes instead of provider text", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    expect(source).toContain("const sanitizedErrors = result.errors.map(sanitizeErrorReason)");
-    expect(source).toContain("errors: sanitizedErrors");
+    expect(source).toContain("const diagnosticCodes = [...new Set(result.errors.map(diagnosticErrorCode))]");
+    expect(source).toContain("errors: diagnosticCodes");
     expect(source).toContain("metadataRowsCommitted: result.metadataRowsCommitted ?? 0");
     expect(source).toContain(
       "metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null"

@@ -291,7 +291,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       );
       expect(run.rows[0]).toEqual({
         status: "partial_success",
-        error: "Sync interrupted by scheduler"
+        error: "SYNC_ERROR"
       });
     } finally {
       releaseLock();
@@ -381,7 +381,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     expect(run.rows[0]).toEqual({
       status: "failed",
-      error: "[Error] provider failed before shutdown"
+      error: "SYNC_ERROR"
     });
   });
 
@@ -717,7 +717,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       )
     ).rows[0];
     expect(row.sync_state).toBe("BROKEN");
-    expect(row.sync_state_reason).toMatch(/^AUTH_ERROR:/);
+    expect(row.sync_state_reason).toBe("AUTH_ERROR");
     expect(row.current_backoff_ms).toBe(0);
     expect(row.backoff_until).toBeNull();
   });
@@ -788,7 +788,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ).rows[0];
     expect(broken.uidvalidity_reset_count).toBe(3);
     expect(broken.sync_state).toBe("BROKEN");
-    expect(broken.sync_state_reason).toMatch(/UIDVALIDITY_RESET_LIMIT_EXCEEDED/);
+    expect(broken.sync_state_reason).toBe("SYNC_ERROR");
 
     // 24h rolling window: backdate, unbreak, expect a single reset to count=1.
     await h.pool.query(
@@ -1998,7 +1998,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       )
     ).rows[0];
     expect(afterTimeout.sync_state).toBe("DEGRADED");
-    expect(afterTimeout.sync_state_reason).toContain("INITIAL_SYNC_BATCH_TIMEOUT_MS exceeded during initial sync FETCH");
+    expect(afterTimeout.sync_state_reason).toBe("SYNC_TIMEOUT");
     expect(afterTimeout.initial_sync_complete).toBe(false);
     expect(Number(afterTimeout.initial_sync_target_max_uid)).toBe(3);
     expect(Number(afterTimeout.initial_sync_oldest_uid_synced)).toBe(4);

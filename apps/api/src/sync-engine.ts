@@ -21,6 +21,10 @@ import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
+import {
+  isAuthDiagnosticText,
+  isMissingMailboxDiagnosticText,
+} from "./sync-diagnostics.js";
 import type { MetadataWriteOptions } from "./repository.js";
 import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
 import type {
@@ -40,29 +44,10 @@ import { createImapClient } from "./imap-client.js";
 // non-retryable, so over-matching is preferable to under-matching here
 // (a legitimate transient error caught as auth means a manual unstuck;
 // a missed auth error means burning through retries on bad creds).
-const AUTH_ERROR_PATTERNS = [
-  /authentication failed/i,
-  /invalid credentials/i,
-  /invalid (user|username|login)/i,
-  /incorrect password/i,
-  /login failed/i,
-  /auth(?:enticate)? failed/i,
-  /AUTHENTICATIONFAILED/i,
-  /\bNO LOGIN\b/i,
-  /\b535\b/, // SMTP/IMAP auth fail code
-];
-
 const HISTORY_METADATA_COMMIT_GRACE_MS = 30_000;
 const SYNC_STATE_WRITE_GRACE_MS = 30_000;
 const SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS = 1_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
-const MISSING_MAILBOX_PATTERNS = [
-  /\bNONEXISTENT\b/i,
-  /\bTRYCREATE\b/i,
-  /does not exist/i,
-  /no such mailbox/i,
-  /mailbox not found/i
-];
 
 const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
 const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
@@ -152,7 +137,7 @@ const TRANSIENT_RESPONSE_CODES = new Set(["UNAVAILABLE", "INUSE", "LIMIT", "SERV
  */
 export function isAuthError(error: unknown): boolean {
   if (typeof error === "string") {
-    return AUTH_ERROR_PATTERNS.some((p) => p.test(error));
+    return isAuthDiagnosticText(error);
   }
   if (!error || typeof error !== "object") return false;
 
@@ -176,13 +161,12 @@ export function isAuthError(error: unknown): boolean {
     (error as { response?: unknown }).response,
     (error as { responseText?: unknown }).responseText
   ].filter((t): t is string => typeof t === "string" && t.length > 0);
-  return texts.some((text) => AUTH_ERROR_PATTERNS.some((p) => p.test(text)));
+  return texts.some(isAuthDiagnosticText);
 }
 
 /**
- * Persistable description of a sync failure. `error.message` alone is often just
- * "Command failed"; keep the server response code + text so the stored reason says
- * WHY (the okano incident: 67 failures all recorded as the useless "Command failed").
+ * Detailed transient description of a sync failure. Classification converts this
+ * text to a fixed code before durable storage or worker logging.
  */
 export function describeSyncError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
@@ -221,7 +205,7 @@ export function isMissingMailboxError(error: unknown): boolean {
   }
 
   const message = error instanceof Error ? error.message : String(error);
-  return MISSING_MAILBOX_PATTERNS.some((pattern) => pattern.test(message));
+  return isMissingMailboxDiagnosticText(message);
 }
 
 // imapflow error codes for a closed/unusable IMAP connection ("Connection not
