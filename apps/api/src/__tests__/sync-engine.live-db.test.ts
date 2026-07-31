@@ -261,7 +261,7 @@ liveDb("live DB reliability lane", () => {
       );
       expect(orphanRun.rows[0].status).toBe("failed");
       expect(orphanRun.rows[0].finished_at).not.toBeNull();
-      expect(orphanRun.rows[0].error).toMatch(/reaped/);
+      expect(orphanRun.rows[0].error).toBe("WORKER_REAPED");
     } finally {
       await releaseKilledClient(locker);
     }
@@ -398,7 +398,7 @@ liveDb("live DB reliability lane", () => {
     );
     expect(orphanRun.rows[0].status).toBe("failed");
     expect(orphanRun.rows[0].finished_at).not.toBeNull();
-    expect(orphanRun.rows[0].error).toMatch(/reaped/);
+    expect(orphanRun.rows[0].error).toBe("WORKER_REAPED");
 
     // Live account is untouched: still syncing, run still open.
     const liveAccountRow = await h.pool.query<{ currently_syncing: boolean }>(

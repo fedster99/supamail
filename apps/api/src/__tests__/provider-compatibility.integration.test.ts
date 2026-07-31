@@ -359,6 +359,6 @@ integration("provider compatibility fixtures (real Postgres + fixture IMAP)", ()
       )
     ).rows[0];
     expect(account.sync_state).toBe("DEGRADED");
-    expect(account.sync_state_reason).toMatch(/provider transient disconnect/);
+    expect(account.sync_state_reason).toBe("CONNECTION_ERROR");
   });
 });

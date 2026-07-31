@@ -3,7 +3,7 @@ import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
 import { closePool, getPool, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
-import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
+import { diagnosticErrorCode, MirrorRepository } from "./repository.js";
 import { MirrorEngine } from "./sync-engine.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import {
@@ -128,9 +128,7 @@ export function handleFatalProcessEvent(
   processState: { exitCode?: string | number | null } = process
 ): void {
   processState.exitCode = 1;
-  const detail = value instanceof Error
-    ? { message: value.message, stack: value.stack }
-    : String(value);
+  const detail = { code: diagnosticErrorCode(value instanceof Error ? value.message : String(value)) };
   try {
     sink.error(JSON.stringify(event === "uncaughtException"
       ? { event: "process.uncaughtException", error: detail }
@@ -194,7 +192,7 @@ function loggedOutcome(result: WorkerSyncResult) {
       ? metadataRowsPerSecond(metadataRowsCommitted, metadataWriteDurationMs)
       : null,
     bodiesFetched: result.bodiesFetched,
-    errors: result.errors.map(sanitizeErrorReason)
+    errors: [...new Set(result.errors.map(diagnosticErrorCode))]
   };
 }
 
@@ -338,7 +336,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     } catch (error) {
       console.error(JSON.stringify({
         event: "threading.tick.failed",
-        error: error instanceof Error ? error.message : String(error)
+        error: diagnosticErrorCode(error instanceof Error ? error.message : String(error))
       }));
       return;
     }
@@ -373,7 +371,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
           console.error(JSON.stringify({
             event: "threading.account.failed",
             accountId,
-            error: error instanceof Error ? error.message : String(error)
+            error: diagnosticErrorCode(error instanceof Error ? error.message : String(error))
           }));
         }
       }
@@ -414,9 +412,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
       } catch (error) {
         console.error(JSON.stringify({
           event: "sync.tick.failed",
-          error: error instanceof Error
-            ? { message: error.message, stack: error.stack }
-            : String(error)
+          error: diagnosticErrorCode(error instanceof Error ? error.message : String(error))
         }));
       }
       if (stopping) break;
@@ -442,7 +438,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
           attempt,
           maxAttempts,
           delayMs,
-          error: error instanceof Error ? error.message : String(error)
+          error: diagnosticErrorCode(error instanceof Error ? error.message : String(error))
         }))
     });
   } catch (error) {
@@ -511,7 +507,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
       .catch((error) =>
         console.error(JSON.stringify({
           event: "worker.retention.failed",
-          error: error instanceof Error ? error.message : String(error)
+          error: diagnosticErrorCode(error instanceof Error ? error.message : String(error))
         }))
       );
   }, 24 * 60 * 60_000);

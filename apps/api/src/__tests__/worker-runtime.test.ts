@@ -63,7 +63,7 @@ describe("worker fatal-process handling", () => {
     expect(shutdown).toHaveBeenCalledTimes(1);
     expect(JSON.parse(sink.error.mock.calls[0][0])).toMatchObject({
       event: "process.uncaughtException",
-      error: { message: "boom" }
+      error: { code: "SYNC_ERROR" }
     });
   });
 
@@ -280,17 +280,14 @@ describe("worker runtime logging", () => {
       metadataTelemetryComplete: true,
       metadataWriteServiceRowsPerSecond: 0,
       bodiesFetched: 0,
-      errors: [
-        "[Error] [AUTHENTICATIONFAILED] [AUTH] Command failed",
-        "LOGIN [REDACTED]"
-      ]
+      errors: ["AUTH_ERROR", "SYNC_ERROR"]
     });
     expect(sink.error.mock.calls[0][0]).not.toContain("super-secret");
     expect(sink.warn).toHaveBeenCalledTimes(1);
     expect(JSON.parse(sink.warn.mock.calls[0][0])).toMatchObject({
       event: "sync.account.partial_success",
       runId: "run-partial",
-      errors: ["[ProviderFailure] Archive: provider exploded"]
+      errors: ["SYNC_ERROR"]
     });
     expect(sink.log).toHaveBeenCalledTimes(1);
     expect(JSON.parse(sink.log.mock.calls[0][0])).toMatchObject({

@@ -1,5 +1,21 @@
 # Session Handoff
 
+## 2026-07-31 — Fixed durable sync diagnostic codes
+
+- Branch `fedster99/protect-sync-diagnostics` addresses issue #111.
+- Provider error sentences no longer enter Mailbox Account health, sync-run
+  error fields, sync-run error arrays, pending-folder event payloads, or worker
+  error logs.
+- Durable state uses fixed codes such as `AUTH_ERROR`, `SYNC_TIMEOUT`,
+  `RATE_LIMITED`, `MAILBOX_MISSING`, and `CONNECTION_ERROR`.
+- Stable Mailbox Account and sync-run IDs, status, counters, and retry state
+  remain readable for support.
+- Verification passed typecheck, 737 fast tests, both builds, 219 live
+  PostgreSQL tests, and 120/120 conformance checks. The local shell used Node
+  26 while the repository pins Node 24.
+- After merge and image publication, SupaMail Cloud must re-pin this commit and
+  scrub retained Managed diagnostic text before metadata activation.
+
 ## 2026-07-31 — Protected metadata serving adapter
 
 - Branch `fedster99/metadata-protection-serving` completes the public serving

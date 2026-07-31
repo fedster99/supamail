@@ -48,7 +48,9 @@ class RecordingProtectionAdapter implements MetadataProtectionAdapter {
 }
 
 describe("MirrorRepository metadata protection", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
 
   it("stores adapter output and returns the revealed Mailbox Account", async () => {
     let insertParams: unknown[] = [];
