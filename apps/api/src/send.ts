@@ -15,6 +15,10 @@ import {
   SmtpDeliveryError
 } from "./smtp-client.js";
 import type { SendRequest, SendResult } from "./types.js";
+import {
+  plaintextMetadataProtection,
+  type MetadataProtectionAdapter
+} from "./metadata-protection.js";
 
 /**
  * The send/reply primitive (email-001, ADR 0017). Loads the account, validates
@@ -43,11 +47,12 @@ import type { SendRequest, SendResult } from "./types.js";
 export async function sendMessage(
   pool: PgPool,
   config: AppConfig,
-  req: SendRequest
+  req: SendRequest,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<SendResult> {
   let deliveryConfirmed = false;
   try {
-    return await sendMessageAttempt(pool, config, req, () => {
+    return await sendMessageAttempt(pool, config, req, metadataProtection, () => {
       deliveryConfirmed = true;
     });
   } catch (error) {
@@ -72,9 +77,10 @@ async function sendMessageAttempt(
   pool: PgPool,
   config: AppConfig,
   req: SendRequest,
+  metadataProtection: MetadataProtectionAdapter,
   confirmDelivery: () => void
 ): Promise<SendResult> {
-  const repository = new MirrorRepository(pool, config);
+  const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(req.accountId);
   if (!account) {
     throw new Error(`Account not found: ${req.accountId}`);

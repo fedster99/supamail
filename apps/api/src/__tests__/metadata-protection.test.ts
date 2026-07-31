@@ -5,6 +5,8 @@ import {
   assertMetadataProtectionProjection,
   assertRevealedMetadataValues,
   protectedMetadataColumns,
+  isPlaintextMetadataProtectionAdapter,
+  revealMetadataRecord,
   storedMetadataProjection,
   type MetadataProtectionAdapter,
   type MetadataProtectionProjection,
@@ -36,6 +38,30 @@ describe("metadata protection seam", () => {
     expect(protectedValue.values).not.toBe(values);
     expect(revealed).toEqual(values);
     expect(revealed).not.toBe(protectedValue.values);
+  });
+
+  it("uses an adapter's explicit durable write mode", () => {
+    const migratingReader: MetadataProtectionAdapter = {
+      storageMode: "plaintext",
+      async protect(_context, values) {
+        return {
+          values,
+          protectedMetadata: null,
+          envelopeVersion: null,
+          keyVersion: null,
+          tokens: null
+        };
+      },
+      async reveal(_context, stored) {
+        return stored.values;
+      }
+    };
+
+    expect(isPlaintextMetadataProtectionAdapter(migratingReader)).toBe(true);
+    expect(isPlaintextMetadataProtectionAdapter({
+      ...migratingReader,
+      storageMode: "protected"
+    })).toBe(false);
   });
 
   it("fails closed when the plaintext adapter receives protected metadata", async () => {
@@ -72,6 +98,41 @@ describe("metadata protection seam", () => {
       envelopeVersion: 1,
       keyVersion: 7,
       tokens: { subject: "opaque-token" }
+    });
+  });
+
+  it("reveals a protected serving row and removes storage-only columns", async () => {
+    const adapter: MetadataProtectionAdapter = {
+      async protect(_context, values) {
+        return {
+          values,
+          protectedMetadata: Buffer.from("ciphertext"),
+          envelopeVersion: 1,
+          keyVersion: 7,
+          tokens: { subject: "opaque-token" }
+        };
+      },
+      async reveal(receivedContext, stored) {
+        expect(receivedContext).toEqual(context);
+        expect(stored.values).toEqual({ subject: null, from_email: null });
+        return { subject: "Quarterly plan", from_email: "sender@example.com" };
+      }
+    };
+
+    const row = await revealMetadataRecord(adapter, context, {
+      id: context.recordId,
+      subject: null,
+      from_email: null,
+      protected_metadata: Buffer.from("ciphertext"),
+      protected_metadata_version: 1,
+      protected_metadata_key_version: 7,
+      protected_metadata_tokens: { subject: "opaque-token" }
+    }, ["subject", "from_email"]);
+
+    expect(row).toEqual({
+      id: context.recordId,
+      subject: "Quarterly plan",
+      from_email: "sender@example.com"
     });
   });
 

@@ -1,4 +1,11 @@
 import type { PgClient, PgPool } from "../db.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "../metadata-protection.js";
 import { buildSyncTrust } from "../search/index.js";
 import type { SyncTrust } from "../search/types.js";
 import type { WindowStatus } from "../types.js";
@@ -104,12 +111,53 @@ export interface MessageDetailRow {
   attachments: MessageAttachmentRow[] | null;
 }
 
-export interface MessageAttachmentRow {
+export interface MessageAttachmentRow extends ProtectedMetadataColumns {
   attachment_id: string;
+  message_id: string;
+  account_id: string;
   filename: string | null;
   mime_type: string | null;
   size_bytes: number | string | null;
   disposition: string | null;
+}
+
+/** Load and reveal attachment metadata for one or more messages. */
+export async function loadMessageAttachments(
+  client: PgClient,
+  messageIds: readonly string[],
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<Map<string, MessageAttachmentRow[]>> {
+  const byMessage = new Map<string, MessageAttachmentRow[]>();
+  for (const messageId of messageIds) byMessage.set(messageId, []);
+  if (messageIds.length === 0) return byMessage;
+
+  const result = await client.query<MessageAttachmentRow>(
+    `
+    SELECT attachment.id AS attachment_id, attachment.message_id, message.account_id,
+           attachment.filename, attachment.mime_type, attachment.size_bytes,
+           attachment.disposition, attachment.part_number,
+           attachment.protected_metadata, attachment.protected_metadata_version,
+           attachment.protected_metadata_key_version, attachment.protected_metadata_tokens
+    FROM public.imap_attachments attachment
+    JOIN public.imap_messages message ON message.id = attachment.message_id
+    WHERE attachment.message_id = ANY($1::uuid[])
+    ORDER BY attachment.message_id,
+             NULLIF(regexp_replace(coalesce(attachment.part_number, ''), '[^0-9]', '', 'g'), '')::bigint NULLS LAST,
+             attachment.part_number
+    `,
+    [messageIds]
+  );
+
+  for (const row of result.rows) {
+    const revealed = await revealMetadataRecord(
+      metadataProtection,
+      { kind: "attachment", accountId: row.account_id, recordId: row.attachment_id },
+      row,
+      METADATA_PROTECTED_FIELDS.attachment
+    );
+    byMessage.get(row.message_id)?.push(revealed);
+  }
+  return byMessage;
 }
 
 export interface CleanBodyResult {

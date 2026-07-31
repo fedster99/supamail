@@ -298,7 +298,12 @@ describe("updateDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
     expect(mocks.deleteMessage).toHaveBeenCalledTimes(1);
     // Old draft removed by a hard delete (reuses email-002), not trashed.
-    expect(mocks.deleteMessage).toHaveBeenCalledWith({}, config, "draft-1", { hard: true });
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(
+      {},
+      config,
+      "draft-1",
+      expect.objectContaining({ hard: true })
+    );
     expect(result).toMatchObject({ replacedMessageId: "draft-1", draftsFolderPath: "Drafts" });
   });
 
@@ -411,7 +416,7 @@ describe("sendDraft", () => {
 
     // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
     // parsed mirror fields — there is no SendRequest reconstruction anymore.
-    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1");
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1", expect.anything());
     const rawBytes = mocks.getRawMime.mock.results[0].value as Promise<{ raw: Buffer }>;
     const expectedRaw = (await rawBytes).raw;
 
@@ -433,7 +438,12 @@ describe("sendDraft", () => {
     expect(sentFlags).toContain("\\Seen");
 
     // Delete happens AFTER the send.
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(pool, config, "draft-1", { hard: true });
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(
+      pool,
+      config,
+      "draft-1",
+      expect.objectContaining({ hard: true })
+    );
     const deliverOrder = mocks.deliverSmtp.mock.invocationCallOrder[0];
     const deleteOrder = mocks.deleteMessage.mock.invocationCallOrder[0];
     expect(deliverOrder).toBeLessThan(deleteOrder);

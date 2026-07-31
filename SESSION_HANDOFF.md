@@ -1,5 +1,23 @@
 # Session Handoff
 
+## 2026-07-31 — Protected metadata serving adapter
+
+- Branch `fedster99/metadata-protection-serving` completes the public serving
+  boundary needed by Managed Hosting metadata encryption.
+- Message, thread, reply, draft, attachment, header, send, mailbox-action, and
+  folder-action helpers accept the same metadata adapter used by sync and
+  threading. The readable identity adapter remains the default for OSS and BYO.
+- A plaintext-write adapter may reveal protected rows during a controlled
+  migration. A protected adapter still fails closed on readable rows.
+- Message and thread reads reveal attachment metadata in one bounded query.
+  Provider thread identifiers remain opaque stored handles for exact lookup.
+- Node 24 verification passed the harness check, typecheck, 735 fast tests,
+  both builds, 219 live PostgreSQL tests, and 120/120 conformance checks. One
+  intermediate live run hit the known threading timing flake; the immediate
+  complete rerun passed all 71 threading tests and the full live gate.
+- Next: open the public PR and merge only with Federico's explicit approval.
+  Then publish the immutable image and finish Cloud wiring.
+
 ## 2026-07-31 — Explicit SMTP delivery outcomes
 
 - Branch `fedster99/fix-smtp-outcome-contract` replaces the false retry
