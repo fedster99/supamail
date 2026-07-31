@@ -1,11 +1,18 @@
 import type { PgClient, PgPool } from "../db.js";
 import type { SyncTrust, SyncTrustAccount } from "./types.js";
+import {
+  METADATA_PROTECTED_FIELDS,
+  plaintextMetadataProtection,
+  revealMetadataRecord,
+  type MetadataProtectionAdapter,
+  type ProtectedMetadataColumns
+} from "../metadata-protection.js";
 
 export type Queryable = Pick<PgPool | PgClient, "query">;
 
-interface TrustRow {
+interface TrustRow extends ProtectedMetadataColumns {
   account_id: string;
-  account_email: string;
+  email_address: string;
   sync_state: string;
   sync_state_reason: string | null;
   last_sync_finished_at: Date | null;
@@ -23,16 +30,24 @@ interface TrustRow {
  * searched is complete, still doing its initial sync, backfilling history, or
  * missing bodies — so it never silently trusts a partial result set.
  */
-export async function buildSyncTrust(db: Queryable, accountIds: string[] | null): Promise<SyncTrust> {
+export async function buildSyncTrust(
+  db: Queryable,
+  accountIds: string[] | null,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<SyncTrust> {
   const result = await db.query<TrustRow>(
     `
     SELECT
       a.id AS account_id,
-      a.email_address AS account_email,
+      a.email_address,
       a.sync_state,
       a.sync_state_reason,
       a.last_sync_finished_at,
       a.currently_syncing,
+      a.protected_metadata,
+      a.protected_metadata_version,
+      a.protected_metadata_key_version,
+      a.protected_metadata_tokens,
       (a.sync_state = 'INITIAL_SYNC') AS initial_sync_in_progress,
       EXISTS (
         SELECT 1 FROM public.imap_folders f
@@ -44,14 +59,20 @@ export async function buildSyncTrust(db: Queryable, accountIds: string[] | null)
     FROM public.imap_accounts a
     LEFT JOIN public.imap_account_progress p ON p.account_id = a.id
     WHERE ($1::uuid[] IS NULL OR a.id = ANY($1::uuid[]))
-    ORDER BY a.email_address
+    ORDER BY a.id
     `,
     [accountIds]
   );
 
-  const accounts: SyncTrustAccount[] = result.rows.map((row) => ({
+  const revealedRows = await Promise.all(result.rows.map((row) => revealMetadataRecord(
+    metadataProtection,
+    { kind: "account", accountId: row.account_id, recordId: row.account_id },
+    row,
+    METADATA_PROTECTED_FIELDS.account
+  )));
+  const accounts: SyncTrustAccount[] = revealedRows.map((row) => ({
     account_id: row.account_id,
-    account_email: row.account_email,
+    account_email: row.email_address,
     sync_state: row.sync_state,
     sync_state_reason: row.sync_state_reason,
     last_sync_at: row.last_sync_finished_at ? row.last_sync_finished_at.toISOString() : null,

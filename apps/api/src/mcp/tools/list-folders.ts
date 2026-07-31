@@ -2,6 +2,10 @@ import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { syncTrustFor, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
+import {
+  plaintextMetadataProtection,
+  type MetadataProtectionAdapter
+} from "../../metadata-protection.js";
 
 /**
  * `list_folders` — the agent's "orient" tool. One aggregate scan over the live
@@ -91,7 +95,11 @@ export const listFoldersDefinition: ToolDefinition = {
  * for `special_use`/`status`. One read-only transaction; sync_trust runs in its
  * own (matching the search layer's pattern). Empty result is not an error.
  */
-export async function runListFolders(pool: PgPool, args: unknown): Promise<ListFoldersResponse | ReturnType<typeof toolError>> {
+export async function runListFolders(
+  pool: PgPool,
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<ListFoldersResponse | ReturnType<typeof toolError>> {
   let request: z.infer<typeof listFoldersRequestSchema>;
   try {
     request = listFoldersRequestSchema.parse(args);
@@ -170,7 +178,11 @@ export async function runListFolders(pool: PgPool, args: unknown): Promise<ListF
     return { folders: folderRows, totals: totalsOut };
   });
 
-  const sync_trust = await syncTrustFor(pool, accountId ? [accountId] : null);
+  const sync_trust = await syncTrustFor(
+    pool,
+    accountId ? [accountId] : null,
+    metadataProtection
+  );
 
   return { folders, totals, sync_trust };
 }

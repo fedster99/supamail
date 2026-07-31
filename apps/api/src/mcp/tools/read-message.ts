@@ -172,7 +172,7 @@ export async function runReadMessage(
   const served = { ...revealed, provider_thread_id: row.provider_thread_id };
   const headers = includeHeaders ? projectHeaders(served.headers_json) : undefined;
   const detail = mapMessageRow(served, { includeQuoted, headers });
-  const sync_trust = await syncTrustFor(pool, [row.account_id]);
+  const sync_trust = await syncTrustFor(pool, [row.account_id], metadataProtection);
 
   return { ...detail, sync_trust };
 }

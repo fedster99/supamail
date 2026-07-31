@@ -5,6 +5,10 @@ import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
+import {
+  plaintextMetadataProtection,
+  type MetadataProtectionAdapter
+} from "../metadata-protection.js";
 
 interface ResultRow {
   id: string;
@@ -94,7 +98,11 @@ function mapRow(row: ResultRow, explain: boolean): SearchResult {
  * The database connection is injected (no global pool reach-in) so the same
  * logic runs locally and hosted. It never sends, mutates, or schedules.
  */
-export async function searchMessages(pool: PgPool, request: SearchRequest): Promise<SearchResponse> {
+export async function searchMessages(
+  pool: PgPool,
+  request: SearchRequest,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<SearchResponse> {
   const startedAt = Date.now();
 
   const parsed = request.q
@@ -169,7 +177,7 @@ export async function searchMessages(pool: PgPool, request: SearchRequest): Prom
       rows = result.rows;
     }
 
-    const syncTrust = await buildSyncTrust(client, accountIds);
+    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
     await client.query("COMMIT");
 
     const hasMore = rows.length > limit;
