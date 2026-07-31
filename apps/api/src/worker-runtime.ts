@@ -257,7 +257,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     ?? new MirrorRepository(pool, config, options.metadataProtection);
   const engine = options.engine ?? new MirrorEngine({ pool, config, repository });
   const threading = options.threading === undefined
-    ? new ThreadingRepository(pool)
+    ? new ThreadingRepository(pool, { metadataProtection: options.metadataProtection })
     : options.threading;
   const abort = new AbortController();
   let stopping = false;

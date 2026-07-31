@@ -309,5 +309,28 @@ liveDb("metadata-protection repository seam", () => {
       rfc_message_id: metadata.rfcMessageId,
       message_id_normalized: metadata.messageIdNormalized
     });
+
+    await expect(pool.query(
+      `UPDATE public.imap_accounts
+       SET metadata_protection_mode = 'invalid'
+       WHERE id = $1`,
+      [accountId]
+    )).rejects.toThrow();
+
+    for (const [relation, predicate] of [
+      ["imap_accounts", "id = $1"],
+      ["imap_messages", "id = $1"],
+      ["imap_message_bodies", "message_id = $1"],
+      ["imap_attachments", "message_id = $1"],
+      ["imap_message_evidence", "message_id = $1"]
+    ] as const) {
+      await expect(pool.query(
+        `UPDATE public.${relation}
+         SET protected_metadata = NULL,
+             protected_metadata_tokens = '{}'::jsonb
+         WHERE ${predicate}`,
+        [relation === "imap_accounts" ? accountId : message.id]
+      )).rejects.toThrow();
+    }
   });
 });

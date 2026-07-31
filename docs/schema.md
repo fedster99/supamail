@@ -38,6 +38,11 @@ does not change. A deployment that injects a protected adapter owns its field
 policy, key custody, token purposes, migration, and activation checks. The
 columns alone do not provide encryption.
 
+`0024_metadata_protection_mode` adds one indexed adapter-mode marker to each
+Mailbox Account. The runtime uses this marker to reject a protected adapter
+before migration completes and to reject the identity adapter after cutover.
+The migration also rejects exact-match tokens that have no opaque envelope.
+
 `0022_content_extract_body_store` adds `search_extract`, a maximum 32 KiB UTF-8
 prefix of the parser's selected normalized plain text, plus an FTS expression
 index that does not store a duplicate generated vector. It also adds

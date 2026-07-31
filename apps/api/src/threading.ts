@@ -49,6 +49,8 @@ export interface ThreadingMessageInput {
   raw_mime_hash?: string | null;
   /** Transport-invariant authored MIME evidence, computed only for collisions. */
   authored_delivery_fingerprint?: string | null;
+  /** True when the stored MIME evidence can produce a missing authored digest. */
+  authored_delivery_repair_eligible?: boolean;
   subject?: string | null;
   from_email?: string | null;
   to_emails?: readonly string[] | null;

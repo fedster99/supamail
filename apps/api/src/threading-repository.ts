@@ -1,5 +1,22 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { PgClient, PgPool } from "./db.js";
+import {
+  MAX_PROTECTED_METADATA_ENVELOPE_BYTES,
+  assertMetadataProtectionProjection,
+  assertRevealedMetadataValues,
+  isPlaintextMetadataProtectionAdapter,
+  plaintextMetadataProtection,
+  protectedMetadataColumns,
+  storedMetadataProjection,
+  usesPlaintextMetadataStorage,
+  type MetadataProtectionAdapter,
+  type MetadataProtectionContext,
+  type MetadataProtectionOperationOptions,
+  type MetadataProtectionProjection,
+  type MetadataValues,
+  type ProtectedMetadataColumns
+} from "./metadata-protection.js";
 import {
   THREADING_ALGORITHM_VERSION,
   computeThreadAssignments,
@@ -14,11 +31,19 @@ import {
 const DEFAULT_BATCH_SIZE = 500;
 const DEFAULT_BODY_EVIDENCE_BATCH_SIZE = 2;
 const DEFAULT_BODY_EVIDENCE_STATEMENT_TIMEOUT_MS = 15_000;
+const DEFAULT_METADATA_PROTECTION_TIMEOUT_MS = 5_000;
+const METADATA_PROTECTION_CONCURRENCY = 16;
+const PROTECTED_INPUT_LOAD_BATCH_SIZE = 32;
+const PROTECTED_HISTORY_PAGE_SIZE = 32;
+const MAX_THREADING_INPUT_EVIDENCE_BYTES = 2 * 1024 * 1024;
+const MAX_PROTECTED_INPUT_ROW_BYTES =
+  (2 * MAX_PROTECTED_METADATA_ENVELOPE_BYTES) + MAX_THREADING_INPUT_EVIDENCE_BYTES;
 const DEFAULT_MAX_CLOSURE_MESSAGES = 25_000;
 const DEFAULT_MAX_CLOSURE_EVIDENCE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_CLOSURE_CRITERIA_KEYS = 100_000;
 const DEFAULT_MAX_SUBJECT_BUCKET_MESSAGES = 5_000;
 const WRITE_CHUNK_SIZE = 1_000;
+const MAX_PROTECTED_WRITE_JSON_BYTES = 4 * 1024 * 1024;
 const LIVE_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const DEFAULT_COMPARISON_STATEMENT_TIMEOUT_MS = 30_000;
 const RUN_FAIRNESS_SCHEDULE = ["active", "active", "standby", "active", "building"] as const;
@@ -114,6 +139,69 @@ interface StoredAssignment {
 
 interface AssignmentRecord extends StoredAssignment {}
 
+const THREAD_ASSIGNMENT_PROTECTED_FIELDS = [
+  "delivery_key",
+  "strict_message_id",
+  "strict_message_id_hash",
+  "conversation_id",
+  "root_reference",
+  "root_reference_hash",
+  "parent_reference",
+  "parent_reference_hash",
+  "parent_delivery_key",
+  "reference_ids",
+  "reference_hashes",
+  "delivery_fingerprint_hashes",
+  "subject_base",
+  "subject_key",
+  "participant_edge_hashes",
+  "provider_thread_key",
+  "provider_thread_hash",
+  "input_hash",
+  "evidence"
+] as const satisfies readonly (keyof AssignmentRecord)[];
+
+const THREADING_MESSAGE_PROTECTED_FIELDS = [
+  "rfc_message_id",
+  "message_id_normalized",
+  "provider_message_id",
+  "provider_message_id_namespace",
+  "provider_thread_id",
+  "provider_thread_id_namespace",
+  "in_reply_to",
+  "references_header",
+  "subject",
+  "from_email",
+  "from_name",
+  "to_emails",
+  "to_names",
+  "cc_emails",
+  "cc_names",
+  "bcc_emails",
+  "headers_json",
+  "mime_structure"
+] as const;
+
+const THREADING_BODY_PROTECTED_FIELDS = [
+  "raw_mime_sha256",
+  "parsed_delivery_sha256",
+  "authored_delivery_sha256",
+  "headers_json",
+  "mime_structure",
+  "parser_warnings",
+  "structured_evidence_sha256",
+  "threading_payload_sha256",
+  "search_extract"
+] as const;
+
+type StoredProtectedAssignment = StoredAssignment & ProtectedMetadataColumns;
+
+interface StoredAssignmentHistory extends ProtectedMetadataColumns {
+  message_id: string;
+  previous_assignment: Record<string, unknown> | null;
+  next_assignment: Record<string, unknown> | null;
+}
+
 interface ThreadingCriteria {
   conversationIds: Set<string>;
   deliveryKeys: Set<string>;
@@ -144,11 +232,52 @@ function deliveryEvidenceBridgeIds(
     if (deliveryKeys.size < 2 && !metadataMatchNeedsCorroboration) continue;
     for (const assignment of group) {
       const input = inputsById.get(assignment.physical_message_id);
-      if (!input || input.authored_delivery_fingerprint) continue;
+      if (!input
+        || input.authored_delivery_fingerprint
+        || input.authored_delivery_repair_eligible !== true) {
+        continue;
+      }
       ids.add(assignment.physical_message_id);
     }
   }
   return [...ids].sort(compareText);
+}
+
+function threadingInputEvidenceBytes(input: ThreadingMessageInput): number {
+  const bytes = (value: unknown): number => {
+    if (value == null) return 0;
+    if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+    if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") {
+      return Buffer.byteLength(String(value), "utf8");
+    }
+    if (value instanceof Date) return Buffer.byteLength(value.toISOString(), "utf8");
+    if (Array.isArray(value)) return value.reduce((total, entry) => total + bytes(entry), 0);
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  };
+  return [
+    input.folder_path,
+    input.rfc_message_id,
+    input.references_header,
+    input.in_reply_to,
+    input.headers_json,
+    input.provider_message_id,
+    input.provider_message_namespace,
+    input.provider_thread_id,
+    input.provider_thread_namespace,
+    input.delivery_fingerprint,
+    input.raw_mime_hash,
+    input.authored_delivery_fingerprint,
+    input.subject,
+    input.from_email,
+    input.to_emails,
+    input.cc_emails,
+    input.bcc_emails,
+    input.auto_submitted,
+    input.precedence,
+    input.list_id,
+    input.list_unsubscribe,
+    input.x_auto_response_suppress
+  ].reduce((total, value) => total + bytes(value), 0);
 }
 
 interface ClosureLimits {
@@ -290,11 +419,15 @@ export interface ThreadingRepositoryOptions {
   bodyEvidenceBatchSize?: number;
   /** Server-side deadline for one legacy fingerprint repair transaction. */
   bodyEvidenceStatementTimeoutMs?: number;
+  /** Deadline for one adapter protect or reveal operation. */
+  metadataProtectionTimeoutMs?: number;
   /**
    * Every executor still needed by an active or rollback run. A new release
    * must retain the previous executor until its standby retention window ends.
    */
   algorithms?: ReadonlyMap<number, ThreadingAlgorithmExecutor>;
+  /** Durable metadata projection. OSS and BYO use the readable default. */
+  metadataProtection?: MetadataProtectionAdapter;
 }
 
 export class ThreadingClosureLimitError extends Error {
@@ -434,16 +567,6 @@ function deliveryFingerprintHashes(
     .sort(compareText);
 }
 
-function addInputCriteria(
-  criteria: ThreadingCriteria,
-  input: ThreadingMessageInput,
-  algorithmVersion: number
-): void {
-  for (const fingerprint of deliveryClosureFingerprints(input, algorithmVersion)) {
-    criteria.deliveryFingerprintHashes.add(sha256(`delivery-fingerprint\u0000${fingerprint}`));
-  }
-}
-
 function emptyCriteria(): ThreadingCriteria {
   return {
     conversationIds: new Set(),
@@ -469,18 +592,6 @@ function addStoredCriteria(criteria: ThreadingCriteria, assignment: StoredAssign
     addValue(criteria.deliveryFingerprintHashes, fingerprint);
   }
   addValue(criteria.providerThreadHashes, assignment.provider_thread_hash);
-}
-
-function addComputedCriteria(criteria: ThreadingCriteria, assignment: ThreadingAssignment): void {
-  addValue(criteria.conversationIds, assignment.conversation_id);
-  addValue(criteria.deliveryKeys, persistedDeliveryKey(assignment.delivery_key));
-  addValue(criteria.referenceHashes, evidenceHash("message-id", assignment.strict_message_id));
-  addValue(criteria.referenceHashes, evidenceHash("message-id", assignment.root_reference));
-  addValue(criteria.referenceHashes, evidenceHash("message-id", assignment.parent_reference));
-  for (const reference of assignment.reference_ids) {
-    addValue(criteria.referenceHashes, evidenceHash("message-id", reference));
-  }
-  addValue(criteria.providerThreadHashes, evidenceHash("provider-thread", assignment.provider_thread_key));
 }
 
 function canonicalJson(value: unknown): string {
@@ -625,6 +736,118 @@ function chunk<T>(values: readonly T[], size = WRITE_CHUNK_SIZE): T[][] {
   return chunks;
 }
 
+function jsonWriteBatches<T>(
+  values: readonly T[],
+  serialize: (value: T) => unknown,
+  maxBytes = MAX_PROTECTED_WRITE_JSON_BYTES
+): Array<{ values: T[]; json: string }> {
+  const batches: Array<{ values: T[]; json: string }> = [];
+  let batchValues: T[] = [];
+  let batchJson: string[] = [];
+  let batchBytes = 2;
+  const flush = () => {
+    if (batchValues.length === 0) return;
+    batches.push({ values: batchValues, json: `[${batchJson.join(",")}]` });
+    batchValues = [];
+    batchJson = [];
+    batchBytes = 2;
+  };
+  for (const value of values) {
+    const json = JSON.stringify(serialize(value));
+    const jsonBytes = Buffer.byteLength(json);
+    const addedBytes = jsonBytes + (batchValues.length === 0 ? 0 : 1);
+    if (jsonBytes + 2 > maxBytes) {
+      throw new Error(`metadata protection write row exceeds ${maxBytes} bytes`);
+    }
+    if (batchBytes + addedBytes > maxBytes) flush();
+    batchValues.push(value);
+    batchJson.push(json);
+    batchBytes += jsonBytes + (batchValues.length === 1 ? 0 : 1);
+  }
+  flush();
+  return batches;
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  limit: number,
+  mapper: (value: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, values.length) },
+    async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= values.length) return;
+        results[index] = await mapper(values[index] as T, index);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+interface MetadataProtectionScope {
+  remainingMs: number;
+  activeOperations: number;
+  controller: AbortController | null;
+  timer: ReturnType<typeof setTimeout> | null;
+  startedAtMs: number | null;
+}
+
+class AdapterPermitPool {
+  private active = 0;
+  private readonly waiters: Array<{
+    signal: AbortSignal;
+    resolve: (release: () => void) => void;
+    reject: (error: unknown) => void;
+    onAbort: () => void;
+  }> = [];
+
+  constructor(private readonly limit: number) {}
+
+  acquire(signal: AbortSignal): Promise<() => void> {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        signal,
+        resolve,
+        reject,
+        onAbort: () => {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) this.waiters.splice(index, 1);
+          reject(signal.reason);
+        }
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+      this.waiters.push(waiter);
+      this.dispatch();
+    });
+  }
+
+  private dispatch(): void {
+    while (this.active < this.limit && this.waiters.length > 0) {
+      const waiter = this.waiters.shift() as AdapterPermitPool["waiters"][number];
+      waiter.signal.removeEventListener("abort", waiter.onAbort);
+      if (waiter.signal.aborted) {
+        waiter.reject(waiter.signal.reason);
+        continue;
+      }
+      this.active += 1;
+      let released = false;
+      waiter.resolve(() => {
+        if (released) return;
+        released = true;
+        this.active -= 1;
+        this.dispatch();
+      });
+    }
+  }
+}
+
 function sanitizedFailure(error: unknown): string {
   return (error instanceof Error ? error.message : String(error))
     .replace(/[\x00-\x1F\x7F]+/g, " ")
@@ -668,8 +891,15 @@ export class ThreadingRepository {
   private readonly algorithms: ReadonlyMap<number, ThreadingAlgorithmExecutor>;
   private readonly bodyEvidenceBatchSize: number;
   private readonly bodyEvidenceStatementTimeoutMs: number;
+  private readonly metadataProtectionTimeoutMs: number;
+  private readonly metadataProtection: MetadataProtectionAdapter;
+  private readonly metadataProtectionScope = new AsyncLocalStorage<MetadataProtectionScope>();
+  private readonly metadataProtectionPermits = new AdapterPermitPool(
+    METADATA_PROTECTION_CONCURRENCY
+  );
 
   constructor(private readonly pool: PgPool, options: ThreadingRepositoryOptions = {}) {
+    this.metadataProtection = options.metadataProtection ?? plaintextMetadataProtection;
     this.currentAlgorithmVersion = options.currentAlgorithmVersion ?? THREADING_ALGORITHM_VERSION;
     if (!Number.isSafeInteger(this.currentAlgorithmVersion) || this.currentAlgorithmVersion <= 0) {
       throw new Error("current threading algorithm version must be a positive safe integer");
@@ -682,6 +912,11 @@ export class ThreadingRepository {
       ?? DEFAULT_BODY_EVIDENCE_STATEMENT_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.bodyEvidenceStatementTimeoutMs) || this.bodyEvidenceStatementTimeoutMs <= 0) {
       throw new Error("threading body evidence statement timeout must be a positive safe integer");
+    }
+    this.metadataProtectionTimeoutMs = options.metadataProtectionTimeoutMs
+      ?? DEFAULT_METADATA_PROTECTION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.metadataProtectionTimeoutMs) || this.metadataProtectionTimeoutMs <= 0) {
+      throw new Error("metadata protection timeout must be a positive safe integer");
     }
     this.algorithms = options.algorithms ?? PRODUCTION_THREADING_ALGORITHMS;
     if (!this.algorithms.has(this.currentAlgorithmVersion)) {
@@ -697,8 +932,137 @@ export class ThreadingRepository {
     }
   }
 
+  private async withMetadataProtectionDeadline<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.metadataProtectionScope.getStore()) return operation();
+    const scope: MetadataProtectionScope = {
+      remainingMs: this.metadataProtectionTimeoutMs,
+      activeOperations: 0,
+      controller: null,
+      timer: null,
+      startedAtMs: null
+    };
+    try {
+      return await this.metadataProtectionScope.run(scope, operation);
+    } finally {
+      if (scope.timer) clearTimeout(scope.timer);
+      if (scope.activeOperations > 0 && scope.controller && !scope.controller.signal.aborted) {
+        scope.controller.abort(new Error("metadata protection operation cancelled"));
+      }
+    }
+  }
+
+  private startMetadataProtectionOperation(scope: MetadataProtectionScope): AbortSignal {
+    if (scope.remainingMs <= 0) {
+      throw new Error("metadata protection operation timed out");
+    }
+    if (scope.activeOperations === 0) {
+      scope.controller = new AbortController();
+      scope.startedAtMs = Date.now();
+      scope.timer = setTimeout(() => {
+        scope.remainingMs = 0;
+        scope.controller?.abort(new Error("metadata protection operation timed out"));
+      }, scope.remainingMs);
+      scope.timer.unref?.();
+    }
+    scope.activeOperations += 1;
+    return (scope.controller as AbortController).signal;
+  }
+
+  private finishMetadataProtectionOperation(scope: MetadataProtectionScope): void {
+    scope.activeOperations -= 1;
+    if (scope.activeOperations > 0) return;
+    if (scope.timer) clearTimeout(scope.timer);
+    if (scope.startedAtMs != null && scope.remainingMs > 0) {
+      scope.remainingMs = Math.max(0, scope.remainingMs - (Date.now() - scope.startedAtMs));
+    }
+    scope.controller = null;
+    scope.timer = null;
+    scope.startedAtMs = null;
+  }
+
+  private async metadataProtectionOperation<T>(
+    operation: (options: MetadataProtectionOperationOptions) => Promise<T>
+  ): Promise<T> {
+    if (!this.metadataProtectionScope.getStore()) {
+      return this.withMetadataProtectionDeadline(
+        () => this.metadataProtectionOperation(operation)
+      );
+    }
+    const scope = this.metadataProtectionScope.getStore() as MetadataProtectionScope;
+    const signal = this.startMetadataProtectionOperation(scope);
+    try {
+      const release = await this.metadataProtectionPermits.acquire(signal);
+      let task: Promise<T>;
+      try {
+        task = operation({ signal });
+      } catch (error) {
+        release();
+        throw error;
+      }
+      task.then(release, release);
+      if (signal.aborted) throw signal.reason;
+      return await new Promise<T>((resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        task.then(
+          (value) => {
+            signal.removeEventListener("abort", onAbort);
+            resolve(value);
+          },
+          (error) => {
+            signal.removeEventListener("abort", onAbort);
+            reject(error);
+          }
+        );
+      });
+    } finally {
+      this.finishMetadataProtectionOperation(scope);
+    }
+  }
+
+  private protectMetadata(
+    context: MetadataProtectionContext,
+    values: MetadataValues
+  ): Promise<MetadataProtectionProjection> {
+    return this.metadataProtectionOperation(
+      (options) => this.metadataProtection.protect(context, values, options)
+    );
+  }
+
+  private revealMetadata(
+    context: MetadataProtectionContext,
+    stored: MetadataProtectionProjection
+  ): Promise<MetadataValues> {
+    return this.metadataProtectionOperation(
+      (options) => this.metadataProtection.reveal(context, stored, options)
+    );
+  }
+
+  private async assertMetadataProtectionCompatibility(accountId?: string): Promise<void> {
+    const expectedMode = isPlaintextMetadataProtectionAdapter(this.metadataProtection)
+      ? "plaintext"
+      : "protected";
+    const result = await this.pool.query<{ id: string }>(
+      `SELECT id
+       FROM public.imap_accounts
+       WHERE ($1::uuid IS NULL OR id = $1)
+         AND metadata_protection_mode <> $2
+       ORDER BY id
+       LIMIT 1`,
+      [accountId ?? null, expectedMode]
+    );
+    if (!result.rows[0]) return;
+    if (expectedMode === "plaintext") {
+      throw new Error("protected threading metadata requires its protection adapter");
+    }
+    throw new Error(
+      "metadata protection mode is plaintext; finish migration before adapter activation"
+    );
+  }
+
   /** Fail deployment before a state-referenced run can be silently abandoned. */
   async assertRolloutCompatibility(): Promise<void> {
+    await this.assertMetadataProtectionCompatibility();
     const unsupported = await this.pool.query<{
       account_id: string;
       role: "active" | "candidate" | "standby";
@@ -868,6 +1232,16 @@ export class ThreadingRepository {
   }
 
   async drainAccount(accountId: string, options: DrainThreadingOptions = {}): Promise<ThreadingRunResult> {
+    return this.withMetadataProtectionDeadline(
+      () => this.drainAccountWithinMetadataDeadline(accountId, options)
+    );
+  }
+
+  private async drainAccountWithinMetadataDeadline(
+    accountId: string,
+    options: DrainThreadingOptions
+  ): Promise<ThreadingRunResult> {
+    await this.assertMetadataProtectionCompatibility(accountId);
     const batchSize = Math.max(1, Math.min(
       Number.isFinite(options.batchSize) ? Math.floor(Number(options.batchSize)) : DEFAULT_BATCH_SIZE,
       10_000
@@ -1168,6 +1542,7 @@ export class ThreadingRepository {
   }
 
   async startRebuild(accountId: string, options: RebuildThreadingOptions = {}): Promise<string> {
+    await this.assertMetadataProtectionCompatibility(accountId);
     const result = await this.withAccountLock(accountId, async (client) => {
       await client.query("BEGIN");
       try {
@@ -1230,6 +1605,7 @@ export class ThreadingRepository {
     runId: string,
     options: ActivateThreadingOptions = {}
   ): Promise<ThreadingRunResult> {
+    await this.assertMetadataProtectionCompatibility(accountId);
     const result = await this.withAccountLock(accountId, async (client) => {
       // The state-row lock is the serialization point. READ COMMITTED matters:
       // after waiting for a mirror writer's SHARE lock, coverage checks must see
@@ -1383,6 +1759,17 @@ export class ThreadingRepository {
   }
 
   async rollbackOperation(accountId: string, operationId: string, requestedBy = "operator"): Promise<ThreadingRunResult> {
+    return this.withMetadataProtectionDeadline(
+      () => this.rollbackOperationWithinMetadataDeadline(accountId, operationId, requestedBy)
+    );
+  }
+
+  private async rollbackOperationWithinMetadataDeadline(
+    accountId: string,
+    operationId: string,
+    requestedBy: string
+  ): Promise<ThreadingRunResult> {
+    await this.assertMetadataProtectionCompatibility(accountId);
     const result = await this.withAccountLock(accountId, async (client) => {
       await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
       try {
@@ -1480,33 +1867,19 @@ export class ThreadingRepository {
         if (latest.rows[0]?.id !== operationId) {
           throw new Error("Only the latest material threading operation can be rolled back");
         }
-        const history = await client.query<{
-          message_id: string;
-          previous_assignment: Record<string, unknown> | null;
-        }>(
-          `SELECT message_id, previous_assignment
+        const historyCount = await client.query<{ count: number }>(
+          `SELECT count(*)::integer AS count
            FROM public.imap_thread_assignment_history
-           WHERE operation_id = $1 AND account_id = $2 ORDER BY message_id`,
+           WHERE operation_id = $1 AND account_id = $2`,
           [operationId, accountId]
         );
-        if (history.rows.length === 0 || history.rows.length !== target.assignments_changed) {
+        if (
+          historyCount.rows[0]?.count === 0
+          || historyCount.rows[0]?.count !== target.assignments_changed
+        ) {
           throw new Error("Threading operation has incomplete history; refusing a partial rollback");
         }
-        const current = await this.loadStoredAssignments(client, run.id, history.rows.map((row) => row.message_id));
-        const currentById = new Map(current.map((row) => [row.message_id, row]));
         const generation = (BigInt(await this.currentGeneration(client, run.id)) + 1n).toString();
-        const restores: AssignmentRecord[] = [];
-        const deletes: string[] = [];
-        for (const entry of history.rows) {
-          const existing = currentById.get(entry.message_id);
-          if (!existing) throw new Error(`Current assignment missing for ${entry.message_id}; refusing a partial rollback`);
-          if (entry.previous_assignment) {
-            const restored = restoreSnapshot(entry.previous_assignment, generation);
-            restores.push(restored);
-          } else {
-            deletes.push(entry.message_id);
-          }
-        }
         const rollbackId = await this.insertOperation(client, {
           run,
           type: "rollback",
@@ -1515,14 +1888,83 @@ export class ThreadingRepository {
           reversesOperationId: operationId,
           fromGeneration: await this.currentGeneration(client, run.id),
           toGeneration: generation,
-          summary: { assignments_changed: history.rows.length }
+          summary: { assignments_changed: historyCount.rows[0].count }
         });
-        await this.upsertAssignments(client, restores);
-        if (deletes.length > 0) {
-          await client.query(
-            "DELETE FROM public.imap_thread_assignments WHERE run_id = $1 AND message_id = ANY($2::uuid[])",
-            [run.id, deletes]
+        let processed = 0;
+        let afterMessageId: string | null = null;
+        for (;;) {
+          const historyRows: StoredAssignmentHistory[] = (await client.query<StoredAssignmentHistory>(
+            `SELECT message_id, previous_assignment, next_assignment,
+                    protected_metadata, protected_metadata_version,
+                    protected_metadata_key_version, protected_metadata_tokens
+             FROM public.imap_thread_assignment_history
+             WHERE operation_id = $1
+               AND account_id = $2
+               AND ($3::uuid IS NULL OR message_id > $3)
+             ORDER BY message_id
+             LIMIT $4`,
+            [operationId, accountId, afterMessageId, PROTECTED_HISTORY_PAGE_SIZE]
+          )).rows;
+          if (historyRows.length === 0) break;
+          const history: StoredAssignmentHistory[] = await mapWithConcurrency(
+            historyRows,
+            METADATA_PROTECTION_CONCURRENCY,
+            async (row) => {
+              if (usesPlaintextMetadataStorage(this.metadataProtection, row)) {
+                return row;
+              }
+              const revealed = await this.revealMetadata(
+                {
+                  kind: "thread_assignment_history",
+                  accountId,
+                  recordId: `${operationId}:${row.message_id}`
+                },
+                storedMetadataProjection(row, {
+                  previous_assignment: row.previous_assignment,
+                  next_assignment: row.next_assignment
+                })
+              );
+              assertRevealedMetadataValues(revealed, ["previous_assignment", "next_assignment"]);
+              return {
+                ...row,
+                protected_metadata: null,
+                protected_metadata_tokens: null,
+                previous_assignment: revealed.previous_assignment as Record<string, unknown> | null,
+                next_assignment: revealed.next_assignment as Record<string, unknown> | null
+              };
+            }
           );
+          const current = await this.loadStoredAssignments(
+            client,
+            run.id,
+            history.map((row) => row.message_id)
+          );
+          const currentById = new Map(current.map((row) => [row.message_id, row]));
+          const restores: AssignmentRecord[] = [];
+          const deletes: string[] = [];
+          for (const entry of history) {
+            const existing = currentById.get(entry.message_id);
+            if (!existing) {
+              throw new Error(`Current assignment missing for ${entry.message_id}; refusing a partial rollback`);
+            }
+            if (entry.previous_assignment) {
+              restores.push(restoreSnapshot(entry.previous_assignment, generation));
+            } else {
+              deletes.push(entry.message_id);
+            }
+          }
+          await this.upsertAssignments(client, restores);
+          if (deletes.length > 0) {
+            await client.query(
+              "DELETE FROM public.imap_thread_assignments WHERE run_id = $1 AND message_id = ANY($2::uuid[])",
+              [run.id, deletes]
+            );
+          }
+          processed += history.length;
+          afterMessageId = history.at(-1)?.message_id ?? afterMessageId;
+        }
+        if (processed !== historyCount.rows[0].count) {
+          throw new Error("Threading operation history changed during rollback");
         }
         await client.query(
           "UPDATE public.imap_thread_operations SET status = 'rolled_back', rolled_back_at = now() WHERE id = $1",
@@ -1541,8 +1983,8 @@ export class ThreadingRepository {
           operationId: rollbackId,
           operationType: "rollback",
           generation,
-          assignmentsChanged: history.rows.length,
-          messagesConsidered: history.rows.length,
+          assignmentsChanged: processed,
+          messagesConsidered: processed,
           active: true,
           ready: true
         });
@@ -1645,6 +2087,7 @@ export class ThreadingRepository {
     sampleSize = 100,
     options: CompareThreadingOptions = {}
   ): Promise<ThreadingRunComparison> {
+    await this.assertMetadataProtectionCompatibility(accountId);
     const boundedSampleSize = Math.max(0, Math.min(
       Number.isFinite(sampleSize) ? Math.floor(sampleSize) : 100,
       1_000
@@ -2021,6 +2464,28 @@ export class ThreadingRepository {
     return bridged + await this.backfillLegacyBodyEvidenceBatch(client, accountId, limit - bridged);
   }
 
+  private async assertNoProtectedBodyEvidenceBridge(
+    client: PgClient,
+    ids: string[]
+  ): Promise<void> {
+    if (ids.length === 0) return;
+    const protectedRows = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM public.imap_messages message
+         JOIN public.imap_message_bodies body ON body.message_id = message.id
+         WHERE message.id = ANY($1::uuid[])
+           AND (message.protected_metadata IS NOT NULL OR body.protected_metadata IS NOT NULL)
+       ) AS exists`,
+      [ids]
+    );
+    if (protectedRows.rows[0]?.exists) {
+      throw new Error(
+        "protected metadata has incomplete authored-delivery evidence; repair it before activation"
+      );
+    }
+  }
+
   private async backfillQueuedDeliveryBridgeBatch(
     client: PgClient,
     accountId: string,
@@ -2039,8 +2504,12 @@ export class ThreadingRepository {
     );
     const queuedIds = queued.rows.map((row) => row.message_id);
     if (queuedIds.length === 0) return 0;
+    const repairEligibleIds = (await this.loadInputs(client, queuedIds))
+      .filter((input) => input.authored_delivery_repair_eligible === true)
+      .map((input) => input.id);
+    await this.assertNoProtectedBodyEvidenceBridge(client, repairEligibleIds);
 
-    const candidates = await client.query<{
+    const plaintextCandidates = await client.query<{
       message_id: string;
       authored_delivery_sha256: string;
     }>(
@@ -2064,6 +2533,8 @@ export class ThreadingRepository {
        FROM public.imap_message_bodies body
        JOIN public.imap_messages message ON message.id = body.message_id
        WHERE body.message_id = ANY($1::uuid[])
+         AND body.protected_metadata IS NULL
+         AND message.protected_metadata IS NULL
          AND body.authored_delivery_sha256 IS NULL
          AND NOT body.raw_truncated
          AND body.raw_bytes > 0
@@ -2085,7 +2556,9 @@ export class ThreadingRepository {
       [queuedIds]
     );
 
-    const eligibleIds = new Set(candidates.rows.map((candidate) => candidate.message_id));
+    const eligibleIds = new Set(
+      plaintextCandidates.rows.map((candidate) => candidate.message_id)
+    );
     const recheckIds = queuedIds.filter((id) => !eligibleIds.has(id));
     if (recheckIds.length > 0) {
       await client.query(
@@ -2102,9 +2575,9 @@ export class ThreadingRepository {
         [accountId, recheckIds, DELIVERY_EVIDENCE_BRIDGE_REASON]
       );
     }
-    if (candidates.rows.length === 0) return 0;
-
-    const changed = await client.query<{ count: string }>(
+    const plaintextChanged = plaintextCandidates.rows.length === 0
+      ? 0
+      : Number((await client.query<{ count: string }>(
       `WITH candidates AS MATERIALIZED (
          SELECT *
          FROM jsonb_to_recordset($1::jsonb) AS candidate(
@@ -2117,13 +2590,17 @@ export class ThreadingRepository {
          FROM candidates
          WHERE body.message_id = candidates.message_id
            AND body.message_id = ANY($2::uuid[])
+           AND body.protected_metadata IS NULL
            AND body.authored_delivery_sha256 IS NULL
          RETURNING body.message_id
        )
        SELECT count(*)::text AS count FROM repaired`,
-      [JSON.stringify(candidates.rows), candidates.rows.map((candidate) => candidate.message_id)]
-    );
-    return Number(changed.rows[0]?.count ?? 0);
+      [
+        JSON.stringify(plaintextCandidates.rows),
+        plaintextCandidates.rows.map((candidate) => candidate.message_id)
+      ]
+    )).rows[0]?.count ?? 0);
+    return plaintextChanged;
   }
 
   private async backfillLegacyBodyEvidenceBatch(
@@ -2178,6 +2655,8 @@ export class ThreadingRepository {
          FROM public.imap_message_bodies body
          JOIN public.imap_messages message ON message.id = body.message_id
          WHERE message.account_id = $1
+           AND body.protected_metadata IS NULL
+           AND message.protected_metadata IS NULL
            AND (
              (body.raw_mime_sha256 IS NULL AND body.raw_mime IS NOT NULL AND NOT body.raw_truncated)
              OR
@@ -2219,6 +2698,7 @@ export class ThreadingRepository {
          FROM candidates
          WHERE body.message_id = candidates.message_id
            AND body.message_id = ANY($2::uuid[])
+           AND body.protected_metadata IS NULL
          RETURNING body.message_id
        )
        SELECT count(*)::text AS count FROM repaired`,
@@ -2243,6 +2723,8 @@ export class ThreadingRepository {
          JOIN public.imap_message_bodies body ON body.message_id = queue.message_id
          JOIN public.imap_messages message ON message.id = body.message_id
          WHERE queue.account_id = $1
+           AND body.protected_metadata IS NULL
+           AND message.protected_metadata IS NULL
            AND (
              (
                queue.reason = $3
@@ -2567,26 +3049,57 @@ export class ThreadingRepository {
     const loadedStored = new Map<string, StoredAssignment>();
     const criteria = emptyCriteria();
     let evidenceBytes = 0;
+    const loadBatches = async (messageIds: string[]): Promise<void> => {
+      let offset = 0;
+      while (offset < messageIds.length) {
+        const remainingBytes = Math.max(1, limits.maxEvidenceBytes - evidenceBytes);
+        const perRowBudget = isPlaintextMetadataProtectionAdapter(this.metadataProtection)
+          ? MAX_THREADING_INPUT_EVIDENCE_BYTES
+          : MAX_PROTECTED_INPUT_ROW_BYTES;
+        const boundedBatchSize = Math.max(1, Math.min(
+          PROTECTED_INPUT_LOAD_BATCH_SIZE,
+          Math.floor(remainingBytes / perRowBudget)
+        ));
+        const batch = messageIds.slice(offset, offset + boundedBatchSize);
+        offset += batch.length;
+        const inputs = await this.loadInputs(client, batch);
+        for (const input of inputs) {
+          const inputBytes = threadingInputEvidenceBytes(input);
+          if (inputBytes > MAX_THREADING_INPUT_EVIDENCE_BYTES) {
+            throw new ThreadingEvidenceLimitError(
+              "bytes",
+              Math.min(limits.maxEvidenceBytes, MAX_THREADING_INPUT_EVIDENCE_BYTES)
+            );
+          }
+          evidenceBytes += inputBytes;
+          if (evidenceBytes > limits.maxEvidenceBytes) {
+            throw new ThreadingEvidenceLimitError("bytes", limits.maxEvidenceBytes);
+          }
+          loadedInputs.set(input.id, input);
+        }
+        const stored = await this.loadStoredAssignmentProjections(client, run.id, batch);
+        for (const assignment of stored) loadedStored.set(assignment.message_id, assignment);
+      }
+    };
 
     for (;;) {
       if (ids.size > limits.maxMessages) throw new ThreadingClosureLimitError(limits.maxMessages);
       const toLoad = [...ids].filter((id) => !loadedInputs.has(id));
-      if (toLoad.length > 0) {
-        evidenceBytes += await this.measureInputEvidenceBytes(client, toLoad);
-        if (evidenceBytes > limits.maxEvidenceBytes) {
-          throw new ThreadingEvidenceLimitError("bytes", limits.maxEvidenceBytes);
-        }
-        const inputs = await this.loadInputs(client, toLoad);
-        const stored = await this.loadStoredAssignments(client, run.id, toLoad);
-        for (const input of inputs) {
-          loadedInputs.set(input.id, input);
-          addInputCriteria(criteria, input, run.algorithm_version);
-        }
-        for (const assignment of stored) loadedStored.set(assignment.message_id, assignment);
-      }
+      if (toLoad.length > 0) await loadBatches(toLoad);
       for (const assignment of loadedStored.values()) addStoredCriteria(criteria, assignment);
-      for (const assignment of this.computeAssignments(run, [...loadedInputs.values()], { allowSubjectFallback: false })) {
-        addComputedCriteria(criteria, assignment);
+      const closureInputs = [...loadedInputs.values()];
+      const closureInputsById = new Map(closureInputs.map((input) => [input.id, input]));
+      const computedRecords = this.computeAssignments(
+        run,
+        closureInputs,
+        { allowSubjectFallback: false }
+      ).map((assignment) => assignmentRecord(run, assignment, "0", closureInputsById));
+      for (const assignment of await mapWithConcurrency(
+        computedRecords,
+        METADATA_PROTECTION_CONCURRENCY,
+        async (record) => (await this.protectAssignment(record)).record
+      )) {
+        addStoredCriteria(criteria, assignment);
       }
 
       const criteriaKeyCount = criteria.conversationIds.size + criteria.deliveryKeys.size +
@@ -2633,60 +3146,94 @@ export class ThreadingRepository {
     }
 
     const missing = [...ids].filter((id) => !loadedInputs.has(id));
-    if (missing.length > 0) {
-      for (const input of await this.loadInputs(client, missing)) loadedInputs.set(input.id, input);
-    }
+    if (missing.length > 0) await loadBatches(missing);
     return { inputs: [...loadedInputs.values()].sort((a, b) => compareText(a.id, b.id)) };
-  }
-
-  private async measureInputEvidenceBytes(client: PgClient, ids: string[]): Promise<number> {
-    if (ids.length === 0) return 0;
-    const result = await client.query<{ bytes: string }>(
-      `SELECT coalesce(sum(
-         octet_length(coalesce(message.rfc_message_id, '')) +
-         octet_length(coalesce(message.references_header, '')) +
-         octet_length(coalesce(message.in_reply_to, '')) +
-         octet_length(coalesce(message.headers_json::text, '')) +
-         octet_length(coalesce(message.provider_message_id, '')) +
-         octet_length(coalesce(message.provider_message_id_namespace, '')) +
-         octet_length(coalesce(message.provider_thread_id, '')) +
-         octet_length(coalesce(message.provider_thread_id_namespace, '')) +
-         octet_length(coalesce(message.subject, '')) +
-         octet_length(coalesce(message.from_email, '')) +
-         octet_length(coalesce(array_to_string(message.to_emails, ','), '')) +
-         octet_length(coalesce(array_to_string(message.cc_emails, ','), '')) +
-         octet_length(coalesce(array_to_string(message.bcc_emails, ','), '')) +
-         octet_length(coalesce(body.headers_json::text, ''))
-       ), 0)::text AS bytes
-       FROM public.imap_messages message
-       LEFT JOIN public.imap_message_bodies body ON body.message_id = message.id
-       WHERE message.id = ANY($1::uuid[])`,
-      [ids]
-    );
-    return Number(result.rows[0]?.bytes ?? 0);
   }
 
   private async loadInputs(client: PgClient, ids: string[]): Promise<ThreadingMessageInput[]> {
     if (ids.length === 0) return [];
-    const result = await client.query<ThreadingMessageInput>(
+    const result = await client.query<{
+      id: string;
+      account_id: string;
+      folder_path: string;
+      uidvalidity: string;
+      uid: string;
+      internal_date: Date | string | null;
+      size_bytes: string;
+      rfc_message_id: string | null;
+      message_id_normalized: string | null;
+      provider_message_id: string | null;
+      provider_message_id_namespace: string | null;
+      provider_thread_id: string | null;
+      provider_thread_id_namespace: string | null;
+      in_reply_to: string | null;
+      references_header: string | null;
+      subject: string | null;
+      from_email: string | null;
+      from_name: string | null;
+      to_emails: string[];
+      to_names: string[];
+      cc_emails: string[];
+      cc_names: string[];
+      bcc_emails: string[];
+      headers_json: Record<string, unknown>;
+      mime_structure: unknown;
+      protected_metadata: Buffer | null;
+      protected_metadata_version: number | null;
+      protected_metadata_key_version: number | null;
+      protected_metadata_tokens: Record<string, string> | null;
+      body_message_id: string | null;
+      body_raw_bytes: string | null;
+      body_raw_truncated: boolean | null;
+      body_raw_mime_sha256: string | null;
+      body_parsed_delivery_sha256: string | null;
+      body_authored_delivery_sha256: string | null;
+      body_headers_json: Record<string, unknown> | null;
+      body_mime_structure: unknown;
+      body_parser_warnings: string[] | null;
+      body_structured_evidence_sha256: string | null;
+      body_structured_evidence_complete: boolean | null;
+      body_threading_payload_sha256: string | null;
+      body_search_extract: string | null;
+      body_protected_metadata: Buffer | null;
+      body_protected_metadata_version: number | null;
+      body_protected_metadata_key_version: number | null;
+      body_protected_metadata_tokens: Record<string, string> | null;
+    }>(
       `
       SELECT
         m.id, m.account_id, m.folder_path,
         m.uidvalidity::text AS uidvalidity, m.uid::text AS uid,
-        m.rfc_message_id, m.references_header, m.in_reply_to,
-        coalesce(body.headers_json, '{}'::jsonb) || m.headers_json AS headers_json,
-        m.provider_message_id,
-        m.provider_message_id_namespace AS provider_message_namespace,
-        m.provider_thread_id,
-        m.provider_thread_id_namespace AS provider_thread_namespace,
+        m.rfc_message_id, m.message_id_normalized,
+        m.references_header, m.in_reply_to, m.headers_json, m.mime_structure,
+        m.provider_message_id, m.provider_message_id_namespace,
+        m.provider_thread_id, m.provider_thread_id_namespace,
         m.internal_date, m.size_bytes::text AS size_bytes,
-        body.raw_mime_sha256 AS raw_mime_hash,
-        body.parsed_delivery_sha256 AS delivery_fingerprint,
-        body.authored_delivery_sha256 AS authored_delivery_fingerprint,
-        m.subject, m.from_email,
+        m.subject, m.from_email, m.from_name,
         coalesce(m.to_emails, '{}'::text[]) AS to_emails,
+        coalesce(m.to_names, '{}'::text[]) AS to_names,
         coalesce(m.cc_emails, '{}'::text[]) AS cc_emails,
-        coalesce(m.bcc_emails, '{}'::text[]) AS bcc_emails
+        coalesce(m.cc_names, '{}'::text[]) AS cc_names,
+        coalesce(m.bcc_emails, '{}'::text[]) AS bcc_emails,
+        m.protected_metadata, m.protected_metadata_version,
+        m.protected_metadata_key_version, m.protected_metadata_tokens,
+        body.message_id AS body_message_id,
+        body.raw_bytes::text AS body_raw_bytes,
+        body.raw_truncated AS body_raw_truncated,
+        body.raw_mime_sha256 AS body_raw_mime_sha256,
+        body.parsed_delivery_sha256 AS body_parsed_delivery_sha256,
+        body.authored_delivery_sha256 AS body_authored_delivery_sha256,
+        body.headers_json AS body_headers_json,
+        body.mime_structure AS body_mime_structure,
+        body.parser_warnings AS body_parser_warnings,
+        body.structured_evidence_sha256 AS body_structured_evidence_sha256,
+        body.structured_evidence_complete AS body_structured_evidence_complete,
+        body.threading_payload_sha256 AS body_threading_payload_sha256,
+        body.search_extract AS body_search_extract,
+        body.protected_metadata AS body_protected_metadata,
+        body.protected_metadata_version AS body_protected_metadata_version,
+        body.protected_metadata_key_version AS body_protected_metadata_key_version,
+        body.protected_metadata_tokens AS body_protected_metadata_tokens
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies body ON body.message_id = m.id
       WHERE m.id = ANY($1::uuid[])
@@ -2694,12 +3241,103 @@ export class ThreadingRepository {
       `,
       [ids]
     );
-    return result.rows;
+    return mapWithConcurrency(
+      result.rows,
+      METADATA_PROTECTION_CONCURRENCY,
+      async (row) => {
+      const messageValues = Object.fromEntries(
+        THREADING_MESSAGE_PROTECTED_FIELDS.map((field) => [field, row[field]])
+      );
+      const message = await this.revealMetadata(
+        { kind: "message", accountId: row.account_id, recordId: row.id },
+        storedMetadataProjection(row, messageValues)
+      );
+      assertRevealedMetadataValues(message, THREADING_MESSAGE_PROTECTED_FIELDS);
+
+      const bodyValues = {
+        raw_mime_sha256: row.body_raw_mime_sha256,
+        parsed_delivery_sha256: row.body_parsed_delivery_sha256,
+        authored_delivery_sha256: row.body_authored_delivery_sha256,
+        headers_json: row.body_headers_json ?? {},
+        mime_structure: row.body_mime_structure,
+        parser_warnings: row.body_parser_warnings ?? [],
+        structured_evidence_sha256: row.body_structured_evidence_sha256,
+        threading_payload_sha256: row.body_threading_payload_sha256,
+        search_extract: row.body_search_extract
+      };
+      const body = row.body_message_id === null
+        ? bodyValues
+        : await this.revealMetadata(
+          { kind: "message_body", accountId: row.account_id, recordId: row.id },
+          storedMetadataProjection(
+            {
+              protected_metadata: row.body_protected_metadata,
+              protected_metadata_version: row.body_protected_metadata_version,
+              protected_metadata_key_version: row.body_protected_metadata_key_version,
+              protected_metadata_tokens: row.body_protected_metadata_tokens
+            },
+            bodyValues
+          )
+        );
+      assertRevealedMetadataValues(body, THREADING_BODY_PROTECTED_FIELDS);
+      const bodyHeaders = body.headers_json as Record<string, unknown>;
+      const toEmails = Array.isArray(message.to_emails) ? message.to_emails as string[] : [];
+      const ccEmails = Array.isArray(message.cc_emails) ? message.cc_emails as string[] : [];
+      const bccEmails = Array.isArray(message.bcc_emails) ? message.bcc_emails as string[] : [];
+      const authoredDeliveryRepairEligible = row.body_message_id !== null
+        && body.authored_delivery_sha256 == null
+        && row.body_raw_truncated === false
+        && Number(row.body_raw_bytes ?? 0) > 0
+        && message.from_email != null
+        && Object.hasOwn(bodyHeaders, "message-id")
+        && Object.hasOwn(bodyHeaders, "from")
+        && Object.hasOwn(bodyHeaders, "date")
+        && (toEmails.length + ccEmails.length + bccEmails.length) > 0
+        && body.threading_payload_sha256 != null
+        && body.mime_structure != null
+        && row.body_structured_evidence_complete === true
+        && body.structured_evidence_sha256 != null;
+
+      return {
+        id: row.id,
+        account_id: row.account_id,
+        folder_path: row.folder_path,
+        uidvalidity: row.uidvalidity,
+        uid: row.uid,
+        rfc_message_id: message.rfc_message_id as string | null,
+        references_header: message.references_header as string | null,
+        in_reply_to: message.in_reply_to as string | null,
+        headers_json: {
+          ...body.headers_json as Record<string, unknown>,
+          ...message.headers_json as Record<string, unknown>
+        },
+        provider_message_id: message.provider_message_id as string | null,
+        provider_message_namespace: message.provider_message_id_namespace as string | null,
+        provider_thread_id: message.provider_thread_id as string | null,
+        provider_thread_namespace: message.provider_thread_id_namespace as string | null,
+        internal_date: row.internal_date,
+        size_bytes: row.size_bytes,
+        raw_mime_hash: body.raw_mime_sha256 as string | null,
+        delivery_fingerprint: body.parsed_delivery_sha256 as string | null,
+        authored_delivery_fingerprint: body.authored_delivery_sha256 as string | null,
+        authored_delivery_repair_eligible: authoredDeliveryRepairEligible,
+        subject: message.subject as string | null,
+        from_email: message.from_email as string | null,
+        to_emails: toEmails,
+        cc_emails: ccEmails,
+        bcc_emails: bccEmails
+      };
+      }
+    );
   }
 
-  private async loadStoredAssignments(client: PgClient, runId: string, ids: string[]): Promise<StoredAssignment[]> {
+  private async loadStoredAssignmentRows(
+    client: PgClient,
+    runId: string,
+    ids: string[]
+  ): Promise<StoredProtectedAssignment[]> {
     if (ids.length === 0) return [];
-    const result = await client.query<StoredAssignment>(
+    const result = await client.query<StoredProtectedAssignment>(
       `
       SELECT run_id, message_id, account_id, delivery_key,
              strict_message_id, strict_message_id_hash, conversation_id,
@@ -2709,7 +3347,9 @@ export class ThreadingRepository {
              subject_base, subject_key, participant_edge_hashes,
              provider_thread_key, provider_thread_hash, assignment_method,
              confidence, is_provisional, subject_fallback_eligible,
-             algorithm_version, input_hash, generation::text AS generation, evidence
+             algorithm_version, input_hash, generation::text AS generation, evidence,
+             protected_metadata, protected_metadata_version,
+             protected_metadata_key_version, protected_metadata_tokens
       FROM public.imap_thread_assignments
       WHERE run_id = $1 AND message_id = ANY($2::uuid[])
       ORDER BY message_id
@@ -2717,6 +3357,89 @@ export class ThreadingRepository {
       [runId, ids]
     );
     return result.rows;
+  }
+
+  private async loadStoredAssignmentProjections(
+    client: PgClient,
+    runId: string,
+    ids: string[]
+  ): Promise<StoredAssignment[]> {
+    const rows = await this.loadStoredAssignmentRows(client, runId, ids);
+    return rows.map((row) => {
+      const {
+        protected_metadata: _protectedMetadata,
+        protected_metadata_version: _protectedMetadataVersion,
+        protected_metadata_key_version: _protectedMetadataKeyVersion,
+        protected_metadata_tokens: _protectedMetadataTokens,
+        ...stored
+      } = row;
+      return stored;
+    });
+  }
+
+  private async loadStoredAssignments(client: PgClient, runId: string, ids: string[]): Promise<StoredAssignment[]> {
+    const rows = await this.loadStoredAssignmentRows(client, runId, ids);
+    return mapWithConcurrency(
+      rows,
+      METADATA_PROTECTION_CONCURRENCY,
+      async (row) => {
+      const {
+        protected_metadata: _protectedMetadata,
+        protected_metadata_version: _protectedMetadataVersion,
+        protected_metadata_key_version: _protectedMetadataKeyVersion,
+        protected_metadata_tokens: _protectedMetadataTokens,
+        ...stored
+      } = row;
+      if (usesPlaintextMetadataStorage(this.metadataProtection, row)) {
+        return stored;
+      }
+      const values = Object.fromEntries(
+        THREAD_ASSIGNMENT_PROTECTED_FIELDS.map((field) => [field, row[field]])
+      );
+      const revealed = await this.revealMetadata(
+        {
+          kind: "thread_assignment",
+          accountId: row.account_id,
+          recordId: `${row.run_id}:${row.message_id}`
+        },
+        storedMetadataProjection(row, values)
+      );
+      assertRevealedMetadataValues(revealed, THREAD_ASSIGNMENT_PROTECTED_FIELDS);
+      return { ...stored, ...revealed } as StoredAssignment;
+      }
+    );
+  }
+
+  private async protectAssignment(record: AssignmentRecord): Promise<{
+    record: AssignmentRecord;
+    protected_metadata_base64: string | null;
+    protected_metadata_version: number | null;
+    protected_metadata_key_version: number | null;
+    protected_metadata_tokens: Record<string, string> | null;
+  }> {
+    const values = Object.fromEntries(
+      THREAD_ASSIGNMENT_PROTECTED_FIELDS.map((field) => [field, record[field]])
+    );
+    const projection = await this.protectMetadata(
+      {
+        kind: "thread_assignment",
+        accountId: record.account_id,
+        recordId: `${record.run_id}:${record.message_id}`
+      },
+      values
+    );
+    assertMetadataProtectionProjection(projection, THREAD_ASSIGNMENT_PROTECTED_FIELDS);
+    const columns = protectedMetadataColumns(projection);
+    return {
+      record: {
+        ...record,
+        ...projection.values as MetadataValues
+      },
+      protected_metadata_base64: columns.protected_metadata?.toString("base64") ?? null,
+      protected_metadata_version: columns.protected_metadata_version,
+      protected_metadata_key_version: columns.protected_metadata_key_version,
+      protected_metadata_tokens: columns.protected_metadata_tokens
+    };
   }
 
   private async persistAssignments(
@@ -2756,7 +3479,7 @@ export class ThreadingRepository {
       }
     });
     if (changed.length > 0) {
-      await this.upsertAssignments(client, changed);
+      const persistedChanged = await this.upsertAssignments(client, changed);
       // Build rows are themselves a disposable, versioned snapshot; duplicating
       // every one into JSON history on every rebuild is pure write amplification.
       // Only the latest material change to the active projection is
@@ -2781,10 +3504,21 @@ export class ThreadingRepository {
       }
       if (options.enqueueSubjectWork) {
         const keys = new Set<string>();
-        for (const record of changed) {
+        const projectedPrevious = new Map<string, AssignmentRecord>();
+        await mapWithConcurrency(
+          changed,
+          METADATA_PROTECTION_CONCURRENCY,
+          async (record) => {
           const previous = currentById.get(record.message_id);
+          if (previous?.assignment_method !== "subject_fallback" || !previous.subject_key) return;
+          const protectedPrevious = await this.protectAssignment(previous);
+          projectedPrevious.set(record.message_id, protectedPrevious.record);
+          }
+        );
+        for (const record of persistedChanged) {
           if (record.subject_fallback_eligible && record.subject_key) keys.add(record.subject_key);
-          if (previous?.assignment_method === "subject_fallback" && previous.subject_key) keys.add(previous.subject_key);
+          const previousProjection = projectedPrevious.get(record.message_id);
+          if (previousProjection?.subject_key) keys.add(previousProjection.subject_key);
         }
         await this.enqueueSubjectWork(client, run, [...keys]);
       }
@@ -2797,10 +3531,32 @@ export class ThreadingRepository {
     return { operationId, generation, changed: changed.length };
   }
 
-  private async upsertAssignments(client: PgClient, records: AssignmentRecord[]): Promise<void> {
-    for (const batch of chunk(records)) {
-      await client.query(
-        `
+  private async upsertAssignments(client: PgClient, records: AssignmentRecord[]): Promise<AssignmentRecord[]> {
+    const persisted: AssignmentRecord[] = [];
+    const protectionBatchSize = isPlaintextMetadataProtectionAdapter(this.metadataProtection)
+      ? WRITE_CHUNK_SIZE
+      : METADATA_PROTECTION_CONCURRENCY;
+    for (const batch of chunk(records, protectionBatchSize)) {
+      const protectedRows = await mapWithConcurrency(
+        batch,
+        METADATA_PROTECTION_CONCURRENCY,
+        async (record) => {
+        const protectedRecord = await this.protectAssignment(record);
+        return {
+          persisted: protectedRecord.record,
+          stored: {
+            ...protectedRecord.record,
+            protected_metadata_base64: protectedRecord.protected_metadata_base64,
+            protected_metadata_version: protectedRecord.protected_metadata_version,
+            protected_metadata_key_version: protectedRecord.protected_metadata_key_version,
+            protected_metadata_tokens: protectedRecord.protected_metadata_tokens
+          }
+        };
+        }
+      );
+      for (const writeBatch of jsonWriteBatches(protectedRows, (row) => row.stored)) {
+        await client.query(
+          `
         WITH incoming AS (
           SELECT * FROM jsonb_to_recordset($1::jsonb) AS value(
             run_id uuid, message_id uuid, account_id uuid, delivery_key text,
@@ -2812,7 +3568,11 @@ export class ThreadingRepository {
             participant_edge_hashes text[], provider_thread_key text, provider_thread_hash text,
             assignment_method text, confidence text, is_provisional boolean,
             subject_fallback_eligible boolean, algorithm_version integer,
-            input_hash text, generation bigint, evidence jsonb
+            input_hash text, generation bigint, evidence jsonb,
+            protected_metadata_base64 text,
+            protected_metadata_version smallint,
+            protected_metadata_key_version integer,
+            protected_metadata_tokens jsonb
           )
         )
         INSERT INTO public.imap_thread_assignments (
@@ -2824,7 +3584,10 @@ export class ThreadingRepository {
           subject_base, subject_key, participant_edge_hashes,
           provider_thread_key, provider_thread_hash, assignment_method,
           confidence, is_provisional, subject_fallback_eligible,
-          algorithm_version, input_hash, generation, evidence, computed_at
+          algorithm_version, input_hash, generation, evidence,
+          protected_metadata, protected_metadata_version,
+          protected_metadata_key_version, protected_metadata_tokens,
+          computed_at
         )
         SELECT run_id, message_id, account_id, delivery_key,
           strict_message_id, strict_message_id_hash, conversation_id,
@@ -2834,7 +3597,15 @@ export class ThreadingRepository {
           subject_base, subject_key, participant_edge_hashes,
           provider_thread_key, provider_thread_hash, assignment_method,
           confidence, is_provisional, subject_fallback_eligible,
-          algorithm_version, input_hash, generation, evidence, now()
+          algorithm_version, input_hash, generation, evidence,
+          CASE
+            WHEN protected_metadata_base64 IS NULL THEN NULL
+            ELSE decode(protected_metadata_base64, 'base64')
+          END,
+          protected_metadata_version,
+          protected_metadata_key_version,
+          protected_metadata_tokens,
+          now()
         FROM incoming
         ON CONFLICT (run_id, message_id) DO UPDATE SET
           account_id = EXCLUDED.account_id,
@@ -2863,33 +3634,88 @@ export class ThreadingRepository {
           input_hash = EXCLUDED.input_hash,
           generation = EXCLUDED.generation,
           evidence = EXCLUDED.evidence,
+          protected_metadata = EXCLUDED.protected_metadata,
+          protected_metadata_version = EXCLUDED.protected_metadata_version,
+          protected_metadata_key_version = EXCLUDED.protected_metadata_key_version,
+          protected_metadata_tokens = EXCLUDED.protected_metadata_tokens,
           computed_at = now()
         `,
-        [JSON.stringify(batch)]
-      );
+          [writeBatch.json]
+        );
+        persisted.push(...writeBatch.values.map((row) => row.persisted));
+      }
     }
+    return persisted;
   }
 
   private async insertHistory(client: PgClient, operationId: string, run: ThreadRun, entries: HistoryEntry[]): Promise<void> {
-    for (const batch of chunk(entries)) {
-      await client.query(
-        `
+    const protectionBatchSize = isPlaintextMetadataProtectionAdapter(this.metadataProtection)
+      ? WRITE_CHUNK_SIZE
+      : METADATA_PROTECTION_CONCURRENCY;
+    for (const batch of chunk(entries, protectionBatchSize)) {
+      const protectedRows = await mapWithConcurrency(
+        batch,
+        METADATA_PROTECTION_CONCURRENCY,
+        async (entry) => {
+        const values = {
+          previous_assignment: entry.previous_assignment,
+          next_assignment: entry.next_assignment
+        };
+        const projection = await this.protectMetadata(
+          {
+            kind: "thread_assignment_history",
+            accountId: run.account_id,
+            recordId: `${operationId}:${entry.message_id}`
+          },
+          values
+        );
+        assertMetadataProtectionProjection(projection, ["previous_assignment", "next_assignment"]);
+        const columns = protectedMetadataColumns(projection);
+        return {
+          ...entry,
+          previous_assignment: projection.values.previous_assignment,
+          next_assignment: projection.values.next_assignment,
+          protected_metadata_base64: columns.protected_metadata?.toString("base64") ?? null,
+          protected_metadata_version: columns.protected_metadata_version,
+          protected_metadata_key_version: columns.protected_metadata_key_version,
+          protected_metadata_tokens: columns.protected_metadata_tokens
+        };
+        }
+      );
+      for (const writeBatch of jsonWriteBatches(protectedRows, (row) => row)) {
+        await client.query(
+          `
         WITH incoming AS (
           SELECT * FROM jsonb_to_recordset($4::jsonb) AS value(
             message_id uuid, change_type text,
-            previous_assignment jsonb, next_assignment jsonb
+            previous_assignment jsonb, next_assignment jsonb,
+            protected_metadata_base64 text,
+            protected_metadata_version smallint,
+            protected_metadata_key_version integer,
+            protected_metadata_tokens jsonb
           )
         )
         INSERT INTO public.imap_thread_assignment_history (
           operation_id, run_id, account_id, message_id, change_type,
-          previous_assignment, next_assignment
+          previous_assignment, next_assignment,
+          protected_metadata, protected_metadata_version,
+          protected_metadata_key_version, protected_metadata_tokens
         )
-        SELECT $1, $2, $3, message_id, change_type, previous_assignment, next_assignment
+        SELECT $1, $2, $3, message_id, change_type,
+               previous_assignment, next_assignment,
+               CASE
+                 WHEN protected_metadata_base64 IS NULL THEN NULL
+                 ELSE decode(protected_metadata_base64, 'base64')
+               END,
+               protected_metadata_version,
+               protected_metadata_key_version,
+               protected_metadata_tokens
         FROM incoming
         ON CONFLICT (operation_id, message_id) DO NOTHING
         `,
-        [operationId, run.id, run.account_id, JSON.stringify(batch)]
-      );
+          [operationId, run.id, run.account_id, writeBatch.json]
+        );
+      }
     }
   }
 
@@ -2977,6 +3803,7 @@ export class ThreadingRepository {
     ids: string[]
   ): Promise<void> {
     if (ids.length === 0) return;
+    await this.assertNoProtectedBodyEvidenceBridge(client, ids);
     await client.query(
       `INSERT INTO public.imap_thread_work_queue (
          run_id, message_id, account_id, reason, attempts, available_at,
@@ -2990,6 +3817,8 @@ export class ThreadingRepository {
          AND body.authored_delivery_sha256 IS NULL
          AND NOT body.raw_truncated
          AND body.raw_bytes > 0
+         AND message.protected_metadata IS NULL
+         AND body.protected_metadata IS NULL
          AND message.from_email IS NOT NULL
          AND body.headers_json ? 'message-id'
          AND body.headers_json ? 'from'

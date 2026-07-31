@@ -21,6 +21,11 @@ export interface MetadataProtectionContext {
   recordId: string;
 }
 
+export interface MetadataProtectionOperationOptions {
+  /** The caller aborts this signal when the bounded storage operation expires. */
+  signal?: AbortSignal;
+}
+
 export interface MetadataProtectionProjection {
   /**
    * Values that public core persists in the normal relation columns.
@@ -47,12 +52,14 @@ export interface MetadataProtectionAdapter {
    */
   protect(
     context: MetadataProtectionContext,
-    values: MetadataValues
+    values: MetadataValues,
+    options?: MetadataProtectionOperationOptions
   ): Promise<MetadataProtectionProjection>;
 
   reveal(
     context: MetadataProtectionContext,
-    stored: MetadataProtectionProjection
+    stored: MetadataProtectionProjection,
+    options?: MetadataProtectionOperationOptions
   ): Promise<MetadataValues>;
 }
 
@@ -88,14 +95,38 @@ export class PlaintextMetadataProtectionAdapter implements MetadataProtectionAda
     _context: MetadataProtectionContext,
     stored: MetadataProtectionProjection
   ): Promise<MetadataValues> {
+    if (stored.protectedMetadata !== null
+      || stored.envelopeVersion !== null
+      || stored.keyVersion !== null
+      || stored.tokens !== null) {
+      throw new Error("plaintext metadata adapter cannot reveal protected metadata");
+    }
     return { ...stored.values };
   }
 }
 
 export const plaintextMetadataProtection = new PlaintextMetadataProtectionAdapter();
 
+export function isPlaintextMetadataProtectionAdapter(
+  adapter: MetadataProtectionAdapter
+): adapter is PlaintextMetadataProtectionAdapter {
+  return adapter instanceof PlaintextMetadataProtectionAdapter;
+}
+
+export function usesPlaintextMetadataStorage(
+  adapter: MetadataProtectionAdapter,
+  row: Partial<ProtectedMetadataColumns>
+): boolean {
+  return isPlaintextMetadataProtectionAdapter(adapter)
+    && row.protected_metadata == null
+    && row.protected_metadata_version == null
+    && row.protected_metadata_key_version == null
+    && row.protected_metadata_tokens == null;
+}
+
 const POSTGRES_SMALLINT_MAX = 32_767;
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
+export const MAX_PROTECTED_METADATA_ENVELOPE_BYTES = 512 * 1024;
 
 export function assertMetadataProtectionProjection(
   projection: MetadataProtectionProjection,
@@ -119,9 +150,21 @@ export function assertMetadataProtectionProjection(
     }
   }
   const hasEnvelope = projection.protectedMetadata !== null;
+  if (hasEnvelope && !Buffer.isBuffer(projection.protectedMetadata)) {
+    throw new Error("metadata protection envelope must be a Buffer or null");
+  }
+  if (projection.protectedMetadata
+    && projection.protectedMetadata.byteLength > MAX_PROTECTED_METADATA_ENVELOPE_BYTES) {
+    throw new Error(
+      `metadata protection envelope exceeds ${MAX_PROTECTED_METADATA_ENVELOPE_BYTES} bytes`
+    );
+  }
   if (hasEnvelope !== (projection.envelopeVersion !== null)
     || hasEnvelope !== (projection.keyVersion !== null)) {
     throw new Error("metadata protection envelope fields must be present or absent together");
+  }
+  if (!hasEnvelope && projection.tokens !== null) {
+    throw new Error("metadata protection tokens require an envelope");
   }
   if (projection.envelopeVersion !== null
     && (!Number.isSafeInteger(projection.envelopeVersion)

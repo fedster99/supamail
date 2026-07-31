@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0023_metadata_protection_seam",
+  "schemaVersion": "0024_metadata_protection_mode",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -92,6 +92,10 @@
     {
       "id": "0023_metadata_protection_seam",
       "file": "0023_metadata_protection_seam.sql"
+    },
+    {
+      "id": "0024_metadata_protection_mode",
+      "file": "0024_metadata_protection_mode.sql"
     }
   ]
 }

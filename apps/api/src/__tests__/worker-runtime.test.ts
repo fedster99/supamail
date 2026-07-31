@@ -26,8 +26,8 @@ vi.mock("../locks.js", () => lockRuntime);
 
 vi.mock("../threading-repository.js", () => ({
   ThreadingRepository: class {
-    constructor() {
-      defaultThreading.constructed();
+    constructor(...args: unknown[]) {
+      defaultThreading.constructed(...args);
     }
 
     listAccountsNeedingWork = defaultThreading.listAccountsNeedingWork;
@@ -385,6 +385,8 @@ describe("worker conversation-threading lane", () => {
     defaultThreading.assertRolloutCompatibility.mockClear();
     defaultThreading.listAccountsNeedingWork.mockClear();
 
+    const metadataProtection = {} as never;
+    const pool = { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never;
     const runtime = await startWorkerRuntime({
       config: {
         SYNC_INTERVAL_MS: 60_000,
@@ -392,19 +394,21 @@ describe("worker conversation-threading lane", () => {
         STALE_HEARTBEAT_MS: 300_000,
         SYNC_MAX_ACCOUNTS: 40
       } as AppConfig,
-      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      pool,
       engine: {
         syncDueAccounts: vi.fn(async () => []),
         syncDueSentFolders: vi.fn(async () => [])
       },
       repository: {
         runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
-      } as never
+      } as never,
+      metadataProtection
     });
 
     try {
       await vi.advanceTimersByTimeAsync(0);
       expect(defaultThreading.constructed).toHaveBeenCalledTimes(1);
+      expect(defaultThreading.constructed).toHaveBeenCalledWith(pool, { metadataProtection });
       expect(defaultThreading.assertRolloutCompatibility).toHaveBeenCalledTimes(1);
       expect(defaultThreading.listAccountsNeedingWork).toHaveBeenCalledWith(40, {
         activateInitial: false

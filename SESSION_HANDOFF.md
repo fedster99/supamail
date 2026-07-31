@@ -31,6 +31,38 @@
 - Next: review the public PR. Merge only with Federico's explicit approval.
   Then wait for the immutable core image and pin it in the Cloud PR.
 
+## 2026-07-31 — Protected threading adapter follow-up
+
+- Branch `fedster99/threading-metadata-protection` completes the neutral
+  metadata-protection seam for durable threading state.
+- `ThreadingRepository` now protects assignment writes, uses protected
+  projections for incremental closure and subject work, reveals values only for
+  the in-memory algorithm, and protects retained rollback history.
+- The worker passes its injected metadata adapter to both sync persistence and
+  threading. The identity adapter keeps OSS and BYO storage readable. It fails
+  closed if it receives a protected row.
+- Threading bounds protected-row loads, adapter concurrency, and adapter
+  duration. Database and lock time do not consume the adapter budget. Timed-out
+  calls retain their permits until they settle. Closure state drops opaque
+  envelopes after reading indexed projections. Assignment and history writes
+  use byte-bounded payloads and discard envelopes after each write. Rollback
+  restores protected history in bounded pages. Control operations use an
+  indexed Mailbox Account mode marker to reject mixed readable and protected
+  projections.
+- Migration `0024_metadata_protection_mode` adds that marker and rejects
+  token-only protected storage.
+- Live PostgreSQL tests prove protected assignment storage, orphan-family
+  repair, subject fallback, fail-closed protected evidence gaps, revealed-input
+  evidence limits, adapter timeout lock release, opaque history-envelope
+  persistence, paged rollback atomicity, migration constraints, and account
+  mode selection, and protected-write payload bounds. Final verification passed
+  the harness check, typecheck, 733 fast tests, both builds, two idempotent
+  migration applications, 219 PostgreSQL tests, and 120/120 conformance checks.
+- Protected rows bypass the old plaintext body-evidence backfill. Managed
+  Hosting must finish that legacy backfill before it activates encryption.
+- Next: push the rebased public-core PR, watch CI, and wait for explicit merge
+  approval.
+
 ## 2026-07-30 — Neutral metadata-protection seam
 
 - Branch `fedster99/metadata-protection-adapter` adds the public-core half of
