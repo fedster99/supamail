@@ -35,8 +35,7 @@ Keep the existing `read_thread` tool and add a `message_ids` batch selector:
 
 - one `message_id`, `conversation_id`, or provider `thread_id` keeps the existing
   single-thread input and response;
-- `message_ids` accepts one to ten message handles from grouped
-  `search_email` results;
+- `message_ids` accepts one to ten message handles;
 - exact duplicate handles are removed while preserving first-seen order;
 - at most four threads execute concurrently;
 - shared `include_quoted` and `max_messages` controls apply to every thread;
@@ -44,9 +43,8 @@ Keep the existing `read_thread` tool and add a `message_ids` batch selector:
   `{message_id, error}` independently for each seed;
 - selector modes cannot be mixed.
 
-The MCP server instructions tell agents to search first, use snippets to select
-relevant conversations, use one selector for a focused read, and batch selected
-threads for a broader investigation instead of issuing many separate calls.
+The MCP server instructions and tool definitions describe capabilities,
+identifiers, limits, and guarantees without prescribing a reasoning workflow.
 
 ## Consequences
 
@@ -65,8 +63,8 @@ hydrate all successful batch items under one bounded concurrency limit.
 - Unit tests cover single-call compatibility, batch ordering, exact-seed
   deduplication, the ten-thread cap, selector exclusivity, and independent
   validation and operational failures.
-- MCP instruction tests pin the grouped-search-to-batch-read guidance and the
-  advertised schema bound.
+- MCP instruction tests pin the neutral capability contract and the advertised
+  schema bound.
 - Existing live-Postgres `read_thread` coverage continues to prove conversation
   membership, ordering, attachment indexing, message caps, and sync trust.
 

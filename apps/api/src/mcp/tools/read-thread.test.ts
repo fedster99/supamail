@@ -219,6 +219,18 @@ describe("read_thread stored assignments", () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
+  it("rejects a secondary selector even when its account scope is absent", async () => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, {
+      message_id: "message-one",
+      conversation_id: "conversation-two"
+    });
+
+    expect(out).toMatchObject({ error: { code: "invalid_input" } });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
   it("isolates an operational failure to its batch item", async () => {
     const { pool } = batchConversationPool();
 
@@ -261,6 +273,21 @@ describe("read_thread stored assignments", () => {
     expect(out).toMatchObject({ error: { code: "invalid_input" } });
     expect(connect).not.toHaveBeenCalled();
   });
+
+  it.each([0, 101, 1.5])(
+    "rejects max_messages=%s when it is outside the advertised integer range",
+    async (maxMessages) => {
+      const connect = vi.fn();
+
+      const out = await runReadThread({ connect } as never, {
+        message_id: "message-one",
+        max_messages: maxMessages
+      });
+
+      expect(out).toMatchObject({ error: { code: "invalid_input" } });
+      expect(connect).not.toHaveBeenCalled();
+    }
+  );
 
   it("runs at most four thread reads concurrently", async () => {
     const base = batchConversationPool();

@@ -131,7 +131,7 @@ export const readThreadRequestSchema = z
     thread_id: z.string().optional(),
     account: z.string().uuid().optional(),
     include_quoted: z.boolean().optional(),
-    max_messages: z.number().optional()
+    max_messages: z.number().int().min(1).max(MAX_MESSAGES_CEILING).optional()
   })
   .strict();
 
@@ -158,16 +158,16 @@ export interface ReadThreadBatchResult {
 
 export const readThreadDefinition: ToolDefinition = {
   name: "read_thread",
-  title: "Read one or more full email threads (read-only)",
+  title: "Read one or more email threads (read-only)",
   description:
-    "Reassemble and read one or more conversations from the SupaMail mirror. For one focused " +
-    "conversation, provide message_id (any message in the thread), a durable conversation_id, " +
-    "or a legacy provider thread_id. For a broader investigation, pass message_ids with up to " +
-    "10 distinct ids selected from grouped search_email results instead of issuing separate " +
-    "read_thread calls. Direct conversation/thread selectors require account. Batch items " +
-    "succeed or fail independently and preserve request order. " +
+    "Reassemble and read one or more conversations from the SupaMail mirror. Supported selectors are " +
+    "message_id (any message in the thread), message_ids (1 to 10 seeds), a durable " +
+    "conversation_id, or a legacy provider thread_id. Direct conversation/thread selectors " +
+    "require account. Duplicate message_ids are collapsed in first-occurrence order; each " +
+    "distinct seed succeeds or fails independently. " +
     "Returns the thread's messages oldest-first with cleaned plain-text " +
-    "bodies (quoted reply tails and signatures stripped unless include_quoted=true), the " +
+    "bodies limited to 4,096 characters with body_truncated set when cut (quoted reply tails " +
+    "and signatures are stripped unless include_quoted=true), the " +
     "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
@@ -184,10 +184,38 @@ export const readThreadDefinition: ToolDefinition = {
     type: "object",
     additionalProperties: false,
     oneOf: [
-      { required: ["message_id"] },
-      { required: ["message_ids"] },
-      { required: ["conversation_id", "account"] },
-      { required: ["thread_id", "account"] }
+      {
+        required: ["message_id"],
+        not: { anyOf: [
+          { required: ["message_ids"] },
+          { required: ["conversation_id"] },
+          { required: ["thread_id"] }
+        ] }
+      },
+      {
+        required: ["message_ids"],
+        not: { anyOf: [
+          { required: ["message_id"] },
+          { required: ["conversation_id"] },
+          { required: ["thread_id"] }
+        ] }
+      },
+      {
+        required: ["conversation_id", "account"],
+        not: { anyOf: [
+          { required: ["message_id"] },
+          { required: ["message_ids"] },
+          { required: ["thread_id"] }
+        ] }
+      },
+      {
+        required: ["thread_id", "account"],
+        not: { anyOf: [
+          { required: ["message_id"] },
+          { required: ["message_ids"] },
+          { required: ["conversation_id"] }
+        ] }
+      }
     ],
     properties: {
       message_id: {
@@ -199,7 +227,7 @@ export const readThreadDefinition: ToolDefinition = {
         minItems: 1,
         maxItems: MAX_THREAD_BATCH,
         items: { type: "string" },
-        description: "Up to 10 message UUIDs from grouped search results, one seed per conversation."
+        description: "One to 10 message UUIDs. Duplicate seeds are collapsed in first-occurrence order."
       },
       conversation_id: {
         type: "string",
@@ -516,10 +544,7 @@ export async function runReadThread(
       "Provider and conversation identifiers are account-scoped; pass account as a UUID."
     );
   }
-  // Number.isFinite guards NaN/Infinity so the newest-keeping cap is never
-  // silently disabled; non-finite falls back to the default.
-  const requestedMax = Number.isFinite(input.max_messages as number) ? (input.max_messages as number) : DEFAULT_MAX_MESSAGES;
-  const maxMessages = Math.max(1, Math.min(MAX_MESSAGES_CEILING, Math.floor(requestedMax)));
+  const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;
 
   return withReadOnlyTx(pool, async (client) => {
     let fetched: FetchedThread;

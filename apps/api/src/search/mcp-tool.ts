@@ -165,7 +165,7 @@ export const searchEmailToolDefinition = {
       includeBody: { type: "boolean", default: false },
       explain: { type: "boolean", default: false },
       groupByThread: { type: "boolean", default: true, description: "Collapse each conversation to its best message." },
-      semantic: { type: "boolean", default: false, description: "Opt in to the semantic tier (no-op until it ships)." }
+      semantic: { type: "boolean", default: false, description: "Enables the semantic tier; currently a no-op." }
     }
   }
 } as const;

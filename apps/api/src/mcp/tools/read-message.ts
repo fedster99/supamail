@@ -70,10 +70,11 @@ export const readMessageDefinition: ToolDefinition = {
   title: "Read one mirrored email (read-only)",
   description:
     "Fetch a single mirrored email by its stable message_id (the id returned by search_email " +
-    "or read_thread). Returns the full cleaned plain-text body, the from/to/cc envelope, flags, " +
+    "or read_thread). Returns the cleaned plain-text body, limited to 4,096 characters with " +
+    "body_truncated set when cut, plus the from/to/cc envelope, flags, " +
     "window_status, and the attachments list (filename, mime_type, size_bytes, disposition — " +
-    "including inline parts). Pass include_quoted=true to keep the quoted reply tail and " +
-    "signature; include_headers=true to attach parsed select headers. Attachment BYTES are not " +
+    "including inline parts). include_quoted=true retains the quoted reply tail and " +
+    "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
     "mirrored (metadata only). Always attaches a sync_trust block describing mirror completeness. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {

@@ -89,8 +89,8 @@ export const draftReplyDefinition: ToolDefinition = {
     "(original To+Cc minus self), a single 'Re:' subject, RFC 5322 threading headers " +
     "(In-Reply-To / References), and a quoted body. PRODUCE-ONLY: this NEVER sends, " +
     "saves drafts to IMAP, or writes any file — there is no send flag. The returned " +
-    "draftId is a local handle (drf_<source id>), not an IMAP UID. Hand the payload to " +
-    "your own send path to actually deliver it.",
+    "draftId is a local handle (drf_<source id>), not an IMAP UID. Delivery requires " +
+    "a separate send path outside this MCP server.",
   annotations: {
     readOnlyHint: false,
     destructiveHint: false,

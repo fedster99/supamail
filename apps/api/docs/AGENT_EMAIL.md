@@ -38,28 +38,13 @@ repository and database placeholders:
 The process communicates only over stdin/stdout. It does not open a remote
 listener; remote deployments provide their own transport and authentication.
 
-## The loop: orient → search → read → draft
-
-1. **Orient** — `list_folders` shows the folders that **contain mail** for an
-   account with per-folder `total` / `unread` counts and account-level `total` /
-   `unread` / `flagged` totals (a folder with no mirrored messages is not listed).
-   One call to answer "where am I, what needs attention".
-2. **Search** — `search_email` is the canonical ranked search. Every hit carries
-   a mailbox `identity` whose `id` is the stable message handle.
-3. **Read** — `read_message` reads one message. `read_thread {message_id}` reads
-   one focused conversation. For a broader investigation, inspect the grouped
-   search snippets and pass up to ten relevant hit ids as
-   `read_thread {message_ids:[...]}` instead of issuing separate calls.
-4. **Draft** — `draft_reply` produces a ready-to-send reply with correct
-   threading headers. It never sends; you (or the user's client) send it.
-
 ## The five tools
 
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `search_email` | Canonical ranked search over the mirror. | `q` (free-text + operators), `filters`, `accounts`, `sort`, `limit` |
-| `read_thread` | One durable conversation, or a bounded batch selected from grouped search results. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` |
-| `read_message` | One message with full body, cc, attachments. | `message_id`, `include_headers=false`, `include_quoted=false` |
+| `read_thread` | One durable conversation or a bounded batch. Exact duplicate seeds are collapsed; distinct seeds return independently. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` (max 100) |
+| `read_message` | One message with a cleaned body capped at 4,096 characters, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false` |
 | `list_folders` | Folders + unread/flagged/total counts for an account. | `account?` |
 | `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `reply_all=false` |
 
@@ -68,24 +53,22 @@ listener; remote deployments provide their own transport and authentication.
 A search hit looks like `{ identity: { id, account_id, folder_path, ... }, ... }`.
 The stable handle is **`identity.id`** — it equals `imap_messages.id`.
 
-- Pass `identity.id` as `read_message {message_id}` to read that single message.
-- Pass `identity.id` as `read_thread {message_id}` to read the conversation that
-  message belongs to. A stored assignment resolves the complete, transitive
+- `read_message {message_id}` accepts `identity.id` and returns that single message.
+- `read_thread {message_id}` accepts `identity.id` and returns the conversation
+  that message belongs to. A stored assignment resolves the complete, transitive
   account-scoped conversation and returns one representative for each delivered
   email, not one result for every mirrored folder copy.
-- For a broader investigation, pass up to ten distinct grouped-search hit ids as
-  `read_thread {message_ids:[...]}`. Results stay in request order, and each
-  thread returns its own result or error so one missing thread does not discard
-  the rest.
+- `read_thread {message_ids:[...]}` accepts one to ten message IDs. Exact
+  duplicates are removed in first-occurrence order. Each distinct seed returns
+  its own result or error, so one failure does not discard the other results.
 - `read_thread` returns `thread.conversation_id`, SupaMail's durable conversation
   handle, plus `thread.provider_thread_id` as provider metadata when available.
   A direct `conversation_id` lookup always requires `account` because conversation
   identifiers are account-scoped. Direct legacy `thread_id` lookup also requires
   `account` because provider IDs are not globally unique.
-- `draft_reply {source_message_id}` takes the same `identity.id`.
+- `draft_reply {source_message_id}` accepts the same `identity.id`.
 
-You never construct ids yourself — always copy one back from a search hit (or
-from a `read_thread` message).
+Message IDs are returned by `search_email`, `read_message`, and `read_thread`.
 
 Search groups by durable conversation by default and first deduplicates physical
 copies of one delivery. A hit's `thread.conversation_id` is therefore the right
@@ -100,18 +83,9 @@ are skipped. Body similarity and cross-conversation task/document clustering are
 not part of this layer. A message still awaiting its durable assignment
 temporarily uses the legacy one-hop read fallback.
 
-## Recipes
-
-- **Latest email from someone:** `search_email {q:"from:alice@example.com sort:recent", limit:1}`.
-- **Unread today:** `search_email {q:"is:unread newer_than:1d", sort:"recent"}`.
-- **Triage the inbox:** `search_email {q:"is:unread", sort:"recent"}`, then
-  `read_message` the ones that matter.
-- **Investigate a topic:** search broadly, inspect the grouped snippets, then
-  batch the relevant hit ids through `read_thread`.
-
 ## Non-goals
 
-These are deliberate and permanent for v1 — do not attempt them:
+These capabilities are not exposed in v1:
 
 - **No sending or appending.** There is no send tool, no send flag, and
   `draft_reply` only produces a draft object (ADR 0016).
@@ -131,11 +105,10 @@ The top-level `fully_synced` is true only when every searched account is HEALTHY
 not initial-syncing, not backfilling, and at 100% live coverage;
 `results_may_be_incomplete` and `degraded_reasons` spell out why when it is not.
 
-If `sync_trust` says results may be incomplete, **say so** — do not present a
-partial mirror as the whole mailbox.
+`results_may_be_incomplete=true` means the returned mirror view may be partial.
 
 ## Errors
 
-Errors are returned as `{ error: { code, message, hint } }`. The `hint` tells you
-what to do next. **Empty results are not errors** — an empty list means the query
-ran and matched nothing.
+Errors are returned as `{ error: { code, message, hint } }`; `hint` contains
+recovery information. **Empty results are not errors** — an empty list means the
+query ran and matched nothing.
