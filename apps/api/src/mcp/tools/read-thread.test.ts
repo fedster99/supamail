@@ -114,6 +114,7 @@ function unassignedSeedPool() {
 }
 
 function batchConversationPool() {
+  let syncTrustQueryCount = 0;
   const connect = vi.fn(async () => {
     const query = vi.fn(async (
       sql: string,
@@ -160,17 +161,24 @@ function batchConversationPool() {
           }]
         };
       }
-      if (sql.includes("FROM public.imap_accounts a")) return { rows: [] };
+      if (sql.includes("FROM public.imap_accounts a")) {
+        syncTrustQueryCount += 1;
+        return { rows: [] };
+      }
       return { rows: [] };
     });
     return { query, release: vi.fn() };
   });
-  return { pool: { connect }, connect };
+  return {
+    pool: { connect },
+    connect,
+    getSyncTrustQueryCount: () => syncTrustQueryCount
+  };
 }
 
 describe("read_thread stored assignments", () => {
   it("reads several search-result seeds in one call and preserves request order", async () => {
-    const { pool, connect } = batchConversationPool();
+    const { pool, connect, getSyncTrustQueryCount } = batchConversationPool();
 
     const out = await runReadThread(pool as never, {
       message_ids: ["message-one", "message-two"]
@@ -189,6 +197,7 @@ describe("read_thread stored assignments", () => {
       ]
     });
     expect(connect).toHaveBeenCalledTimes(2);
+    expect(getSyncTrustQueryCount()).toBe(1);
   });
 
   it("returns an independent error without discarding the other requested threads", async () => {
@@ -315,6 +324,7 @@ describe("read_thread stored assignments", () => {
 
     expect(peak).toBe(4);
     expect(active).toBe(0);
+    expect(base.getSyncTrustQueryCount()).toBe(1);
   });
 
   it("resolves an assigned seed to the full stored conversation and exposes its id", async () => {

@@ -156,6 +156,25 @@ export interface ReadThreadBatchResult {
   >;
 }
 
+type SyncTrustCache = Map<string, Promise<SyncTrust>>;
+
+function loadSyncTrust(
+  client: PgClient,
+  accountIds: string[] | null,
+  metadataProtection: MetadataProtectionAdapter,
+  cache?: SyncTrustCache
+): Promise<SyncTrust> {
+  if (!cache) return buildSyncTrust(client, accountIds, metadataProtection);
+
+  const key = accountIds === null ? "*" : [...accountIds].sort().join(",");
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const pending = buildSyncTrust(client, accountIds, metadataProtection);
+  cache.set(key, pending);
+  return pending;
+}
+
 export const readThreadDefinition: ToolDefinition = {
   name: "read_thread",
   title: "Read one or more email threads (read-only)",
@@ -453,10 +472,11 @@ async function fetchThreadRows(
   return summarizeFetchedRows(result.rows);
 }
 
-export async function runReadThread(
+async function runReadThreadInternal(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter,
+  syncTrustCache?: SyncTrustCache
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
@@ -485,6 +505,7 @@ export async function runReadThread(
 
   if (input.message_ids) {
     const messageIds = [...new Set(input.message_ids)];
+    const batchSyncTrustCache: SyncTrustCache = new Map();
     const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
     let nextIndex = 0;
     await Promise.all(Array.from(
@@ -494,12 +515,12 @@ export async function runReadThread(
           const index = nextIndex++;
           const messageId = messageIds[index];
           try {
-            const result = await runReadThread(pool, {
+            const result = await runReadThreadInternal(pool, {
               message_id: messageId,
               account: input.account,
               include_quoted: input.include_quoted,
               max_messages: input.max_messages
-            }, metadataProtection);
+            }, metadataProtection, batchSyncTrustCache);
             if ("thread" in result) {
               threads[index] = { message_id: messageId, result };
             } else if ("error" in result) {
@@ -613,8 +634,14 @@ export async function runReadThread(
       );
     }
 
-    // sync_trust computed inside the open tx (buildSyncTrust) to avoid a second connection; syncTrustFor is the standalone equivalent.
-    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
+    // Single reads compute sync_trust in their open transaction. Concurrent
+    // batch items from the same account share the same pending trust scan.
+    const syncTrust = await loadSyncTrust(
+      client,
+      accountIds,
+      metadataProtection,
+      syncTrustCache
+    );
 
     const attachments = await loadMessageAttachments(
       client,
@@ -666,6 +693,14 @@ export async function runReadThread(
       sync_trust: syncTrust
     };
   });
+}
+
+export function runReadThread(
+  pool: PgPool,
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
+  return runReadThreadInternal(pool, args, metadataProtection);
 }
 
 export const readThreadEntry: ToolEntry = {
