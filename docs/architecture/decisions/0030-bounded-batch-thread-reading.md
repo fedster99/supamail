@@ -39,8 +39,10 @@ Keep the existing `read_thread` tool and add a `message_ids` batch selector:
 - exact duplicate handles are removed while preserving first-seen order;
 - at most four threads execute concurrently;
 - shared `include_quoted` and `max_messages` controls apply to every thread;
-- batch output preserves request order and gives each seed its own
+- batch output preserves request order and gives each validated seed its own
   `{message_id, result}` or `{message_id, error}` entry;
+- malformed IDs and other batch-shape failures reject the request before any
+  item executes;
 - selector modes cannot be mixed.
 
 The MCP server instructions and tool definitions describe capabilities,
@@ -68,8 +70,8 @@ hydrate all successful batch items under one bounded concurrency limit.
 ## Verification
 
 - Unit tests cover single-call compatibility, batch ordering, exact-seed
-  deduplication, the ten-thread cap, selector exclusivity, and per-item validation
-  and operational failures.
+  deduplication, the ten-thread cap, selector exclusivity, request-level batch
+  validation, and per-item operational failures.
 - MCP instruction tests pin the neutral capability contract and the advertised
   schema bound.
 - Existing live-Postgres `read_thread` coverage continues to prove conversation

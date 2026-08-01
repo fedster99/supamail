@@ -43,7 +43,7 @@ listener; remote deployments provide their own transport and authentication.
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `search_email` | Canonical ranked search over the mirror. | `q` (free-text + operators), `filters`, `accounts`, `sort`, `limit` |
-| `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100) |
+| `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each valid distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100) |
 | `read_message` | One message with a bounded, recoverable cleaned body range, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false`, `body_offset=0`, `max_body_chars=4096` (max 32768) |
 | `list_folders` | Folders + unread/flagged/total counts for an account. | `account?` |
 | `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `reply_all=false` |
@@ -59,8 +59,9 @@ The stable handle is **`identity.id`** — it equals `imap_messages.id`.
   account-scoped conversation and returns one representative for each delivered
   email, not one result for every mirrored folder copy.
 - `read_thread {message_ids:[...]}` accepts one to ten message IDs. Exact
-  duplicates are removed in first-occurrence order. Each distinct seed returns
-  its own result or error, so one failure does not discard the other results.
+  duplicates are removed in first-occurrence order. After the request passes
+  batch validation, each distinct seed returns its own result or error, so one
+  operational failure does not discard the other results.
 - `read_thread` returns `thread.conversation_id`, SupaMail's durable conversation
   handle, plus `thread.provider_thread_id` as provider metadata when available.
   A direct `conversation_id` lookup always requires `account` because conversation
@@ -104,9 +105,11 @@ These capabilities are not exposed in v1:
 
 ## What `sync_trust` means
 
-Every read tool attaches a `sync_trust` block describing how complete the mirror
-is for the accounts you touched. The mirror fills incrementally (initial sync,
-then history backfill, then bodies), so a result set can be a partial view.
+Every successful read result attaches a `sync_trust` block describing how
+complete the mirror is for the accounts you touched. In a batch thread response,
+each successful entry carries its own block inside `result`; error entries do not.
+The mirror fills incrementally (initial sync, then history backfill, then bodies),
+so a result set can be a partial view.
 
 `sync_trust` reports, per account: `sync_state`, whether initial sync or a
 historical backfill is in progress, and live/historical completeness percentages.
@@ -119,7 +122,8 @@ not initial-syncing, not backfilling, and at 100% live coverage;
 ## Errors
 
 Request-level errors are returned as `{ error: { code, message, hint } }`;
-`hint` contains recovery information. Batch thread reads return
+`hint` contains recovery information. An invalid batch shape or malformed UUID
+fails at this level before any item runs. Valid batch thread reads return
 `{ threads: [{ message_id, result } | { message_id, error }] }`, with the same
 error fields inside the affected thread entry. **Empty results are not errors** —
 an empty list means the query ran and matched nothing.

@@ -360,6 +360,12 @@ new MirrorEngine({
 });
 ```
 
+The `@supamail/api` barrel also exports the shared MCP registry, handlers, and
+`MCP_INSTRUCTIONS` for deployment wrappers. Its `cleanBody` TypeScript helper
+uses camelCase options and range metadata (`includeQuoted`, `offset`, `maxChars`,
+`totalChars`, and `nextOffset`); MCP requests and results use the snake_case
+field names documented in the Agent Email Guide.
+
 ## Deployment Options
 
 - `apps/api/fly.worker.toml.example`: low-cost Fly.io worker-only deployment
