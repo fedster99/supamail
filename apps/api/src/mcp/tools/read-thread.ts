@@ -30,6 +30,8 @@ import {
 
 const DEFAULT_MAX_MESSAGES = 20;
 const MAX_MESSAGES_CEILING = 100;
+const MAX_THREAD_BATCH = 10;
+const THREAD_BATCH_CONCURRENCY = 4;
 
 /**
  * Collapse physical mailbox occurrences only when we have delivery-identity
@@ -107,6 +109,7 @@ type SeedRow = ThreadSeedRow & { conversation_id: string | null };
 
 export interface ReadThreadArgs {
   message_id?: string;
+  message_ids?: string[];
   conversation_id?: string;
   thread_id?: string;
   account?: string;
@@ -123,6 +126,7 @@ export interface ReadThreadArgs {
 export const readThreadRequestSchema = z
   .object({
     message_id: z.string().optional(),
+    message_ids: z.array(z.string()).min(1).max(MAX_THREAD_BATCH).optional(),
     conversation_id: z.string().optional(),
     thread_id: z.string().optional(),
     account: z.string().uuid().optional(),
@@ -145,13 +149,23 @@ export interface ReadThreadResult {
   sync_trust: SyncTrust;
 }
 
+export interface ReadThreadBatchResult {
+  threads: Array<
+    | { message_id: string; result: ReadThreadResult }
+    | { message_id: string; error: ReturnType<typeof toolError>["error"] }
+  >;
+}
+
 export const readThreadDefinition: ToolDefinition = {
   name: "read_thread",
-  title: "Read a full email thread (read-only)",
+  title: "Read one or more full email threads (read-only)",
   description:
-    "Reassemble and read a whole conversation from the SupaMail mirror. Provide either a " +
-    "message_id (any message in the thread, used as the seed), a durable conversation_id, " +
-    "or a legacy provider thread_id. Direct conversation/thread selectors require account. " +
+    "Reassemble and read one or more conversations from the SupaMail mirror. For one focused " +
+    "conversation, provide message_id (any message in the thread), a durable conversation_id, " +
+    "or a legacy provider thread_id. For a broader investigation, pass message_ids with up to " +
+    "10 distinct ids selected from grouped search_email results instead of issuing separate " +
+    "read_thread calls. Direct conversation/thread selectors require account. Batch items " +
+    "succeed or fail independently and preserve request order. " +
     "Returns the thread's messages oldest-first with cleaned plain-text " +
     "bodies (quoted reply tails and signatures stripped unless include_quoted=true), the " +
     "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
@@ -169,8 +183,9 @@ export const readThreadDefinition: ToolDefinition = {
   inputSchema: {
     type: "object",
     additionalProperties: false,
-    anyOf: [
+    oneOf: [
       { required: ["message_id"] },
+      { required: ["message_ids"] },
       { required: ["conversation_id", "account"] },
       { required: ["thread_id", "account"] }
     ],
@@ -178,6 +193,13 @@ export const readThreadDefinition: ToolDefinition = {
       message_id: {
         type: "string",
         description: "A message UUID to seed the thread from (any message in the conversation)."
+      },
+      message_ids: {
+        type: "array",
+        minItems: 1,
+        maxItems: MAX_THREAD_BATCH,
+        items: { type: "string" },
+        description: "Up to 10 message UUIDs from grouped search results, one seed per conversation."
       },
       conversation_id: {
         type: "string",
@@ -407,7 +429,7 @@ export async function runReadThread(
   pool: PgPool,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
-): Promise<ReadThreadResult | ReturnType<typeof toolError>> {
+): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
     input = readThreadRequestSchema.parse(args ?? {});
@@ -415,8 +437,62 @@ export async function runReadThread(
     return toolError(
       "invalid_input",
       error instanceof Error ? error.message : "Invalid arguments.",
-      "Pass message_id, or pass conversation_id/thread_id together with the account UUID."
+      "Pass message_id, message_ids, or conversation_id/thread_id together with the account UUID."
     );
+  }
+
+  const selectorCount = [
+    input.message_id,
+    input.message_ids,
+    input.conversation_id,
+    input.thread_id
+  ].filter((value) => value !== undefined).length;
+  if (selectorCount > 1) {
+    return toolError(
+      "invalid_input",
+      "read_thread accepts one selector mode at a time.",
+      "Pass one message_id, one message_ids batch, or one account-scoped conversation/thread id."
+    );
+  }
+
+  if (input.message_ids) {
+    const messageIds = [...new Set(input.message_ids)];
+    const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from(
+      { length: Math.min(THREAD_BATCH_CONCURRENCY, messageIds.length) },
+      async () => {
+        while (nextIndex < messageIds.length) {
+          const index = nextIndex++;
+          const messageId = messageIds[index];
+          try {
+            const result = await runReadThread(pool, {
+              message_id: messageId,
+              account: input.account,
+              include_quoted: input.include_quoted,
+              max_messages: input.max_messages
+            }, metadataProtection);
+            if ("thread" in result) {
+              threads[index] = { message_id: messageId, result };
+            } else if ("error" in result) {
+              threads[index] = { message_id: messageId, error: result.error };
+            } else {
+              throw new Error("unexpected nested read_thread batch result");
+            }
+          } catch {
+            threads[index] = {
+              message_id: messageId,
+              error: toolError(
+                "tool_failed",
+                "Thread could not be read.",
+                "Retry this thread or remove it from the batch."
+              ).error
+            };
+          }
+        }
+      }
+    ));
+    return { threads };
   }
 
   const messageId = typeof input.message_id === "string" ? input.message_id : undefined;
@@ -426,8 +502,8 @@ export async function runReadThread(
   if (!messageId && !conversationId && !threadId) {
     return toolError(
       "invalid_input",
-      "read_thread requires message_id, conversation_id, or thread_id.",
-      "Pass message_id, or pass conversation_id/thread_id together with account."
+      "read_thread requires message_id, message_ids, conversation_id, or thread_id.",
+      "Pass message_id/message_ids, or pass conversation_id/thread_id together with account."
     );
   }
 

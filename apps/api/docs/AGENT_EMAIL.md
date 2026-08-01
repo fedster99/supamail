@@ -46,8 +46,10 @@ listener; remote deployments provide their own transport and authentication.
    One call to answer "where am I, what needs attention".
 2. **Search** — `search_email` is the canonical ranked search. Every hit carries
    a mailbox `identity` whose `id` is the stable message handle.
-3. **Read** — `read_message` (one message, full body) or `read_thread` (the whole
-   conversation) — pass a search hit's `identity.id` as `message_id`.
+3. **Read** — `read_message` reads one message. `read_thread {message_id}` reads
+   one focused conversation. For a broader investigation, inspect the grouped
+   search snippets and pass up to ten relevant hit ids as
+   `read_thread {message_ids:[...]}` instead of issuing separate calls.
 4. **Draft** — `draft_reply` produces a ready-to-send reply with correct
    threading headers. It never sends; you (or the user's client) send it.
 
@@ -56,7 +58,7 @@ listener; remote deployments provide their own transport and authentication.
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `search_email` | Canonical ranked search over the mirror. | `q` (free-text + operators), `filters`, `accounts`, `sort`, `limit` |
-| `read_thread` | The whole durable conversation, seeded from one message or selected directly. | `message_id` (seed) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` |
+| `read_thread` | One durable conversation, or a bounded batch selected from grouped search results. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` |
 | `read_message` | One message with full body, cc, attachments. | `message_id`, `include_headers=false`, `include_quoted=false` |
 | `list_folders` | Folders + unread/flagged/total counts for an account. | `account?` |
 | `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `reply_all=false` |
@@ -71,6 +73,10 @@ The stable handle is **`identity.id`** — it equals `imap_messages.id`.
   message belongs to. A stored assignment resolves the complete, transitive
   account-scoped conversation and returns one representative for each delivered
   email, not one result for every mirrored folder copy.
+- For a broader investigation, pass up to ten distinct grouped-search hit ids as
+  `read_thread {message_ids:[...]}`. Results stay in request order, and each
+  thread returns its own result or error so one missing thread does not discard
+  the rest.
 - `read_thread` returns `thread.conversation_id`, SupaMail's durable conversation
   handle, plus `thread.provider_thread_id` as provider metadata when available.
   A direct `conversation_id` lookup always requires `account` because conversation
@@ -100,6 +106,8 @@ temporarily uses the legacy one-hop read fallback.
 - **Unread today:** `search_email {q:"is:unread newer_than:1d", sort:"recent"}`.
 - **Triage the inbox:** `search_email {q:"is:unread", sort:"recent"}`, then
   `read_message` the ones that matter.
+- **Investigate a topic:** search broadly, inspect the grouped snippets, then
+  batch the relevant hit ids through `read_thread`.
 
 ## Non-goals
 

@@ -33,6 +33,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0026-post-repair-reconcile-health.md`: Reconcile gap counts describe observed drift, while account health describes the post-repair mirror state.
 - `0027-mutable-body-policy-row-accurate-coverage.md`: Existing accounts can change live body policy, while current complete message rows define live and priority body coverage.
 - `0028-content-extract-body-store-seam.md`: A 32 KiB plain-text extract and threading evidence commit before the pluggable body store receives the full payload.
+- `0030-bounded-batch-thread-reading.md`: `read_thread` batches up to ten grouped-search conversation seeds without adding another MCP tool.
 
 ## Status Values
 

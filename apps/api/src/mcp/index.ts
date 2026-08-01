@@ -6,6 +6,7 @@ import { listFoldersEntry, runListFolders } from "./tools/list-folders.js";
 import { draftReplyEntry, runDraftReply } from "./tools/draft-reply.js";
 
 export * from "./shared.js";
+export { MCP_INSTRUCTIONS } from "./instructions.js";
 
 // Re-export each tool's run-function so the CLI and any remote transport can wire
 // to the same handlers the registry runs (one source of truth). Tool definitions

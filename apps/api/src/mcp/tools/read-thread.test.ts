@@ -113,7 +113,183 @@ function unassignedSeedPool() {
   return { pool, query };
 }
 
+function batchConversationPool() {
+  const connect = vi.fn(async () => {
+    const query = vi.fn(async (
+      sql: string,
+      values?: unknown[]
+    ): Promise<{ rows: Array<Record<string, unknown>> }> => {
+      if (sql.includes("WHERE m.id = $1")) {
+        const messageId = String(values?.[0]);
+        if (messageId === "missing-message") return { rows: [] };
+        if (messageId === "broken-message") throw new Error("temporary database failure");
+        return {
+          rows: [{
+            id: messageId,
+            provider_thread_id: `provider-${messageId}`,
+            rfc_message_id: `<${messageId}@example.test>`,
+            message_id_normalized: `${messageId}@example.test`,
+            in_reply_to: null,
+            references_header: null,
+            account_id: ACCOUNT_ID,
+            conversation_id: `conversation-${messageId}`
+          }]
+        };
+      }
+      if (sql.includes("WITH delivery_representatives")) {
+        const conversationId = String(values?.[1]);
+        return {
+          rows: [{
+            id: `representative-${conversationId}`,
+            account_id: ACCOUNT_ID,
+            folder_path: "INBOX",
+            provider_thread_id: `provider-${conversationId}`,
+            conversation_id: conversationId,
+            subject: conversationId,
+            from_email: "alice@example.test",
+            from_name: "Alice",
+            to_emails: ["bob@example.test"],
+            cc_emails: [],
+            flags: [],
+            window_status: "IN_WINDOW",
+            internal_date: new Date("2026-01-02T03:04:05.000Z"),
+            body_text: "hello",
+            body_plain: null,
+            selected_text_part: null,
+            attachments: []
+          }]
+        };
+      }
+      if (sql.includes("FROM public.imap_accounts a")) return { rows: [] };
+      return { rows: [] };
+    });
+    return { query, release: vi.fn() };
+  });
+  return { pool: { connect }, connect };
+}
+
 describe("read_thread stored assignments", () => {
+  it("reads several search-result seeds in one call and preserves request order", async () => {
+    const { pool, connect } = batchConversationPool();
+
+    const out = await runReadThread(pool as never, {
+      message_ids: ["message-one", "message-two"]
+    });
+
+    expect(out).toMatchObject({
+      threads: [
+        {
+          message_id: "message-one",
+          result: { thread: { conversation_id: "conversation-message-one" } }
+        },
+        {
+          message_id: "message-two",
+          result: { thread: { conversation_id: "conversation-message-two" } }
+        }
+      ]
+    });
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns an independent error without discarding the other requested threads", async () => {
+    const { pool } = batchConversationPool();
+
+    const out = await runReadThread(pool as never, {
+      message_ids: ["message-one", "missing-message", "message-two"]
+    });
+
+    expect(out).toMatchObject({
+      threads: [
+        { message_id: "message-one", result: { thread: { conversation_id: "conversation-message-one" } } },
+        { message_id: "missing-message", error: { code: "not_found" } },
+        { message_id: "message-two", result: { thread: { conversation_id: "conversation-message-two" } } }
+      ]
+    });
+  });
+
+  it("rejects mixing batch mode with a single-thread selector", async () => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, {
+      message_id: "message-one",
+      message_ids: ["message-two"]
+    });
+
+    expect(out).toMatchObject({ error: { code: "invalid_input" } });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("isolates an operational failure to its batch item", async () => {
+    const { pool } = batchConversationPool();
+
+    const out = await runReadThread(pool as never, {
+      message_ids: ["message-one", "broken-message", "message-two"]
+    });
+
+    expect(out).toMatchObject({
+      threads: [
+        { message_id: "message-one", result: { thread: { conversation_id: "conversation-message-one" } } },
+        { message_id: "broken-message", error: { code: "tool_failed" } },
+        { message_id: "message-two", result: { thread: { conversation_id: "conversation-message-two" } } }
+      ]
+    });
+  });
+
+  it("deduplicates repeated message seeds before reading", async () => {
+    const { pool, connect } = batchConversationPool();
+
+    const out = await runReadThread(pool as never, {
+      message_ids: ["message-one", "message-one", "message-two"]
+    });
+
+    expect(out).toMatchObject({
+      threads: [
+        { message_id: "message-one" },
+        { message_id: "message-two" }
+      ]
+    });
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects batches larger than ten before opening a database connection", async () => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, {
+      message_ids: Array.from({ length: 11 }, (_, index) => `message-${index}`)
+    });
+
+    expect(out).toMatchObject({ error: { code: "invalid_input" } });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("runs at most four thread reads concurrently", async () => {
+    const base = batchConversationPool();
+    let active = 0;
+    let peak = 0;
+    const pool = {
+      async connect() {
+        const client = await base.pool.connect();
+        active += 1;
+        peak = Math.max(peak, active);
+        const release = client.release;
+        return {
+          ...client,
+          release() {
+            active -= 1;
+            release();
+          }
+        };
+      }
+    };
+
+    await runReadThread(pool as never, {
+      message_ids: Array.from({ length: 10 }, (_, index) => `message-${index}`)
+    });
+
+    expect(peak).toBe(4);
+    expect(active).toBe(0);
+  });
+
   it("resolves an assigned seed to the full stored conversation and exposes its id", async () => {
     const { pool, query } = assignedConversationPool();
     const out = await runReadThread(pool as never, { message_id: "message-seed" });
