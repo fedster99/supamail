@@ -168,8 +168,7 @@ export const readThreadDefinition: ToolDefinition = {
     "distinct seed has its own result or error entry. " +
     "Returns the thread's messages oldest-first. Replies contain newly authored plain text by default. " +
     "When no older messages were omitted, the oldest mirrored message keeps quoted content. " +
-    "Each body is limited to 4,096 characters. " +
-    "body_truncated is set when more cleaned text remains; recognized quoted reply tails and signatures " +
+    "Each message contains its full cleaned body. Recognized quoted reply tails and signatures " +
     "are stripped unless include_quoted=true. Returns the " +
     "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PgPool } from "../../db.js";
-import { DEFAULT_MAX_BODY_CHARS, cleanBody, toolError, withReadOnlyTx } from "../shared.js";
+import { cleanBody, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   METADATA_PROTECTED_FIELDS,
@@ -189,10 +189,12 @@ export function buildCc(row: SourceRow): DraftRecipient[] {
   return out;
 }
 
-/** Quote the original body, capping it via cleanBody and prefixing each line "> ". */
+const MAX_DRAFT_QUOTE_CHARS = 4096;
+
+/** Quote a bounded part of the original body and prefix each line with "> ". */
 function quoteOriginal(row: SourceRow): string {
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
-  const cleaned = cleanBody(raw, { includeQuoted: true, maxChars: DEFAULT_MAX_BODY_CHARS });
+  const cleaned = cleanBody(raw, { includeQuoted: true, maxChars: MAX_DRAFT_QUOTE_CHARS });
   const text = cleaned.text ?? "";
   const fromLabel = row.from_name ? `${row.from_name} <${row.from_email ?? ""}>` : row.from_email ?? "unknown sender";
   const attribution = `On ${row.internal_date.toISOString()}, ${fromLabel} wrote:`;

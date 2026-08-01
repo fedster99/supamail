@@ -44,7 +44,7 @@ listener; remote deployments provide their own transport and authentication.
 | --- | --- | --- |
 | `search_email` | Canonical ranked search over the mirror. | `q` (free-text + operators), `filters`, `accounts`, `sort`, `limit` |
 | `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each valid distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100) |
-| `read_message` | One message with a bounded, recoverable cleaned body range, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false`, `body_offset=0`, `max_body_chars=4096` (max 32768) |
+| `read_message` | One message with its full available cleaned body, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false`, optional `body_offset`, optional `max_body_chars` (max 131072) |
 | `list_folders` | Folders + unread/flagged/total counts for an account. | `account?` |
 | `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `reply_all=false` |
 
@@ -71,14 +71,14 @@ The stable handle is **`identity.id`** — it equals `imap_messages.id`.
 
 Message IDs are returned by `search_email`, `read_message`, and `read_thread`.
 
-`read_message` and thread replies return newly authored text by default. They
+`read_message` and `read_thread` return the full available cleaned body for each
+message. Replies return newly authored text by default. They
 remove recognized quoted reply tails and signatures. When no older messages
-were omitted, the oldest mirrored message keeps quoted content within the same
-4,096-character body limit. `include_quoted=true` keeps quoted content in all
-messages.
-`read_message` returns 4,096 by default and up to 32,768 when requested.
-`body_total_chars`, `body_next_offset`, and `body_truncated` describe the range,
-so the same message can be read again from a later `body_offset`.
+were omitted, the oldest mirrored message keeps quoted content.
+`include_quoted=true` keeps quoted content in all messages.
+`read_message` can return a specific range when `body_offset` or
+`max_body_chars` is supplied. `body_total_chars`, `body_next_offset`, and
+`body_truncated` describe that range.
 
 Search groups by durable conversation by default and first deduplicates physical
 copies of one delivery. A hit's `thread.conversation_id` is therefore the right

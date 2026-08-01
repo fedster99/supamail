@@ -260,38 +260,42 @@ liveDb("read_message tool live DB", () => {
     expect(res.body_next_offset).toBeNull();
   });
 
-  it("returns a recoverable body range through the same read_message tool", async () => {
+  it("returns the full available cleaned body", async () => {
+    const messageId = idByUid.get(2)!;
+    const body = "x".repeat(40_000) + "END MARKER";
+    await pool.query(
+      "UPDATE public.imap_message_bodies SET body_plain = $2 WHERE message_id = $1",
+      [messageId, body]
+    );
+
+    const result = await runReadMessage(pool, { message_id: messageId });
+    if ("error" in result) throw new Error("unexpected error envelope");
+    expect(result.body).toBe(body);
+    expect(result.body_truncated).toBe(false);
+    expect(result.body_offset).toBe(0);
+    expect(result.body_total_chars).toBe(40_010);
+    expect(result.body_next_offset).toBeNull();
+  });
+
+  it("returns an explicit body range when requested", async () => {
     const messageId = idByUid.get(2)!;
     await pool.query(
       "UPDATE public.imap_message_bodies SET body_plain = $2 WHERE message_id = $1",
       [messageId, "0123456789"]
     );
 
-    const first = await runReadMessage(pool, {
+    const result = await runReadMessage(pool, {
       message_id: messageId,
+      body_offset: 3,
       max_body_chars: 4
     });
-    if ("error" in first) throw new Error("unexpected error envelope");
-    expect(first).toMatchObject({
-      body: "0123",
+    if ("error" in result) throw new Error("unexpected error envelope");
+    expect(result).toMatchObject({
+      body: "3456",
       body_truncated: true,
-      body_offset: 0,
+      body_offset: 3,
       body_total_chars: 10,
-      body_next_offset: 4
-    });
-
-    const second = await runReadMessage(pool, {
-      message_id: messageId,
-      body_offset: first.body_next_offset,
-      max_body_chars: 8
-    });
-    if ("error" in second) throw new Error("unexpected error envelope");
-    expect(second).toMatchObject({
-      body: "456789",
-      body_truncated: false,
-      body_offset: 4,
-      body_total_chars: 10,
-      body_next_offset: null
+      body_next_offset: 7
     });
   });
 });

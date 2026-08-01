@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import {
-  DEFAULT_MAX_BODY_CHARS,
   loadMessageAttachments,
   mapMessageRow,
   syncTrustFor,
@@ -21,7 +20,7 @@ import {
   type ProtectedMetadataColumns
 } from "../../metadata-protection.js";
 
-export const MAX_READ_MESSAGE_BODY_CHARS = 32768;
+export const MAX_READ_MESSAGE_BODY_CHARS = 131072;
 
 /**
  * Zod schema for `read_message`. The handler validates raw tool arguments
@@ -76,9 +75,10 @@ export const readMessageDefinition: ToolDefinition = {
   description:
     "Fetch a single mirrored email by its stable message_id (the id returned by search_email " +
     "or read_thread). By default, the body contains the newly authored plain text, with " +
-    "recognized quoted reply tails and signatures removed. It returns 4,096 characters from " +
-    "body_offset 0 by default; max_body_chars may request up to 32,768. body_total_chars, " +
-    "body_next_offset, and body_truncated describe the remaining cleaned text. Also returns the from/to/cc envelope, flags, " +
+    "recognized quoted reply tails and signatures removed. It returns the full cleaned body. " +
+    "body_offset and max_body_chars can return a specific range of up to 131,072 characters; " +
+    "body_total_chars, body_next_offset, and body_truncated describe that range. " +
+    "Also returns the from/to/cc envelope, flags, " +
     "window_status, and the attachments list (filename, mime_type, size_bytes, disposition — " +
     "including inline parts). include_quoted=true retains the quoted reply tail and " +
     "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
@@ -117,14 +117,13 @@ export const readMessageDefinition: ToolDefinition = {
         minimum: 0,
         maximum: Number.MAX_SAFE_INTEGER,
         default: 0,
-        description: "Character offset in the cleaned body at which to start the returned range (default 0)."
+        description: "Optional character offset at which to start the cleaned body (default 0)."
       },
       max_body_chars: {
         type: "integer",
         minimum: 1,
         maximum: MAX_READ_MESSAGE_BODY_CHARS,
-        default: DEFAULT_MAX_BODY_CHARS,
-        description: "Maximum cleaned body characters to return (default 4,096; maximum 32,768)."
+        description: "Optional body range size (maximum 131,072). Omit it to return the full remaining cleaned body."
       }
     }
   }
@@ -147,8 +146,6 @@ export async function runReadMessage(
   const request = readMessageRequestSchema.parse(args);
   const includeHeaders = request.include_headers ?? false;
   const includeQuoted = request.include_quoted ?? false;
-  const bodyOffset = request.body_offset ?? 0;
-  const maxBodyChars = request.max_body_chars ?? DEFAULT_MAX_BODY_CHARS;
 
   const row = await withReadOnlyTx(pool, async (client: PgClient) => {
     const result = await client.query<ReadMessageRow>(
@@ -201,8 +198,8 @@ export async function runReadMessage(
   const detail = mapMessageRow(served, {
     includeQuoted,
     headers,
-    offset: bodyOffset,
-    maxChars: maxBodyChars,
+    offset: request.body_offset,
+    maxChars: request.max_body_chars,
     includeBodyRange: true
   });
   const sync_trust = await syncTrustFor(pool, [row.account_id], metadataProtection);

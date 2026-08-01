@@ -78,10 +78,10 @@ export interface MessageDetail {
   date: string;
   flags: string[];
   window_status: WindowStatus;
-  /** Cleaned + capped body (coalesce(body_text, body_plain, selected_text_part)). */
+  /** Cleaned body (coalesce(body_text, body_plain, selected_text_part)). */
   body: string | null;
   body_truncated: boolean;
-  /** Present on read_message responses so a caller can continue a bounded body read. */
+  /** Present on read_message responses so a caller can recover a specific body range. */
   body_offset?: number;
   body_total_chars?: number;
   body_next_offset?: number | null;
@@ -178,8 +178,6 @@ export interface CleanBodyOptions {
   offset?: number;
 }
 
-export const DEFAULT_MAX_BODY_CHARS = 4096;
-
 /**
  * Shared attachment-aggregation SQL fragment (assumes the message alias is `m`).
  * Both read tools select this verbatim so attachment shape and ordering stay in
@@ -256,8 +254,8 @@ const MIN_QUOTED_TAIL_LINES = 2;
  * (ADR 0015). When `includeQuoted=false` (the default for read tools) we drop the
  * quoted reply tail introduced by a recognized attribution, original-message
  * separator, Outlook header block, or trailing quote-only block. It also drops
- * a trailing signature after a `-- ` delimiter. Then it returns the requested
- * bounded range (default offset 0 and 4096 characters). No heavy markdown
+ * a trailing signature after a `-- ` delimiter. It returns the full cleaned
+ * body unless the caller explicitly supplies `maxChars`. No heavy markdown
  * conversion.
  */
 export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBodyResult {
@@ -266,7 +264,7 @@ export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBod
   }
   const maxChars = Number.isFinite(opts.maxChars) && Number(opts.maxChars) > 0
     ? Math.floor(Number(opts.maxChars))
-    : DEFAULT_MAX_BODY_CHARS;
+    : undefined;
   const requestedOffset = Number.isFinite(opts.offset) && Number(opts.offset) > 0
     ? Math.floor(Number(opts.offset))
     : 0;
@@ -287,17 +285,19 @@ export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBod
   };
 }
 
-/** Slice by Unicode code points so a range cannot split a surrogate pair. */
+/** Slice by Unicode code points so a requested range cannot split a surrogate pair. */
 function sliceCodePoints(
   text: string,
   requestedOffset: number,
-  maxChars: number
+  maxChars?: number
 ): { text: string; totalChars: number; offset: number; nextOffset: number | null } {
   let charIndex = 0;
   let unitIndex = 0;
   let startUnit = text.length;
   let endUnit = text.length;
-  const requestedEnd = requestedOffset + maxChars;
+  const requestedEnd = maxChars === undefined
+    ? Number.POSITIVE_INFINITY
+    : requestedOffset + maxChars;
 
   while (unitIndex < text.length) {
     if (charIndex === requestedOffset) startUnit = unitIndex;
@@ -309,7 +309,9 @@ function sliceCodePoints(
 
   const totalChars = charIndex;
   const offset = Math.min(requestedOffset, totalChars);
-  const end = Math.min(totalChars, offset + maxChars);
+  const end = maxChars === undefined
+    ? totalChars
+    : Math.min(totalChars, offset + maxChars);
   if (offset === totalChars) startUnit = text.length;
   if (end === totalChars) endUnit = text.length;
 

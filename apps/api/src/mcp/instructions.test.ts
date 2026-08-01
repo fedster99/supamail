@@ -15,10 +15,11 @@ describe("MCP agent guidance", () => {
     expect(MCP_INSTRUCTIONS).toContain("Each thread returns at most 20 messages by default and 100 when requested");
     expect(MCP_INSTRUCTIONS).toContain("Duplicate message_ids are collapsed");
     expect(MCP_INSTRUCTIONS).toContain("each distinct ID has its own result or error entry");
-    expect(MCP_INSTRUCTIONS).toContain("thread replies contain newly authored text by default");
-    expect(MCP_INSTRUCTIONS).toContain("oldest mirrored message keeps quoted content within the same 4,096-character body limit");
-    expect(MCP_INSTRUCTIONS).toContain("body_offset plus max_body_chars up to 32,768");
+    expect(MCP_INSTRUCTIONS).toContain("full available cleaned body for each message");
+    expect(MCP_INSTRUCTIONS).toContain("specific range of up to 131,072 characters");
     expect(MCP_INSTRUCTIONS).toContain("body_total_chars and body_next_offset");
+    expect(MCP_INSTRUCTIONS).toContain("Replies contain newly authored text by default");
+    expect(MCP_INSTRUCTIONS).toContain("oldest mirrored message keeps quoted content");
     expect(MCP_INSTRUCTIONS).toContain("batch thread errors use the same fields in the affected thread entry");
     expect(MCP_INSTRUCTIONS).toContain("cannot send, save drafts, move, delete, flag, or otherwise change mail");
     expect(MCP_INSTRUCTIONS).toContain("Read results include sync_trust");
@@ -28,7 +29,7 @@ describe("MCP agent guidance", () => {
 
     expect(readThreadDefinition.description).not.toContain("broader investigation");
     expect(readThreadDefinition.description).not.toContain("instead of issuing separate");
-    expect(readThreadDefinition.description).toContain("4,096 characters");
+    expect(readThreadDefinition.description).toContain("full cleaned body");
     const properties = readThreadDefinition.inputSchema.properties as Record<string, unknown>;
     expect(properties.message_ids).toMatchObject({
       minItems: 1,
@@ -59,17 +60,16 @@ describe("MCP agent guidance", () => {
     });
     expect(readMessageProperties.max_body_chars).toMatchObject({
       minimum: 1,
-      maximum: 32768,
-      default: 4096
+      maximum: 131072
     });
     expect(readMessageRequestSchema.safeParse({
       message_id: messageId,
-      body_offset: 4096,
-      max_body_chars: 32768
+      body_offset: 131072,
+      max_body_chars: 131072
     }).success).toBe(true);
     expect(readMessageRequestSchema.safeParse({
       message_id: messageId,
-      max_body_chars: 32769
+      max_body_chars: 131073
     }).success).toBe(false);
     for (const range of [
       { body_offset: -1 },

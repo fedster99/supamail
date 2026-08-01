@@ -416,6 +416,30 @@ liveDb("read_thread live DB", () => {
     expect(quotedBody).toContain("Alice wrote:");
   });
 
+  it("returns a large message body in full", async () => {
+    const messageId = idByUid.get(3)!;
+    const body = `${"x".repeat(40_000)}END MARKER`;
+    await pool.query(
+      "UPDATE public.imap_message_bodies SET body_text = $2 WHERE message_id = $1",
+      [messageId, body]
+    );
+
+    try {
+      const out = await runReadThread(pool, { message_id: messageId });
+      expect(isResult(out)).toBe(true);
+      if (!isResult(out)) return;
+      expect(out.messages.find((message) => message.message_id === messageId)).toMatchObject({
+        body,
+        body_truncated: false
+      });
+    } finally {
+      await pool.query(
+        "UPDATE public.imap_message_bodies SET body_text = $2 WHERE message_id = $1",
+        [messageId, "Carol, joining you both."]
+      );
+    }
+  });
+
   it("collects distinct participants and a flat attachments_index", async () => {
     const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId });
     expect(isResult(out)).toBe(true);

@@ -52,14 +52,18 @@ identifiers, limits, and guarantees without prescribing a reasoning workflow.
 
 The five-tool local MCP surface does not grow. A normal focused read is
 unchanged. A broad investigation can expand up to ten conversations per request
-with explicit seed, per-thread message, and per-body limits.
+with an explicit seed and per-thread message limit.
 
 Thread replies return newly authored text by default. When no older messages
-were omitted, the oldest mirrored message keeps quoted content. All remain
-capped at 4,096 characters per message. `read_message` provides a bounded continuation on the
-same tool through `body_offset` and `max_body_chars` (maximum 32,768), with total
-and next-offset metadata. This keeps batch responses bounded without making
-long original messages inaccessible.
+were omitted, the oldest mirrored message keeps quoted content. `read_message`
+and `read_thread` return each message's full available cleaned body. This avoids
+silently omitting evidence from long messages. A hosted wrapper can still apply
+a request-level resource limit to protect the service.
+
+`read_message` also accepts an optional Unicode-safe body range of up to 131,072
+characters. The default remains the full cleaned body. The range exists so a
+client that truncates an unusually large tool result can recover a specific
+missing section without adding another MCP tool.
 
 The agent still owns query refinement, evidence selection, and synthesis.
 SupaMail does not add an `investigate_topic`, summary, or reasoning tool.
@@ -72,8 +76,7 @@ hydrate all successful batch items under one bounded concurrency limit.
 - Unit tests cover single-call compatibility, batch ordering, exact-seed
   deduplication, the ten-thread cap, selector exclusivity, request-level batch
   validation, and per-item operational failures.
-- MCP instruction tests pin the neutral capability contract and the advertised
-  schema bound.
+- MCP instruction tests pin the neutral capability contract.
 - Existing live-Postgres `read_thread` coverage continues to prove conversation
   membership, ordering, attachment indexing, message caps, and sync trust.
 

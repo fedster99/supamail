@@ -204,9 +204,9 @@ reads the same `DATABASE_URL`, and has no remote listener or send capability.
 
 `read_thread` accepts one message seed or a batch of up to ten `message_ids`,
 preserving first-seen order and isolating each thread's result or error.
-`read_message` returns a bounded body range and supports continuation through
-`body_offset` and `max_body_chars` when the default 4,096 characters are not
-enough.
+`read_message` and `read_thread` return the full available cleaned body for each
+message. `read_message` also accepts an optional body range for targeted recovery
+when a client cannot carry one unusually large body in a single response.
 
 ```bash
 pnpm build

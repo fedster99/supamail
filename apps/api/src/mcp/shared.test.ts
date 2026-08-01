@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_BODY_CHARS, cleanBody } from "./shared.js";
+import { cleanBody } from "./shared.js";
 import { buildCc, buildReferences, reSubject } from "./tools/draft-reply.js";
 
 /**
@@ -36,12 +36,11 @@ describe("cleanBody", () => {
     expect(out.truncated).toBe(false);
   });
 
-  it("truncates a body longer than the cap and marks truncated", () => {
-    const long = "x".repeat(DEFAULT_MAX_BODY_CHARS + 500);
+  it("returns a large body in full when no explicit bound is supplied", () => {
+    const long = "x".repeat(733_287);
     const out = cleanBody(long, { includeQuoted: true });
-    expect(out.text).not.toBeNull();
-    expect((out.text ?? "").length).toBeLessThanOrEqual(DEFAULT_MAX_BODY_CHARS);
-    expect(out.truncated).toBe(true);
+    expect(out.text).toBe(long);
+    expect(out.truncated).toBe(false);
   });
 
   it("does not mark a short body as truncated", () => {
@@ -91,7 +90,7 @@ describe("cleanBody", () => {
     expect(cleanBody(original, { includeQuoted: false }).text).toBe(original);
   });
 
-  it("returns a bounded body range with a stable continuation offset", () => {
+  it("returns a requested range with a stable continuation offset", () => {
     const out = cleanBody("0123456789", {
       includeQuoted: false,
       offset: 3,
@@ -107,8 +106,7 @@ describe("cleanBody", () => {
     });
     expect(cleanBody("0123456789", {
       includeQuoted: false,
-      offset: out.nextOffset ?? 0,
-      maxChars: 4
+      offset: out.nextOffset ?? 0
     })).toEqual({
       text: "789",
       truncated: false,
