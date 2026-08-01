@@ -35,4 +35,4 @@ Put durable public facts close to the behavior they describe:
 - `docs/deployment-options.md`: self-hosting and deployment guidance.
 - `README.md`: public product overview and quickstart.
 
-`pnpm harness:check` checks public-content hygiene and reminds contributors to review documentation impact before submitting changes.
+`pnpm harness:check` reminds contributors to review documentation impact before submitting changes.
