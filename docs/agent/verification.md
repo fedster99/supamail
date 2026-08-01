@@ -14,7 +14,7 @@ pnpm build
 
 Root verification runs through Turborepo. Use package filters for fast local checks while editing, but run the root lane before claiming broad repo health.
 
-`pnpm harness:check` enforces public-content hygiene and prints the documentation-impact reminder. It runs before typecheck in `./init.sh`.
+`pnpm harness:check` prints the documentation-impact reminder. It runs before typecheck in `./init.sh`.
 
 Useful package-scoped commands:
 
