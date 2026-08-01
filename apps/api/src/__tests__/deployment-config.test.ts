@@ -57,18 +57,15 @@ describe("deployment configs", () => {
     await expect(access(resolve(apiRoot, "render.yaml"))).rejects.toThrow();
   });
 
-  it("keeps Fly.io as the recommended hosted deployment path", async () => {
+  it("keeps Fly.io as the recommended managed-container deployment path", async () => {
     const readme = await readFile(resolve(repoRoot, "README.md"), "utf8");
     const deploymentOptions = await readFile(resolve(repoRoot, "docs/deployment-options.md"), "utf8");
     const flyGuide = await readFile(resolve(repoRoot, "docs/fly-supabase.md"), "utf8");
-    const hostedBoundary = await readFile(resolve(repoRoot, "docs/hosted-product-boundary.md"), "utf8");
 
     expect(readme).toContain("Quickstart: Supabase + Fly.io");
     expect(readme).toContain("docs/fly-supabase.md");
-    expect(readme).toContain("docs/hosted-product-boundary.md");
-    expect(deploymentOptions).toContain("Use Fly.io as the hosted path");
-    expect(flyGuide).toContain("This is the recommended hosted setup for SupaMail.");
-    expect(hostedBoundary).toContain("The public repo intentionally does not include the hosted SaaS wrapper");
+    expect(deploymentOptions).toContain("Use Fly.io as the managed-container path");
+    expect(flyGuide).toContain("This is the recommended Fly.io setup for SupaMail.");
     expect(readme).not.toContain("render.yaml");
     expect(deploymentOptions).not.toContain("Render");
   });

@@ -22,7 +22,3 @@ The authenticated HTTP API replaces a rejected password or app password with `PA
 - Yahoo/AOL: app password where available.
 
 Gmail app passwords can be documented as best-effort only for accounts that still support them. Gmail OAuth and Microsoft OAuth should be added as explicit future provider work, not folded into the generic IMAP password path.
-
-## Hosted Boundary
-
-The hosted SaaS may collect IMAP credentials or app passwords during onboarding, but the public core only stores encrypted credentials in the mirror database. Hosted OAuth tokens for Supabase project access are a control-plane concern and must not be stored in public mirror tables.

@@ -1,6 +1,6 @@
 # Fly.io + Supabase Deployment
 
-This is the recommended hosted setup for SupaMail.
+This is the recommended Fly.io setup for SupaMail.
 
 Supabase hosts Postgres. Fly.io runs the sync worker as a small Docker Machine with no public IP. The API is optional and should be a separate Fly app when you need remote control endpoints.
 

@@ -57,7 +57,7 @@ mailbox. Its `destructiveHint` is `false`: producing a draft destroys nothing.
   decision.
 - The zero-send safety test asserts the absence of a send flag and that no tool
   imports the IMAP write client, so a regression that wires sending in fails CI.
-- The cloud remote binding inherits the boundary for free: it wraps the same
+- Remote bindings inherit the boundary by wrapping the same
   `TOOLS` registry and cannot introduce a send path the core does not expose.
 
 ## Verification
@@ -73,7 +73,7 @@ mailbox. Its `destructiveHint` is `false`: producing a draft destroys nothing.
 
 ## References
 
-- ADR 0014: Agent email access is a core read surface, hosted in cloud (the
+- ADR 0014: Agent email access is a core read surface (the
   read-only boundary this preserves).
 - ADR 0015: Search is a pure-Postgres read layer.
 - `apps/api/src/mcp/` (the agent email surface and its tool registry).

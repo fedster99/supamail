@@ -1,10 +1,6 @@
 # Spec Conformance
 
-SupaMail was extracted from an older Rackspace IMAP sync design that was used to build the original Signal sync engine. This document is the public, sanitized conformance map: it records which reliability mechanics were imported, how SupaMail implements them, and what proves they work.
-
-The private source context is kept outside the public repo in `.context/old-spec-used-to-build-original-signal-sync-engine.md`.
-
-This file is not a full copy of the old spec. It keeps the portable mailbox-mirror contract and omits private Signal product behavior.
+This document records SupaMail's portable mailbox-mirror reliability contract, how each requirement is implemented, and what proves it works.
 
 ## Operating Contract
 
@@ -16,13 +12,13 @@ SupaMail owns a conservative mailbox mirror:
 - Full MIME bodies are fetched according to a mutable account policy and always behind the same account lock.
 - Multi-folder moves are normal. A message that leaves one folder may still appear elsewhere with a different folder-scoped UID identity.
 - Physical mailbox rows, duplicate delivery copies, and protocol conversations are separate identities. Conversation assignment is derived and replaceable; it does not redefine mailbox-row identity.
-- Mailbox identity is not CRM identity. SupaMail does not resolve people, companies, handles, relationships, or hydrated activities.
+- Mailbox identity is limited to protocol and mirror records. Application-specific identity models belong outside the core.
 - Threading stops at protocol conversations. It does not cluster separate conversations by task, document, decision, or semantic similarity.
 - The architecture is intentionally stateful and account-capped. Scaling beyond the default account cap requires a new architecture decision.
 
 ## Reliability Matrix
 
-| Old spec requirement | SupaMail status | Implementation / proof |
+| Reliability requirement | SupaMail status | Implementation / proof |
 | --- | --- | --- |
 | UIDs are scoped by folder and UIDVALIDITY, never globally unique. | Implemented | Message uniqueness is `(account_id, folder_path, uidvalidity, uid)`; `pnpm spec-conformance` covers UIDVALIDITY behavior. |
 | Message-ID is useful but not authoritative identity. | Implemented | Raw and normalized Message-ID are stored for lookup and correlation, but uniqueness is still folder/UIDVALIDITY/UID-scoped. |
@@ -68,7 +64,7 @@ SupaMail owns a conservative mailbox mirror:
 | Body completeness should be observable because downstream search reliability depends on it. | Implemented | `imap_account_progress` derives live and priority body coverage from current active `IN_WINDOW` messages and counts only store-completed, non-truncated body rows as complete. An evidence-only row does not produce false completion. Cumulative folder counters remain telemetry for headers and history rather than proof of current live-body coverage. Scenario M proves the roll-up contract; real-Postgres Scenario R proves post-snapshot rows and truncated bodies cannot produce false full coverage. |
 | Historical backfill should not starve fresh mail. | Implemented | The engine runs hot, body, then history lanes under one advisory lock; history is resumable through folder `backfill_*` state and skipped when the body lane exhausts the lock budget. An already-fetched history batch persists under a separate bounded database deadline before yielding at the safe boundary, so the cooperative lock budget cannot turn completed IMAP work into repeated failures. Spec-conformance Scenario L and the history safe-boundary integration regression prove ordering and budget behavior. |
 | Attachment metadata belongs in the mirror, not necessarily attachment binaries. | Implemented | MIME `BODYSTRUCTURE` is parsed into attachment metadata during sync; binary attachment retrieval is outside the current core path. Decoded full-body parsing hashes attachment streams and buffers only bounded calendar payloads, then stores SHA-256/calendar/provider-resource evidence rather than attachment bytes. |
-| Structured artifact evidence must remain separate from conversation and work-item truth. | Implemented | `0016_message_evidence` stores versioned neutral evidence and extraction coverage. SupaMail does not cluster tasks: attachment identity, calendar occurrence, and provider resource keys cannot alter `conversation_id`. |
+| Structured artifact evidence must remain separate from conversation truth. | Implemented | `0016_message_evidence` stores versioned neutral evidence and extraction coverage. Attachment identity, calendar occurrence, and provider resource keys cannot alter `conversation_id`. |
 | Worker shutdown should release held resources. | Implemented | SIGTERM/SIGINT propagate into active full-sync work, close IMAP, explicitly release the account advisory lock, clear active-sync state without changing mailbox health, and then close the Postgres pool. Live DB tests prove no account lock remains after cancellation. |
 | Sync should emit durable observability events. | Implemented at mirror-event level | Sync runs, message/folder events, flag changes, reconcile backfills, and retention outcomes are stored or logged. Durable failure fields and worker error logs use fixed diagnostic codes instead of provider text, so mailbox metadata cannot enter Postgres or the log backend through an error sentence. Stable Mailbox Account and run IDs keep support attribution intact. Failed account outcomes use error severity, and partial outcomes use warning severity. Sync-run metadata exposes acknowledged message-record upserts, cumulative persistence time, attempted/failed batches, and write-service rate; tick logs separately expose rows over monotonic wall time as production throughput. Failed attempts add time but zero rows, and incomplete telemetry emits no aggregate rate. Normal idempotent API shutdown is silent; genuine close failures remain error-level events. Alert thresholds remain an open operational layer. |
 | CI must prove DB behavior against real Postgres. | Implemented | `pnpm test:db:live` starts disposable Postgres, migrates twice, runs live DB integration tests, then runs spec conformance. |
@@ -83,7 +79,7 @@ Threading then builds two derived layers without changing that primary identity.
 
 Valid `References` supplies ancestry. Only when it yields no valid token does the first valid `In-Reply-To` supply a parent. Missing tokens remain provisional nodes so siblings and later-arriving parents converge. A directly prefixed forward starts a new authored protocol conversation even when a client inherited reply or provider-thread evidence; replies to that forward may form their own branch. Provider thread IDs otherwise add account-scoped membership but never invent parentage. The final subject fallback is intentionally weak and narrow, and is disabled whenever a bounded incremental drain cannot prove it has a complete candidate universe. Content/body similarity is never protocol-conversation evidence.
 
-This is mailbox/protocol identity only; it must not grow into CRM identity hydration, person/company resolution, handle mapping, activity construction, or work-item clustering inside SupaMail core. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
+This is mailbox/protocol identity only; application-specific semantic relationships remain outside SupaMail core. Flags are normalized case-insensitively, de-duplicated, sorted, and compared as sets.
 
 ### Conversation Projection Operations
 
@@ -135,22 +131,22 @@ Health is a reliability statement, not a cosmetic status. `HEALTHY` requires com
 
 Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge is limited to strict trapdoor reasons and must not purge `RECONCILE_MISSING` rows.
 
-## Open Deltas From The Old Spec
+## Open Reliability Deltas
 
-These old-spec ideas are still useful, but they are not part of the current implemented contract:
+These ideas are useful, but they are not part of the current implemented contract:
 
 - Broader metrics and alerts: metadata write-service efficiency and wall-clock throughput now have distinct structured fields, but this repo does not yet define alert thresholds or a complete production metric catalog.
 - Provider-specific live account CI: the open-source project now has a compatibility matrix, deterministic provider-shape fixtures, GreenMail and Dovecot smoke tests, and disposable Postgres. Live provider accounts still require manual smoke runs unless a safe provider-specific CI account is added later.
 - UI fallback for body-fetch failures: SupaMail stores metadata and body state, but it does not own an end-user UI contract.
-- CRM interaction fallback: the old Signal interaction-resolution behavior is intentionally outside SupaMail core.
+- Application-specific interaction resolution is intentionally outside SupaMail core.
 
 ## Intentionally Out Of Scope
 
-SupaMail keeps the Signal product layer out:
+SupaMail keeps application-specific product layers out:
 
-- Relationship CRM tables and interactions.
-- CRM hydration, identity resolution, handle/person/company mapping, belief, and epistemic architecture layers.
-- Signal dashboard/API routes.
+- Business-domain tables and workflows.
+- Application-specific identity and relationship models.
+- Product dashboard and account-lifecycle routes.
 - Provider-specific live account tests in CI.
 
 The open-source project owns the mailbox mirror: durable metadata, flags, bodies, folders, sync events, health, and reliability semantics.

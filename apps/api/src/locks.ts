@@ -428,7 +428,7 @@ export function isTransientStartupDbError(error: unknown): boolean {
     msg.includes("timeout exceeded when trying to connect") ||
     msg.includes("connection terminated") ||
     msg.includes("connection to database closed") ||
-    // Session-pooler-backed deployments (PgBouncer / Supavisor — e.g. cloud, BYO).
+    // Session-pooler-backed deployments (for example PgBouncer or Supavisor).
     msg.includes("maxclientsinsessionmode") ||
     msg.includes("max clients reached") ||
     msg.includes("too many clients") ||

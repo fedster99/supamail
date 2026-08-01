@@ -107,7 +107,7 @@ export const readMessageDefinition: ToolDefinition = {
 
 /**
  * Validate raw tool arguments and read one message from the mirror. The injected
- * pool keeps this transport-agnostic: the local stdio binding and any hosted
+ * pool keeps this transport-agnostic: the local stdio binding and any remote
  * binding call this same function.
  *
  * Body precedence is `coalesce(body_text, body_plain, selected_text_part)` (I2);

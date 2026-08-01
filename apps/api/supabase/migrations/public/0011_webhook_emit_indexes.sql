@@ -1,10 +1,8 @@
 -- 0011_webhook_emit_indexes.sql
 --
--- BYO Supabase webhook emit support for the hosted product. SupaMail Cloud is the
--- webhook emitter for both managed and BYO lanes, but BYO targets receive only this
--- public mirror schema. The worker scans new/changed mirror rows by `(created_at,id)`
--- and `(updated_at,id)` high-water cursors, so customer targets need the same serving
--- indexes the managed overlay carries with tenant_id.
+-- Event-consumer indexes for incremental scans of new or changed mirror rows.
+-- Consumers can advance stable `(created_at,id)` and `(updated_at,id)` high-water
+-- cursors without coupling deployment-specific event delivery to the core schema.
 --
 -- Additive + idempotent. Do not use CREATE INDEX CONCURRENTLY: public migrations run
 -- inside the migration transaction.

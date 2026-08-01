@@ -4,9 +4,9 @@
 ## Verification
 
 
-## Harness Impact
+## Documentation Impact
 
-- [ ] Project docs / harness reviewed and updated where needed
-- [ ] Project docs / harness reviewed; no updates needed
+- [ ] Public documentation or contributor guidance updated where needed
+- [ ] Reviewed; no documentation update needed
 
-Harness note:
+Documentation note:

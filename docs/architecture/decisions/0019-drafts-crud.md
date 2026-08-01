@@ -140,7 +140,7 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   `sendDraft` resends the draft's real bytes (whatever Content-Type/parts they
   carry). The `getDraft` `bodyHtml` + `isHtml` distinction is kept for read/display
   use; it is no longer load-bearing for send (the raw resend preserves markup).
-- The cloud re-pin inherits draft CRUD via `@supamail/api`; cloud adds tenant
+- Downstream deployments inherit draft CRUD via `@supamail/api` and add their
   scoping + the human-confirm MCP wrapper, never editing `imap_*` schema.
 
 ## Verification

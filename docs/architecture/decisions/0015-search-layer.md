@@ -13,7 +13,7 @@ flagship read tool behind both. This ADR records how that search is built.
 
 The constraints are fixed by the rest of the product:
 
-- **Public core, per-account, BYO Supabase.** The search schema ships as a public
+- **Public core, per-account Supabase/Postgres.** The search schema ships as a public
   migration that runs unchanged on every self-hoster and customer database. It must
   be additive, idempotent, and safe to re-run (the whole public set is concatenated
   and executed as one implicit transaction by `applyPublicMigrations`, re-applied on
@@ -151,14 +151,14 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   confidence. The contract documents this.
 - On a large existing mirror, the `ADD COLUMN ... GENERATED STORED` rewrite and the GIN
   builds take table-level locks inside the single migration transaction. Fresh / empty
-  BYO databases are instant; populated mirrors should pre-build out of band before
+  Empty databases are instant; populated mirrors should pre-build out of band before
   flipping the schema version. Documented in the migration header.
 - Tier 2 stays out of the pure core. Any future write capability (send, label) is a
   separate ADR; this surface is read-only (reinforces ADR 0014).
 
 ## Verification
 
-- `schema.test.ts` asserts the migration is additive, idempotent, control-plane-free,
+- `schema.test.ts` asserts the migration is additive, idempotent, deployment-neutral,
   uses the 128 KB body cap, omits the raw email-array GINs, and self-gates pgvector.
 - A live-DB integration test applies `0001..0007` to a real Postgres, proves the
   generated columns populate (including a pathological large body that must not ERROR),
@@ -193,7 +193,7 @@ the 15s `statement_timeout` — slow / 500 on a large mailbox.
 
 ## References
 
-- ADR 0014: Agent email access is a core read surface, hosted in cloud.
+- ADR 0014: Agent email access is a core read surface.
 - ADR 0001: SupaMail core is email sync only (escape hatch invoked by ADR 0014).
 - GitHub issues #4 (MCP server) and #7 (agent-first email CLI).
 - `apps/api/supabase/migrations/public/0008_search_layer.sql`

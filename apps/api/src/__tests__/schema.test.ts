@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -73,10 +73,10 @@ describe("initial schema", () => {
     expect(sql).toContain("m.body_fetched_at IS NOT NULL");
     expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_search_extract");
     expect(sql).toContain("CREATE TRIGGER imap_message_bodies_capture_threading_payload_sha256");
-    expect(sql).not.toMatch(/stripe|tenant|turbopuffer|storage_key/i);
+    expect(sql).not.toMatch(/deployment_owner|external_search_backend|storage_key/i);
   });
 
-  it("adds neutral protected metadata storage without Cloud key logic", async () => {
+  it("adds neutral protected metadata storage without deployment key logic", async () => {
     const sql = await readFile(metadataProtectionSeamMigrationPath, "utf8");
 
     for (const table of [
@@ -95,7 +95,7 @@ describe("initial schema", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_key_version integer");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata_tokens jsonb");
     expect(sql).toContain("jsonb_typeof(protected_metadata_tokens) = ''object''");
-    expect(sql).not.toMatch(/tenant_id|hkdf|aes-256|kms|turbopuffer|metadata_root_key/i);
+    expect(sql).not.toMatch(/deployment_owner|key_derivation|key_provider|encryption_algorithm/i);
   });
 
   it("adds an indexed adapter-mode marker and rejects token-only storage", async () => {
@@ -106,7 +106,7 @@ describe("initial schema", () => {
     expect(sql).toContain("imap_accounts_metadata_protection_mode_idx");
     expect(sql).toContain("protected_metadata IS NOT NULL");
     expect(sql).toContain("OR protected_metadata_tokens IS NULL");
-    expect(sql).not.toMatch(/tenant_id|hkdf|aes-256|kms|turbopuffer|metadata_root_key/i);
+    expect(sql).not.toMatch(/deployment_owner|key_derivation|key_provider|encryption_algorithm/i);
   });
 
   it("contains the neutral mirror tables and raw body storage", async () => {
@@ -181,7 +181,7 @@ describe("initial schema", () => {
     expect(applyPublicMigrations.toString()).toContain("pg_advisory_lock(hashtext('supamail.public_migrations'))");
   });
 
-  it("exposes an ordered public migration manifest for hosted deploy gates", async () => {
+  it("exposes an ordered public migration manifest for deployment gates", async () => {
     const manifest = await readPublicMigrationManifest();
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
@@ -463,21 +463,17 @@ describe("initial schema", () => {
 
     // Replayed public migrations remain transaction-safe and public-core-only.
     expect(sql).not.toMatch(/CREATE\s+INDEX\s+CONCURRENTLY/i);
-    expect(sql).not.toMatch(/stripe/i);
-    expect(sql).not.toContain("tenant");
     expect(sql).not.toMatch(/\bINSERT\s+INTO\s+public\.imap_thread_assignments\b/i);
   });
 
-  it("adds stuck-degraded escalation state without control-plane tables", async () => {
+  it("adds stuck-degraded escalation state to the mirror schema", async () => {
     const sql = await readFile(stuckDegradedMigrationPath, "utf8");
 
     expect(sql).toContain("ALTER TABLE public.imap_accounts");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_priority_sync_succeeded_at timestamptz");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
-  it("adds folder-count cap override and pending verification state without control-plane tables", async () => {
+  it("adds folder-count cap override and pending verification state", async () => {
     const sql = await readFile(folderCapMigrationPath, "utf8");
 
     expect(sql).toContain("ALTER TABLE public.imap_accounts");
@@ -485,11 +481,9 @@ describe("initial schema", () => {
     expect(sql).toContain("DROP CONSTRAINT IF EXISTS imap_folders_status_check");
     expect(sql).toContain("ADD CONSTRAINT imap_folders_status_check");
     expect(sql).toContain("'PENDING_VERIFICATION'");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
-  it("adds account lane settings with defaults and checks without control-plane tables", async () => {
+  it("adds account lane settings with defaults and checks", async () => {
     const sql = await readFile(accountSettingsMigrationPath, "utf8");
 
     expect(sql).toContain("ALTER TABLE public.imap_accounts");
@@ -502,11 +496,9 @@ describe("initial schema", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS archive_flag_sync boolean NOT NULL DEFAULT false");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS max_backfill_rate text NOT NULL DEFAULT 'normal'");
     expect(sql).toContain("CHECK (max_backfill_rate IN ('small', 'normal', 'aggressive'))");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
-  it("adds progress counters and a security-invoker roll-up view without control-plane tables", async () => {
+  it("adds progress counters and a security-invoker roll-up view", async () => {
     const sql = await readFile(progressRollupMigrationPath, "utf8");
 
     expect(sql).toContain("ADD COLUMN headers_synced_count int NOT NULL DEFAULT 0");
@@ -521,8 +513,6 @@ describe("initial schema", () => {
     expect(sql).toContain("historical_bodies_complete_pct");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM anon");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM authenticated");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
   it("replaces account body progress with current complete live rows while preserving view security", async () => {
@@ -550,26 +540,20 @@ describe("initial schema", () => {
     expect(sql).not.toContain("DROP VIEW");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM anon");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_account_progress FROM authenticated");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
-  it("adds history lane refresh state without control-plane tables", async () => {
+  it("adds history lane refresh state", async () => {
     const sql = await readFile(historyLaneMigrationPath, "utf8");
 
     expect(sql).toContain("ALTER TABLE public.imap_folders");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_archive_refresh_at timestamptz");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
-  it("makes raw_mime optional for parsed-only body storage without control-plane tables", async () => {
+  it("makes raw_mime optional for parsed-only body storage", async () => {
     const sql = await readFile(optionalRawMimeMigrationPath, "utf8");
 
     expect(sql).toContain("ALTER TABLE public.imap_message_bodies");
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
-    expect(sql).not.toContain("stripe");
-    expect(sql).not.toContain("tenant");
   });
 
   it("adds the search layer as an additive, idempotent, pure-core migration", async () => {
@@ -621,21 +605,20 @@ describe("initial schema", () => {
     expect(sql).not.toMatch(/CREATE\s+INDEX\s+CONCURRENTLY/i);
     expect(sql).not.toMatch(/REFRESH\s+MATERIALIZED\s+VIEW\s+CONCURRENTLY/i);
 
-    // Pure core: no control-plane coupling.
-    expect(sql).not.toMatch(/stripe/i);
-    expect(sql).not.toContain("tenant");
   });
 
-  it("keeps control-plane migrations out of the public core package path", async () => {
+  it("keeps deployment-specific migrations out of the public package path", async () => {
     const packageJson = JSON.parse(await readFile(resolve(process.cwd(), "package.json"), "utf8")) as {
       files?: string[];
     };
     const loader = await readFile(resolve(process.cwd(), "src/db.ts"), "utf8");
 
-    await expect(access(resolve(process.cwd(), "supabase/migrations/control-plane"))).rejects.toThrow();
+    const migrationEntries = await readdir(resolve(process.cwd(), "supabase/migrations"), {
+      withFileTypes: true
+    });
+    expect(migrationEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)).toEqual(["public"]);
     expect(packageJson.files).toContain("supabase/migrations/public");
     expect(packageJson.files).not.toContain("supabase/migrations");
     expect(loader).toContain("../supabase/migrations/public");
-    expect(loader).not.toContain("control-plane");
   });
 });

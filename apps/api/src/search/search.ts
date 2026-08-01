@@ -96,7 +96,7 @@ function mapRow(row: ResultRow, explain: boolean): SearchResult {
  * the compiled search and the sync-trust query inside one read-only transaction.
  *
  * The database connection is injected (no global pool reach-in) so the same
- * logic runs locally and hosted. It never sends, mutates, or schedules.
+ * logic runs locally or through a remote wrapper. It never sends, mutates, or schedules.
  */
 export async function searchMessages(
   pool: PgPool,

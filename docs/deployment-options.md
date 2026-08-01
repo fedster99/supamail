@@ -8,7 +8,7 @@ The Docker image uses Node 24 (`node:24-slim`). Fly and Compose examples inherit
 
 ## Recommendation
 
-Use Fly.io as the hosted path for SupaMail. It fits the shape of the product: one small always-on worker with no public IP, plus an optional separate API app only if remote control endpoints are needed.
+Use Fly.io as the managed-container path for SupaMail. It fits the deployment shape: one small always-on worker with no public IP, plus an optional separate API app only if remote control endpoints are needed.
 
 Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cost across multiple always-on services and you are comfortable owning OS updates, Docker, Coolify upgrades, monitoring, and server backups.
 
@@ -16,7 +16,7 @@ Use Coolify on a small Hetzner VPS when the priority is lowest fixed monthly cos
 
 | Platform | Good fit | Approximate shape |
 | --- | --- | --- |
-| Fly.io | Hosted SupaMail path: managed Docker worker, no public IP required, optional API app | One small Machine for the worker, optional second Machine for API. |
+| Fly.io | Managed Docker worker, no public IP required, optional API app | One small Machine for the worker, optional second Machine for API. |
 | Hetzner + Coolify | Cheapest fixed infrastructure for several services | One VPS can run worker, API, and other small services; more ops responsibility. |
 
 ## Fly.io Worker
@@ -48,14 +48,6 @@ All three sync batch-size settings accept values from `1` through `500`. A metad
 
 `DATABASE_POOL_MAX` (default 10) sets the Postgres connection pool size for the process. Raise it when one worker drives many accounts/folders concurrently and the database can afford the connections; keep it at or below what a connection-capped Postgres (for example a Supavisor session pooler) allows. It does not change advisory-lock semantics — each pooled connection is its own session.
 
-If your Signal repo already has the Fly and database env vars loaded locally, you can reuse them:
-
-```bash
-fly secrets set \
-  DATABASE_URL="$DATABASE_URL" \
-  IMAP_ENCRYPTION_KEY="$IMAP_ENCRYPTION_KEY"
-```
-
 Optional API deploy:
 
 ```bash
@@ -70,7 +62,7 @@ fly deploy --config apps/api/fly.api.toml --ha=false
 
 Keep the API separate from the worker so a public HTTP service cannot accidentally change the worker's uptime or cost profile.
 
-The same image also supports `SUPAMAIL_MODE=combined` for one-process API + worker deployments. That mode is intended for the private hosted SaaS runtime first; self-hosters should start with separate worker/API processes unless they specifically want one process.
+The same image also supports `SUPAMAIL_MODE=combined` for one-process API + worker deployments. Separate worker/API processes remain the recommended starting point unless one process is an explicit operational choice.
 
 ## Coolify / VPS
 

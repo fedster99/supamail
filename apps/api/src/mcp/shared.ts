@@ -41,7 +41,7 @@ export interface ToolDefinition {
 /**
  * One entry in the single tool registry. The server reads `definition` for
  * `tools/list` and runs `handler` for `tools/call`. The pool is injected (no
- * global reach-in) so the same handler runs locally and hosted (ADR 0014).
+ * global reach-in) so the same handler runs locally or through a remote wrapper (ADR 0014).
  */
 export interface ToolEntry {
   definition: ToolDefinition;

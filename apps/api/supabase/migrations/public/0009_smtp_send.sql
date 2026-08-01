@@ -1,4 +1,4 @@
--- SMTP send coordinates for the single-tenant send/reply primitive (email-001).
+-- SMTP send coordinates for the single-account send/reply primitive (email-001).
 -- Columns live on the 1:1 imap_accounts row, not a side table. All nullable:
 -- a NULL smtp_username/encrypted_smtp_password means "reuse the IMAP username /
 -- encrypted_password", covering the common "same creds, SMTP on 465/587" case

@@ -13,7 +13,7 @@ bytes and MIME bodies during fetch, including in `parsed_only` mode, but previou
 discarded that exact evidence after parsing.
 
 SupaMail must preserve its boundary: delivery identity and reply conversations belong
-in the public core; semantic task/work-item clustering does not.
+in the public core; application-specific semantic grouping does not.
 
 ## Decision
 

@@ -89,15 +89,11 @@ done
 
 See [docs/fly-supabase.md](docs/fly-supabase.md) for the full Fly.io + Supabase setup.
 
-See [docs/hosted-product-boundary.md](docs/hosted-product-boundary.md) for what belongs outside the open-source core.
-
-See [docs/hosted-cloud-contracts.md](docs/hosted-cloud-contracts.md) for the public contracts that the private hosted SaaS layer must consume.
-
 See [docs/imap-auth-v1.md](docs/imap-auth-v1.md) for the v1 IMAP authentication scope.
 
 See [docs/imap-compatibility.md](docs/imap-compatibility.md) for the provider compatibility matrix, minimum IMAP contract, and manual smoke checklist.
 
-See [docs/spec-conformance.md](docs/spec-conformance.md) for the public reliability matrix against the old Signal sync-engine spec that SupaMail was extracted from.
+See [docs/spec-conformance.md](docs/spec-conformance.md) for the public reliability contract and its verification matrix.
 
 ## Add a Mailbox
 
@@ -423,12 +419,7 @@ pnpm --filter @supamail/api smoke:load
 
 ## Project Status
 
-SupaMail is early and intentionally focused on the mailbox protocol and
-agent-access layers. No calendar, contacts, CRM, identity hydration, work-item
-clustering, hosted tenant orchestration, or embedded AI features are included
-in the core.
-
-The repo is independent from the app it came from. It includes the reusable
-local CLI and MCP tool contracts, while hosted authentication, billing,
-multi-tenancy, remote MCP transport, and support operations remain outside the
-open-source core.
+SupaMail is early and intentionally focused on reusable mailbox infrastructure.
+It includes local CLI and MCP contracts plus explicit API and mailbox-operation
+surfaces. Product-specific business models, identity systems, and account
+orchestration remain outside the open-source core.

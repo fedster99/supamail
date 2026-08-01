@@ -13,7 +13,7 @@ import { toolError } from "./shared.js";
  * The local stdio MCP server for agent email access (ADR 0014). It is the
  * read-only surface over the Postgres mirror: orient → search → read → draft.
  * Every tool is read-only except draft_reply, which only *produces* a reply and
- * never sends, appends, or mutates (ADR 0016). Transport-pluggable: cloud wraps
+ * never sends, appends, or mutates (ADR 0016). Transport-pluggable: deployments wrap
  * the same TOOLS registry behind authed remote transport without reimplementing.
  */
 

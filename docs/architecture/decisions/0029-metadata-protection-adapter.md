@@ -7,8 +7,8 @@ Date: 2026-07-30
 ## Context
 
 Some deployments need application-layer protection for sensitive email
-metadata. Public core must support that protection without owning hosted
-Tenant, key, or provider logic. OSS and BYO Supabase users must keep the current
+metadata. Public core must support that protection without owning
+deployment-specific identity, key, or provider logic. Default installations keep the current
 readable database behavior.
 
 The seam must protect complete relation rows rather than encrypt each field
@@ -78,10 +78,10 @@ deployment adapter.
 
 ## Consequences
 
-OSS and BYO Supabase behavior does not change. Their normal metadata columns
+Default installation behavior does not change. Normal metadata columns
 remain readable.
 
-A hosted deployment can supply its own adapter without adding Tenant or
+A deployment can supply its own adapter without adding account identity or
 key-custody logic to public core. The deployment owns its field policy, key
 provider, envelope format, exact-token purposes, migration, activation marker,
 and fail-closed checks.
@@ -103,7 +103,7 @@ zero knowledge.
   bounded and abortable adapter work, fail-closed legacy repair, evidence
   limits, mode cutover, history, and rollback while the identity adapter
   preserves readable behavior.
-- Schema tests prove that the migration contains no hosted Tenant, key,
+- Schema tests prove that the migration contains no deployment-specific identity, key,
   encryption-algorithm, or search-provider logic.
 - The normal typecheck, unit, build, and live-database lanes prove OSS parity.
 
