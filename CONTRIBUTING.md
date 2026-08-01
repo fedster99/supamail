@@ -5,9 +5,9 @@ Thanks for helping improve SupaMail.
 Before opening a pull request:
 
 1. Open or reference an issue for behavior changes.
-2. Keep the change focused on the open-source IMAP mirror. Hosted billing,
-   tenant orchestration, and remote MCP authentication belong in SupaMail
-   Cloud.
+2. Keep the change focused on the reusable mailbox mirror and its public
+   interfaces. Product-specific identity systems and account orchestration are
+   out of scope.
 3. Use Node 24 and pnpm 10.
 4. Run:
 

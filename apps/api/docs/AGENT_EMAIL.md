@@ -36,7 +36,7 @@ repository and database placeholders:
 ```
 
 The process communicates only over stdin/stdout. It does not open a remote
-listener; hosted transport and authentication belong to SupaMail Cloud.
+listener; remote deployments provide their own transport and authentication.
 
 ## The loop: orient → search → read → draft
 

@@ -7,7 +7,7 @@ import { draftReplyEntry, runDraftReply } from "./tools/draft-reply.js";
 
 export * from "./shared.js";
 
-// Re-export each tool's run-function so the CLI and any hosted transport can wire
+// Re-export each tool's run-function so the CLI and any remote transport can wire
 // to the same handlers the registry runs (one source of truth). Tool definitions
 // are reachable via TOOLS[i].definition, so they are not re-exported here.
 export { runReadMessage, runReadThread, runListFolders, runDraftReply };

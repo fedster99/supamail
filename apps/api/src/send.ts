@@ -29,7 +29,7 @@ import {
  * never guessed.
  *
  * This lives OUTSIDE src/mcp/ on purpose: the agent surface stays zero-send. The
- * caller (CLI with --confirm, the single-tenant HTTP door, or the cloud runtime)
+ * caller (CLI with --confirm, the single-account HTTP API, or a remote runtime)
  * is the human-in-the-loop gate.
  *
  * Failure ordering is deliberate: an SMTP failure throws BEFORE any APPEND, so a
@@ -42,7 +42,7 @@ import {
  * stop SMTP from accepting the same bytes twice. `deliverSmtp` therefore returns
  * the provider receipt or throws `SmtpDeliveryError` with `not_delivered` or
  * `unknown`. A durable caller may retry only `not_delivered`; it must reconcile
- * `unknown` and never submit it again. The Cloud wrapper owns that durable ledger.
+ * `unknown` and never submit it again. Remote wrappers own that durable ledger.
  */
 export async function sendMessage(
   pool: PgPool,

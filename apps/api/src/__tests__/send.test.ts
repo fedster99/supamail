@@ -390,7 +390,7 @@ describe("sendMessage orchestration", () => {
     expect(mocks.appenderAppend).not.toHaveBeenCalled();
   });
 
-  it("preserves an unknown SMTP outcome for the durable Cloud caller", async () => {
+  it("preserves an unknown SMTP outcome for a durable remote caller", async () => {
     const { SmtpDeliveryError } = await import("../smtp-client.js");
     const unknown = new SmtpDeliveryError("unknown", "response lost");
     mocks.deliverSmtp.mockRejectedValueOnce(unknown);

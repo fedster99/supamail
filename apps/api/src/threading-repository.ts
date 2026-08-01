@@ -426,7 +426,7 @@ export interface ThreadingRepositoryOptions {
    * must retain the previous executor until its standby retention window ends.
    */
   algorithms?: ReadonlyMap<number, ThreadingAlgorithmExecutor>;
-  /** Durable metadata projection. OSS and BYO use the readable default. */
+  /** Durable metadata projection. Default installations use the readable adapter. */
   metadataProtection?: MetadataProtectionAdapter;
 }
 

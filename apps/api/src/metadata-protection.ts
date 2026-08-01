@@ -277,7 +277,7 @@ export function storedMetadataProjection(
 
 /**
  * Reveal one durable row after a read. Public serving helpers use this shared
- * boundary so Cloud can inject protection without wrapping arbitrary SQL.
+ * boundary so deployments can inject protection without wrapping arbitrary SQL.
  */
 export async function revealMetadataRecord<T extends ProtectedMetadataColumns>(
   adapter: MetadataProtectionAdapter,

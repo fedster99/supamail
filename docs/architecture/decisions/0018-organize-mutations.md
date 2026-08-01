@@ -74,8 +74,8 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
 ## Consequences
 
 - The agent read surface and the sync read path are provably unchanged; mutations
-  are available to operators (CLI), the single-tenant HTTP door, and the cloud
-  multi-tenant wrapper.
+  are available to operators (CLI), the single-account HTTP API, and compatible
+  remote deployment wrappers.
 - Flag changes are visible in the mirror immediately (write-through). Move and
   delete changes are not reflected until the next UID reconcile, which can lag by
   more than the flag-scan window for older mail — callers should treat move/delete

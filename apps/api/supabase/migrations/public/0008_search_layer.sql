@@ -4,7 +4,7 @@
 -- trigram + structured-predicate retrieval over the mirror.
 --
 -- DESIGN CONTRACT (see docs/architecture/decisions/0015-search-layer.md):
---   * PUBLIC CORE, per-account, BYO Supabase. The SAME file runs on every
+--   * PUBLIC CORE, per-account Supabase/Postgres. The SAME file runs on every
 --     self-hoster and customer database. Fully additive and idempotent
 --     (CREATE ... IF NOT EXISTS / guarded DO blocks). It is safe to run
 --     repeatedly and never breaks existing reliability migrations.
@@ -27,7 +27,7 @@
 --
 -- LARGE EXISTING MIRRORS: the two ADD COLUMN ... GENERATED STORED rewrite the
 -- tables and the GIN builds take table-level locks while this transaction holds
--- the public-migration advisory lock. On a fresh/empty BYO database this is
+-- the public-migration advisory lock. On a fresh/empty database this is
 -- instant. On a populated mirror, pre-build the columns + indexes out of band
 -- BEFORE flipping the schema version so every object here already exists and
 -- IF NOT EXISTS no-ops.

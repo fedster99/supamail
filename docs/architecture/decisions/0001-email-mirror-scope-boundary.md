@@ -1,4 +1,4 @@
-# ADR 0001: SupaMail Core Is Email Sync Only
+# ADR 0001: SupaMail Core Owns Reusable Mailbox Infrastructure
 
 Status: Accepted
 
@@ -6,38 +6,35 @@ Date: 2026-05-18
 
 ## Context
 
-SupaMail was extracted from a larger Signal system. The original context included CRM hydration, identity resolution, belief, dashboard, Trigger.dev, MCP, and other product layers. The open-source SupaMail project needs a tighter boundary so the sync engine stays reusable and reliable.
+SupaMail needs a clear boundary so its mailbox engine remains reusable and reliable across self-hosted deployments and downstream applications.
 
 ## Decision
 
-SupaMail core owns the mailbox mirror only:
+SupaMail core owns reusable mailbox infrastructure:
 
 - IMAP accounts and folders
-- message metadata
-- flags
-- raw and parsed MIME bodies
-- attachment metadata
-- sync runs and sync events
-- health, lag, retries, backoff, and retention semantics
+- message metadata, flags, and MIME bodies
+- attachment metadata and content access
+- mailbox search and protocol conversation threading
+- sync runs, events, health, lag, retries, and retention
+- generic API, CLI, MCP, and mailbox-operation surfaces
 
-SupaMail core does not own CRM, CRM hydration, person/company identity resolution, handle mapping, belief modeling, calendar, contacts, sending, scheduling, AI workflows, MCP, or internal dashboard logic unless a future issue explicitly adds a separate package/process.
+Application-specific business models, identity systems, dashboards, and account orchestration are outside the core.
 
-References to message identity in SupaMail mean mailbox-row identity only: `(account_id, folder_path, uidvalidity, uid)`. They do not authorize identity hydration, relationship modeling, activity construction, or other CRM-layer behavior in the core package.
+Message identity in SupaMail means mailbox-row identity: `(account_id, folder_path, uidvalidity, uid)`. Derived delivery and conversation identities do not replace it.
 
 ## Consequences
 
-- The sync engine stays boring and operationally focused.
-- Follow-up products can consume SupaMail tables without coupling back into the core.
-- Agents must reject opportunistic product-layer additions while working in core sync code.
-- If a future CRM or identity system consumes SupaMail data, it should live outside this core package or behind a separately accepted ADR.
+- The sync engine stays operationally focused and reusable.
+- Downstream applications can consume SupaMail without coupling their business domain back into the core.
+- New generic mailbox capabilities require explicit public contracts and verification.
 
 ## Verification
 
-- `README.md` project status states the scope boundary.
-- `docs/spec-conformance.md` lists Signal product layers as intentionally out of scope.
+- `README.md` states the public scope.
+- `docs/spec-conformance.md` records the reliability contract.
 
 ## References
 
 - `README.md`
 - `docs/spec-conformance.md`
-- GitHub issues `#2`, `#3`, `#4` for explicit follow-up scope.

@@ -73,8 +73,8 @@ parsed-only preflight FETCH. This improves one connection without adding
 parallel body writes or weakening crash recovery.
 
 The database store remains byte-compatible for OSS users. This ADR introduces
-no object-storage provider, hosted search backend, retention policy, or
-multi-tenant behavior. Those belong outside public core or in separately
+no object-storage provider, external search backend, retention policy, or
+deployment-specific account behavior. Those belong outside public core or in separately
 accepted work.
 
 Existing mirrors pay bounded extract/threading-digest backfills and one new

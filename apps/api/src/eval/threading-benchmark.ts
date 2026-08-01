@@ -11,7 +11,7 @@ import {
  * are written explicitly rather than copied from the algorithm. In particular,
  * `rain_style_notifications` is only a regression shape inspired by the class
  * of same-document notification failures; it is not claimed to reproduce a
- * private production incident.
+ * real-world regression.
  */
 export interface ThreadingBenchmarkCase {
   id: string;

@@ -390,7 +390,7 @@ const parseRecipients = (values: string[]): SendRecipient[] =>
   });
 
 // The operator IS the human-in-the-loop, so the explicit --confirm flag is the
-// send gate (no token dance, unlike the cloud MCP two-phase confirm). Both verbs
+// send gate. Both verbs
 // refuse without it and call the shared sendMessage primitive.
 // Read a `--attach path` (and `--inline cid=path`) option list into base64 attachments.
 const readAttachments = async (attach: string[], inline: string[]): Promise<SendAttachment[]> => {

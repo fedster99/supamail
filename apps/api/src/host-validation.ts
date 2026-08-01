@@ -139,9 +139,9 @@ export async function assertSafeImapTarget(
 // This resolves the host and rejects private/reserved IPs, but it does NOT pin
 // the resolved IP — connectImap/deliverSmtp re-resolve at socket time, so a
 // low-TTL DNS record can return public-at-check and private-at-connect (e.g.
-// 169.254.169.254 / a cloud metadata endpoint). In the single-tenant OSS host
-// the SMTP/IMAP target is operator-controlled, so this is acceptable. The CLOUD
-// MULTI-TENANT LAYER, where a tenant supplies the host, MUST close this window:
+// 169.254.169.254 / a cloud metadata endpoint). When the SMTP/IMAP target is
+// operator-controlled, this is acceptable. Any deployment that accepts an
+// untrusted user-supplied host MUST close this window:
 // resolve once here, then connect to the LITERAL resolved IP with
 // `tls.servername = host` for SNI/cert validation (so check and connect see the
 // same address). Do NOT rely on this check alone for untrusted hosts. See ADR

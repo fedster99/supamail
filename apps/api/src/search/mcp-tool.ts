@@ -78,7 +78,7 @@ export const searchRequestSchema = z
 /**
  * The MCP input schema (JSON Schema). Kept in sync with {@link searchRequestSchema}
  * and exposed as the `search_email` tool's contract. The remote transport binding
- * (issue #4, cloud) wraps {@link runSearchTool} without reimplementing it.
+ * (issue #4) wraps {@link runSearchTool} without reimplementing it.
  */
 export const searchEmailToolDefinition = {
   name: "search_email",
@@ -172,7 +172,7 @@ export const searchEmailToolDefinition = {
 
 /**
  * Validate raw tool arguments and run the search. The injected pool keeps this
- * transport-agnostic: the local stdio binding and any hosted binding call this
+ * transport-agnostic: the local stdio binding and any remote binding call this
  * same function. Returns the typed {@link SearchResponse}; the transport layer
  * formats it for the wire.
  */

@@ -73,7 +73,7 @@
         "pnpm build"
       ],
       "evidence": "Revalidated against issue #4 on 2026-07-23. `apps/api/src/mcp/server.ts` provides the local stdio server; the package exposes `supamail-mcp` plus `start:mcp`; the injected-pool tool registry exposes sanitized search, message, thread, folder, and draft-only contracts; tests enforce the five-tool, zero-send boundary and cover the read tools against live Postgres. Root typecheck, tests, and build are required by the repository-hygiene PR.",
-      "notes": "Passing. Core owns the local stdio server and shared tool contracts; remote transport, bearer/tenant auth, and MCP token secrets remain in supamail-cloud."
+      "notes": "Passing. Core owns the local stdio server and shared tool contracts; remote deployments provide their own transport, authentication, authorization, and secret storage."
     },
     {
       "id": "issue-7-agent-email-cli",

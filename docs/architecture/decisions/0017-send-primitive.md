@@ -34,8 +34,8 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   `apps/api/src/`, never under `src/mcp/`. The zero-send safety test
   (`agent-surface-zero-send.test.ts`) scans only `src/mcp/**` + the `TOOLS`
   registry, so it stays green and unchanged: the 5 read tools remain the only OSS
-  MCP tools, and none can send. Send is NOT a 6th MCP tool here — human-confirm
-  send is a cloud concern.
+  MCP tools, and none can send. Send is not a sixth local MCP tool; deployments
+  can add their own explicitly authorized wrapper.
 - **Compose with nodemailer's `MailComposer`, deliver the EXACT composed bytes.**
   MIME folding / quoted-printable / multipart / Message-ID generation is the
   long-tail correctness surface where hand-rolling bites, so we do not hand-roll.
@@ -87,11 +87,11 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   (`secure.emailsrvr.com:465`). Generic IMAP requires explicit columns — ship the
   resolution-order hook, not speculative heuristics.
 
-The single-tenant HTTP door (`POST /accounts/:id/send`, behind the existing
+The single-account HTTP door (`POST /accounts/:id/send`, behind the existing
 `API_TOKEN` bearer) and the CLI verbs (`send` / `reply`, both requiring an
-explicit `--confirm`) are the OSS human-in-the-loop gates. Hosted Cloud owns its
-send permission and durable idempotency ledger. Those concerns do not enter the
-single-tenant core schema.
+explicit `--confirm`) are the built-in human-in-the-loop gates. Other deployments
+provide their own send authorization and durable idempotency ledger. Those
+concerns do not enter the core schema.
 
 This supersedes the **scope** (not the spirit) of ADR 0014/0016 for the new
 modules only: 0014's read-only agent surface and 0016's produce-only drafter
@@ -128,11 +128,9 @@ that surface, exactly as 0014 required any write capability to be a new decision
   defaults to 10 minutes as required by RFC 5321. It does not reuse the
   one-minute IMAP command timeout. A shorter final-response timeout can create a
   false `unknown` result and invite a duplicate send.
-- Core does not retry. Cloud owns the durable operation ledger and Sent
-  reconciliation because it owns tenant-scoped hosted state.
-- The cloud re-pin inherits the primitive via `@supamail/api`; the cloud adds
-  tenant scoping, send permission checks, and the durable operation ledger. It
-  never edits `imap_*` schema or the engine.
+- Core does not retry. Deployments that need retry orchestration own the durable
+  operation ledger, permission checks, and Sent reconciliation around this
+  primitive without editing the `imap_*` schema.
 
 ## Verification
 
@@ -171,8 +169,8 @@ A whole-stack review hardened four send-path edges:
   receipt. It wraps failures in `SmtpDeliveryError`: proven non-delivery is
   `not_delivered`; an ambiguous final result is `unknown`. The HTTP API and CLI
   expose this outcome without provider details. Callers may retry only
-  `not_delivered`. The Cloud wrapper owns the tenant-scoped idempotency ledger
-  and never resubmits `unknown`.
+  `not_delivered`. Any remote wrapper must keep a durable idempotency ledger and
+  never resubmit `unknown`.
 - **STARTTLS decoupled from the private-hosts opt-in.** `deliverSmtp`'s
   `requireTLS` no longer keys off `IMAP_ALLOW_PRIVATE_HOSTS`. A non-implicit-TLS host
   that resolved PUBLIC keeps `requireTLS=true` even when the opt-in is set (so a
@@ -183,10 +181,10 @@ A whole-stack review hardened four send-path edges:
 - **SSRF is check-time, not connect-time (DNS-rebinding TOCTOU).** `host-validation.ts`
   resolves and rejects private IPs but does NOT pin the resolved IP; `deliverSmtp`
   re-resolves at socket time, so a low-TTL record can be public-at-check and
-  private-at-connect. Acceptable for the operator-controlled single-tenant OSS host;
-  the CLOUD multi-tenant layer (tenant-supplied host) MUST pin the resolved IP and
-  connect to the literal address with `tls.servername` for SNI. A prominent comment in
-  `host-validation.ts` records this. See ADR 0022.
+  private-at-connect. Acceptable for an operator-controlled single-account host;
+  a deployment accepting untrusted user-supplied hosts must pin the resolved IP and
+  connect to the literal address with `tls.servername` for SNI. A prominent comment
+  in `host-validation.ts` records this. See ADR 0022.
 - **Header trust boundary.** `buildRawMime` now denylists structural/identity headers
   (Bcc/From/To/Cc/Sender/Reply-To/Return-Path/Received/Content-Type/MIME-Version) in
   `req.headers` and restricts customs to `X-*` (plus the threading headers), so a
@@ -200,7 +198,7 @@ A whole-stack review hardened four send-path edges:
 
 - ADR 0002: Node-side credential encryption (the frozen AES-256-GCM envelope the
   SMTP secret reuses).
-- ADR 0007: Public-core / hosted-cloud contract (cloud consumes this via re-pin).
+- ADR 0007: Stable core distribution contracts.
 - ADR 0014: Agent email access is a read-only core surface (the boundary this
   preserves).
 - ADR 0016: The reply drafter produces, never sends (this is the send path it

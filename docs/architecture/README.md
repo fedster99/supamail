@@ -16,7 +16,7 @@ SupaMail is a small, stateful email mirror packaged as a monorepo. IMAP is the p
 - `apps/api/src/threading.ts`: pure, deterministic delivery deduplication and conversation-graph algorithm.
 - `apps/api/src/threading-repository.ts`: versioned executor registry and shadow-run state machine, bounded per-run queues/closures, persisted comparison certificates, atomic activation, audit history, retention, and guarded rollback.
 - `apps/api/supabase/migrations/public/`: ordered public mirror migrations and manifest.
-- `apps/web`: Next.js landing site. It is not the product dashboard or CRM surface.
+- `apps/web`: Next.js landing site. It is not an application dashboard.
 
 ## Data Flow
 
@@ -32,11 +32,8 @@ The worker and API share the same repository and account-locking model. Any IMAP
 - Public reliability contract: `docs/spec-conformance.md`
 - Schema overview: `docs/schema.md`
 - Deployment options: `docs/deployment-options.md`, `docs/fly-supabase.md`
-- Hosted product boundary: `docs/hosted-product-boundary.md`
-- Hosted cloud contracts: `docs/hosted-cloud-contracts.md`
 - IMAP auth scope: `docs/imap-auth-v1.md`
 - IMAP compatibility: `docs/imap-compatibility.md`
-- Tracked session handoff: `SESSION_HANDOFF.md`
 - Agent operating guide: `docs/agent/README.md`
 - Reliability invariants: `docs/agent/reliability-invariants.md`
 - Reliability hardening plan: `docs/architecture/reliability-and-three-lanes.md`

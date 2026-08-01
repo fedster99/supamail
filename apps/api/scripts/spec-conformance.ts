@@ -1,9 +1,7 @@
 /**
- * End-to-end conformance for the Tier-1 spec fixes in
- * `apps/sync/docs/rackspace-email-sync-engine-spec.md` (the Signal sync engine
- * spec the SupaMail extraction inherited). Each scenario manipulates real
- * state in Postgres, runs MirrorEngine.syncAccount, and asserts on the
- * resulting rows. No source-string grep tests here.
+ * End-to-end conformance for SupaMail's public reliability contract. Each
+ * scenario manipulates real state in Postgres, runs MirrorEngine.syncAccount,
+ * and asserts on the resulting rows. No source-string grep tests here.
  *
  * Usage: DATABASE_URL=… IMAP_ENCRYPTION_KEY=… IMAP_ALLOW_PRIVATE_HOSTS=true \
  *        pnpm tsx scripts/spec-conformance.ts

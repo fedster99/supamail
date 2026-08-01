@@ -2,7 +2,7 @@
 --
 -- Persist bounded, source-neutral artifact/resource identities extracted while
 -- decoded MIME is available. These rows are evidence only: they deliberately do
--- not assign protocol conversations or semantic work-item clusters.
+-- not assign protocol conversations or application-specific semantic groups.
 
 ALTER TABLE public.imap_message_bodies
   ADD COLUMN IF NOT EXISTS structured_evidence_extractor_version text,

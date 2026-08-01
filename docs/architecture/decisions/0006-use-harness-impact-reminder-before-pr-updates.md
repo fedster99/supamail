@@ -1,4 +1,4 @@
-# ADR 0006: Use Docs/Harness Impact Reminder Before PR Updates
+# ADR 0006: Review Documentation Impact Before PR Updates
 
 Status: Accepted
 
@@ -6,36 +6,29 @@ Date: 2026-05-20
 
 ## Context
 
-The repo moved from a root API package to a Turborepo with `apps/api` and `apps/web`, but the project docs and agent instructions were not updated in the same push. That left `AGENTS.md`, architecture docs, deployment docs, and verification notes partially stale.
-
-The harness failed because it relied on agent memory instead of a forced impact checkpoint.
+Repository layout and runtime changes previously landed without updating the public documentation and contributor guidance that described them.
 
 ## Decision
 
-Add a Harness Impact section to the pull request template. Before pushing or updating a PR, agents should explicitly choose one:
+The pull request template includes a Documentation Impact section. Contributors explicitly record whether public documentation or contributor guidance changed.
 
-- Project docs / harness reviewed and updated where needed.
-- Project docs / harness reviewed; no updates needed.
-
-The PR should also include a one-sentence harness note. `pnpm harness:check` reminds local agents during normal verification to check whether project docs or agent instructions became stale. It does not attempt to prove whether docs are correct.
+`pnpm harness:check` runs the public-content hygiene check and prints a reminder before the normal verification lane. It does not attempt to prove that every document is correct.
 
 ## Consequences
 
-- Agents see the reminder during `./init.sh`, before the normal typecheck/test/build flow.
-- The reminder is broad and durable rather than a brittle path detector.
-- This does not prove the decision is correct, but it makes project-docs and harness review part of the normal pre-git ritual.
+- Documentation review is part of the normal change workflow.
+- The automated check blocks known private-context residue and tracked local state.
+- Contributors still use judgment to decide which public documents need updates.
 
 ## Verification
 
-- `.github/pull_request_template.md` defines the required section.
+- `.github/pull_request_template.md` defines the Documentation Impact section.
+- `scripts/check-public-content.mjs` enforces public-content hygiene.
 - `scripts/check-harness-impact.mjs` prints the reminder.
-- `package.json` exposes `pnpm harness:check`.
-- `init.sh` runs it before typecheck.
-- `.github/pull_request_template.md` includes the Harness Impact section.
+- `init.sh` runs `pnpm harness:check` before typecheck.
 
 ## References
 
 - `AGENTS.md`
 - `docs/agent/verification.md`
 - `.github/pull_request_template.md`
-- `scripts/check-harness-impact.mjs`

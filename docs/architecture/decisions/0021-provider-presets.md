@@ -94,10 +94,9 @@ resolution-order contract (ADR 0017) are untouched.
 - The preset table is the maintenance surface: a provider that changes a host (or
   a new long-tail provider) is a one-line table edit plus a domain-alias entry,
   not engine code.
-- The cloud onboarding UX, credential-lifecycle (app-password capture),
-  multi-mailbox, and JMAP parts of email-008 are out of scope here and live in
-  the cloud repo; this OSS layer only supplies the preset coordinates + domain
-  lookup the cloud consumes via re-pin.
+- Onboarding UX, credential lifecycle, multi-mailbox behavior, provider
+  authorization, and JMAP are deployment concerns. This layer only supplies
+  preset coordinates and domain lookup.
 
 ## Verification
 

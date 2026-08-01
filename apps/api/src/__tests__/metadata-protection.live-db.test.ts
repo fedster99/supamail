@@ -25,7 +25,7 @@ function token(value: unknown): string | null {
 
 /**
  * This adapter proves the storage seam. It is not production encryption.
- * The Cloud repository owns the real key and envelope implementation.
+ * Deployments own their real key and envelope implementations.
  */
 class OpaqueTestAdapter implements MetadataProtectionAdapter {
   async protect(

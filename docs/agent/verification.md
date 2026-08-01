@@ -14,7 +14,7 @@ pnpm build
 
 Root verification runs through Turborepo. Use package filters for fast local checks while editing, but run the root lane before claiming broad repo health.
 
-`pnpm harness:check` is the project-docs and harness impact reminder. It runs before typecheck in `./init.sh` so agents see it during normal pre-push verification.
+`pnpm harness:check` enforces public-content hygiene and prints the documentation-impact reminder. It runs before typecheck in `./init.sh`.
 
 Useful package-scoped commands:
 
@@ -31,7 +31,7 @@ pnpm --filter @supamail/web build
 | Change area | Required verification |
 | --- | --- |
 | Docs only | `git diff --check`; for untracked new files, also run a trailing-whitespace check such as `rg -n "[ \t]+$" <new-files>` |
-| Repo layout, package scripts, CI, Docker/Fly/Compose, migration path, workspace config, startup flow, or task boundaries | Review project docs / harness, complete PR Harness Impact section, `pnpm harness:check`, `git diff --check`, then the affected build/test lane |
+| Repo layout, package scripts, CI, Docker/Fly/Compose, migration path, workspace config, startup flow, or task boundaries | Review public docs and contributor guidance, complete the PR Documentation Impact section, `pnpm harness:check`, `git diff --check`, then the affected build/test lane |
 | Type-only or helper-only TypeScript change | `pnpm typecheck`, targeted `pnpm test`, `pnpm build` |
 | API auth, input validation, sanitization, or response shape | `pnpm typecheck`, `pnpm test`, `pnpm build` |
 | MIME parsing, host validation, crypto, provider profiles | `pnpm typecheck`, `pnpm test`, `pnpm build` |
@@ -82,7 +82,7 @@ When completing work, record:
 - skipped commands and why
 - known residual risks
 
-Use `SESSION_HANDOFF.md` for tracked handoff, `.context/` for private/local notes, and `docs/agent/feature-list.json` when feature state changes.
+Use the pull request or issue for durable public progress, ignored local files for private or temporary notes, and `docs/agent/feature-list.json` when a listed feature changes state.
 
 ## Bootstrap Shortcut
 

@@ -89,13 +89,13 @@ The shared SSRF guard (`assertSafeImapTarget` / `assertSafeSmtpTarget` in
 private/reserved IPs, but it does NOT pin the resolved IP. The clients
 (`connectImap` / `deliverSmtp`) re-resolve at socket time, so a low-TTL DNS record
 can return public-at-check and private-at-connect (DNS-rebinding TOCTOU, e.g. a
-metadata endpoint at `169.254.169.254`). In the single-tenant OSS host the target is
-operator-controlled, so this is acceptable and the connect path is deliberately NOT
-rewritten. The CLOUD MULTI-TENANT layer, where a tenant supplies the host, MUST close
-this window: resolve once in the prelude, then connect to the LITERAL resolved IP with
-`tls.servername = host` for SNI/cert validation so check and connect observe the same
-address. A prominent comment in `host-validation.ts` records this for the cloud
-implementer; the OSS guard is intentionally check-time only.
+metadata endpoint at `169.254.169.254`). In an operator-controlled single-account host
+this is acceptable and the connect path is deliberately not rewritten. A deployment
+accepting untrusted user-supplied hosts must close this window: resolve once in the
+prelude, then connect to the literal resolved IP with `tls.servername = host` for
+SNI/cert validation so check and connect observe the same address. A prominent comment
+in `host-validation.ts` records this requirement; the built-in guard is intentionally
+check-time only.
 
 ## References
 

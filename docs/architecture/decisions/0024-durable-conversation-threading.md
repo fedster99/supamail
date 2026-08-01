@@ -85,7 +85,7 @@ V3 also treats a directly prefixed forward as a new authored protocol
 conversation. Inherited `References`, `In-Reply-To`, and provider-thread evidence
 do not attach it to the original, while a later reply may attach to the forwarded
 outer message. The original and forwarded branches may still share a future
-work-item cluster; that broader relation is not protocol conversation truth.
+broader application relationship; that relation is not protocol conversation truth.
 
 V2 queues every eligible row only after the same strict Message-ID has produced
 different delivery candidates. The next bounded preflight derives at most the
@@ -220,7 +220,7 @@ unrelated mail.
 - First-run auto-activation is deployment opt-in and deliberately narrower than
   general shadow activation. Consumers can avoid an indefinite no-active-run
   state without weakening reviewed replacement rollouts.
-- Work-item clustering, content similarity, CRM identity, and belief machinery
+- Application-specific clustering, identity, and relationship machinery
   remain outside the SupaMail core.
 
 ## Verification
