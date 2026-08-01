@@ -81,6 +81,10 @@ export interface MessageDetail {
   /** Cleaned + capped body (coalesce(body_text, body_plain, selected_text_part)). */
   body: string | null;
   body_truncated: boolean;
+  /** Present on read_message responses so a caller can continue a bounded body read. */
+  body_offset?: number;
+  body_total_chars?: number;
+  body_next_offset?: number | null;
   attachments: MessageAttachment[];
   /** Parsed select headers, only when the tool was asked to include them. */
   headers?: Record<string, string>;
@@ -163,11 +167,15 @@ export async function loadMessageAttachments(
 export interface CleanBodyResult {
   text: string | null;
   truncated: boolean;
+  totalChars: number;
+  offset: number;
+  nextOffset: number | null;
 }
 
 export interface CleanBodyOptions {
   includeQuoted: boolean;
   maxChars?: number;
+  offset?: number;
 }
 
 export const DEFAULT_MAX_BODY_CHARS = 4096;
@@ -188,10 +196,20 @@ export const ATTACHMENTS_AGG = `COALESCE((SELECT jsonb_agg(jsonb_build_object('a
  */
 export function mapMessageRow(
   row: MessageDetailRow,
-  opts: { includeQuoted: boolean; maxChars?: number; headers?: Record<string, string> } = { includeQuoted: false }
+  opts: {
+    includeQuoted: boolean;
+    maxChars?: number;
+    offset?: number;
+    includeBodyRange?: boolean;
+    headers?: Record<string, string>;
+  } = { includeQuoted: false }
 ): MessageDetail {
   const rawBody = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
-  const cleaned = cleanBody(rawBody, { includeQuoted: opts.includeQuoted, maxChars: opts.maxChars });
+  const cleaned = cleanBody(rawBody, {
+    includeQuoted: opts.includeQuoted,
+    maxChars: opts.maxChars,
+    offset: opts.offset
+  });
   const detail: MessageDetail = {
     message_id: row.id,
     thread_id: row.provider_thread_id,
@@ -214,52 +232,151 @@ export function mapMessageRow(
       disposition: a.disposition
     }))
   };
+  if (opts.includeBodyRange) {
+    detail.body_offset = cleaned.offset;
+    detail.body_total_chars = cleaned.totalChars;
+    detail.body_next_offset = cleaned.nextOffset;
+  }
   if (opts.headers) detail.headers = opts.headers;
   return detail;
 }
 
 const SIGNATURE_DELIMITER = /^-- ?$/;
-const ATTRIBUTION_LINE = /^On\b.*\bwrote:\s*$/;
+const ATTRIBUTION_START = /^On\b/i;
+const ATTRIBUTION_END = /\bwrote:\s*$/i;
+const ORIGINAL_MESSAGE_SEPARATOR = /^-{2,}\s*Original Message\s*-{2,}$/i;
+const OUTLOOK_HEADER = /^(From|Sent|Date|To|Cc|Subject):\s*\S/i;
+const MAX_ATTRIBUTION_LINES = 4;
+const OUTLOOK_HEADER_SCAN_LINES = 8;
+const MIN_OUTLOOK_HEADER_LABELS = 3;
+const MIN_QUOTED_TAIL_LINES = 2;
 
 /**
  * Clean a plain-text body for an agent. `body_text` is already HTML-stripped
  * (ADR 0015). When `includeQuoted=false` (the default for read tools) we drop the
- * quoted reply tail — `>`-prefixed lines and the `"On ... wrote:"` attribution
- * block that introduces them — plus a trailing signature after a `-- ` delimiter.
- * Then clamp to `maxChars` (default 4096), marking `truncated` when cut. No heavy
- * markdown conversion.
+ * quoted reply tail introduced by a recognized attribution, original-message
+ * separator, Outlook header block, or trailing quote-only block. It also drops
+ * a trailing signature after a `-- ` delimiter. Then it returns the requested
+ * bounded range (default offset 0 and 4096 characters). No heavy markdown
+ * conversion.
  */
 export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBodyResult {
-  if (text === null) return { text: null, truncated: false };
-  const maxChars = opts.maxChars ?? DEFAULT_MAX_BODY_CHARS;
+  if (text === null) {
+    return { text: null, truncated: false, totalChars: 0, offset: 0, nextOffset: null };
+  }
+  const maxChars = Number.isFinite(opts.maxChars) && Number(opts.maxChars) > 0
+    ? Math.floor(Number(opts.maxChars))
+    : DEFAULT_MAX_BODY_CHARS;
+  const requestedOffset = Number.isFinite(opts.offset) && Number(opts.offset) > 0
+    ? Math.floor(Number(opts.offset))
+    : 0;
 
-  let working = text;
+  let working = text.replace(/\r\n?/g, "\n");
   if (!opts.includeQuoted) {
     working = stripQuotedTail(working);
     working = stripSignature(working);
   }
   working = working.replace(/\s+$/, "");
+  const range = sliceCodePoints(working, requestedOffset, maxChars);
+  return {
+    text: range.text,
+    truncated: range.nextOffset !== null,
+    totalChars: range.totalChars,
+    offset: range.offset,
+    nextOffset: range.nextOffset
+  };
+}
 
-  if (working.length > maxChars) {
-    return { text: working.slice(0, maxChars), truncated: true };
+/** Slice by Unicode code points so a range cannot split a surrogate pair. */
+function sliceCodePoints(
+  text: string,
+  requestedOffset: number,
+  maxChars: number
+): { text: string; totalChars: number; offset: number; nextOffset: number | null } {
+  let charIndex = 0;
+  let unitIndex = 0;
+  let startUnit = text.length;
+  let endUnit = text.length;
+  const requestedEnd = requestedOffset + maxChars;
+
+  while (unitIndex < text.length) {
+    if (charIndex === requestedOffset) startUnit = unitIndex;
+    if (charIndex === requestedEnd) endUnit = unitIndex;
+    const codePoint = text.codePointAt(unitIndex);
+    unitIndex += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
+    charIndex += 1;
   }
-  return { text: working, truncated: false };
+
+  const totalChars = charIndex;
+  const offset = Math.min(requestedOffset, totalChars);
+  const end = Math.min(totalChars, offset + maxChars);
+  if (offset === totalChars) startUnit = text.length;
+  if (end === totalChars) endUnit = text.length;
+
+  return {
+    text: text.slice(startUnit, endUnit),
+    totalChars,
+    offset,
+    nextOffset: end < totalChars ? end : null
+  };
 }
 
 /**
- * Drop the quoted reply tail: everything from the first `"On ... wrote:"`
- * attribution line to the end. Attribution-anchored ONLY — if no attribution
- * line is found we return the text unchanged (conservative: never strip a legit
- * body just because it ends in `>`-quoted lines).
+ * Drop the quoted reply tail from the first conservative boundary to the end.
+ * Forwarded-message separators are intentionally not boundaries because a
+ * forward can be new evidence rather than a duplicate thread tail.
  */
 function stripQuotedTail(text: string): string {
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
-    if (ATTRIBUTION_LINE.test(lines[i].trim())) {
+    if (
+      isAttributionBoundary(lines, i)
+      || ORIGINAL_MESSAGE_SEPARATOR.test(lines[i].trim())
+      || isOutlookHeaderBoundary(lines, i)
+      || isQuoteOnlyBoundary(lines, i)
+    ) {
       return lines.slice(0, i).join("\n");
     }
   }
   return text;
+}
+
+/** Match one-line and conservatively wrapped `On ... wrote:` attributions. */
+function isAttributionBoundary(lines: string[], start: number): boolean {
+  if (!ATTRIBUTION_START.test(lines[start].trim())) return false;
+  for (let end = start; end < Math.min(lines.length, start + MAX_ATTRIBUTION_LINES); end++) {
+    const joined = lines
+      .slice(start, end + 1)
+      .map((line) => line.trim())
+      .join(" ");
+    if (ATTRIBUTION_END.test(joined)) return true;
+  }
+  return false;
+}
+
+/** Match a pasted Outlook reply header after a blank line. */
+function isOutlookHeaderBoundary(lines: string[], start: number): boolean {
+  if (!/^From:\s*\S/i.test(lines[start].trim())) return false;
+  if (start === 0 || lines[start - 1].trim() !== "") return false;
+
+  const labels = new Set<string>();
+  for (const line of lines.slice(start, start + OUTLOOK_HEADER_SCAN_LINES)) {
+    const match = line.trim().match(OUTLOOK_HEADER);
+    if (match) labels.add(match[1].toLowerCase());
+  }
+  return labels.has("from")
+    && labels.has("subject")
+    && (labels.has("sent") || labels.has("date"))
+    && labels.size >= MIN_OUTLOOK_HEADER_LABELS;
+}
+
+/** Match a final block of at least two `>`-quoted lines after a blank line. */
+function isQuoteOnlyBoundary(lines: string[], start: number): boolean {
+  if (start === 0 || lines[start - 1].trim() !== "" || !/^\s*>/.test(lines[start])) {
+    return false;
+  }
+  const tail = lines.slice(start).filter((line) => line.trim() !== "");
+  return tail.length >= MIN_QUOTED_TAIL_LINES && tail.every((line) => /^\s*>/.test(line));
 }
 
 /** Drop a trailing signature introduced by a `-- ` delimiter line. */

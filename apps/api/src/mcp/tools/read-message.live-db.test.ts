@@ -255,5 +255,43 @@ liveDb("read_message tool live DB", () => {
     if ("error" in res) throw new Error("unexpected error envelope");
     expect(res.body).toBeNull();
     expect(res.body_truncated).toBe(false);
+    expect(res.body_offset).toBe(0);
+    expect(res.body_total_chars).toBe(0);
+    expect(res.body_next_offset).toBeNull();
+  });
+
+  it("returns a recoverable body range through the same read_message tool", async () => {
+    const messageId = idByUid.get(2)!;
+    await pool.query(
+      "UPDATE public.imap_message_bodies SET body_plain = $2 WHERE message_id = $1",
+      [messageId, "0123456789"]
+    );
+
+    const first = await runReadMessage(pool, {
+      message_id: messageId,
+      max_body_chars: 4
+    });
+    if ("error" in first) throw new Error("unexpected error envelope");
+    expect(first).toMatchObject({
+      body: "0123",
+      body_truncated: true,
+      body_offset: 0,
+      body_total_chars: 10,
+      body_next_offset: 4
+    });
+
+    const second = await runReadMessage(pool, {
+      message_id: messageId,
+      body_offset: first.body_next_offset,
+      max_body_chars: 8
+    });
+    if ("error" in second) throw new Error("unexpected error envelope");
+    expect(second).toMatchObject({
+      body: "456789",
+      body_truncated: false,
+      body_offset: 4,
+      body_total_chars: 10,
+      body_next_offset: null
+    });
   });
 });

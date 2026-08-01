@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import {
+  DEFAULT_MAX_BODY_CHARS,
   loadMessageAttachments,
   mapMessageRow,
   syncTrustFor,
@@ -20,6 +21,8 @@ import {
   type ProtectedMetadataColumns
 } from "../../metadata-protection.js";
 
+export const MAX_READ_MESSAGE_BODY_CHARS = 32768;
+
 /**
  * Zod schema for `read_message`. The handler validates raw tool arguments
  * through this before touching the database, so the read-tool contract is
@@ -27,9 +30,11 @@ import {
  */
 export const readMessageRequestSchema = z
   .object({
-    message_id: z.string().min(1),
+    message_id: z.string().uuid(),
     include_headers: z.boolean().optional(),
-    include_quoted: z.boolean().optional()
+    include_quoted: z.boolean().optional(),
+    body_offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    max_body_chars: z.number().int().min(1).max(MAX_READ_MESSAGE_BODY_CHARS).optional()
   })
   .strict();
 
@@ -70,8 +75,10 @@ export const readMessageDefinition: ToolDefinition = {
   title: "Read one mirrored email (read-only)",
   description:
     "Fetch a single mirrored email by its stable message_id (the id returned by search_email " +
-    "or read_thread). Returns the cleaned plain-text body, limited to 4,096 characters with " +
-    "body_truncated set when cut, plus the from/to/cc envelope, flags, " +
+    "or read_thread). By default, the body contains the newly authored plain text, with " +
+    "recognized quoted reply tails and signatures removed. It returns 4,096 characters from " +
+    "body_offset 0 by default; max_body_chars may request up to 32,768. body_total_chars, " +
+    "body_next_offset, and body_truncated describe the remaining cleaned text. Also returns the from/to/cc envelope, flags, " +
     "window_status, and the attachments list (filename, mime_type, size_bytes, disposition — " +
     "including inline parts). include_quoted=true retains the quoted reply tail and " +
     "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
@@ -90,6 +97,9 @@ export const readMessageDefinition: ToolDefinition = {
     properties: {
       message_id: {
         type: "string",
+        format: "uuid",
+        minLength: 36,
+        maxLength: 36,
         description: "The stable message id (imap_messages.id) returned by search_email or read_thread."
       },
       include_headers: {
@@ -101,6 +111,20 @@ export const readMessageDefinition: ToolDefinition = {
         type: "boolean",
         default: false,
         description: "Keep the quoted reply tail + signature instead of stripping them (default false)."
+      },
+      body_offset: {
+        type: "integer",
+        minimum: 0,
+        maximum: Number.MAX_SAFE_INTEGER,
+        default: 0,
+        description: "Character offset in the cleaned body at which to start the returned range (default 0)."
+      },
+      max_body_chars: {
+        type: "integer",
+        minimum: 1,
+        maximum: MAX_READ_MESSAGE_BODY_CHARS,
+        default: DEFAULT_MAX_BODY_CHARS,
+        description: "Maximum cleaned body characters to return (default 4,096; maximum 32,768)."
       }
     }
   }
@@ -123,6 +147,8 @@ export async function runReadMessage(
   const request = readMessageRequestSchema.parse(args);
   const includeHeaders = request.include_headers ?? false;
   const includeQuoted = request.include_quoted ?? false;
+  const bodyOffset = request.body_offset ?? 0;
+  const maxBodyChars = request.max_body_chars ?? DEFAULT_MAX_BODY_CHARS;
 
   const row = await withReadOnlyTx(pool, async (client: PgClient) => {
     const result = await client.query<ReadMessageRow>(
@@ -172,7 +198,13 @@ export async function runReadMessage(
   );
   const served = { ...revealed, provider_thread_id: row.provider_thread_id };
   const headers = includeHeaders ? projectHeaders(served.headers_json) : undefined;
-  const detail = mapMessageRow(served, { includeQuoted, headers });
+  const detail = mapMessageRow(served, {
+    includeQuoted,
+    headers,
+    offset: bodyOffset,
+    maxChars: maxBodyChars,
+    includeBodyRange: true
+  });
   const sync_trust = await syncTrustFor(pool, [row.account_id], metadataProtection);
 
   return { ...detail, sync_trust };

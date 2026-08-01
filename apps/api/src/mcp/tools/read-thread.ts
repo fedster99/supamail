@@ -14,14 +14,15 @@ import {
 } from "../../metadata-protection.js";
 
 /**
- * `read_thread` — reassemble a conversation from the mirror and return every
- * message in it, oldest first, with cleaned bodies and a flat attachments index.
+ * `read_thread` — reassemble one or more conversations from the mirror and
+ * return each thread's messages oldest first, with cleaned bodies and a flat
+ * attachments index.
  *
- * Seed by a `message_id` (any message in the thread), a durable
- * `conversation_id`, or the legacy provider `thread_id`. A message with a stored
- * assignment resolves through the complete account-scoped conversation and
- * mirrored delivery copies collapse to one deterministic representative. The
- * old one-hop References walk remains only as a compatibility fallback for
+ * Seed by one `message_id` (any message in the thread), 1 to 10 `message_ids`, a
+ * durable `conversation_id`, or the legacy provider `thread_id`. A message with
+ * a stored assignment resolves through the complete account-scoped conversation
+ * and mirrored delivery copies collapse to one deterministic representative.
+ * The old one-hop References walk remains only as a compatibility fallback for
  * messages that have not been assigned yet.
  *
  * Read-only by construction (SELECTs inside {@link withReadOnlyTx}); never sends,
@@ -125,8 +126,8 @@ export interface ReadThreadArgs {
  */
 export const readThreadRequestSchema = z
   .object({
-    message_id: z.string().optional(),
-    message_ids: z.array(z.string()).min(1).max(MAX_THREAD_BATCH).optional(),
+    message_id: z.string().uuid().optional(),
+    message_ids: z.array(z.string().uuid()).min(1).max(MAX_THREAD_BATCH).optional(),
     conversation_id: z.string().optional(),
     thread_id: z.string().optional(),
     account: z.string().uuid().optional(),
@@ -156,25 +157,6 @@ export interface ReadThreadBatchResult {
   >;
 }
 
-type SyncTrustCache = Map<string, Promise<SyncTrust>>;
-
-function loadSyncTrust(
-  client: PgClient,
-  accountIds: string[] | null,
-  metadataProtection: MetadataProtectionAdapter,
-  cache?: SyncTrustCache
-): Promise<SyncTrust> {
-  if (!cache) return buildSyncTrust(client, accountIds, metadataProtection);
-
-  const key = accountIds === null ? "*" : [...accountIds].sort().join(",");
-  const cached = cache.get(key);
-  if (cached) return cached;
-
-  const pending = buildSyncTrust(client, accountIds, metadataProtection);
-  cache.set(key, pending);
-  return pending;
-}
-
 export const readThreadDefinition: ToolDefinition = {
   name: "read_thread",
   title: "Read one or more email threads (read-only)",
@@ -183,10 +165,12 @@ export const readThreadDefinition: ToolDefinition = {
     "message_id (any message in the thread), message_ids (1 to 10 seeds), a durable " +
     "conversation_id, or a legacy provider thread_id. Direct conversation/thread selectors " +
     "require account. Duplicate message_ids are collapsed in first-occurrence order; each " +
-    "distinct seed succeeds or fails independently. " +
-    "Returns the thread's messages oldest-first with cleaned plain-text " +
-    "bodies limited to 4,096 characters with body_truncated set when cut (quoted reply tails " +
-    "and signatures are stripped unless include_quoted=true), the " +
+    "distinct seed has its own result or error entry. " +
+    "Returns the thread's messages oldest-first. Replies contain newly authored plain text by default. " +
+    "When no older messages were omitted, the oldest mirrored message keeps quoted content. " +
+    "Each body is limited to 4,096 characters. " +
+    "body_truncated is set when more cleaned text remains; recognized quoted reply tails and signatures " +
+    "are stripped unless include_quoted=true. Returns the " +
     "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
@@ -239,13 +223,16 @@ export const readThreadDefinition: ToolDefinition = {
     properties: {
       message_id: {
         type: "string",
+        format: "uuid",
+        minLength: 36,
+        maxLength: 36,
         description: "A message UUID to seed the thread from (any message in the conversation)."
       },
       message_ids: {
         type: "array",
         minItems: 1,
         maxItems: MAX_THREAD_BATCH,
-        items: { type: "string" },
+        items: { type: "string", format: "uuid", minLength: 36, maxLength: 36 },
         description: "One to 10 message UUIDs. Duplicate seeds are collapsed in first-occurrence order."
       },
       conversation_id: {
@@ -263,7 +250,9 @@ export const readThreadDefinition: ToolDefinition = {
       include_quoted: {
         type: "boolean",
         default: false,
-        description: "Keep quoted reply tails and signatures in each body (default false strips them)."
+        description:
+          "Keep quoted reply tails and signatures in every body. By default, replies are cleaned; " +
+          "when no older messages were omitted, the oldest mirrored message keeps quoted content."
       },
       max_messages: {
         type: "integer",
@@ -475,8 +464,7 @@ async function fetchThreadRows(
 async function runReadThreadInternal(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter,
-  syncTrustCache?: SyncTrustCache
+  metadataProtection: MetadataProtectionAdapter
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
@@ -505,9 +493,10 @@ async function runReadThreadInternal(
 
   if (input.message_ids) {
     const messageIds = [...new Set(input.message_ids)];
-    const batchSyncTrustCache: SyncTrustCache = new Map();
     const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
     let nextIndex = 0;
+    // Each item owns one snapshot, including sync_trust. Sharing trust across
+    // items could describe a different mirror state than the returned thread.
     await Promise.all(Array.from(
       { length: Math.min(THREAD_BATCH_CONCURRENCY, messageIds.length) },
       async () => {
@@ -520,7 +509,7 @@ async function runReadThreadInternal(
               account: input.account,
               include_quoted: input.include_quoted,
               max_messages: input.max_messages
-            }, metadataProtection, batchSyncTrustCache);
+            }, metadataProtection);
             if ("thread" in result) {
               threads[index] = { message_id: messageId, result };
             } else if ("error" in result) {
@@ -634,14 +623,7 @@ async function runReadThreadInternal(
       );
     }
 
-    // Single reads compute sync_trust in their open transaction. Concurrent
-    // batch items from the same account share the same pending trust scan.
-    const syncTrust = await loadSyncTrust(
-      client,
-      accountIds,
-      metadataProtection,
-      syncTrustCache
-    );
+    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
 
     const attachments = await loadMessageAttachments(
       client,
@@ -664,7 +646,11 @@ async function runReadThreadInternal(
     const kept = rows.length > maxMessages ? rows.slice(rows.length - maxMessages) : rows;
     const omitted = Math.max(0, totalCount - kept.length);
 
-    const messages = kept.map((row) => mapMessageRow(row, { includeQuoted }));
+    const messages = kept.map((row, index) => mapMessageRow(row, {
+      // Keep quoted content in the oldest mirrored message when it was not
+      // removed by the message cap.
+      includeQuoted: includeQuoted || (omitted === 0 && index === 0)
+    }));
     const attachmentsIndex = messages.flatMap((message) =>
       message.attachments.map((att) => ({ message_id: message.message_id, ...att }))
     );

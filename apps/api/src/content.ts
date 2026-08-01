@@ -631,8 +631,8 @@ export async function getMessageHeaders(
 /**
  * Return a message's cleaned body text. Operates on the STORED body only (no IMAP
  * round-trip): coalesce(body_text, body_plain, selected_text_part), then reuse the
- * deterministic {@link cleanBody} heuristic from the MCP shared layer (drop the
- * `On … wrote:` quoted tail + the `-- ` signature unless includeQuoted) and clamp
+ * deterministic {@link cleanBody} heuristic from the MCP shared layer (drop
+ * recognized quoted-reply tails and signatures unless includeQuoted) and clamp
  * to maxChars. No LLM — pure text parsing (ADR 0020).
  */
 export async function cleanMessageBody(

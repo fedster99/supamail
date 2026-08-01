@@ -3,6 +3,21 @@ import { runReadThread } from "./read-thread.js";
 import type { ReadThreadResult } from "./read-thread.js";
 
 const ACCOUNT_ID = "11111111-1111-1111-1111-111111111111";
+const BATCH_IDS = Array.from(
+  { length: 11 },
+  (_, index) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`
+);
+const MESSAGE_ONE = BATCH_IDS[0];
+const MESSAGE_TWO = BATCH_IDS[1];
+const MISSING_MESSAGE = BATCH_IDS[2];
+const BROKEN_MESSAGE = BATCH_IDS[3];
+const MESSAGE_SEED = BATCH_IDS[4];
+const LEGACY_SEED = BATCH_IDS[5];
+const CONCURRENCY_IDS = Array.from(
+  { length: 10 },
+  (_, index) => `00000000-0000-4000-8000-${String(index + 100).padStart(12, "0")}`
+);
+const conversationFor = (messageId: string) => `conversation-${messageId}`;
 
 function isResult(value: unknown): value is ReadThreadResult {
   return typeof value === "object" && value !== null && "thread" in value;
@@ -122,8 +137,8 @@ function batchConversationPool() {
     ): Promise<{ rows: Array<Record<string, unknown>> }> => {
       if (sql.includes("WHERE m.id = $1")) {
         const messageId = String(values?.[0]);
-        if (messageId === "missing-message") return { rows: [] };
-        if (messageId === "broken-message") throw new Error("temporary database failure");
+        if (messageId === MISSING_MESSAGE) return { rows: [] };
+        if (messageId === BROKEN_MESSAGE) throw new Error("temporary database failure");
         return {
           rows: [{
             id: messageId,
@@ -133,7 +148,7 @@ function batchConversationPool() {
             in_reply_to: null,
             references_header: null,
             account_id: ACCOUNT_ID,
-            conversation_id: `conversation-${messageId}`
+            conversation_id: conversationFor(messageId)
           }]
         };
       }
@@ -181,37 +196,37 @@ describe("read_thread stored assignments", () => {
     const { pool, connect, getSyncTrustQueryCount } = batchConversationPool();
 
     const out = await runReadThread(pool as never, {
-      message_ids: ["message-one", "message-two"]
+      message_ids: [MESSAGE_ONE, MESSAGE_TWO]
     });
 
     expect(out).toMatchObject({
       threads: [
         {
-          message_id: "message-one",
-          result: { thread: { conversation_id: "conversation-message-one" } }
+          message_id: MESSAGE_ONE,
+          result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } }
         },
         {
-          message_id: "message-two",
-          result: { thread: { conversation_id: "conversation-message-two" } }
+          message_id: MESSAGE_TWO,
+          result: { thread: { conversation_id: conversationFor(MESSAGE_TWO) } }
         }
       ]
     });
     expect(connect).toHaveBeenCalledTimes(2);
-    expect(getSyncTrustQueryCount()).toBe(1);
+    expect(getSyncTrustQueryCount()).toBe(2);
   });
 
-  it("returns an independent error without discarding the other requested threads", async () => {
+  it("returns a per-item error without discarding the other requested threads", async () => {
     const { pool } = batchConversationPool();
 
     const out = await runReadThread(pool as never, {
-      message_ids: ["message-one", "missing-message", "message-two"]
+      message_ids: [MESSAGE_ONE, MISSING_MESSAGE, MESSAGE_TWO]
     });
 
     expect(out).toMatchObject({
       threads: [
-        { message_id: "message-one", result: { thread: { conversation_id: "conversation-message-one" } } },
-        { message_id: "missing-message", error: { code: "not_found" } },
-        { message_id: "message-two", result: { thread: { conversation_id: "conversation-message-two" } } }
+        { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } },
+        { message_id: MISSING_MESSAGE, error: { code: "not_found" } },
+        { message_id: MESSAGE_TWO, result: { thread: { conversation_id: conversationFor(MESSAGE_TWO) } } }
       ]
     });
   });
@@ -220,8 +235,8 @@ describe("read_thread stored assignments", () => {
     const connect = vi.fn();
 
     const out = await runReadThread({ connect } as never, {
-      message_id: "message-one",
-      message_ids: ["message-two"]
+      message_id: MESSAGE_ONE,
+      message_ids: [MESSAGE_TWO]
     });
 
     expect(out).toMatchObject({ error: { code: "invalid_input" } });
@@ -232,7 +247,7 @@ describe("read_thread stored assignments", () => {
     const connect = vi.fn();
 
     const out = await runReadThread({ connect } as never, {
-      message_id: "message-one",
+      message_id: MESSAGE_ONE,
       conversation_id: "conversation-two"
     });
 
@@ -244,14 +259,14 @@ describe("read_thread stored assignments", () => {
     const { pool } = batchConversationPool();
 
     const out = await runReadThread(pool as never, {
-      message_ids: ["message-one", "broken-message", "message-two"]
+      message_ids: [MESSAGE_ONE, BROKEN_MESSAGE, MESSAGE_TWO]
     });
 
     expect(out).toMatchObject({
       threads: [
-        { message_id: "message-one", result: { thread: { conversation_id: "conversation-message-one" } } },
-        { message_id: "broken-message", error: { code: "tool_failed" } },
-        { message_id: "message-two", result: { thread: { conversation_id: "conversation-message-two" } } }
+        { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } },
+        { message_id: BROKEN_MESSAGE, error: { code: "tool_failed" } },
+        { message_id: MESSAGE_TWO, result: { thread: { conversation_id: conversationFor(MESSAGE_TWO) } } }
       ]
     });
   });
@@ -260,23 +275,59 @@ describe("read_thread stored assignments", () => {
     const { pool, connect } = batchConversationPool();
 
     const out = await runReadThread(pool as never, {
-      message_ids: ["message-one", "message-one", "message-two"]
+      message_ids: [MESSAGE_ONE, MESSAGE_ONE, MESSAGE_TWO]
     });
 
     expect(out).toMatchObject({
       threads: [
-        { message_id: "message-one" },
-        { message_id: "message-two" }
+        { message_id: MESSAGE_ONE },
+        { message_id: MESSAGE_TWO }
       ]
     });
     expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns the batch envelope for one message seed", async () => {
+    const { pool, connect } = batchConversationPool();
+
+    const out = await runReadThread(pool as never, {
+      message_ids: [MESSAGE_ONE]
+    });
+
+    expect(out).toMatchObject({
+      threads: [
+        { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } }
+      ]
+    });
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an empty message batch before opening a database connection", async () => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, { message_ids: [] });
+
+    expect(out).toMatchObject({ error: { code: "invalid_input" } });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { message_id: "not-a-uuid" },
+    { message_ids: ["not-a-uuid"] }
+  ])("rejects invalid message ids before opening a database connection", async (args) => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, args);
+
+    expect(out).toMatchObject({ error: { code: "invalid_input" } });
+    expect(connect).not.toHaveBeenCalled();
   });
 
   it("rejects batches larger than ten before opening a database connection", async () => {
     const connect = vi.fn();
 
     const out = await runReadThread({ connect } as never, {
-      message_ids: Array.from({ length: 11 }, (_, index) => `message-${index}`)
+      message_ids: BATCH_IDS
     });
 
     expect(out).toMatchObject({ error: { code: "invalid_input" } });
@@ -289,7 +340,7 @@ describe("read_thread stored assignments", () => {
       const connect = vi.fn();
 
       const out = await runReadThread({ connect } as never, {
-        message_id: "message-one",
+        message_id: MESSAGE_ONE,
         max_messages: maxMessages
       });
 
@@ -319,17 +370,17 @@ describe("read_thread stored assignments", () => {
     };
 
     await runReadThread(pool as never, {
-      message_ids: Array.from({ length: 10 }, (_, index) => `message-${index}`)
+      message_ids: CONCURRENCY_IDS
     });
 
     expect(peak).toBe(4);
     expect(active).toBe(0);
-    expect(base.getSyncTrustQueryCount()).toBe(1);
+    expect(base.getSyncTrustQueryCount()).toBe(10);
   });
 
   it("resolves an assigned seed to the full stored conversation and exposes its id", async () => {
     const { pool, query } = assignedConversationPool();
-    const out = await runReadThread(pool as never, { message_id: "message-seed" });
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED });
 
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
@@ -437,7 +488,7 @@ describe("read_thread stored assignments", () => {
 
   it("falls back to the legacy one-hop walk when the active run has no assignment", async () => {
     const { pool, query } = unassignedSeedPool();
-    const out = await runReadThread(pool as never, { message_id: "legacy-seed" });
+    const out = await runReadThread(pool as never, { message_id: LEGACY_SEED });
 
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;

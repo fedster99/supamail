@@ -39,8 +39,8 @@ Keep the existing `read_thread` tool and add a `message_ids` batch selector:
 - exact duplicate handles are removed while preserving first-seen order;
 - at most four threads execute concurrently;
 - shared `include_quoted` and `max_messages` controls apply to every thread;
-- batch output preserves request order and returns `{message_id, result}` or
-  `{message_id, error}` independently for each seed;
+- batch output preserves request order and gives each seed its own
+  `{message_id, result}` or `{message_id, error}` entry;
 - selector modes cannot be mixed.
 
 The MCP server instructions and tool definitions describe capabilities,
@@ -50,7 +50,14 @@ identifiers, limits, and guarantees without prescribing a reasoning workflow.
 
 The five-tool local MCP surface does not grow. A normal focused read is
 unchanged. A broad investigation can expand up to ten conversations per request
-without making one oversized, unbounded response.
+with explicit seed, per-thread message, and per-body limits.
+
+Thread replies return newly authored text by default. When no older messages
+were omitted, the oldest mirrored message keeps quoted content. All remain
+capped at 4,096 characters per message. `read_message` provides a bounded continuation on the
+same tool through `body_offset` and `max_body_chars` (maximum 32,768), with total
+and next-offset metadata. This keeps batch responses bounded without making
+long original messages inaccessible.
 
 The agent still owns query refinement, evidence selection, and synthesis.
 SupaMail does not add an `investigate_topic`, summary, or reasoning tool.
@@ -61,8 +68,8 @@ hydrate all successful batch items under one bounded concurrency limit.
 ## Verification
 
 - Unit tests cover single-call compatibility, batch ordering, exact-seed
-  deduplication, the ten-thread cap, selector exclusivity, and independent
-  validation and operational failures.
+  deduplication, the ten-thread cap, selector exclusivity, and per-item validation
+  and operational failures.
 - MCP instruction tests pin the neutral capability contract and the advertised
   schema bound.
 - Existing live-Postgres `read_thread` coverage continues to prove conversation

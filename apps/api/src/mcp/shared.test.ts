@@ -51,7 +51,110 @@ describe("cleanBody", () => {
   });
 
   it("returns {text:null, truncated:false} for null input", () => {
-    expect(cleanBody(null, { includeQuoted: false })).toEqual({ text: null, truncated: false });
+    expect(cleanBody(null, { includeQuoted: false })).toEqual({
+      text: null,
+      truncated: false,
+      totalChars: 0,
+      offset: 0,
+      nextOffset: null
+    });
+  });
+
+  it.each([
+    [
+      "an Outlook header block",
+      "New answer.\n\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: Re: Plan\n\nOld answer."
+    ],
+    [
+      "an Original Message separator",
+      "New answer.\n\n-----Original Message-----\nFrom: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nOld answer."
+    ],
+    [
+      "a wrapped attribution",
+      "New answer.\n\nOn Friday, August 1, 2026, Alice <alice@example.com>\nwrote:\n> Old answer.\n> Older answer."
+    ],
+    [
+      "a trailing quote-only block",
+      "New answer.\n\n> Old answer.\n> Older answer."
+    ]
+  ])("keeps only authored text before %s", (_label, body) => {
+    const out = cleanBody(body, { includeQuoted: false });
+    expect(out.text).toBe("New answer.");
+    expect(out.truncated).toBe(false);
+  });
+
+  it("keeps forwarded content and header-like original content when no reply boundary is present", () => {
+    const forwarded = "Please review this.\n\n---------- Forwarded message ---------\nFrom: Alice\nSubject: Plan";
+    const original = "From: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThis is the original email.";
+
+    expect(cleanBody(forwarded, { includeQuoted: false }).text).toBe(forwarded);
+    expect(cleanBody(original, { includeQuoted: false }).text).toBe(original);
+  });
+
+  it("returns a bounded body range with a stable continuation offset", () => {
+    const out = cleanBody("0123456789", {
+      includeQuoted: false,
+      offset: 3,
+      maxChars: 4
+    });
+
+    expect(out).toEqual({
+      text: "3456",
+      truncated: true,
+      totalChars: 10,
+      offset: 3,
+      nextOffset: 7
+    });
+    expect(cleanBody("0123456789", {
+      includeQuoted: false,
+      offset: out.nextOffset ?? 0,
+      maxChars: 4
+    })).toEqual({
+      text: "789",
+      truncated: false,
+      totalChars: 10,
+      offset: 7,
+      nextOffset: null
+    });
+  });
+
+  it("counts Unicode code points and does not split a surrogate pair", () => {
+    const first = cleanBody("A😀B", {
+      includeQuoted: true,
+      maxChars: 2
+    });
+    expect(first).toEqual({
+      text: "A😀",
+      truncated: true,
+      totalChars: 3,
+      offset: 0,
+      nextOffset: 2
+    });
+    expect(cleanBody("A😀B", {
+      includeQuoted: true,
+      offset: first.nextOffset ?? 0,
+      maxChars: 1
+    })).toEqual({
+      text: "B",
+      truncated: false,
+      totalChars: 3,
+      offset: 2,
+      nextOffset: null
+    });
+  });
+
+  it("returns an empty final range when the offset is beyond the body", () => {
+    expect(cleanBody("short", {
+      includeQuoted: true,
+      offset: 100,
+      maxChars: 4
+    })).toEqual({
+      text: "",
+      truncated: false,
+      totalChars: 5,
+      offset: 5,
+      nextOffset: null
+    });
   });
 });
 

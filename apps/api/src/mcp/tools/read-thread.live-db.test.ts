@@ -139,7 +139,7 @@ liveDb("read_thread live DB", () => {
       providerThreadId: THREAD_ID,
       rfcMessageId: "<root@acme.com>",
       messageIdNormalized: "root@acme.com",
-      body: "Let's kick off the project on Monday.",
+      body: "Let's kick off the project on Monday.\n\nFrom: Prior Author\nSent: Friday\nTo: Alice\nSubject: Forwarded context\n\nOriginal starter details.",
       attachments: [
         { filename: "agenda.pdf", mimeType: "application/pdf", sizeBytes: 1024, partNumber: "2", disposition: "attachment" }
       ]
@@ -247,7 +247,7 @@ liveDb("read_thread live DB", () => {
       providerThreadId: THREAD_ID,
       rfcMessageId: "<root@acme.com>",
       messageIdNormalized: "root@acme.com",
-      body: "Let's kick off the project on Monday."
+      body: "Let's kick off the project on Monday.\n\nFrom: Prior Author\nSent: Friday\nTo: Alice\nSubject: Forwarded context\n\nOriginal starter details."
     });
     await seedMessage({
       uid: 10,
@@ -407,7 +407,9 @@ liveDb("read_thread live DB", () => {
     if (!isResult(stripped) || !isResult(withQuotes)) return;
 
     const strippedBody = stripped.messages.find((m) => m.message_id === idByUid.get(2))?.body ?? "";
+    const starterBody = stripped.messages.find((m) => m.message_id === idByUid.get(1))?.body ?? "";
     const quotedBody = withQuotes.messages.find((m) => m.message_id === idByUid.get(2))?.body ?? "";
+    expect(starterBody).toContain("Original starter details.");
     expect(strippedBody).toContain("Sounds good.");
     expect(strippedBody).not.toContain("Alice wrote:");
     expect(strippedBody).not.toContain("Bob");
@@ -440,6 +442,7 @@ liveDb("read_thread live DB", () => {
     expect(out.messages.map((m) => m.message_id)).toEqual([idByUid.get(2), idByUid.get(3)]);
     expect(out.thread.message_count).toBe(3);
     expect(out.omitted_message_count).toBe(1);
+    expect(out.messages[0].body).not.toContain("Alice wrote:");
   });
 
   it("reconstructs a header-only (no provider_thread_id) thread from the middle seed", async () => {
