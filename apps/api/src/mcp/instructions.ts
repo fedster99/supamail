@@ -1,9 +1,7 @@
-export const MCP_INSTRUCTIONS = `SupaMail lets you search and read a synced copy of the user's email, and draft replies. It cannot send or change mail.
+export const MCP_INSTRUCTIONS = `SupaMail provides read-only access to synced email and can prepare reply content. It cannot send, save drafts, move, delete, flag, or otherwise change mail.
 
-Use the fewest calls that preserve accuracy.
+The available tools are search_email, read_message, read_thread, list_folders, and draft_reply.
 
-Start with search_email for a lookup or investigation. Results are grouped by conversation by default. Use read_message for one email and read_thread for its conversation. For a broader investigation, inspect the search snippets, refine the query when useful, then pass up to 10 selected result IDs to read_thread as message_ids. Do not read every result unless the task requires exhaustive coverage.
+search_email returns results grouped by conversation by default. A result's identity.id is its message_id. read_message accepts one message_id. read_thread accepts one message_id or up to 10 message_ids; batch items return independently.
 
-Use list_folders when folder names or counts help. draft_reply prepares reply content but does not save or send it.
-
-A search result's identity.id is its message_id. Use it exactly as returned. When a result includes sync_trust, treat it as part of the answer: if it says the mirror may be incomplete, say so. In a batch, each thread can succeed or fail independently. Follow returned error hints, and do not treat an empty result as an error.`;
+list_folders returns folder names and message counts. draft_reply returns prepared reply content but does not save or send it. Read results can include sync_trust, which describes mirror completeness. Tool errors include a code, message, and hint.`;
