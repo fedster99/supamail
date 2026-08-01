@@ -202,6 +202,12 @@ The MCP server exposes five agent tools: `search_email`, `read_message`,
 `read_thread`, `list_folders`, and `draft_reply`. It uses local stdio transport,
 reads the same `DATABASE_URL`, and has no remote listener or send capability.
 
+`read_thread` accepts one message seed or a batch of up to ten `message_ids`,
+preserving first-seen order and isolating each thread's result or error.
+`read_message` returns a bounded body range and supports continuation through
+`body_offset` and `max_body_chars` when the default 4,096 characters are not
+enough.
+
 ```bash
 pnpm build
 DATABASE_URL=postgresql://... \
