@@ -147,6 +147,8 @@ export interface ReadThreadResult {
   messages: MessageDetail[];
   attachments_index: Array<{ message_id: string } & MessageAttachment>;
   omitted_message_count: number;
+  thread_content_status: "complete" | "partial";
+  thread_omissions: Array<"older_messages">;
   sync_trust: SyncTrust;
 }
 
@@ -174,8 +176,10 @@ export const readThreadDefinition: ToolDefinition = {
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
     "provider-threaded siblings only when the seed has no stored assignment. Capped to " +
-    "max_messages (default 20), keeping the NEWEST when over the cap; omitted_message_count " +
-    "reports how many were dropped. READ-ONLY: never sends, deletes, moves, or modifies mail.",
+    "max_messages (default 20), keeping the NEWEST when over the cap; thread_content_status, " +
+    "thread_omissions, and omitted_message_count explicitly report missing older messages. " +
+    "Each message's body_content_status and body_omissions explicitly report absent source text. " +
+    "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -675,6 +679,8 @@ async function runReadThreadInternal(
       messages,
       attachments_index: attachmentsIndex,
       omitted_message_count: omitted,
+      thread_content_status: omitted > 0 ? "partial" : "complete",
+      thread_omissions: omitted > 0 ? ["older_messages"] : [],
       sync_trust: syncTrust
     };
   });

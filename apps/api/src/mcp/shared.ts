@@ -80,6 +80,10 @@ export interface MessageDetail {
   window_status: WindowStatus;
   /** Cleaned body (coalesce(body_text, body_plain, selected_text_part)). */
   body: string | null;
+  /** Whether `body` contains all available source text after the requested options. */
+  body_content_status: "complete" | "partial" | "unavailable";
+  /** Exact reasons that available source text is absent from `body`. */
+  body_omissions: BodyContentOmission[];
   body_truncated: boolean;
   /** Present on read_message responses so a caller can recover a specific body range. */
   body_offset?: number;
@@ -170,7 +174,13 @@ export interface CleanBodyResult {
   totalChars: number;
   offset: number;
   nextOffset: number | null;
+  omissions: BodyContentOmission[];
 }
+
+export type BodyContentOmission =
+  | "quoted_reply_tail"
+  | "signature"
+  | "outside_requested_range";
 
 export interface CleanBodyOptions {
   includeQuoted: boolean;
@@ -221,6 +231,10 @@ export function mapMessageRow(
     flags: row.flags ?? [],
     window_status: row.window_status,
     body: cleaned.text,
+    body_content_status: rawBody === null
+      ? "unavailable"
+      : cleaned.omissions.length > 0 ? "partial" : "complete",
+    body_omissions: cleaned.omissions,
     body_truncated: cleaned.truncated,
     attachments: (row.attachments ?? []).map((a) => ({
       attachment_id: a.attachment_id,
@@ -256,7 +270,14 @@ const MIN_QUOTED_TAIL_LINES = 2;
  */
 export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBodyResult {
   if (text === null) {
-    return { text: null, truncated: false, totalChars: 0, offset: 0, nextOffset: null };
+    return {
+      text: null,
+      truncated: false,
+      totalChars: 0,
+      offset: 0,
+      nextOffset: null,
+      omissions: []
+    };
   }
   const maxChars = Number.isFinite(opts.maxChars) && Number(opts.maxChars) > 0
     ? Math.floor(Number(opts.maxChars))
@@ -266,18 +287,27 @@ export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBod
     : 0;
 
   let working = text.replace(/\r\n?/g, "\n");
+  const omissions: BodyContentOmission[] = [];
   if (!opts.includeQuoted) {
-    working = stripQuotedTail(working);
-    working = stripSignature(working);
+    const withoutQuotedTail = stripQuotedTail(working);
+    if (withoutQuotedTail !== working) omissions.push("quoted_reply_tail");
+    working = withoutQuotedTail;
+    const withoutSignature = stripSignature(working);
+    if (withoutSignature !== working) omissions.push("signature");
+    working = withoutSignature;
   }
   working = working.replace(/\s+$/, "");
   const range = sliceCodePoints(working, requestedOffset, maxChars);
+  if (range.offset > 0 || range.nextOffset !== null) {
+    omissions.push("outside_requested_range");
+  }
   return {
     text: range.text,
     truncated: range.nextOffset !== null,
     totalChars: range.totalChars,
     offset: range.offset,
-    nextOffset: range.nextOffset
+    nextOffset: range.nextOffset,
+    omissions
   };
 }
 

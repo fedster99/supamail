@@ -254,6 +254,8 @@ liveDb("read_message tool live DB", () => {
     const res = await runReadMessage(pool, { message_id: idByUid.get(3)! });
     if ("error" in res) throw new Error("unexpected error envelope");
     expect(res.body).toBeNull();
+    expect(res.body_content_status).toBe("unavailable");
+    expect(res.body_omissions).toEqual([]);
     expect(res.body_truncated).toBe(false);
     expect(res.body_offset).toBe(0);
     expect(res.body_total_chars).toBe(0);
@@ -271,6 +273,8 @@ liveDb("read_message tool live DB", () => {
     const result = await runReadMessage(pool, { message_id: messageId });
     if ("error" in result) throw new Error("unexpected error envelope");
     expect(result.body).toBe(body);
+    expect(result.body_content_status).toBe("complete");
+    expect(result.body_omissions).toEqual([]);
     expect(result.body_truncated).toBe(false);
     expect(result.body_offset).toBe(0);
     expect(result.body_total_chars).toBe(40_010);
@@ -292,6 +296,8 @@ liveDb("read_message tool live DB", () => {
     if ("error" in result) throw new Error("unexpected error envelope");
     expect(result).toMatchObject({
       body: "3456",
+      body_content_status: "partial",
+      body_omissions: ["outside_requested_range"],
       body_truncated: true,
       body_offset: 3,
       body_total_chars: 10,

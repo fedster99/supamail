@@ -60,10 +60,16 @@ and `read_thread` return each message's full available cleaned body. This avoids
 silently omitting evidence from long messages. A hosted wrapper can still apply
 a request-level resource limit to protect the service.
 
-`read_message` also accepts an optional Unicode-safe body range of up to 131,072
-characters. The default remains the full cleaned body. The range exists so a
-client that truncates an unusually large tool result can recover a specific
+`read_message` also accepts an optional Unicode-safe body range with no product
+character ceiling. The default remains the full cleaned body. The range exists
+so a client that truncates an unusually large tool result can recover a specific
 missing section without adding another MCP tool.
+
+Partial content is explicit in returned data. Every message reports
+`body_content_status` and exact `body_omissions`. Every thread reports
+`thread_content_status`, `thread_omissions`, and `omitted_message_count`. A
+caller never has to infer that a requested range, quote policy, signature policy,
+or message window removed available text.
 
 The agent still owns query refinement, evidence selection, and synthesis.
 SupaMail does not add an `investigate_topic`, summary, or reasoning tool.

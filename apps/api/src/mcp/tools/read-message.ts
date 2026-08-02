@@ -20,8 +20,6 @@ import {
   type ProtectedMetadataColumns
 } from "../../metadata-protection.js";
 
-export const MAX_READ_MESSAGE_BODY_CHARS = 131072;
-
 /**
  * Zod schema for `read_message`. The handler validates raw tool arguments
  * through this before touching the database, so the read-tool contract is
@@ -33,7 +31,7 @@ export const readMessageRequestSchema = z
     include_headers: z.boolean().optional(),
     include_quoted: z.boolean().optional(),
     body_offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-    max_body_chars: z.number().int().min(1).max(MAX_READ_MESSAGE_BODY_CHARS).optional()
+    max_body_chars: z.number().int().min(1).optional()
   })
   .strict();
 
@@ -76,8 +74,9 @@ export const readMessageDefinition: ToolDefinition = {
     "Fetch a single mirrored email by its stable message_id (the id returned by search_email " +
     "or read_thread). By default, the body contains the newly authored plain text, with " +
     "recognized quoted reply tails and signatures removed. It returns the full cleaned body. " +
-    "body_offset and max_body_chars can return a specific range of up to 131,072 characters; " +
-    "body_total_chars, body_next_offset, and body_truncated describe that range. " +
+    "body_offset and max_body_chars can return a specific range without a product character ceiling; " +
+    "body_total_chars, body_next_offset, body_truncated, body_content_status, and body_omissions " +
+    "state whether text is absent and why. " +
     "Also returns the from/to/cc envelope, flags, " +
     "window_status, and the attachments list (filename, mime_type, size_bytes, disposition — " +
     "including inline parts). include_quoted=true retains the quoted reply tail and " +
@@ -122,8 +121,7 @@ export const readMessageDefinition: ToolDefinition = {
       max_body_chars: {
         type: "integer",
         minimum: 1,
-        maximum: MAX_READ_MESSAGE_BODY_CHARS,
-        description: "Optional body range size (maximum 131,072). Omit it to return the full remaining cleaned body."
+        description: "Optional positive body range size. Omit it to return the full remaining cleaned body."
       }
     }
   }

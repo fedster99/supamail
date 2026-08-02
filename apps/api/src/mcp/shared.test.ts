@@ -26,6 +26,7 @@ describe("cleanBody", () => {
     expect(out.text).not.toContain(">");
     expect(out.text).not.toContain("My Signature");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual(["quoted_reply_tail"]);
   });
 
   it("keeps the attribution, quote, and signature when includeQuoted is true", () => {
@@ -34,6 +35,7 @@ describe("cleanBody", () => {
     expect(out.text).toContain("> quoted line one");
     expect(out.text).toContain("My Signature");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual([]);
   });
 
   it("returns a large body in full when no explicit bound is supplied", () => {
@@ -41,12 +43,14 @@ describe("cleanBody", () => {
     const out = cleanBody(long, { includeQuoted: true });
     expect(out.text).toBe(long);
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual([]);
   });
 
   it("does not mark a short body as truncated", () => {
     const out = cleanBody("short body", { includeQuoted: true });
     expect(out.text).toBe("short body");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual([]);
   });
 
   it("returns {text:null, truncated:false} for null input", () => {
@@ -55,7 +59,8 @@ describe("cleanBody", () => {
       truncated: false,
       totalChars: 0,
       offset: 0,
-      nextOffset: null
+      nextOffset: null,
+      omissions: []
     });
   });
 
@@ -72,6 +77,7 @@ describe("cleanBody", () => {
     const out = cleanBody(body, { includeQuoted: false });
     expect(out.text).toBe("New answer.");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual(["quoted_reply_tail"]);
   });
 
   it("keeps forwarded and ambiguous mail-client blocks", () => {
@@ -86,6 +92,12 @@ describe("cleanBody", () => {
     expect(cleanBody(originalMessage, { includeQuoted: false }).text).toBe(originalMessage);
   });
 
+  it("reports a removed signature", () => {
+    const out = cleanBody("New answer.\n-- \nAlice", { includeQuoted: false });
+    expect(out.text).toBe("New answer.");
+    expect(out.omissions).toEqual(["signature"]);
+  });
+
   it("returns a requested range with a stable continuation offset", () => {
     const out = cleanBody("0123456789", {
       includeQuoted: false,
@@ -98,7 +110,8 @@ describe("cleanBody", () => {
       truncated: true,
       totalChars: 10,
       offset: 3,
-      nextOffset: 7
+      nextOffset: 7,
+      omissions: ["outside_requested_range"]
     });
     expect(cleanBody("0123456789", {
       includeQuoted: false,
@@ -108,7 +121,8 @@ describe("cleanBody", () => {
       truncated: false,
       totalChars: 10,
       offset: 7,
-      nextOffset: null
+      nextOffset: null,
+      omissions: ["outside_requested_range"]
     });
   });
 
@@ -122,7 +136,8 @@ describe("cleanBody", () => {
       truncated: true,
       totalChars: 3,
       offset: 0,
-      nextOffset: 2
+      nextOffset: 2,
+      omissions: ["outside_requested_range"]
     });
     expect(cleanBody("A😀B", {
       includeQuoted: true,
@@ -133,7 +148,8 @@ describe("cleanBody", () => {
       truncated: false,
       totalChars: 3,
       offset: 2,
-      nextOffset: null
+      nextOffset: null,
+      omissions: ["outside_requested_range"]
     });
   });
 
@@ -147,7 +163,8 @@ describe("cleanBody", () => {
       truncated: false,
       totalChars: 5,
       offset: 5,
-      nextOffset: null
+      nextOffset: null,
+      omissions: ["outside_requested_range"]
     });
   });
 });

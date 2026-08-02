@@ -465,6 +465,8 @@ describe("read_thread stored assignments", () => {
     expect(out.thread.message_count).toBe(3);
     expect(out.thread.participants).toEqual(["alice@example.test", "bob@example.test"]);
     expect(out.omitted_message_count).toBe(2);
+    expect(out.thread_content_status).toBe("partial");
+    expect(out.thread_omissions).toEqual(["older_messages"]);
     const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"));
     expect(call?.[0]).toContain("LIMIT $3");
     expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 1]);

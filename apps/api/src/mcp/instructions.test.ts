@@ -16,8 +16,10 @@ describe("MCP agent guidance", () => {
     expect(MCP_INSTRUCTIONS).toContain("Duplicate message_ids are collapsed");
     expect(MCP_INSTRUCTIONS).toContain("each distinct ID has its own result or error entry");
     expect(MCP_INSTRUCTIONS).toContain("full available cleaned body for each message");
-    expect(MCP_INSTRUCTIONS).toContain("specific range of up to 131,072 characters");
+    expect(MCP_INSTRUCTIONS).toContain("specific range without a product character ceiling");
     expect(MCP_INSTRUCTIONS).toContain("body_total_chars and body_next_offset");
+    expect(MCP_INSTRUCTIONS).toContain("body_content_status and body_omissions");
+    expect(MCP_INSTRUCTIONS).toContain("thread_content_status, thread_omissions, and omitted_message_count");
     expect(MCP_INSTRUCTIONS).toContain("Replies contain newly authored text by default");
     expect(MCP_INSTRUCTIONS).toContain("oldest mirrored message keeps quoted content");
     expect(MCP_INSTRUCTIONS).toContain("batch thread errors use the same fields in the affected thread entry");
@@ -59,9 +61,9 @@ describe("MCP agent guidance", () => {
       default: 0
     });
     expect(readMessageProperties.max_body_chars).toMatchObject({
-      minimum: 1,
-      maximum: 131072
+      minimum: 1
     });
+    expect(readMessageProperties.max_body_chars).not.toHaveProperty("maximum");
     expect(readMessageRequestSchema.safeParse({
       message_id: messageId,
       body_offset: 131072,
@@ -70,7 +72,7 @@ describe("MCP agent guidance", () => {
     expect(readMessageRequestSchema.safeParse({
       message_id: messageId,
       max_body_chars: 131073
-    }).success).toBe(false);
+    }).success).toBe(true);
     for (const range of [
       { body_offset: -1 },
       { body_offset: 1.5 },
@@ -91,6 +93,10 @@ describe("MCP agent guidance", () => {
       message_id: messageId,
       body_offset: Number.MAX_SAFE_INTEGER + 1
     }).success).toBe(false);
+    expect(readMessageRequestSchema.safeParse({
+      message_id: messageId,
+      max_body_chars: Number.MAX_SAFE_INTEGER + 1
+    }).success).toBe(true);
 
     expect((properties.include_quoted as { description: string }).description)
       .toContain("oldest mirrored message keeps quoted content");
