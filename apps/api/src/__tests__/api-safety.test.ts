@@ -1078,11 +1078,11 @@ describe("API safety", () => {
     expect(content.getMessageHeaders).toHaveBeenCalledWith(messageId, { basic: true });
   });
 
-  it("falls back to the default truncation on a non-numeric max_chars", async () => {
+  it("falls back to the clean-body default for a non-numeric max_chars", async () => {
     const { app, content } = buildApp();
     const res = await app.request(`/messages/${messageId}/clean-body?max_chars=abc`, { headers: auth() });
     expect(res.status).toBe(200);
-    // NaN must NOT reach the lib — it would disable truncation; default (undefined) instead.
+    // NaN must not reach the cleaner; undefined selects its bounded default.
     expect(content.cleanMessageBody).toHaveBeenCalledWith(messageId, { includeQuoted: false, maxChars: undefined });
   });
 

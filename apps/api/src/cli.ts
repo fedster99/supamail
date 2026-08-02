@@ -765,8 +765,7 @@ program
   .option("--include-quoted", "Keep the quoted reply tail + signature")
   .option("--max-chars <n>", "Clamp the cleaned body to n characters")
   .action(async (messageId: string, options) => {
-    // A non-numeric `--max-chars abc` yields NaN, which would silently disable
-    // truncation; fall back to the default (undefined) on anything non-finite.
+    // A non-numeric value falls back to cleanMessageBody's 4,096-character default.
     const maxCharsParsed = options.maxChars === undefined ? undefined : Number(options.maxChars);
     const result = await cleanMessageBody(pool, config, messageId, {
       includeQuoted: Boolean(options.includeQuoted),

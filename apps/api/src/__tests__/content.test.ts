@@ -113,6 +113,20 @@ describe("cleanMessageBody (deterministic, no LLM)", () => {
     const clean = await cleanMessageBody(pool, config, "m1", { includeQuoted: true });
     expect(clean.body).toContain("original");
   });
+
+  it("keeps the existing 4,096-character default outside MCP", async () => {
+    const pool = fakePool([{ body_text: "x".repeat(5_000), body_plain: null, selected_text_part: null }]);
+    const clean = await cleanMessageBody(pool, config, "m1");
+    expect(clean.body).toHaveLength(4_096);
+    expect(clean.truncated).toBe(true);
+  });
+
+  it("does not let a non-positive limit disable the content-operation bound", async () => {
+    const pool = fakePool([{ body_text: "x".repeat(5_000), body_plain: null, selected_text_part: null }]);
+    const clean = await cleanMessageBody(pool, config, "m1", { maxChars: 0 });
+    expect(clean.body).toHaveLength(4_096);
+    expect(clean.truncated).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

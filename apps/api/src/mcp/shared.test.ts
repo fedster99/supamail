@@ -61,14 +61,6 @@ describe("cleanBody", () => {
 
   it.each([
     [
-      "an Outlook header block",
-      "New answer.\n\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: Re: Plan\n\nOld answer."
-    ],
-    [
-      "an Original Message separator",
-      "New answer.\n\n-----Original Message-----\nFrom: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nOld answer."
-    ],
-    [
       "a wrapped attribution",
       "New answer.\n\nOn Friday, August 1, 2026, Alice <alice@example.com>\nwrote:\n> Old answer.\n> Older answer."
     ],
@@ -82,12 +74,16 @@ describe("cleanBody", () => {
     expect(out.truncated).toBe(false);
   });
 
-  it("keeps forwarded content and header-like original content when no reply boundary is present", () => {
+  it("keeps forwarded and ambiguous mail-client blocks", () => {
     const forwarded = "Please review this.\n\n---------- Forwarded message ---------\nFrom: Alice\nSubject: Plan";
     const original = "From: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThis is the original email.";
+    const outlook = "Please review this.\n\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: Plan\n\nThe incident started here.";
+    const originalMessage = "Please review this.\n\n-----Original Message-----\nFrom: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThe incident started here.";
 
     expect(cleanBody(forwarded, { includeQuoted: false }).text).toBe(forwarded);
     expect(cleanBody(original, { includeQuoted: false }).text).toBe(original);
+    expect(cleanBody(outlook, { includeQuoted: false }).text).toBe(outlook);
+    expect(cleanBody(originalMessage, { includeQuoted: false }).text).toBe(originalMessage);
   });
 
   it("returns a requested range with a stable continuation offset", () => {

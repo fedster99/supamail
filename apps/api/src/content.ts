@@ -16,6 +16,8 @@ import {
   type ProtectedMetadataColumns
 } from "./metadata-protection.js";
 
+const DEFAULT_CLEAN_BODY_MAX_CHARS = 4096;
+
 /**
  * Attachment bytes / raw MIME / headers / clean-body read surface (email-004,
  * ADR 0020). This module lives OUTSIDE src/mcp/ on purpose: the agent MCP surface
@@ -632,8 +634,8 @@ export async function getMessageHeaders(
  * Return a message's cleaned body text. Operates on the STORED body only (no IMAP
  * round-trip): coalesce(body_text, body_plain, selected_text_part), then reuse the
  * deterministic {@link cleanBody} heuristic from the MCP shared layer (drop
- * recognized quoted-reply tails and signatures unless includeQuoted) and clamp
- * to maxChars. No LLM — pure text parsing (ADR 0020).
+ * recognized quoted-reply tails and signatures unless includeQuoted), then
+ * clamp to maxChars (default 4,096). No LLM — pure text parsing (ADR 0020).
  */
 export async function cleanMessageBody(
   pool: PgPool,
@@ -664,7 +666,13 @@ export async function cleanMessageBody(
   if (!row) throw new NotFoundError(`Message not found: ${messageId}`);
 
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
-  const cleaned = cleanBody(raw, { includeQuoted: options.includeQuoted ?? false, maxChars: options.maxChars });
+  const maxChars = Number.isFinite(options.maxChars) && Number(options.maxChars) > 0
+    ? Math.floor(Number(options.maxChars))
+    : DEFAULT_CLEAN_BODY_MAX_CHARS;
+  const cleaned = cleanBody(raw, {
+    includeQuoted: options.includeQuoted ?? false,
+    maxChars
+  });
   return { messageId, body: cleaned.text, truncated: cleaned.truncated };
 }
 

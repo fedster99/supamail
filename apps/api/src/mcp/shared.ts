@@ -242,21 +242,17 @@ export function mapMessageRow(
 const SIGNATURE_DELIMITER = /^-- ?$/;
 const ATTRIBUTION_START = /^On\b/i;
 const ATTRIBUTION_END = /\bwrote:\s*$/i;
-const ORIGINAL_MESSAGE_SEPARATOR = /^-{2,}\s*Original Message\s*-{2,}$/i;
-const OUTLOOK_HEADER = /^(From|Sent|Date|To|Cc|Subject):\s*\S/i;
 const MAX_ATTRIBUTION_LINES = 4;
-const OUTLOOK_HEADER_SCAN_LINES = 8;
-const MIN_OUTLOOK_HEADER_LABELS = 3;
 const MIN_QUOTED_TAIL_LINES = 2;
 
 /**
  * Clean a plain-text body for an agent. `body_text` is already HTML-stripped
  * (ADR 0015). When `includeQuoted=false` (the default for read tools) we drop the
- * quoted reply tail introduced by a recognized attribution, original-message
- * separator, Outlook header block, or trailing quote-only block. It also drops
- * a trailing signature after a `-- ` delimiter. It returns the full cleaned
- * body unless the caller explicitly supplies `maxChars`. No heavy markdown
- * conversion.
+ * quoted reply tail introduced by a recognized attribution or trailing
+ * quote-only block. It also drops a trailing signature after a `-- ` delimiter.
+ * Ambiguous Outlook and Original Message blocks stay intact because email
+ * clients use the same shape for forwarded content. It returns the full cleaned
+ * body unless the caller explicitly supplies `maxChars`. No heavy markdown conversion.
  */
 export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBodyResult {
   if (text === null) {
@@ -333,8 +329,6 @@ function stripQuotedTail(text: string): string {
   for (let i = 0; i < lines.length; i++) {
     if (
       isAttributionBoundary(lines, i)
-      || ORIGINAL_MESSAGE_SEPARATOR.test(lines[i].trim())
-      || isOutlookHeaderBoundary(lines, i)
       || isQuoteOnlyBoundary(lines, i)
     ) {
       return lines.slice(0, i).join("\n");
@@ -354,22 +348,6 @@ function isAttributionBoundary(lines: string[], start: number): boolean {
     if (ATTRIBUTION_END.test(joined)) return true;
   }
   return false;
-}
-
-/** Match a pasted Outlook reply header after a blank line. */
-function isOutlookHeaderBoundary(lines: string[], start: number): boolean {
-  if (!/^From:\s*\S/i.test(lines[start].trim())) return false;
-  if (start === 0 || lines[start - 1].trim() !== "") return false;
-
-  const labels = new Set<string>();
-  for (const line of lines.slice(start, start + OUTLOOK_HEADER_SCAN_LINES)) {
-    const match = line.trim().match(OUTLOOK_HEADER);
-    if (match) labels.add(match[1].toLowerCase());
-  }
-  return labels.has("from")
-    && labels.has("subject")
-    && (labels.has("sent") || labels.has("date"))
-    && labels.size >= MIN_OUTLOOK_HEADER_LABELS;
 }
 
 /** Match a final block of at least two `>`-quoted lines after a blank line. */
