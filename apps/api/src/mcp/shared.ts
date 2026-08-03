@@ -116,6 +116,8 @@ export interface MessageDetailRow {
   body_text: string | null;
   body_plain: string | null;
   selected_text_part: string | null;
+  /** True when sync stored only a bounded prefix of the original source. */
+  raw_truncated: boolean | null;
   attachments: MessageAttachmentRow[] | null;
 }
 
@@ -178,6 +180,7 @@ export interface CleanBodyResult {
 }
 
 export type BodyContentOmission =
+  | "source_truncated"
   | "quoted_reply_tail"
   | "signature"
   | "outside_requested_range";
@@ -218,6 +221,12 @@ export function mapMessageRow(
     maxChars: opts.maxChars,
     offset: opts.offset
   });
+  // `body_truncated` below describes only an explicitly requested response range.
+  // Sync's raw-source limit is a separate completeness signal, even when parsing
+  // yielded some body text from that prefix.
+  const bodyOmissions: BodyContentOmission[] = row.raw_truncated === true
+    ? ["source_truncated", ...cleaned.omissions]
+    : cleaned.omissions;
   const detail: MessageDetail = {
     message_id: row.id,
     thread_id: row.provider_thread_id,
@@ -231,10 +240,10 @@ export function mapMessageRow(
     flags: row.flags ?? [],
     window_status: row.window_status,
     body: cleaned.text,
-    body_content_status: rawBody === null
-      ? "unavailable"
-      : cleaned.omissions.length > 0 ? "partial" : "complete",
-    body_omissions: cleaned.omissions,
+    body_content_status: bodyOmissions.length > 0
+      ? "partial"
+      : rawBody === null ? "unavailable" : "complete",
+    body_omissions: bodyOmissions,
     body_truncated: cleaned.truncated,
     attachments: (row.attachments ?? []).map((a) => ({
       attachment_id: a.attachment_id,
@@ -411,6 +420,7 @@ function stripSignature(text: string): string {
  */
 export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
+  let releaseError: Error | undefined;
   try {
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await client.query("SET LOCAL transaction_read_only = on");
@@ -419,10 +429,16 @@ export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => 
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      releaseError = rollbackError instanceof Error
+        ? rollbackError
+        : new Error("read-only transaction rollback failed");
+    }
     throw error;
   } finally {
-    client.release();
+    client.release(releaseError);
   }
 }
 

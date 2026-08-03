@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { cleanBody } from "./shared.js";
-import { buildCc, buildReferences, reSubject } from "./tools/draft-reply.js";
+import { describe, expect, it, vi } from "vitest";
+import { cleanBody, mapMessageRow, withReadOnlyTx } from "./shared.js";
+import { buildCc, buildReferences, quoteText, reSubject } from "./tools/draft-reply.js";
 
 /**
  * No-DB unit suite for the pure MCP helpers (ADR 0014/0016). These run in the
@@ -166,6 +166,84 @@ describe("cleanBody", () => {
       nextOffset: null,
       omissions: ["outside_requested_range"]
     });
+  });
+});
+
+describe("mapMessageRow", () => {
+  it("keeps sync source truncation distinct from an explicit response range", () => {
+    const message = mapMessageRow({
+      id: "message-1",
+      account_id: "account-1",
+      folder_path: "INBOX",
+      provider_thread_id: null,
+      subject: "Partial source",
+      from_email: "alice@example.test",
+      from_name: "Alice",
+      to_emails: ["me@example.test"],
+      cc_emails: [],
+      flags: [],
+      window_status: "IN_WINDOW",
+      internal_date: new Date("2026-08-01T00:00:00.000Z"),
+      body_text: "0123456789",
+      body_plain: null,
+      selected_text_part: null,
+      raw_truncated: true,
+      attachments: []
+    }, { includeQuoted: true, maxChars: 4, includeBodyRange: true });
+
+    expect(message).toMatchObject({
+      body: "0123",
+      body_content_status: "partial",
+      body_omissions: ["source_truncated", "outside_requested_range"],
+      body_truncated: true,
+      body_total_chars: 10,
+      body_next_offset: 4
+    });
+  });
+});
+
+describe("quoteText", () => {
+  it("prefixes empty and trailing lines without a per-line string array", () => {
+    expect(quoteText("first\n\nlast\n")).toBe("> first\n> \n> last\n> ");
+  });
+});
+
+describe("withReadOnlyTx", () => {
+  it("evicts the client when rollback fails", async () => {
+    const workError = new Error("read failed");
+    const rollbackError = new Error("rollback failed");
+    const query = vi.fn(async (sql: string) => {
+      if (sql === "ROLLBACK") throw rollbackError;
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const pool = {
+      connect: vi.fn(async () => ({ query, release })),
+    } as never;
+
+    await expect(withReadOnlyTx(pool, async () => {
+      throw workError;
+    })).rejects.toBe(workError);
+
+    expect(query).toHaveBeenLastCalledWith("ROLLBACK");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(rollbackError);
+  });
+
+  it("releases the client normally after a successful rollback", async () => {
+    const workError = new Error("read failed");
+    const query = vi.fn(async () => ({ rows: [] }));
+    const release = vi.fn();
+    const pool = {
+      connect: vi.fn(async () => ({ query, release })),
+    } as never;
+
+    await expect(withReadOnlyTx(pool, async () => {
+      throw workError;
+    })).rejects.toBe(workError);
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(undefined);
   });
 });
 

@@ -80,8 +80,10 @@ were omitted, the oldest mirrored message keeps quoted content.
 `max_body_chars` is supplied. There is no product character ceiling.
 `body_total_chars`, `body_next_offset`, and `body_truncated` describe the range.
 Every message also returns `body_content_status` and `body_omissions`. A
-`partial` status explicitly identifies quoted text, a signature, or text outside
-the requested range that is not present in `body`.
+`partial` status explicitly identifies source text that sync stored only in part
+(`source_truncated`), quoted text, a signature, or text outside the requested
+range that is not present in `body`. `body_truncated` describes only a requested
+response range; it does not hide source truncation.
 
 Every thread returns `thread_content_status`, `thread_omissions`, and
 `omitted_message_count`. A `partial` status explicitly identifies older messages
@@ -105,7 +107,8 @@ temporarily uses the legacy one-hop read fallback.
 These capabilities are not exposed in v1:
 
 - **No sending or appending.** There is no send tool, no send flag, and
-  `draft_reply` only produces a draft object (ADR 0016).
+  `draft_reply` only produces a draft object (ADR 0016). Its quote includes the
+  full available source body; it does not silently apply a quote-size cap.
 - **No attachment bytes or content extraction.** Only attachment *metadata*
   (filename, mime type, size, disposition) is mirrored; the bytes are not.
 - **No mutations.** No labels, flags, moves, deletes, marking read, or scheduling.

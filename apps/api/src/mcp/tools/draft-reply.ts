@@ -189,16 +189,35 @@ export function buildCc(row: SourceRow): DraftRecipient[] {
   return out;
 }
 
-const MAX_DRAFT_QUOTE_CHARS = 4096;
+/** Prefix every UTF-8 line without allocating one JavaScript string per line. */
+export function quoteText(text: string): string {
+  if (text.length === 0) return "";
+  const source = Buffer.from(text, "utf8");
+  let lineFeeds = 0;
+  for (const byte of source) {
+    if (byte === 0x0a) lineFeeds += 1;
+  }
+  const output = Buffer.allocUnsafe(source.length + (2 * (lineFeeds + 1)));
+  let position = 0;
+  output[position++] = 0x3e; // >
+  output[position++] = 0x20; // space
+  for (const byte of source) {
+    output[position++] = byte;
+    if (byte !== 0x0a) continue;
+    output[position++] = 0x3e;
+    output[position++] = 0x20;
+  }
+  return output.toString("utf8");
+}
 
-/** Quote a bounded part of the original body and prefix each line with "> ". */
+/** Quote the full available original body without allocating one string per line. */
 function quoteOriginal(row: SourceRow): string {
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
-  const cleaned = cleanBody(raw, { includeQuoted: true, maxChars: MAX_DRAFT_QUOTE_CHARS });
+  const cleaned = cleanBody(raw, { includeQuoted: true });
   const text = cleaned.text ?? "";
   const fromLabel = row.from_name ? `${row.from_name} <${row.from_email ?? ""}>` : row.from_email ?? "unknown sender";
   const attribution = `On ${row.internal_date.toISOString()}, ${fromLabel} wrote:`;
-  const quoted = text.length === 0 ? "" : text.split("\n").map((line) => `> ${line}`).join("\n");
+  const quoted = quoteText(text);
   return `${attribution}\n${quoted}`;
 }
 

@@ -67,7 +67,8 @@ const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
  * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
-const THREAD_SELECT = `
+function threadSelect(includeBody: boolean): string {
+  return `
   m.id,
   m.account_id,
   m.folder_path,
@@ -85,12 +86,14 @@ const THREAD_SELECT = `
   m.protected_metadata_version,
   m.protected_metadata_key_version,
   m.protected_metadata_tokens,
-  b.body_text,
-  b.body_plain,
-  b.selected_text_part,
+  b.raw_truncated,
+  ${includeBody
+    ? "b.body_text, b.body_plain, b.selected_text_part"
+    : "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"},
   stats.total_count AS thread_total_count,
   stats.participants AS thread_participants
 `;
+}
 
 type ThreadRow = MessageDetailRow & ProtectedMetadataColumns & {
   conversation_id: string | null;
@@ -116,6 +119,14 @@ export interface ReadThreadArgs {
   account?: string;
   include_quoted?: boolean;
   max_messages?: number;
+}
+
+/**
+ * Library-only switch for hosted callers that hydrate complete bodies from their
+ * own body store. The public MCP tool always leaves this enabled.
+ */
+export interface ReadThreadOptions {
+  includeBody?: boolean;
 }
 
 /**
@@ -347,7 +358,8 @@ async function fetchThreadRows(
     | { kind: "conversation"; conversationId: string; accountId: string }
     | { kind: "provider-thread"; threadId: string; accountId: string }
     | { kind: "keys"; seed: SeedRow },
-  maxMessages: number
+  maxMessages: number,
+  { includeBody = true }: ReadThreadOptions
 ): Promise<FetchedThread> {
   if (selector.kind === "conversation") {
     const result = await client.query<ThreadRow>(
@@ -368,7 +380,7 @@ async function fetchThreadRows(
           m.folder_path ASC,
           m.id ASC
       )${boundedThreadCtes("$3")}
-      SELECT ${THREAD_SELECT}
+      SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
       LEFT JOIN public.imap_thread_active_assignments ta
@@ -404,7 +416,7 @@ async function fetchThreadRows(
           m.folder_path ASC,
           m.id ASC
       )${boundedThreadCtes("$3")}
-      SELECT ${THREAD_SELECT}
+      SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
       LEFT JOIN public.imap_thread_active_assignments ta
@@ -449,7 +461,7 @@ async function fetchThreadRows(
         m.folder_path ASC,
         m.id ASC
     )${boundedThreadCtes("$5")}
-    SELECT ${THREAD_SELECT}
+    SELECT ${threadSelect(includeBody)}
     FROM limited_representatives representative
     JOIN public.imap_messages m ON m.id = representative.id
     LEFT JOIN public.imap_thread_active_assignments ta
@@ -467,7 +479,8 @@ async function fetchThreadRows(
 async function runReadThreadInternal(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter
+  metadataProtection: MetadataProtectionAdapter,
+  options: ReadThreadOptions
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
@@ -512,7 +525,7 @@ async function runReadThreadInternal(
               account: input.account,
               include_quoted: input.include_quoted,
               max_messages: input.max_messages
-            }, metadataProtection);
+            }, metadataProtection, options);
             if ("thread" in result) {
               threads[index] = { message_id: messageId, result };
             } else if ("error" in result) {
@@ -570,14 +583,14 @@ async function runReadThreadInternal(
         kind: "conversation",
         conversationId,
         accountId: accountScope!
-      }, maxMessages);
+      }, maxMessages, options);
       accountIds = [accountScope!];
     } else if (threadId) {
       fetched = await fetchThreadRows(client, {
         kind: "provider-thread",
         threadId,
         accountId: accountScope!
-      }, maxMessages);
+      }, maxMessages, options);
       accountIds = [accountScope!];
     } else {
       const seedResult = await client.query<SeedRow>(
@@ -609,9 +622,9 @@ async function runReadThreadInternal(
           kind: "conversation",
           conversationId: seed.conversation_id,
           accountId: seed.account_id
-        }, maxMessages);
+        }, maxMessages, options);
       } else {
-        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages);
+        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages, options);
       }
       accountIds = [seed.account_id];
     }
@@ -689,9 +702,10 @@ async function runReadThreadInternal(
 export function runReadThread(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: ReadThreadOptions = {}
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
-  return runReadThreadInternal(pool, args, metadataProtection);
+  return runReadThreadInternal(pool, args, metadataProtection, options);
 }
 
 export const readThreadEntry: ToolEntry = {

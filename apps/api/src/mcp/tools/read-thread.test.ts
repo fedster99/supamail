@@ -192,6 +192,22 @@ function batchConversationPool() {
 }
 
 describe("read_thread stored assignments", () => {
+  it("can select metadata without inline body columns for hosted hydration", async () => {
+    const { pool, query } = assignedConversationPool();
+
+    const out = await runReadThread(
+      pool as never,
+      { message_id: MESSAGE_SEED },
+      undefined,
+      { includeBody: false }
+    );
+
+    expect(isResult(out)).toBe(true);
+    const select = query.mock.calls.find(([sql]) => String(sql).includes("WITH delivery_representatives"))?.[0];
+    expect(select).toContain("b.raw_truncated");
+    expect(select).not.toContain("b.body_text");
+  });
+
   it("reads several search-result seeds in one call and preserves request order", async () => {
     const { pool, connect, getSyncTrustQueryCount } = batchConversationPool();
 
@@ -401,15 +417,20 @@ describe("read_thread stored assignments", () => {
 
   it("accepts a direct account-scoped conversation selector", async () => {
     const { pool, query } = assignedConversationPool();
-    const out = await runReadThread(pool as never, {
-      conversation_id: "conversation-1",
-      account: ACCOUNT_ID
-    });
+    const out = await runReadThread(
+      pool as never,
+      { conversation_id: "conversation-1", account: ACCOUNT_ID },
+      undefined,
+      { includeBody: false }
+    );
 
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
     expect(out.thread.conversation_id).toBe("conversation-1");
     expect(query.mock.calls.some(([sql]) => sql.includes("WHERE m.id = $1"))).toBe(false);
+    const select = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"))?.[0];
+    expect(select).toContain("b.raw_truncated");
+    expect(select).not.toContain("b.body_text");
   });
 
   it.each([
@@ -474,10 +495,12 @@ describe("read_thread stored assignments", () => {
 
   it("deduplicates a provider selector by active delivery identity with conservative pre-activation fallbacks", async () => {
     const { pool, query } = assignedConversationPool();
-    const out = await runReadThread(pool as never, {
-      thread_id: "provider-thread",
-      account: ACCOUNT_ID
-    });
+    const out = await runReadThread(
+      pool as never,
+      { thread_id: "provider-thread", account: ACCOUNT_ID },
+      undefined,
+      { includeBody: false }
+    );
 
     expect(isResult(out)).toBe(true);
     const providerCall = query.mock.calls.find(([sql]) => sql.includes("WHERE m.provider_thread_id = $1"));
@@ -485,12 +508,19 @@ describe("read_thread stored assignments", () => {
     expect(providerCall?.[0]).toContain("ta.delivery_key");
     expect(providerCall?.[0]).toContain("b.raw_mime_sha256");
     expect(providerCall?.[0]).toContain("public.imap_thread_active_assignments ta");
+    expect(providerCall?.[0]).toContain("b.raw_truncated");
+    expect(providerCall?.[0]).not.toContain("b.body_text");
     expect(providerCall?.[1]).toEqual(["provider-thread", ACCOUNT_ID, 20]);
   });
 
   it("falls back to the legacy one-hop walk when the active run has no assignment", async () => {
     const { pool, query } = unassignedSeedPool();
-    const out = await runReadThread(pool as never, { message_id: LEGACY_SEED });
+    const out = await runReadThread(
+      pool as never,
+      { message_id: LEGACY_SEED },
+      undefined,
+      { includeBody: false }
+    );
 
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
@@ -502,6 +532,8 @@ describe("read_thread stored assignments", () => {
     const legacyCall = query.mock.calls.find(([sql]) => sql.includes("WITH legacy_candidates"));
     expect(legacyCall?.[0]).toContain("DISTINCT ON (m.account_id");
     expect(legacyCall?.[0]).toContain("public.imap_thread_active_assignments ta");
+    expect(legacyCall?.[0]).toContain("b.raw_truncated");
+    expect(legacyCall?.[0]).not.toContain("b.body_text");
   });
 
   it.each([

@@ -46,6 +46,14 @@ interface ReadMessageRow extends MessageDetailRow, ProtectedMetadataColumns {
 }
 
 /**
+ * Library-only switch for hosted callers that hydrate complete bodies from their
+ * own body store. The public MCP tool always leaves this enabled.
+ */
+export interface ReadMessageOptions {
+  includeBody?: boolean;
+}
+
+/**
  * Project `headers_json` to a flat string→string map. The mirror stores parsed
  * headers as JSON; we keep only scalar values (the common select headers) and
  * stringify them so the agent gets a predictable shape.
@@ -139,9 +147,19 @@ export const readMessageDefinition: ToolDefinition = {
 export async function runReadMessage(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: ReadMessageOptions = {}
 ): Promise<(MessageDetail & { sync_trust: SyncTrust }) | ReturnType<typeof toolError>> {
-  const request = readMessageRequestSchema.parse(args);
+  let request: z.infer<typeof readMessageRequestSchema>;
+  try {
+    request = readMessageRequestSchema.parse(args);
+  } catch (error) {
+    return toolError(
+      "invalid_input",
+      error instanceof Error ? error.message : "Invalid arguments.",
+      "Pass one valid message_id and optional body range or header settings."
+    );
+  }
   const includeHeaders = request.include_headers ?? false;
   const includeQuoted = request.include_quoted ?? false;
 
@@ -166,9 +184,10 @@ export async function runReadMessage(
         m.protected_metadata_version,
         m.protected_metadata_key_version,
         m.protected_metadata_tokens,
-        b.body_text,
-        b.body_plain,
-        b.selected_text_part
+        b.raw_truncated,
+        ${options.includeBody === false
+          ? "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"
+          : "b.body_text, b.body_plain, b.selected_text_part"}
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
