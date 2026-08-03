@@ -764,8 +764,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (!message) throw new NotFoundError(`Message not found: ${id}`);
     const includeQuoted = c.req.query("include_quoted") === "true" || c.req.query("include_quoted") === "1";
     const maxCharsRaw = c.req.query("max_chars");
-    // A non-numeric `?max_chars=abc` yields NaN, which would silently disable
-    // truncation; fall back to the default (undefined) on anything non-finite.
+    // A non-numeric value falls back to cleanMessageBody's 4,096-character default.
     const maxCharsParsed = maxCharsRaw ? Number(maxCharsRaw) : undefined;
     const maxChars = Number.isFinite(maxCharsParsed) ? maxCharsParsed : undefined;
     const result = await options.content.cleanMessageBody(id, { includeQuoted, maxChars });

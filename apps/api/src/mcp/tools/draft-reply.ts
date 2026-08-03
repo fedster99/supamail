@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PgPool } from "../../db.js";
-import { DEFAULT_MAX_BODY_CHARS, cleanBody, toolError, withReadOnlyTx } from "../shared.js";
+import { cleanBody, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   METADATA_PROTECTED_FIELDS,
@@ -89,8 +89,8 @@ export const draftReplyDefinition: ToolDefinition = {
     "(original To+Cc minus self), a single 'Re:' subject, RFC 5322 threading headers " +
     "(In-Reply-To / References), and a quoted body. PRODUCE-ONLY: this NEVER sends, " +
     "saves drafts to IMAP, or writes any file — there is no send flag. The returned " +
-    "draftId is a local handle (drf_<source id>), not an IMAP UID. Hand the payload to " +
-    "your own send path to actually deliver it.",
+    "draftId is a local handle (drf_<source id>), not an IMAP UID. Delivery requires " +
+    "a separate send path outside this MCP server.",
   annotations: {
     readOnlyHint: false,
     destructiveHint: false,
@@ -189,14 +189,35 @@ export function buildCc(row: SourceRow): DraftRecipient[] {
   return out;
 }
 
-/** Quote the original body, capping it via cleanBody and prefixing each line "> ". */
+/** Prefix every UTF-8 line without allocating one JavaScript string per line. */
+export function quoteText(text: string): string {
+  if (text.length === 0) return "";
+  const source = Buffer.from(text, "utf8");
+  let lineFeeds = 0;
+  for (const byte of source) {
+    if (byte === 0x0a) lineFeeds += 1;
+  }
+  const output = Buffer.allocUnsafe(source.length + (2 * (lineFeeds + 1)));
+  let position = 0;
+  output[position++] = 0x3e; // >
+  output[position++] = 0x20; // space
+  for (const byte of source) {
+    output[position++] = byte;
+    if (byte !== 0x0a) continue;
+    output[position++] = 0x3e;
+    output[position++] = 0x20;
+  }
+  return output.toString("utf8");
+}
+
+/** Quote the full available original body without allocating one string per line. */
 function quoteOriginal(row: SourceRow): string {
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
-  const cleaned = cleanBody(raw, { includeQuoted: true, maxChars: DEFAULT_MAX_BODY_CHARS });
+  const cleaned = cleanBody(raw, { includeQuoted: true });
   const text = cleaned.text ?? "";
   const fromLabel = row.from_name ? `${row.from_name} <${row.from_email ?? ""}>` : row.from_email ?? "unknown sender";
   const attribution = `On ${row.internal_date.toISOString()}, ${fromLabel} wrote:`;
-  const quoted = text.length === 0 ? "" : text.split("\n").map((line) => `> ${line}`).join("\n");
+  const quoted = quoteText(text);
   return `${attribution}\n${quoted}`;
 }
 

@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_BODY_CHARS, cleanBody } from "./shared.js";
-import { buildCc, buildReferences, reSubject } from "./tools/draft-reply.js";
+import { describe, expect, it, vi } from "vitest";
+import { cleanBody, mapMessageRow, withReadOnlyTx } from "./shared.js";
+import { buildCc, buildReferences, quoteText, reSubject } from "./tools/draft-reply.js";
 
 /**
  * No-DB unit suite for the pure MCP helpers (ADR 0014/0016). These run in the
@@ -26,6 +26,7 @@ describe("cleanBody", () => {
     expect(out.text).not.toContain(">");
     expect(out.text).not.toContain("My Signature");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual(["quoted_reply_tail"]);
   });
 
   it("keeps the attribution, quote, and signature when includeQuoted is true", () => {
@@ -34,24 +35,215 @@ describe("cleanBody", () => {
     expect(out.text).toContain("> quoted line one");
     expect(out.text).toContain("My Signature");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual([]);
   });
 
-  it("truncates a body longer than the cap and marks truncated", () => {
-    const long = "x".repeat(DEFAULT_MAX_BODY_CHARS + 500);
+  it("returns a large body in full when no explicit bound is supplied", () => {
+    const long = "x".repeat(733_287);
     const out = cleanBody(long, { includeQuoted: true });
-    expect(out.text).not.toBeNull();
-    expect((out.text ?? "").length).toBeLessThanOrEqual(DEFAULT_MAX_BODY_CHARS);
-    expect(out.truncated).toBe(true);
+    expect(out.text).toBe(long);
+    expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual([]);
   });
 
   it("does not mark a short body as truncated", () => {
     const out = cleanBody("short body", { includeQuoted: true });
     expect(out.text).toBe("short body");
     expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual([]);
   });
 
   it("returns {text:null, truncated:false} for null input", () => {
-    expect(cleanBody(null, { includeQuoted: false })).toEqual({ text: null, truncated: false });
+    expect(cleanBody(null, { includeQuoted: false })).toEqual({
+      text: null,
+      truncated: false,
+      totalChars: 0,
+      offset: 0,
+      nextOffset: null,
+      omissions: []
+    });
+  });
+
+  it.each([
+    [
+      "a wrapped attribution",
+      "New answer.\n\nOn Friday, August 1, 2026, Alice <alice@example.com>\nwrote:\n> Old answer.\n> Older answer."
+    ],
+    [
+      "a trailing quote-only block",
+      "New answer.\n\n> Old answer.\n> Older answer."
+    ]
+  ])("keeps only authored text before %s", (_label, body) => {
+    const out = cleanBody(body, { includeQuoted: false });
+    expect(out.text).toBe("New answer.");
+    expect(out.truncated).toBe(false);
+    expect(out.omissions).toEqual(["quoted_reply_tail"]);
+  });
+
+  it("keeps forwarded and ambiguous mail-client blocks", () => {
+    const forwarded = "Please review this.\n\n---------- Forwarded message ---------\nFrom: Alice\nSubject: Plan";
+    const original = "From: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThis is the original email.";
+    const outlook = "Please review this.\n\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: Plan\n\nThe incident started here.";
+    const originalMessage = "Please review this.\n\n-----Original Message-----\nFrom: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThe incident started here.";
+
+    expect(cleanBody(forwarded, { includeQuoted: false }).text).toBe(forwarded);
+    expect(cleanBody(original, { includeQuoted: false }).text).toBe(original);
+    expect(cleanBody(outlook, { includeQuoted: false }).text).toBe(outlook);
+    expect(cleanBody(originalMessage, { includeQuoted: false }).text).toBe(originalMessage);
+  });
+
+  it("reports a removed signature", () => {
+    const out = cleanBody("New answer.\n-- \nAlice", { includeQuoted: false });
+    expect(out.text).toBe("New answer.");
+    expect(out.omissions).toEqual(["signature"]);
+  });
+
+  it("returns a requested range with a stable continuation offset", () => {
+    const out = cleanBody("0123456789", {
+      includeQuoted: false,
+      offset: 3,
+      maxChars: 4
+    });
+
+    expect(out).toEqual({
+      text: "3456",
+      truncated: true,
+      totalChars: 10,
+      offset: 3,
+      nextOffset: 7,
+      omissions: ["outside_requested_range"]
+    });
+    expect(cleanBody("0123456789", {
+      includeQuoted: false,
+      offset: out.nextOffset ?? 0
+    })).toEqual({
+      text: "789",
+      truncated: false,
+      totalChars: 10,
+      offset: 7,
+      nextOffset: null,
+      omissions: ["outside_requested_range"]
+    });
+  });
+
+  it("counts Unicode code points and does not split a surrogate pair", () => {
+    const first = cleanBody("A😀B", {
+      includeQuoted: true,
+      maxChars: 2
+    });
+    expect(first).toEqual({
+      text: "A😀",
+      truncated: true,
+      totalChars: 3,
+      offset: 0,
+      nextOffset: 2,
+      omissions: ["outside_requested_range"]
+    });
+    expect(cleanBody("A😀B", {
+      includeQuoted: true,
+      offset: first.nextOffset ?? 0,
+      maxChars: 1
+    })).toEqual({
+      text: "B",
+      truncated: false,
+      totalChars: 3,
+      offset: 2,
+      nextOffset: null,
+      omissions: ["outside_requested_range"]
+    });
+  });
+
+  it("returns an empty final range when the offset is beyond the body", () => {
+    expect(cleanBody("short", {
+      includeQuoted: true,
+      offset: 100,
+      maxChars: 4
+    })).toEqual({
+      text: "",
+      truncated: false,
+      totalChars: 5,
+      offset: 5,
+      nextOffset: null,
+      omissions: ["outside_requested_range"]
+    });
+  });
+});
+
+describe("mapMessageRow", () => {
+  it("keeps sync source truncation distinct from an explicit response range", () => {
+    const message = mapMessageRow({
+      id: "message-1",
+      account_id: "account-1",
+      folder_path: "INBOX",
+      provider_thread_id: null,
+      subject: "Partial source",
+      from_email: "alice@example.test",
+      from_name: "Alice",
+      to_emails: ["me@example.test"],
+      cc_emails: [],
+      flags: [],
+      window_status: "IN_WINDOW",
+      internal_date: new Date("2026-08-01T00:00:00.000Z"),
+      body_text: "0123456789",
+      body_plain: null,
+      selected_text_part: null,
+      raw_truncated: true,
+      attachments: []
+    }, { includeQuoted: true, maxChars: 4, includeBodyRange: true });
+
+    expect(message).toMatchObject({
+      body: "0123",
+      body_content_status: "partial",
+      body_omissions: ["source_truncated", "outside_requested_range"],
+      body_truncated: true,
+      body_total_chars: 10,
+      body_next_offset: 4
+    });
+  });
+});
+
+describe("quoteText", () => {
+  it("prefixes empty and trailing lines without a per-line string array", () => {
+    expect(quoteText("first\n\nlast\n")).toBe("> first\n> \n> last\n> ");
+  });
+});
+
+describe("withReadOnlyTx", () => {
+  it("evicts the client when rollback fails", async () => {
+    const workError = new Error("read failed");
+    const rollbackError = new Error("rollback failed");
+    const query = vi.fn(async (sql: string) => {
+      if (sql === "ROLLBACK") throw rollbackError;
+      return { rows: [] };
+    });
+    const release = vi.fn();
+    const pool = {
+      connect: vi.fn(async () => ({ query, release })),
+    } as never;
+
+    await expect(withReadOnlyTx(pool, async () => {
+      throw workError;
+    })).rejects.toBe(workError);
+
+    expect(query).toHaveBeenLastCalledWith("ROLLBACK");
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(rollbackError);
+  });
+
+  it("releases the client normally after a successful rollback", async () => {
+    const workError = new Error("read failed");
+    const query = vi.fn(async () => ({ rows: [] }));
+    const release = vi.fn();
+    const pool = {
+      connect: vi.fn(async () => ({ query, release })),
+    } as never;
+
+    await expect(withReadOnlyTx(pool, async () => {
+      throw workError;
+    })).rejects.toBe(workError);
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith(undefined);
   });
 });
 

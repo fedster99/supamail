@@ -14,14 +14,15 @@ import {
 } from "../../metadata-protection.js";
 
 /**
- * `read_thread` — reassemble a conversation from the mirror and return every
- * message in it, oldest first, with cleaned bodies and a flat attachments index.
+ * `read_thread` — reassemble one or more conversations from the mirror and
+ * return each thread's messages oldest first, with cleaned bodies and a flat
+ * attachments index.
  *
- * Seed by a `message_id` (any message in the thread), a durable
- * `conversation_id`, or the legacy provider `thread_id`. A message with a stored
- * assignment resolves through the complete account-scoped conversation and
- * mirrored delivery copies collapse to one deterministic representative. The
- * old one-hop References walk remains only as a compatibility fallback for
+ * Seed by one `message_id` (any message in the thread), 1 to 10 `message_ids`, a
+ * durable `conversation_id`, or the legacy provider `thread_id`. A message with
+ * a stored assignment resolves through the complete account-scoped conversation
+ * and mirrored delivery copies collapse to one deterministic representative.
+ * The old one-hop References walk remains only as a compatibility fallback for
  * messages that have not been assigned yet.
  *
  * Read-only by construction (SELECTs inside {@link withReadOnlyTx}); never sends,
@@ -30,6 +31,8 @@ import {
 
 const DEFAULT_MAX_MESSAGES = 20;
 const MAX_MESSAGES_CEILING = 100;
+const MAX_THREAD_BATCH = 10;
+const THREAD_BATCH_CONCURRENCY = 4;
 
 /**
  * Collapse physical mailbox occurrences only when we have delivery-identity
@@ -64,7 +67,8 @@ const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
  * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
-const THREAD_SELECT = `
+function threadSelect(includeBody: boolean): string {
+  return `
   m.id,
   m.account_id,
   m.folder_path,
@@ -82,12 +86,14 @@ const THREAD_SELECT = `
   m.protected_metadata_version,
   m.protected_metadata_key_version,
   m.protected_metadata_tokens,
-  b.body_text,
-  b.body_plain,
-  b.selected_text_part,
+  b.raw_truncated,
+  ${includeBody
+    ? "b.body_text, b.body_plain, b.selected_text_part"
+    : "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"},
   stats.total_count AS thread_total_count,
   stats.participants AS thread_participants
 `;
+}
 
 type ThreadRow = MessageDetailRow & ProtectedMetadataColumns & {
   conversation_id: string | null;
@@ -107,11 +113,20 @@ type SeedRow = ThreadSeedRow & { conversation_id: string | null };
 
 export interface ReadThreadArgs {
   message_id?: string;
+  message_ids?: string[];
   conversation_id?: string;
   thread_id?: string;
   account?: string;
   include_quoted?: boolean;
   max_messages?: number;
+}
+
+/**
+ * Library-only switch for hosted callers that hydrate complete bodies from their
+ * own body store. The public MCP tool always leaves this enabled.
+ */
+export interface ReadThreadOptions {
+  includeBody?: boolean;
 }
 
 /**
@@ -122,12 +137,13 @@ export interface ReadThreadArgs {
  */
 export const readThreadRequestSchema = z
   .object({
-    message_id: z.string().optional(),
+    message_id: z.string().uuid().optional(),
+    message_ids: z.array(z.string().uuid()).min(1).max(MAX_THREAD_BATCH).optional(),
     conversation_id: z.string().optional(),
     thread_id: z.string().optional(),
     account: z.string().uuid().optional(),
     include_quoted: z.boolean().optional(),
-    max_messages: z.number().optional()
+    max_messages: z.number().int().min(1).max(MAX_MESSAGES_CEILING).optional()
   })
   .strict();
 
@@ -142,24 +158,39 @@ export interface ReadThreadResult {
   messages: MessageDetail[];
   attachments_index: Array<{ message_id: string } & MessageAttachment>;
   omitted_message_count: number;
+  thread_content_status: "complete" | "partial";
+  thread_omissions: Array<"older_messages">;
   sync_trust: SyncTrust;
+}
+
+export interface ReadThreadBatchResult {
+  threads: Array<
+    | { message_id: string; result: ReadThreadResult }
+    | { message_id: string; error: ReturnType<typeof toolError>["error"] }
+  >;
 }
 
 export const readThreadDefinition: ToolDefinition = {
   name: "read_thread",
-  title: "Read a full email thread (read-only)",
+  title: "Read one or more email threads (read-only)",
   description:
-    "Reassemble and read a whole conversation from the SupaMail mirror. Provide either a " +
-    "message_id (any message in the thread, used as the seed), a durable conversation_id, " +
-    "or a legacy provider thread_id. Direct conversation/thread selectors require account. " +
-    "Returns the thread's messages oldest-first with cleaned plain-text " +
-    "bodies (quoted reply tails and signatures stripped unless include_quoted=true), the " +
+    "Reassemble and read one or more conversations from the SupaMail mirror. Supported selectors are " +
+    "message_id (any message in the thread), message_ids (1 to 10 seeds), a durable " +
+    "conversation_id, or a legacy provider thread_id. Direct conversation/thread selectors " +
+    "require account. Duplicate message_ids are collapsed in first-occurrence order; each " +
+    "distinct seed has its own result or error entry. " +
+    "Returns the thread's messages oldest-first. Replies contain newly authored plain text by default. " +
+    "When no older messages were omitted, the oldest mirrored message keeps quoted content. " +
+    "Each message contains its full cleaned body. Recognized quoted reply tails and signatures " +
+    "are stripped unless include_quoted=true. Returns the " +
     "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
     "provider-threaded siblings only when the seed has no stored assignment. Capped to " +
-    "max_messages (default 20), keeping the NEWEST when over the cap; omitted_message_count " +
-    "reports how many were dropped. READ-ONLY: never sends, deletes, moves, or modifies mail.",
+    "max_messages (default 20), keeping the NEWEST when over the cap; thread_content_status, " +
+    "thread_omissions, and omitted_message_count explicitly report missing older messages. " +
+    "Each message's body_content_status and body_omissions explicitly report absent source text. " +
+    "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -169,15 +200,54 @@ export const readThreadDefinition: ToolDefinition = {
   inputSchema: {
     type: "object",
     additionalProperties: false,
-    anyOf: [
-      { required: ["message_id"] },
-      { required: ["conversation_id", "account"] },
-      { required: ["thread_id", "account"] }
+    oneOf: [
+      {
+        required: ["message_id"],
+        not: { anyOf: [
+          { required: ["message_ids"] },
+          { required: ["conversation_id"] },
+          { required: ["thread_id"] }
+        ] }
+      },
+      {
+        required: ["message_ids"],
+        not: { anyOf: [
+          { required: ["message_id"] },
+          { required: ["conversation_id"] },
+          { required: ["thread_id"] }
+        ] }
+      },
+      {
+        required: ["conversation_id", "account"],
+        not: { anyOf: [
+          { required: ["message_id"] },
+          { required: ["message_ids"] },
+          { required: ["thread_id"] }
+        ] }
+      },
+      {
+        required: ["thread_id", "account"],
+        not: { anyOf: [
+          { required: ["message_id"] },
+          { required: ["message_ids"] },
+          { required: ["conversation_id"] }
+        ] }
+      }
     ],
     properties: {
       message_id: {
         type: "string",
+        format: "uuid",
+        minLength: 36,
+        maxLength: 36,
         description: "A message UUID to seed the thread from (any message in the conversation)."
+      },
+      message_ids: {
+        type: "array",
+        minItems: 1,
+        maxItems: MAX_THREAD_BATCH,
+        items: { type: "string", format: "uuid", minLength: 36, maxLength: 36 },
+        description: "One to 10 message UUIDs. Duplicate seeds are collapsed in first-occurrence order."
       },
       conversation_id: {
         type: "string",
@@ -194,7 +264,9 @@ export const readThreadDefinition: ToolDefinition = {
       include_quoted: {
         type: "boolean",
         default: false,
-        description: "Keep quoted reply tails and signatures in each body (default false strips them)."
+        description:
+          "Keep quoted reply tails and signatures in every body. By default, replies are cleaned; " +
+          "when no older messages were omitted, the oldest mirrored message keeps quoted content."
       },
       max_messages: {
         type: "integer",
@@ -286,7 +358,8 @@ async function fetchThreadRows(
     | { kind: "conversation"; conversationId: string; accountId: string }
     | { kind: "provider-thread"; threadId: string; accountId: string }
     | { kind: "keys"; seed: SeedRow },
-  maxMessages: number
+  maxMessages: number,
+  { includeBody = true }: ReadThreadOptions
 ): Promise<FetchedThread> {
   if (selector.kind === "conversation") {
     const result = await client.query<ThreadRow>(
@@ -307,7 +380,7 @@ async function fetchThreadRows(
           m.folder_path ASC,
           m.id ASC
       )${boundedThreadCtes("$3")}
-      SELECT ${THREAD_SELECT}
+      SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
       LEFT JOIN public.imap_thread_active_assignments ta
@@ -343,7 +416,7 @@ async function fetchThreadRows(
           m.folder_path ASC,
           m.id ASC
       )${boundedThreadCtes("$3")}
-      SELECT ${THREAD_SELECT}
+      SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
       LEFT JOIN public.imap_thread_active_assignments ta
@@ -388,7 +461,7 @@ async function fetchThreadRows(
         m.folder_path ASC,
         m.id ASC
     )${boundedThreadCtes("$5")}
-    SELECT ${THREAD_SELECT}
+    SELECT ${threadSelect(includeBody)}
     FROM limited_representatives representative
     JOIN public.imap_messages m ON m.id = representative.id
     LEFT JOIN public.imap_thread_active_assignments ta
@@ -403,11 +476,12 @@ async function fetchThreadRows(
   return summarizeFetchedRows(result.rows);
 }
 
-export async function runReadThread(
+async function runReadThreadInternal(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
-): Promise<ReadThreadResult | ReturnType<typeof toolError>> {
+  metadataProtection: MetadataProtectionAdapter,
+  options: ReadThreadOptions
+): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
     input = readThreadRequestSchema.parse(args ?? {});
@@ -415,8 +489,64 @@ export async function runReadThread(
     return toolError(
       "invalid_input",
       error instanceof Error ? error.message : "Invalid arguments.",
-      "Pass message_id, or pass conversation_id/thread_id together with the account UUID."
+      "Pass message_id, message_ids, or conversation_id/thread_id together with the account UUID."
     );
+  }
+
+  const selectorCount = [
+    input.message_id,
+    input.message_ids,
+    input.conversation_id,
+    input.thread_id
+  ].filter((value) => value !== undefined).length;
+  if (selectorCount > 1) {
+    return toolError(
+      "invalid_input",
+      "read_thread accepts one selector mode at a time.",
+      "Pass one message_id, one message_ids batch, or one account-scoped conversation/thread id."
+    );
+  }
+
+  if (input.message_ids) {
+    const messageIds = [...new Set(input.message_ids)];
+    const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
+    let nextIndex = 0;
+    // Each item owns one snapshot, including sync_trust. Sharing trust across
+    // items could describe a different mirror state than the returned thread.
+    await Promise.all(Array.from(
+      { length: Math.min(THREAD_BATCH_CONCURRENCY, messageIds.length) },
+      async () => {
+        while (nextIndex < messageIds.length) {
+          const index = nextIndex++;
+          const messageId = messageIds[index];
+          try {
+            const result = await runReadThreadInternal(pool, {
+              message_id: messageId,
+              account: input.account,
+              include_quoted: input.include_quoted,
+              max_messages: input.max_messages
+            }, metadataProtection, options);
+            if ("thread" in result) {
+              threads[index] = { message_id: messageId, result };
+            } else if ("error" in result) {
+              threads[index] = { message_id: messageId, error: result.error };
+            } else {
+              throw new Error("unexpected nested read_thread batch result");
+            }
+          } catch {
+            threads[index] = {
+              message_id: messageId,
+              error: toolError(
+                "tool_failed",
+                "Thread could not be read.",
+                "Retry this thread or remove it from the batch."
+              ).error
+            };
+          }
+        }
+      }
+    ));
+    return { threads };
   }
 
   const messageId = typeof input.message_id === "string" ? input.message_id : undefined;
@@ -426,8 +556,8 @@ export async function runReadThread(
   if (!messageId && !conversationId && !threadId) {
     return toolError(
       "invalid_input",
-      "read_thread requires message_id, conversation_id, or thread_id.",
-      "Pass message_id, or pass conversation_id/thread_id together with account."
+      "read_thread requires message_id, message_ids, conversation_id, or thread_id.",
+      "Pass message_id/message_ids, or pass conversation_id/thread_id together with account."
     );
   }
 
@@ -440,10 +570,7 @@ export async function runReadThread(
       "Provider and conversation identifiers are account-scoped; pass account as a UUID."
     );
   }
-  // Number.isFinite guards NaN/Infinity so the newest-keeping cap is never
-  // silently disabled; non-finite falls back to the default.
-  const requestedMax = Number.isFinite(input.max_messages as number) ? (input.max_messages as number) : DEFAULT_MAX_MESSAGES;
-  const maxMessages = Math.max(1, Math.min(MAX_MESSAGES_CEILING, Math.floor(requestedMax)));
+  const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;
 
   return withReadOnlyTx(pool, async (client) => {
     let fetched: FetchedThread;
@@ -456,14 +583,14 @@ export async function runReadThread(
         kind: "conversation",
         conversationId,
         accountId: accountScope!
-      }, maxMessages);
+      }, maxMessages, options);
       accountIds = [accountScope!];
     } else if (threadId) {
       fetched = await fetchThreadRows(client, {
         kind: "provider-thread",
         threadId,
         accountId: accountScope!
-      }, maxMessages);
+      }, maxMessages, options);
       accountIds = [accountScope!];
     } else {
       const seedResult = await client.query<SeedRow>(
@@ -495,9 +622,9 @@ export async function runReadThread(
           kind: "conversation",
           conversationId: seed.conversation_id,
           accountId: seed.account_id
-        }, maxMessages);
+        }, maxMessages, options);
       } else {
-        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages);
+        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages, options);
       }
       accountIds = [seed.account_id];
     }
@@ -512,7 +639,6 @@ export async function runReadThread(
       );
     }
 
-    // sync_trust computed inside the open tx (buildSyncTrust) to avoid a second connection; syncTrustFor is the standalone equivalent.
     const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
 
     const attachments = await loadMessageAttachments(
@@ -536,7 +662,11 @@ export async function runReadThread(
     const kept = rows.length > maxMessages ? rows.slice(rows.length - maxMessages) : rows;
     const omitted = Math.max(0, totalCount - kept.length);
 
-    const messages = kept.map((row) => mapMessageRow(row, { includeQuoted }));
+    const messages = kept.map((row, index) => mapMessageRow(row, {
+      // Keep quoted content in the oldest mirrored message when it was not
+      // removed by the message cap.
+      includeQuoted: includeQuoted || (omitted === 0 && index === 0)
+    }));
     const attachmentsIndex = messages.flatMap((message) =>
       message.attachments.map((att) => ({ message_id: message.message_id, ...att }))
     );
@@ -562,9 +692,20 @@ export async function runReadThread(
       messages,
       attachments_index: attachmentsIndex,
       omitted_message_count: omitted,
+      thread_content_status: omitted > 0 ? "partial" : "complete",
+      thread_omissions: omitted > 0 ? ["older_messages"] : [],
       sync_trust: syncTrust
     };
   });
+}
+
+export function runReadThread(
+  pool: PgPool,
+  args: unknown,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: ReadThreadOptions = {}
+): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
+  return runReadThreadInternal(pool, args, metadataProtection, options);
 }
 
 export const readThreadEntry: ToolEntry = {

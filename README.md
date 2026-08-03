@@ -202,6 +202,13 @@ The MCP server exposes five agent tools: `search_email`, `read_message`,
 `read_thread`, `list_folders`, and `draft_reply`. It uses local stdio transport,
 reads the same `DATABASE_URL`, and has no remote listener or send capability.
 
+`read_thread` accepts one message seed or a batch of up to ten `message_ids`,
+preserving first-seen order and isolating each thread's result or error.
+`read_message` and `read_thread` return the full available cleaned body for each
+message. `read_message` also accepts an optional body range without a product
+character ceiling. Every message and thread explicitly reports whether text or
+older messages are absent and gives the exact omission reason.
+
 ```bash
 pnpm build
 DATABASE_URL=postgresql://... \
@@ -353,6 +360,12 @@ new MirrorEngine({
   }
 });
 ```
+
+The `@supamail/api` barrel also exports the shared MCP registry, handlers, and
+`MCP_INSTRUCTIONS` for deployment wrappers. Its `cleanBody` TypeScript helper
+uses camelCase options and range metadata (`includeQuoted`, `offset`, `maxChars`,
+`totalChars`, `nextOffset`, and `omissions`); MCP requests and results use the
+snake_case field names documented in the Agent Email Guide.
 
 ## Deployment Options
 

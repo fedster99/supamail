@@ -128,6 +128,13 @@ liveDb("draft_reply live DB", () => {
       referencesHeader: null,
       body: "No message id here."
     });
+
+    await seedMessage({
+      uid: 3,
+      subject: "Long source",
+      fromEmail: "long@example.com",
+      body: `${"x".repeat(4_097)}END MARKER`
+    });
   });
 
   afterAll(async () => {
@@ -191,6 +198,12 @@ liveDb("draft_reply live DB", () => {
     expect(draft.headers.References).toBe("<earlier@other.com>");
     expect(draft.subject).toBe("Re:");
     expect(draft.warnings.some((w) => w.includes("Message-ID"))).toBe(true);
+  });
+
+  it("quotes the full available source instead of silently shortening it", async () => {
+    const draft = await runDraftReply(pool, { source_message_id: idByUid.get(3), body: "Thanks." });
+    isDraft(draft);
+    expect(draft.body.text).toContain(`> ${"x".repeat(4_097)}END MARKER`);
   });
 
   it("returns a not_found error for an unknown source id", async () => {

@@ -139,7 +139,7 @@ liveDb("read_thread live DB", () => {
       providerThreadId: THREAD_ID,
       rfcMessageId: "<root@acme.com>",
       messageIdNormalized: "root@acme.com",
-      body: "Let's kick off the project on Monday.",
+      body: "Let's kick off the project on Monday.\n\nFrom: Prior Author\nSent: Friday\nTo: Alice\nSubject: Forwarded context\n\nOriginal starter details.",
       attachments: [
         { filename: "agenda.pdf", mimeType: "application/pdf", sizeBytes: 1024, partNumber: "2", disposition: "attachment" }
       ]
@@ -247,7 +247,7 @@ liveDb("read_thread live DB", () => {
       providerThreadId: THREAD_ID,
       rfcMessageId: "<root@acme.com>",
       messageIdNormalized: "root@acme.com",
-      body: "Let's kick off the project on Monday."
+      body: "Let's kick off the project on Monday.\n\nFrom: Prior Author\nSent: Friday\nTo: Alice\nSubject: Forwarded context\n\nOriginal starter details."
     });
     await seedMessage({
       uid: 10,
@@ -407,11 +407,47 @@ liveDb("read_thread live DB", () => {
     if (!isResult(stripped) || !isResult(withQuotes)) return;
 
     const strippedBody = stripped.messages.find((m) => m.message_id === idByUid.get(2))?.body ?? "";
+    const starterBody = stripped.messages.find((m) => m.message_id === idByUid.get(1))?.body ?? "";
     const quotedBody = withQuotes.messages.find((m) => m.message_id === idByUid.get(2))?.body ?? "";
+    expect(starterBody).toContain("Original starter details.");
     expect(strippedBody).toContain("Sounds good.");
     expect(strippedBody).not.toContain("Alice wrote:");
     expect(strippedBody).not.toContain("Bob");
     expect(quotedBody).toContain("Alice wrote:");
+    expect(stripped.messages.find((m) => m.message_id === idByUid.get(2))).toMatchObject({
+      body_content_status: "partial",
+      body_omissions: ["quoted_reply_tail"]
+    });
+    expect(withQuotes.messages.find((m) => m.message_id === idByUid.get(2))).toMatchObject({
+      body_content_status: "complete",
+      body_omissions: []
+    });
+  });
+
+  it("returns a large message body in full", async () => {
+    const messageId = idByUid.get(3)!;
+    const body = `${"x".repeat(40_000)}END MARKER`;
+    await pool.query(
+      "UPDATE public.imap_message_bodies SET body_text = $2 WHERE message_id = $1",
+      [messageId, body]
+    );
+
+    try {
+      const out = await runReadThread(pool, { message_id: messageId });
+      expect(isResult(out)).toBe(true);
+      if (!isResult(out)) return;
+      expect(out.messages.find((message) => message.message_id === messageId)).toMatchObject({
+        body,
+        body_content_status: "complete",
+        body_omissions: [],
+        body_truncated: false
+      });
+    } finally {
+      await pool.query(
+        "UPDATE public.imap_message_bodies SET body_text = $2 WHERE message_id = $1",
+        [messageId, "Carol, joining you both."]
+      );
+    }
   });
 
   it("collects distinct participants and a flat attachments_index", async () => {
@@ -440,6 +476,9 @@ liveDb("read_thread live DB", () => {
     expect(out.messages.map((m) => m.message_id)).toEqual([idByUid.get(2), idByUid.get(3)]);
     expect(out.thread.message_count).toBe(3);
     expect(out.omitted_message_count).toBe(1);
+    expect(out.thread_content_status).toBe("partial");
+    expect(out.thread_omissions).toEqual(["older_messages"]);
+    expect(out.messages[0].body).not.toContain("Alice wrote:");
   });
 
   it("reconstructs a header-only (no provider_thread_id) thread from the middle seed", async () => {

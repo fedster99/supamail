@@ -27,9 +27,11 @@ import {
  */
 export const readMessageRequestSchema = z
   .object({
-    message_id: z.string().min(1),
+    message_id: z.string().uuid(),
     include_headers: z.boolean().optional(),
-    include_quoted: z.boolean().optional()
+    include_quoted: z.boolean().optional(),
+    body_offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    max_body_chars: z.number().int().min(1).optional()
   })
   .strict();
 
@@ -41,6 +43,14 @@ export const readMessageRequestSchema = z
  */
 interface ReadMessageRow extends MessageDetailRow, ProtectedMetadataColumns {
   headers_json: Record<string, unknown> | null;
+}
+
+/**
+ * Library-only switch for hosted callers that hydrate complete bodies from their
+ * own body store. The public MCP tool always leaves this enabled.
+ */
+export interface ReadMessageOptions {
+  includeBody?: boolean;
 }
 
 /**
@@ -70,10 +80,15 @@ export const readMessageDefinition: ToolDefinition = {
   title: "Read one mirrored email (read-only)",
   description:
     "Fetch a single mirrored email by its stable message_id (the id returned by search_email " +
-    "or read_thread). Returns the full cleaned plain-text body, the from/to/cc envelope, flags, " +
+    "or read_thread). By default, the body contains the newly authored plain text, with " +
+    "recognized quoted reply tails and signatures removed. It returns the full cleaned body. " +
+    "body_offset and max_body_chars can return a specific range without a product character ceiling; " +
+    "body_total_chars, body_next_offset, body_truncated, body_content_status, and body_omissions " +
+    "state whether text is absent and why. " +
+    "Also returns the from/to/cc envelope, flags, " +
     "window_status, and the attachments list (filename, mime_type, size_bytes, disposition — " +
-    "including inline parts). Pass include_quoted=true to keep the quoted reply tail and " +
-    "signature; include_headers=true to attach parsed select headers. Attachment BYTES are not " +
+    "including inline parts). include_quoted=true retains the quoted reply tail and " +
+    "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
     "mirrored (metadata only). Always attaches a sync_trust block describing mirror completeness. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
@@ -89,6 +104,9 @@ export const readMessageDefinition: ToolDefinition = {
     properties: {
       message_id: {
         type: "string",
+        format: "uuid",
+        minLength: 36,
+        maxLength: 36,
         description: "The stable message id (imap_messages.id) returned by search_email or read_thread."
       },
       include_headers: {
@@ -100,6 +118,18 @@ export const readMessageDefinition: ToolDefinition = {
         type: "boolean",
         default: false,
         description: "Keep the quoted reply tail + signature instead of stripping them (default false)."
+      },
+      body_offset: {
+        type: "integer",
+        minimum: 0,
+        maximum: Number.MAX_SAFE_INTEGER,
+        default: 0,
+        description: "Optional character offset at which to start the cleaned body (default 0)."
+      },
+      max_body_chars: {
+        type: "integer",
+        minimum: 1,
+        description: "Optional positive body range size. Omit it to return the full remaining cleaned body."
       }
     }
   }
@@ -117,9 +147,19 @@ export const readMessageDefinition: ToolDefinition = {
 export async function runReadMessage(
   pool: PgPool,
   args: unknown,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: ReadMessageOptions = {}
 ): Promise<(MessageDetail & { sync_trust: SyncTrust }) | ReturnType<typeof toolError>> {
-  const request = readMessageRequestSchema.parse(args);
+  let request: z.infer<typeof readMessageRequestSchema>;
+  try {
+    request = readMessageRequestSchema.parse(args);
+  } catch (error) {
+    return toolError(
+      "invalid_input",
+      error instanceof Error ? error.message : "Invalid arguments.",
+      "Pass one valid message_id and optional body range or header settings."
+    );
+  }
   const includeHeaders = request.include_headers ?? false;
   const includeQuoted = request.include_quoted ?? false;
 
@@ -144,9 +184,10 @@ export async function runReadMessage(
         m.protected_metadata_version,
         m.protected_metadata_key_version,
         m.protected_metadata_tokens,
-        b.body_text,
-        b.body_plain,
-        b.selected_text_part
+        b.raw_truncated,
+        ${options.includeBody === false
+          ? "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"
+          : "b.body_text, b.body_plain, b.selected_text_part"}
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
@@ -171,7 +212,13 @@ export async function runReadMessage(
   );
   const served = { ...revealed, provider_thread_id: row.provider_thread_id };
   const headers = includeHeaders ? projectHeaders(served.headers_json) : undefined;
-  const detail = mapMessageRow(served, { includeQuoted, headers });
+  const detail = mapMessageRow(served, {
+    includeQuoted,
+    headers,
+    offset: request.body_offset,
+    maxChars: request.max_body_chars,
+    includeBodyRange: true
+  });
   const sync_trust = await syncTrustFor(pool, [row.account_id], metadataProtection);
 
   return { ...detail, sync_trust };

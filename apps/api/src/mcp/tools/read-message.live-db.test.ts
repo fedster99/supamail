@@ -254,6 +254,54 @@ liveDb("read_message tool live DB", () => {
     const res = await runReadMessage(pool, { message_id: idByUid.get(3)! });
     if ("error" in res) throw new Error("unexpected error envelope");
     expect(res.body).toBeNull();
+    expect(res.body_content_status).toBe("unavailable");
+    expect(res.body_omissions).toEqual([]);
     expect(res.body_truncated).toBe(false);
+    expect(res.body_offset).toBe(0);
+    expect(res.body_total_chars).toBe(0);
+    expect(res.body_next_offset).toBeNull();
+  });
+
+  it("returns the full available cleaned body", async () => {
+    const messageId = idByUid.get(2)!;
+    const body = "x".repeat(40_000) + "END MARKER";
+    await pool.query(
+      "UPDATE public.imap_message_bodies SET body_plain = $2 WHERE message_id = $1",
+      [messageId, body]
+    );
+
+    const result = await runReadMessage(pool, { message_id: messageId });
+    if ("error" in result) throw new Error("unexpected error envelope");
+    expect(result.body).toBe(body);
+    expect(result.body_content_status).toBe("complete");
+    expect(result.body_omissions).toEqual([]);
+    expect(result.body_truncated).toBe(false);
+    expect(result.body_offset).toBe(0);
+    expect(result.body_total_chars).toBe(40_010);
+    expect(result.body_next_offset).toBeNull();
+  });
+
+  it("returns an explicit body range when requested", async () => {
+    const messageId = idByUid.get(2)!;
+    await pool.query(
+      "UPDATE public.imap_message_bodies SET body_plain = $2 WHERE message_id = $1",
+      [messageId, "0123456789"]
+    );
+
+    const result = await runReadMessage(pool, {
+      message_id: messageId,
+      body_offset: 3,
+      max_body_chars: 4
+    });
+    if ("error" in result) throw new Error("unexpected error envelope");
+    expect(result).toMatchObject({
+      body: "3456",
+      body_content_status: "partial",
+      body_omissions: ["outside_requested_range"],
+      body_truncated: true,
+      body_offset: 3,
+      body_total_chars: 10,
+      body_next_offset: 7
+    });
   });
 });

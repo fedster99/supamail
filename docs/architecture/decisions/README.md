@@ -24,7 +24,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0017-send-primitive.md`: SMTP send/reply is a single reusable primitive authored outside the agent surface; the agent surface stays zero-send and the sync adapter stays read-only.
 - `0018-organize-mutations.md`: Mark/star/move/delete + thread fan-out + folder CRUD are UID-addressed write-only verbs outside the agent surface; the mirror reconciles on the next sync.
 - `0019-drafts-crud.md`: Draft CRUD (create/list/get/update/send/delete) saved to the provider Drafts folder is a composition of the send + organize primitives; update is append-new + delete-old (IMAP drafts are immutable); the agent surface stays zero-send.
-- `0020-attachments-content.md`: Attachment bytes + raw MIME are on-demand UIDVALIDITY-guarded reads (never mirrored under parsed_only); metadata/headers/clean-bodies come from the mirror; all live outside the agent surface (no sixth MCP tool); clean-body is deterministic (no LLM).
+- `0020-attachments-content.md`: Attachment bytes + raw MIME are on-demand UIDVALIDITY-guarded reads (never mirrored under parsed_only); dedicated content operations stay outside the agent surface and keep their bounded default, while existing MCP reads return mirrored metadata and the full available cleaned body; clean-body is deterministic (no LLM).
 - `0021-provider-presets.md`: Long-tail IMAP/SMTP presets (Fastmail/Zoho/iCloud/Yahoo) carry both coordinate sets on `ProviderProfile`; a pure static email-domain lookup autodiscovers the preset at connect time (explicit input always wins); connectivity config only — no new MCP tool, frozen crypto + `resolveSmtpCreds` order untouched.
 - `0022-shared-imap-connect-prelude.md`: The four IMAP clients' copied connect prelude (SSRF guard + decrypt + ImapFlow construct + connect) is extracted to one shared `connectImap` (`imap-connect.ts`) with the close-on-connect-error guard baked in (fixing a socket-leak drift on two of the four); the UIDVALIDITY fail-closed comparison is co-located and shared; verb surfaces stay separate — behavior-preserving.
 - `0023-sent-freshness-lane.md`: Sent metadata refreshes on a supplemental 30-second cadence that preserves Inbox-first full-sweep ordering and skips expensive secondary lanes and full-account health transitions.
@@ -33,6 +33,8 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0026-post-repair-reconcile-health.md`: Reconcile gap counts describe observed drift, while account health describes the post-repair mirror state.
 - `0027-mutable-body-policy-row-accurate-coverage.md`: Existing accounts can change live body policy, while current complete message rows define live and priority body coverage.
 - `0028-content-extract-body-store-seam.md`: A 32 KiB plain-text extract and threading evidence commit before the pluggable body store receives the full payload.
+- `0029-metadata-protection-adapter.md`: A deployment-neutral adapter protects complete sensitive metadata rows while preserving the exact-match projections public core requires.
+- `0030-bounded-batch-thread-reading.md`: `read_thread` batches up to ten grouped-search conversation seeds without adding another MCP tool.
 
 ## Status Values
 
