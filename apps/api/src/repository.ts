@@ -4113,6 +4113,7 @@ export class MirrorRepository {
         SELECT id, account_id, folder_path
         FROM public.imap_messages
         WHERE id = $1
+        FOR UPDATE
       ), completed AS (
         UPDATE public.imap_messages message
         SET body_fetched_at = now()

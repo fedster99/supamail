@@ -1345,6 +1345,42 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     expect(completion.rows[0].body_fetched_at).not.toBeNull();
     expect(completion.rows[0].bodies_fetched_count).toBe(1);
+
+    await h.pool.query(
+      `UPDATE public.imap_messages SET body_fetched_at = NULL WHERE id = $1`,
+      [messageId]
+    );
+    const blocker = await h.pool.connect();
+    let pendingCompletion: Promise<void> | null = null;
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        "SELECT id FROM public.imap_messages WHERE id = $1 FOR UPDATE",
+        [messageId]
+      );
+      const blockerPid = await blocker.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+      pendingCompletion = h.repository.completeBodyStorage(messageId);
+      await vi.waitFor(async () => {
+        const waiting = await h.pool.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND $1 = ANY(pg_blocking_pids(pid))
+             AND query ILIKE '%WITH target AS MATERIALIZED%'`,
+          [blockerPid.rows[0].pid]
+        );
+        expect(waiting.rows[0].count).toBe("1");
+      }, { timeout: 2_000, interval: 10 });
+      await blocker.query("DELETE FROM public.imap_messages WHERE id = $1", [messageId]);
+      await blocker.query("COMMIT");
+      await expect(pendingCompletion).rejects.toThrow(
+        `Message not found after body storage: ${messageId}`
+      );
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      blocker.release();
+      await pendingCompletion?.catch(() => undefined);
+    }
   });
 
   it("batches small parsed-only bodies through one UID FETCH command", async () => {

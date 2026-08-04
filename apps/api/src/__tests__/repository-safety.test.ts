@@ -186,12 +186,16 @@ describe("repository safety", () => {
   it("maintains progress counters at the write sites", async () => {
     const repository = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
     const engine = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
+    const bodyCompletionMethod = repository.slice(
+      repository.indexOf("async completeBodyStorage("),
+      repository.indexOf("async getHistoryBacklog(")
+    );
 
     expect(repository).toContain("live_window_target_count = $4");
     expect(repository).toContain("headers_synced_count = headers_synced_count + $2");
-    expect(repository).toContain("bodies_fetched_count = folder.bodies_fetched_count + 1");
-    expect(repository).toContain("FOR UPDATE");
-    expect(repository).toContain("AND message.body_fetched_at IS NULL");
+    expect(bodyCompletionMethod).toContain("bodies_fetched_count = folder.bodies_fetched_count + 1");
+    expect(bodyCompletionMethod).toContain("FOR UPDATE");
+    expect(bodyCompletionMethod).toContain("AND message.body_fetched_at IS NULL");
     expect(repository).toContain("headers_synced_count = 0");
     expect(repository).toContain("bodies_fetched_count = 0");
     expect(repository).toContain("historical_target_count = NULL");
