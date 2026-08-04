@@ -129,10 +129,11 @@ describe("repository threading evidence wiring", () => {
     }]);
   });
 
-  it("does not requeue an unchanged body when JSONB key order changes", async () => {
+  it("creates missing thread state before comparing unchanged body evidence", async () => {
     const rawMime = Buffer.from("Message-ID: <new@example.test>\r\n\r\nbody");
     const rawHash = createHash("sha256").update(rawMime).digest("hex");
     const calls: Array<{ sql: string; params: unknown[] }> = [];
+    let threadStateLocks = 0;
     const client = {
       release: vi.fn(),
       query: vi.fn(async (sql: unknown, params: unknown[] = []) => {
@@ -142,6 +143,8 @@ describe("repository threading evidence wiring", () => {
           return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
         }
         if (text.includes("FROM public.imap_thread_state") && text.includes("FOR SHARE")) {
+          threadStateLocks += 1;
+          if (threadStateLocks === 1) return { rows: [], rowCount: 0 };
           return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
         }
         if (text.includes("LEFT JOIN public.imap_message_bodies")) {
@@ -184,6 +187,8 @@ describe("repository threading evidence wiring", () => {
     });
 
     expect(calls.some((call) => call.sql.startsWith("INSERT INTO public.imap_thread_work_queue"))).toBe(false);
+    expect(calls.some((call) => call.sql.startsWith("INSERT INTO public.imap_thread_state"))).toBe(true);
+    expect(threadStateLocks).toBe(2);
     expect(calls.some((call) => (
       call.sql.startsWith("SELECT id, message_id")
       && call.sql.includes("FROM public.imap_message_evidence")
@@ -297,6 +302,7 @@ describe("repository threading evidence wiring", () => {
       null,
       false
     ]);
+    expect(calls.some((call) => call.sql.startsWith("INSERT INTO public.imap_thread_state"))).toBe(false);
   });
 
   it("requeues every live run when a complete body fingerprint changes", async () => {
