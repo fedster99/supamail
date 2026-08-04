@@ -189,9 +189,9 @@ describe("repository safety", () => {
 
     expect(repository).toContain("live_window_target_count = $4");
     expect(repository).toContain("headers_synced_count = headers_synced_count + $2");
-    expect(repository).toContain("bodies_fetched_count = bodies_fetched_count + 1");
+    expect(repository).toContain("bodies_fetched_count = folder.bodies_fetched_count + 1");
     expect(repository).toContain("FOR UPDATE");
-    expect(repository).toContain("if (!message.body_fetched_at)");
+    expect(repository).toContain("AND message.body_fetched_at IS NULL");
     expect(repository).toContain("headers_synced_count = 0");
     expect(repository).toContain("bodies_fetched_count = 0");
     expect(repository).toContain("historical_target_count = NULL");

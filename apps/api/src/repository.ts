@@ -1504,17 +1504,24 @@ export class MirrorRepository {
   }
 
   private async lockThreadStateForMirrorWrite(client: PgClient, accountId: string): Promise<void> {
-    await client.query(
-      `INSERT INTO public.imap_thread_state (account_id)
-       SELECT id FROM public.imap_accounts WHERE id = $1
-       ON CONFLICT (account_id) DO NOTHING`,
-      [accountId]
-    );
-    const locked = await client.query<{ account_id: string }>(
+    let locked = await client.query<{ account_id: string }>(
       `SELECT account_id FROM public.imap_thread_state
        WHERE account_id = $1 FOR SHARE`,
       [accountId]
     );
+    if (!locked.rows[0]) {
+      await client.query(
+        `INSERT INTO public.imap_thread_state (account_id)
+         SELECT id FROM public.imap_accounts WHERE id = $1
+         ON CONFLICT (account_id) DO NOTHING`,
+        [accountId]
+      );
+      locked = await client.query<{ account_id: string }>(
+        `SELECT account_id FROM public.imap_thread_state
+         WHERE account_id = $1 FOR SHARE`,
+        [accountId]
+      );
+    }
     if (!locked.rows[0]) throw new Error(`Account not found: ${accountId}`);
   }
 
@@ -4100,52 +4107,34 @@ export class MirrorRepository {
 
   /** Mark the body readable only after the selected BodyStore succeeds. */
   async completeBodyStorage(messageId: string): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const target = await client.query<{
-        account_id: string;
-        folder_path: string;
-        body_fetched_at: Date | null;
-      }>(
-        `
-        SELECT account_id, folder_path, body_fetched_at
+    const result = await this.pool.query<{ message_id: string }>(
+      `
+      WITH target AS MATERIALIZED (
+        SELECT id, account_id, folder_path
         FROM public.imap_messages
         WHERE id = $1
-        FOR UPDATE
-        `,
-        [messageId]
-      );
-      const message = target.rows[0];
-      if (!message) throw new Error(`Message not found after body storage: ${messageId}`);
-
-      await client.query(
-        `
-        UPDATE public.imap_messages
+      ), completed AS (
+        UPDATE public.imap_messages message
         SET body_fetched_at = now()
-        WHERE id = $1
-        `,
-        [messageId]
-      );
-
-      if (!message.body_fetched_at) {
-        await client.query(
-          `
-          UPDATE public.imap_folders
-          SET bodies_fetched_count = bodies_fetched_count + 1
-          WHERE account_id = $1
-            AND path = $2
-          `,
-          [message.account_id, message.folder_path]
-        );
-      }
-
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
+        FROM target
+        WHERE message.id = target.id
+          AND message.body_fetched_at IS NULL
+        RETURNING target.account_id, target.folder_path
+      ), folder_progress AS (
+        UPDATE public.imap_folders folder
+        SET bodies_fetched_count = folder.bodies_fetched_count + 1
+        FROM completed
+        WHERE folder.account_id = completed.account_id
+          AND folder.path = completed.folder_path
+        RETURNING folder.id
+      )
+      SELECT target.id AS message_id
+      FROM target
+      `,
+      [messageId]
+    );
+    if (!result.rows[0]) {
+      throw new Error(`Message not found after body storage: ${messageId}`);
     }
   }
 

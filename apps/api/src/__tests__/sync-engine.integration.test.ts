@@ -1285,6 +1285,68 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(bodyCount.rows[0].count)).toBe(4);
   });
 
+  it("completes body storage atomically across concurrent retries", async () => {
+    const h = await setupIntegration("G-body-completion-atomic", {
+      BODY_STORAGE_MODE: "parsed_only",
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 409,
+      messages: [makeTextMessage({
+        uid: 1,
+        subject: "atomic body completion",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "atomic body completion"
+      })]
+    }];
+    const synced = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    expect(synced.outcome).toBe("success");
+    const message = await h.pool.query<{ id: string }>(
+      "SELECT id FROM public.imap_messages WHERE account_id = $1 AND uid = 1",
+      [h.account.id]
+    );
+    const messageId = message.rows[0].id;
+    await h.pool.query(
+      `UPDATE public.imap_messages SET body_fetched_at = NULL WHERE id = $1`,
+      [messageId]
+    );
+    await h.pool.query(
+      `UPDATE public.imap_folders SET bodies_fetched_count = 0
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+
+    await Promise.all(Array.from(
+      { length: 5 },
+      () => h.repository.completeBodyStorage(messageId)
+    ));
+
+    const completion = await h.pool.query<{
+      body_fetched_at: Date | null;
+      bodies_fetched_count: number;
+    }>(
+      `SELECT message.body_fetched_at, folder.bodies_fetched_count
+       FROM public.imap_messages message
+       JOIN public.imap_folders folder
+         ON folder.account_id = message.account_id
+        AND folder.path = message.folder_path
+       WHERE message.id = $1`,
+      [messageId]
+    );
+    expect(completion.rows[0].body_fetched_at).not.toBeNull();
+    expect(completion.rows[0].bodies_fetched_count).toBe(1);
+  });
+
   it("batches small parsed-only bodies through one UID FETCH command", async () => {
     const h = await setupIntegration("G-body-batch", {
       BODY_STORAGE_MODE: "parsed_only",
