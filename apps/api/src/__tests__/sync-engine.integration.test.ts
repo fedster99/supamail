@@ -1756,7 +1756,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       {
         uid: "3",
         fetched: false,
-        evidence: null,
+        evidence: "store-retry-body-3",
         payload: null
       }
     ]);
@@ -1770,6 +1770,67 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id]
     );
     expect(Number(completed.rows[0].count)).toBe(3);
+  });
+
+  it("settles every parsed-only batch evidence write before an evidence failure unwinds", async () => {
+    const h = await setupIntegration("G-body-batch-evidence-failure", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 408,
+      messages: Array.from({ length: 3 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `evidence-failure-body-${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: `evidence-failure-body-${index + 1}`
+      }))
+    }];
+    const originalStoreBodyEvidence = h.repository.storeBodyEvidence.bind(h.repository);
+    let evidenceCalls = 0;
+    let releaseThirdEvidence!: () => void;
+    const thirdEvidenceGate = new Promise<void>((resolve) => {
+      releaseThirdEvidence = resolve;
+    });
+    let markThirdEvidenceStarted!: () => void;
+    const thirdEvidenceStarted = new Promise<void>((resolve) => {
+      markThirdEvidenceStarted = resolve;
+    });
+    h.repository.storeBodyEvidence = async (body) => {
+      evidenceCalls += 1;
+      if (evidenceCalls === 2) throw new Error("injected evidence failure");
+      if (evidenceCalls === 3) {
+        markThirdEvidenceStarted();
+        await thirdEvidenceGate;
+      }
+      await originalStoreBodyEvidence(body);
+    };
+    const bodyStore: BodyStore = { store: vi.fn() };
+
+    const sync = h.buildEngine({ folders, bodyStore }).syncAccount(h.account.id, "manual");
+    await thirdEvidenceStarted;
+    const settledEarly = await Promise.race([
+      sync.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 100))
+    ]);
+    expect(settledEarly).toBe(false);
+
+    releaseThirdEvidence();
+    const failed = await sync;
+    expect(failed.outcome).toBe("failed");
+    expect(evidenceCalls).toBe(3);
+    expect(bodyStore.store).not.toHaveBeenCalled();
   });
 
   it("streams parsed-only bodies that exceed the bounded batch source cap", async () => {

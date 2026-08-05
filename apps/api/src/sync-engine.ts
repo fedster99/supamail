@@ -1831,9 +1831,20 @@ export class MirrorEngine {
       messages,
       { skipMailboxLock }
     );
+    // The target pool bounds concurrency. Settle every evidence transaction
+    // before payload storage so a rejection cannot leave database work running
+    // after the account sync starts unwinding.
+    const evidenceWrites = await Promise.allSettled(
+      result.bodies.map(({ body }) => this.repository.storeBodyEvidence(body))
+    );
+    const failedEvidenceWrite = evidenceWrites.find(
+      (write): write is PromiseRejectedResult => write.status === "rejected"
+    );
+    if (failedEvidenceWrite) throw failedEvidenceWrite.reason;
+
     let processed = 0;
     for (const { message, body } of result.bodies) {
-      await this.commitBody(message, body);
+      await this.commitBodyPayload(message, body);
       processed += 1;
     }
     for (const message of result.missingMessages) {
@@ -1933,6 +1944,13 @@ export class MirrorEngine {
     body: Awaited<ReturnType<typeof fetchFullMessageBody>>
   ): Promise<void> {
     await this.repository.storeBodyEvidence(body);
+    await this.commitBodyPayload(message, body);
+  }
+
+  private async commitBodyPayload(
+    message: ImapMessage,
+    body: Awaited<ReturnType<typeof fetchFullMessageBody>>
+  ): Promise<void> {
     await this.bodyStore.store(body);
     await this.repository.completeBodyStorage(body.messageId);
     await this.hooks.onBodyFetched?.(message, body);
