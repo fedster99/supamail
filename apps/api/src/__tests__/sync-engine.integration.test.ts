@@ -8,6 +8,10 @@ import { resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
 import {
+  plaintextMetadataProtection,
+  type MetadataProtectionAdapter
+} from "../metadata-protection.js";
+import {
   backdateMissingSince,
   buildInboxAndSentFolders,
   dueAllFolders,
@@ -1706,29 +1710,37 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         body: `atomic-body-${index + 1}`
       }))
     }];
-    const repositoryInternals = h.repository as unknown as {
-      storeBodyEvidenceInTransaction(...args: unknown[]): Promise<void>;
-    };
-    const originalStore = repositoryInternals.storeBodyEvidenceInTransaction.bind(h.repository);
     let evidenceWrites = 0;
-    repositoryInternals.storeBodyEvidenceInTransaction = async (...args: unknown[]) => {
-      evidenceWrites += 1;
-      await originalStore(...args);
-      if (evidenceWrites === 2) throw new Error("injected evidence batch failure");
+    const failingProtection: MetadataProtectionAdapter = {
+      storageMode: "plaintext",
+      async protect(context, values) {
+        if (context.kind === "message_body") {
+          evidenceWrites += 1;
+          if (evidenceWrites === 2) throw new Error("injected evidence batch failure");
+        }
+        return plaintextMetadataProtection.protect(context, values);
+      },
+      async reveal(context, stored) {
+        return plaintextMetadataProtection.reveal(context, stored);
+      }
     };
 
-    const failed = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    const failed = await new MirrorEngine({
+      pool: h.pool,
+      config: h.config,
+      metadataProtection: failingProtection,
+      clientFactory: async () => new FixtureImapClient(folders)
+    }).syncAccount(h.account.id, "manual");
 
     expect(failed.outcome).toBe("failed");
-    const rows = await h.pool.query<{ search_extract: string | null }>(
-      `SELECT b.search_extract
+    const rows = await h.pool.query<{ body_rows: string }>(
+      `SELECT count(b.message_id)::text AS body_rows
        FROM public.imap_messages m
        LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-       WHERE m.account_id = $1
-       ORDER BY m.uid`,
+       WHERE m.account_id = $1`,
       [h.account.id]
     );
-    expect(rows.rows.map((row) => row.search_extract)).toEqual([null, null, null]);
+    expect(Number(rows.rows[0].body_rows)).toBe(0);
   });
 
   it("retries a parsed-only batch after body storage fails without losing batched evidence", async () => {
@@ -1811,15 +1823,41 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     ]);
 
-    const retried = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    const retriedUids: string[] = [];
+    const retried = await h.buildEngine({
+      folders,
+      hooks: {
+        onBodyFetched(message) {
+          retriedUids.push(String(message.uid));
+        }
+      }
+    }).syncAccount(h.account.id, "manual");
     expect(retried.outcome).toBe("success");
-    const completed = await h.pool.query<{ count: string }>(
-      `SELECT count(*)::text AS count
-       FROM public.imap_messages
-       WHERE account_id = $1 AND body_fetched_at IS NOT NULL`,
+    expect(retriedUids).toEqual(["2", "3"]);
+    const completed = await h.pool.query<{
+      uid: string;
+      body_fetched_at: Date | null;
+      search_extract: string | null;
+      body_text: string | null;
+    }>(
+      `SELECT m.uid::text, m.body_fetched_at, b.search_extract, b.body_text
+       FROM public.imap_messages m
+       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+       WHERE m.account_id = $1
+       ORDER BY m.uid`,
       [h.account.id]
     );
-    expect(Number(completed.rows[0].count)).toBe(3);
+    expect(completed.rows.map((row) => ({
+      uid: row.uid,
+      fetched: row.body_fetched_at !== null,
+      evidence: row.search_extract,
+      payload: row.body_text
+    }))).toEqual([1, 2, 3].map((uid) => ({
+      uid: String(uid),
+      fetched: true,
+      evidence: `store-retry-body-${uid}`,
+      payload: `store-retry-body-${uid}`
+    })));
   });
 
   it("streams parsed-only bodies that exceed the bounded batch source cap", async () => {

@@ -12,6 +12,9 @@ import {
 } from "./mime.js";
 import {
   MAX_SYNC_ATTACHMENTS_PER_FETCH,
+  PARSED_BODY_BATCH_MAX_MESSAGES,
+  PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
+  PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   MAX_SYNC_FLAG_FETCH_BYTES,
   MAX_SYNC_FLAGS_PER_FETCH,
   MAX_SYNC_METADATA_FETCH_BYTES,
@@ -519,9 +522,11 @@ export class MessageMovedError extends Error {
   }
 }
 
-export const PARSED_BODY_BATCH_MAX_MESSAGES = 10;
-export const PARSED_BODY_BATCH_MAX_SOURCE_BYTES = 4 * 1024 * 1024;
-export const PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024;
+export {
+  PARSED_BODY_BATCH_MAX_MESSAGES,
+  PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
+  PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES
+};
 
 export interface BodyBatchFetchResult {
   bodies: Array<{ message: ImapMessage; body: MessageBodyInput }>;

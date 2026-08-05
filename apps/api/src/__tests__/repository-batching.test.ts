@@ -7,11 +7,14 @@ import {
   MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
   MAX_SYNC_METADATA_BATCH_BYTES,
   MAX_SYNC_FLAGS_PER_BATCH,
+  PARSED_BODY_BATCH_MAX_MESSAGES,
+  PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
+  PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   splitFlagEventBatches,
   splitFlagWriteBatches,
   splitMetadataWriteBatches
 } from "../sync-limits.js";
-import type { ImapFolder, ImapMessage, MessageMetadata } from "../types.js";
+import type { ImapFolder, ImapMessage, MessageBodyInput, MessageMetadata } from "../types.js";
 
 const folder = { id: "00000000-0000-4000-8000-000000000002", path: "INBOX" } as ImapFolder;
 
@@ -42,6 +45,123 @@ function metadata(uid: number): MessageMetadata {
     attachments: []
   };
 }
+
+function bodyEvidence(messageId: string, rawBytes = 1): MessageBodyInput {
+  return {
+    messageId,
+    rawMime: Buffer.alloc(Math.min(rawBytes, 1)),
+    rawBytes,
+    rawTruncated: false,
+    bodyText: "body",
+    bodyHtml: null,
+    bodyPlain: "body",
+    selectedTextPart: "body",
+    selectedTextFormat: "plain",
+    headersJson: {},
+    mimeStructure: null,
+    parserWarnings: [],
+    evidence: []
+  };
+}
+
+function bodyEvidenceOwnerStub(owners: Array<{ id: string; account_id: string }>) {
+  const calls: string[] = [];
+  const client = {
+    async query(query: string | { text: string }) {
+      const normalized = (typeof query === "string" ? query : query.text).trim();
+      calls.push(normalized);
+      if (normalized.includes("WHERE id = ANY($1::uuid[])")) return { rows: owners };
+      return { rows: [] };
+    },
+    release() {}
+  };
+  let connectCalls = 0;
+  const pool = {
+    async connect() {
+      connectCalls += 1;
+      return client;
+    }
+  } as unknown as PgPool;
+  return {
+    calls,
+    connectCalls: () => connectCalls,
+    repository: new MirrorRepository(pool, {} as AppConfig)
+  };
+}
+
+describe("repository body evidence batching", () => {
+  it("accepts an empty batch without checking out a connection", async () => {
+    const stub = bodyEvidenceOwnerStub([]);
+
+    await expect(stub.repository.storeBodyEvidenceBatch([])).resolves.toBeUndefined();
+
+    expect(stub.connectCalls()).toBe(0);
+  });
+
+  it("rejects duplicate message ids before checking out a connection", async () => {
+    const stub = bodyEvidenceOwnerStub([]);
+    const duplicate = "00000000-0000-4000-8000-000000000010";
+
+    await expect(stub.repository.storeBodyEvidenceBatch([
+      bodyEvidence(duplicate),
+      bodyEvidence(duplicate)
+    ])).rejects.toThrow(/duplicate message ids/);
+
+    expect(stub.connectCalls()).toBe(0);
+  });
+
+  it("enforces the message-count and source-byte bounds before database admission", async () => {
+    const tooMany = bodyEvidenceOwnerStub([]);
+    await expect(tooMany.repository.storeBodyEvidenceBatch(
+      Array.from({ length: PARSED_BODY_BATCH_MAX_MESSAGES + 1 }, (_, index) =>
+        bodyEvidence(`00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`))
+    )).rejects.toThrow(/exceeds 10 messages/);
+    expect(tooMany.connectCalls()).toBe(0);
+
+    const tooLarge = bodyEvidenceOwnerStub([]);
+    await expect(tooLarge.repository.storeBodyEvidenceBatch([
+      bodyEvidence("00000000-0000-4000-8000-000000000020", PARSED_BODY_BATCH_MAX_SOURCE_BYTES + 1)
+    ])).rejects.toThrow(/parsed batch source limit/);
+    expect(tooLarge.connectCalls()).toBe(0);
+
+    const aggregateTooLarge = bodyEvidenceOwnerStub([]);
+    await expect(aggregateTooLarge.repository.storeBodyEvidenceBatch([
+      bodyEvidence("00000000-0000-4000-8000-000000000021", PARSED_BODY_BATCH_MAX_SOURCE_BYTES),
+      bodyEvidence("00000000-0000-4000-8000-000000000022", PARSED_BODY_BATCH_MAX_SOURCE_BYTES),
+      bodyEvidence(
+        "00000000-0000-4000-8000-000000000023",
+        PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES - (2 * PARSED_BODY_BATCH_MAX_SOURCE_BYTES) + 1
+      )
+    ])).rejects.toThrow(/aggregate source limit/);
+    expect(aggregateTooLarge.connectCalls()).toBe(0);
+  });
+
+  it("rolls back when a message is missing from the owner lookup", async () => {
+    const stub = bodyEvidenceOwnerStub([]);
+
+    await expect(stub.repository.storeBodyEvidenceBatch([
+      bodyEvidence("00000000-0000-4000-8000-000000000030")
+    ])).rejects.toThrow(/Message not found/);
+
+    expect(stub.calls.at(-1)).toBe("ROLLBACK");
+  });
+
+  it("rolls back a batch whose messages belong to different IMAP accounts", async () => {
+    const first = "00000000-0000-4000-8000-000000000040";
+    const second = "00000000-0000-4000-8000-000000000041";
+    const stub = bodyEvidenceOwnerStub([
+      { id: first, account_id: "00000000-0000-4000-8000-000000000001" },
+      { id: second, account_id: "00000000-0000-4000-8000-000000000002" }
+    ]);
+
+    await expect(stub.repository.storeBodyEvidenceBatch([
+      bodyEvidence(first),
+      bodyEvidence(second)
+    ])).rejects.toThrow(/must belong to one IMAP account/);
+
+    expect(stub.calls.at(-1)).toBe("ROLLBACK");
+  });
+});
 
 function repositoryStub(
   existingUids: number[] = [],

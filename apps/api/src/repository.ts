@@ -27,6 +27,9 @@ import {
   MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
   MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH,
   MAX_SYNC_BATCH_SIZE,
+  PARSED_BODY_BATCH_MAX_MESSAGES,
+  PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
+  PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   splitFlagEventBatches,
   splitFlagWriteBatches,
   splitMetadataWriteBatches
@@ -3518,12 +3521,37 @@ export class MirrorRepository {
    * receives the full payload.
    */
   async storeBodyEvidence(body: MessageBodyInput): Promise<void> {
-    await this.storeBodyEvidenceBatch([body]);
+    await this.storeBodyEvidenceTransaction([body]);
   }
 
   /** Commit a bounded body-fetch batch atomically with one database transaction. */
   async storeBodyEvidenceBatch(bodies: readonly MessageBodyInput[]): Promise<void> {
     if (bodies.length === 0) return;
+    if (bodies.length > PARSED_BODY_BATCH_MAX_MESSAGES) {
+      throw new Error(
+        `Body evidence batch exceeds ${PARSED_BODY_BATCH_MAX_MESSAGES} messages`
+      );
+    }
+    let totalSourceBytes = 0;
+    for (const body of bodies) {
+      if (!Number.isSafeInteger(body.rawBytes)
+        || body.rawBytes < 0
+        || body.rawBytes > PARSED_BODY_BATCH_MAX_SOURCE_BYTES) {
+        throw new Error(
+          `Body evidence for ${body.messageId} exceeds the parsed batch source limit`
+        );
+      }
+      totalSourceBytes += body.rawBytes;
+    }
+    if (totalSourceBytes > PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES) {
+      throw new Error("Body evidence batch exceeds the aggregate source limit");
+    }
+    await this.storeBodyEvidenceTransaction(bodies);
+  }
+
+  private async storeBodyEvidenceTransaction(
+    bodies: readonly MessageBodyInput[]
+  ): Promise<void> {
     const messageIds = bodies.map((body) => body.messageId);
     if (new Set(messageIds).size !== messageIds.length) {
       throw new Error("Body evidence batch contains duplicate message ids");
