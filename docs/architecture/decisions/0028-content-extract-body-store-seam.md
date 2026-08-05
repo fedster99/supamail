@@ -44,8 +44,11 @@ a mailbox re-sync.
   8 MiB aggregate source cap. The fetch and parse complete before body storage,
   so storage latency never pauses an active IMAP command. The loop issues no
   nested IMAP command. Larger, unknown-size, singleton, and cap-limited messages
-  use the streaming download path. This fast path does not change the evidence
-  → store → completion order.
+  use the streaming download path. Evidence for the bounded UID-set result
+  commits atomically in one transaction before payload storage begins. An
+  evidence failure rolls back the whole batch; a later payload-store failure
+  leaves the committed batch evidence available to the normal idempotent retry.
+  This fast path does not change the evidence → store → completion order.
 - `DatabaseBodyStore` is the OSS default. It stores parsed text, HTML, selected
   part data, and raw MIME exactly as before; `BODY_STORAGE_MODE=parsed_only`
   continues to store `raw_mime = NULL`.
@@ -95,6 +98,9 @@ also avoids over-representing quoted history commonly found at message tails.
 - Live-DB integration observes committed search/thread evidence with every full
   payload field still NULL when the body store is called, and confirms progress
   remains incomplete until store completion.
+- Live-DB integration injects a mid-batch evidence failure and proves every
+  evidence write rolls back, then injects a payload-store failure and proves
+  the entire bounded batch's evidence survives for retry.
 - Threading live-DB coverage removes every full payload column and proves two
   physical copies still share one delivery and conversation.
 - Public migrations apply twice; live-DB, threading, and spec-conformance gates

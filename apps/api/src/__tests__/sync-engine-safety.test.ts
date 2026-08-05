@@ -117,6 +117,14 @@ describe("sync engine safety", () => {
     expect(evidenceWrite).toBeGreaterThan(-1);
     expect(payloadWrite).toBeGreaterThan(evidenceWrite);
     expect(completionWrite).toBeGreaterThan(payloadWrite);
+
+    const batchEvidenceWrite = source.indexOf("await this.repository.storeBodyEvidenceBatch(");
+    const batchPayloadWrite = source.indexOf(
+      "await this.commitBodyPayload(message, body)",
+      batchEvidenceWrite
+    );
+    expect(batchEvidenceWrite).toBeGreaterThan(-1);
+    expect(batchPayloadWrite).toBeGreaterThan(batchEvidenceWrite);
   });
 
   it("reconciles only the active sync window", async () => {
