@@ -139,8 +139,8 @@ describe("repository threading evidence wiring", () => {
       query: vi.fn(async (sql: unknown, params: unknown[] = []) => {
         const text = sqlText(sql);
         calls.push({ sql: text, params });
-        if (text === "SELECT account_id FROM public.imap_messages WHERE id = $1") {
-          return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
+        if (text.includes("WHERE id = ANY($1::uuid[])")) {
+          return { rows: [{ id: MESSAGE_ID, account_id: ACCOUNT_ID }], rowCount: 1 };
         }
         if (text.includes("FROM public.imap_thread_state") && text.includes("FOR SHARE")) {
           threadStateLocks += 1;
@@ -209,8 +209,8 @@ describe("repository threading evidence wiring", () => {
         const text = sqlText(sql);
         const values = sqlParams(sql, params);
         calls.push({ sql: text, params: values });
-        if (text === "SELECT account_id FROM public.imap_messages WHERE id = $1") {
-          return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
+        if (text.includes("WHERE id = ANY($1::uuid[])")) {
+          return { rows: [{ id: MESSAGE_ID, account_id: ACCOUNT_ID }], rowCount: 1 };
         }
         if (text.includes("FROM public.imap_thread_state") && text.includes("FOR SHARE")) {
           return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
@@ -313,8 +313,8 @@ describe("repository threading evidence wiring", () => {
       query: vi.fn(async (sql: unknown, params: unknown[] = []) => {
         const text = sqlText(sql);
         calls.push({ sql: text, params });
-        if (text === "SELECT account_id FROM public.imap_messages WHERE id = $1") {
-          return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };
+        if (text.includes("WHERE id = ANY($1::uuid[])")) {
+          return { rows: [{ id: MESSAGE_ID, account_id: ACCOUNT_ID }], rowCount: 1 };
         }
         if (text.includes("FROM public.imap_thread_state") && text.includes("FOR SHARE")) {
           return { rows: [{ account_id: ACCOUNT_ID }], rowCount: 1 };

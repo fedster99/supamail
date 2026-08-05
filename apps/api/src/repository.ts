@@ -3518,6 +3518,52 @@ export class MirrorRepository {
    * receives the full payload.
    */
   async storeBodyEvidence(body: MessageBodyInput): Promise<void> {
+    await this.storeBodyEvidenceBatch([body]);
+  }
+
+  /** Commit a bounded body-fetch batch atomically with one database transaction. */
+  async storeBodyEvidenceBatch(bodies: readonly MessageBodyInput[]): Promise<void> {
+    if (bodies.length === 0) return;
+    const messageIds = bodies.map((body) => body.messageId);
+    if (new Set(messageIds).size !== messageIds.length) {
+      throw new Error("Body evidence batch contains duplicate message ids");
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const owners = await client.query<{ id: string; account_id: string }>(
+        `SELECT id::text, account_id::text
+         FROM public.imap_messages
+         WHERE id = ANY($1::uuid[])`,
+        [messageIds]
+      );
+      if (owners.rows.length !== messageIds.length) {
+        throw new Error("Message not found for batched body storage");
+      }
+      const ownerAccountIds = new Set(owners.rows.map((row) => row.account_id));
+      if (ownerAccountIds.size !== 1) {
+        throw new Error("Body evidence batch must belong to one IMAP account");
+      }
+      const ownerAccountId = owners.rows[0].account_id;
+      await this.lockThreadStateForMirrorWrite(client, ownerAccountId);
+      for (const body of bodies) {
+        await this.storeBodyEvidenceInTransaction(client, body, ownerAccountId);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async storeBodyEvidenceInTransaction(
+    client: PgClient,
+    body: MessageBodyInput,
+    ownerAccountId: string
+  ): Promise<void> {
     const preparedEvidence = body.rawTruncated ? [] : prepareMessageEvidence(body);
     const structuredEvidenceComplete = !body.rawTruncated
       && !body.parserWarnings.includes("artifact_evidence_truncated");
@@ -3526,17 +3572,6 @@ export class MirrorRepository {
       : createHash("sha256")
         .update(canonicalJsonForThreadingEvidence(preparedEvidence))
         .digest("hex");
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const owner = await client.query<{ account_id: string }>(
-        "SELECT account_id FROM public.imap_messages WHERE id = $1",
-        [body.messageId]
-      );
-      const ownerAccountId = owner.rows[0]?.account_id;
-      if (!ownerAccountId) throw new Error(`Message not found for body storage: ${body.messageId}`);
-      await this.lockThreadStateForMirrorWrite(client, ownerAccountId);
-
       const target = await client.query<
         ImapMessage & ProtectedMetadataColumns & {
         body_raw_mime_sha256: string | null;
@@ -4054,13 +4089,6 @@ export class MirrorRepository {
         );
       }
 
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
   }
 
   /** Persist only the full body payload; search and threading never read these fields. */

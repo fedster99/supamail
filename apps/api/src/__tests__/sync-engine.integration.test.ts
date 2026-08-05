@@ -1681,7 +1681,57 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ]);
   });
 
-  it("retries a parsed-only batch after body storage fails without losing fetched evidence", async () => {
+  it("rolls back every evidence write when a parsed-only batch evidence transaction fails", async () => {
+    const h = await setupIntegration("G-body-batch-evidence-atomic", {
+      BODY_STORAGE_MODE: "parsed_only",
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      MAX_BODY_BATCHES_PER_TICK: 1
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 406,
+      messages: Array.from({ length: 3 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `atomic-body-${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: `atomic-body-${index + 1}`
+      }))
+    }];
+    const repositoryInternals = h.repository as unknown as {
+      storeBodyEvidenceInTransaction(...args: unknown[]): Promise<void>;
+    };
+    const originalStore = repositoryInternals.storeBodyEvidenceInTransaction.bind(h.repository);
+    let evidenceWrites = 0;
+    repositoryInternals.storeBodyEvidenceInTransaction = async (...args: unknown[]) => {
+      evidenceWrites += 1;
+      await originalStore(...args);
+      if (evidenceWrites === 2) throw new Error("injected evidence batch failure");
+    };
+
+    const failed = await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+
+    expect(failed.outcome).toBe("failed");
+    const rows = await h.pool.query<{ search_extract: string | null }>(
+      `SELECT b.search_extract
+       FROM public.imap_messages m
+       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+       WHERE m.account_id = $1
+       ORDER BY m.uid`,
+      [h.account.id]
+    );
+    expect(rows.rows.map((row) => row.search_extract)).toEqual([null, null, null]);
+  });
+
+  it("retries a parsed-only batch after body storage fails without losing batched evidence", async () => {
     const h = await setupIntegration("G-body-batch-store-retry", {
       BODY_STORAGE_MODE: "parsed_only",
       INITIAL_SYNC_BATCH_SIZE: 50,
@@ -1756,7 +1806,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       {
         uid: "3",
         fetched: false,
-        evidence: null,
+        evidence: "store-retry-body-3",
         payload: null
       }
     ]);
