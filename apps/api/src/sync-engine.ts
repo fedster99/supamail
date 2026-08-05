@@ -54,6 +54,33 @@ const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
 const FOLDER_ALIAS_SAMPLE_SIZE = 5;
 const FOLDER_ALIAS_SAMPLE_UID_WINDOW = 100;
 
+async function peekAsyncIterable<T>(values: AsyncIterable<T>): Promise<{
+  empty: boolean;
+  values: AsyncIterable<T>;
+}> {
+  const iterator = values[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  if (first.done) {
+    return { empty: true, values: (async function* empty() {})() };
+  }
+
+  return {
+    empty: false,
+    values: (async function* replay() {
+      try {
+        yield first.value;
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) break;
+          yield next.value;
+        }
+      } finally {
+        await iterator.return?.();
+      }
+    })()
+  };
+}
+
 type DiscoveredFolder = {
   path: string;
   delimiter?: string | null;
@@ -993,20 +1020,34 @@ export class MirrorEngine {
           folder,
           uidValidity
         );
+        const windowUidStream = await peekAsyncIterable(this.withAsyncIterableDeadline(
+          client,
+          reconcileDeadline,
+          "RECONCILE_TOTAL_TIMEOUT_MS",
+          "reconcile UID stream",
+          iterateAllUids(client, windowCutoff)
+        ));
+        const needsAllUidConfirmation = shouldFailOnEmptyReconcile && windowUidStream.empty;
         const reconcile = await this.repository.markMissingMessagesFromLiveUidStream(
           account.id,
           folder,
           uidValidity,
-          this.withAsyncIterableDeadline(
-            client,
-            reconcileDeadline,
-            "RECONCILE_TOTAL_TIMEOUT_MS",
-            "reconcile UID stream",
-            iterateAllUids(client, windowCutoff)
-          ),
+          needsAllUidConfirmation
+            ? this.withAsyncIterableDeadline(
+                client,
+                reconcileDeadline,
+                "RECONCILE_TOTAL_TIMEOUT_MS",
+                "reconcile all-UID confirmation stream",
+                iterateAllUids(client)
+              )
+            : windowUidStream.values,
           {
             failIfEmpty: shouldFailOnEmptyReconcile,
-            emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`
+            emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`,
+            // The unfiltered fallback confirms provider deletions only. Feeding its
+            // archive UIDs into missing-in-DB repair would violate the live-window
+            // boundary and turn a rare safety probe into unbounded history backfill.
+            findMissingInDb: !needsAllUidConfirmation
           }
         );
 

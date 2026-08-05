@@ -133,8 +133,9 @@ describe("sync engine safety", () => {
     expect(source).toContain("iterateAllUids(client, windowCutoff)");
     expect(source).toContain("markMissingMessagesFromLiveUidStream");
     expect(source).toContain("Reconcile returned no UIDs for non-empty mailbox");
+    expect(source).toContain("needsAllUidConfirmation");
+    expect(source).toContain("findMissingInDb: !needsAllUidConfirmation");
     expect(source).not.toContain("searchAllUids(client, windowCutoff)");
-    expect(source).not.toContain("iterateAllUids(client),");
   });
 
   it("does not accept an empty folder discovery response as authoritative", async () => {
