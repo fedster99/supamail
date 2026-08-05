@@ -1855,6 +1855,113 @@ liveDb("live DB reliability lane", () => {
     });
   });
 
+  it("confirms an empty live window against all UIDs before repairing deletions", async () => {
+    const h = await setupIntegration("live-reconcile-empty-window-confirmation", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const recentMessage = makeTextMessage({
+      uid: 22,
+      subject: "recent-then-moved",
+      from: "sender@example.test",
+      to: "user@example.test",
+      body: "recent-then-moved"
+    });
+    const oldMessage = makeTextMessage({
+      uid: 1,
+      subject: "old-provider-only",
+      from: "sender@example.test",
+      to: "user@example.test",
+      body: "old-provider-only",
+      internalDate: new Date(Date.now() - 120 * 24 * 60 * 60 * 1000)
+    });
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 18_001,
+      messages: [recentMessage]
+    }];
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    // Reproduce the production edge: every mirrored live-window UID vanished,
+    // while the provider still has only older messages outside the window.
+    folders[0].messages = [oldMessage];
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET next_sync_due_at = now() - interval '1 second',
+          next_reconcile_at = now() - interval '1 second'
+      WHERE account_id = $1 AND path = 'INBOX'
+      `,
+      [h.account.id]
+    );
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileGapsFound).toBe(1);
+
+    const messages = await h.pool.query<{
+      uid: string;
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `
+      SELECT uid::text, deleted_in_provider, deleted_reason
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX'
+      ORDER BY uid
+      `,
+      [h.account.id]
+    );
+    expect(messages.rows).toEqual([{
+      uid: "22",
+      deleted_in_provider: true,
+      deleted_reason: "RECONCILE_MISSING"
+    }]);
+  });
+
+  it("keeps reconciliation fail-closed when both UID streams are empty", async () => {
+    const h = await setupIntegration("live-reconcile-double-empty", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = oneFolder("INBOX", 1);
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    folders[0].messages = [];
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET next_sync_due_at = now() - interval '1 second',
+          next_reconcile_at = now() - interval '1 second'
+      WHERE account_id = $1 AND path = 'INBOX'
+      `,
+      [h.account.id]
+    );
+
+    const result = await engine.syncAccount(h.account.id, "manual");
+    expect(result.outcome).toBe("failed");
+
+    const message = await h.pool.query<{
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `
+      SELECT deleted_in_provider, deleted_reason
+      FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1
+      `,
+      [h.account.id]
+    );
+    expect(message.rows[0]).toEqual({
+      deleted_in_provider: false,
+      deleted_reason: null
+    });
+  });
+
   it("reports when missing-in-DB repair exceeds the bounded reconcile batch", async () => {
     const h = await setupIntegration("live-reconcile-missing-db-overflow", {
       INITIAL_SYNC_BATCH_SIZE: 50

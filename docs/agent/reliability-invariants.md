@@ -133,6 +133,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Flag scans are due-based, compare normalized flags, and keep FETCH/write locks bounded to incremental-size batches under one overall deadline.
 - Reconcile only runs after initial sync is complete for the folder.
 - Reconcile must handle both sides: mark provider-missing local rows and backfill missing-in-DB provider UIDs.
+- If a live-window UID stream is empty while live-window mirror rows remain, confirm against an unfiltered UID stream before tombstoning. Use that fallback only for deletion evidence; never backfill provider-only archive UIDs from it, and keep a second empty response fail-closed.
 - Reconcile gap telemetry describes drift observed before repair; `last_reconcile_clean` and account health describe the mirror after repair. A pass that tombstones every provider-missing row and backfills every returned missing-in-DB UID is clean even when `reconcile_gaps_found` is nonzero.
 - Missing-in-DB repair is bounded to 5,000 UIDs per pass and must detect overflow with a sentinel row. Overflow, lock-budget interruption, or incomplete backfill leaves reconcile unclean and schedules another reconcile on the next full-sync cadence instead of the normal six-hour cadence.
 

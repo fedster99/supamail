@@ -3337,7 +3337,12 @@ export class MirrorRepository {
     folder: ImapFolder,
     uidValidity: number,
     liveUids: AsyncIterable<number>,
-    options: { failIfEmpty?: boolean; emptyError?: string; batchSize?: number } = {}
+    options: {
+      failIfEmpty?: boolean;
+      emptyError?: string;
+      batchSize?: number;
+      findMissingInDb?: boolean;
+    } = {}
   ): Promise<{
     markedCount: number;
     liveUidCount: number;
@@ -3415,10 +3420,17 @@ export class MirrorRepository {
             AND m.uid = live.uid
             AND m.deleted_in_provider = false
         )
+          AND $5::boolean
         ORDER BY live.uid DESC
         LIMIT $4
         `,
-        [accountId, folder.path, uidValidity, RECONCILE_MISSING_UID_LIMIT + 1]
+        [
+          accountId,
+          folder.path,
+          uidValidity,
+          RECONCILE_MISSING_UID_LIMIT + 1,
+          options.findMissingInDb !== false
+        ]
       );
 
       await client.query("COMMIT");
