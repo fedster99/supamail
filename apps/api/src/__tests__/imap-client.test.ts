@@ -47,6 +47,50 @@ describe("fetchMessageMetadata", () => {
     });
   });
 
+  it("stores embedded-message MIME dates as exact JSON text", () => {
+    const internalDate = new Date("2026-08-12T17:00:00.123Z");
+    const embeddedDate = new Date("2026-08-11T09:08:07.654Z");
+    const parsed = parseMessageMetadata({
+      uid: 8,
+      internalDate,
+      bodyStructure: {
+        type: "multipart/mixed",
+        childNodes: [
+          { type: "text/plain" },
+          {
+            type: "message/rfc822",
+            envelope: { date: embeddedDate }
+          }
+        ]
+      }
+    });
+
+    expect(parsed.internalDate).toBe(internalDate);
+    expect(parsed.mimeStructure).toEqual({
+      type: "multipart/mixed",
+      childNodes: [
+        { type: "text/plain" },
+        {
+          type: "message/rfc822",
+          envelope: { date: "2026-08-11T09:08:07.654Z" }
+        }
+      ]
+    });
+    expect(embeddedDate).toEqual(new Date("2026-08-11T09:08:07.654Z"));
+  });
+
+  it("rejects MIME metadata that cannot be stored as JSON", () => {
+    expect(() => parseMessageMetadata({
+      uid: 9,
+      bodyStructure: { parameters: new Map([["charset", "utf-8"]]) }
+    })).toThrow("IMAP MIME metadata contains a non-JSON object");
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => parseMessageMetadata({ uid: 10, bodyStructure: cyclic }))
+      .toThrow("IMAP MIME metadata contains a cycle");
+  });
+
   it("fails instead of advancing past a partial UID batch", async () => {
     const client = new FixtureImapClient([
       {

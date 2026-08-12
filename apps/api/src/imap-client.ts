@@ -258,6 +258,60 @@ function addressList(addresses: Array<{ address?: string; name?: string }> | und
 
 export type ProviderObjectIdNamespace = "objectid" | "gmail";
 
+type JsonMetadataValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonMetadataValue[]
+  | { [key: string]: JsonMetadataValue };
+
+function normalizeMimeMetadata(
+  value: unknown,
+  ancestors = new WeakSet<object>()
+): JsonMetadataValue {
+  if (value instanceof Date) {
+    if (!Number.isFinite(value.getTime())) {
+      throw new Error("IMAP MIME metadata contains an invalid date");
+    }
+    return value.toISOString();
+  }
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("IMAP MIME metadata contains a non-finite number");
+    }
+    return value;
+  }
+  if (typeof value !== "object") {
+    throw new Error("IMAP MIME metadata contains a non-JSON value");
+  }
+  if (ancestors.has(value)) {
+    throw new Error("IMAP MIME metadata contains a cycle");
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return Array.from(value, (item) => normalizeMimeMetadata(item, ancestors));
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error("IMAP MIME metadata contains a non-JSON object");
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new Error("IMAP MIME metadata contains a symbol key");
+    }
+
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, normalizeMimeMetadata(item, ancestors)])
+    );
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
 export function providerObjectIdNamespace(
   capabilities: ReadonlyMap<string, boolean | number> | undefined
 ): ProviderObjectIdNamespace | null {
@@ -299,7 +353,7 @@ export function parseMessageMetadata(
     ccNames: cc.names,
     bccEmails: bcc.emails,
     headersJson: headers,
-    mimeStructure: msg.bodyStructure ?? null,
+    mimeStructure: normalizeMimeMetadata(msg.bodyStructure ?? null),
     attachments: extractAttachmentMetadata(msg.bodyStructure)
   };
 }
