@@ -813,6 +813,19 @@ export class MirrorRepository {
     return result.rows[0] ? await this.revealAccount(result.rows[0]) : null;
   }
 
+  /** Active Mailbox Accounts that a host may keep on an Inbox IDLE session. */
+  async getIdleWatchAccounts(): Promise<ImapAccount[]> {
+    const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
+      `SELECT *
+       FROM public.imap_accounts
+       WHERE sync_state <> 'PAUSED'
+         AND (sync_state <> 'BROKEN' OR backoff_until IS NOT NULL)
+         AND (backoff_until IS NULL OR backoff_until <= now())
+       ORDER BY id`
+    );
+    return await Promise.all(result.rows.map((row) => this.revealAccount(row)));
+  }
+
   async getAccountDetails(id: string): Promise<AccountDetails | null> {
     const accountResult = await this.pool.query<
       AccountSummary & Omit<AccountProgress, "account_id"> & ProtectedMetadataColumns
@@ -2057,6 +2070,28 @@ export class MirrorRepository {
     }
 
     return [...priority.rows, ...rr];
+  }
+
+  /**
+   * Return the tracked Inbox even when its normal polling deadline is in the
+   * future. An IDLE wake is an explicit reason to run this one folder now.
+   */
+  async getInboxFolderForWake(accountId: string): Promise<ImapFolder | null> {
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND lower(path) = 'inbox'
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      ORDER BY CASE WHEN path = 'INBOX' THEN 0 ELSE 1 END
+      LIMIT 1
+      `,
+      [accountId]
+    );
+    return result.rows[0] ?? null;
   }
 
   async getSentFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {

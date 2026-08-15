@@ -265,9 +265,14 @@ describe("sync engine safety", () => {
 
     expect(source).toContain("isConnectionLostError(error)");
     expect(source).toContain("connectionLost = true");
-    // Both the body backlog and the history lane are skipped for a fast Sent pass
-    // and once the client is dead.
-    expect(source.match(/} else if \(!options\.sentOnly && !connectionLost\) \{/g)).toHaveLength(2);
+    // Both the body backlog and the history lane stop once the client is dead.
+    // The IDLE wake path keeps bodies but deliberately skips history.
+    expect(source).toContain(
+      "} else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {"
+    );
+    expect(source).toContain(
+      "} else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {"
+    );
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {

@@ -160,6 +160,171 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(runsAfterNoop.rows[0].count).toBe(runsBeforeNoop.rows[0].count);
   });
 
+  it("uses an IDLE wake for Inbox delete, move, and flag repair without consuming other folders", async () => {
+    const h = await setupIntegration("idle-inbox-reconcile", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_003,
+      messages: []
+    });
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50 }
+    });
+
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET next_sync_due_at = now() + interval '1 hour',
+           next_reconcile_at = now() + interval '1 hour',
+           next_flag_scan_at = now() + interval '1 hour'
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `DELETE FROM public.imap_message_bodies
+       WHERE message_id IN (
+         SELECT id FROM public.imap_messages
+         WHERE account_id = $1 AND folder_path = 'Sent' AND uid = 201
+       )`,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `UPDATE public.imap_messages
+       SET body_fetched_at = NULL
+       WHERE account_id = $1 AND folder_path = 'Sent' AND uid = 201`,
+      [h.account.id]
+    );
+
+    const moved = folders[0].messages.find((message) => message.uid === 103)!;
+    folders[0].messages = folders[0].messages.filter(
+      (message) => message.uid !== 101 && message.uid !== 103
+    );
+    folders[0].messages.find((message) => message.uid === 102)!.flags = ["\\Seen"];
+    folders[0].messages.push(
+      makeTextMessage({
+        uid: 106,
+        subject: "arrived via idle",
+        from: "fresh@x.test",
+        to: "u@x.test",
+        body: "fresh"
+      })
+    );
+    folders[1].messages.push(
+      makeTextMessage({
+        uid: 202,
+        subject: "sent outside idle lane",
+        from: "u@x.test",
+        to: "fresh@x.test",
+        body: "sent"
+      })
+    );
+    folders[2].messages.push({ ...moved, uid: 301 });
+
+    const idleClient = new FixtureImapClient(folders);
+    const logout = vi.spyOn(idleClient, "logout");
+    const list = vi.spyOn(idleClient, "list");
+    const beforeWake = await h.pool.query<{ last_sync_finished_at: Date | null }>(
+      "SELECT last_sync_finished_at FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    await expect(engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: "00000000-0000-4000-8000-000000000000",
+      keepClientOpen: true
+    })).rejects.toThrow("Host-owned client does not match the Mailbox Account");
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceInboxReconcile: true,
+      forceInboxFlagScan: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.foldersProcessed).toBe(1);
+    expect(result.reconcileGapsFound).toBe(2);
+    expect(result.flagsUpdated).toBe(1);
+    expect(list).not.toHaveBeenCalled();
+    const afterWake = await h.pool.query<{ last_sync_finished_at: Date | null }>(
+      "SELECT last_sync_finished_at FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(afterWake.rows[0].last_sync_finished_at?.toISOString()).toBe(
+      beforeWake.rows[0].last_sync_finished_at?.toISOString()
+    );
+
+    const messages = await h.pool.query<{
+      folder_path: string;
+      uid: string;
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+      flags: string[];
+    }>(
+      `SELECT folder_path, uid::text, deleted_in_provider, deleted_reason, flags
+       FROM public.imap_messages
+       WHERE account_id = $1 AND uid IN (101, 102, 103, 106, 202, 301)
+       ORDER BY folder_path, uid`,
+      [h.account.id]
+    );
+    expect(messages.rows).toEqual([
+      {
+        folder_path: "INBOX",
+        uid: "101",
+        deleted_in_provider: true,
+        deleted_reason: "RECONCILE_MISSING",
+        flags: []
+      },
+      {
+        folder_path: "INBOX",
+        uid: "102",
+        deleted_in_provider: false,
+        deleted_reason: null,
+        flags: ["\\Seen"]
+      },
+      {
+        folder_path: "INBOX",
+        uid: "103",
+        deleted_in_provider: true,
+        deleted_reason: "RECONCILE_MISSING",
+        flags: []
+      },
+      {
+        folder_path: "INBOX",
+        uid: "106",
+        deleted_in_provider: false,
+        deleted_reason: null,
+        flags: []
+      }
+    ]);
+
+    expect(logout).not.toHaveBeenCalled();
+    const unrelatedBody = await h.pool.query<{ body_fetched_at: Date | null }>(
+      `SELECT body_fetched_at
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Sent' AND uid = 201`,
+      [h.account.id]
+    );
+    expect(unrelatedBody.rows[0].body_fetched_at).toBeNull();
+
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "scheduled");
+    const movedDestination = await h.pool.query<{ folder_path: string; uid: string }>(
+      `SELECT folder_path, uid::text
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 301`,
+      [h.account.id]
+    );
+    expect(movedDestination.rows).toEqual([{ folder_path: "Archive", uid: "301" }]);
+  });
+
   it("closes an in-flight Sent IMAP operation when its scheduler deadline aborts", async () => {
     const h = await setupIntegration("sent-fast-pass-abort");
     activeAccountIds.push(h.account.id);

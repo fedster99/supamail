@@ -95,6 +95,15 @@ Between full sync cycles, a separate due-based Sent lane refreshes metadata at `
 
 Flag scans and reconciles are also due-based and budgeted. Agents should not change this into "scan every folder every cycle" behavior; that is exactly the folder-explosion failure mode the old spec was trying to prevent.
 
+Hosts may reduce Inbox latency with the exported `openInboxIdleSession`
+primitive. It opens one read-only Inbox session and waits for `exists`,
+`expunge`, or `flags` notifications. The notification is not mirror truth. The
+host passes the same session into the existing account-locked sync path and
+retains the periodic full-sync timer as recovery.
+`EXPUNGE` forces the normal Inbox UID reconcile; `FLAGS` forces the normal Inbox
+flag scan. Listener ownership, reconnect backoff, and shutdown belong to the
+host, not public core.
+
 Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. Backfill *completeness* does not gate `sync_state` health (an account is not DEGRADED for incomplete history), though a history-lane *error* surfaces in the sync run outcome like other lane errors. Progress consumers should read `imap_account_progress` and per-folder progress rows.
 
 The live body lane reads `body_fetch_policy` on each account run. `immediate`

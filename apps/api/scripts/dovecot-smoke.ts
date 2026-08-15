@@ -5,8 +5,10 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { ImapFlow } from "imapflow";
 import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
+import { openInboxIdleSession } from "../src/inbox-idle.js";
 import { MirrorRepository } from "../src/repository.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 
@@ -296,6 +298,61 @@ async function main(): Promise<void> {
     const engine = new MirrorEngine({ pool, config, repository });
     const result = await engine.syncAccount(account.id, "manual");
     const counts = await countRows(account.id);
+    const idleAccount = await repository.getAccount(account.id);
+    if (!idleAccount) throw new Error("Dovecot smoke Mailbox Account disappeared");
+    const opened = await openInboxIdleSession(pool, config, idleAccount);
+    if (opened.status !== "ready") throw new Error("Dovecot did not advertise IDLE");
+    const session = opened.session;
+    const waitForWake = async (message: string) => {
+      const waiting = session.wait();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const injector = new ImapFlow({
+        host: "127.0.0.1",
+        port: imapPort,
+        secure: false,
+        auth: { user: mailbox, pass: password },
+        logger: false
+      });
+      await injector.connect();
+      try {
+        await injector.append("INBOX", Buffer.from(message));
+      } finally {
+        await injector.logout().catch(() => injector.close());
+      }
+      return await Promise.race([
+        waiting,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("Timed out waiting for Dovecot IDLE wake")),
+          5_000
+        ))
+      ]);
+    };
+    try {
+      const firstWake = await waitForWake(
+        plainMessage("3", "Dovecot IDLE 3", "First IDLE arrival.")
+      );
+      if (firstWake.status !== "wake" || firstWake.wake.kind !== "exists") {
+        throw new Error("Dovecot did not produce the first EXISTS wake");
+      }
+      const liveResult = await engine.syncAccount(account.id, "scheduled", {
+        liveInboxOnly: true,
+        client: session.syncClient,
+        clientAccountId: session.accountId,
+        keepClientOpen: true
+      });
+      if (liveResult.outcome !== "success") {
+        throw new Error("Same-session IDLE sync failed");
+      }
+      const secondWake = await waitForWake(
+        plainMessage("4", "Dovecot IDLE 4", "Second IDLE arrival.")
+      );
+      if (secondWake.status !== "wake" || secondWake.wake.kind !== "exists") {
+        throw new Error("Dovecot did not re-enter IDLE on the same session");
+      }
+    } finally {
+      session.close();
+    }
+    const idleCounts = await countRows(account.id);
     const assertions: Array<[string, boolean]> = [
       ["sync succeeded", result.outcome === "success"],
       ["discovered Dovecot folders", counts.folders >= 4],
@@ -304,7 +361,8 @@ async function main(): Promise<void> {
       ["stored attachment metadata", counts.attachments >= 1],
       ["kept Archive trackable", counts.trackedArchive],
       ["excluded Trash by provider profile", counts.excludedTrash],
-      ["no false provider deletes", counts.deletedMessages === 0]
+      ["no false provider deletes", counts.deletedMessages === 0],
+      ["same-session IDLE sync stored the first arrival", idleCounts.messages === 5]
     ];
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
@@ -317,7 +375,8 @@ async function main(): Promise<void> {
       mailbox,
       imapPort,
       result,
-      counts
+      counts,
+      idleCounts
     }, null, 2));
   } finally {
     const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";
