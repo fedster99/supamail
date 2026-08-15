@@ -3684,6 +3684,10 @@ liveDb("ThreadingRepository live DB", () => {
       "SELECT count(*)::text AS count FROM public.imap_thread_work_queue WHERE run_id = $1",
       [ready.runId]
     );
+    const selectedPageSizes = timings
+      .filter((timing) => timing.stage === "queue_selection" && timing.outcome === "completed")
+      .map((timing) => timing.itemCount);
+    expect(selectedPageSizes.slice(0, 2)).toEqual([331, 165]);
     expect(queueItemsProcessed).toBeGreaterThan(0);
     expect(remaining.rows[0]?.count).toBe("0");
   }, 180_000);
