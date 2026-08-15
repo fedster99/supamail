@@ -3685,7 +3685,7 @@ liveDb("ThreadingRepository live DB", () => {
       [ready.runId]
     );
     const selectedPageSizes = timings
-      .filter((timing) => timing.stage === "queue_selection" && timing.outcome === "completed")
+      .filter((timing) => timing.stage === "queue_selection" && timing.outcome === "succeeded")
       .map((timing) => timing.itemCount);
     expect(selectedPageSizes.slice(0, 2)).toEqual([331, 165]);
     expect(queueItemsProcessed).toBeGreaterThan(0);
