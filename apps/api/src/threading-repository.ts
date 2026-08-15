@@ -3124,15 +3124,20 @@ export class ThreadingRepository {
     requestedBy: string,
     attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
+    const selectionDetails: Pick<ThreadingStageTiming, "itemCount"> = {};
     const work = await this.timeStage(
       "queue_selection",
-      { itemCount: batchSize },
-      () => client.query<{ message_id: string }>(
-        `SELECT message_id FROM public.imap_thread_work_queue
-         WHERE run_id = $1 AND available_at <= now()
-         ORDER BY enqueued_at, message_id LIMIT $2 FOR UPDATE SKIP LOCKED`,
-        [run.id, batchSize]
-      )
+      selectionDetails,
+      async () => {
+        const selected = await client.query<{ message_id: string }>(
+          `SELECT message_id FROM public.imap_thread_work_queue
+           WHERE run_id = $1 AND available_at <= now()
+           ORDER BY enqueued_at, message_id LIMIT $2 FOR UPDATE SKIP LOCKED`,
+          [run.id, batchSize]
+        );
+        selectionDetails.itemCount = selected.rows.length;
+        return selected;
+      }
     );
     const ids = work.rows.map((row) => row.message_id);
     if (ids.length === 0) return this.resultForRun(run.account_id, run);
