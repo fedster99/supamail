@@ -3609,6 +3609,12 @@ liveDb("ThreadingRepository live DB", () => {
       "assignment_history_write",
       "assignment_history_retention"
     ]).toContain(failedStage?.stage);
+    console.info(JSON.stringify({
+      event: "threading.timeout_stage",
+      stage: failedStage?.stage,
+      durationMs: Math.round(failedStage?.elapsedMs ?? 0),
+      itemCount: failedStage?.itemCount
+    }));
     expect(timings.every((timing) => Object.keys(timing).every((key) => [
       "stage",
       "outcome",
