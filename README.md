@@ -417,6 +417,10 @@ pnpm --filter @supamail/api smoke:greenmail
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55322/postgres \
 IMAP_ENCRYPTION_KEY=local-dry-run-encryption-key \
 pnpm --filter @supamail/api smoke:dovecot
+
+IDLE_SCALE_WATCHERS=1000 \
+IDLE_SCALE_DURATION_MS=60000 \
+pnpm smoke:idle-scale
 ```
 
 Load smoke test:
@@ -428,7 +432,7 @@ NODE_OPTIONS=--max-old-space-size=160 \
 pnpm --filter @supamail/api smoke:load
 ```
 
-`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol. `pnpm --filter @supamail/api smoke:dovecot` starts a disposable `dovecot/dovecot` Docker IMAP server with seeded Maildir data to validate the generic-hosting shape. See [docs/imap-compatibility.md](docs/imap-compatibility.md) before claiming support for a specific provider.
+`pnpm --filter @supamail/api dry-run:local` uses a fake IMAP client with fixture folders, messages, MIME bodies, and attachment metadata. `pnpm --filter @supamail/api smoke:greenmail` starts a disposable `greenmail/standalone` Docker IMAP/SMTP server and syncs through the real IMAP protocol. `pnpm --filter @supamail/api smoke:dovecot` starts a disposable `dovecot/dovecot` Docker IMAP server with seeded Maildir data to validate the generic-hosting shape. `pnpm smoke:idle-scale` measures real ImapFlow TLS IDLE session capacity against a synthetic server; it does not validate a provider. See [docs/imap-compatibility.md](docs/imap-compatibility.md) before claiming support for a specific provider.
 
 ## Project Status
 

@@ -43,6 +43,7 @@ The compatibility gate is split by cost:
 - `pnpm test:db:live` runs `provider-compatibility.integration.test.ts` against disposable Postgres with deterministic IMAP fixtures.
 - `pnpm smoke:greenmail` starts a real GreenMail container and syncs through the real IMAP/SMTP protocol.
 - `pnpm smoke:dovecot` starts a real Dovecot container and syncs through the real IMAP protocol against seeded Maildir data.
+- `pnpm smoke:idle-scale` opens real ImapFlow TLS sessions against a synthetic IDLE server, emits `EXISTS`, `EXPUNGE`, and flag events, drops every connection, and measures event delivery, reconnect recovery, memory, CPU, and file descriptors. It is a capacity harness, not provider-compatibility evidence.
 
 The live DB fixture suite currently covers:
 
