@@ -210,13 +210,38 @@ export function quoteText(text: string): string {
   return output.toString("utf8");
 }
 
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+const MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec"
+] as const;
+
+/** Format a reply attribution date for a server that has no user timezone. */
+export function formatReplyDate(date: Date): string {
+  const hour = date.getUTCHours();
+  const hour12 = hour % 12 || 12;
+  const minute = String(date.getUTCMinutes()).padStart(2, "0");
+  const day = `${WEEKDAYS[date.getUTCDay()]}, ${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}`;
+  return `${day} at ${hour12}:${minute} ${hour < 12 ? "AM" : "PM"} UTC`;
+}
+
 /** Quote the full available original body without allocating one string per line. */
 function quoteOriginal(row: SourceRow): string {
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
   const cleaned = cleanBody(raw, { includeQuoted: true });
   const text = cleaned.text ?? "";
   const fromLabel = row.from_name ? `${row.from_name} <${row.from_email ?? ""}>` : row.from_email ?? "unknown sender";
-  const attribution = `On ${row.internal_date.toISOString()}, ${fromLabel} wrote:`;
+  const attribution = `On ${formatReplyDate(row.internal_date)}, ${fromLabel} wrote:`;
   const quoted = quoteText(text);
   return `${attribution}\n${quoted}`;
 }
