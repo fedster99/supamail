@@ -56,6 +56,26 @@ describe("config SMTP delivery timeout", () => {
   });
 });
 
+describe("config Inbox IDLE timeouts", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it("renews IDLE at 25 minutes with a longer idle-safe socket timeout", () => {
+    const config = getConfig(baseEnv);
+    expect(config.IMAP_IDLE_MAX_TIME_MS).toBe(25 * 60_000);
+    expect(config.IMAP_IDLE_SOCKET_TIMEOUT_MS).toBe(30 * 60_000);
+  });
+
+  it("rejects an idle socket timeout that cannot contain one renewal", () => {
+    expect(() => getConfig({
+      ...baseEnv,
+      IMAP_IDLE_MAX_TIME_MS: "1500000",
+      IMAP_IDLE_SOCKET_TIMEOUT_MS: "1500000"
+    })).toThrow(/must exceed/);
+  });
+});
+
 describe("config initial thread activation", () => {
   beforeEach(() => {
     resetConfigForTests();

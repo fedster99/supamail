@@ -49,13 +49,14 @@ export async function connectImap(
   pool: PgPool,
   config: AppConfig,
   account: ImapAccount,
-  options: { signal?: AbortSignal } = {}
+  options: { signal?: AbortSignal; purpose?: "command" | "idle" } = {}
 ): Promise<ImapFlow> {
   await assertSafeImapTarget(account.host, account.port, account.secure, {
     allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
   });
   const password = await decryptPassword(pool, account.encrypted_password, config.IMAP_ENCRYPTION_KEY);
   let closingIntentionally = false;
+  const idleConnection = options.purpose === "idle";
   const client = new ImapFlow({
     host: account.host,
     port: account.port,
@@ -64,7 +65,11 @@ export async function connectImap(
     logger: false,
     connectionTimeout: config.CONNECT_TIMEOUT_MS,
     greetingTimeout: config.CONNECT_TIMEOUT_MS,
-    socketTimeout: config.IMAP_COMMAND_TIMEOUT_MS
+    socketTimeout: idleConnection
+      ? config.IMAP_IDLE_SOCKET_TIMEOUT_MS
+      : config.IMAP_COMMAND_TIMEOUT_MS,
+    disableAutoIdle: idleConnection,
+    maxIdleTime: idleConnection ? config.IMAP_IDLE_MAX_TIME_MS : undefined
   });
   // ImapFlow reports some lifecycle failures through both the command/connect
   // promise and EventEmitter's special `error` channel. A scheduler abort can

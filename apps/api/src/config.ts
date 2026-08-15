@@ -69,6 +69,11 @@ const envSchema = z.object({
   RECONCILE_TOTAL_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),
   CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   IMAP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  // IDLE is intentionally renewed before the RFC 2177 29-minute guidance.
+  // The socket timeout must remain longer than one renewal interval so a quiet
+  // mailbox does not look like a dead connection.
+  IMAP_IDLE_MAX_TIME_MS: z.coerce.number().int().positive().default(25 * 60_000),
+  IMAP_IDLE_SOCKET_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60_000),
   SMTP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(10 * 60_000),
   IMAP_MAX_COMMANDS_PER_MINUTE: z.coerce.number().int().positive().default(200),
   MAX_LOCK_HOLD_MS: z.coerce.number().int().positive().default(10 * 60_000),
@@ -97,6 +102,14 @@ const envSchema = z.object({
     message: "BACKFILL_WINDOW_TIMEZONE must be a valid IANA time zone"
   })
 }).superRefine((env, ctx) => {
+  if (env.IMAP_IDLE_SOCKET_TIMEOUT_MS <= env.IMAP_IDLE_MAX_TIME_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "IMAP_IDLE_SOCKET_TIMEOUT_MS must exceed IMAP_IDLE_MAX_TIME_MS",
+      path: ["IMAP_IDLE_SOCKET_TIMEOUT_MS"]
+    });
+  }
+
   const hasStart = env.BACKFILL_WINDOW_START_HOUR !== undefined;
   const hasEnd = env.BACKFILL_WINDOW_END_HOUR !== undefined;
   if (hasStart !== hasEnd) {

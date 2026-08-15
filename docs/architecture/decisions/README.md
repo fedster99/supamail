@@ -35,6 +35,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0028-content-extract-body-store-seam.md`: A 32 KiB plain-text extract and threading evidence commit before the pluggable body store receives the full payload.
 - `0029-metadata-protection-adapter.md`: A deployment-neutral adapter protects complete sensitive metadata rows while preserving the exact-match projections public core requires.
 - `0030-bounded-batch-thread-reading.md`: `read_thread` batches up to ten grouped-search conversation seeds without adding another MCP tool.
+- `0031-host-owned-inbox-idle-wake.md`: Hosts may use one read-only Inbox IDLE session per active Mailbox Account as a low-latency wake hint while polling, reconciliation, and account locking remain authoritative.
 
 ## Status Values
 

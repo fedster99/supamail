@@ -54,7 +54,9 @@ const config = {
   IMAP_ENCRYPTION_KEY: "0123456789abcdef",
   IMAP_ALLOW_PRIVATE_HOSTS: false,
   CONNECT_TIMEOUT_MS: 15000,
-  IMAP_COMMAND_TIMEOUT_MS: 30000
+  IMAP_COMMAND_TIMEOUT_MS: 30000,
+  IMAP_IDLE_MAX_TIME_MS: 1_500_000,
+  IMAP_IDLE_SOCKET_TIMEOUT_MS: 1_800_000
 } as never;
 
 const account = {
@@ -159,6 +161,15 @@ describe("connectImap (the one shared connect prelude)", () => {
       connectionTimeout: 15000,
       greetingTimeout: 15000,
       socketTimeout: 30000
+    });
+  });
+
+  it("uses idle-safe timeouts and explicit IDLE control for a watcher socket", async () => {
+    await connectImap({} as never, config, account, { purpose: "idle" });
+    expect(fake.lastOptions).toMatchObject({
+      socketTimeout: 1_800_000,
+      maxIdleTime: 1_500_000,
+      disableAutoIdle: true
     });
   });
 

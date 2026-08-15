@@ -294,6 +294,23 @@ export interface MirrorEngineOptions {
   ) => Promise<MirrorImapClient>;
 }
 
+export interface SyncAccountOptions {
+  sentOnly?: boolean;
+  /** Run only Inbox metadata, reconciliation, and flag work. */
+  liveInboxOnly?: boolean;
+  /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
+  forceInboxReconcile?: boolean;
+  /** A flags notification may arrive before the normal flag deadline. */
+  forceInboxFlagScan?: boolean;
+  signal?: AbortSignal;
+  /** Reuse a host-owned session, such as an Inbox IDLE connection. */
+  client?: MirrorImapClient;
+  /** Mailbox Account identity bound to the host-owned session. */
+  clientAccountId?: string;
+  /** Leave a healthy host-owned session open after this pass. */
+  keepClientOpen?: boolean;
+}
+
 export class MirrorEngine {
   private readonly pool: PgPool;
   private readonly config: AppConfig;
@@ -353,10 +370,23 @@ export class MirrorEngine {
   async syncAccount(
     accountId: string,
     triggerType: SyncTriggerType = "manual",
-    options: { sentOnly?: boolean; signal?: AbortSignal } = {}
+    options: SyncAccountOptions = {}
   ): Promise<SyncResult> {
+    if (options.sentOnly && options.liveInboxOnly) {
+      throw new Error("sentOnly and liveInboxOnly cannot be combined");
+    }
+    if (options.client && options.keepClientOpen !== true) {
+      throw new Error("A host-owned client requires keepClientOpen");
+    }
+    if (options.keepClientOpen && !options.client) {
+      throw new Error("keepClientOpen requires a host-owned client");
+    }
+    if (options.client && options.clientAccountId !== accountId) {
+      throw new Error("Host-owned client does not match the Mailbox Account");
+    }
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
+    const supplemental = options.sentOnly === true || options.liveInboxOnly === true;
 
     const runId = await this.repository.startSyncRun(account.id, triggerType);
     const metadataWriteStats: MetadataWriteStats = {
@@ -418,14 +448,19 @@ export class MirrorEngine {
           return;
         }
 
-        client = await this.clientFactory(account, { signal: options.signal });
+        client = options.client
+          ?? await this.clientFactory(account, { signal: options.signal });
         throwIfInterrupted();
 
-        if (!options.sentOnly && this.shouldDiscoverFolders(account)) {
+        if (!supplemental && this.shouldDiscoverFolders(account)) {
           await this.discoverFolders(account, client);
         }
 
-        const folders = sentFolders ?? await this.repository.getFoldersDueForSync(account.id);
+        const folders = sentFolders ?? (options.liveInboxOnly
+          ? [await this.repository.getInboxFolderForWake(account.id)].filter(
+              (folder): folder is ImapFolder => folder !== null
+            )
+          : await this.repository.getFoldersDueForSync(account.id));
         let priorityFolderFailed = false;
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
@@ -445,6 +480,8 @@ export class MirrorEngine {
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
+              forceReconcile: options.liveInboxOnly && options.forceInboxReconcile === true,
+              forceFlagScan: options.liveInboxOnly && options.forceInboxFlagScan === true,
               signal: options.signal
             });
             throwIfInterrupted();
@@ -496,7 +533,7 @@ export class MirrorEngine {
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly && !connectionLost) {
+        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
@@ -505,7 +542,7 @@ export class MirrorEngine {
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly && !connectionLost) {
+        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
           const historyResult = await this.runHistoryLane(
             account,
             client,
@@ -524,7 +561,7 @@ export class MirrorEngine {
           result.outcome = priorityFolderFailed ? "failed" : "partial_success";
         }
 
-        if (options.sentOnly) {
+        if (supplemental) {
           await this.repository.markAccountSyncYielded(account.id, {
             deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
             signal: options.signal,
@@ -561,7 +598,7 @@ export class MirrorEngine {
           // Defer database cleanup until withAccountLock has released the
           // advisory lock. A locked account row must not pin mailbox ownership.
           cancellationCleanupRequired = accountSyncStarted;
-          if (!options.sentOnly) {
+          if (!supplemental) {
             result.outcome = "partial_success";
             result.errors.push("Sync interrupted by scheduler");
           }
@@ -574,7 +611,7 @@ export class MirrorEngine {
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
         try {
-          if (options.sentOnly) {
+          if (supplemental) {
             await this.repository.markAccountSyncYielded(account.id, {
               deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
               signal: options.signal,
@@ -608,18 +645,21 @@ export class MirrorEngine {
         }
       } finally {
         options.signal?.removeEventListener("abort", interruptActiveClient);
-        if (client) await client.logout().catch(() => undefined);
+        if (
+          client
+          && (!options.keepClientOpen || client.usable === false || options.signal?.aborted)
+        ) {
+          await client.logout().catch(() => this.abortClient(client!));
+        }
       }
     });
 
     let runFinished = false;
     try {
       let locked = await runLockedSync();
-      // The Sent lane is supplemental. If another worker owns the account, defer
-      // to the next Sent/full pass instead of spending its bounded deadline on
-      // stale-lock recovery or emitting a false lock-busy outage. Full/manual
-      // syncs retain the recovery and failure behavior below.
-      const yieldedBeforeLock = locked === null && options.sentOnly === true;
+      // Supplemental Sent and live Inbox lanes defer to the authoritative full
+      // sweep when another worker owns the Mailbox Account.
+      const yieldedBeforeLock = locked === null && supplemental;
       if (locked === null && !yieldedBeforeLock) {
         const recovered = await clearOrphanedLockForAccount(
           this.pool,
@@ -832,6 +872,8 @@ export class MirrorEngine {
       enforceLockDeadline: boolean;
       lockDeadline: number;
       metadataWriteStats: MetadataWriteStats;
+      forceReconcile?: boolean;
+      forceFlagScan?: boolean;
       signal?: AbortSignal;
     }
   ): Promise<FolderSyncResult> {
@@ -952,7 +994,9 @@ export class MirrorEngine {
         }
       }
 
-      const flagScanDue = !folder.next_flag_scan_at || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
+      const flagScanDue = options.forceFlagScan
+        || !folder.next_flag_scan_at
+        || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       if (!hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
@@ -999,7 +1043,8 @@ export class MirrorEngine {
 
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
-      const reconcileDue = !folder.last_full_reconcile_at
+      const reconcileDue = options.forceReconcile
+        || !folder.last_full_reconcile_at
         || !folder.next_reconcile_at
         || new Date(folder.next_reconcile_at).getTime() <= Date.now();
       let backfilled = 0;

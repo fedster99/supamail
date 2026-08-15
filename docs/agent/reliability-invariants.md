@@ -96,11 +96,12 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 
 - Current default sync edges:
   - Live sync window is `WINDOW_DAYS=90` days.
-  - Inbox/new mail is polling-based and usually detected in about 1-2 minutes.
+  - The built-in worker detects Inbox/new mail by polling, usually in about 1-2 minutes.
+  - A host may use `openInboxIdleSession` to request an earlier Inbox sync after an `exists`, `expunge`, or `flags` notification. IDLE is only a wake hint. The host must reuse that one provider session for sync, keep the periodic full-sync timer, own reconnect/backoff, and use the existing account-locked sync path. `EXPUNGE` must force Inbox reconcile; `FLAGS` must force an Inbox flag scan.
   - Sent metadata has a separate 30-second default cadence. Its lightweight pass skips discovery, flag scan, reconcile, bodies, history, and full-account health/backoff transitions.
   - Supplemental Sent work must yield at the next full-sweep deadline: abort connection setup, throttle waits, or the active Sent connection; start no further Sent accounts; and re-check the full lane without another poll sleep. Any Sent-lane account-lock contention yields without stale-lock recovery. These yields are not outage/failure signals.
   - Folder discovery runs every 15 minutes.
-  - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder.
+  - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder. An Inbox `EXPUNGE` wake may force this reconcile earlier; other folders keep the normal cadence.
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
   - Inbox remains first in bounded full-sweep priority selection. Sent stays at priority 5 and receives a supplemental lightweight refresh on its separate cadence.
@@ -123,6 +124,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - `immediate` includes every active live-window message in the automatic body lane. `lazy` disables automatic backlog fetch. `priority_then_backfill` includes only priority folders and does not promise later live-body coverage for current non-priority folders.
 - `imap_account_progress` is a read model. Live and priority body fields come from current message/body rows; header and historical fields still use cumulative folder counters. Per-folder `live_bodies_fetched_count`, `live_bodies_target_count`, and `bodies_pct` use current nondeleted `IN_WINDOW` rows and store-completed, non-truncated body evidence for every returned folder. Because the folder list includes inactive folders, its targets need not sum to the active account target. Migration `0021_row_accurate_body_progress` adds `imap_messages_live_body_progress_idx` on `(account_id, folder_path, id)` for active `IN_WINDOW` rows; migration `0022_content_extract_body_store` additionally requires `body_fetched_at` so a pre-store evidence row cannot count as complete. Large existing mirrors must prebuild that exact index concurrently before applying the transactional migration.
 - Account sync runs as three ordered lanes under one advisory lock: hot metadata/reconcile, capped live body backlog, then history.
+- A host-driven `liveInboxOnly` pass runs only Inbox metadata, reconciliation, and flag work. It skips discovery, body backlog, and history, and it does not advance the authoritative full-sync schedule. It must not combine with the Sent-only lane. Hosted causal telemetry belongs to the host and does not change the public mirror schema.
 - History lane work must never run before hot sync or the live body lane, and it must stop when the cooperative lock budget is exhausted.
 - Historical backfill uses the folder `backfill_*` state and `last_archive_refresh_at`; it snapshots older-than-window UIDs and walks them newest-first in resumable batches.
 - `historical_backfill_mode = 'off'` disables history work. `metadata_only` mirrors historical headers only. `metadata_and_bodies` fetches historical bodies too.
