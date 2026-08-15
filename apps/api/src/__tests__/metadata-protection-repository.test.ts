@@ -9,7 +9,10 @@ import type {
 } from "../metadata-protection.js";
 import { plaintextMetadataProtection } from "../metadata-protection.js";
 import { MirrorRepository } from "../repository.js";
-import { threadingFailureReason } from "../threading-repository.js";
+import {
+  isThreadingStatementTimeout,
+  threadingFailureReason
+} from "../threading-repository.js";
 
 vi.mock("../host-validation.js", () => ({
   assertSafeImapTarget: vi.fn(async () => undefined)
@@ -157,5 +160,21 @@ describe("MirrorRepository metadata protection", () => {
       .toBe("THREADING_ERROR");
     expect(threadingFailureReason(error, plaintextMetadataProtection))
       .toContain("Private Clients");
+  });
+
+  it("classifies only PostgreSQL statement-timeout cancellations for subdivision", () => {
+    expect(isThreadingStatementTimeout({
+      code: "57014",
+      message: "canceling statement due to statement timeout"
+    })).toBe(true);
+    expect(isThreadingStatementTimeout({
+      code: "57014",
+      message: "canceling statement due to user request"
+    })).toBe(false);
+    expect(isThreadingStatementTimeout({
+      code: "XX000",
+      message: "statement timeout"
+    })).toBe(false);
+    expect(isThreadingStatementTimeout(new Error("statement timeout"))).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { getConfig } from "../config.js";
-import { closePool, getPool } from "../db.js";
+import { closePool, createPool, getPool } from "../db.js";
 import type {
   MetadataProtectionAdapter,
   MetadataProtectionContext,
@@ -16,6 +16,7 @@ import {
   ThreadingEvidenceLimitError,
   ThreadingRepository,
   ThreadingVersionSkewError,
+  isThreadingStatementTimeout,
   type ThreadingRunResult
 } from "../threading-repository.js";
 import {
@@ -3347,7 +3348,7 @@ liveDb("ThreadingRepository live DB", () => {
     expect(new Set((await activeProjection(accountId)).map((row) => row.delivery_key)).size).toBe(1);
   });
 
-  it("fails closed with persisted backoff before a protocol closure can exceed its bound", async () => {
+  it("fails closed with queue-local backoff before a protocol closure can exceed its bound", async () => {
     const accountId = await createAccount("closure-cap");
     const root = await seedMessage(accountId, {
       uid: 1,
@@ -3378,9 +3379,17 @@ liveDb("ThreadingRepository live DB", () => {
       requestedBy: "live-test"
     })).rejects.toBeInstanceOf(ThreadingClosureLimitError);
 
-    const delayed = await pool.query<{ attempts: number; delayed: boolean; failures: string }>(
+    const delayed = await pool.query<{
+      attempts: number;
+      failures: string;
+      queue_delayed: boolean;
+      run_ready: boolean;
+    }>(
       `SELECT run.attempts,
-              run.available_at > now() AS delayed,
+              run.available_at <= now() AS run_ready,
+              (SELECT bool_and(queue.available_at > now())
+               FROM public.imap_thread_work_queue queue
+               WHERE queue.run_id = run.id) AS queue_delayed,
               (SELECT count(*)::text FROM public.imap_thread_operations operation
                WHERE operation.run_id = run.id
                  AND operation.operation_type = 'failure'
@@ -3388,7 +3397,12 @@ liveDb("ThreadingRepository live DB", () => {
        FROM public.imap_thread_runs run WHERE run.id = $1`,
       [ready.runId]
     );
-    expect(delayed.rows[0]).toEqual({ attempts: 1, delayed: true, failures: "1" });
+    expect(delayed.rows[0]).toEqual({
+      attempts: 1,
+      failures: "1",
+      queue_delayed: true,
+      run_ready: true
+    });
     expect(await repository.listAccountsNeedingWork()).not.toContain(accountId);
   });
 
@@ -3483,12 +3497,12 @@ liveDb("ThreadingRepository live DB", () => {
     const adaptive = await pool.query<{
       attempts: number;
       batch_size: string | null;
-      retry_delay_seconds: number;
       max_queue_delay_seconds: number;
+      run_ready: boolean;
     }>(
       `SELECT attempts,
               summary->>'adaptive_closure_batch_size' AS batch_size,
-              extract(epoch FROM available_at - now())::double precision AS retry_delay_seconds,
+              available_at <= now() AS run_ready,
               (SELECT max(extract(epoch FROM queue.available_at - now()))::double precision
                FROM public.imap_thread_work_queue queue
                WHERE queue.run_id = run.id) AS max_queue_delay_seconds
@@ -3496,8 +3510,7 @@ liveDb("ThreadingRepository live DB", () => {
       [runId]
     );
     expect(adaptive.rows[0]).toMatchObject({ attempts: 9, batch_size: "2" });
-    expect(adaptive.rows[0]?.retry_delay_seconds).toBeGreaterThan(0);
-    expect(adaptive.rows[0]?.retry_delay_seconds).toBeLessThanOrEqual(5);
+    expect(adaptive.rows[0]?.run_ready).toBe(true);
     expect(adaptive.rows[0]?.max_queue_delay_seconds).toBeGreaterThan(0);
     expect(adaptive.rows[0]?.max_queue_delay_seconds).toBeLessThanOrEqual(5);
 
@@ -3514,6 +3527,310 @@ liveDb("ThreadingRepository live DB", () => {
     }
     expect(ready).toMatchObject({ runId, runStatus: "ready", ready: true });
     expect(await projection(runId as string)).toHaveLength(4);
+  });
+
+  it("subdivides a production-shaped statement timeout until the queue makes progress", async () => {
+    const accountId = await createAccount("timeout-stage-repro");
+    await pool.query(
+      `WITH generated AS (
+         SELECT sequence,
+                ((sequence - 1) / 9)::integer AS component,
+                ((sequence - 1) % 9)::integer AS position
+         FROM generate_series(1, 990) AS sequence
+       )
+       INSERT INTO public.imap_messages (
+         account_id, folder_path, uidvalidity, uid, internal_date,
+         subject, from_email, to_emails,
+         rfc_message_id, message_id_normalized,
+         provider_thread_id, provider_thread_id_namespace,
+         window_status, size_bytes, headers_json
+       )
+       SELECT $1, 'INBOX', 101, sequence, '2026-08-15T00:00:00.000Z',
+              format('Synthetic component %s message %s', component, position),
+              'sender@example.test', ARRAY['recipient@example.test'],
+              format('<timeout-%s-%s@example.test>', component, position),
+              format('timeout-%s-%s@example.test', component, position),
+              format('timeout-component-%s', component), 'fixture',
+              'IN_WINDOW', 1024, '{}'::jsonb
+       FROM generated`,
+      [accountId]
+    );
+
+    const ready = await drainUntilReady(accountId, { batchSize: 500 });
+    await activateReviewed(repository, accountId, ready.runId as string);
+    const changed = await pool.query<{ id: string }>(
+      `WITH ranked AS (
+         SELECT id, provider_thread_id,
+                row_number() OVER (PARTITION BY provider_thread_id ORDER BY id) AS position
+         FROM public.imap_messages
+         WHERE account_id = $1
+       )
+       UPDATE public.imap_messages message
+       SET provider_thread_id = message.provider_thread_id || '-changed'
+       FROM ranked
+       WHERE message.id = ranked.id
+         AND (ranked.position <= 3 OR (ranked.provider_thread_id = 'timeout-component-0' AND ranked.position = 4))
+       RETURNING message.id`,
+      [accountId]
+    );
+    expect(changed.rows).toHaveLength(331);
+
+    const timedPool = createPool({
+      DATABASE_URL: process.env.DATABASE_URL as string,
+      DATABASE_POOL_MAX: 1
+    });
+    const timings: Array<{
+      stage: string;
+      outcome: string;
+      elapsedMs: number;
+      itemCount?: number;
+      iteration?: number;
+    }> = [];
+    const timedRepository = new ThreadingRepository(timedPool, {
+      projectionStatementTimeoutMs: 30,
+      onStageTiming: (timing) => timings.push(timing)
+    });
+    let firstFailure: unknown;
+    try {
+      await timedRepository.drainAccount(accountId, {
+        batchSize: 500,
+        requestedBy: "live-test"
+      });
+    } catch (error) {
+      firstFailure = error;
+    }
+    expect(isThreadingStatementTimeout(firstFailure)).toBe(true);
+
+    const failedStage = timings.find((timing) => timing.outcome === "failed");
+    expect([
+      "assignment_state_load",
+      "assignment_operation_write",
+      "assignment_upsert",
+      "assignment_history_write",
+      "assignment_history_retention"
+    ]).toContain(failedStage?.stage);
+    expect(timings.every((timing) => Object.keys(timing).every((key) => [
+      "stage",
+      "outcome",
+      "elapsedMs",
+      "itemCount",
+      "iteration"
+    ].includes(key)))).toBe(true);
+
+    const failure = await pool.query<{
+      attempted: string;
+      adaptive_batch_size: string | null;
+      error_code: string | null;
+      queued: string;
+      retry_state: string | null;
+    }>(
+      `SELECT operation.summary->>'messages_attempted' AS attempted,
+              operation.summary->>'adaptive_retry_batch_size' AS adaptive_batch_size,
+              operation.summary->>'error_code' AS error_code,
+              (SELECT count(*)::text FROM public.imap_thread_work_queue queue
+               WHERE queue.run_id = operation.run_id) AS queued,
+              operation.summary->>'retry_state' AS retry_state
+       FROM public.imap_thread_operations operation
+       WHERE operation.run_id = $1 AND operation.operation_type = 'failure'
+       ORDER BY operation.completed_at DESC
+       LIMIT 1`,
+      [ready.runId]
+    );
+    expect(failure.rows[0]).toEqual({
+      attempted: "331",
+      adaptive_batch_size: "165",
+      error_code: "statement_timeout",
+      queued: "331",
+      retry_state: "subdivided"
+    });
+
+    let queueItemsProcessed = 0;
+    try {
+      for (let pass = 0; pass < 40; pass += 1) {
+        await pool.query(
+          "UPDATE public.imap_thread_runs SET available_at = now() WHERE id = $1",
+          [ready.runId]
+        );
+        await pool.query(
+          "UPDATE public.imap_thread_work_queue SET available_at = now() WHERE run_id = $1",
+          [ready.runId]
+        );
+        try {
+          const result = await timedRepository.drainAccount(accountId, {
+            batchSize: 500,
+            requestedBy: "live-test"
+          });
+          queueItemsProcessed += result.queueItemsProcessed;
+        } catch (error) {
+          expect(isThreadingStatementTimeout(error)).toBe(true);
+        }
+        const queued = await pool.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM public.imap_thread_work_queue WHERE run_id = $1",
+          [ready.runId]
+        );
+        if (queued.rows[0]?.count === "0") break;
+      }
+    } finally {
+      await timedPool.end();
+    }
+
+    const remaining = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_thread_work_queue WHERE run_id = $1",
+      [ready.runId]
+    );
+    expect(queueItemsProcessed).toBeGreaterThan(0);
+    expect(remaining.rows[0]?.count).toBe("0");
+  }, 180_000);
+
+  it("isolates and alerts on one irreducible timeout while later work advances", async () => {
+    const accountId = await createAccount("irreducible-timeout");
+    const poisonId = await seedMessage(accountId, {
+      uid: 1,
+      subject: "Poison",
+      rfcMessageId: "<poison@example.test>",
+      providerMessageId: "poison",
+      providerMessageNamespace: "fixture"
+    });
+    const healthyIds = await Promise.all([2, 3].map((uid) => seedMessage(accountId, {
+      uid,
+      subject: `Healthy ${uid}`,
+      rfcMessageId: `<healthy-${uid}@example.test>`,
+      providerMessageId: `healthy-${uid}`,
+      providerMessageNamespace: "fixture"
+    })));
+    const ready = await drainUntilReady(accountId, { batchSize: 3 });
+    await activateReviewed(repository, accountId, ready.runId as string);
+
+    const timeoutExecutor = (inputs: Parameters<typeof computeThreadAssignments>[0]) => {
+      if (inputs.some((input) => input.provider_message_id === "poison")) {
+        throw Object.assign(
+          new Error("canceling statement due to statement timeout"),
+          { code: "57014" }
+        );
+      }
+      return computeThreadAssignments(inputs);
+    };
+    const faultRepository = new ThreadingRepository(pool, {
+      algorithms: new Map([
+        [1, computeThreadAssignmentsV1],
+        [2, computeThreadAssignmentsV2],
+        [3, timeoutExecutor]
+      ])
+    });
+    await Promise.all([poisonId, ...healthyIds].map((id) => enqueueMessage(accountId, id)));
+    await pool.query(
+      `UPDATE public.imap_thread_work_queue queue
+       SET enqueued_at = ordering.enqueued_at
+       FROM (VALUES
+         ($1::uuid, now() - interval '3 minutes'),
+         ($2::uuid, now() - interval '2 minutes'),
+         ($3::uuid, now() - interval '1 minute')
+       ) AS ordering(message_id, enqueued_at)
+       WHERE queue.run_id = $4 AND queue.message_id = ordering.message_id`,
+      [poisonId, healthyIds[0], healthyIds[1], ready.runId]
+    );
+
+    await expect(faultRepository.drainAccount(accountId, {
+      batchSize: 3,
+      requestedBy: "live-test"
+    })).rejects.toMatchObject({
+      code: "57014",
+      message: expect.stringContaining("statement timeout")
+    });
+    await pool.query(
+      "UPDATE public.imap_thread_runs SET available_at = now() WHERE id = $1",
+      [ready.runId]
+    );
+    await pool.query(
+      "UPDATE public.imap_thread_work_queue SET available_at = now() WHERE run_id = $1",
+      [ready.runId]
+    );
+    await expect(faultRepository.drainAccount(accountId, {
+      batchSize: 3,
+      requestedBy: "live-test"
+    })).rejects.toMatchObject({
+      code: "57014",
+      message: expect.stringContaining("statement timeout")
+    });
+
+    for (const healthyId of healthyIds) {
+      const result = await faultRepository.drainAccount(accountId, {
+        batchSize: 3,
+        requestedBy: "live-test"
+      });
+      expect(result.queueItemsProcessed).toBe(1);
+      const queued = await pool.query<{ queued: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM public.imap_thread_work_queue
+           WHERE run_id = $1 AND message_id = $2
+         ) AS queued`,
+        [ready.runId, healthyId]
+      );
+      expect(queued.rows[0]?.queued).toBe(false);
+    }
+
+    for (let attempt = 2; attempt < 10; attempt += 1) {
+      await pool.query(
+        "UPDATE public.imap_thread_runs SET available_at = now() WHERE id = $1",
+        [ready.runId]
+      );
+      await pool.query(
+        "UPDATE public.imap_thread_work_queue SET available_at = now() WHERE run_id = $1 AND message_id = $2",
+        [ready.runId, poisonId]
+      );
+      await expect(faultRepository.drainAccount(accountId, {
+        batchSize: 3,
+        requestedBy: "live-test"
+      })).rejects.toMatchObject({
+        code: "57014",
+        message: expect.stringContaining("statement timeout")
+      });
+    }
+
+    const isolated = await pool.query<{
+      attempts: number;
+      reason: string;
+      retry_state: string | null;
+    }>(
+      `SELECT queue.attempts, queue.reason,
+              operation.summary->>'retry_state' AS retry_state
+       FROM public.imap_thread_work_queue queue
+       JOIN LATERAL (
+         SELECT summary
+         FROM public.imap_thread_operations operation
+         WHERE operation.run_id = queue.run_id
+           AND operation.operation_type = 'failure'
+         ORDER BY operation.completed_at DESC
+         LIMIT 1
+       ) operation ON true
+       WHERE queue.run_id = $1 AND queue.message_id = $2`,
+      [ready.runId, poisonId]
+    );
+    expect(isolated.rows[0]).toEqual({
+      attempts: 10,
+      reason: "threading_retry_alert",
+      retry_state: "irreducible_item"
+    });
+
+    const newHealthyId = await seedMessage(accountId, {
+      uid: 4,
+      subject: "New healthy work",
+      rfcMessageId: "<healthy-4@example.test>",
+      providerMessageId: "healthy-4",
+      providerMessageNamespace: "fixture"
+    });
+    await enqueueMessage(accountId, newHealthyId);
+    const progressed = await faultRepository.drainAccount(accountId, {
+      batchSize: 3,
+      requestedBy: "live-test"
+    });
+    expect(progressed.queueItemsProcessed).toBe(1);
+    const retained = await pool.query<{ ids: string[] }>(
+      `SELECT array_agg(message_id::text ORDER BY message_id)::text[] AS ids
+       FROM public.imap_thread_work_queue WHERE run_id = $1`,
+      [ready.runId]
+    );
+    expect(retained.rows[0]?.ids).toEqual([poisonId]);
   });
 
   it("accepts a measured 17 MiB production-sized evidence page under the default bound", async () => {

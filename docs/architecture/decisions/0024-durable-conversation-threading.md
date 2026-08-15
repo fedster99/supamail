@@ -130,6 +130,17 @@ old weak edges in bounded components. Work is serialized per account, retries
 are persisted before releasing the account lock, and processing is idempotent
 per run.
 
+An aggregate closure/evidence-limit failure or PostgreSQL statement timeout
+reduces the run's durable queue page size before retry. The selected queue rows
+remain intact with their original ordering and a queue-local delay; the run
+itself stays eligible so ready work in another active/standby/build lane is not
+globally backed off. Repeated subdivision reaches one seed, whose own retry is
+then delayed without blocking later rows and becomes operator-alertable after
+ten attempts. Other database and executor failures retain run-level exponential
+backoff. Optional stage timings expose only fixed stage names, outcome, elapsed
+time, counts, and iteration numbers; they never include account, message, or
+mailbox identifiers or email metadata.
+
 An initial build, explicit rebuild, or algorithm upgrade creates an isolated
 shadow run. It keyset-scans body evidence and protocol edges in bounded
 transactions, drains per-run changes that arrived during the scan, and stops at
@@ -235,6 +246,7 @@ unrelated mail.
   metadata merge, forward boundaries with replies, overlapping delivery
   fingerprints across a one-message page boundary, retained v1/v2 executor routing, persisted weighted
   active/candidate/standby fairness and missing-executor startup/direct-path guards,
+  statement-timeout subdivision, irreducible-item isolation and alerting,
   persisted comparison drift, an in-flight legacy-writer activation barrier,
   activation and incremental rollback, purge invalidation, run retention,
   active-view isolation, read dedupe, and mutation fan-out.
