@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { performance } from "node:perf_hooks";
 import type { PgClient, PgPool } from "./db.js";
 import {
   MAX_PROTECTED_METADATA_ENVELOPE_BYTES,
@@ -46,6 +47,7 @@ const WRITE_CHUNK_SIZE = 1_000;
 const MAX_PROTECTED_WRITE_JSON_BYTES = 4 * 1024 * 1024;
 const LIVE_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const DEFAULT_COMPARISON_STATEMENT_TIMEOUT_MS = 30_000;
+const ALERTABLE_THREADING_RETRY_ATTEMPTS = 10;
 const RUN_FAIRNESS_SCHEDULE = ["active", "active", "standby", "active", "building"] as const;
 const DELIVERY_EVIDENCE_BRIDGE_REASON = "delivery_evidence_bridge";
 
@@ -286,7 +288,11 @@ interface ClosureLimits {
   maxCriteriaKeys: number;
 }
 
-type AttemptedThreadWork = (ids: string[], canSubdivide: boolean) => void;
+type AttemptedThreadWork = (
+  ids: string[],
+  canSubdivide: boolean,
+  queueDelayControlsRetry: boolean
+) => void;
 
 function adaptiveClosureBatchSize(run: ThreadRun, requestedBatchSize: number): number {
   const stored = run.summary.adaptive_closure_batch_size;
@@ -421,6 +427,8 @@ export interface ThreadingRepositoryOptions {
   bodyEvidenceStatementTimeoutMs?: number;
   /** Deadline for one adapter protect or reveal operation. */
   metadataProtectionTimeoutMs?: number;
+  /** Optional transaction-local statement budget, primarily for bounded deployments and tests. */
+  projectionStatementTimeoutMs?: number;
   /**
    * Every executor still needed by an active or rollback run. A new release
    * must retain the previous executor until its standby retention window ends.
@@ -428,7 +436,48 @@ export interface ThreadingRepositoryOptions {
   algorithms?: ReadonlyMap<number, ThreadingAlgorithmExecutor>;
   /** Durable metadata projection. Default installations use the readable adapter. */
   metadataProtection?: MetadataProtectionAdapter;
+  /** Identifier-free stage timings for tests and deployment-owned telemetry. */
+  onStageTiming?: (timing: ThreadingStageTiming) => void | Promise<void>;
 }
+
+export type ThreadingStage =
+  | "queue_selection"
+  | "input_loading_reveal"
+  | "closure_assignment_computation"
+  | "closure_expansion_query"
+  | "assignment_computation"
+  | "assignment_persistence_history"
+  | "assignment_state_load"
+  | "assignment_operation_write"
+  | "assignment_upsert"
+  | "assignment_history_write"
+  | "assignment_history_retention"
+  | "delivery_evidence_bridge_enqueue"
+  | "subject_work_enqueue"
+  | "queue_deletion"
+  | "transaction_commit";
+
+export interface ThreadingStageTiming {
+  stage: ThreadingStage;
+  outcome: "succeeded" | "failed";
+  elapsedMs: number;
+  itemCount?: number;
+  iteration?: number;
+}
+
+const ADAPTIVE_STATEMENT_TIMEOUT_STAGES = new Set<ThreadingStage>([
+  "input_loading_reveal",
+  "closure_assignment_computation",
+  "closure_expansion_query",
+  "assignment_computation",
+  "assignment_state_load",
+  "assignment_upsert",
+  "assignment_history_write",
+  "delivery_evidence_bridge_enqueue",
+  "subject_work_enqueue",
+  "queue_deletion",
+  "transaction_commit"
+]);
 
 export class ThreadingClosureLimitError extends Error {
   constructor(readonly limit: number) {
@@ -865,6 +914,19 @@ export function threadingFailureReason(
     : "THREADING_ERROR";
 }
 
+export function isThreadingStatementTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const record = error as { code?: unknown; message?: unknown };
+  return record.code === "57014" && /statement timeout/i.test(String(record.message ?? ""));
+}
+
+function threadingFailureCode(error: unknown): string {
+  if (isThreadingStatementTimeout(error)) return "statement_timeout";
+  if (error instanceof ThreadingClosureLimitError) return "closure_limit";
+  if (error instanceof ThreadingEvidenceLimitError) return `evidence_${error.kind}_limit`;
+  return "threading_error";
+}
+
 function boundedNonNegativeInteger(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   if (!Number.isFinite(value)) throw new Error("threading comparison thresholds must be finite numbers");
@@ -901,7 +963,10 @@ export class ThreadingRepository {
   private readonly bodyEvidenceBatchSize: number;
   private readonly bodyEvidenceStatementTimeoutMs: number;
   private readonly metadataProtectionTimeoutMs: number;
+  private readonly projectionStatementTimeoutMs: number | null;
   private readonly metadataProtection: MetadataProtectionAdapter;
+  private readonly onStageTiming: (timing: ThreadingStageTiming) => void | Promise<void>;
+  private readonly failedStages = new WeakMap<object, ThreadingStage>();
   private readonly metadataProtectionScope = new AsyncLocalStorage<MetadataProtectionScope>();
   private readonly metadataProtectionPermits = new AdapterPermitPool(
     METADATA_PROTECTION_CONCURRENCY
@@ -909,6 +974,7 @@ export class ThreadingRepository {
 
   constructor(private readonly pool: PgPool, options: ThreadingRepositoryOptions = {}) {
     this.metadataProtection = options.metadataProtection ?? plaintextMetadataProtection;
+    this.onStageTiming = options.onStageTiming ?? (() => undefined);
     this.currentAlgorithmVersion = options.currentAlgorithmVersion ?? THREADING_ALGORITHM_VERSION;
     if (!Number.isSafeInteger(this.currentAlgorithmVersion) || this.currentAlgorithmVersion <= 0) {
       throw new Error("current threading algorithm version must be a positive safe integer");
@@ -927,6 +993,13 @@ export class ThreadingRepository {
     if (!Number.isSafeInteger(this.metadataProtectionTimeoutMs) || this.metadataProtectionTimeoutMs <= 0) {
       throw new Error("metadata protection timeout must be a positive safe integer");
     }
+    this.projectionStatementTimeoutMs = options.projectionStatementTimeoutMs ?? null;
+    if (
+      this.projectionStatementTimeoutMs !== null &&
+      (!Number.isSafeInteger(this.projectionStatementTimeoutMs) || this.projectionStatementTimeoutMs <= 0)
+    ) {
+      throw new Error("threading projection statement timeout must be a positive safe integer");
+    }
     this.algorithms = options.algorithms ?? PRODUCTION_THREADING_ALGORITHMS;
     if (!this.algorithms.has(this.currentAlgorithmVersion)) {
       throw new Error(`missing executor for current threading algorithm v${this.currentAlgorithmVersion}`);
@@ -938,6 +1011,55 @@ export class ThreadingRepository {
       if (version > this.currentAlgorithmVersion) {
         throw new Error(`threading executor v${version} is newer than current v${this.currentAlgorithmVersion}`);
       }
+    }
+  }
+
+  private async timeStage<T>(
+    stage: ThreadingStage,
+    details: Omit<ThreadingStageTiming, "stage" | "outcome" | "elapsedMs">,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const startedAt = performance.now();
+    let outcome: ThreadingStageTiming["outcome"] = "succeeded";
+    try {
+      return await operation();
+    } catch (error) {
+      outcome = "failed";
+      if (error && typeof error === "object" && !this.failedStages.has(error)) {
+        this.failedStages.set(error, stage);
+      }
+      throw error;
+    } finally {
+      this.emitStageTiming({ stage, outcome, elapsedMs: performance.now() - startedAt, ...details });
+    }
+  }
+
+  private timeStageSync<T>(
+    stage: ThreadingStage,
+    details: Omit<ThreadingStageTiming, "stage" | "outcome" | "elapsedMs">,
+    operation: () => T
+  ): T {
+    const startedAt = performance.now();
+    let outcome: ThreadingStageTiming["outcome"] = "succeeded";
+    try {
+      return operation();
+    } catch (error) {
+      outcome = "failed";
+      if (error && typeof error === "object" && !this.failedStages.has(error)) {
+        this.failedStages.set(error, stage);
+      }
+      throw error;
+    } finally {
+      this.emitStageTiming({ stage, outcome, elapsedMs: performance.now() - startedAt, ...details });
+    }
+  }
+
+  private emitStageTiming(timing: ThreadingStageTiming): void {
+    try {
+      const pending = this.onStageTiming(timing);
+      if (pending) void pending.catch(() => undefined);
+    } catch {
+      // Observability must never change threading behavior.
     }
   }
 
@@ -1287,6 +1409,7 @@ export class ThreadingRepository {
     let failedRun: ThreadRun | null = null;
     let attemptedIds: string[] = [];
     let attemptedCanSubdivide = false;
+    let attemptedQueueDelayControlsRetry = false;
 
     const result = await this.withAccountLock(accountId, async (client) => {
         // This pass deliberately runs before the thread-state transaction. A
@@ -1312,6 +1435,12 @@ export class ThreadingRepository {
         // this bounded projection transaction finishes.
         await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
         try {
+          if (this.projectionStatementTimeoutMs !== null) {
+            await client.query(
+              "SELECT set_config('statement_timeout', $1, true)",
+              [`${this.projectionStatementTimeoutMs}ms`]
+            );
+          }
           const state = await this.lockState(client, accountId);
           if (await this.hasQueuedBodyEvidenceGap(client, accountId)) {
             await client.query("COMMIT");
@@ -1402,9 +1531,10 @@ export class ThreadingRepository {
           }
           failedRun = run;
           const closureBatchSize = adaptiveClosureBatchSize(run, batchSize);
-          const attempted: AttemptedThreadWork = (ids, canSubdivide) => {
+          const attempted: AttemptedThreadWork = (ids, canSubdivide, queueDelayControlsRetry) => {
             attemptedIds = ids;
             attemptedCanSubdivide = canSubdivide;
+            attemptedQueueDelayControlsRetry = queueDelayControlsRetry;
           };
           if (run.available_at > new Date()) {
             await client.query("COMMIT");
@@ -1470,7 +1600,11 @@ export class ThreadingRepository {
           if ((run.status !== "building" || processed.runStatus === "ready") && !(await this.runHasAnyWork(client, run.id))) {
             await this.markRunCaughtUp(client, run);
           }
-          await client.query("COMMIT");
+          await this.timeStage(
+            "transaction_commit",
+            { itemCount: processed.messagesConsidered },
+            () => client.query("COMMIT")
+          );
           return processed;
         } catch (error) {
           await client.query("ROLLBACK").catch(() => undefined);
@@ -1481,7 +1615,8 @@ export class ThreadingRepository {
               attemptedIds,
               error,
               options.requestedBy ?? "thread-worker",
-              attemptedCanSubdivide
+              attemptedCanSubdivide,
+              attemptedQueueDelayControlsRetry
             );
           }
           throw error;
@@ -2794,7 +2929,7 @@ export class ThreadingRepository {
       return this.resultForRun(run.account_id, next);
     }
     const seedIds = page.map((row) => row.id);
-    attempted(seedIds, true);
+    attempted(seedIds, true, false);
     const closure = await this.expandClosure(client, run, seedIds, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: false });
     const persisted = await this.persistAssignments(client, run, assignments, closure.inputs, {
@@ -2884,7 +3019,7 @@ export class ThreadingRepository {
       );
       if (staleWeak.rows.length > 0) {
         const staleIds = staleWeak.rows.map((row) => row.message_id);
-        attempted(staleIds, false);
+        attempted(staleIds, false, false);
         const closure = await this.expandClosure(client, run, staleIds, {
           ...closureLimits,
           maxMessages: Math.max(closureLimits.maxMessages, maxBucket)
@@ -2940,7 +3075,7 @@ export class ThreadingRepository {
       });
     }
     const ids = members.rows.map((row) => row.message_id);
-    attempted(ids, false);
+    attempted(ids, false, false);
     const closure = await this.expandClosure(client, run, ids, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: true });
     const operationType = run.status === "building" ? "build_batch" : "incremental";
@@ -3018,25 +3153,46 @@ export class ThreadingRepository {
     requestedBy: string,
     attempted: AttemptedThreadWork
   ): Promise<ThreadingRunResult> {
-    const work = await client.query<{ message_id: string }>(
-      `SELECT message_id FROM public.imap_thread_work_queue
-       WHERE run_id = $1 AND available_at <= now()
-       ORDER BY enqueued_at, message_id LIMIT $2 FOR UPDATE SKIP LOCKED`,
-      [run.id, batchSize]
+    const selectionDetails: Pick<ThreadingStageTiming, "itemCount"> = {};
+    const work = await this.timeStage(
+      "queue_selection",
+      selectionDetails,
+      async () => {
+        const selected = await client.query<{ message_id: string }>(
+          `SELECT message_id FROM public.imap_thread_work_queue
+           WHERE run_id = $1 AND available_at <= now()
+           ORDER BY enqueued_at, message_id LIMIT $2 FOR UPDATE SKIP LOCKED`,
+          [run.id, batchSize]
+        );
+        selectionDetails.itemCount = selected.rows.length;
+        return selected;
+      }
     );
     const ids = work.rows.map((row) => row.message_id);
     if (ids.length === 0) return this.resultForRun(run.account_id, run);
-    attempted(ids, true);
+    attempted(ids, true, true);
     const closure = await this.expandClosure(client, run, ids, closureLimits);
-    const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: false });
-    const persisted = await this.persistAssignments(client, run, assignments, closure.inputs, {
-      operationType: "incremental",
-      requestedBy,
-      reason: "threading inputs changed",
-      subjectFallbackEnabled: false,
-      enqueueSubjectWork: true
-    });
-    const removed = await this.deleteRunQueue(client, run.id, closure.inputs.map((input) => input.id));
+    const assignments = this.timeStageSync(
+      "assignment_computation",
+      { itemCount: closure.inputs.length },
+      () => this.computeAssignments(run, closure.inputs, { allowSubjectFallback: false })
+    );
+    const persisted = await this.timeStage(
+      "assignment_persistence_history",
+      { itemCount: assignments.length },
+      () => this.persistAssignments(client, run, assignments, closure.inputs, {
+        operationType: "incremental",
+        requestedBy,
+        reason: "threading inputs changed",
+        subjectFallbackEnabled: false,
+        enqueueSubjectWork: true
+      })
+    );
+    const removed = await this.timeStage(
+      "queue_deletion",
+      { itemCount: closure.inputs.length },
+      () => this.deleteRunQueue(client, run.id, closure.inputs.map((input) => input.id))
+    );
     return this.resultForRun(run.account_id, run, {
       operationId: persisted.operationId,
       operationType: "incremental",
@@ -3091,23 +3247,38 @@ export class ThreadingRepository {
       }
     };
 
+    let iteration = 0;
     for (;;) {
+      iteration += 1;
       if (ids.size > limits.maxMessages) throw new ThreadingClosureLimitError(limits.maxMessages);
       const toLoad = [...ids].filter((id) => !loadedInputs.has(id));
-      if (toLoad.length > 0) await loadBatches(toLoad);
+      if (toLoad.length > 0) {
+        await this.timeStage(
+          "input_loading_reveal",
+          { itemCount: toLoad.length, iteration },
+          () => loadBatches(toLoad)
+        );
+      }
       for (const assignment of loadedStored.values()) addStoredCriteria(criteria, assignment);
       const closureInputs = [...loadedInputs.values()];
       const closureInputsById = new Map(closureInputs.map((input) => [input.id, input]));
-      const computedRecords = this.computeAssignments(
-        run,
-        closureInputs,
-        { allowSubjectFallback: false }
-      ).map((assignment) => assignmentRecord(run, assignment, "0", closureInputsById));
-      for (const assignment of await mapWithConcurrency(
-        computedRecords,
-        METADATA_PROTECTION_CONCURRENCY,
-        async (record) => (await this.protectAssignment(record)).record
-      )) {
+      const protectedComputedRecords = await this.timeStage(
+        "closure_assignment_computation",
+        { itemCount: closureInputs.length, iteration },
+        async () => {
+          const computedRecords = this.computeAssignments(
+            run,
+            closureInputs,
+            { allowSubjectFallback: false }
+          ).map((assignment) => assignmentRecord(run, assignment, "0", closureInputsById));
+          return mapWithConcurrency(
+            computedRecords,
+            METADATA_PROTECTION_CONCURRENCY,
+            async (record) => (await this.protectAssignment(record)).record
+          );
+        }
+      );
+      for (const assignment of protectedComputedRecords) {
         addStoredCriteria(criteria, assignment);
       }
 
@@ -3118,35 +3289,39 @@ export class ThreadingRepository {
         throw new ThreadingEvidenceLimitError("criteria", limits.maxCriteriaKeys);
       }
       const remaining = limits.maxMessages - ids.size;
-      const candidates = await client.query<{ message_id: string }>(
-        `
-        SELECT message_id
-        FROM public.imap_thread_assignments
-        WHERE run_id = $1
-          AND NOT (message_id = ANY($7::uuid[]))
-          AND (
-            conversation_id = ANY($2::text[])
-            OR delivery_key = ANY($3::text[])
-            OR strict_message_id_hash = ANY($4::text[])
-            OR root_reference_hash = ANY($4::text[])
-            OR parent_reference_hash = ANY($4::text[])
-            OR reference_hashes && $4::text[]
-            OR provider_thread_hash = ANY($5::text[])
-            OR delivery_fingerprint_hashes && $6::text[]
-          )
-        ORDER BY message_id
-        LIMIT $8
-        `,
-        [
-          run.id,
-          [...criteria.conversationIds],
-          [...criteria.deliveryKeys],
-          [...criteria.referenceHashes],
-          [...criteria.providerThreadHashes],
-          [...criteria.deliveryFingerprintHashes],
-          [...ids],
-          remaining + 1
-        ]
+      const candidates = await this.timeStage(
+        "closure_expansion_query",
+        { itemCount: ids.size, iteration },
+        () => client.query<{ message_id: string }>(
+          `
+          SELECT message_id
+          FROM public.imap_thread_assignments
+          WHERE run_id = $1
+            AND NOT (message_id = ANY($7::uuid[]))
+            AND (
+              conversation_id = ANY($2::text[])
+              OR delivery_key = ANY($3::text[])
+              OR strict_message_id_hash = ANY($4::text[])
+              OR root_reference_hash = ANY($4::text[])
+              OR parent_reference_hash = ANY($4::text[])
+              OR reference_hashes && $4::text[]
+              OR provider_thread_hash = ANY($5::text[])
+              OR delivery_fingerprint_hashes && $6::text[]
+            )
+          ORDER BY message_id
+          LIMIT $8
+          `,
+          [
+            run.id,
+            [...criteria.conversationIds],
+            [...criteria.deliveryKeys],
+            [...criteria.referenceHashes],
+            [...criteria.providerThreadHashes],
+            [...criteria.deliveryFingerprintHashes],
+            [...ids],
+            remaining + 1
+          ]
+        )
       );
       const newIds = candidates.rows.filter((row) => !ids.has(row.message_id));
       if (newIds.length > remaining) throw new ThreadingClosureLimitError(limits.maxMessages);
@@ -3465,7 +3640,11 @@ export class ThreadingRepository {
     }
   ): Promise<{ operationId: string; generation: string | null; changed: number }> {
     const ids = assignments.map((assignment) => assignment.physical_message_id);
-    const current = await this.loadStoredAssignments(client, run.id, ids);
+    const current = await this.timeStage(
+      "assignment_state_load",
+      { itemCount: ids.length },
+      () => this.loadStoredAssignments(client, run.id, ids)
+    );
     const currentById = new Map(current.map((row) => [row.message_id, row]));
     const inputsById = new Map(inputs.map((input) => [input.id, input]));
     const fromGeneration = await this.currentGeneration(client, run.id);
@@ -3473,43 +3652,59 @@ export class ThreadingRepository {
     const candidates = assignments.map((assignment) => assignmentRecord(run, assignment, candidateGeneration, inputsById));
     const changed = candidates.filter((candidate) => !sameAssignment(currentById.get(candidate.message_id), candidate));
     const generation = changed.length > 0 ? candidateGeneration : null;
-    const operationId = await this.insertOperation(client, {
-      run,
-      type: options.operationType,
-      requestedBy: options.requestedBy,
-      reason: options.reason,
-      fromGeneration,
-      toGeneration: generation,
-      parameters: { subject_fallback_enabled: options.subjectFallbackEnabled },
-      summary: {
-        messages_considered: inputs.length,
-        assignments_changed: changed.length,
-        assignments_unchanged: assignments.length - changed.length
-      }
-    });
+    const operationId = await this.timeStage(
+      "assignment_operation_write",
+      { itemCount: assignments.length },
+      () => this.insertOperation(client, {
+        run,
+        type: options.operationType,
+        requestedBy: options.requestedBy,
+        reason: options.reason,
+        fromGeneration,
+        toGeneration: generation,
+        parameters: { subject_fallback_enabled: options.subjectFallbackEnabled },
+        summary: {
+          messages_considered: inputs.length,
+          assignments_changed: changed.length,
+          assignments_unchanged: assignments.length - changed.length
+        }
+      })
+    );
     if (changed.length > 0) {
-      const persistedChanged = await this.upsertAssignments(client, changed);
+      const persistedChanged = await this.timeStage(
+        "assignment_upsert",
+        { itemCount: changed.length },
+        () => this.upsertAssignments(client, changed)
+      );
       // Build rows are themselves a disposable, versioned snapshot; duplicating
       // every one into JSON history on every rebuild is pure write amplification.
       // Only the latest material change to the active projection is
       // rollbackable. Keep that one reversible delta, not an unbounded audit
       // log. Candidate and standby projections cannot use incremental rollback.
       if (options.operationType === "incremental" && run.status === "active") {
-        await this.insertHistory(
-          client,
-          operationId,
-          run,
-          changed.map((record) => {
-            const previous = currentById.get(record.message_id);
-            return {
-              message_id: record.message_id,
-              change_type: previous ? "update" as const : "insert" as const,
-              previous_assignment: previous ? snapshot(previous) : null,
-              next_assignment: snapshot(record)
-            };
-          })
+        await this.timeStage(
+          "assignment_history_write",
+          { itemCount: changed.length },
+          () => this.insertHistory(
+            client,
+            operationId,
+            run,
+            changed.map((record) => {
+              const previous = currentById.get(record.message_id);
+              return {
+                message_id: record.message_id,
+                change_type: previous ? "update" as const : "insert" as const,
+                previous_assignment: previous ? snapshot(previous) : null,
+                next_assignment: snapshot(record)
+              };
+            })
+          )
         );
-        await this.retainOnlyOperationHistory(client, run.account_id, operationId);
+        await this.timeStage(
+          "assignment_history_retention",
+          { itemCount: changed.length },
+          () => this.retainOnlyOperationHistory(client, run.account_id, operationId)
+        );
       }
       if (options.enqueueSubjectWork) {
         const keys = new Set<string>();
@@ -3529,13 +3724,18 @@ export class ThreadingRepository {
           const previousProjection = projectedPrevious.get(record.message_id);
           if (previousProjection?.subject_key) keys.add(previousProjection.subject_key);
         }
-        await this.enqueueSubjectWork(client, run, [...keys]);
+        await this.timeStage(
+          "subject_work_enqueue",
+          { itemCount: keys.size },
+          () => this.enqueueSubjectWork(client, run, [...keys])
+        );
       }
     }
-    await this.enqueueDeliveryEvidenceBridges(
-      client,
-      run,
-      deliveryEvidenceBridgeIds(assignments, inputs)
+    const bridgeIds = deliveryEvidenceBridgeIds(assignments, inputs);
+    await this.timeStage(
+      "delivery_evidence_bridge_enqueue",
+      { itemCount: bridgeIds.length },
+      () => this.enqueueDeliveryEvidenceBridges(client, run, bridgeIds)
     );
     return { operationId, generation, changed: changed.length };
   }
@@ -4230,30 +4430,46 @@ export class ThreadingRepository {
     messageIds: string[],
     error: unknown,
     requestedBy: string,
-    canSubdivide: boolean
+    canSubdivide: boolean,
+    queueDelayControlsRetry: boolean
   ): Promise<void> {
     const reason = threadingFailureReason(error, this.metadataProtection);
-    const adaptiveBatchSize = canSubdivide && messageIds.length > 1 && (
+    const failedStage = error && typeof error === "object"
+      ? this.failedStages.get(error)
+      : undefined;
+    const adaptiveStatementTimeout = isThreadingStatementTimeout(error) &&
+      failedStage !== undefined && ADAPTIVE_STATEMENT_TIMEOUT_STAGES.has(failedStage);
+    const adaptiveFailure = canSubdivide && (
+      adaptiveStatementTimeout ||
       error instanceof ThreadingClosureLimitError || error instanceof ThreadingEvidenceLimitError
-    )
+    );
+    const adaptiveBatchSize = adaptiveFailure && messageIds.length > 1
       ? Math.max(1, Math.floor(messageIds.length / 2))
       : null;
+    const retryWithoutRunBackoff = adaptiveFailure && messageIds.length > 0 && (
+      adaptiveBatchSize !== null || queueDelayControlsRetry
+    );
+    const retryState = adaptiveBatchSize !== null
+      ? "subdivided"
+      : adaptiveFailure && messageIds.length > 0
+        ? "irreducible_item"
+        : "run_backoff";
     try {
       await client.query("BEGIN");
       const updated = await client.query<{ id: string }>(
         `UPDATE public.imap_thread_runs
          SET attempts = attempts + 1,
-             available_at = CASE WHEN $6::integer IS NOT NULL
-               THEN now() + interval '5 seconds'
+             available_at = CASE WHEN $6::boolean
+               THEN now()
                ELSE now() + make_interval(
                  secs => least(3600, (5 * power(2, least(attempts, 10)))::integer)
                )
              END,
              last_error = $2,
-             summary = CASE WHEN $6::integer IS NULL THEN summary ELSE jsonb_set(
+             summary = CASE WHEN $7::integer IS NULL THEN summary ELSE jsonb_set(
                summary,
                '{adaptive_closure_batch_size}',
-               to_jsonb($6::integer),
+               to_jsonb($7::integer),
                true
              ) END
          WHERE id = $1
@@ -4261,7 +4477,15 @@ export class ThreadingRepository {
            AND algorithm_version = $4
            AND status = $5
          RETURNING id`,
-        [run.id, reason, run.account_id, run.algorithm_version, run.status, adaptiveBatchSize]
+        [
+          run.id,
+          reason,
+          run.account_id,
+          run.algorithm_version,
+          run.status,
+          retryWithoutRunBackoff,
+          adaptiveBatchSize
+        ]
       );
       if (!updated.rows[0]) {
         await client.query("ROLLBACK");
@@ -4273,12 +4497,22 @@ export class ThreadingRepository {
           INSERT INTO public.imap_thread_work_queue (
             run_id, message_id, account_id, reason, attempts, available_at, last_error
           )
-          SELECT $1, message.id, message.account_id, 'threading_retry', 1,
-                 now() + interval '5 seconds', $4
+          SELECT $1, message.id, message.account_id,
+                 CASE WHEN $6::boolean AND $5::integer IS NULL AND 1 >= $7::integer
+                   THEN 'threading_retry_alert'
+                   ELSE 'threading_retry'
+                 END,
+                 1, now() + interval '5 seconds', $4
           FROM public.imap_messages message
           WHERE message.account_id = $2 AND message.id = ANY($3::uuid[])
           ON CONFLICT (run_id, message_id) DO UPDATE SET
-            reason = 'threading_retry',
+            reason = CASE
+              WHEN $6::boolean
+                AND $5::integer IS NULL
+                AND public.imap_thread_work_queue.attempts + 1 >= $7::integer
+              THEN 'threading_retry_alert'
+              ELSE 'threading_retry'
+            END,
             attempts = public.imap_thread_work_queue.attempts + 1,
             available_at = CASE WHEN $5::integer IS NOT NULL
               THEN now() + interval '5 seconds'
@@ -4288,7 +4522,15 @@ export class ThreadingRepository {
             END,
             last_error = EXCLUDED.last_error
           `,
-          [run.id, run.account_id, messageIds, reason, adaptiveBatchSize]
+          [
+            run.id,
+            run.account_id,
+            messageIds,
+            reason,
+            adaptiveBatchSize,
+            adaptiveFailure && messageIds.length > 0,
+            ALERTABLE_THREADING_RETRY_ATTEMPTS
+          ]
         );
       }
       await this.insertOperation(client, {
@@ -4299,8 +4541,10 @@ export class ThreadingRepository {
         status: "failed",
         summary: {
           error: reason,
+          error_code: threadingFailureCode(error),
           messages_attempted: messageIds.length,
-          adaptive_retry_batch_size: adaptiveBatchSize
+          adaptive_retry_batch_size: adaptiveBatchSize,
+          retry_state: retryState
         }
       });
       await client.query("COMMIT");
