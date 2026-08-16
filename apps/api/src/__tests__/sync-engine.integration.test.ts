@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { closePool, getPool } from "../db.js";
 import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
-import type { MirrorImapClient } from "../imap-client.js";
+import type { MailboxChange, MirrorImapClient } from "../imap-client.js";
 import { resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
@@ -323,6 +323,498 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id]
     );
     expect(movedDestination.rows).toEqual([{ folder_path: "Archive", uid: "301" }]);
+  });
+
+  it("uses a STATUS wake to reconcile only the changed non-Inbox folder", async () => {
+    const h = await setupIntegration("idle-archive-reconcile", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_003,
+      messages: [makeTextMessage({
+        uid: 301,
+        subject: "old archive",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "old"
+      })]
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    folders[2].messages = [makeTextMessage({
+      uid: 302,
+      subject: "new archive",
+      from: "b@x.test",
+      to: "u@x.test",
+      body: "new"
+    })];
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_003,
+        uidNext: 303,
+        messages: 1
+      }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.foldersProcessed).toBe(1);
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+    const rows = await h.pool.query<{
+      uid: string;
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT uid::text, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive'
+       ORDER BY uid`,
+      [h.account.id]
+    );
+    expect(rows.rows).toEqual([
+      { uid: "301", deleted_in_provider: true },
+      { uid: "302", deleted_in_provider: false }
+    ]);
+  });
+
+  it("scans the full active window for a forced flag wake without CONDSTORE", async () => {
+    const h = await setupIntegration("status-old-flag-no-condstore", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      FLAG_DIFF_WINDOW_DAYS: 7,
+      WINDOW_DAYS: 90
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_009,
+      messages: [makeTextMessage({
+        uid: 301,
+        subject: "old archive flag",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "old",
+        internalDate: new Date(Date.now() - 30 * 24 * 60 * 60_000)
+      })]
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+    folders[2].messages[0].flags = ["\\Seen"];
+
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: false,
+      forceFlagScan: true,
+      observed: { path: "Archive", uidValidity: 50_009, uidNext: 302, messages: 1, unseen: 0 }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.flagsUpdated).toBe(1);
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+  });
+
+  it("does not let a pending non-Inbox hint shadow a concurrent Inbox wake", async () => {
+    const h = await setupIntegration("idle-inbox-with-archive", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      MAX_RECONCILES_PER_CYCLE: 2
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({ path: "Archive", delimiter: "/", uidValidity: 50_006, messages: [] });
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 2 }
+    });
+    await engine.syncAccount(h.account.id, "manual");
+    folders[0].messages.push(makeTextMessage({
+      uid: 106,
+      subject: "new inbox",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "new"
+    }));
+
+    const archiveChange: MailboxChange = {
+      path: "Archive",
+      forceReconcile: false,
+      forceFlagScan: false,
+      observed: { path: "Archive", uidValidity: 50_006, uidNext: 1, messages: 0 }
+    };
+    const inboxChange: MailboxChange = {
+      path: "INBOX",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: { path: "INBOX", uidValidity: 0 }
+    };
+    const idleClient = new FixtureImapClient(folders);
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [archiveChange, inboxChange];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.foldersProcessed).toBe(2);
+    expect(acknowledge).toHaveBeenCalledWith([archiveChange, inboxChange]);
+    const inbox = await h.pool.query<{ uid: string }>(
+      `SELECT uid::text FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 106`,
+      [h.account.id]
+    );
+    expect(inbox.rows).toEqual([{ uid: "106" }]);
+  });
+
+  it("drains forced mailbox reconciles across bounded live passes", async () => {
+    const h = await setupIntegration("idle-bounded-reconciles", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      MAX_RECONCILES_PER_CYCLE: 1
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push(
+      { path: "Archive", delimiter: "/", uidValidity: 50_007, messages: [] },
+      { path: "Projects", delimiter: "/", uidValidity: 50_008, messages: [] }
+    );
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 1 }
+    });
+    await engine.syncAccount(h.account.id, "manual");
+
+    let pending: MailboxChange[] = [
+      {
+        path: "Archive",
+        forceReconcile: true,
+        forceFlagScan: false,
+        observed: { path: "Archive", uidValidity: 50_007, uidNext: 1, messages: 0 }
+      },
+      {
+        path: "Projects",
+        forceReconcile: true,
+        forceFlagScan: false,
+        observed: { path: "Projects", uidValidity: 50_008, uidNext: 1, messages: 0 }
+      }
+    ];
+    const idleClient = new FixtureImapClient(folders);
+    const acknowledge = vi.fn((handled: readonly MailboxChange[]) => {
+      pending = pending.filter((change) => !handled.includes(change));
+    });
+    idleClient.peekMailboxChanges = (limit) => pending.slice(0, limit);
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+    const liveOptions = {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    } as const;
+
+    const first = await engine.syncAccount(h.account.id, "scheduled", liveOptions);
+    expect(first.outcome).toBe("success");
+    expect(pending.map((change) => change.path)).toEqual(["Projects"]);
+
+    const second = await engine.syncAccount(h.account.id, "scheduled", liveOptions);
+    expect(second.outcome).toBe("success");
+    expect(pending).toEqual([]);
+    expect(acknowledge).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a changed folder after initial sync completes, then acknowledges reconcile", async () => {
+    const h = await setupIntegration("live-change-finishes-initial", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_004,
+      messages: [makeTextMessage({
+        uid: 301,
+        subject: "archive",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "archive"
+      })]
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET initial_sync_complete = false,
+           initial_sync_target_max_uid = 301,
+           initial_sync_oldest_uid_synced = 302
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: { path: "Archive", uidValidity: 50_004, uidNext: 302, messages: 1 }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(acknowledge).not.toHaveBeenCalled();
+    const folder = await h.pool.query<{ initial_sync_complete: boolean }>(
+      `SELECT initial_sync_complete FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    expect(folder.rows[0].initial_sync_complete).toBe(true);
+
+    const retry = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+    expect(retry.outcome).toBe("success");
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+  });
+
+  it("retains a mailbox change when its tracked folder no longer matches", async () => {
+    const h = await setupIntegration("live-change-missing-folder");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const engine = h.buildEngine({ folders });
+    await engine.syncAccount(h.account.id, "manual");
+
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Gone",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: { path: "Gone", uidValidity: 90_001, uidNext: 2, messages: 1 }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.errors).toContain("Mailbox change set no longer matches tracked folders");
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it("retains a structural mailbox change when forced reconcile is truncated", async () => {
+    const h = await setupIntegration("live-change-truncated-reconcile");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const engine = h.buildEngine({ folders });
+    await engine.syncAccount(h.account.id, "manual");
+    vi.spyOn(h.repository, "markMissingMessagesFromLiveUidStream").mockResolvedValue({
+      markedCount: 0,
+      liveUidCount: 1,
+      missingInDbUids: [],
+      missingInDbTruncated: true
+    });
+
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "INBOX",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: { path: "INBOX", uidValidity: 11_001, uidNext: 106, messages: 5 }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it("chunks a CONDSTORE flag delta larger than the repository write limit", async () => {
+    const h = await setupIntegration("condstore-large-delta", {
+      INITIAL_SYNC_BATCH_SIZE: 500,
+      INCREMENTAL_SYNC_BATCH_SIZE: 500
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_005,
+      highestModseq: 2n,
+      messages: Array.from({ length: 501 }, (_, index) => makeTextMessage({
+        uid: index + 1,
+        subject: `archive ${index + 1}`,
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "archive"
+      }))
+    });
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 500, INCREMENTAL_SYNC_BATCH_SIZE: 500 }
+    });
+    await engine.syncAccount(h.account.id, "manual");
+    await dueAllFolders(h.pool, h.account.id);
+    await engine.syncAccount(h.account.id, "manual");
+    const initialFolder = await h.pool.query<{
+      initial_sync_complete: boolean;
+      highest_modseq: string | null;
+    }>(
+      `SELECT initial_sync_complete, highest_modseq::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    expect(initialFolder.rows[0]).toEqual({
+      initial_sync_complete: true,
+      highest_modseq: null
+    });
+    for (const message of folders[2].messages) message.flags = ["\\Seen"];
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 1,
+           next_flag_scan_at = now() - interval '1 second'
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: false,
+      forceFlagScan: true,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_005,
+        uidNext: 502,
+        messages: 501,
+        highestModseq: 2n
+      }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.flagsUpdated).toBe(501);
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+    const folder = await h.pool.query<{ highest_modseq: string | null }>(
+      `SELECT highest_modseq::text FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    expect(folder.rows[0].highest_modseq).toBe("2");
+
+    folders[2].highestModseq = 3n;
+    const manyFlags = Array.from({ length: 40 }, (_, index) => `$Keyword-${index}`);
+    for (const message of folders[2].messages) message.flags = manyFlags;
+    const overflowClient = new FixtureImapClient(folders);
+    const overflowChange: MailboxChange = {
+      ...change,
+      observed: { ...change.observed, highestModseq: 3n }
+    };
+    const acknowledgeOverflow = vi.fn();
+    overflowClient.peekMailboxChanges = () => [overflowChange];
+    overflowClient.acknowledgeMailboxChanges = acknowledgeOverflow;
+
+    const overflowResult = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: overflowClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(overflowResult.outcome).toBe("success");
+    expect(overflowResult.flagsUpdated).toBe(501);
+    expect(acknowledgeOverflow).toHaveBeenCalledWith([overflowChange]);
+    const overflowFolder = await h.pool.query<{ highest_modseq: string | null }>(
+      `SELECT highest_modseq::text FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    expect(overflowFolder.rows[0].highest_modseq).toBe("3");
+
+    const quietClient = new FixtureImapClient(folders);
+    const quietFetch = vi.spyOn(quietClient, "fetch");
+    const quietChange: MailboxChange = {
+      ...change,
+      observed: { ...change.observed, highestModseq: 3n }
+    };
+    quietClient.peekMailboxChanges = () => [quietChange];
+    quietClient.acknowledgeMailboxChanges = vi.fn();
+
+    const quietResult = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: quietClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(quietResult.outcome).toBe("success");
+    expect(quietFetch.mock.calls.some((call) => call[1]?.flags === true)).toBe(false);
   });
 
   it("closes an in-flight Sent IMAP operation when its scheduler deadline aborts", async () => {

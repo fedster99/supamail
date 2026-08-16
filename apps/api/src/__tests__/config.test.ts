@@ -64,6 +64,7 @@ describe("config Inbox IDLE timeouts", () => {
   it("renews IDLE at 25 minutes with a longer idle-safe socket timeout", () => {
     const config = getConfig(baseEnv);
     expect(config.IMAP_IDLE_MAX_TIME_MS).toBe(25 * 60_000);
+    expect(config.IMAP_FOLDER_STATUS_INTERVAL_MS).toBe(60_000);
     expect(config.IMAP_IDLE_SOCKET_TIMEOUT_MS).toBe(30 * 60_000);
   });
 
@@ -73,6 +74,14 @@ describe("config Inbox IDLE timeouts", () => {
       IMAP_IDLE_MAX_TIME_MS: "1500000",
       IMAP_IDLE_SOCKET_TIMEOUT_MS: "1500000"
     })).toThrow(/must exceed/);
+  });
+
+  it("rejects a folder STATUS interval that IDLE would renew before reaching", () => {
+    expect(() => getConfig({
+      ...baseEnv,
+      IMAP_IDLE_MAX_TIME_MS: "60000",
+      IMAP_FOLDER_STATUS_INTERVAL_MS: "60000"
+    })).toThrow(/must be less than/);
   });
 });
 

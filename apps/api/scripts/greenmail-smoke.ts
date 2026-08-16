@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { ImapFlow } from "imapflow";
 import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
+import { openInboxIdleSession } from "../src/inbox-idle.js";
 import { MirrorRepository } from "../src/repository.js";
 import { sendMessage } from "../src/send.js";
 import { createDraft, listDrafts, sendDraft } from "../src/drafts.js";
@@ -366,6 +367,7 @@ async function main(): Promise<void> {
     INCREMENTAL_SYNC_BATCH_SIZE: 10,
     CONNECT_TIMEOUT_MS: 10_000,
     IMAP_COMMAND_TIMEOUT_MS: 10_000,
+    IMAP_FOLDER_STATUS_INTERVAL_MS: 3_000,
     IMAP_ALLOW_PRIVATE_HOSTS: true
   };
   const repository = new MirrorRepository(pool, config);
@@ -400,6 +402,77 @@ async function main(): Promise<void> {
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
       throw new Error(`GreenMail smoke failed: ${failed.map(([name]) => name).join(", ")}`);
+    }
+
+    // GreenMail has IDLE and basic STATUS but no CONDSTORE/QRESYNC. Prove that
+    // the same shared session still detects and mirrors a non-Inbox addition.
+    await ensureFolder("Archive");
+    await pool.query(
+      "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
+      [account.id]
+    );
+    const archiveDiscovery = await engine.syncAccount(account.id, "manual");
+    if (archiveDiscovery.outcome !== "success") {
+      throw new Error("GreenMail Archive discovery failed");
+    }
+    const idleAccount = await repository.getAccount(account.id);
+    if (!idleAccount) throw new Error("GreenMail smoke Mailbox Account disappeared");
+    const opened = await openInboxIdleSession(pool, config, idleAccount);
+    if (opened.status !== "ready") throw new Error("GreenMail did not advertise IDLE");
+    let archiveStatusLatencyMs = 0;
+    let archiveLiveOutcome = "failed";
+    try {
+      const waiting = opened.session.wait();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const injector = new ImapFlow({
+        host: "127.0.0.1",
+        port: imapPort,
+        secure: false,
+        auth: { user: mailbox, pass: "any-password" },
+        logger: false
+      });
+      await injector.connect();
+      let mutationCompletedAt = 0;
+      try {
+        await injector.append("Archive", Buffer.from(plainMessage(50)));
+        mutationCompletedAt = Date.now();
+      } finally {
+        await injector.logout().catch(() => injector.close());
+      }
+      const wake = await Promise.race([
+        waiting,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("Timed out waiting for GreenMail Archive STATUS wake")),
+          8_000
+        ))
+      ]);
+      archiveStatusLatencyMs = Date.now() - mutationCompletedAt;
+      if (wake.status !== "wake" || wake.wake.folderPath !== "Archive") {
+        throw new Error("GreenMail STATUS renewal did not identify Archive");
+      }
+      const archiveLive = await engine.syncAccount(account.id, "scheduled", {
+        liveInboxOnly: true,
+        client: opened.session.syncClient,
+        clientAccountId: opened.session.accountId,
+        keepClientOpen: true
+      });
+      archiveLiveOutcome = archiveLive.outcome;
+    } finally {
+      opened.session.close();
+    }
+    const archiveMirror = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_messages
+       WHERE account_id = $1
+         AND folder_path = 'Archive'
+         AND rfc_message_id = '<greenmail-smoke-50@example.test>'
+         AND deleted_in_provider = false`,
+      [account.id]
+    );
+    if (archiveLiveOutcome !== "success"
+      || Number(archiveMirror.rows[0]?.count ?? 0) !== 1
+      || archiveStatusLatencyMs >= 4_500) {
+      throw new Error("GreenMail basic STATUS fallback did not converge Archive promptly");
     }
 
     // Send path (email-001): reply to a mirrored message over SMTP, which APPENDs
@@ -576,6 +649,10 @@ async function main(): Promise<void> {
       imapPort,
       result,
       counts,
+      archiveStatus: {
+        latencyMs: archiveStatusLatencyMs,
+        liveOutcome: archiveLiveOutcome
+      },
       send: {
         sendResult,
         resyncOutcome: resyncResult.outcome,

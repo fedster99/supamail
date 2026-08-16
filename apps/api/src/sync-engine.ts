@@ -9,6 +9,7 @@ import {
   fetchFullMessageBodyBatch,
   fetchMessageFlags,
   fetchMessageMetadata,
+  iterateChangedMessageFlagBatches,
   iterateAllUids,
   MessageMovedError,
   PARSED_BODY_BATCH_MAX_MESSAGES,
@@ -17,7 +18,7 @@ import {
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
-import type { MailboxListItem, MirrorImapClient } from "./imap-client.js";
+import type { MailboxChange, MailboxListItem, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -102,6 +103,8 @@ type FolderSyncResult = {
   reconcileAttempted: boolean;
   flagScanAttempted: boolean;
   hitLockBudget: boolean;
+  initialSyncComplete: boolean;
+  reconcileClean: boolean;
 };
 
 type HistoryBatchResult = {
@@ -296,7 +299,7 @@ export interface MirrorEngineOptions {
 
 export interface SyncAccountOptions {
   sentOnly?: boolean;
-  /** Run only Inbox metadata, reconciliation, and flag work. */
+  /** Run the supplemental live-change lane (the name is retained for host compatibility). */
   liveInboxOnly?: boolean;
   /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
   forceInboxReconcile?: boolean;
@@ -452,26 +455,50 @@ export class MirrorEngine {
           ?? await this.clientFactory(account, { signal: options.signal });
         throwIfInterrupted();
 
+        const mailboxChanges = options.liveInboxOnly
+          ? [...(client.peekMailboxChanges?.(
+              this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE + this.config.MAX_RR_FOLDERS_PER_CYCLE
+            ) ?? [])]
+          : [];
+        const mailboxChangeByPath = new Map(
+          mailboxChanges.map((change) => [change.path, change] as const)
+        );
+
         if (!supplemental && this.shouldDiscoverFolders(account)) {
           await this.discoverFolders(account, client);
         }
 
         const folders = sentFolders ?? (options.liveInboxOnly
-          ? [await this.repository.getInboxFolderForWake(account.id)].filter(
-              (folder): folder is ImapFolder => folder !== null
-            )
+          ? mailboxChanges.length > 0
+            ? await this.repository.getFoldersForWake(
+                account.id,
+                mailboxChanges.map((change) => change.path)
+              )
+            : [await this.repository.getInboxFolderForWake(account.id)].filter(
+                (folder): folder is ImapFolder => folder !== null
+              )
           : await this.repository.getFoldersDueForSync(account.id));
         let priorityFolderFailed = false;
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
+        let attemptedMailboxChanges = 0;
+        const handledMailboxChanges: MailboxChange[] = [];
         for (const folder of folders) {
           throwIfInterrupted();
-          const isPriorityFolder = folder.sync_priority <= this.config.PRIORITY_CUTOFF;
+          const mailboxChange = mailboxChangeByPath.get(folder.path);
+          const isPriorityFolder = mailboxChange !== undefined
+            || folder.sync_priority <= this.config.PRIORITY_CUTOFF;
           if (this.isLockBudgetExpired(lockDeadline) && !isPriorityFolder) {
             result.hitLockBudget = true;
             break;
           }
+          if (mailboxChange !== undefined && attemptedMailboxChanges > 0
+            && this.isLockBudgetExpired(lockDeadline)) {
+            result.hitLockBudget = true;
+            break;
+          }
+          if (mailboxChange !== undefined) attemptedMailboxChanges += 1;
 
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
@@ -480,8 +507,12 @@ export class MirrorEngine {
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
-              forceReconcile: options.liveInboxOnly && options.forceInboxReconcile === true,
-              forceFlagScan: options.liveInboxOnly && options.forceInboxFlagScan === true,
+              forceReconcile: options.liveInboxOnly
+                && (mailboxChange?.forceReconcile === true
+                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
+              forceFlagScan: options.liveInboxOnly
+                && (mailboxChange?.forceFlagScan === true
+                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true)),
               signal: options.signal
             });
             throwIfInterrupted();
@@ -494,6 +525,14 @@ export class MirrorEngine {
             }
             if (folderResult.reconcileAttempted) remainingReconciles -= 1;
             if (folderResult.flagScanAttempted) remainingFlagScans -= 1;
+            if (mailboxChange !== undefined
+              && folderResult.initialSyncComplete
+              && !folderResult.hitLockBudget
+              && (!mailboxChange.forceReconcile
+                || (folderResult.reconcileAttempted && folderResult.reconcileClean))
+              && (!mailboxChange.forceFlagScan || folderResult.flagScanAttempted)) {
+              handledMailboxChanges.push(mailboxChange);
+            }
             await this.repository.heartbeat(account.id);
           } catch (error) {
             throwIfInterrupted();
@@ -526,9 +565,14 @@ export class MirrorEngine {
                 message
               );
             }
-            if (folder.sync_priority <= this.config.PRIORITY_CUTOFF) priorityFolderFailed = true;
+            if (isPriorityFolder) priorityFolderFailed = true;
             result.errors.push(sanitizeErrorReason(`${sanitizedPath}: ${message}`));
           }
+        }
+
+        if (mailboxChanges.length > 0 && folders.length !== mailboxChanges.length) {
+          priorityFolderFailed = true;
+          result.errors.push("Mailbox change set no longer matches tracked folders");
         }
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
@@ -559,6 +603,10 @@ export class MirrorEngine {
 
         if (result.errors.length > 0) {
           result.outcome = priorityFolderFailed ? "failed" : "partial_success";
+        }
+
+        if (handledMailboxChanges.length > 0) {
+          client.acknowledgeMailboxChanges?.(handledMailboxChanges);
         }
 
         if (supplemental) {
@@ -889,6 +937,9 @@ export class MirrorEngine {
 
       const uidValidity = Number(mailbox.uidValidity);
       const uidNext = mailbox.uidNext ?? undefined;
+      const highestModseq = mailbox.highestModseq === undefined
+        ? undefined
+        : String(mailbox.highestModseq);
       const storedUidValidity = folder.uidvalidity ? Number(folder.uidvalidity) : null;
 
       if (storedUidValidity && storedUidValidity !== uidValidity) {
@@ -912,7 +963,9 @@ export class MirrorEngine {
           reconcileGapsFound: 0,
           reconcileAttempted: false,
           flagScanAttempted: false,
-          hitLockBudget: false
+          hitLockBudget: false,
+          initialSyncComplete: false,
+          reconcileClean: false
         };
       }
 
@@ -944,7 +997,9 @@ export class MirrorEngine {
           reconcileGapsFound: 0,
           reconcileAttempted: false,
           flagScanAttempted: false,
-          hitLockBudget: this.folderHitLockBudget(options)
+          hitLockBudget: this.folderHitLockBudget(options),
+          initialSyncComplete: initial.initialSyncComplete,
+          reconcileClean: false
         };
       }
 
@@ -1001,42 +1056,88 @@ export class MirrorEngine {
       if (!hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
         const flagScanDeadline = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
-        const flagCutoff = new Date();
-        flagCutoff.setDate(flagCutoff.getDate() - this.config.FLAG_DIFF_WINDOW_DAYS);
-        const flagUids = [
-          ...new Set(await this.withOperationDeadline(
+        const canUseChangedSince = folder.highest_modseq !== null
+          && highestModseq !== undefined
+          && BigInt(highestModseq) > BigInt(folder.highest_modseq);
+        const condstoreCursorUnchanged = folder.highest_modseq !== null
+          && highestModseq !== undefined
+          && BigInt(highestModseq) === BigInt(folder.highest_modseq);
+        if (canUseChangedSince) {
+          for await (const flags of this.withAsyncIterableDeadline(
             client,
             flagScanDeadline,
             "FLAG_SCAN_TOTAL_TIMEOUT_MS",
-            "flag scan SEARCH",
-            () => searchUidsSince(client, flagCutoff)
-          ))
-        ].sort((a, b) => a - b);
-        for (let i = 0; i < flagUids.length; i += incrementalBatchSize) {
-          const batchUids = flagUids.slice(i, i + incrementalBatchSize);
-          const flags = await this.withOperationDeadline(
-            client,
-            flagScanDeadline,
-            "FLAG_SCAN_TOTAL_TIMEOUT_MS",
-            "flag scan FETCH",
-            () => fetchMessageFlags(client, batchUids, incrementalBatchSize)
-          );
-          this.assertDeadlineAvailable(
-            client,
-            flagScanDeadline,
-            "FLAG_SCAN_TOTAL_TIMEOUT_MS",
-            "flag scan write"
-          );
-          const scan = await this.repository.applyFlagScan(
-            account.id,
-            folder,
-            uidValidity,
-            flags,
-            { deadlineAt: flagScanDeadline, signal: options.signal }
-          );
-          flagsUpdated += scan.flagsChanged;
-          for (const message of scan.messages) {
-            await this.hooks.onMessageUpsert?.(message);
+            "CONDSTORE flag delta",
+            iterateChangedMessageFlagBatches(
+              client,
+              BigInt(folder.highest_modseq!),
+              incrementalBatchSize
+            )
+          )) {
+            this.assertDeadlineAvailable(
+              client,
+              flagScanDeadline,
+              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+              "flag scan write"
+            );
+            const scan = await this.repository.applyFlagScan(
+              account.id,
+              folder,
+              uidValidity,
+              flags,
+              { deadlineAt: flagScanDeadline, signal: options.signal }
+            );
+            flagsUpdated += scan.flagsChanged;
+            for (const message of scan.messages) {
+              await this.hooks.onMessageUpsert?.(message);
+            }
+          }
+        } else if (!condstoreCursorUnchanged) {
+          // Establishing a CONDSTORE cursor must cover the entire active mirror
+          // window. Otherwise a flag changed before the first persisted modseq
+          // could be skipped forever when the cursor advances.
+          const establishingCondstoreCursor = folder.highest_modseq === null
+            && highestModseq !== undefined;
+          const scanEntireWindow = establishingCondstoreCursor || options.forceFlagScan === true;
+          const flagCutoff = scanEntireWindow ? windowCutoff : new Date();
+          if (!scanEntireWindow) {
+            flagCutoff.setDate(flagCutoff.getDate() - this.config.FLAG_DIFF_WINDOW_DAYS);
+          }
+          const flagUids = [
+            ...new Set(await this.withOperationDeadline(
+              client,
+              flagScanDeadline,
+              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+              "flag scan SEARCH",
+              () => searchUidsSince(client, flagCutoff)
+            ))
+          ].sort((a, b) => a - b);
+          for (let i = 0; i < flagUids.length; i += incrementalBatchSize) {
+            const batchUids = flagUids.slice(i, i + incrementalBatchSize);
+            const flags = await this.withOperationDeadline(
+              client,
+              flagScanDeadline,
+              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+              "flag scan FETCH",
+              () => fetchMessageFlags(client, batchUids, incrementalBatchSize)
+            );
+            this.assertDeadlineAvailable(
+              client,
+              flagScanDeadline,
+              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+              "flag scan write"
+            );
+            const scan = await this.repository.applyFlagScan(
+              account.id,
+              folder,
+              uidValidity,
+              flags,
+              { deadlineAt: flagScanDeadline, signal: options.signal }
+            );
+            flagsUpdated += scan.flagsChanged;
+            for (const message of scan.messages) {
+              await this.hooks.onMessageUpsert?.(message);
+            }
           }
         }
       }
@@ -1157,6 +1258,7 @@ export class MirrorEngine {
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext,
+        highestModseq: flagScanAttempted ? highestModseq : undefined,
         lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,
@@ -1172,7 +1274,9 @@ export class MirrorEngine {
         reconcileGapsFound,
         reconcileAttempted,
         flagScanAttempted,
-        hitLockBudget
+        hitLockBudget,
+        initialSyncComplete: true,
+        reconcileClean: reconcileClean === true
       };
     } finally {
       mailboxLock.release();
@@ -1326,7 +1430,7 @@ export class MirrorEngine {
     windowCutoff: Date,
     metadataWriteStats: MetadataWriteStats,
     signal?: AbortSignal
-  ): Promise<{ messagesUpserted: number }> {
+  ): Promise<{ messagesUpserted: number; initialSyncComplete: boolean }> {
     const initialSyncDeadline = Date.now() + this.config.INITIAL_SYNC_BATCH_TIMEOUT_MS;
     let targetMaxUid: number | null = folder.initial_sync_target_max_uid
       ? Number(folder.initial_sync_target_max_uid)
@@ -1362,7 +1466,7 @@ export class MirrorEngine {
           lastUid: 0,
           initialComplete: true
         }, { deadlineAt: initialSyncDeadline, signal });
-        return { messagesUpserted: 0 };
+        return { messagesUpserted: 0, initialSyncComplete: true };
       }
 
       targetMaxUid = sortedTargets[sortedTargets.length - 1];
@@ -1450,7 +1554,7 @@ export class MirrorEngine {
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
-      return { messagesUpserted };
+      return { messagesUpserted, initialSyncComplete: true };
     }
 
     // Collect up to one batch of UIDs strictly less than the watermark,
@@ -1472,7 +1576,7 @@ export class MirrorEngine {
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
-      return { messagesUpserted };
+      return { messagesUpserted, initialSyncComplete: true };
     }
 
     const batch = descending.slice().reverse(); // ascending order for FETCH
@@ -1528,7 +1632,7 @@ export class MirrorEngine {
       }, { deadlineAt: initialSyncDeadline, signal });
     }
 
-    return { messagesUpserted };
+    return { messagesUpserted, initialSyncComplete: !stillRemaining };
   }
 
   private historyBatchLimit(account: ImapAccount): number {

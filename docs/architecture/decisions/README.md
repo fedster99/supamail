@@ -36,6 +36,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0029-metadata-protection-adapter.md`: A deployment-neutral adapter protects complete sensitive metadata rows while preserving the exact-match projections public core requires.
 - `0030-bounded-batch-thread-reading.md`: `read_thread` batches up to ten grouped-search conversation seeds without adding another MCP tool.
 - `0031-host-owned-inbox-idle-wake.md`: Hosts may use one read-only Inbox IDLE session per active Mailbox Account as a low-latency wake hint while polling, reconciliation, and account locking remain authoritative.
+- `0032-shared-idle-all-folder-status-feed.md`: The shared Inbox IDLE session uses bounded STATUS rotations to wake authoritative sync for changes in every tracked folder, with CONDSTORE deltas when available and the periodic loop retained as the safety net.
 
 ## Status Values
 

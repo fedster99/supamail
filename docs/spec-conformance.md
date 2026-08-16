@@ -95,14 +95,18 @@ Between full sync cycles, a separate due-based Sent lane refreshes metadata at `
 
 Flag scans and reconciles are also due-based and budgeted. Agents should not change this into "scan every folder every cycle" behavior; that is exactly the folder-explosion failure mode the old spec was trying to prevent.
 
-Hosts may reduce Inbox latency with the exported `openInboxIdleSession`
-primitive. It opens one read-only Inbox session and waits for `exists`,
-`expunge`, or `flags` notifications. The notification is not mirror truth. The
-host passes the same session into the existing account-locked sync path and
-retains the periodic full-sync timer as recovery.
-`EXPUNGE` forces the normal Inbox UID reconcile; `FLAGS` forces the normal Inbox
-flag scan. Listener ownership, reconnect backoff, and shutdown belong to the
-host, not public core.
+Hosts may reduce mailbox latency with the exported `openInboxIdleSession`
+primitive. It keeps one read-only Inbox IDLE session for `exists`, `expunge`,
+and `flags` hints, and uses the same connection for a bounded round-robin STATUS
+sweep of tracked non-Inbox folders. These signals are not mirror truth. The host
+passes the session into the compatibility-named `liveInboxOnly` path, which
+targets the exact changed folders and forces their indicated UID reconcile or
+flag work under the existing per-cycle operation caps; unfinished snapshots
+remain pending for later passes. `EXPUNGE` forces the normal Inbox UID reconcile; `FLAGS` forces the
+normal Inbox flag scan. CONDSTORE deltas are used when available; the periodic
+full-sync timer remains the safety net. A natural IDLE completion yields before
+the host takes the connection for periodic sync. Listener ownership, reconnect
+backoff, and shutdown belong to the host, not public core.
 
 Historical backfill runs after hot sync and the capped live body lane. It snapshots older-than-window UIDs per folder, walks them newest-first, and persists progress in the folder `backfill_*` fields. Backfill *completeness* does not gate `sync_state` health (an account is not DEGRADED for incomplete history), though a history-lane *error* surfaces in the sync run outcome like other lane errors. Progress consumers should read `imap_account_progress` and per-folder progress rows.
 

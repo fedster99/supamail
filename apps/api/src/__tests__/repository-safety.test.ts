@@ -128,7 +128,7 @@ describe("repository safety", () => {
     const syncFilter = "AND missing_since IS NULL AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
     const joinedFilter = "AND f.missing_since IS NULL AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
 
-    expect(collapsed.split(syncFilter).length - 1).toBe(4);
+    expect(collapsed.split(syncFilter).length - 1).toBe(6);
     expect(collapsed.split(joinedFilter).length - 1).toBe(2);
   });
 

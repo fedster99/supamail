@@ -6,6 +6,7 @@ import type { AppConfig } from "../config.js";
 import {
   fetchFullMessageBody,
   fetchFullMessageBodyBatch,
+  fetchChangedMessageFlags,
   fetchMessageFlags,
   fetchMessageMetadata,
   MessageMovedError,
@@ -380,6 +381,20 @@ describe("fetchFullMessageBody mailbox locking", () => {
 });
 
 describe("ThrottledImapClient fetch cancellation", () => {
+  it("forwards the mailbox-change limit to the durable feed", () => {
+    const peek = vi.fn(() => []);
+    const client = new ThrottledImapClient(
+      {} as never,
+      1_000,
+      1_000,
+      undefined,
+      { peek, acknowledge: vi.fn() }
+    );
+
+    expect(client.peekMailboxChanges(2)).toEqual([]);
+    expect(peek).toHaveBeenCalledWith(2);
+  });
+
   it("forwards an early consumer return to the underlying IMAP iterator", async () => {
     const iteratorReturn = vi.fn(async () => ({ done: true, value: undefined }));
     const rawIterator = {
@@ -754,5 +769,46 @@ describe("fetchMessageFlags", () => {
   it("fails closed when a requested response omits FLAGS", async () => {
     const client = flagsStub([{ uid: 100 }]);
     await expect(fetchMessageFlags(client, [100], 50)).rejects.toThrow(/omitted FLAGS.*100/i);
+  });
+});
+
+describe("fetchChangedMessageFlags", () => {
+  it("uses CONDSTORE CHANGEDSINCE without requiring a complete UID set", async () => {
+    const calls: Array<{
+      range: unknown;
+      query: Record<string, unknown>;
+      options?: Record<string, unknown>;
+    }> = [];
+    const client = {
+      mailbox: { path: "Archive", uidValidity: 1, highestModseq: 11n },
+      async *fetch(
+        range: unknown,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ) {
+        calls.push({ range, query, options });
+        yield { uid: 7, flags: new Set(["\\Seen", "\\Flagged"]) };
+      }
+    } as unknown as MirrorImapClient;
+
+    await expect(fetchChangedMessageFlags(client, 10n)).resolves.toEqual([
+      { uid: 7, flags: ["\\Seen", "\\Flagged"] }
+    ]);
+    expect(calls).toEqual([{
+      range: "1:*",
+      query: { uid: true, flags: true },
+      options: { uid: true, changedSince: 10n }
+    }]);
+  });
+
+  it("fails closed when a changed row omits FLAGS", async () => {
+    const client = {
+      mailbox: { path: "Archive", uidValidity: 1, highestModseq: 11n },
+      async *fetch() {
+        yield { uid: 7 };
+      }
+    } as unknown as MirrorImapClient;
+
+    await expect(fetchChangedMessageFlags(client, 10n)).rejects.toThrow(/omitted FLAGS/i);
   });
 });

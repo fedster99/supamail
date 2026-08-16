@@ -2094,6 +2094,47 @@ export class MirrorRepository {
     return result.rows[0] ?? null;
   }
 
+  /** Active tracked mailboxes eligible for the shared IDLE connection's STATUS sweep. */
+  async getTrackedFoldersForWake(accountId: string): Promise<ImapFolder[]> {
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND lower(path) <> 'inbox'
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      ORDER BY sync_priority, path
+      LIMIT COALESCE(
+        (SELECT folder_count_cap_override FROM public.imap_accounts WHERE id = $1),
+        $2
+      )
+      `,
+      [accountId, this.config.FOLDER_COUNT_ENFORCE_THRESHOLD]
+    );
+    return result.rows;
+  }
+
+  /** Changed mailboxes bypass normal due times but remain constrained to tracked rows. */
+  async getFoldersForWake(accountId: string, paths: readonly string[]): Promise<ImapFolder[]> {
+    if (paths.length === 0) return [];
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND path = ANY($2::text[])
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      ORDER BY array_position($2::text[], path)
+      `,
+      [accountId, paths]
+    );
+    return result.rows;
+  }
+
   async getSentFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
     const result = await this.pool.query<ImapFolder>(
       `
@@ -2214,6 +2255,7 @@ export class MirrorRepository {
   async markFolderSynced(folderId: string, patch: {
     uidValidity: number;
     uidNext?: number;
+    highestModseq?: string;
     lastUid?: number;
     initialComplete?: boolean;
     reconcileClean?: boolean;
@@ -2225,6 +2267,7 @@ export class MirrorRepository {
         status = 'ACTIVE',
         uidvalidity = $2,
         uid_next = COALESCE($3, uid_next),
+        highest_modseq = COALESCE($14::numeric, highest_modseq),
         last_uid = COALESCE($4, last_uid),
         initial_sync_complete = COALESCE($5, initial_sync_complete),
         last_synced_at = now(),
@@ -2271,7 +2314,8 @@ export class MirrorRepository {
       this.config.RECONCILE_INTERVAL_MS,
       this.config.PRIORITY_CUTOFF,
       this.config.SENT_SYNC_INTERVAL_MS,
-      this.config.SYNC_INTERVAL_MS
+      this.config.SYNC_INTERVAL_MS,
+      patch.highestModseq ?? null
     ];
     const result = options.deadlineAt === undefined
       ? await this.pool.query<{ id: string }>(query, values)
@@ -2331,6 +2375,7 @@ export class MirrorRepository {
         `
         UPDATE public.imap_folders
         SET uidvalidity = $3,
+            highest_modseq = NULL,
             last_uid = NULL,
             initial_sync_complete = false,
             initial_sync_target_max_uid = NULL,
