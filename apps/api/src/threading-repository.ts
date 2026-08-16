@@ -1518,11 +1518,23 @@ export class ThreadingRepository {
             this.algorithms.has(building.algorithm_version)
             ? building
             : null;
-          const scheduled = selectFairRun(state.scheduler_cursor, {
+          const schedulingNow = new Date();
+          const candidates = {
             active: activeHasReadyWork ? active : null,
             standby: standbyHasReadyWork ? standby : null,
             building: compatibleBuilding
-          });
+          };
+          const scheduled = selectFairRun(state.scheduler_cursor, {
+            active: activeHasReadyWork && active && active.available_at <= schedulingNow
+              ? active
+              : null,
+            standby: standbyHasReadyWork && standby && standby.available_at <= schedulingNow
+              ? standby
+              : null,
+            building: compatibleBuilding && compatibleBuilding.available_at <= schedulingNow
+              ? compatibleBuilding
+              : null
+          }) ?? selectFairRun(state.scheduler_cursor, candidates);
           let run = scheduled?.run ?? null;
           if (scheduled) {
             await client.query(
