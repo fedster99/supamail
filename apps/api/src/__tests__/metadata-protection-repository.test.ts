@@ -10,6 +10,8 @@ import type {
 import { plaintextMetadataProtection } from "../metadata-protection.js";
 import { MirrorRepository } from "../repository.js";
 import {
+  ThreadingMetadataProtectionTimeoutError,
+  isThreadingMetadataProtectionTimeout,
   isThreadingStatementTimeout,
   threadingFailureReason
 } from "../threading-repository.js";
@@ -176,5 +178,14 @@ describe("MirrorRepository metadata protection", () => {
       message: "statement timeout"
     })).toBe(false);
     expect(isThreadingStatementTimeout(new Error("statement timeout"))).toBe(false);
+  });
+
+  it("classifies only the repository metadata-protection deadline for subdivision", () => {
+    expect(isThreadingMetadataProtectionTimeout(
+      new ThreadingMetadataProtectionTimeoutError()
+    )).toBe(true);
+    expect(isThreadingMetadataProtectionTimeout(
+      new Error("metadata protection operation timed out")
+    )).toBe(false);
   });
 });

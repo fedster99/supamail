@@ -1004,7 +1004,7 @@ liveDb("ThreadingRepository live DB", () => {
       metadataProtection: adapter,
       metadataProtectionTimeoutMs: 50
     });
-    await protectedRepository.drainAccount(accountId, {
+    const created = await protectedRepository.drainAccount(accountId, {
       batchSize: 20,
       requestedBy: "live-test"
     });
@@ -1018,6 +1018,32 @@ liveDb("ThreadingRepository live DB", () => {
       requestedBy: "live-test"
     })).rejects.toThrow("metadata protection operation timed out");
     expect(adapter.maxActive).toBeLessThanOrEqual(16);
+    const failure = await pool.query<{
+      attempted: string;
+      adaptive_batch_size: string | null;
+      error_code: string | null;
+      queued: string;
+      retry_state: string | null;
+    }>(
+      `SELECT operation.summary->>'messages_attempted' AS attempted,
+              operation.summary->>'adaptive_retry_batch_size' AS adaptive_batch_size,
+              operation.summary->>'error_code' AS error_code,
+              (SELECT count(*)::text FROM public.imap_thread_work_queue queue
+               WHERE queue.run_id = operation.run_id) AS queued,
+              operation.summary->>'retry_state' AS retry_state
+       FROM public.imap_thread_operations operation
+       WHERE operation.run_id = $1 AND operation.operation_type = 'failure'
+       ORDER BY operation.completed_at DESC
+       LIMIT 1`,
+      [created.runId]
+    );
+    expect(failure.rows[0]).toEqual({
+      attempted: "20",
+      adaptive_batch_size: "10",
+      error_code: "metadata_protection_timeout",
+      queued: "20",
+      retry_state: "subdivided"
+    });
     const assignments = await pool.query<{ count: string }>(
       "SELECT count(*)::text AS count FROM public.imap_thread_assignments WHERE account_id = $1",
       [accountId]
