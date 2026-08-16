@@ -10,7 +10,11 @@ Many SupaMail correctness properties depend on real Postgres behavior: advisory 
 
 ## Decision
 
-Maintain a separate live DB reliability lane. `pnpm test:db:live` provisions disposable Docker Postgres, applies the migration twice, runs DB-backed sync engine suites, runs spec conformance, and cleans up the container unless `KEEP_DB=1` is set.
+Maintain a separate live DB reliability lane. `pnpm test:db:live` first proves
+the disposable Docker lifecycle across success, failure, `SIGINT`, `SIGTERM`,
+and parallel runs. It then provisions disposable Docker Postgres, applies the
+migration twice, runs DB-backed sync engine suites, runs spec conformance, and
+cleans up the exact container and named volume unless `KEEP_DB=1` is set.
 
 Normal `pnpm test` stays fast and does not require Docker or `DATABASE_URL`.
 
@@ -23,6 +27,8 @@ Normal `pnpm test` stays fast and does not require Docker or `DATABASE_URL`.
 ## Verification
 
 - `apps/api/scripts/test-db-live.ts` provisions and tears down the disposable Postgres container.
+- `apps/api/scripts/test-ephemeral-postgres-lifecycle.ts` compares labeled Docker
+  containers and volumes before and after every lifecycle scenario.
 - `package.json` exposes `pnpm test:db:live`.
 - `.github/workflows/ci.yml` runs a separate Live DB Reliability job.
 - `docs/agent/verification.md` maps reliability-sensitive changes to this gate.
