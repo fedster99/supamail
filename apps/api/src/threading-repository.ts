@@ -43,6 +43,9 @@ const DEFAULT_MAX_CLOSURE_MESSAGES = 25_000;
 const DEFAULT_MAX_CLOSURE_EVIDENCE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_CLOSURE_CRITERIA_KEYS = 100_000;
 const DEFAULT_MAX_SUBJECT_BUCKET_MESSAGES = 5_000;
+// Production A/Bs found indexed probes faster through 20 IDs and slower for
+// dense 30- and 331-ID closures.
+const INDEXED_CLOSURE_MAX_MESSAGE_IDS = 20;
 const WRITE_CHUNK_SIZE = 1_000;
 const MAX_PROTECTED_WRITE_JSON_BYTES = 4 * 1024 * 1024;
 const LIVE_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
@@ -313,6 +316,12 @@ function adaptiveClosureBatchSize(run: ThreadRun, requestedBatchSize: number): n
   return Number.isSafeInteger(parsed) && parsed > 0
     ? Math.min(requestedBatchSize, parsed)
     : requestedBatchSize;
+}
+
+export function selectClosureExpansionPlan(
+  messageCount: number
+): "indexed" | "ordered_scan" {
+  return messageCount <= INDEXED_CLOSURE_MAX_MESSAGE_IDS ? "indexed" : "ordered_scan";
 }
 
 export interface ThreadingRunResult {
@@ -3325,49 +3334,69 @@ export class ThreadingRepository {
         throw new ThreadingEvidenceLimitError("criteria", limits.maxCriteriaKeys);
       }
       const remaining = limits.maxMessages - ids.size;
+      const expansionPlan = selectClosureExpansionPlan(ids.size);
       const candidates = await this.timeStage(
         "closure_expansion_query",
         { itemCount: ids.size, iteration },
         () => client.query<{ message_id: string }>(
-          `
-          SELECT DISTINCT message_id
-          FROM (
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1 AND conversation_id = ANY($2::text[])
-            UNION ALL
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1 AND delivery_key = ANY($3::text[])
-            UNION ALL
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1 AND strict_message_id_hash = ANY($4::text[])
-            UNION ALL
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1 AND root_reference_hash = ANY($4::text[])
-            UNION ALL
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1 AND parent_reference_hash = ANY($4::text[])
-            UNION ALL
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1 AND provider_thread_hash = ANY($5::text[])
-            UNION ALL
-            SELECT message_id
-            FROM public.imap_thread_assignments
-            WHERE run_id = $1
-              AND (
-                reference_hashes && $4::text[]
-                OR delivery_fingerprint_hashes && $6::text[]
-              )
-          ) AS candidates
-          WHERE NOT (message_id = ANY($7::uuid[]))
-          ORDER BY message_id
-          LIMIT $8
-          `,
+          expansionPlan === "indexed"
+            ? `
+              SELECT DISTINCT message_id
+              FROM (
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1 AND conversation_id = ANY($2::text[])
+                UNION ALL
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1 AND delivery_key = ANY($3::text[])
+                UNION ALL
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1 AND strict_message_id_hash = ANY($4::text[])
+                UNION ALL
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1 AND root_reference_hash = ANY($4::text[])
+                UNION ALL
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1 AND parent_reference_hash = ANY($4::text[])
+                UNION ALL
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1 AND provider_thread_hash = ANY($5::text[])
+                UNION ALL
+                SELECT message_id
+                FROM public.imap_thread_assignments
+                WHERE run_id = $1
+                  AND (
+                    reference_hashes && $4::text[]
+                    OR delivery_fingerprint_hashes && $6::text[]
+                  )
+              ) AS candidates
+              WHERE NOT (message_id = ANY($7::uuid[]))
+              ORDER BY message_id
+              LIMIT $8
+              `
+            : `
+              SELECT message_id
+              FROM public.imap_thread_assignments
+              WHERE run_id = $1
+                AND NOT (message_id = ANY($7::uuid[]))
+                AND (
+                  conversation_id = ANY($2::text[])
+                  OR delivery_key = ANY($3::text[])
+                  OR strict_message_id_hash = ANY($4::text[])
+                  OR root_reference_hash = ANY($4::text[])
+                  OR parent_reference_hash = ANY($4::text[])
+                  OR reference_hashes && $4::text[]
+                  OR provider_thread_hash = ANY($5::text[])
+                  OR delivery_fingerprint_hashes && $6::text[]
+                )
+              ORDER BY message_id
+              LIMIT $8
+              `,
           [
             run.id,
             [...criteria.conversationIds],
