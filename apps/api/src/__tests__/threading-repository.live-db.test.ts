@@ -3431,13 +3431,26 @@ liveDb("ThreadingRepository live DB", () => {
       requestedBy: "live-test"
     })).rejects.toBeInstanceOf(ThreadingEvidenceLimitError);
 
-    const failed = await pool.query<{ attempts: number; error: string | null }>(
-      `SELECT attempts, last_error AS error
+    const failed = await pool.query<{ attempts: number; error: string | null; run_ready: boolean }>(
+      `SELECT attempts, last_error AS error, available_at <= now() AS run_ready
        FROM public.imap_thread_runs WHERE account_id = $1 AND status = 'building'`,
       [accountId]
     );
     expect(failed.rows[0]?.attempts).toBe(1);
     expect(failed.rows[0]?.error).toMatch(/evidence bytes/);
+    expect(failed.rows[0]?.run_ready).toBe(false);
+
+    await expect(repository.drainAccount(accountId, {
+      batchSize: 1,
+      maxClosureEvidenceBytes: 1_024,
+      requestedBy: "live-test"
+    })).resolves.toMatchObject({ busy: true, assignmentsChanged: 0 });
+    const attempts = await pool.query<{ attempts: number }>(
+      `SELECT attempts FROM public.imap_thread_runs
+       WHERE account_id = $1 AND status = 'building'`,
+      [accountId]
+    );
+    expect(attempts.rows[0]?.attempts).toBe(1);
   });
 
   it("counts recipient evidence once when enforcing the closure byte bound", async () => {

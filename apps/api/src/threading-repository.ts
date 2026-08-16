@@ -288,7 +288,11 @@ interface ClosureLimits {
   maxCriteriaKeys: number;
 }
 
-type AttemptedThreadWork = (ids: string[], canSubdivide: boolean) => void;
+type AttemptedThreadWork = (
+  ids: string[],
+  canSubdivide: boolean,
+  queueDelayControlsRetry: boolean
+) => void;
 
 function adaptiveClosureBatchSize(run: ThreadRun, requestedBatchSize: number): number {
   const stored = run.summary.adaptive_closure_batch_size;
@@ -1383,6 +1387,7 @@ export class ThreadingRepository {
     let failedRun: ThreadRun | null = null;
     let attemptedIds: string[] = [];
     let attemptedCanSubdivide = false;
+    let attemptedQueueDelayControlsRetry = false;
 
     const result = await this.withAccountLock(accountId, async (client) => {
         // This pass deliberately runs before the thread-state transaction. A
@@ -1504,9 +1509,10 @@ export class ThreadingRepository {
           }
           failedRun = run;
           const closureBatchSize = adaptiveClosureBatchSize(run, batchSize);
-          const attempted: AttemptedThreadWork = (ids, canSubdivide) => {
+          const attempted: AttemptedThreadWork = (ids, canSubdivide, queueDelayControlsRetry) => {
             attemptedIds = ids;
             attemptedCanSubdivide = canSubdivide;
+            attemptedQueueDelayControlsRetry = queueDelayControlsRetry;
           };
           if (run.available_at > new Date()) {
             await client.query("COMMIT");
@@ -1587,7 +1593,8 @@ export class ThreadingRepository {
               attemptedIds,
               error,
               options.requestedBy ?? "thread-worker",
-              attemptedCanSubdivide
+              attemptedCanSubdivide,
+              attemptedQueueDelayControlsRetry
             );
           }
           throw error;
@@ -2900,7 +2907,7 @@ export class ThreadingRepository {
       return this.resultForRun(run.account_id, next);
     }
     const seedIds = page.map((row) => row.id);
-    attempted(seedIds, true);
+    attempted(seedIds, true, false);
     const closure = await this.expandClosure(client, run, seedIds, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: false });
     const persisted = await this.persistAssignments(client, run, assignments, closure.inputs, {
@@ -2990,7 +2997,7 @@ export class ThreadingRepository {
       );
       if (staleWeak.rows.length > 0) {
         const staleIds = staleWeak.rows.map((row) => row.message_id);
-        attempted(staleIds, false);
+        attempted(staleIds, false, false);
         const closure = await this.expandClosure(client, run, staleIds, {
           ...closureLimits,
           maxMessages: Math.max(closureLimits.maxMessages, maxBucket)
@@ -3046,7 +3053,7 @@ export class ThreadingRepository {
       });
     }
     const ids = members.rows.map((row) => row.message_id);
-    attempted(ids, false);
+    attempted(ids, false, false);
     const closure = await this.expandClosure(client, run, ids, closureLimits);
     const assignments = this.computeAssignments(run, closure.inputs, { allowSubjectFallback: true });
     const operationType = run.status === "building" ? "build_batch" : "incremental";
@@ -3141,7 +3148,7 @@ export class ThreadingRepository {
     );
     const ids = work.rows.map((row) => row.message_id);
     if (ids.length === 0) return this.resultForRun(run.account_id, run);
-    attempted(ids, true);
+    attempted(ids, true, true);
     const closure = await this.expandClosure(client, run, ids, closureLimits);
     const assignments = this.timeStageSync(
       "assignment_computation",
@@ -4401,20 +4408,23 @@ export class ThreadingRepository {
     messageIds: string[],
     error: unknown,
     requestedBy: string,
-    canSubdivide: boolean
+    canSubdivide: boolean,
+    queueDelayControlsRetry: boolean
   ): Promise<void> {
     const reason = threadingFailureReason(error, this.metadataProtection);
     const adaptiveFailure = canSubdivide && (
       isThreadingStatementTimeout(error) ||
       error instanceof ThreadingClosureLimitError || error instanceof ThreadingEvidenceLimitError
     );
-    const isolateQueueFailure = adaptiveFailure && messageIds.length > 0;
-    const adaptiveBatchSize = isolateQueueFailure && messageIds.length > 1
+    const adaptiveBatchSize = adaptiveFailure && messageIds.length > 1
       ? Math.max(1, Math.floor(messageIds.length / 2))
       : null;
+    const retryWithoutRunBackoff = adaptiveFailure && messageIds.length > 0 && (
+      adaptiveBatchSize !== null || queueDelayControlsRetry
+    );
     const retryState = adaptiveBatchSize !== null
       ? "subdivided"
-      : isolateQueueFailure
+      : adaptiveFailure && messageIds.length > 0
         ? "irreducible_item"
         : "run_backoff";
     try {
@@ -4446,7 +4456,7 @@ export class ThreadingRepository {
           run.account_id,
           run.algorithm_version,
           run.status,
-          isolateQueueFailure,
+          retryWithoutRunBackoff,
           adaptiveBatchSize
         ]
       );
@@ -4491,7 +4501,7 @@ export class ThreadingRepository {
             messageIds,
             reason,
             adaptiveBatchSize,
-            isolateQueueFailure,
+            adaptiveFailure && messageIds.length > 0,
             ALERTABLE_THREADING_RETRY_ATTEMPTS
           ]
         );
