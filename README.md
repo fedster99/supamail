@@ -391,7 +391,35 @@ Live DB reliability tests:
 pnpm test:db:live
 ```
 
-This starts a disposable `postgres:16-alpine` container on a random localhost port, applies the migration twice, runs the DB-backed sync engine suites, runs spec conformance, and removes the container. Set `KEEP_DB=1` to leave the container running for inspection.
+This first runs the Docker lifecycle regression (success, failure, `SIGINT`,
+`SIGTERM`, and parallel isolation), then starts a disposable
+`postgres:16-alpine` container on a random localhost port, applies the migration
+twice, runs the DB-backed sync engine suites, and runs spec conformance. Each
+database uses its own named volume. The container and volume carry
+`io.supamail.ephemeral=true`, run ID, purpose, and creation-time labels and are
+removed together. Set `KEEP_DB=1` to leave the live-test container and named
+volume running for inspection.
+
+To inspect labeled resources left by `KEEP_DB=1`, `SIGKILL`, a Docker crash, or
+a machine crash:
+
+```bash
+docker volume ls \
+  --filter label=io.supamail.ephemeral=true \
+  --format '{{.Name}}\t{{.Label "io.supamail.purpose"}}\t{{.Label "io.supamail.run-id"}}\t{{.Label "io.supamail.created-at"}}'
+```
+
+Before removing a stale volume, inspect its labels and confirm that no container
+uses it. Then remove that exact volume by name:
+
+```bash
+VOLUME_NAME=supamail-db-live-data-EXACT_RUN_ID
+docker volume inspect "$VOLUME_NAME"
+docker ps -a --filter volume="$VOLUME_NAME"
+docker volume rm "$VOLUME_NAME"
+```
+
+Do not use `docker volume prune`: unrelated developer databases may be valuable.
 
 Local Supabase dry run:
 
