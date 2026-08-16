@@ -130,16 +130,18 @@ old weak edges in bounded components. Work is serialized per account, retries
 are persisted before releasing the account lock, and processing is idempotent
 per run.
 
-An aggregate closure/evidence-limit failure or PostgreSQL statement timeout
-reduces the run's durable queue page size before retry. The selected queue rows
-remain intact with their original ordering and a queue-local delay; the run
-itself stays eligible so ready work in another active/standby/build lane is not
-globally backed off. Repeated subdivision reaches one seed, whose own retry is
-then delayed without blocking later rows and becomes operator-alertable after
-ten attempts. Other database and executor failures retain run-level exponential
-backoff. Optional stage timings expose only fixed stage names, outcome, elapsed
-time, counts, and iteration numbers; they never include account, message, or
-mailbox identifiers or email metadata.
+An aggregate closure/evidence-limit failure or PostgreSQL statement timeout in
+page-scaled closure/persistence work reduces the run's durable page size before
+retry. Dirty-queue rows remain intact with their original ordering and a
+queue-local delay; the run itself stays eligible so later ready rows can advance.
+Repeated subdivision reaches one seed, whose own retry is then delayed without
+blocking later rows and becomes operator-alertable after ten attempts. A
+one-seed failure during the keyset build scan uses run-level backoff because
+queue delay does not control that scan. Fixed-cost database work, other database
+errors, and executor failures also retain run-level exponential backoff.
+Optional stage timings expose only fixed stage names, outcome, elapsed time,
+counts, and iteration numbers; they never include account, message, or mailbox
+identifiers or email metadata.
 
 An initial build, explicit rebuild, or algorithm upgrade creates an isolated
 shadow run. It keyset-scans body evidence and protocol edges in bounded

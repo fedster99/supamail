@@ -3601,7 +3601,10 @@ liveDb("ThreadingRepository live DB", () => {
     }> = [];
     const timedRepository = new ThreadingRepository(timedPool, {
       projectionStatementTimeoutMs: 30,
-      onStageTiming: (timing) => timings.push(timing)
+      onStageTiming: async (timing) => {
+        timings.push(timing);
+        throw new Error("telemetry sink unavailable");
+      }
     });
     let firstFailure: unknown;
     try {
@@ -3617,10 +3620,8 @@ liveDb("ThreadingRepository live DB", () => {
     const failedStage = timings.find((timing) => timing.outcome === "failed");
     expect([
       "assignment_state_load",
-      "assignment_operation_write",
       "assignment_upsert",
-      "assignment_history_write",
-      "assignment_history_retention"
+      "assignment_history_write"
     ]).toContain(failedStage?.stage);
     console.info(JSON.stringify({
       event: "threading.timeout_stage",

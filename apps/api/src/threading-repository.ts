@@ -437,7 +437,7 @@ export interface ThreadingRepositoryOptions {
   /** Durable metadata projection. Default installations use the readable adapter. */
   metadataProtection?: MetadataProtectionAdapter;
   /** Identifier-free stage timings for tests and deployment-owned telemetry. */
-  onStageTiming?: (timing: ThreadingStageTiming) => void;
+  onStageTiming?: (timing: ThreadingStageTiming) => void | Promise<void>;
 }
 
 export type ThreadingStage =
@@ -464,6 +464,20 @@ export interface ThreadingStageTiming {
   itemCount?: number;
   iteration?: number;
 }
+
+const ADAPTIVE_STATEMENT_TIMEOUT_STAGES = new Set<ThreadingStage>([
+  "input_loading_reveal",
+  "closure_assignment_computation",
+  "closure_expansion_query",
+  "assignment_computation",
+  "assignment_state_load",
+  "assignment_upsert",
+  "assignment_history_write",
+  "delivery_evidence_bridge_enqueue",
+  "subject_work_enqueue",
+  "queue_deletion",
+  "transaction_commit"
+]);
 
 export class ThreadingClosureLimitError extends Error {
   constructor(readonly limit: number) {
@@ -951,7 +965,8 @@ export class ThreadingRepository {
   private readonly metadataProtectionTimeoutMs: number;
   private readonly projectionStatementTimeoutMs: number | null;
   private readonly metadataProtection: MetadataProtectionAdapter;
-  private readonly onStageTiming: (timing: ThreadingStageTiming) => void;
+  private readonly onStageTiming: (timing: ThreadingStageTiming) => void | Promise<void>;
+  private readonly failedStages = new WeakMap<object, ThreadingStage>();
   private readonly metadataProtectionScope = new AsyncLocalStorage<MetadataProtectionScope>();
   private readonly metadataProtectionPermits = new AdapterPermitPool(
     METADATA_PROTECTION_CONCURRENCY
@@ -1010,13 +1025,12 @@ export class ThreadingRepository {
       return await operation();
     } catch (error) {
       outcome = "failed";
+      if (error && typeof error === "object" && !this.failedStages.has(error)) {
+        this.failedStages.set(error, stage);
+      }
       throw error;
     } finally {
-      try {
-        this.onStageTiming({ stage, outcome, elapsedMs: performance.now() - startedAt, ...details });
-      } catch {
-        // Observability must never change threading behavior.
-      }
+      this.emitStageTiming({ stage, outcome, elapsedMs: performance.now() - startedAt, ...details });
     }
   }
 
@@ -1031,13 +1045,21 @@ export class ThreadingRepository {
       return operation();
     } catch (error) {
       outcome = "failed";
+      if (error && typeof error === "object" && !this.failedStages.has(error)) {
+        this.failedStages.set(error, stage);
+      }
       throw error;
     } finally {
-      try {
-        this.onStageTiming({ stage, outcome, elapsedMs: performance.now() - startedAt, ...details });
-      } catch {
-        // Observability must never change threading behavior.
-      }
+      this.emitStageTiming({ stage, outcome, elapsedMs: performance.now() - startedAt, ...details });
+    }
+  }
+
+  private emitStageTiming(timing: ThreadingStageTiming): void {
+    try {
+      const pending = this.onStageTiming(timing);
+      if (pending) void pending.catch(() => undefined);
+    } catch {
+      // Observability must never change threading behavior.
     }
   }
 
@@ -4412,8 +4434,13 @@ export class ThreadingRepository {
     queueDelayControlsRetry: boolean
   ): Promise<void> {
     const reason = threadingFailureReason(error, this.metadataProtection);
+    const failedStage = error && typeof error === "object"
+      ? this.failedStages.get(error)
+      : undefined;
+    const adaptiveStatementTimeout = isThreadingStatementTimeout(error) &&
+      failedStage !== undefined && ADAPTIVE_STATEMENT_TIMEOUT_STAGES.has(failedStage);
     const adaptiveFailure = canSubdivide && (
-      isThreadingStatementTimeout(error) ||
+      adaptiveStatementTimeout ||
       error instanceof ThreadingClosureLimitError || error instanceof ThreadingEvidenceLimitError
     );
     const adaptiveBatchSize = adaptiveFailure && messageIds.length > 1
