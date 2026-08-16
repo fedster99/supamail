@@ -139,6 +139,19 @@ interface StoredAssignment {
   evidence: Record<string, unknown>;
 }
 
+type StoredClosureCriteria = Pick<
+  StoredAssignment,
+  | "message_id"
+  | "conversation_id"
+  | "delivery_key"
+  | "strict_message_id_hash"
+  | "root_reference_hash"
+  | "parent_reference_hash"
+  | "reference_hashes"
+  | "delivery_fingerprint_hashes"
+  | "provider_thread_hash"
+>;
+
 interface AssignmentRecord extends StoredAssignment {}
 
 const THREAD_ASSIGNMENT_PROTECTED_FIELDS = [
@@ -630,7 +643,7 @@ function addValue(target: Set<string>, value: string | null | undefined): void {
   if (value) target.add(value);
 }
 
-function addStoredCriteria(criteria: ThreadingCriteria, assignment: StoredAssignment): void {
+function addStoredCriteria(criteria: ThreadingCriteria, assignment: StoredClosureCriteria): void {
   addValue(criteria.conversationIds, assignment.conversation_id);
   addValue(criteria.deliveryKeys, assignment.delivery_key);
   addValue(criteria.referenceHashes, assignment.strict_message_id_hash);
@@ -2672,7 +2685,7 @@ export class ThreadingRepository {
     );
     const queuedIds = queued.rows.map((row) => row.message_id);
     if (queuedIds.length === 0) return 0;
-    const repairEligibleIds = (await this.loadInputs(client, queuedIds))
+    const repairEligibleIds = (await this.loadInputs(client, queuedIds)).inputs
       .filter((input) => input.authored_delivery_repair_eligible === true)
       .map((input) => input.id);
     await this.assertNoProtectedBodyEvidenceBridge(client, repairEligibleIds);
@@ -3235,7 +3248,7 @@ export class ThreadingRepository {
   ): Promise<{ inputs: ThreadingMessageInput[] }> {
     const ids = new Set(seedIds);
     const loadedInputs = new Map<string, ThreadingMessageInput>();
-    const loadedStored = new Map<string, StoredAssignment>();
+    const loadedStored = new Map<string, StoredClosureCriteria>();
     const criteria = emptyCriteria();
     let evidenceBytes = 0;
     const loadBatches = async (messageIds: string[]): Promise<void> => {
@@ -3251,7 +3264,7 @@ export class ThreadingRepository {
         ));
         const batch = messageIds.slice(offset, offset + boundedBatchSize);
         offset += batch.length;
-        const inputs = await this.loadInputs(client, batch);
+        const { inputs, stored } = await this.loadInputs(client, batch, run.id);
         for (const input of inputs) {
           const inputBytes = threadingInputEvidenceBytes(input);
           if (inputBytes > MAX_THREADING_INPUT_EVIDENCE_BYTES) {
@@ -3266,7 +3279,6 @@ export class ThreadingRepository {
           }
           loadedInputs.set(input.id, input);
         }
-        const stored = await this.loadStoredAssignmentProjections(client, run.id, batch);
         for (const assignment of stored) loadedStored.set(assignment.message_id, assignment);
       }
     };
@@ -3318,20 +3330,41 @@ export class ThreadingRepository {
         { itemCount: ids.size, iteration },
         () => client.query<{ message_id: string }>(
           `
-          SELECT message_id
-          FROM public.imap_thread_assignments
-          WHERE run_id = $1
-            AND NOT (message_id = ANY($7::uuid[]))
-            AND (
-              conversation_id = ANY($2::text[])
-              OR delivery_key = ANY($3::text[])
-              OR strict_message_id_hash = ANY($4::text[])
-              OR root_reference_hash = ANY($4::text[])
-              OR parent_reference_hash = ANY($4::text[])
-              OR reference_hashes && $4::text[]
-              OR provider_thread_hash = ANY($5::text[])
-              OR delivery_fingerprint_hashes && $6::text[]
-            )
+          SELECT DISTINCT message_id
+          FROM (
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1 AND conversation_id = ANY($2::text[])
+            UNION ALL
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1 AND delivery_key = ANY($3::text[])
+            UNION ALL
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1 AND strict_message_id_hash = ANY($4::text[])
+            UNION ALL
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1 AND root_reference_hash = ANY($4::text[])
+            UNION ALL
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1 AND parent_reference_hash = ANY($4::text[])
+            UNION ALL
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1 AND provider_thread_hash = ANY($5::text[])
+            UNION ALL
+            SELECT message_id
+            FROM public.imap_thread_assignments
+            WHERE run_id = $1
+              AND (
+                reference_hashes && $4::text[]
+                OR delivery_fingerprint_hashes && $6::text[]
+              )
+          ) AS candidates
+          WHERE NOT (message_id = ANY($7::uuid[]))
           ORDER BY message_id
           LIMIT $8
           `,
@@ -3358,8 +3391,12 @@ export class ThreadingRepository {
     return { inputs: [...loadedInputs.values()].sort((a, b) => compareText(a.id, b.id)) };
   }
 
-  private async loadInputs(client: PgClient, ids: string[]): Promise<ThreadingMessageInput[]> {
-    if (ids.length === 0) return [];
+  private async loadInputs(
+    client: PgClient,
+    ids: string[],
+    runId: string | null = null
+  ): Promise<{ inputs: ThreadingMessageInput[]; stored: StoredClosureCriteria[] }> {
+    if (ids.length === 0) return { inputs: [], stored: [] };
     const result = await client.query<{
       id: string;
       account_id: string;
@@ -3407,6 +3444,7 @@ export class ThreadingRepository {
       body_protected_metadata_version: number | null;
       body_protected_metadata_key_version: number | null;
       body_protected_metadata_tokens: Record<string, string> | null;
+      stored_assignment: StoredClosureCriteria | null;
     }>(
       `
       SELECT
@@ -3441,15 +3479,28 @@ export class ThreadingRepository {
         body.protected_metadata AS body_protected_metadata,
         body.protected_metadata_version AS body_protected_metadata_version,
         body.protected_metadata_key_version AS body_protected_metadata_key_version,
-        body.protected_metadata_tokens AS body_protected_metadata_tokens
+        body.protected_metadata_tokens AS body_protected_metadata_tokens,
+        CASE WHEN assignment.message_id IS NULL THEN NULL ELSE jsonb_build_object(
+          'message_id', assignment.message_id,
+          'conversation_id', assignment.conversation_id,
+          'delivery_key', assignment.delivery_key,
+          'strict_message_id_hash', assignment.strict_message_id_hash,
+          'root_reference_hash', assignment.root_reference_hash,
+          'parent_reference_hash', assignment.parent_reference_hash,
+          'reference_hashes', assignment.reference_hashes,
+          'delivery_fingerprint_hashes', assignment.delivery_fingerprint_hashes,
+          'provider_thread_hash', assignment.provider_thread_hash
+        ) END AS stored_assignment
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies body ON body.message_id = m.id
+      LEFT JOIN public.imap_thread_assignments assignment
+        ON assignment.run_id = $2 AND assignment.message_id = m.id
       WHERE m.id = ANY($1::uuid[])
       ORDER BY m.id
       `,
-      [ids]
+      [ids, runId]
     );
-    return mapWithConcurrency(
+    const inputs = await mapWithConcurrency(
       result.rows,
       METADATA_PROTECTION_CONCURRENCY,
       async (row) => {
@@ -3537,6 +3588,10 @@ export class ThreadingRepository {
       };
       }
     );
+    return {
+      inputs,
+      stored: result.rows.flatMap((row) => row.stored_assignment ? [row.stored_assignment] : [])
+    };
   }
 
   private async loadStoredAssignmentRows(
@@ -3565,24 +3620,6 @@ export class ThreadingRepository {
       [runId, ids]
     );
     return result.rows;
-  }
-
-  private async loadStoredAssignmentProjections(
-    client: PgClient,
-    runId: string,
-    ids: string[]
-  ): Promise<StoredAssignment[]> {
-    const rows = await this.loadStoredAssignmentRows(client, runId, ids);
-    return rows.map((row) => {
-      const {
-        protected_metadata: _protectedMetadata,
-        protected_metadata_version: _protectedMetadataVersion,
-        protected_metadata_key_version: _protectedMetadataKeyVersion,
-        protected_metadata_tokens: _protectedMetadataTokens,
-        ...stored
-      } = row;
-      return stored;
-    });
   }
 
   private async loadStoredAssignments(client: PgClient, runId: string, ids: string[]): Promise<StoredAssignment[]> {
