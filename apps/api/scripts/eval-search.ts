@@ -154,8 +154,11 @@ async function main(): Promise<void> {
     // Machine-readable scorecard to stdout (summary went to stderr).
     process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
   } finally {
-    removeSignalHandlers?.();
-    if (disposable) await disposable.cleanup("completion");
+    try {
+      if (disposable) await disposable.cleanup("completion");
+    } finally {
+      removeSignalHandlers?.();
+    }
   }
 }
 

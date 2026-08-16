@@ -4,14 +4,25 @@ import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import type { EphemeralPostgresResources } from "./ephemeral-postgres.js";
+import {
+  EphemeralPostgres,
+  type EphemeralPostgresResources
+} from "./ephemeral-postgres.js";
 
 const execFileAsync = promisify(execFile);
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const fixturePath = resolve(scriptDir, "ephemeral-postgres-fixture.ts");
-const testGroup = randomUUID();
+const runnerMode = process.argv[2];
+const testGroup = process.env.SUPAMAIL_EPHEMERAL_TEST_GROUP ?? randomUUID();
 const groupFilter = `label=io.supamail.lifecycle-test=${testGroup}`;
-const activeChildren = new Set<ChildProcess>();
+const activeChildren = new Map<ChildProcess, Promise<ProcessExit>>();
+
+type FixtureMode = "success" | "failure" | "port-failure" | "hold";
+
+type ProcessExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
 
 type Snapshot = {
   containers: string[];
@@ -20,8 +31,15 @@ type Snapshot = {
 
 type Fixture = {
   child: ChildProcess;
-  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  exit: Promise<ProcessExit>;
   ready: Promise<EphemeralPostgresResources>;
+  stderr: () => string;
+};
+
+type RunnerFixture = {
+  child: ChildProcess;
+  exit: Promise<ProcessExit>;
+  ready: Promise<void>;
   stderr: () => string;
 };
 
@@ -46,13 +64,15 @@ async function snapshot(): Promise<Snapshot> {
   };
 }
 
-function launchFixture(mode: "success" | "failure" | "hold"): Fixture {
+function launchFixture(mode: FixtureMode): Fixture {
+  if (runnerCleanupPromise) {
+    throw new Error("Cannot launch a lifecycle fixture after runner cleanup has begun");
+  }
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode], {
     cwd: resolve(scriptDir, ".."),
     env: { ...process.env, SUPAMAIL_EPHEMERAL_TEST_GROUP: testGroup },
     stdio: ["ignore", "pipe", "pipe"]
   });
-  activeChildren.add(child);
 
   let stdoutBuffer = "";
   let stderrBuffer = "";
@@ -84,7 +104,7 @@ function launchFixture(mode: "success" | "failure" | "hold"): Fixture {
     stderrBuffer += chunk;
   });
 
-  const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise) => {
+  const exit = new Promise<ProcessExit>((resolvePromise) => {
     child.once("exit", (code, signal) => {
       activeChildren.delete(child);
       if (!readySettled) {
@@ -95,13 +115,68 @@ function launchFixture(mode: "success" | "failure" | "hold"): Fixture {
       resolvePromise({ code, signal });
     });
   });
+  activeChildren.set(child, exit);
+
+  return { child, exit, ready, stderr: () => stderrBuffer };
+}
+
+function launchRunnerFixture(): RunnerFixture {
+  if (runnerCleanupPromise) {
+    throw new Error("Cannot launch a nested lifecycle runner after cleanup has begun");
+  }
+  const child = spawn(process.execPath, ["--import", "tsx", fileURLToPath(import.meta.url), "hold-runner"], {
+    cwd: resolve(scriptDir, ".."),
+    env: { ...process.env, SUPAMAIL_EPHEMERAL_TEST_GROUP: testGroup },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
+  let resolveReady: () => void;
+  let rejectReady: (error: Error) => void;
+  let readySettled = false;
+  const ready = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveReady = resolvePromise;
+    rejectReady = rejectPromise;
+  });
+  const readyTimer = setTimeout(() => {
+    if (readySettled) return;
+    readySettled = true;
+    rejectReady(new Error(`Lifecycle runner did not become ready. stderr:\n${stderrBuffer}`));
+  }, 45_000);
+
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdoutBuffer += chunk;
+    if (!stdoutBuffer.includes("SUPAMAIL_RUNNER_READY") || readySettled) return;
+    readySettled = true;
+    clearTimeout(readyTimer);
+    resolveReady();
+  });
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    stderrBuffer += chunk;
+  });
+
+  const exit = new Promise<ProcessExit>((resolvePromise) => {
+    child.once("exit", (code, signal) => {
+      activeChildren.delete(child);
+      if (!readySettled) {
+        readySettled = true;
+        clearTimeout(readyTimer);
+        rejectReady(new Error(`Lifecycle runner exited before ready. stderr:\n${stderrBuffer}`));
+      }
+      resolvePromise({ code, signal });
+    });
+  });
+  activeChildren.set(child, exit);
 
   return { child, exit, ready, stderr: () => stderrBuffer };
 }
 
 async function assertScenario(
   name: string,
-  mode: "success" | "failure" | "hold",
+  mode: Exclude<FixtureMode, "port-failure">,
   expectedCode: number,
   signal?: NodeJS.Signals
 ): Promise<void> {
@@ -117,6 +192,45 @@ async function assertScenario(
   );
   assert.deepEqual(await snapshot(), before, `${name} leaked a labeled container or volume`);
   console.log(`[docker-lifecycle] ${name}: passed`);
+}
+
+async function assertPortDiscoveryFailure(): Promise<void> {
+  const before = await snapshot();
+  const fixture = launchFixture("port-failure");
+  const readyFailure = assert.rejects(fixture.ready, /exited before ready/);
+  const result = await fixture.exit;
+  await readyFailure;
+  assert.equal(result.code, 1, fixture.stderr());
+  assert.deepEqual(await snapshot(), before, "port discovery failure leaked labeled resources");
+  console.log("[docker-lifecycle] port discovery failure: passed");
+}
+
+async function assertNoStartAfterCleanup(): Promise<void> {
+  const before = await snapshot();
+  const database = new EphemeralPostgres({
+    image: process.env.LIVE_DB_POSTGRES_IMAGE ?? "postgres:16-alpine",
+    namePrefix: "supamail-lifecycle",
+    purpose: "docker-lifecycle-regression",
+    testGroup
+  });
+  await database.cleanup("shutdown before startup");
+  await assert.rejects(
+    database.start(),
+    /Cannot start disposable Postgres after cleanup has begun/
+  );
+  assert.deepEqual(await snapshot(), before, "startup after cleanup created labeled resources");
+  console.log("[docker-lifecycle] startup blocked after cleanup: passed");
+}
+
+async function assertRunnerSignal(signal: "SIGINT" | "SIGTERM", expectedCode: number): Promise<void> {
+  const before = await snapshot();
+  const runner = launchRunnerFixture();
+  await runner.ready;
+  runner.child.kill(signal);
+  const result = await runner.exit;
+  assert.equal(result.code, expectedCode, runner.stderr());
+  assert.deepEqual(await snapshot(), before, `lifecycle runner ${signal} leaked labeled resources`);
+  console.log(`[docker-lifecycle] runner ${signal}: passed`);
 }
 
 async function assertParallelIsolation(): Promise<void> {
@@ -155,24 +269,60 @@ async function cleanupTestGroup(): Promise<void> {
   for (const volume of resources.volumes) await docker(["volume", "rm", volume], true);
 }
 
+let runnerCleanupPromise: Promise<void> | null = null;
+function cleanupRunner(): Promise<void> {
+  if (runnerCleanupPromise) return runnerCleanupPromise;
+  runnerCleanupPromise = (async () => {
+    const children = [...activeChildren.entries()];
+    for (const [child] of children) child.kill("SIGTERM");
+    await Promise.allSettled(children.map(([, exit]) => exit));
+    await cleanupTestGroup();
+  })();
+  return runnerCleanupPromise;
+}
+
+function installRunnerSignalHandlers(): void {
+  const exitCodes = { SIGINT: 130, SIGTERM: 143 } as const;
+  let shuttingDown = false;
+  for (const signal of Object.keys(exitCodes) as Array<keyof typeof exitCodes>) {
+    process.once(signal, () => {
+      if (shuttingDown) process.exit(exitCodes[signal]);
+      shuttingDown = true;
+      void cleanupRunner()
+        .catch((error) => {
+          console.error(error instanceof Error ? error.message : error);
+        })
+        .finally(() => process.exit(exitCodes[signal]));
+    });
+  }
+}
+
 async function main(): Promise<void> {
-  await docker(["version", "--format", "{{.Server.Version}}"]);
+  installRunnerSignalHandlers();
   try {
+    await docker(["version", "--format", "{{.Server.Version}}"]);
+    if (runnerMode === "hold-runner") {
+      const fixture = launchFixture("hold");
+      await fixture.ready;
+      console.log("SUPAMAIL_RUNNER_READY");
+      await new Promise(() => {
+        setInterval(() => undefined, 60_000);
+      });
+      return;
+    }
+    if (runnerMode) throw new Error(`Unknown lifecycle runner mode: ${runnerMode}`);
+
     await assertScenario("success", "success", 0);
     await assertScenario("failure", "failure", 1);
+    await assertPortDiscoveryFailure();
+    await assertNoStartAfterCleanup();
     await assertScenario("SIGINT", "hold", 130, "SIGINT");
     await assertScenario("SIGTERM", "hold", 143, "SIGTERM");
     await assertParallelIsolation();
+    await assertRunnerSignal("SIGINT", 130);
+    await assertRunnerSignal("SIGTERM", 143);
   } finally {
-    for (const child of activeChildren) child.kill("SIGTERM");
-    await Promise.allSettled([...activeChildren].map((child) => new Promise<void>((resolvePromise) => {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        resolvePromise();
-        return;
-      }
-      child.once("exit", () => resolvePromise());
-    })));
-    await cleanupTestGroup();
+    await cleanupRunner();
   }
 }
 

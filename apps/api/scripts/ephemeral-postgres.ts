@@ -74,6 +74,9 @@ export class EphemeralPostgres {
   }
 
   async start(): Promise<string> {
+    if (this.cleanupPromise) {
+      throw new Error("Cannot start disposable Postgres after cleanup has begun");
+    }
     try {
       this.provisioningPromise = this.provision();
       await this.provisioningPromise;
@@ -82,7 +85,7 @@ export class EphemeralPostgres {
         const output = await docker([
           "exec", this.resources.containerName, "pg_isready", "-U", "postgres", "-d", "postgres"
         ], true);
-        if (output.includes("accepting connections")) return this.databaseUrl();
+        if (output.includes("accepting connections")) return await this.databaseUrl();
         await delay(500);
       }
 

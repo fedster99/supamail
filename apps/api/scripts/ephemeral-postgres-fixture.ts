@@ -7,11 +7,18 @@ const mode = process.argv[2];
 const testGroup = process.env.SUPAMAIL_EPHEMERAL_TEST_GROUP;
 
 if (!testGroup) throw new Error("SUPAMAIL_EPHEMERAL_TEST_GROUP is required");
-if (!mode || !["success", "failure", "hold"].includes(mode)) {
-  throw new Error("Fixture mode must be success, failure, or hold");
+if (!mode || !["success", "failure", "port-failure", "hold"].includes(mode)) {
+  throw new Error("Fixture mode must be success, failure, port-failure, or hold");
 }
 
-const database = new EphemeralPostgres({
+class PortFailurePostgres extends EphemeralPostgres {
+  override async databaseUrl(): Promise<string> {
+    throw new Error("intentional port discovery failure");
+  }
+}
+
+const DatabaseClass = mode === "port-failure" ? PortFailurePostgres : EphemeralPostgres;
+const database = new DatabaseClass({
   image: process.env.LIVE_DB_POSTGRES_IMAGE ?? "postgres:16-alpine",
   namePrefix: "supamail-lifecycle",
   purpose: "docker-lifecycle-regression",

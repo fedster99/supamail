@@ -61,11 +61,11 @@ async function printContainerLogs(reason: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  await assertDockerAvailable();
   installEphemeralPostgresSignalHandlers(database, {
     logPrefix: "[test:db:live]",
     onSignal: (signal) => currentChild?.kill(signal)
   });
-  await assertDockerAvailable();
 
   try {
     console.log(
