@@ -847,6 +847,13 @@ interface MetadataProtectionScope {
   startedAtMs: number | null;
 }
 
+export class ThreadingMetadataProtectionTimeoutError extends Error {
+  constructor() {
+    super("metadata protection operation timed out");
+    this.name = "ThreadingMetadataProtectionTimeoutError";
+  }
+}
+
 class AdapterPermitPool {
   private active = 0;
   private readonly waiters: Array<{
@@ -920,8 +927,13 @@ export function isThreadingStatementTimeout(error: unknown): boolean {
   return record.code === "57014" && /statement timeout/i.test(String(record.message ?? ""));
 }
 
+export function isThreadingMetadataProtectionTimeout(error: unknown): boolean {
+  return error instanceof ThreadingMetadataProtectionTimeoutError;
+}
+
 function threadingFailureCode(error: unknown): string {
   if (isThreadingStatementTimeout(error)) return "statement_timeout";
+  if (isThreadingMetadataProtectionTimeout(error)) return "metadata_protection_timeout";
   if (error instanceof ThreadingClosureLimitError) return "closure_limit";
   if (error instanceof ThreadingEvidenceLimitError) return `evidence_${error.kind}_limit`;
   return "threading_error";
@@ -1084,14 +1096,14 @@ export class ThreadingRepository {
 
   private startMetadataProtectionOperation(scope: MetadataProtectionScope): AbortSignal {
     if (scope.remainingMs <= 0) {
-      throw new Error("metadata protection operation timed out");
+      throw new ThreadingMetadataProtectionTimeoutError();
     }
     if (scope.activeOperations === 0) {
       scope.controller = new AbortController();
       scope.startedAtMs = Date.now();
       scope.timer = setTimeout(() => {
         scope.remainingMs = 0;
-        scope.controller?.abort(new Error("metadata protection operation timed out"));
+        scope.controller?.abort(new ThreadingMetadataProtectionTimeoutError());
       }, scope.remainingMs);
       scope.timer.unref?.();
     }
@@ -4439,8 +4451,10 @@ export class ThreadingRepository {
       : undefined;
     const adaptiveStatementTimeout = isThreadingStatementTimeout(error) &&
       failedStage !== undefined && ADAPTIVE_STATEMENT_TIMEOUT_STAGES.has(failedStage);
+    const adaptiveMetadataProtectionTimeout = isThreadingMetadataProtectionTimeout(error) &&
+      failedStage !== undefined && ADAPTIVE_STATEMENT_TIMEOUT_STAGES.has(failedStage);
     const adaptiveFailure = canSubdivide && (
-      adaptiveStatementTimeout ||
+      adaptiveStatementTimeout || adaptiveMetadataProtectionTimeout ||
       error instanceof ThreadingClosureLimitError || error instanceof ThreadingEvidenceLimitError
     );
     const adaptiveBatchSize = adaptiveFailure && messageIds.length > 1

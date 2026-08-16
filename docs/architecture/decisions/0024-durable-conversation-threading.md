@@ -130,10 +130,12 @@ old weak edges in bounded components. Work is serialized per account, retries
 are persisted before releasing the account lock, and processing is idempotent
 per run.
 
-An aggregate closure/evidence-limit failure or PostgreSQL statement timeout in
-page-scaled closure/persistence work reduces the run's durable page size before
-retry. Dirty-queue rows remain intact with their original ordering and a
-queue-local delay; the run itself stays eligible so later ready rows can advance.
+An aggregate closure/evidence-limit failure, PostgreSQL statement timeout, or
+repository-owned aggregate metadata-protection deadline in page-scaled
+closure/persistence work reduces the run's durable page size before retry.
+Arbitrary adapter failures remain non-adaptive. Dirty-queue rows remain intact
+with their original ordering and a queue-local delay; the run itself stays
+eligible so later ready rows can advance.
 Repeated subdivision reaches one seed, whose own retry is then delayed without
 blocking later rows and becomes operator-alertable after ten attempts. A
 one-seed failure during the keyset build scan uses run-level backoff because
@@ -248,7 +250,8 @@ unrelated mail.
   metadata merge, forward boundaries with replies, overlapping delivery
   fingerprints across a one-message page boundary, retained v1/v2 executor routing, persisted weighted
   active/candidate/standby fairness and missing-executor startup/direct-path guards,
-  statement-timeout subdivision, irreducible-item isolation and alerting,
+  statement-timeout and metadata-protection-deadline subdivision,
+  irreducible-item isolation and alerting,
   persisted comparison drift, an in-flight legacy-writer activation barrier,
   activation and incremental rollback, purge invalidation, run retention,
   active-view isolation, read dedupe, and mutation fan-out.
