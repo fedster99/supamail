@@ -3645,6 +3645,7 @@ liveDb("ThreadingRepository live DB", () => {
 
     const failedStage = timings.find((timing) => timing.outcome === "failed");
     expect([
+      "closure_expansion_query",
       "assignment_state_load",
       "assignment_upsert",
       "assignment_history_write"
