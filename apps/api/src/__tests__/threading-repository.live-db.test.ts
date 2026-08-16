@@ -4154,6 +4154,58 @@ liveDb("ThreadingRepository live DB", () => {
     expect(await projection(first.runId as string)).toHaveLength(2);
   });
 
+  it("skips a backed-off active run so eligible standby work advances", async () => {
+    const accountId = await createAccount("backed-off-active-fairness");
+    await seedMessage(accountId, {
+      uid: 1,
+      subject: "Backoff fairness",
+      rfcMessageId: "<backoff-fairness-root@example.test>"
+    });
+    const standby = await drainUntilReady(accountId, { batchSize: 1 });
+    await activateReviewed(repository, accountId, standby.runId as string);
+    const active = await repository.rebuildAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    });
+    await activateReviewed(repository, accountId, active.runId as string);
+
+    const reply = await seedMessage(accountId, {
+      uid: 2,
+      subject: "Re: Backoff fairness",
+      rfcMessageId: "<backoff-fairness-reply@example.test>",
+      inReplyTo: "<backoff-fairness-root@example.test>",
+      referencesHeader: "<backoff-fairness-root@example.test>"
+    });
+    await enqueueMessage(accountId, reply);
+    await pool.query(
+      "UPDATE public.imap_thread_runs SET available_at = now() + interval '1 hour' WHERE id = $1",
+      [active.runId]
+    );
+    await pool.query(
+      "UPDATE public.imap_thread_state SET scheduler_cursor = 0 WHERE account_id = $1",
+      [accountId]
+    );
+
+    const drained = await repository.drainAccount(accountId, {
+      batchSize: 1,
+      requestedBy: "live-test"
+    });
+    expect(drained).toMatchObject({
+      runId: standby.runId,
+      busy: false,
+      queueItemsProcessed: 1
+    });
+    const remaining = await pool.query<{ run_id: string; count: string }>(
+      `SELECT run_id::text, count(*)::text AS count
+       FROM public.imap_thread_work_queue
+       WHERE run_id = ANY($1::uuid[])
+       GROUP BY run_id
+       ORDER BY run_id`,
+      [[standby.runId, active.runId]]
+    );
+    expect(remaining.rows).toEqual([{ run_id: active.runId, count: "1" }]);
+  });
+
   it("persists weighted fairness so active ingress cannot starve a shadow build", async () => {
     const accountId = await createAccount("persistent-run-fairness");
     await seedMessage(accountId, {

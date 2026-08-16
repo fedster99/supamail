@@ -140,7 +140,9 @@ Repeated subdivision reaches one seed, whose own retry is then delayed without
 blocking later rows and becomes operator-alertable after ten attempts. A
 one-seed failure during the keyset build scan uses run-level backoff because
 queue delay does not control that scan. Fixed-cost database work, other database
-errors, and executor failures also retain run-level exponential backoff.
+errors, and executor failures also retain run-level exponential backoff. A run
+under that backoff is excluded from the weighted active/candidate/standby choice
+so another eligible projection can use the account's threading pass.
 Optional stage timings expose only fixed stage names, outcome, elapsed time,
 counts, and iteration numbers; they never include account, message, or mailbox
 identifiers or email metadata.

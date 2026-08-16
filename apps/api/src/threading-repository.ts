@@ -1518,10 +1518,17 @@ export class ThreadingRepository {
             this.algorithms.has(building.algorithm_version)
             ? building
             : null;
+          const schedulingNow = new Date();
           const scheduled = selectFairRun(state.scheduler_cursor, {
-            active: activeHasReadyWork ? active : null,
-            standby: standbyHasReadyWork ? standby : null,
-            building: compatibleBuilding
+            active: activeHasReadyWork && active && active.available_at <= schedulingNow
+              ? active
+              : null,
+            standby: standbyHasReadyWork && standby && standby.available_at <= schedulingNow
+              ? standby
+              : null,
+            building: compatibleBuilding && compatibleBuilding.available_at <= schedulingNow
+              ? compatibleBuilding
+              : null
           });
           let run = scheduled?.run ?? null;
           if (scheduled) {
