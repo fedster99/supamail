@@ -1519,6 +1519,11 @@ export class ThreadingRepository {
             ? building
             : null;
           const schedulingNow = new Date();
+          const candidates = {
+            active: activeHasReadyWork ? active : null,
+            standby: standbyHasReadyWork ? standby : null,
+            building: compatibleBuilding
+          };
           const scheduled = selectFairRun(state.scheduler_cursor, {
             active: activeHasReadyWork && active && active.available_at <= schedulingNow
               ? active
@@ -1529,7 +1534,7 @@ export class ThreadingRepository {
             building: compatibleBuilding && compatibleBuilding.available_at <= schedulingNow
               ? compatibleBuilding
               : null
-          });
+          }) ?? selectFairRun(state.scheduler_cursor, candidates);
           let run = scheduled?.run ?? null;
           if (scheduled) {
             await client.query(
