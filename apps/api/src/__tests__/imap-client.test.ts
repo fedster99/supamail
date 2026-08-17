@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
@@ -834,5 +835,98 @@ describe("fetchChangedMessageFlags", () => {
     } as unknown as MirrorImapClient;
 
     await expect(fetchChangedMessageFlags(client, 10n)).rejects.toThrow(/omitted FLAGS/i);
+  });
+});
+
+describe("ThrottledImapClient QRESYNC replay", () => {
+  it("captures exact changed flags and VANISHED UIDs during mailbox selection", async () => {
+    const raw = Object.assign(new EventEmitter(), {
+      mailbox: {
+        path: "Archive",
+        uidValidity: 7n,
+        highestModseq: 12n,
+        qresync: true
+      },
+      close: vi.fn(),
+      getMailboxLock: vi.fn(async function(this: EventEmitter) {
+        this.emit("flags", {
+          path: "Archive",
+          seq: 2,
+          uid: 22,
+          modseq: 11n,
+          flags: new Set(["\\Seen", "\\Flagged"])
+        });
+        this.emit("expunge", { path: "Archive", uid: 9, vanished: true, earlier: true });
+        return { release: vi.fn() };
+      })
+    });
+    const client = new ThrottledImapClient(raw as never, 200, 5_000);
+
+    const lock = await client.getMailboxLock("Archive", {
+      qresync: { uidValidity: 7n, changedSince: 10n }
+    });
+
+    expect(raw.getMailboxLock).toHaveBeenCalledWith("Archive", {
+      uidValidity: 7n,
+      changedSince: 10n
+    });
+    expect(lock.qresync).toEqual({
+      accepted: true,
+      complete: true,
+      vanishedUids: [9],
+      changedFlags: [{ uid: 22, flags: ["\\Seen", "\\Flagged"] }]
+    });
+    expect(raw.listenerCount("flags")).toBe(0);
+    expect(raw.listenerCount("expunge")).toBe(0);
+  });
+
+  it("fails closed on a sequence-only EXPUNGE during replay", async () => {
+    const raw = Object.assign(new EventEmitter(), {
+      mailbox: {
+        path: "Archive",
+        uidValidity: 7n,
+        highestModseq: 12n,
+        qresync: true
+      },
+      close: vi.fn(),
+      getMailboxLock: vi.fn(async function(this: EventEmitter) {
+        this.emit("expunge", { path: "Archive", seq: 2, vanished: false });
+        return { release: vi.fn() };
+      })
+    });
+    const client = new ThrottledImapClient(raw as never, 200, 5_000);
+
+    const lock = await client.getMailboxLock("Archive", {
+      qresync: { uidValidity: 7n, changedSince: 10n }
+    });
+
+    expect(lock.qresync).toEqual({
+      accepted: true,
+      complete: false,
+      vanishedUids: [],
+      changedFlags: []
+    });
+  });
+
+  it("latches plain mailbox selection after the server declines QRESYNC", async () => {
+    const raw = Object.assign(new EventEmitter(), {
+      mailbox: {
+        path: "Archive",
+        uidValidity: 7n,
+        highestModseq: 12n,
+        qresync: false
+      },
+      close: vi.fn(),
+      getMailboxLock: vi.fn(async () => ({ release: vi.fn() }))
+    });
+    const client = new ThrottledImapClient(raw as never, 200, 5_000);
+    const request = { qresync: { uidValidity: 7n, changedSince: 10n } };
+
+    expect((await client.getMailboxLock("Archive", request)).qresync?.accepted).toBe(false);
+    expect((await client.getMailboxLock("Archive", request)).qresync).toBeUndefined();
+    expect(raw.getMailboxLock.mock.calls).toEqual([
+      ["Archive", { uidValidity: 7n, changedSince: 10n }],
+      ["Archive"]
+    ]);
   });
 });

@@ -278,10 +278,13 @@ async function main(): Promise<void> {
       INITIAL_SYNC_BATCH_SIZE: 10,
       INCREMENTAL_SYNC_BATCH_SIZE: 10,
       MAX_RR_FOLDERS_PER_CYCLE: 10,
+      MAX_FLAG_SCANS_PER_CYCLE: 10,
+      MAX_RECONCILES_PER_CYCLE: 10,
       CONNECT_TIMEOUT_MS: 10_000,
       IMAP_COMMAND_TIMEOUT_MS: 10_000,
       IMAP_FOLDER_STATUS_INTERVAL_MS: 3_000,
       IMAP_LIST_STATUS_ENABLED: true,
+      IMAP_QRESYNC_ENABLED: true,
       IMAP_ALLOW_PRIVATE_HOSTS: true
     };
     const repository = new MirrorRepository(pool, config);
@@ -299,6 +302,18 @@ async function main(): Promise<void> {
 
     const engine = new MirrorEngine({ pool, config, repository });
     const result = await engine.syncAccount(account.id, "manual");
+    await pool.query(
+      `UPDATE public.imap_folders
+       SET next_sync_due_at = now() - interval '1 second',
+           next_flag_scan_at = now() - interval '1 second',
+           next_reconcile_at = now() - interval '1 second'
+       WHERE account_id = $1 AND tracked = true`,
+      [account.id]
+    );
+    const cursorResult = await engine.syncAccount(account.id, "manual");
+    if (cursorResult.outcome !== "success") {
+      throw new Error("Dovecot smoke could not establish CONDSTORE cursors");
+    }
     const counts = await countRows(account.id);
     const idleAccount = await repository.getAccount(account.id);
     if (!idleAccount) throw new Error("Dovecot smoke Mailbox Account disappeared");
@@ -421,6 +436,24 @@ async function main(): Promise<void> {
       session.close();
     }
     const idleCounts = await countRows(account.id);
+    const qresyncEvent = await pool.query<{
+      payload: {
+        accepted?: boolean;
+        complete?: boolean;
+        fallbackRequired?: boolean;
+        vanishedUidCount?: number;
+      };
+    }>(
+      `SELECT payload
+       FROM public.imap_sync_events
+       WHERE account_id = $1
+         AND folder_path = 'Archive'
+         AND event_type = 'QRESYNC_REPLAY'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [account.id]
+    );
+    const archiveQresync = qresyncEvent.rows[0]?.payload;
     const assertions: Array<[string, boolean]> = [
       ["sync succeeded", result.outcome === "success"],
       ["discovered Dovecot folders", counts.folders >= 4],
@@ -433,7 +466,11 @@ async function main(): Promise<void> {
       ["same-session IDLE and STATUS sync stored both arrivals", idleCounts.messages === 6],
       ["Archive STATUS sync reconciled the removed row", idleCounts.deletedMessages === 1],
       ["Archive STATUS wake stayed within one configured interval", archiveWakeLatencyMs !== null && archiveWakeLatencyMs < 4_500],
-      ["Archive STATUS sync targeted one folder", archiveLiveResult?.foldersProcessed === 1]
+      ["Archive STATUS sync targeted one folder", archiveLiveResult?.foldersProcessed === 1],
+      ["Archive replay used complete QRESYNC", archiveQresync?.accepted === true
+        && archiveQresync.complete === true
+        && archiveQresync.fallbackRequired === false
+        && (archiveQresync.vanishedUidCount ?? 0) >= 1]
     ];
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
@@ -446,10 +483,12 @@ async function main(): Promise<void> {
       mailbox,
       imapPort,
       result,
+      cursorResult,
       counts,
       idleCounts,
       archiveWakeLatencyMs,
-      archiveLiveResult
+      archiveLiveResult,
+      archiveQresync
     }, null, 2));
   } finally {
     const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";
