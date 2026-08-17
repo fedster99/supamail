@@ -33,6 +33,22 @@ import type {
 
 const MAX_QRESYNC_VANISHED_UIDS = 10_000;
 
+export type ImapNotifyEventType =
+  | "EXISTS"
+  | "EXPUNGE"
+  | "FETCH_FLAGS"
+  | "STATUS"
+  | "NOTIFICATIONOVERFLOW";
+
+export interface ImapNotifySignal {
+  sequence: number;
+  receivedAt: Date;
+  monotonicReceivedAtMs: number;
+  eventType: ImapNotifyEventType;
+  connectionState: string;
+  activeCommand: string;
+}
+
 export interface MailboxStatus {
   path: string;
   uidValidity: bigint | number;
@@ -41,6 +57,7 @@ export interface MailboxStatus {
   messages?: number;
   unseen?: number;
   highestModseq?: bigint | number;
+  notifySignal?: ImapNotifySignal;
 }
 
 export interface MailboxChange {
