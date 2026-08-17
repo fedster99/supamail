@@ -12,6 +12,11 @@ overrides:
   sharp: 0.35.3
   vite: 6.4.3
 
+patchedDependencies:
+  imapflow@1.6.1:
+    hash: fe24948f99580f5e775298c1f0ed279dc258eb9b29883f50281e9357be72f90c
+    path: patches/imapflow@1.6.1.patch
+
 importers:
 
   .:
@@ -39,7 +44,7 @@ importers:
         version: 4.12.32
       imapflow:
         specifier: ^1.6.1
-        version: 1.6.1
+        version: 1.6.1(patch_hash=fe24948f99580f5e775298c1f0ed279dc258eb9b29883f50281e9357be72f90c)
       mailparser:
         specifier: ^3.9.14
         version: 3.9.14
@@ -2326,7 +2331,7 @@ snapshots:
     dependencies:
       safer-buffer: 2.1.2
 
-  imapflow@1.6.1:
+  imapflow@1.6.1(patch_hash=fe24948f99580f5e775298c1f0ed279dc258eb9b29883f50281e9357be72f90c):
     dependencies:
       '@zone-eu/mailsplit': 5.4.14
       encoding-japanese: 2.2.0

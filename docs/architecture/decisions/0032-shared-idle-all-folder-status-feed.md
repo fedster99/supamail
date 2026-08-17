@@ -23,6 +23,22 @@ Keep one read-only Inbox IDLE connection per Mailbox Account. Every 60 seconds,
 use that connection to STATUS a bounded, rotating batch of tracked non-Inbox
 folders. Inbox stays on IDLE so the same change is not queued twice.
 
+An independently deployable `IMAP_LIST_STATUS_ENABLED` layer may replace that
+batch with one LIST-STATUS command when the authenticated server advertises the
+extension. It is off by default. The command contains only the current tracked
+folder patterns. The response is filtered back to those exact paths, and every
+tracked folder must have a complete snapshot. The pinned ImapFlow dependency is
+patched to send this as one strict status-only command: no subscription lookup,
+auxiliary metadata, retry ladder, folder-cache update, or implicit per-mailbox
+STATUS fallback can bypass SupaMail's command throttle. A rejected, failed,
+empty, malformed, or partial response disables LIST-STATUS for that session and
+immediately returns to the bounded STATUS path. The dirty-signal and exact
+reconciliation semantics below do not change.
+
+Mailbox names containing LIST wildcards (`*` or `%`) cannot be represented as
+exact LIST patterns. Such a session stays on bounded STATUS rather than issuing
+a broader provider query.
+
 The session snapshots `UIDVALIDITY`, `UIDNEXT`, `MESSAGES`, `UNSEEN`, and
 `HIGHESTMODSEQ` when available. A changed fingerprint is only a dirty signal.
 It carries the folder path and exact observed snapshot into the existing sync
@@ -57,15 +73,18 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 - Servers without CONDSTORE detect read/unread changes through `UNSEEN`; other
   flag-only changes still rely on bounded flag scans and the periodic loop.
 - STATUS is not deletion truth. Exact UID reconciliation remains mandatory.
-- No persistent connection is added per folder, and NOTIFY/QRESYNC remain
-  deferred optimizations.
+- No persistent connection is added per folder. QRESYNC and NOTIFY remain
+  independent, separately flagged layers.
+- LIST-STATUS reduces polling commands. It does not make its counts
+  authoritative and does not replace the bounded STATUS fallback.
 - The public session API remains compatible with hosts already passing its
   shared client to the live Inbox lane.
 
 ## Verification Plan
 
 - Unit tests cover non-Inbox STATUS wake creation, pending snapshot retention,
-  bounded change-feed behavior, and CONDSTORE `CHANGEDSINCE` requests.
+  bounded change-feed behavior, LIST-STATUS command reduction and fallback,
+  and CONDSTORE `CHANGEDSINCE` requests.
 - Live-DB integration proves that an Archive replacement targets only Archive,
   inserts the new UID, tombstones the removed UID, and acknowledges afterward.
 - Dovecot 2.4.1 smoke proves structural plus flag convergence through the

@@ -7,6 +7,7 @@ class FakeIdleClient extends EventEmitter {
   capabilities = new Map<string, boolean | number>([["IDLE", true]]);
   enabled = new Set<string>();
   usable = true;
+  skipListStatusArgs = false;
   mailboxOpen = vi.fn(async () => ({}));
   logout = vi.fn(async () => undefined);
   close = vi.fn(() => this.emit("close"));
@@ -20,6 +21,10 @@ class FakeIdleClient extends EventEmitter {
     unseen: number;
     highestModseq?: bigint;
   }>();
+  list = vi.fn(async () => [...this.statuses.values()].map((status) => ({
+    path: status.path,
+    status
+  })));
   status = vi.fn(async (path: string) => this.statuses.get(path)!);
 
   async idle(): Promise<boolean> {
@@ -287,6 +292,312 @@ describe("waitForInboxIdleWake", () => {
     opened.session.syncClient.acknowledgeMailboxChanges?.(changes);
     expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
     opened.session.close();
+  });
+
+  it("uses one LIST-STATUS command for all tracked folders when enabled", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 5,
+      messages: 4,
+      unseen: 0,
+      highestModseq: 8n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive", "Projects"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("list_status");
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.status).not.toHaveBeenCalled();
+
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 6,
+      messages: 5,
+      unseen: 1,
+      highestModseq: 9n
+    });
+
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "Projects" }
+    });
+    expect(client.list).toHaveBeenCalledTimes(2);
+    expect(client.status).not.toHaveBeenCalled();
+    opened.session.close();
+  });
+
+  it("does not enumerate provider folders when no non-Inbox folder is tracked", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => []
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(client.list).not.toHaveBeenCalled();
+    expect(client.status).not.toHaveBeenCalled();
+    opened.session.close();
+  });
+
+  it("uses LIST-STATUS when IMAP4rev2 is the base protocol", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.delete("IDLE");
+    client.capabilities.set("IMAP4rev2", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("list_status");
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.status).not.toHaveBeenCalled();
+    opened.session.close();
+  });
+
+  it("rejects incomplete LIST-STATUS fields and latches bounded STATUS", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.list.mockResolvedValueOnce([{
+      path: "Archive",
+      status: { path: "Archive", uidValidity: 2n }
+    }] as never);
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("status");
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.status).toHaveBeenCalledTimes(1);
+    opened.session.close();
+  });
+
+  it("falls back to bounded STATUS when LIST-STATUS omits a tracked snapshot", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 5,
+      messages: 4,
+      unseen: 0,
+      highestModseq: 8n
+    });
+    client.list.mockResolvedValueOnce([{
+      path: "Archive",
+      status: client.statuses.get("Archive")!
+    }]);
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive", "Projects"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("status");
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.status).toHaveBeenCalledTimes(1);
+
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 6,
+      messages: 5,
+      unseen: 1,
+      highestModseq: 9n
+    });
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "Projects" }
+    });
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.status).toHaveBeenCalledTimes(3);
+    opened.session.close();
+  });
+
+  it("uses bounded STATUS when a legal mailbox name contains a LIST wildcard", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Project *", {
+      path: "Project *",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Project *"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("status");
+    expect(client.list).not.toHaveBeenCalled();
+    expect(client.status).toHaveBeenCalledWith("Project *", expect.any(Object));
+    opened.session.close();
+  });
+
+  it("latches bounded STATUS after ImapFlow falls back from rejected LIST-STATUS", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.list.mockImplementationOnce(async () => {
+      client.skipListStatusArgs = true;
+      return [...client.statuses.values()].map((status) => ({ path: status.path, status }));
+    });
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("status");
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.status).toHaveBeenCalledTimes(1);
+
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 12,
+      messages: 11,
+      unseen: 2,
+      highestModseq: 21n
+    });
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "Archive" }
+    });
+    expect(client.list).toHaveBeenCalledTimes(1);
+    opened.session.close();
+  });
+
+  it("latches bounded STATUS after a transient LIST-STATUS failure", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.list.mockRejectedValueOnce(new Error("LIST-STATUS rejected"));
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("status");
+    expect(client.list).toHaveBeenCalledTimes(1);
+
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 12,
+      messages: 11,
+      unseen: 2,
+      highestModseq: 21n
+    });
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "Archive" }
+    });
+    expect(client.list).toHaveBeenCalledTimes(1);
+    opened.session.close();
+  });
+
+  it("rejects initialization when LIST-STATUS leaves the connection unusable", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.list.mockImplementationOnce(async () => {
+      client.usable = false;
+      throw new Error("connection closed during LIST-STATUS");
+    });
+
+    await expect(openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    })).rejects.toThrow("connection closed during LIST-STATUS");
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(client.status).not.toHaveBeenCalled();
   });
 
   it("turns a transient STATUS failure into conservative reconcile and flag work", async () => {

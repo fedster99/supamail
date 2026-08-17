@@ -32,6 +32,9 @@
       "postcss": "8.5.24",
       "sharp": "0.35.3",
       "vite": "6.4.3"
+    },
+    "patchedDependencies": {
+      "imapflow@1.6.1": "patches/imapflow@1.6.1.patch"
     }
   },
   "engines": {

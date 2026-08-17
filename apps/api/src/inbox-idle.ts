@@ -38,7 +38,19 @@ interface InboxIdleClient extends Pick<EventEmitter, "on" | "removeListener"> {
   capabilities: ReadonlyMap<string, boolean | number>;
   enabled?: ReadonlySet<string>;
   usable?: boolean;
+  skipListStatusArgs?: boolean;
   mailboxOpen(path: string, options?: { readOnly?: boolean }): Promise<unknown>;
+  list?(options?: {
+    statusQuery?: Record<string, boolean>;
+    statusFallback?: boolean;
+    mailboxPatterns?: string[];
+    statusOnly?: boolean;
+    returnOptionFallback?: boolean;
+    cache?: boolean;
+  }): Promise<Array<{
+    path: string;
+    status?: MailboxStatus | { error: unknown };
+  }>>;
   status?(path: string, query: Record<string, boolean>): Promise<MailboxStatus>;
   idle(): Promise<boolean | void>;
   logout(): Promise<void>;
@@ -49,6 +61,7 @@ export interface InboxIdleSession {
   readonly accountId: string;
   readonly connectedAt: Date;
   readonly syncClient: MirrorImapClient;
+  readonly folderProbeStrategy?: "list_status" | "status";
   wait(options?: { signal?: AbortSignal; now?: () => Date }): Promise<InboxIdleWaitResult>;
   close(): void;
 }
@@ -166,9 +179,31 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
 
 function supportsIdle(client: InboxIdleClient): boolean {
   if (client.capabilities.has("IDLE")) return true;
-  if (client.enabled?.has("IMAP4REV2")) return true;
-  return client.capabilities.has("IMAP4rev2")
-    && !client.capabilities.has("IMAP4rev1");
+  return isRev2Active(client);
+}
+
+function isRev2Active(client: InboxIdleClient): boolean {
+  return client.enabled?.has("IMAP4REV2") === true
+    || (client.capabilities.has("IMAP4rev2") && !client.capabilities.has("IMAP4rev1"));
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return isNonNegativeInteger(value) && value > 0;
+}
+
+function isPositiveIntegerLike(value: unknown): value is bigint | number {
+  return typeof value === "bigint" ? value > 0n : isPositiveInteger(value);
+}
+
+function isCompleteStatus(status: MailboxStatus): boolean {
+  return isPositiveIntegerLike(status.uidValidity)
+    && isPositiveInteger(status.uidNext)
+    && isNonNegativeInteger(status.messages)
+    && isNonNegativeInteger(status.unseen);
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -187,6 +222,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   private idleCycle = 0;
   private probeCursor = 0;
   private acceptingEvents = false;
+  private listStatusEnabled: boolean;
   private deferredInboxWake = false;
   private queuedWake: InboxIdleWake | null = null;
   private wakeDeliveryScheduled = false;
@@ -205,6 +241,9 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     now: () => Date = () => new Date()
   ) {
     this.now = now;
+    this.listStatusEnabled = config.IMAP_LIST_STATUS_ENABLED
+      && (client.capabilities.has("LIST-STATUS") || isRev2Active(client))
+      && typeof client.list === "function";
     this.syncClient = new ThrottledImapClient(
       client as unknown as ImapFlow,
       config.IMAP_MAX_COMMANDS_PER_MINUTE,
@@ -219,6 +258,10 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   }
 
   private folderPaths: string[] = [];
+
+  get folderProbeStrategy(): "list_status" | "status" {
+    return this.listStatusEnabled ? "list_status" : "status";
+  }
 
   private async refreshFolderPaths(): Promise<void> {
     const paths = [...new Set(await this.folderPathsFactory())]
@@ -235,7 +278,23 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   async initialize(): Promise<void> {
     await this.refreshFolderPaths();
     const baseline: MailboxStatus[] = [];
+    if (this.listStatusEnabled && this.folderPaths.length > 0) {
+      try {
+        baseline.push(...await this.listStatusSnapshots());
+        if (new Set(baseline.map((status) => status.path)).size !== this.folderPaths.length) {
+          this.listStatusEnabled = false;
+        }
+      } catch (error) {
+        if (this.client.usable === false) {
+          this.close();
+          throw error;
+        }
+        this.listStatusEnabled = false;
+      }
+    }
+    const seen = new Set(baseline.map((status) => status.path));
     for (const path of this.folderPaths) {
+      if (seen.has(path)) continue;
       try {
         baseline.push(await this.syncClient.status!(path, STATUS_QUERY));
       } catch (error) {
@@ -249,10 +308,47 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.changeFeed.seed(baseline);
   }
 
+  private async listStatusSnapshots(): Promise<MailboxStatus[]> {
+    // LIST mailbox patterns have no escape for their `*` and `%` wildcards.
+    // An exact probe is therefore impossible for these otherwise legal names.
+    // Keep the whole session on bounded STATUS instead of broadening the query.
+    if (this.folderPaths.some((path) => /[*%]/.test(path))) {
+      throw new Error("Tracked mailbox name cannot be represented as an exact LIST pattern");
+    }
+    const tracked = new Set(this.folderPaths);
+    const statuses = await this.syncClient.listWithStatus!(STATUS_QUERY, this.folderPaths);
+    if (this.client.skipListStatusArgs === true) {
+      throw new Error("IMAP server rejected LIST-STATUS");
+    }
+    const trackedStatuses = statuses.filter((status) => tracked.has(status.path));
+    if (trackedStatuses.some((status) => !isCompleteStatus(status))) {
+      throw new Error("IMAP server returned incomplete LIST-STATUS data");
+    }
+    return trackedStatuses;
+  }
+
   private async probeMailboxChanges(): Promise<MailboxChange | null> {
     await this.refreshFolderPaths();
     const pending = this.changeFeed.peek(1)[0];
     if (this.folderPaths.length === 0) return pending ?? null;
+    if (this.listStatusEnabled) {
+      try {
+        const statuses = await this.listStatusSnapshots();
+        if (new Set(statuses.map((status) => status.path)).size !== this.folderPaths.length) {
+          this.listStatusEnabled = false;
+        } else {
+          let firstChange: MailboxChange | null = null;
+          for (const status of statuses) {
+            const change = this.changeFeed.observe(status);
+            if (!firstChange && change) firstChange = change;
+          }
+          return firstChange ?? pending ?? null;
+        }
+      } catch (error) {
+        if (this.client.usable === false) throw error;
+        this.listStatusEnabled = false;
+      }
+    }
     const count = Math.min(this.probeBatchSize, this.folderPaths.length);
     const paths = Array.from(
       { length: count },

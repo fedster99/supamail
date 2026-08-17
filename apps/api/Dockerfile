@@ -6,6 +6,7 @@ WORKDIR /app
 
 FROM base AS deps
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches/ patches/
 COPY apps/api/package.json apps/api/package.json
 RUN pnpm install --filter @supamail/api... --frozen-lockfile=false
 
@@ -20,6 +21,7 @@ ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches/ patches/
 COPY apps/api/package.json apps/api/package.json
 RUN pnpm install --filter @supamail/api --prod --frozen-lockfile=false
 COPY --from=build /app/apps/api/dist ./apps/api/dist
