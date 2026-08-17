@@ -59,6 +59,14 @@ The real-server smoke suite currently covers:
 - Dovecot slash delimiters, UID search, raw body fetch, and attachment metadata
 - Dovecot Archive folders staying trackable while Trash stays provider-excluded
 
+LIST-STATUS is an optional command-reduction layer, not part of the minimum
+compatibility contract. Enable `IMAP_LIST_STATUS_ENABLED=true` only for a
+canary after capability evidence confirms support. A missing or incomplete
+response falls back to the bounded STATUS detector. The pinned ImapFlow patch
+sends only the tracked folder patterns and prevents its subscription, retry,
+and per-mailbox STATUS paths from bypassing the command throttle. Exact UID
+reconciliation remains the correctness path.
+
 ## Manual Smoke Checklist
 
 Use this checklist before moving a provider from "manual smoke pending" to "validated":

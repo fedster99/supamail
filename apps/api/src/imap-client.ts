@@ -62,6 +62,7 @@ export interface MailboxListItem {
   delimiter?: string;
   specialUse?: string;
   flags?: Set<string>;
+  status?: MailboxStatus | { error: unknown };
 }
 
 export interface FetchMessage {
@@ -96,6 +97,10 @@ export interface MirrorImapClient {
   close?(): void;
   logout(): Promise<void>;
   list(): Promise<MailboxListItem[]>;
+  listWithStatus?(
+    query: Record<string, boolean>,
+    mailboxPatterns: readonly string[]
+  ): Promise<MailboxStatus[]>;
   status?(
     path: string,
     query: Record<string, boolean>
@@ -156,6 +161,28 @@ export class ThrottledImapClient implements MirrorImapClient {
   async list(): Promise<MailboxListItem[]> {
     await this.throttle.acquire(this.signal);
     return await this.withCommandTimeout("list", async () => (await this.client.list()) as MailboxListItem[]);
+  }
+
+  async listWithStatus(
+    query: Record<string, boolean>,
+    mailboxPatterns: readonly string[]
+  ): Promise<MailboxStatus[]> {
+    await this.throttle.acquire(this.signal);
+    const folders = await this.withCommandTimeout(
+      "list status",
+      async () => await this.client.list({
+        statusQuery: query,
+        statusFallback: false,
+        mailboxPatterns: [...mailboxPatterns],
+        statusOnly: true,
+        returnOptionFallback: false,
+        cache: false
+      }) as MailboxListItem[]
+    );
+    return folders.flatMap((folder) => {
+      if (!folder.status || "error" in folder.status) return [];
+      return [{ ...folder.status, path: folder.path }];
+    });
   }
 
   async status(

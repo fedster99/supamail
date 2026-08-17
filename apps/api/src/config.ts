@@ -74,6 +74,10 @@ const envSchema = z.object({
   // mailbox does not look like a dead connection.
   IMAP_IDLE_MAX_TIME_MS: z.coerce.number().int().positive().default(25 * 60_000),
   IMAP_FOLDER_STATUS_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  IMAP_LIST_STATUS_ENABLED: z
+    .union([z.boolean(), z.enum(["true", "false"])])
+    .default(false)
+    .transform((value) => value === true || value === "true"),
   IMAP_IDLE_SOCKET_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60_000),
   SMTP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(10 * 60_000),
   IMAP_MAX_COMMANDS_PER_MINUTE: z.coerce.number().int().positive().default(200),

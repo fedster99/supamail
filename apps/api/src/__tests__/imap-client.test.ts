@@ -381,6 +381,30 @@ describe("fetchFullMessageBody mailbox locking", () => {
 });
 
 describe("ThrottledImapClient fetch cancellation", () => {
+  it("disables ImapFlow's hidden per-mailbox STATUS fallback", async () => {
+    const list = vi.fn(async () => [{
+      path: "Archive",
+      status: {
+        path: "Archive",
+        uidValidity: 2n,
+        uidNext: 11,
+        messages: 10,
+        unseen: 1
+      }
+    }]);
+    const client = new ThrottledImapClient({ list } as never, 1_000, 1_000);
+
+    await expect(client.listWithStatus({ messages: true }, ["Archive"])).resolves.toHaveLength(1);
+    expect(list).toHaveBeenCalledWith({
+      statusQuery: { messages: true },
+      statusFallback: false,
+      mailboxPatterns: ["Archive"],
+      statusOnly: true,
+      returnOptionFallback: false,
+      cache: false
+    });
+  });
+
   it("forwards the mailbox-change limit to the durable feed", () => {
     const peek = vi.fn(() => []);
     const client = new ThrottledImapClient(

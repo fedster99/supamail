@@ -281,6 +281,7 @@ async function main(): Promise<void> {
       CONNECT_TIMEOUT_MS: 10_000,
       IMAP_COMMAND_TIMEOUT_MS: 10_000,
       IMAP_FOLDER_STATUS_INTERVAL_MS: 3_000,
+      IMAP_LIST_STATUS_ENABLED: true,
       IMAP_ALLOW_PRIVATE_HOSTS: true
     };
     const repository = new MirrorRepository(pool, config);
@@ -304,6 +305,9 @@ async function main(): Promise<void> {
     const opened = await openInboxIdleSession(pool, config, idleAccount);
     if (opened.status !== "ready") throw new Error("Dovecot did not advertise IDLE");
     const session = opened.session;
+    if (session.folderProbeStrategy !== "list_status") {
+      throw new Error("Dovecot smoke did not activate LIST-STATUS");
+    }
     let archiveWakeLatencyMs: number | null = null;
     let archiveLiveResult: Awaited<ReturnType<MirrorEngine["syncAccount"]>> | null = null;
     const waitForWake = async (message: string) => {

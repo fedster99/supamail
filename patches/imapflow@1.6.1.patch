@@ -1,0 +1,150 @@
+diff --git a/lib/commands/list.js b/lib/commands/list.js
+index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5d1983290 100644
+--- a/lib/commands/list.js
++++ b/lib/commands/list.js
+@@ -8,10 +8,13 @@ const { specialUse } = require('../special-use');
+  *
+  * @param {Object} connection - IMAP connection instance
+  * @param {string} reference - Reference name (namespace prefix)
+- * @param {string} mailbox - Mailbox name pattern with possible wildcards
++ * @param {string|string[]} mailbox - Mailbox name pattern or LIST-EXTENDED pattern list
+  * @param {Object} [options] - List options
+  * @param {boolean} [options.listOnly] - If true, return entries after LIST without LSUB or status queries
+  * @param {Object} [options.statusQuery] - Status data items to query for each listed mailbox
++ * @param {boolean} [options.statusFallback=true] - If false, do not issue per-mailbox STATUS commands when LIST-STATUS returns no data
++ * @param {boolean} [options.statusOnly=false] - If true, omit subscription and auxiliary LIST metadata work
++ * @param {boolean} [options.returnOptionFallback=true] - If false, do not retry rejected RETURN options
+  * @param {Object} [options.specialUseHints] - Hints mapping mailbox paths to special-use types (sent, junk, trash, drafts, archive)
+  * @returns {Promise<Object[]>} Array of mailbox entries sorted by special-use flags and name
+  * @throws {Error} If the LIST command fails
+@@ -37,7 +40,8 @@ module.exports = async (connection, reference, mailbox, options) => {
+     // Both provide special-use flags, but SPECIAL-USE is the standardized approach.
+     // SPECIAL-USE is checked with rev2 folding - a rev2 session implies SPECIAL-USE,
+     // so LIST is preferred even if a rev2 server also advertised legacy XLIST.
+-    let listCommand = connection.capabilities.has('XLIST') && !hasCapability(connection, 'SPECIAL-USE') ? 'XLIST' : 'LIST';
++    let listCommand =
++        !options.statusOnly && connection.capabilities.has('XLIST') && !hasCapability(connection, 'SPECIAL-USE') ? 'XLIST' : 'LIST';
+
+     try {
+         // Accumulators filled by the untagged LIST/STATUS handlers below. statusMap
+@@ -74,14 +78,16 @@ module.exports = async (connection, reference, mailbox, options) => {
+         // LSUB command. IMAP4rev2 removed LSUB entirely, and some servers (e.g.
+         // Exchange in IMAP4rev2 mode) reject it with BAD even while still advertising
+         // IMAP4rev1.
+-        let canRequestSubscribed = listCommand === 'LIST' && !options.listOnly && !connection.skipListSubscribedArg && supportsExtendedList;
++        let canRequestSubscribed =
++            !options.statusOnly && listCommand === 'LIST' && !options.listOnly && !connection.skipListSubscribedArg && supportsExtendedList;
+
+         // Auxiliary RETURN options (SPECIAL-USE/CHILDREN) that ride along with the
+         // STATUS/SUBSCRIBED option groups. When RETURN options are present, servers
+         // may report only what was explicitly requested (verified against Dovecot
+         // 2.4: special-use and child attributes disappear from such responses), so
+         // request everything a plain LIST would have provided.
+-        let auxArgsAvailable = hasCapability(connection, 'SPECIAL-USE') || connection.capabilities.has('CHILDREN') || supportsExtendedList;
++        let auxArgsAvailable =
++            !options.statusOnly && (hasCapability(connection, 'SPECIAL-USE') || connection.capabilities.has('CHILDREN') || supportsExtendedList);
+         let stageHasAuxArgs = stage => (stage.status || stage.subscribed) && stage.aux !== false && !connection.skipListAuxArgs && auxArgsAvailable;
+
+         // Builds the RETURN (...) argument list for one retry stage
+@@ -151,7 +157,10 @@ module.exports = async (connection, reference, mailbox, options) => {
+         // Called once for the main listing and optionally again for INBOX if a
+         // namespace prefix was used (INBOX may live outside the namespace).
+         let runList = async (reference, mailbox, returnArgs) => {
+-            const cmdArgs = [encodePath(connection, reference), encodePath(connection, mailbox)];
++            const encodedMailbox = Array.isArray(mailbox)
++                ? mailbox.map(pattern => encodePath(connection, pattern))
++                : encodePath(connection, mailbox);
++            const cmdArgs = [encodePath(connection, reference), encodedMailbox];
+
+             if (returnArgs.length) {
+                 cmdArgs.push({ type: 'ATOM', value: 'RETURN' }, returnArgs);
+@@ -281,7 +290,9 @@ module.exports = async (connection, reference, mailbox, options) => {
+         };
+
+         let normalizedReference = normalizePath(connection, reference || '');
+-        let normalizedMailbox = normalizePath(connection, mailbox || '', true);
++        let normalizedMailbox = Array.isArray(mailbox)
++            ? mailbox.map(pattern => normalizePath(connection, pattern || '', true))
++            : normalizePath(connection, mailbox || '', true);
+
+         // Retry stages for the main listing: start with all applicable RETURN options
+         // and drop one option group per retry. Consecutive stages differ by exactly one
+@@ -351,6 +362,9 @@ module.exports = async (connection, reference, mailbox, options) => {
+                 if (i === stages.length - 1 || !isRejectedCommand(err)) {
+                     throw err;
+                 }
++                if (options.returnOptionFallback === false) {
++                    throw err;
++                }
+                 lastRejectedStage = stage;
+                 if (!auxRetryInserted && stageHasAuxArgs(stage)) {
+                     // The rejection may be about the auxiliary options rather than the
+@@ -419,7 +433,7 @@ module.exports = async (connection, reference, mailbox, options) => {
+                         if (syntheticRecent) {
+                             entry.status.recent = 0;
+                         }
+-                    } else if (!statusMap.size) {
++                    } else if (!statusMap.size && options.statusFallback !== false) {
+                         // Server didn't support LIST-STATUS; fall back to per-mailbox STATUS
+                         try {
+                             entry.status = await connection.run('STATUS', entry.path, options.statusQuery);
+@@ -484,7 +498,8 @@ module.exports = async (connection, reference, mailbox, options) => {
+         // non-rev2 session, assume the server silently ignored RETURN (SUBSCRIBED) and
+         // fall back to LSUB anyway (a rev2 session has no LSUB to fall back to, and an
+         // account without any subscriptions legitimately looks the same).
+-        let needsLsub = !successStage.subscribed || (!isRev2Active(connection) && !entries.some(entry => entry.subscribed));
++        let needsLsub =
++            !options.statusOnly && (!successStage.subscribed || (!isRev2Active(connection) && !entries.some(entry => entry.subscribed)));
+         if (needsLsub && !connection.skipLsub) {
+             try {
+                 await runLsub();
+diff --git a/lib/imap-flow.d.ts b/lib/imap-flow.d.ts
+index 413ac6f273d7d244ee8e989db497feb5c804c985..66136537a137ed5e3281fa741e27dddb9d8ee744 100644
+--- a/lib/imap-flow.d.ts
++++ b/lib/imap-flow.d.ts
+@@ -238,6 +238,16 @@ export interface ListOptions {
+         /** If true request count of messages with \Deleted flag (requires IMAP4rev2) */
+         deleted?: boolean;
+     };
++    /** If false, do not issue per-mailbox STATUS commands when LIST-STATUS returns no data */
++    statusFallback?: boolean;
++    /** Request only these LIST-EXTENDED mailbox patterns instead of "*" */
++    mailboxPatterns?: string[];
++    /** Omit subscription and auxiliary LIST metadata work */
++    statusOnly?: boolean;
++    /** Retry without rejected RETURN options unless false */
++    returnOptionFallback?: boolean;
++    /** Update the connection folder cache unless false */
++    cache?: boolean;
+     /** Set specific paths as special use folders */
+     specialUseHints?: {
+         /** Path to "Sent Mail" folder */
+diff --git a/lib/imap-flow.js b/lib/imap-flow.js
+index a45fb40307bf6d03e61b463e3a29116df94a6a30..9c693453c45073f89a37a353d421ba63913b374d 100644
+--- a/lib/imap-flow.js
++++ b/lib/imap-flow.js
+@@ -2534,6 +2534,10 @@ class ImapFlow extends EventEmitter {
+      * @property {Boolean} [statusQuery.highestModseq] if `true` request last known modseq value
+      * @property {Boolean} [statusQuery.size] if `true` request total mailbox size in octets (requires STATUS=SIZE or IMAP4rev2)
+      * @property {Boolean} [statusQuery.deleted] if `true` request count of messages with \\Deleted flag (requires IMAP4rev2)
++     * @property {String[]} [mailboxPatterns] request only these LIST-EXTENDED mailbox patterns instead of "*"
++     * @property {Boolean} [statusOnly] omit subscription and auxiliary LIST metadata work
++     * @property {Boolean} [returnOptionFallback] retry without rejected RETURN options unless `false`
++     * @property {Boolean} [cache] update the connection folder cache unless `false`
+      * @property {Object} [specialUseHints] set specific paths as special use folders, this would override special use flags provided from the server
+      * @property {String} [specialUseHints.sent] Path to "Sent Mail" folder
+      * @property {String} [specialUseHints.trash] Path to "Trash" folder
+@@ -2554,8 +2558,11 @@ class ImapFlow extends EventEmitter {
+      */
+     async list(options) {
+         options = options || {};
+-        let folders = await this.run('LIST', '', '*', options);
+-        this.folders = new Map(folders.map(folder => [folder.path, folder]));
++        let mailbox = Array.isArray(options.mailboxPatterns) && options.mailboxPatterns.length ? options.mailboxPatterns : '*';
++        let folders = await this.run('LIST', '', mailbox, options);
++        if (options.cache !== false) {
++            this.folders = new Map(folders.map(folder => [folder.path, folder]));
++        }
+         return folders;
+     }
+ 
