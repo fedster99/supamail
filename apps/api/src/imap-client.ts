@@ -18,6 +18,7 @@ import {
   MAX_SYNC_FLAG_FETCH_BYTES,
   MAX_SYNC_FLAGS_PER_FETCH,
   MAX_SYNC_METADATA_FETCH_BYTES,
+  MAX_SYNC_BATCH_SIZE,
   flagSnapshotFootprint,
   metadataMessageFootprint
 } from "./sync-limits.js";
@@ -35,7 +36,21 @@ export interface MailboxStatus {
   uidValidity: bigint | number;
   uidNext?: number;
   exists?: number;
+  messages?: number;
+  unseen?: number;
   highestModseq?: bigint | number;
+}
+
+export interface MailboxChange {
+  path: string;
+  forceReconcile: boolean;
+  forceFlagScan: boolean;
+  observed: MailboxStatus;
+}
+
+export interface MailboxChangeFeed {
+  peek(limit?: number): readonly MailboxChange[];
+  acknowledge(changes: readonly MailboxChange[]): void;
 }
 
 export interface MailboxLock {
@@ -81,6 +96,12 @@ export interface MirrorImapClient {
   close?(): void;
   logout(): Promise<void>;
   list(): Promise<MailboxListItem[]>;
+  status?(
+    path: string,
+    query: Record<string, boolean>
+  ): Promise<MailboxStatus>;
+  peekMailboxChanges?(limit?: number): readonly MailboxChange[];
+  acknowledgeMailboxChanges?(changes: readonly MailboxChange[]): void;
   getMailboxLock(path: string): Promise<MailboxLock>;
   fetch(
     range: string | number[] | Record<string, unknown>,
@@ -102,7 +123,8 @@ export class ThrottledImapClient implements MirrorImapClient {
     private readonly client: ImapFlow,
     maxCommandsPerMinute: number,
     private readonly commandTimeoutMs: number,
-    private readonly signal?: AbortSignal
+    private readonly signal?: AbortSignal,
+    private readonly mailboxChangeFeed?: MailboxChangeFeed
   ) {
     this.throttle = new ImapThrottle(maxCommandsPerMinute);
   }
@@ -134,6 +156,27 @@ export class ThrottledImapClient implements MirrorImapClient {
   async list(): Promise<MailboxListItem[]> {
     await this.throttle.acquire(this.signal);
     return await this.withCommandTimeout("list", async () => (await this.client.list()) as MailboxListItem[]);
+  }
+
+  async status(
+    path: string,
+    query: Record<string, boolean>
+  ): Promise<MailboxStatus> {
+    await this.throttle.acquire(this.signal);
+    const status = await this.withCommandTimeout(
+      "status",
+      () => this.client.status(path, query as never)
+    );
+    if (!status) throw new Error("IMAP STATUS returned no mailbox state");
+    return status as MailboxStatus;
+  }
+
+  peekMailboxChanges(limit?: number): readonly MailboxChange[] {
+    return this.mailboxChangeFeed?.peek(limit) ?? [];
+  }
+
+  acknowledgeMailboxChanges(changes: readonly MailboxChange[]): void {
+    this.mailboxChangeFeed?.acknowledge(changes);
   }
 
   async getMailboxLock(path: string): Promise<MailboxLock> {
@@ -442,6 +485,13 @@ export async function fetchMessageMetadata(
   return messages;
 }
 
+export class FlagFetchBudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FlagFetchBudgetExceededError";
+  }
+}
+
 export async function fetchMessageFlags(
   client: MirrorImapClient,
   uids: number[],
@@ -476,7 +526,7 @@ export async function fetchMessageFlags(
       retainedBytes += footprint.bytes;
       retainedFlags += footprint.flags;
       if (retainedBytes > MAX_SYNC_FLAG_FETCH_BYTES || retainedFlags > MAX_SYNC_FLAGS_PER_FETCH) {
-        throw new Error("IMAP flag fetch exceeded the aggregate memory budget");
+        throw new FlagFetchBudgetExceededError("IMAP flag fetch exceeded the aggregate memory budget");
       }
       returned.set(msg.uid, snapshot);
     }
@@ -497,6 +547,95 @@ export async function fetchMessageFlags(
   }
 
   return snapshots;
+}
+
+/** Fetch only flag rows whose CONDSTORE modification sequence advanced. */
+export async function* iterateChangedMessageFlagBatches(
+  client: MirrorImapClient,
+  changedSince: bigint,
+  batchSize = MAX_SYNC_BATCH_SIZE
+): AsyncIterable<MessageFlagSnapshot[]> {
+  let returned = new Map<number, MessageFlagSnapshot>();
+  let retainedBytes = 2;
+  let retainedFlags = 0;
+
+  const takeBatch = () => {
+    const batch = [...returned.values()];
+    returned = new Map();
+    retainedBytes = 2;
+    retainedFlags = 0;
+    return batch;
+  };
+
+  for await (const msg of client.fetch(
+    "1:*",
+    { uid: true, flags: true },
+    { uid: true, changedSince }
+  )) {
+    if (!Number.isInteger(msg.uid)) continue;
+    if (msg.flags === undefined) {
+      throw new Error(`IMAP changed flag fetch omitted FLAGS for UID ${msg.uid}`);
+    }
+    const snapshot = { uid: msg.uid, flags: [...msg.flags] };
+    const footprint = flagSnapshotFootprint(snapshot);
+    const previous = returned.get(msg.uid);
+    if (!previous && returned.size > 0
+      && (retainedBytes + footprint.bytes > MAX_SYNC_FLAG_FETCH_BYTES
+        || retainedFlags + footprint.flags > MAX_SYNC_FLAGS_PER_FETCH)) {
+      yield takeBatch();
+    }
+    if (previous) {
+      const previousFootprint = flagSnapshotFootprint(previous);
+      retainedBytes -= previousFootprint.bytes;
+      retainedFlags -= previousFootprint.flags;
+    }
+    retainedBytes += footprint.bytes;
+    retainedFlags += footprint.flags;
+    if (retainedBytes > MAX_SYNC_FLAG_FETCH_BYTES || retainedFlags > MAX_SYNC_FLAGS_PER_FETCH) {
+      throw new FlagFetchBudgetExceededError("IMAP changed flag batch exceeded the memory budget");
+    }
+    returned.set(msg.uid, snapshot);
+    if (returned.size >= batchSize) yield takeBatch();
+  }
+
+  if (returned.size > 0) yield takeBatch();
+}
+
+/** Fetch only flag rows whose CONDSTORE modification sequence advanced. */
+export async function fetchChangedMessageFlags(
+  client: MirrorImapClient,
+  changedSince: bigint
+): Promise<MessageFlagSnapshot[]> {
+  const returned = new Map<number, MessageFlagSnapshot>();
+  let retainedBytes = 2;
+  let retainedFlags = 0;
+
+  for await (const msg of client.fetch(
+    "1:*",
+    { uid: true, flags: true },
+    { uid: true, changedSince }
+  )) {
+    if (!Number.isInteger(msg.uid)) continue;
+    if (msg.flags === undefined) {
+      throw new Error(`IMAP changed flag fetch omitted FLAGS for UID ${msg.uid}`);
+    }
+    const snapshot = { uid: msg.uid, flags: [...msg.flags] };
+    const footprint = flagSnapshotFootprint(snapshot);
+    const previous = returned.get(msg.uid);
+    if (previous) {
+      const previousFootprint = flagSnapshotFootprint(previous);
+      retainedBytes -= previousFootprint.bytes;
+      retainedFlags -= previousFootprint.flags;
+    }
+    retainedBytes += footprint.bytes;
+    retainedFlags += footprint.flags;
+    if (retainedBytes > MAX_SYNC_FLAG_FETCH_BYTES || retainedFlags > MAX_SYNC_FLAGS_PER_FETCH) {
+      throw new FlagFetchBudgetExceededError("IMAP changed flag fetch exceeded the aggregate memory budget");
+    }
+    returned.set(msg.uid, snapshot);
+  }
+
+  return [...returned.values()];
 }
 
 export async function searchUidsSince(

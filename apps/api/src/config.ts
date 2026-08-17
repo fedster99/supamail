@@ -73,6 +73,7 @@ const envSchema = z.object({
   // The socket timeout must remain longer than one renewal interval so a quiet
   // mailbox does not look like a dead connection.
   IMAP_IDLE_MAX_TIME_MS: z.coerce.number().int().positive().default(25 * 60_000),
+  IMAP_FOLDER_STATUS_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   IMAP_IDLE_SOCKET_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60_000),
   SMTP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(10 * 60_000),
   IMAP_MAX_COMMANDS_PER_MINUTE: z.coerce.number().int().positive().default(200),
@@ -107,6 +108,14 @@ const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       message: "IMAP_IDLE_SOCKET_TIMEOUT_MS must exceed IMAP_IDLE_MAX_TIME_MS",
       path: ["IMAP_IDLE_SOCKET_TIMEOUT_MS"]
+    });
+  }
+
+  if (env.IMAP_FOLDER_STATUS_INTERVAL_MS >= env.IMAP_IDLE_MAX_TIME_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "IMAP_FOLDER_STATUS_INTERVAL_MS must be less than IMAP_IDLE_MAX_TIME_MS",
+      path: ["IMAP_FOLDER_STATUS_INTERVAL_MS"]
     });
   }
 

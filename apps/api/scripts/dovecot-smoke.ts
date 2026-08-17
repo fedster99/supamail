@@ -280,6 +280,7 @@ async function main(): Promise<void> {
       MAX_RR_FOLDERS_PER_CYCLE: 10,
       CONNECT_TIMEOUT_MS: 10_000,
       IMAP_COMMAND_TIMEOUT_MS: 10_000,
+      IMAP_FOLDER_STATUS_INTERVAL_MS: 3_000,
       IMAP_ALLOW_PRIVATE_HOSTS: true
     };
     const repository = new MirrorRepository(pool, config);
@@ -303,6 +304,8 @@ async function main(): Promise<void> {
     const opened = await openInboxIdleSession(pool, config, idleAccount);
     if (opened.status !== "ready") throw new Error("Dovecot did not advertise IDLE");
     const session = opened.session;
+    let archiveWakeLatencyMs: number | null = null;
+    let archiveLiveResult: Awaited<ReturnType<MirrorEngine["syncAccount"]>> | null = null;
     const waitForWake = async (message: string) => {
       const waiting = session.wait();
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -323,7 +326,7 @@ async function main(): Promise<void> {
         waiting,
         new Promise<never>((_, reject) => setTimeout(
           () => reject(new Error("Timed out waiting for Dovecot IDLE wake")),
-          5_000
+          8_000
         ))
       ]);
     };
@@ -343,6 +346,67 @@ async function main(): Promise<void> {
       if (liveResult.outcome !== "success") {
         throw new Error("Same-session IDLE sync failed");
       }
+      const archiveWaiting = session.wait();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const injector = new ImapFlow({
+        host: "127.0.0.1",
+        port: imapPort,
+        secure: false,
+        auth: { user: mailbox, pass: password },
+        logger: false
+      });
+      await injector.connect();
+      let mutationCompletedAt = 0;
+      try {
+        const archiveLock = await injector.getMailboxLock("Archive");
+        const oldUids: number[] = [];
+        try {
+          for await (const message of injector.fetch("1:*", { uid: true })) {
+            oldUids.push(message.uid);
+          }
+        } finally {
+          archiveLock.release();
+        }
+        const appended = await injector.append(
+          "Archive",
+          Buffer.from(plainMessage("archive-2", "Dovecot STATUS Archive", "Archive replacement."))
+        );
+        if (!appended || appended.uid === undefined) {
+          throw new Error("Dovecot did not return UIDPLUS data for Archive APPEND");
+        }
+        const mutationLock = await injector.getMailboxLock("Archive");
+        try {
+          await injector.messageFlagsAdd([appended.uid], ["\\Seen"], { uid: true });
+          if (oldUids.length > 0) {
+            await injector.messageDelete([oldUids[0]], { uid: true });
+          }
+        } finally {
+          mutationLock.release();
+        }
+        mutationCompletedAt = Date.now();
+      } finally {
+        await injector.logout().catch(() => injector.close());
+      }
+      const archiveWake = await Promise.race([
+        archiveWaiting,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("Timed out waiting for Archive STATUS wake")),
+          8_000
+        ))
+      ]);
+      archiveWakeLatencyMs = Date.now() - mutationCompletedAt;
+      if (archiveWake.status !== "wake" || archiveWake.wake.folderPath !== "Archive") {
+        throw new Error("Dovecot STATUS renewal did not identify Archive");
+      }
+      archiveLiveResult = await engine.syncAccount(account.id, "scheduled", {
+        liveInboxOnly: true,
+        client: session.syncClient,
+        clientAccountId: session.accountId,
+        keepClientOpen: true
+      });
+      if (archiveLiveResult.outcome !== "success") {
+        throw new Error("Same-session Archive STATUS sync failed");
+      }
       const secondWake = await waitForWake(
         plainMessage("4", "Dovecot IDLE 4", "Second IDLE arrival.")
       );
@@ -361,8 +425,11 @@ async function main(): Promise<void> {
       ["stored attachment metadata", counts.attachments >= 1],
       ["kept Archive trackable", counts.trackedArchive],
       ["excluded Trash by provider profile", counts.excludedTrash],
-      ["no false provider deletes", counts.deletedMessages === 0],
-      ["same-session IDLE sync stored the first arrival", idleCounts.messages === 5]
+      ["no false provider deletes before live changes", counts.deletedMessages === 0],
+      ["same-session IDLE and STATUS sync stored both arrivals", idleCounts.messages === 6],
+      ["Archive STATUS sync reconciled the removed row", idleCounts.deletedMessages === 1],
+      ["Archive STATUS wake stayed within one configured interval", archiveWakeLatencyMs !== null && archiveWakeLatencyMs < 4_500],
+      ["Archive STATUS sync targeted one folder", archiveLiveResult?.foldersProcessed === 1]
     ];
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
@@ -376,7 +443,9 @@ async function main(): Promise<void> {
       imapPort,
       result,
       counts,
-      idleCounts
+      idleCounts,
+      archiveWakeLatencyMs,
+      archiveLiveResult
     }, null, 2));
   } finally {
     const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";

@@ -1,6 +1,7 @@
 import type {
   DownloadResult,
   FetchMessage,
+  MailboxChange,
   MailboxListItem,
   MailboxLock,
   MailboxStatus,
@@ -23,11 +24,14 @@ export interface FixtureFolder {
   delimiter?: string;
   specialUse?: string;
   uidValidity: number;
+  highestModseq?: bigint;
   messages: FixtureMessage[];
 }
 
 export class FixtureImapClient implements MirrorImapClient {
   mailbox: MailboxStatus | false | null = null;
+  peekMailboxChanges?: (limit?: number) => readonly MailboxChange[];
+  acknowledgeMailboxChanges?: (changes: readonly MailboxChange[]) => void;
 
   private readonly foldersByPath: Map<string, FixtureFolder>;
 
@@ -53,7 +57,8 @@ export class FixtureImapClient implements MirrorImapClient {
       path,
       uidValidity: folder.uidValidity,
       uidNext: Math.max(0, ...folder.messages.map((message) => message.uid)) + 1,
-      exists: folder.messages.length
+      exists: folder.messages.length,
+      highestModseq: folder.highestModseq
     };
 
     return { release: () => undefined };
