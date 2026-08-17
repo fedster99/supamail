@@ -1,5 +1,71 @@
+diff --git a/lib/commands/fetch.js b/lib/commands/fetch.js
+index 048215e17a6560d00c8cac6b3a7de1b78449059c..3f269eb83f9d93affa2927db29db074a60857578 100644
+--- a/lib/commands/fetch.js
++++ b/lib/commands/fetch.js
+@@ -2,6 +2,37 @@
+ 
+ const { formatMessageResponse, isRev2Active } = require('../tools');
+ 
++function sequenceContains(range, value, wildcard) {
++    if (!Number.isSafeInteger(value) || value <= 0) return false;
++    const endpoint = token => token === '*' ? (wildcard || 0xffffffff) : Number(token);
++    return String(range).split(',').some(part => {
++        const [firstToken, secondToken] = part.trim().split(':');
++        const first = endpoint(firstToken);
++        if (!Number.isSafeInteger(first) || first <= 0) return false;
++        if (secondToken === undefined) return value === first;
++        const second = endpoint(secondToken);
++        if (!Number.isSafeInteger(second) || second <= 0) return false;
++        return value >= Math.min(first, second) && value <= Math.max(first, second);
++    });
++}
++
++function hasRequestedPayload(message, query) {
++    if (query.source && message.source === undefined) return false;
++    if (query.headers && message.headers === undefined) return false;
++    if (query.bodyStructure && message.bodyStructure === undefined) return false;
++    if (query.envelope && message.envelope === undefined) return false;
++    if (query.internalDate && message.internalDate === undefined) return false;
++    if (query.size && message.size === undefined) return false;
++    if (query.bodyParts && query.bodyParts.length && (!message.bodyParts || message.bodyParts.size === 0)) return false;
++    if ((query.all || query.fast || query.full) &&
++        (message.flags === undefined || message.internalDate === undefined || message.size === undefined)) {
++        return false;
++    }
++    if ((query.all || query.full) && message.envelope === undefined) return false;
++    if (query.full && message.bodyStructure === undefined) return false;
++    return true;
++}
++
+ /**
+  * Fetches emails from the server.
+  *
+@@ -207,8 +238,22 @@ module.exports = async (connection, range, query, options) => {
+                     // If onUntaggedFetch callback is provided, stream messages to it one by one
+                     // (useful for large result sets). Otherwise, collect all into messages.list.
+                     FETCH: async untagged => {
+-                        messages.count++;
+                         let formatted = await formatMessageResponse(untagged, mailbox);
++                        const sequenceValue = options.uid ? formatted.uid : formatted.seq;
++                        const wildcard = options.uid
++                            ? (mailbox.uidNext ? Number(mailbox.uidNext) - 1 : undefined)
++                            : mailbox.exists;
++                        // RFC 5465 FlagChange notifications are unsolicited FETCH
++                        // responses. During an ordinary content FETCH, route a
++                        // flags-only notification to the global event handler so it
++                        // cannot become the command result (especially fetchOne).
++                        if (!sequenceContains(range, sequenceValue, wildcard) || !hasRequestedPayload(formatted, query)) {
++                            if (typeof connection.untaggedFetch === 'function') {
++                                await connection.untaggedFetch(untagged, mailbox);
++                            }
++                            return;
++                        }
++                        messages.count++;
+                         if (typeof options.onUntaggedFetch === 'function') {
+                             await new Promise((resolve, reject) => {
+                                 options.onUntaggedFetch(formatted, err => {
 diff --git a/lib/commands/list.js b/lib/commands/list.js
-index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5d1983290 100644
+index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..ddf94ad57b0ae8729587fd15733f63f189ff8993 100644
 --- a/lib/commands/list.js
 +++ b/lib/commands/list.js
 @@ -8,10 +8,13 @@ const { specialUse } = require('../special-use');
@@ -58,7 +124,17 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
  
              if (returnArgs.length) {
                  cmdArgs.push({ type: 'ATOM', value: 'RETURN' }, returnArgs);
-@@ -281,7 +290,9 @@ module.exports = async (connection, reference, mailbox, options) => {
+@@ -230,6 +239,9 @@ module.exports = async (connection, reference, mailbox, options) => {
+                     // Inline STATUS response from LIST-STATUS extension (RFC 5819).
+                     // Parses alternating key-value pairs (i % 2 pattern).
+                     STATUS: async untagged => {
++                        if (typeof connection.untaggedStatus === 'function') {
++                            await connection.untaggedStatus(untagged);
++                        }
+                         let statusPath = normalizePath(connection, decodePath(connection, (untagged.attributes[0] && untagged.attributes[0].value) || ''));
+                         let statusList = untagged.attributes && Array.isArray(untagged.attributes[1]) ? untagged.attributes[1] : false;
+                         if (!statusList || !statusPath) {
+@@ -281,7 +293,9 @@ module.exports = async (connection, reference, mailbox, options) => {
          };
  
          let normalizedReference = normalizePath(connection, reference || '');
@@ -69,7 +145,7 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
  
          // Retry stages for the main listing: start with all applicable RETURN options
          // and drop one option group per retry. Consecutive stages differ by exactly one
-@@ -351,6 +362,9 @@ module.exports = async (connection, reference, mailbox, options) => {
+@@ -351,6 +365,9 @@ module.exports = async (connection, reference, mailbox, options) => {
                  if (i === stages.length - 1 || !isRejectedCommand(err)) {
                      throw err;
                  }
@@ -79,7 +155,7 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
                  lastRejectedStage = stage;
                  if (!auxRetryInserted && stageHasAuxArgs(stage)) {
                      // The rejection may be about the auxiliary options rather than the
-@@ -419,7 +433,7 @@ module.exports = async (connection, reference, mailbox, options) => {
+@@ -419,7 +436,7 @@ module.exports = async (connection, reference, mailbox, options) => {
                          if (syntheticRecent) {
                              entry.status.recent = 0;
                          }
@@ -88,7 +164,7 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
                          // Server didn't support LIST-STATUS; fall back to per-mailbox STATUS
                          try {
                              entry.status = await connection.run('STATUS', entry.path, options.statusQuery);
-@@ -484,7 +498,8 @@ module.exports = async (connection, reference, mailbox, options) => {
+@@ -484,7 +501,8 @@ module.exports = async (connection, reference, mailbox, options) => {
          // non-rev2 session, assume the server silently ignored RETURN (SUBSCRIBED) and
          // fall back to LSUB anyway (a rev2 session has no LSUB to fall back to, and an
          // account without any subscriptions legitimately looks the same).
@@ -98,8 +174,139 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
          if (needsLsub && !connection.skipLsub) {
              try {
                  await runLsub();
+diff --git a/lib/commands/notify.js b/lib/commands/notify.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..3405b0ae2bd05954e614d94b4b3081ad8870dd63
+--- /dev/null
++++ b/lib/commands/notify.js
+@@ -0,0 +1,87 @@
++'use strict';
++
++const { decodePath, encodePath, hasCapability, normalizePath } = require('../tools.js');
++
++const MESSAGE_EVENTS = ['MessageNew', 'MessageExpunge', 'FlagChange'];
++
++function parseStatus(connection, untagged) {
++    let path = normalizePath(connection, decodePath(connection, (untagged.attributes[0] && untagged.attributes[0].value) || ''));
++    let list = untagged.attributes && Array.isArray(untagged.attributes[1]) ? untagged.attributes[1] : false;
++    if (!path || !list) {
++        return false;
++    }
++
++    const fields = {
++        MESSAGES: { key: 'messages', parser: Number },
++        RECENT: { key: 'recent', parser: Number },
++        UIDNEXT: { key: 'uidNext', parser: Number },
++        UIDVALIDITY: { key: 'uidValidity', parser: BigInt },
++        UNSEEN: { key: 'unseen', parser: Number },
++        HIGHESTMODSEQ: { key: 'highestModseq', parser: BigInt },
++        SIZE: { key: 'size', parser: Number },
++        DELETED: { key: 'deleted', parser: Number }
++    };
++    let key;
++    let status = { path };
++    for (let i = 0; i < list.length; i++) {
++        let entry = list[i];
++        if (i % 2 === 0) {
++            key = entry && typeof entry.value === 'string' ? entry.value.toUpperCase() : false;
++            continue;
++        }
++        let field = key && fields[key];
++        if (!field || !entry || typeof entry.value !== 'string' || isNaN(entry.value)) {
++            continue;
++        }
++        status[field.key] = field.parser(entry.value);
++    }
++    return status;
++}
++
++async function notify(connection, mailboxes) {
++    if (![connection.states.AUTHENTICATED, connection.states.SELECTED].includes(connection.state)
++        || !hasCapability(connection, 'NOTIFY')) {
++        return false;
++    }
++
++    mailboxes = [...new Set((mailboxes || []).map(path => normalizePath(connection, path)))]
++        .filter(path => path && path.toUpperCase() !== 'INBOX');
++    let events = MESSAGE_EVENTS.map(value => ({ type: 'ATOM', value }));
++    let attributes = [
++        { type: 'ATOM', value: 'SET' },
++        { type: 'ATOM', value: 'STATUS' },
++        [
++            { type: 'ATOM', value: 'SELECTED' },
++            events
++        ]
++    ];
++
++    if (mailboxes.length) {
++        let encoded = mailboxes.map(path => {
++            let value = encodePath(connection, path);
++            return { type: value.indexOf('&') >= 0 ? 'STRING' : 'ATOM', value };
++        });
++        attributes.push([
++            { type: 'ATOM', value: 'MAILBOXES' },
++            encoded.length === 1 ? encoded[0] : encoded,
++            events
++        ]);
++    }
++
++    let statuses = new Map();
++    let response = await connection.exec('NOTIFY', attributes, {
++        untagged: {
++            STATUS: async untagged => {
++                let status = parseStatus(connection, untagged);
++                if (status) {
++                    statuses.set(status.path, status);
++                }
++            }
++        }
++    });
++    response.next();
++    return [...statuses.values()];
++}
++
++module.exports = notify;
++module.exports.parseStatus = parseStatus;
+diff --git a/lib/commands/status.js b/lib/commands/status.js
+index 0e15a480d321d746c38f869109f556560737baf0..5f201c8b8084e97ecd41c53af9f529afe3869b61 100644
+--- a/lib/commands/status.js
++++ b/lib/commands/status.js
+@@ -1,6 +1,6 @@
+ 'use strict';
+ 
+-const { encodePath, normalizePath, buildStatusQueryAttributes, isRev2Active } = require('../tools.js');
++const { comparePaths, decodePath, encodePath, normalizePath, buildStatusQueryAttributes, isRev2Active } = require('../tools.js');
+ 
+ /**
+  * Requests status information about a mailbox.
+@@ -48,6 +48,13 @@ module.exports = async (connection, path, query) => {
+                 // STATUS response: * STATUS <mailbox> (<key> <value> <key> <value> ...)
+                 // Parsed as alternating key-value pairs (i % 2 pattern).
+                 STATUS: async untagged => {
++                    let responsePath = normalizePath(connection, decodePath(connection, (untagged.attributes[0] && untagged.attributes[0].value) || ''));
++                    if (!comparePaths(connection, path, responsePath)) {
++                        if (typeof connection.untaggedStatus === 'function') {
++                            await connection.untaggedStatus(untagged);
++                        }
++                        return;
++                    }
+                     // If querying the currently selected mailbox, also update the
+                     // connection's live mailbox state and emit events for changes.
+                     let updateCurrent = connection.state === connection.states.SELECTED && path === connection.mailbox.path;
+diff --git a/lib/imap-commands.js b/lib/imap-commands.js
+index 9369b2afec863bb9b36cc6a8378fd362eb0d107b..f2aeda401a76637860ed31b0f9da6d6bf0706e8d 100644
+--- a/lib/imap-commands.js
++++ b/lib/imap-commands.js
+@@ -40,6 +40,7 @@ module.exports = new Map([
+     ['MOVE', require('./commands/move.js')],
+     ['COMPRESS', require('./commands/compress.js')],
+     ['QUOTA', require('./commands/quota.js')],
++    ['NOTIFY', require('./commands/notify.js')],
+     ['IDLE', require('./commands/idle.js')],
+     ['AUTHENTICATE', require('./commands/authenticate.js')]
+ ]);
 diff --git a/lib/imap-flow.d.ts b/lib/imap-flow.d.ts
-index 413ac6f273d7d244ee8e989db497feb5c804c985..1660179f215be88ae30d03e3e868e42a55d87154 100644
+index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d60602b82 100644
 --- a/lib/imap-flow.d.ts
 +++ b/lib/imap-flow.d.ts
 @@ -147,6 +147,8 @@ export interface MailboxObject {
@@ -139,11 +346,29 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..1660179f215be88ae30d03e3e868e42a
  }
  
  export interface MailboxLockOptions extends MailboxOpenOptions {
+@@ -800,6 +816,9 @@ export class ImapFlow extends EventEmitter {
+         }
+     ): Promise<StatusObject>;
+ 
++    /** Registers RFC 5465 notifications for the selected and named mailboxes. */
++    notify(mailboxes: string[]): Promise<StatusObject[] | false>;
++
+     /** Starts listening for new or deleted messages from the currently opened mailbox */
+     idle(): Promise<boolean>;
+ 
 diff --git a/lib/imap-flow.js b/lib/imap-flow.js
-index a45fb40307bf6d03e61b463e3a29116df94a6a30..2fc04ad29a49ffb1a46a4e5fc3f52281b250daf3 100644
+index a45fb40307bf6d03e61b463e3a29116df94a6a30..45006c405b612e3983fdb9bf46fe881b8261c12d 100644
 --- a/lib/imap-flow.js
 +++ b/lib/imap-flow.js
-@@ -1881,7 +1881,9 @@ class ImapFlow extends EventEmitter {
+@@ -16,6 +16,7 @@ const { LimitedPassthrough } = require('./limited-passthrough');
+ 
+ const { ImapStream } = require('./handler/imap-stream');
+ const { parser, compiler } = require('./handler/imap-handler');
++const { parseStatus: parseNotifyStatus } = require('./commands/notify.js');
+ const packageInfo = require('../package.json');
+ 
+ const libqp = require('libqp');
+@@ -1881,7 +1882,9 @@ class ImapFlow extends EventEmitter {
              uids = untagged.attributes[0].value;
          }
  
@@ -154,7 +379,41 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..2fc04ad29a49ffb1a46a4e5fc3f52281
  
          for (let uid of uidList) {
              let payload = {
-@@ -2534,6 +2536,10 @@ class ImapFlow extends EventEmitter {
+@@ -1935,6 +1938,17 @@ class ImapFlow extends EventEmitter {
+         }
+     }
+ 
++    async untaggedStatus(untagged) {
++        let status = parseNotifyStatus(this, untagged);
++        if (status) {
++            this.emit('status', status);
++        }
++    }
++
++    async sectionNotificationOverflow() {
++        this.emit('notificationOverflow');
++    }
++
+     async ensureSelectedMailbox(path) {
+         if (!path) {
+             return false;
+@@ -2049,6 +2063,7 @@ class ImapFlow extends EventEmitter {
+ 
+         this.untaggedHandlers.CAPABILITY = (...args) => this.untaggedCapability(...args);
+         this.sectionHandlers.CAPABILITY = (...args) => this.sectionCapability(...args);
++        this.sectionHandlers.NOTIFICATIONOVERFLOW = (...args) => this.sectionNotificationOverflow(...args);
+ 
+         this.untaggedHandlers.EXISTS = (...args) => this.untaggedExists(...args);
+         this.untaggedHandlers.EXPUNGE = (...args) => this.untaggedExpunge(...args);
+@@ -2056,6 +2071,7 @@ class ImapFlow extends EventEmitter {
+         // these methods take an optional second argument, so make sure that some random IMAP tag is not used as the second argument
+         this.untaggedHandlers.FETCH = untagged => this.untaggedFetch(untagged);
+         this.untaggedHandlers.VANISHED = untagged => this.untaggedVanished(untagged);
++        this.untaggedHandlers.STATUS = untagged => this.untaggedStatus(untagged);
+ 
+         let socket = false;
+         if (this.options.proxy) {
+@@ -2534,6 +2550,10 @@ class ImapFlow extends EventEmitter {
       * @property {Boolean} [statusQuery.highestModseq] if `true` request last known modseq value
       * @property {Boolean} [statusQuery.size] if `true` request total mailbox size in octets (requires STATUS=SIZE or IMAP4rev2)
       * @property {Boolean} [statusQuery.deleted] if `true` request count of messages with \\Deleted flag (requires IMAP4rev2)
@@ -165,7 +424,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..2fc04ad29a49ffb1a46a4e5fc3f52281
       * @property {Object} [specialUseHints] set specific paths as special use folders, this would override special use flags provided from the server
       * @property {String} [specialUseHints.sent] Path to "Sent Mail" folder
       * @property {String} [specialUseHints.trash] Path to "Trash" folder
-@@ -2554,8 +2560,11 @@ class ImapFlow extends EventEmitter {
+@@ -2554,8 +2574,11 @@ class ImapFlow extends EventEmitter {
       */
      async list(options) {
          options = options || {};
@@ -179,7 +438,26 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..2fc04ad29a49ffb1a46a4e5fc3f52281
          return folders;
      }
  
-@@ -4182,7 +4191,11 @@ class ImapFlow extends EventEmitter {
+@@ -2767,6 +2790,18 @@ class ImapFlow extends EventEmitter {
+         return await this.run('STATUS', path, query);
+     }
+ 
++    /**
++     * Registers RFC 5465 notifications for the selected mailbox and the named
++     * non-selected mailboxes. Returns the initial STATUS snapshots supplied by
++     * NOTIFY SET STATUS. Later snapshots are emitted as `status` events.
++     *
++     * @param {String[]} mailboxes mailbox paths to monitor in addition to the selected mailbox
++     * @returns {Promise<StatusObject[]|Boolean>} initial status snapshots, or false when unsupported
++     */
++    async notify(mailboxes) {
++        return await this.run('NOTIFY', mailboxes);
++    }
++
+     /**
+      * Starts listening for new or deleted messages from the currently opened mailbox. Only required if {@link ImapFlow#disableAutoIdle} is set to `true`
+      * otherwise IDLE is started by default on connection inactivity. NB! If `idle()` is called manually then it does not
+@@ -4182,7 +4217,11 @@ class ImapFlow extends EventEmitter {
                      continue; // Process next lock in queue
                  }
  

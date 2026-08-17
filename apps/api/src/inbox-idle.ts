@@ -52,6 +52,7 @@ interface InboxIdleClient extends Pick<EventEmitter, "on" | "removeListener"> {
     status?: MailboxStatus | { error: unknown };
   }>>;
   status?(path: string, query: Record<string, boolean>): Promise<MailboxStatus>;
+  notify?(mailboxes: string[]): Promise<MailboxStatus[] | false>;
   idle(): Promise<boolean | void>;
   logout(): Promise<void>;
   close(): void;
@@ -61,7 +62,7 @@ export interface InboxIdleSession {
   readonly accountId: string;
   readonly connectedAt: Date;
   readonly syncClient: MirrorImapClient;
-  readonly folderProbeStrategy?: "list_status" | "status";
+  readonly folderProbeStrategy?: "notify" | "list_status" | "status";
   wait(options?: { signal?: AbortSignal; now?: () => Date }): Promise<InboxIdleWaitResult>;
   close(): void;
 }
@@ -134,9 +135,13 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
     for (const status of statuses) this.baseline.set(status.path, status);
   }
 
-  observe(status: MailboxStatus): MailboxChange | null {
-    const previous = this.baseline.get(status.path);
+  observe(observed: Partial<MailboxStatus> & Pick<MailboxStatus, "path">): MailboxChange | null {
+    const previous = this.baseline.get(observed.path);
     if (!previous) {
+      if (observed.uidValidity === undefined) {
+        return this.signal(observed.path, true, true);
+      }
+      const status = observed as MailboxStatus;
       this.baseline.set(status.path, status);
       const pending = this.pending.get(status.path);
       if (pending) {
@@ -146,10 +151,21 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
       }
       return null;
     }
-    const pending = this.pending.get(status.path);
+    const pending = this.pending.get(observed.path);
+    const status = {
+      ...previous,
+      ...pending?.observed,
+      ...observed,
+      path: observed.path
+    };
     if (pending && sameStatus(pending.observed, status)) return null;
     if (sameStatus(previous, status)) return null;
-    const change = mailboxChange(previous, status);
+    const detected = mailboxChange(previous, status);
+    const change = {
+      ...detected,
+      forceReconcile: detected.forceReconcile || pending?.forceReconcile === true,
+      forceFlagScan: detected.forceFlagScan || pending?.forceFlagScan === true
+    };
     this.pending.set(status.path, change);
     return change;
   }
@@ -238,6 +254,10 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   private probeCursor = 0;
   private acceptingEvents = false;
   private listStatusEnabled: boolean;
+  private notifyEnabled: boolean;
+  private notifyPathsKey = "";
+  private reconnectAfterNotifyOverflow = false;
+  private deferredNotifyWake = false;
   private deferredInboxWake = false;
   private queuedWake: InboxIdleWake | null = null;
   private wakeDeliveryScheduled = false;
@@ -259,6 +279,9 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.listStatusEnabled = config.IMAP_LIST_STATUS_ENABLED
       && (client.capabilities.has("LIST-STATUS") || isRev2Active(client))
       && typeof client.list === "function";
+    this.notifyEnabled = config.IMAP_NOTIFY_ENABLED
+      && client.capabilities.has("NOTIFY")
+      && typeof client.notify === "function";
     this.syncClient = new ThrottledImapClient(
       client as unknown as ImapFlow,
       config.IMAP_MAX_COMMANDS_PER_MINUTE,
@@ -269,12 +292,15 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.client.on("exists", this.onExists);
     this.client.on("expunge", this.onExpunge);
     this.client.on("flags", this.onFlags);
+    this.client.on("status", this.onStatus);
+    this.client.on("notificationOverflow", this.onNotificationOverflow);
     this.client.on("close", this.onClose);
   }
 
   private folderPaths: string[] = [];
 
-  get folderProbeStrategy(): "list_status" | "status" {
+  get folderProbeStrategy(): "notify" | "list_status" | "status" {
+    if (this.notifyEnabled) return "notify";
     return this.listStatusEnabled ? "list_status" : "status";
   }
 
@@ -290,10 +316,39 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     else this.probeCursor %= this.folderPaths.length;
   }
 
+  private async armNotify(): Promise<MailboxStatus[]> {
+    if (!this.notifyEnabled) return [];
+    const pathsKey = JSON.stringify(this.folderPaths);
+    if (pathsKey === this.notifyPathsKey) return [];
+    try {
+      const statuses = await this.syncClient.notify!(this.folderPaths);
+      if (statuses === false) {
+        this.notifyEnabled = false;
+        this.notifyPathsKey = "";
+        return [];
+      }
+      this.notifyPathsKey = pathsKey;
+      return statuses.filter((status) => this.folderPaths.includes(status.path));
+    } catch (error) {
+      const interrupted = (error instanceof DOMException && error.name === "AbortError")
+        || (error instanceof Error && error.message.startsWith("IMAP_COMMAND_TIMEOUT_MS exceeded"));
+      if (this.closed || interrupted || this.client.usable === false) {
+        this.close();
+        throw error;
+      }
+      this.notifyEnabled = false;
+      this.notifyPathsKey = "";
+      return [];
+    }
+  }
+
   async initialize(): Promise<void> {
     await this.refreshFolderPaths();
-    const baseline: MailboxStatus[] = [];
-    if (this.listStatusEnabled && this.folderPaths.length > 0) {
+    const baseline: MailboxStatus[] = await this.armNotify();
+    const notifySeen = new Set(baseline.map((status) => status.path));
+    if (this.listStatusEnabled
+      && this.folderPaths.length > 0
+      && notifySeen.size !== this.folderPaths.length) {
       try {
         baseline.push(...await this.listStatusSnapshots());
         if (new Set(baseline.map((status) => status.path)).size !== this.folderPaths.length) {
@@ -344,7 +399,14 @@ class ReusableInboxIdleSession implements InboxIdleSession {
 
   private async probeMailboxChanges(): Promise<MailboxChange | null> {
     await this.refreshFolderPaths();
+    const notifyStatuses = await this.armNotify();
+    let notifyChange: MailboxChange | null = null;
+    for (const status of notifyStatuses) {
+      const change = this.changeFeed.observe(status);
+      if (!notifyChange && change) notifyChange = change;
+    }
     const pending = this.changeFeed.peek(1)[0];
+    if (this.notifyEnabled) return notifyChange ?? pending ?? null;
     if (this.folderPaths.length === 0) return pending ?? null;
     if (this.listStatusEnabled) {
       try {
@@ -396,6 +458,8 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.client.removeListener("exists", this.onExists);
     this.client.removeListener("expunge", this.onExpunge);
     this.client.removeListener("flags", this.onFlags);
+    this.client.removeListener("status", this.onStatus);
+    this.client.removeListener("notificationOverflow", this.onNotificationOverflow);
     this.client.removeListener("close", this.onClose);
   }
 
@@ -443,6 +507,10 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       ...(typeof data.seq === "number" ? { sequence: data.seq } : {}),
       ...(typeof data.uid === "number" ? { uid: data.uid } : {})
     };
+    this.enqueueWake(wake);
+  }
+
+  private enqueueWake(wake: InboxIdleWake): void {
     const priority: Record<InboxIdleWakeKind, number> = { exists: 1, flags: 2, expunge: 3 };
     if (!this.queuedWake || priority[wake.kind] >= priority[this.queuedWake.kind]) {
       this.queuedWake = wake;
@@ -457,6 +525,49 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       this.deliver({ status: "wake", wake: queued });
     });
   }
+
+  private readonly onStatus = (data: unknown) => {
+    if (!this.notifyEnabled || !data || typeof data !== "object") return;
+    const status = data as Partial<MailboxStatus> & Pick<MailboxStatus, "path">;
+    if (typeof status.path !== "string"
+      || status.path.toLowerCase() === "inbox"
+      || !this.folderPaths.includes(status.path)) return;
+    const change = this.changeFeed.observe(status);
+    if (!change) return;
+    if (!this.acceptingEvents) {
+      this.deferredNotifyWake = true;
+      return;
+    }
+    this.enqueueWake({
+      kind: change.forceReconcile ? "exists" : "flags",
+      accountId: this.accountId,
+      folderPath: change.path,
+      observedAt: this.now()
+    });
+  };
+
+  private readonly onNotificationOverflow = () => {
+    if (!this.notifyEnabled) return;
+    this.notifyEnabled = false;
+    this.notifyPathsKey = "";
+    this.reconnectAfterNotifyOverflow = true;
+    this.changeFeed.signal("INBOX", true, true);
+    for (const path of this.folderPaths) {
+      this.changeFeed.signal(path, true, true);
+    }
+    const change = this.changeFeed.peek(1)[0];
+    if (!change) return;
+    if (!this.acceptingEvents) {
+      this.deferredNotifyWake = true;
+      return;
+    }
+    this.enqueueWake({
+      kind: "expunge",
+      accountId: this.accountId,
+      folderPath: change.path,
+      observedAt: this.now()
+    });
+  };
 
   private readonly onExists = (data: unknown) => this.wake(
     "exists",
@@ -476,6 +587,54 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.deliver({ status: "disconnected" });
   };
 
+  private takeDeferredWake(): InboxIdleWaitResult | null {
+    if (this.reconnectAfterNotifyOverflow) {
+      const overflowChange = this.changeFeed.peek(1)[0];
+      if (overflowChange) {
+        this.deferredNotifyWake = false;
+        return {
+          status: "wake",
+          wake: {
+            kind: overflowChange.forceReconcile ? "exists" : "flags",
+            accountId: this.accountId,
+            folderPath: overflowChange.path,
+            observedAt: this.now()
+          }
+        };
+      }
+      this.close();
+      return { status: "disconnected" };
+    }
+    const pendingChange = this.deferredNotifyWake ? this.changeFeed.peek(1)[0] : undefined;
+    if (pendingChange) {
+      this.deferredNotifyWake = false;
+      return {
+        status: "wake",
+        wake: {
+          kind: pendingChange.forceReconcile ? "exists" : "flags",
+          accountId: this.accountId,
+          folderPath: pendingChange.path,
+          observedAt: this.now()
+        }
+      };
+    }
+    if (!this.deferredInboxWake) return null;
+    this.deferredInboxWake = false;
+    const inboxChange = this.changeFeed.peek().find(
+      (candidate) => candidate.path.toLowerCase() === "inbox"
+    );
+    if (!inboxChange) return null;
+    return {
+      status: "wake",
+      wake: {
+        kind: inboxChange.forceReconcile ? "exists" : "flags",
+        accountId: this.accountId,
+        folderPath: inboxChange.path,
+        observedAt: this.now()
+      }
+    };
+  }
+
   async wait(
     options: { signal?: AbortSignal; now?: () => Date } = {}
   ): Promise<InboxIdleWaitResult> {
@@ -483,23 +642,17 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     const queued = this.pending.shift();
     if (queued) return queued;
     if (this.closed) return { status: "disconnected" };
-    if (this.deferredInboxWake) {
-      this.deferredInboxWake = false;
-      const change = this.changeFeed.peek().find(
-        (candidate) => candidate.path.toLowerCase() === "inbox"
-      );
-      if (change) {
-        return {
-          status: "wake",
-          wake: {
-            kind: change.forceReconcile ? "exists" : "flags",
-            accountId: this.accountId,
-            folderPath: change.path,
-            observedAt: this.now()
-          }
-        };
-      }
+    // RFC 5465 says NOTIFICATIONOVERFLOW behaves as NOTIFY NONE, including
+    // suppressing the selected-mailbox events used by Inbox IDLE. Drain every
+    // bounded catch-up batch before replacing this connection.
+    const deferred = this.takeDeferredWake();
+    if (deferred) return deferred;
+    await this.refreshFolderPaths();
+    for (const status of await this.armNotify()) {
+      this.changeFeed.observe(status);
     }
+    const armedWake = this.takeDeferredWake();
+    if (armedWake) return armedWake;
     this.now = options.now ?? this.now;
     const abortOpen = () => this.close();
     options.signal?.addEventListener("abort", abortOpen, { once: true });
@@ -515,6 +668,8 @@ class ReusableInboxIdleSession implements InboxIdleSession {
 
     const selectedWake = this.pending.shift();
     if (selectedWake) return selectedWake;
+    const selectedDeferredWake = this.takeDeferredWake();
+    if (selectedDeferredWake) return selectedDeferredWake;
 
     return await new Promise<InboxIdleWaitResult>((resolve, reject) => {
       let settled = false;

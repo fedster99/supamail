@@ -285,6 +285,7 @@ async function main(): Promise<void> {
       IMAP_FOLDER_STATUS_INTERVAL_MS: 3_000,
       IMAP_LIST_STATUS_ENABLED: true,
       IMAP_QRESYNC_ENABLED: true,
+      IMAP_NOTIFY_ENABLED: true,
       IMAP_ALLOW_PRIVATE_HOSTS: true
     };
     const repository = new MirrorRepository(pool, config);
@@ -320,8 +321,8 @@ async function main(): Promise<void> {
     const opened = await openInboxIdleSession(pool, config, idleAccount);
     if (opened.status !== "ready") throw new Error("Dovecot did not advertise IDLE");
     const session = opened.session;
-    if (session.folderProbeStrategy !== "list_status") {
-      throw new Error("Dovecot smoke did not activate LIST-STATUS");
+    if (session.folderProbeStrategy !== "notify") {
+      throw new Error("Dovecot smoke did not activate NOTIFY");
     }
     let archiveWakeLatencyMs: number | null = null;
     let archiveLiveResult: Awaited<ReturnType<MirrorEngine["syncAccount"]>> | null = null;
@@ -409,13 +410,13 @@ async function main(): Promise<void> {
       const archiveWake = await Promise.race([
         archiveWaiting,
         new Promise<never>((_, reject) => setTimeout(
-          () => reject(new Error("Timed out waiting for Archive STATUS wake")),
+          () => reject(new Error("Timed out waiting for Archive NOTIFY wake")),
           8_000
         ))
       ]);
       archiveWakeLatencyMs = Date.now() - mutationCompletedAt;
       if (archiveWake.status !== "wake" || archiveWake.wake.folderPath !== "Archive") {
-        throw new Error("Dovecot STATUS renewal did not identify Archive");
+        throw new Error("Dovecot NOTIFY did not identify Archive");
       }
       archiveLiveResult = await engine.syncAccount(account.id, "scheduled", {
         liveInboxOnly: true,
@@ -424,7 +425,7 @@ async function main(): Promise<void> {
         keepClientOpen: true
       });
       if (archiveLiveResult.outcome !== "success") {
-        throw new Error("Same-session Archive STATUS sync failed");
+        throw new Error("Same-session Archive NOTIFY sync failed");
       }
       const secondWake = await waitForWake(
         plainMessage("4", "Dovecot IDLE 4", "Second IDLE arrival.")
@@ -463,10 +464,10 @@ async function main(): Promise<void> {
       ["kept Archive trackable", counts.trackedArchive],
       ["excluded Trash by provider profile", counts.excludedTrash],
       ["no false provider deletes before live changes", counts.deletedMessages === 0],
-      ["same-session IDLE and STATUS sync stored both arrivals", idleCounts.messages === 6],
-      ["Archive STATUS sync reconciled the removed row", idleCounts.deletedMessages === 1],
-      ["Archive STATUS wake stayed within one configured interval", archiveWakeLatencyMs !== null && archiveWakeLatencyMs < 4_500],
-      ["Archive STATUS sync targeted one folder", archiveLiveResult?.foldersProcessed === 1],
+      ["same-session IDLE and NOTIFY sync stored both arrivals", idleCounts.messages === 6],
+      ["Archive NOTIFY sync reconciled the removed row", idleCounts.deletedMessages === 1],
+      ["Archive NOTIFY wake stayed below the polling fallback interval", archiveWakeLatencyMs !== null && archiveWakeLatencyMs < 3_000],
+      ["Archive NOTIFY sync targeted one folder", archiveLiveResult?.foldersProcessed === 1],
       ["Archive replay used complete QRESYNC", archiveQresync?.accepted === true
         && archiveQresync.complete === true
         && archiveQresync.fallbackRequired === false
