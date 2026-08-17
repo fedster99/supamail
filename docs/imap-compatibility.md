@@ -62,11 +62,13 @@ The real-server smoke suite currently covers:
 
 LIST-STATUS is an optional command-reduction layer, not part of the minimum
 compatibility contract. Enable `IMAP_LIST_STATUS_ENABLED=true` only for a
-canary after capability evidence confirms support. A missing or incomplete
-response falls back to the bounded STATUS detector. The pinned ImapFlow patch
-sends only the tracked folder patterns and prevents its subscription, retry,
-and per-mailbox STATUS paths from bypassing the command throttle. Exact UID
-reconciliation remains the correctness path.
+canary after capability evidence confirms support. SupaMail first sends only
+the tracked folder patterns. If a server accepts but truncates that response,
+SupaMail retries once with `*` and filters the result back to the same bounded
+tracked set. A missing, malformed, or still-incomplete response falls back to
+the bounded STATUS detector. The pinned ImapFlow patch prevents its
+subscription, retry, and per-mailbox STATUS paths from bypassing the command
+throttle. Exact UID reconciliation remains the correctness path.
 
 QRESYNC is an optional replay optimization, not part of the minimum
 compatibility contract. Enable `IMAP_QRESYNC_ENABLED=true` only for a canary

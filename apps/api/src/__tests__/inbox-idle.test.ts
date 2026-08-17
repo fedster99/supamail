@@ -687,10 +687,11 @@ describe("waitForInboxIdleWake", () => {
       unseen: 0,
       highestModseq: 8n
     });
-    client.list.mockResolvedValueOnce([{
+    const partial = [{
       path: "Archive",
       status: client.statuses.get("Archive")!
-    }]);
+    }];
+    client.list.mockResolvedValueOnce(partial).mockResolvedValueOnce(partial);
     const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
       IMAP_LIST_STATUS_ENABLED: true
     }) as never, account, {
@@ -700,7 +701,7 @@ describe("waitForInboxIdleWake", () => {
     expect(opened.status).toBe("ready");
     if (opened.status !== "ready") throw new Error("session was not ready");
     expect(opened.session.folderProbeStrategy).toBe("status");
-    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.list).toHaveBeenCalledTimes(2);
     expect(client.status).toHaveBeenCalledTimes(1);
 
     client.statuses.set("Projects", {
@@ -715,8 +716,48 @@ describe("waitForInboxIdleWake", () => {
       status: "wake",
       wake: { folderPath: "Projects" }
     });
-    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.list).toHaveBeenCalledTimes(2);
     expect(client.status).toHaveBeenCalledTimes(3);
+    opened.session.close();
+  });
+
+  it("retries a partial exact-pattern LIST-STATUS response with one wildcard command", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 5,
+      messages: 4,
+      unseen: 0,
+      highestModseq: 8n
+    });
+    client.list.mockResolvedValueOnce([{
+      path: "Archive",
+      status: client.statuses.get("Archive")!
+    }]);
+    const opened = await openInboxIdleSession(pool, Object.assign({}, fastStatusConfig, {
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive", "Projects"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("list_status");
+    expect(client.list).toHaveBeenCalledTimes(2);
+    expect(client.list).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      mailboxPatterns: ["*"]
+    }));
+    expect(client.status).not.toHaveBeenCalled();
     opened.session.close();
   });
 
