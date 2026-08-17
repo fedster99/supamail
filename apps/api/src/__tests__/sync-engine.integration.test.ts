@@ -3,7 +3,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { closePool, getPool } from "../db.js";
 import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
-import type { MailboxChange, MirrorImapClient } from "../imap-client.js";
+import type {
+  MailboxChange,
+  MailboxLock,
+  MirrorImapClient,
+  QresyncRequest
+} from "../imap-client.js";
 import { resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
@@ -393,6 +398,494 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(rows.rows).toEqual([
       { uid: "301", deleted_in_provider: true },
       { uid: "302", deleted_in_provider: false }
+    ]);
+  });
+
+  it("uses QRESYNC replay for flags and deletions without an immediate exact UID scan", async () => {
+    const h = await setupIntegration("qresync-archive-replay", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_013,
+      highestModseq: 10n,
+      messages: [
+        makeTextMessage({
+          uid: 301,
+          subject: "kept archive",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "kept"
+        }),
+        makeTextMessage({
+          uid: 302,
+          subject: "removed archive",
+          from: "b@x.test",
+          to: "u@x.test",
+          body: "removed"
+        })
+      ]
+    });
+    const initialEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+    await initialEngine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+
+    folders[2].highestModseq = 12n;
+    folders[2].messages[0].flags = ["\\Seen"];
+    folders[2].messages.splice(1, 1, makeTextMessage({
+      uid: 303,
+      subject: "new archive",
+      from: "c@x.test",
+      to: "u@x.test",
+      body: "new"
+    }));
+
+    class QresyncFixtureClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        const lock = await super.getMailboxLock(path);
+        if (!options.qresync || path !== "Archive") return lock;
+        return {
+          ...lock,
+          qresync: {
+            accepted: true,
+            complete: true,
+            vanishedUids: [302],
+            changedFlags: [{ uid: 301, flags: ["\\Seen"] }]
+          }
+        };
+      }
+    }
+
+    const idleClient = new QresyncFixtureClient(folders);
+    const fetch = vi.spyOn(idleClient, "fetch");
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: true,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_013,
+        uidNext: 304,
+        messages: 2,
+        highestModseq: 12n
+      }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.flagsUpdated).toBe(1);
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+    expect(fetch.mock.calls.some(([range]) => range === "1:*")).toBe(false);
+    const rows = await h.pool.query<{
+      uid: string;
+      flags: string[];
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT uid::text, flags, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive'
+       ORDER BY uid`,
+      [h.account.id]
+    );
+    expect(rows.rows).toEqual([
+      { uid: "301", flags: ["\\Seen"], deleted_in_provider: false },
+      { uid: "302", flags: [], deleted_in_provider: true },
+      { uid: "303", flags: [], deleted_in_provider: false }
+    ]);
+    const folder = await h.pool.query<{
+      highest_modseq: string | null;
+      qresync_highest_modseq: string | null;
+    }>(
+      `SELECT highest_modseq::text, qresync_highest_modseq::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    expect(folder.rows[0].highest_modseq).toBe("12");
+    expect(folder.rows[0].qresync_highest_modseq).toBe("12");
+    const replayEvent = await h.pool.query<{ payload: Record<string, unknown> }>(
+      `SELECT payload
+       FROM public.imap_sync_events
+       WHERE account_id = $1 AND folder_path = 'Archive' AND event_type = 'QRESYNC_REPLAY'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [h.account.id]
+    );
+    expect(replayEvent.rows[0].payload).toMatchObject({
+      accepted: true,
+      complete: true,
+      fallbackRequired: false,
+      changedFlagCount: 1,
+      vanishedUidCount: 1
+    });
+  });
+
+  it("falls back to exact UID reconciliation when QRESYNC capture is incomplete", async () => {
+    const h = await setupIntegration("qresync-incomplete-fallback", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_014,
+      highestModseq: 10n,
+      messages: [
+        makeTextMessage({ uid: 301, subject: "kept", from: "a@x.test", to: "u@x.test", body: "kept" }),
+        makeTextMessage({ uid: 302, subject: "gone", from: "b@x.test", to: "u@x.test", body: "gone" })
+      ]
+    });
+    const initialEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+    await initialEngine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    folders[2].highestModseq = 12n;
+    folders[2].messages.splice(1, 1);
+
+    class IncompleteQresyncClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        const lock = await super.getMailboxLock(path);
+        if (!options.qresync || path !== "Archive") return lock;
+        return {
+          ...lock,
+          qresync: {
+            accepted: true,
+            complete: false,
+            vanishedUids: [],
+            changedFlags: []
+          }
+        };
+      }
+    }
+
+    const idleClient = new IncompleteQresyncClient(folders);
+    const fetch = vi.spyOn(idleClient, "fetch");
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_014,
+        uidNext: 302,
+        messages: 1,
+        highestModseq: 12n
+      }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(fetch.mock.calls.some(([range]) => range === "1:*")).toBe(true);
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+    const deleted = await h.pool.query<{ deleted_in_provider: boolean }>(
+      `SELECT deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 302`,
+      [h.account.id]
+    );
+    expect(deleted.rows[0].deleted_in_provider).toBe(true);
+    const replayEvent = await h.pool.query<{ payload: Record<string, unknown> }>(
+      `SELECT payload
+       FROM public.imap_sync_events
+       WHERE account_id = $1 AND folder_path = 'Archive' AND event_type = 'QRESYNC_REPLAY'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [h.account.id]
+    );
+    expect(replayEvent.rows[0].payload).toMatchObject({
+      accepted: true,
+      complete: false,
+      fallbackRequired: true
+    });
+  });
+
+  it("retries plain selection and exact reconciliation when QRESYNC is rejected", async () => {
+    const h = await setupIntegration("qresync-command-rejected", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_015,
+      highestModseq: 10n,
+      messages: [
+        makeTextMessage({ uid: 301, subject: "kept", from: "a@x.test", to: "u@x.test", body: "kept" }),
+        makeTextMessage({ uid: 302, subject: "gone", from: "b@x.test", to: "u@x.test", body: "gone" })
+      ]
+    });
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+    folders[2].highestModseq = 12n;
+    folders[2].messages.splice(1, 1);
+
+    class RejectingQresyncClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+      readonly lockRequests: Array<{ path: string; qresync?: QresyncRequest }> = [];
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        this.lockRequests.push({ path, ...options });
+        if (options.qresync) throw new Error("provider rejected QRESYNC SELECT");
+        return await super.getMailboxLock(path);
+      }
+    }
+
+    const idleClient = new RejectingQresyncClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: true,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_015,
+        uidNext: 302,
+        messages: 1,
+        highestModseq: 12n
+      }
+    };
+    const acknowledge = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(idleClient.lockRequests).toEqual([
+      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n } },
+      { path: "Archive" }
+    ]);
+    expect(acknowledge).toHaveBeenCalledWith([change]);
+    const deleted = await h.pool.query<{ deleted_in_provider: boolean }>(
+      `SELECT deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 302`,
+      [h.account.id]
+    );
+    expect(deleted.rows[0].deleted_in_provider).toBe(true);
+    const replayEvent = await h.pool.query<{ payload: Record<string, unknown> }>(
+      `SELECT payload
+       FROM public.imap_sync_events
+       WHERE account_id = $1 AND folder_path = 'Archive' AND event_type = 'QRESYNC_REPLAY'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [h.account.id]
+    );
+    expect(replayEvent.rows[0].payload).toMatchObject({
+      accepted: false,
+      complete: false,
+      commandRejected: true,
+      fallbackRequired: true
+    });
+  });
+
+  it("keeps the QRESYNC cursor behind changes deferred by the replay budget", async () => {
+    const h = await setupIntegration("qresync-replay-budget", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true,
+      MAX_RECONCILES_PER_CYCLE: 1,
+      MAX_FLAG_SCANS_PER_CYCLE: 1
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push(
+      {
+        path: "Archive",
+        delimiter: "/",
+        uidValidity: 50_016,
+        highestModseq: 10n,
+        messages: [makeTextMessage({ uid: 301, subject: "archive", from: "a@x.test", to: "u@x.test", body: "a" })]
+      },
+      {
+        path: "Projects",
+        delimiter: "/",
+        uidValidity: 50_017,
+        highestModseq: 10n,
+        messages: [makeTextMessage({ uid: 401, subject: "project", from: "b@x.test", to: "u@x.test", body: "b" })]
+      }
+    );
+    const engine = h.buildEngine({
+      folders,
+      overrides: {
+        INITIAL_SYNC_BATCH_SIZE: 50,
+        IMAP_QRESYNC_ENABLED: true,
+        MAX_RECONCILES_PER_CYCLE: 1,
+        MAX_FLAG_SCANS_PER_CYCLE: 1
+      }
+    });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path IN ('Archive', 'Projects')`,
+      [h.account.id]
+    );
+    folders[2].highestModseq = 12n;
+    folders[3].highestModseq = 12n;
+
+    class BudgetedQresyncClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+      readonly lockRequests: Array<{ path: string; qresync?: QresyncRequest }> = [];
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        this.lockRequests.push({ path, ...options });
+        const lock = await super.getMailboxLock(path);
+        if (!options.qresync) return lock;
+        return {
+          ...lock,
+          qresync: {
+            accepted: true,
+            complete: true,
+            vanishedUids: [],
+            changedFlags: []
+          }
+        };
+      }
+    }
+
+    const idleClient = new BudgetedQresyncClient(folders);
+    let pending: MailboxChange[] = [
+      {
+        path: "Archive",
+        forceReconcile: true,
+        forceFlagScan: true,
+        observed: { path: "Archive", uidValidity: 50_016, uidNext: 302, messages: 1, highestModseq: 12n }
+      },
+      {
+        path: "Projects",
+        forceReconcile: true,
+        forceFlagScan: true,
+        observed: { path: "Projects", uidValidity: 50_017, uidNext: 402, messages: 1, highestModseq: 12n }
+      }
+    ];
+    idleClient.peekMailboxChanges = () => pending;
+    idleClient.acknowledgeMailboxChanges = (handled) => {
+      pending = pending.filter((change) => !handled.includes(change));
+    };
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(pending.map((change) => change.path)).toEqual(["Projects"]);
+    expect(idleClient.lockRequests).toEqual([
+      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n } },
+      { path: "Projects" }
+    ]);
+    const cursors = await h.pool.query<{
+      path: string;
+      highest_modseq: string | null;
+      qresync_highest_modseq: string | null;
+    }>(
+      `SELECT path, highest_modseq::text, qresync_highest_modseq::text
+       FROM public.imap_folders
+       WHERE account_id = $1 AND path IN ('Archive', 'Projects')
+       ORDER BY path`,
+      [h.account.id]
+    );
+    expect(cursors.rows).toEqual([
+      { path: "Archive", highest_modseq: "12", qresync_highest_modseq: "12" },
+      { path: "Projects", highest_modseq: "10", qresync_highest_modseq: "10" }
     ]);
   });
 

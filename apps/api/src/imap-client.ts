@@ -1,4 +1,4 @@
-import type { ImapFlow } from "imapflow";
+import type { ExpungeEvent, FlagsEvent, ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { connectImap } from "./imap-connect.js";
@@ -31,6 +31,8 @@ import type {
   MessageMetadata
 } from "./types.js";
 
+const MAX_QRESYNC_VANISHED_UIDS = 10_000;
+
 export interface MailboxStatus {
   path: string;
   uidValidity: bigint | number;
@@ -51,10 +53,25 @@ export interface MailboxChange {
 export interface MailboxChangeFeed {
   peek(limit?: number): readonly MailboxChange[];
   acknowledge(changes: readonly MailboxChange[]): void;
+  beginReplay?(path: string): void;
+  endReplay?(path: string): void;
 }
 
 export interface MailboxLock {
   release(): void;
+  qresync?: QresyncReplay;
+}
+
+export interface QresyncRequest {
+  uidValidity: bigint;
+  changedSince: bigint;
+}
+
+export interface QresyncReplay {
+  accepted: boolean;
+  complete: boolean;
+  vanishedUids: number[];
+  changedFlags: MessageFlagSnapshot[];
 }
 
 export interface MailboxListItem {
@@ -107,7 +124,7 @@ export interface MirrorImapClient {
   ): Promise<MailboxStatus>;
   peekMailboxChanges?(limit?: number): readonly MailboxChange[];
   acknowledgeMailboxChanges?(changes: readonly MailboxChange[]): void;
-  getMailboxLock(path: string): Promise<MailboxLock>;
+  getMailboxLock(path: string, options?: { qresync?: QresyncRequest }): Promise<MailboxLock>;
   fetch(
     range: string | number[] | Record<string, unknown>,
     query: Record<string, unknown>,
@@ -123,6 +140,7 @@ export interface MirrorImapClient {
 
 export class ThrottledImapClient implements MirrorImapClient {
   private readonly throttle: ImapThrottle;
+  private qresyncDisabled = false;
 
   constructor(
     private readonly client: ImapFlow,
@@ -206,9 +224,111 @@ export class ThrottledImapClient implements MirrorImapClient {
     this.mailboxChangeFeed?.acknowledge(changes);
   }
 
-  async getMailboxLock(path: string): Promise<MailboxLock> {
+  async getMailboxLock(
+    path: string,
+    options: { qresync?: QresyncRequest } = {}
+  ): Promise<MailboxLock> {
     await this.throttle.acquire(this.signal);
-    return await this.withCommandTimeout("getMailboxLock", () => this.client.getMailboxLock(path));
+    const request = options.qresync;
+    if (!request || this.qresyncDisabled) {
+      return await this.withCommandTimeout("getMailboxLock", () => this.client.getMailboxLock(path));
+    }
+
+    const vanishedUids = new Set<number>();
+    const changedFlags = new Map<number, MessageFlagSnapshot>();
+    let retainedFlagBytes = 2;
+    let retainedFlags = 0;
+    let complete = true;
+
+    const invalidateReplay = () => {
+      complete = false;
+      vanishedUids.clear();
+      changedFlags.clear();
+      retainedFlagBytes = 2;
+      retainedFlags = 0;
+    };
+    const onExpunge = (event: ExpungeEvent) => {
+      if (event.path !== path || !complete) return;
+      if (!event.vanished || !Number.isSafeInteger(event.uid) || event.uid! <= 0) {
+        invalidateReplay();
+        return;
+      }
+      if (vanishedUids.size >= MAX_QRESYNC_VANISHED_UIDS && !vanishedUids.has(event.uid!)) {
+        invalidateReplay();
+        return;
+      }
+      vanishedUids.add(event.uid!);
+    };
+    const onFlags = (event: FlagsEvent) => {
+      if (event.path !== path || !complete) return;
+      if (!Number.isSafeInteger(event.uid) || event.uid! <= 0 || !(event.flags instanceof Set)) {
+        invalidateReplay();
+        return;
+      }
+      const snapshot = { uid: event.uid!, flags: [...event.flags] };
+      const footprint = flagSnapshotFootprint(snapshot);
+      const previous = changedFlags.get(snapshot.uid);
+      if (previous) {
+        const previousFootprint = flagSnapshotFootprint(previous);
+        retainedFlagBytes -= previousFootprint.bytes;
+        retainedFlags -= previousFootprint.flags;
+      }
+      retainedFlagBytes += footprint.bytes;
+      retainedFlags += footprint.flags;
+      if (retainedFlagBytes > MAX_SYNC_FLAG_FETCH_BYTES || retainedFlags > MAX_SYNC_FLAGS_PER_FETCH) {
+        invalidateReplay();
+        return;
+      }
+      changedFlags.set(snapshot.uid, snapshot);
+    };
+
+    this.mailboxChangeFeed?.beginReplay?.(path);
+    this.client.on("expunge", onExpunge);
+    this.client.on("flags", onFlags);
+    try {
+      let lock: MailboxLock;
+      try {
+        lock = await this.withCommandTimeout(
+          "getMailboxLock QRESYNC",
+          () => this.client.getMailboxLock(path, {
+            uidValidity: request.uidValidity,
+            changedSince: request.changedSince
+          } as never)
+        );
+      } catch (error) {
+        this.qresyncDisabled = true;
+        throw error;
+      }
+      const mailbox = this.client.mailbox;
+      let accepted = mailbox !== false
+        && mailbox !== null
+        && mailbox.qresync === true
+        && BigInt(mailbox.uidValidity) === request.uidValidity
+        && mailbox.highestModseq !== undefined;
+      if (accepted && mailbox) {
+        try {
+          accepted = BigInt(mailbox.highestModseq!) >= request.changedSince;
+        } catch {
+          accepted = false;
+        }
+      }
+      if (!accepted) this.qresyncDisabled = true;
+      return {
+        ...lock,
+        qresync: {
+          accepted,
+          complete: accepted && complete,
+          vanishedUids: accepted && complete ? [...vanishedUids].sort((a, b) => a - b) : [],
+          changedFlags: accepted && complete
+            ? [...changedFlags.values()].sort((a, b) => a.uid - b.uid)
+            : []
+        }
+      };
+    } finally {
+      this.client.off("expunge", onExpunge);
+      this.client.off("flags", onFlags);
+      this.mailboxChangeFeed?.endReplay?.(path);
+    }
   }
 
   async *fetch(
@@ -290,7 +410,7 @@ export async function createImapClient(
   // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
   // one shared connect prelude (imap-connect.ts); this adapter only adds the
   // read-only throttled verb surface on top (ADR 0017/0022).
-  const rawClient = await connectImap(pool, config, account, options);
+  const rawClient = await connectImap(pool, config, account, { ...options, purpose: "sync" });
   return new ThrottledImapClient(
     rawClient,
     config.IMAP_MAX_COMMANDS_PER_MINUTE,

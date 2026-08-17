@@ -24,7 +24,7 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
 -    let listCommand = connection.capabilities.has('XLIST') && !hasCapability(connection, 'SPECIAL-USE') ? 'XLIST' : 'LIST';
 +    let listCommand =
 +        !options.statusOnly && connection.capabilities.has('XLIST') && !hasCapability(connection, 'SPECIAL-USE') ? 'XLIST' : 'LIST';
-
+ 
      try {
          // Accumulators filled by the untagged LIST/STATUS handlers below. statusMap
 @@ -74,14 +78,16 @@ module.exports = async (connection, reference, mailbox, options) => {
@@ -34,7 +34,7 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
 -        let canRequestSubscribed = listCommand === 'LIST' && !options.listOnly && !connection.skipListSubscribedArg && supportsExtendedList;
 +        let canRequestSubscribed =
 +            !options.statusOnly && listCommand === 'LIST' && !options.listOnly && !connection.skipListSubscribedArg && supportsExtendedList;
-
+ 
          // Auxiliary RETURN options (SPECIAL-USE/CHILDREN) that ride along with the
          // STATUS/SUBSCRIBED option groups. When RETURN options are present, servers
          // may report only what was explicitly requested (verified against Dovecot
@@ -44,7 +44,7 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
 +        let auxArgsAvailable =
 +            !options.statusOnly && (hasCapability(connection, 'SPECIAL-USE') || connection.capabilities.has('CHILDREN') || supportsExtendedList);
          let stageHasAuxArgs = stage => (stage.status || stage.subscribed) && stage.aux !== false && !connection.skipListAuxArgs && auxArgsAvailable;
-
+ 
          // Builds the RETURN (...) argument list for one retry stage
 @@ -151,7 +157,10 @@ module.exports = async (connection, reference, mailbox, options) => {
          // Called once for the main listing and optionally again for INBOX if a
@@ -55,18 +55,18 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
 +                ? mailbox.map(pattern => encodePath(connection, pattern))
 +                : encodePath(connection, mailbox);
 +            const cmdArgs = [encodePath(connection, reference), encodedMailbox];
-
+ 
              if (returnArgs.length) {
                  cmdArgs.push({ type: 'ATOM', value: 'RETURN' }, returnArgs);
 @@ -281,7 +290,9 @@ module.exports = async (connection, reference, mailbox, options) => {
          };
-
+ 
          let normalizedReference = normalizePath(connection, reference || '');
 -        let normalizedMailbox = normalizePath(connection, mailbox || '', true);
 +        let normalizedMailbox = Array.isArray(mailbox)
 +            ? mailbox.map(pattern => normalizePath(connection, pattern || '', true))
 +            : normalizePath(connection, mailbox || '', true);
-
+ 
          // Retry stages for the main listing: start with all applicable RETURN options
          // and drop one option group per retry. Consecutive stages differ by exactly one
 @@ -351,6 +362,9 @@ module.exports = async (connection, reference, mailbox, options) => {
@@ -99,10 +99,19 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..91ff933d4a08216ba5ce7b7c47567ec5
              try {
                  await runLsub();
 diff --git a/lib/imap-flow.d.ts b/lib/imap-flow.d.ts
-index 413ac6f273d7d244ee8e989db497feb5c804c985..66136537a137ed5e3281fa741e27dddb9d8ee744 100644
+index 413ac6f273d7d244ee8e989db497feb5c804c985..1660179f215be88ae30d03e3e868e42a55d87154 100644
 --- a/lib/imap-flow.d.ts
 +++ b/lib/imap-flow.d.ts
-@@ -238,6 +238,16 @@ export interface ListOptions {
+@@ -147,6 +147,8 @@ export interface MailboxObject {
+     exists: number;
+     /** Read-only state */
+     readOnly?: boolean;
++    /** True when SELECT accepted and validated a QRESYNC cursor */
++    qresync?: boolean;
+ }
+ 
+ export interface MailboxLockObject {
+@@ -238,6 +240,16 @@ export interface ListOptions {
          /** If true request count of messages with \Deleted flag (requires IMAP4rev2) */
          deleted?: boolean;
      };
@@ -119,11 +128,33 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..66136537a137ed5e3281fa741e27dddb
      /** Set specific paths as special use folders */
      specialUseHints?: {
          /** Path to "Sent Mail" folder */
+@@ -608,6 +620,10 @@ export interface MailboxOpenOptions {
+     readOnly?: boolean;
+     /** Optional description for mailbox lock tracking */
+     description?: string;
++    /** QRESYNC cursor: last known UIDVALIDITY */
++    uidValidity?: bigint;
++    /** QRESYNC cursor: last known HIGHESTMODSEQ */
++    changedSince?: bigint;
+ }
+ 
+ export interface MailboxLockOptions extends MailboxOpenOptions {
 diff --git a/lib/imap-flow.js b/lib/imap-flow.js
-index a45fb40307bf6d03e61b463e3a29116df94a6a30..9c693453c45073f89a37a353d421ba63913b374d 100644
+index a45fb40307bf6d03e61b463e3a29116df94a6a30..2fc04ad29a49ffb1a46a4e5fc3f52281b250daf3 100644
 --- a/lib/imap-flow.js
 +++ b/lib/imap-flow.js
-@@ -2534,6 +2534,10 @@ class ImapFlow extends EventEmitter {
+@@ -1881,7 +1881,9 @@ class ImapFlow extends EventEmitter {
+             uids = untagged.attributes[0].value;
+         }
+ 
+-        let uidList = expandRange(uids);
++        // Bound the provider-controlled sequence set before emitting per-UID
++        // events. The caller falls back to exact reconciliation on overflow.
++        let uidList = expandRange(uids, 10_000);
+ 
+         for (let uid of uidList) {
+             let payload = {
+@@ -2534,6 +2536,10 @@ class ImapFlow extends EventEmitter {
       * @property {Boolean} [statusQuery.highestModseq] if `true` request last known modseq value
       * @property {Boolean} [statusQuery.size] if `true` request total mailbox size in octets (requires STATUS=SIZE or IMAP4rev2)
       * @property {Boolean} [statusQuery.deleted] if `true` request count of messages with \\Deleted flag (requires IMAP4rev2)
@@ -134,7 +165,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..9c693453c45073f89a37a353d421ba63
       * @property {Object} [specialUseHints] set specific paths as special use folders, this would override special use flags provided from the server
       * @property {String} [specialUseHints.sent] Path to "Sent Mail" folder
       * @property {String} [specialUseHints.trash] Path to "Trash" folder
-@@ -2554,8 +2558,11 @@ class ImapFlow extends EventEmitter {
+@@ -2554,8 +2560,11 @@ class ImapFlow extends EventEmitter {
       */
      async list(options) {
          options = options || {};
@@ -148,3 +179,84 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..9c693453c45073f89a37a353d421ba63
          return folders;
      }
  
+@@ -4182,7 +4191,11 @@ class ImapFlow extends EventEmitter {
+                     continue; // Process next lock in queue
+                 }
+ 
+-                if (this.mailbox && this.mailbox.path === path && !!this.mailbox.readOnly === !!options.readOnly) {
++                // A QRESYNC cursor must always reach SELECT/EXAMINE, even when the
++                // requested mailbox is already selected. The replay is carried by
++                // untagged FETCH and VANISHED responses to that command.
++                let requiresReselect = options.uidValidity !== undefined && options.changedSince !== undefined;
++                if (!requiresReselect && this.mailbox && this.mailbox.path === path && !!this.mailbox.readOnly === !!options.readOnly) {
+                     // Fast path: mailbox is already selected with the right access mode
+                     this.log.trace({
+                         msg: 'Mailbox lock acquired [existing]',
+diff --git a/lib/tools.js b/lib/tools.js
+index 4b90c537efbef48a357911598e840f202accb099..5e652daca152c63e9a72c30f4f533caa82bd7ee3 100644
+--- a/lib/tools.js
++++ b/lib/tools.js
+@@ -1195,38 +1195,46 @@ const tools = {
+      * 1:4294967295 is cut off instead of exhausting memory.
+      *
+      * @param {String} range - IMAP sequence range string
++     * @param {Number} [maxItems] aggregate expansion limit
+      * @returns {Number[]} Array of expanded sequence numbers
+      */
+-    expandRange(range) {
+-        return range.split(',').flatMap(entry => {
++    expandRange(range, maxItems = EXPANDED_RANGE_LIMIT) {
++        let expanded = [];
++        for (let entry of range.split(',')) {
+             entry = entry.trim();
+             let colon = entry.indexOf(':');
+             if (colon < 0) {
+                 let value = Number(entry);
+-                return tools.isValidSequenceValue(value) ? value : [];
++                if (tools.isValidSequenceValue(value)) {
++                    if (expanded.length >= maxItems) {
++                        throw new RangeError(`Expanded IMAP sequence exceeds ${maxItems} entries`);
++                    }
++                    expanded.push(value);
++                }
++                continue;
+             }
+             let first = Number(entry.substr(0, colon));
+             let second = Number(entry.substr(colon + 1));
+             if (!tools.isValidSequenceValue(first) || !tools.isValidSequenceValue(second)) {
+-                return [];
++                continue;
+             }
+             if (first === second) {
+-                return first;
+-            }
+-            let list = [];
+-            if (first < second) {
+-                let last = Math.min(second, first + EXPANDED_RANGE_LIMIT - 1);
+-                for (let i = first; i <= last; i++) {
+-                    list.push(i);
++                if (expanded.length >= maxItems) {
++                    throw new RangeError(`Expanded IMAP sequence exceeds ${maxItems} entries`);
+                 }
+-            } else {
+-                let last = Math.max(second, first - EXPANDED_RANGE_LIMIT + 1);
+-                for (let i = first; i >= last; i--) {
+-                    list.push(i);
++                expanded.push(first);
++                continue;
++            }
++            let direction = first < second ? 1 : -1;
++            for (let value = first; ; value += direction) {
++                if (expanded.length >= maxItems) {
++                    throw new RangeError(`Expanded IMAP sequence exceeds ${maxItems} entries`);
+                 }
++                expanded.push(value);
++                if (value === second) break;
+             }
+-            return list;
+-        });
++        }
++        return expanded;
+     },
+ 
+     /**

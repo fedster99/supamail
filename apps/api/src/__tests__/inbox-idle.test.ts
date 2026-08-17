@@ -7,6 +7,7 @@ class FakeIdleClient extends EventEmitter {
   capabilities = new Map<string, boolean | number>([["IDLE", true]]);
   enabled = new Set<string>();
   usable = true;
+  mailbox: Record<string, unknown> | false = false;
   skipListStatusArgs = false;
   mailboxOpen = vi.fn(async () => ({}));
   logout = vi.fn(async () => undefined);
@@ -26,6 +27,19 @@ class FakeIdleClient extends EventEmitter {
     status
   })));
   status = vi.fn(async (path: string) => this.statuses.get(path)!);
+  getMailboxLock = vi.fn(async (path: string, options?: { uidValidity?: bigint; changedSince?: bigint }) => {
+    this.mailbox = {
+      path,
+      uidValidity: options?.uidValidity ?? 1n,
+      highestModseq: 12n,
+      qresync: Boolean(options?.uidValidity && options.changedSince)
+    };
+    if (options?.uidValidity && options.changedSince) {
+      this.emit("flags", { path, seq: 1, uid: 9, flags: new Set(["\\Seen"]), modseq: 11n });
+      this.emit("expunge", { path, uid: 8, vanished: true, earlier: true });
+    }
+    return { release: vi.fn() };
+  });
 
   async idle(): Promise<boolean> {
     this.idleStarted = true;
@@ -240,6 +254,32 @@ describe("waitForInboxIdleWake", () => {
     ]);
     opened.session.close();
     expect(client.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not enqueue QRESYNC replay events as new IDLE wakes", async () => {
+    const client = new FakeIdleClient();
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const lock = await opened.session.syncClient.getMailboxLock("INBOX", {
+      qresync: { uidValidity: 1n, changedSince: 10n }
+    });
+    expect(lock.qresync).toMatchObject({
+      accepted: true,
+      complete: true,
+      vanishedUids: [8],
+      changedFlags: [{ uid: 9, flags: ["\\Seen"] }]
+    });
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.finishIdle!(true);
+    await expect(wait).resolves.toEqual({ status: "renew" });
+    opened.session.close();
   });
 
   it("turns a non-Inbox STATUS change into a durable sync hint on renewal", async () => {

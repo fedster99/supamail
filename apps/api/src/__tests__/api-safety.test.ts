@@ -105,6 +105,7 @@ function makeFolder(overrides: Partial<ImapFolder> = {}): ImapFolder {
     uidvalidity: null,
     uid_next: null,
     highest_modseq: null,
+    qresync_highest_modseq: null,
     last_uid: null,
     last_synced_at: null,
     initial_sync_complete: false,

@@ -114,6 +114,21 @@ function mailboxChange(previous: MailboxStatus, observed: MailboxStatus): Mailbo
 class SessionMailboxChangeFeed implements MailboxChangeFeed {
   private readonly baseline = new Map<string, MailboxStatus>();
   private readonly pending = new Map<string, MailboxChange>();
+  private readonly replayDepth = new Map<string, number>();
+
+  beginReplay(path: string): void {
+    this.replayDepth.set(path, (this.replayDepth.get(path) ?? 0) + 1);
+  }
+
+  endReplay(path: string): void {
+    const depth = this.replayDepth.get(path) ?? 0;
+    if (depth <= 1) this.replayDepth.delete(path);
+    else this.replayDepth.set(path, depth - 1);
+  }
+
+  isReplaying(path: string): boolean {
+    return (this.replayDepth.get(path) ?? 0) > 0;
+  }
 
   seed(statuses: readonly MailboxStatus[]): void {
     for (const status of statuses) this.baseline.set(status.path, status);
@@ -405,6 +420,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     data: { path?: unknown; count?: unknown; prevCount?: unknown; seq?: unknown; uid?: unknown }
   ): void {
     const folderPath = typeof data.path === "string" ? data.path : "INBOX";
+    if (this.changeFeed.isReplaying(folderPath)) return;
     if (!this.acceptingEvents) {
       if (!this.closed && folderPath.toLowerCase() === "inbox") {
         this.changeFeed.signal(folderPath, kind === "expunge", kind === "flags");

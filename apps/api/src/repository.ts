@@ -2256,6 +2256,7 @@ export class MirrorRepository {
     uidValidity: number;
     uidNext?: number;
     highestModseq?: string;
+    qresyncHighestModseq?: string;
     lastUid?: number;
     initialComplete?: boolean;
     reconcileClean?: boolean;
@@ -2268,6 +2269,7 @@ export class MirrorRepository {
         uidvalidity = $2,
         uid_next = COALESCE($3, uid_next),
         highest_modseq = COALESCE($14::numeric, highest_modseq),
+        qresync_highest_modseq = COALESCE($15::numeric, qresync_highest_modseq),
         last_uid = COALESCE($4, last_uid),
         initial_sync_complete = COALESCE($5, initial_sync_complete),
         last_synced_at = now(),
@@ -2315,7 +2317,8 @@ export class MirrorRepository {
       this.config.PRIORITY_CUTOFF,
       this.config.SENT_SYNC_INTERVAL_MS,
       this.config.SYNC_INTERVAL_MS,
-      patch.highestModseq ?? null
+      patch.highestModseq ?? null,
+      patch.qresyncHighestModseq ?? null
     ];
     const result = options.deadlineAt === undefined
       ? await this.pool.query<{ id: string }>(query, values)
@@ -2376,6 +2379,7 @@ export class MirrorRepository {
         UPDATE public.imap_folders
         SET uidvalidity = $3,
             highest_modseq = NULL,
+            qresync_highest_modseq = NULL,
             last_uid = NULL,
             initial_sync_complete = false,
             initial_sync_target_max_uid = NULL,
@@ -3346,6 +3350,44 @@ export class MirrorRepository {
       `,
       [accountId, folder.path, uidValidity, liveUids]
     );
+    return Number(result.rows[0].count);
+  }
+
+  async markVanishedMessages(
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    vanishedUids: number[],
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
+  ): Promise<number> {
+    const uniqueUids = [...new Set(vanishedUids)];
+    if (uniqueUids.length === 0) return 0;
+    if (uniqueUids.length > MAX_SYNC_BATCH_SIZE
+      || uniqueUids.some((uid) => !Number.isSafeInteger(uid) || uid <= 0)) {
+      throw new Error("QRESYNC VANISHED batch is invalid or exceeds the sync batch limit");
+    }
+    const query = `
+      WITH marked AS (
+        UPDATE public.imap_messages
+        SET deleted_in_provider = true,
+            provider_deleted_at = now(),
+            deleted_reason = 'RECONCILE_MISSING'
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND uidvalidity = $3
+          AND uid = ANY($4::bigint[])
+          AND deleted_in_provider = false
+          AND window_status = 'IN_WINDOW'
+        RETURNING id
+      )
+      SELECT count(*)::text AS count FROM marked
+    `;
+    const values = [accountId, folder.path, uidValidity, uniqueUids];
+    const result = options.deadlineAt === undefined
+      ? await this.pool.query<{ count: string }>(query, values)
+      : await runMetadataWriteWithDeadline<{ count: string }>(
+          this.pool, query, values, options.deadlineAt, options.signal
+        );
     return Number(result.rows[0].count);
   }
 
@@ -4534,10 +4576,10 @@ export class MirrorRepository {
     folderPath: string | null,
     providerUid: number | null,
     eventType: string,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
-    await this.pool.query(
-      `
+    const query = `
       INSERT INTO public.imap_sync_events (
         account_id,
         sync_run_id,
@@ -4548,8 +4590,26 @@ export class MirrorRepository {
         payload
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `,
-      [accountId, syncRunId, messageId, folderPath, providerUid, eventType, JSON.stringify(payload)]
+      `;
+    const values = [
+      accountId,
+      syncRunId,
+      messageId,
+      folderPath,
+      providerUid,
+      eventType,
+      JSON.stringify(payload)
+    ];
+    if (options.deadlineAt === undefined) {
+      await this.pool.query(query, values);
+      return;
+    }
+    await runMetadataWriteWithDeadline(
+      this.pool,
+      query,
+      values,
+      options.deadlineAt,
+      options.signal
     );
   }
 }

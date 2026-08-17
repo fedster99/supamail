@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import type { AppConfig } from "../config.js";
 
 /**
  * The one shared IMAP connect prelude (CC-1, ADR 0022). This test pins the
@@ -57,8 +58,9 @@ const config = {
   IMAP_COMMAND_TIMEOUT_MS: 30000,
   IMAP_IDLE_MAX_TIME_MS: 1_500_000,
   IMAP_FOLDER_STATUS_INTERVAL_MS: 60_000,
-  IMAP_IDLE_SOCKET_TIMEOUT_MS: 1_800_000
-} as never;
+  IMAP_IDLE_SOCKET_TIMEOUT_MS: 1_800_000,
+  IMAP_QRESYNC_ENABLED: false
+} as unknown as AppConfig;
 
 const account = {
   id: "acc-1",
@@ -172,6 +174,18 @@ describe("connectImap (the one shared connect prelude)", () => {
       maxIdleTime: 1_500_000,
       disableAutoIdle: true
     });
+  });
+
+  it("enables QRESYNC only on sync and IDLE sockets when its flag is on", async () => {
+    const qresyncConfig = { ...config, IMAP_QRESYNC_ENABLED: true } as never;
+    await connectImap({} as never, qresyncConfig, account, { purpose: "sync" });
+    expect(fake.lastOptions).toMatchObject({ qresync: true });
+
+    await connectImap({} as never, qresyncConfig, account, { purpose: "idle" });
+    expect(fake.lastOptions).toMatchObject({ qresync: true });
+
+    await connectImap({} as never, qresyncConfig, account, { purpose: "command" });
+    expect(fake.lastOptions).toMatchObject({ qresync: false });
   });
 
   it("does not decrypt or construct when the SSRF guard rejects", async () => {

@@ -11,9 +11,10 @@ authoritative. That leaves changes in Archive, Sent, custom folders, and other
 tracked mailboxes waiting for the outer loop.
 
 Current Gmail, Microsoft Graph, JMAP, and Thunderbird designs separate lossy
-notification from durable replay. Current ImapFlow supports STATUS and
-CONDSTORE `CHANGEDSINCE`, but not NOTIFY. Its QRESYNC path couples SELECT state
-to VANISHED events and is a riskier fit for the persistent Inbox session.
+notification from durable replay. Current ImapFlow supports STATUS, CONDSTORE
+`CHANGEDSINCE`, and QRESYNC, but not NOTIFY. QRESYNC couples SELECT state to
+VANISHED and flag events, so SupaMail must capture that replay before treating
+a persisted cursor as advanced.
 GreenMail 2.1.8 also lacks CONDSTORE and QRESYNC, so a correct generic path must
 retain plain UID reconciliation.
 
@@ -55,6 +56,21 @@ snapshots are re-emitted while the rotation continues probing other folders.
 The periodic full loop and its UID-set comparison remain the correctness
 backstop.
 
+An independently deployable `IMAP_QRESYNC_ENABLED` layer requests a real
+QRESYNC re-selection when a completed folder has persisted UIDVALIDITY and a
+deletion-complete QRESYNC mod-sequence cursor and the server advertises QRESYNC.
+That cursor is separate from the flag-only CONDSTORE HIGHESTMODSEQ cursor, so a
+flag scan cannot move replay past unseen VANISHED history. The pinned ImapFlow
+dependency is patched so a replay cursor cannot take its same-mailbox lock fast
+path and silently skip SELECT. SupaMail captures exact changed flags and
+VANISHED UIDs during selection, applies them in bounded writes, and advances
+the QRESYNC cursor only after the complete replay succeeds. Rejection, cursor
+invalidity, sequence-only EXPUNGE, malformed events, or capture-budget overflow
+returns immediately to CONDSTORE plus exact UID reconciliation. One rejection
+disables QRESYNC for that connection. A successful QRESYNC replay may satisfy a
+dirty structural wake, but it never stamps the periodic full-reconcile cursor;
+the scheduled exact UID audit remains independent.
+
 Each renewal probes at most
 `MAX_PRIORITY_FOLDERS_PER_CYCLE + MAX_RR_FOLDERS_PER_CYCLE` folders. With the
 defaults, 15 folders are checked per minute; larger tracked sets rotate, so the
@@ -73,8 +89,8 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 - Servers without CONDSTORE detect read/unread changes through `UNSEEN`; other
   flag-only changes still rely on bounded flag scans and the periodic loop.
 - STATUS is not deletion truth. Exact UID reconciliation remains mandatory.
-- No persistent connection is added per folder. QRESYNC and NOTIFY remain
-  independent, separately flagged layers.
+- No persistent connection is added per folder. QRESYNC is independently
+  flagged, and NOTIFY remains a separate future layer.
 - LIST-STATUS reduces polling commands. It does not make its counts
   authoritative and does not replace the bounded STATUS fallback.
 - The public session API remains compatible with hosts already passing its
@@ -88,7 +104,7 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 - Live-DB integration proves that an Archive replacement targets only Archive,
   inserts the new UID, tombstones the removed UID, and acknowledges afterward.
 - Dovecot 2.4.1 smoke proves structural plus flag convergence through the
-  cursor-capable path and records mutation-to-wake latency.
+  QRESYNC path, confirms VANISHED replay, and records mutation-to-wake latency.
 - GreenMail 2.1.8 smoke proves a non-Inbox addition through basic STATUS without
   CONDSTORE and records mutation-to-wake latency.
 - The full typecheck, unit, build, live-DB, and both protocol smoke lanes remain

@@ -56,6 +56,10 @@ const metadataProtectionModeMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0024_metadata_protection_mode.sql"
 );
+const qresyncCursorMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0025_qresync_cursor.sql"
+);
 
 describe("initial schema", () => {
   it("adds a bounded search extract without moving full body payloads into metadata", async () => {
@@ -186,9 +190,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0024_metadata_protection_mode");
+    expect(version).toBe("0025_qresync_cursor");
     expect(manifest).toEqual({
-      schemaVersion: "0024_metadata_protection_mode",
+      schemaVersion: "0025_qresync_cursor",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -213,7 +217,8 @@ describe("initial schema", () => {
         { id: "0021_row_accurate_body_progress", file: "0021_row_accurate_body_progress.sql" },
         { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" },
         { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" },
-        { id: "0024_metadata_protection_mode", file: "0024_metadata_protection_mode.sql" }
+        { id: "0024_metadata_protection_mode", file: "0024_metadata_protection_mode.sql" },
+        { id: "0025_qresync_cursor", file: "0025_qresync_cursor.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -227,6 +232,7 @@ describe("initial schema", () => {
     expect(sql).toContain("last_archive_refresh_at timestamptz");
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
     expect(sql).toContain("imap_message_bodies_body_head_trgm_idx");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS qresync_highest_modseq numeric");
     expect(sql).toContain("left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)");
     expect(sql).toContain("parsed_delivery_sha256 text");
     expect(sql).toContain("cursor_message_id uuid");
@@ -244,6 +250,14 @@ describe("initial schema", () => {
     expect(sql).toContain("current_live_body_progress AS");
     expect(sql).toContain("FUNCTION public.imap_search_extract_fts");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata bytea");
+  });
+
+  it("adds a deletion-complete cursor that is separate from CONDSTORE", async () => {
+    const sql = await readFile(qresyncCursorMigrationPath, "utf8");
+
+    expect(sql).toContain("ALTER TABLE public.imap_folders");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS qresync_highest_modseq numeric");
+    expect(sql).not.toContain("highest_modseq =");
   });
 
   it("indexes delivery fingerprints for bounded threading closure", async () => {

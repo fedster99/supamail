@@ -18,7 +18,7 @@ import {
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
-import type { MailboxChange, MailboxListItem, MirrorImapClient } from "./imap-client.js";
+import type { MailboxChange, MailboxListItem, MailboxLock, MirrorImapClient } from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -105,6 +105,7 @@ type FolderSyncResult = {
   hitLockBudget: boolean;
   initialSyncComplete: boolean;
   reconcileClean: boolean;
+  qresyncReplayComplete?: boolean;
 };
 
 type HistoryBatchResult = {
@@ -529,7 +530,8 @@ export class MirrorEngine {
               && folderResult.initialSyncComplete
               && !folderResult.hitLockBudget
               && (!mailboxChange.forceReconcile
-                || (folderResult.reconcileAttempted && folderResult.reconcileClean))
+                || (folderResult.reconcileAttempted && folderResult.reconcileClean)
+                || folderResult.qresyncReplayComplete === true)
               && (!mailboxChange.forceFlagScan || folderResult.flagScanAttempted)) {
               handledMailboxChanges.push(mailboxChange);
             }
@@ -929,7 +931,30 @@ export class MirrorEngine {
       deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
       signal: options.signal
     });
-    const mailboxLock = await client.getMailboxLock(folder.path);
+    const qresyncRequest = this.config.IMAP_QRESYNC_ENABLED
+      && options.allowFlagScan
+      && options.allowReconcile
+      && folder.initial_sync_complete
+      && folder.uidvalidity !== null
+      && folder.qresync_highest_modseq !== null
+      && client.capabilities?.has("QRESYNC")
+      ? {
+          uidValidity: BigInt(folder.uidvalidity),
+          changedSince: BigInt(folder.qresync_highest_modseq)
+        }
+      : undefined;
+    let qresyncCommandRejected = false;
+    let mailboxLock: MailboxLock;
+    try {
+      mailboxLock = await client.getMailboxLock(
+        folder.path,
+        qresyncRequest ? { qresync: qresyncRequest } : undefined
+      );
+    } catch (error) {
+      if (!qresyncRequest || client.usable === false) throw error;
+      qresyncCommandRejected = true;
+      mailboxLock = await client.getMailboxLock(folder.path);
+    }
 
     try {
       const mailbox = client.mailbox;
@@ -976,6 +1001,8 @@ export class MirrorEngine {
       let reconcileAttempted = false;
       let flagScanAttempted = false;
       let hitLockBudget = false;
+      let qresyncApplied = false;
+      let qresyncFallbackRequired = qresyncCommandRejected;
 
       // Spec §10.4: initial sync is snapshot-based and newest-first, with a
       // watermark (`initial_sync_oldest_uid_synced`) so a crash mid-backfill
@@ -1049,11 +1076,78 @@ export class MirrorEngine {
         }
       }
 
-      const flagScanDue = options.forceFlagScan
+      const qresyncReplay = mailboxLock.qresync;
+      const qresyncDeadline = qresyncRequest
+        ? Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS
+        : undefined;
+      if (qresyncReplay) {
+        qresyncFallbackRequired = !qresyncReplay.accepted || !qresyncReplay.complete;
+        if (qresyncReplay.accepted && qresyncReplay.complete) {
+          const qresyncWriteDeadline = qresyncDeadline!;
+          for (let i = 0; i < qresyncReplay.changedFlags.length; i += MAX_SYNC_BATCH_SIZE) {
+            this.assertDeadlineAvailable(
+              client,
+              qresyncWriteDeadline,
+              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+              "QRESYNC flag write"
+            );
+            const scan = await this.repository.applyFlagScan(
+              account.id,
+              folder,
+              uidValidity,
+              qresyncReplay.changedFlags.slice(i, i + MAX_SYNC_BATCH_SIZE),
+              { deadlineAt: qresyncWriteDeadline, signal: options.signal }
+            );
+            flagsUpdated += scan.flagsChanged;
+            for (const message of scan.messages) {
+              await this.hooks.onMessageUpsert?.(message);
+            }
+          }
+          for (let i = 0; i < qresyncReplay.vanishedUids.length; i += MAX_SYNC_BATCH_SIZE) {
+            this.assertDeadlineAvailable(
+              client,
+              qresyncWriteDeadline,
+              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+              "QRESYNC VANISHED write"
+            );
+            reconcileGapsFound += await this.repository.markVanishedMessages(
+              account.id,
+              folder,
+              uidValidity,
+              qresyncReplay.vanishedUids.slice(i, i + MAX_SYNC_BATCH_SIZE),
+              { deadlineAt: qresyncWriteDeadline, signal: options.signal }
+            );
+          }
+          flagScanAttempted = true;
+          qresyncApplied = true;
+        }
+      }
+      if (qresyncRequest) {
+        await this.repository.logEvent(
+          account.id,
+          null,
+          null,
+          folder.path,
+          null,
+          "QRESYNC_REPLAY",
+          {
+            accepted: qresyncReplay?.accepted === true,
+            complete: qresyncReplay?.complete === true,
+            commandRejected: qresyncCommandRejected,
+            fallbackRequired: qresyncFallbackRequired,
+            changedFlagCount: qresyncReplay?.changedFlags.length ?? 0,
+            vanishedUidCount: qresyncReplay?.vanishedUids.length ?? 0
+          },
+          { deadlineAt: qresyncDeadline!, signal: options.signal }
+        );
+      }
+
+      const flagScanDue = qresyncFallbackRequired
+        || options.forceFlagScan
         || !folder.next_flag_scan_at
         || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
-      if (!hitLockBudget && flagScanDue && options.allowFlagScan) {
+      if (!qresyncApplied && !hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
         const flagScanDeadline = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
         const canUseChangedSince = folder.highest_modseq !== null
@@ -1144,7 +1238,8 @@ export class MirrorEngine {
 
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
-      const reconcileDue = options.forceReconcile
+      const reconcileDue = qresyncFallbackRequired
+        || (!qresyncApplied && options.forceReconcile)
         || !folder.last_full_reconcile_at
         || !folder.next_reconcile_at
         || new Date(folder.next_reconcile_at).getTime() <= Date.now();
@@ -1243,7 +1338,7 @@ export class MirrorEngine {
             { backfilled, attempted: reconcile.missingInDbUids.length }
           );
         }
-        reconcileGapsFound = reconcile.markedCount + reconcile.missingInDbUids.length;
+        reconcileGapsFound += reconcile.markedCount + reconcile.missingInDbUids.length;
         // Gap count is evidence that the mirror drifted before this pass, not
         // evidence that it is still dirty afterward. Provider-missing rows are
         // tombstoned inside markMissingMessagesFromLiveUidStream, and every
@@ -1259,6 +1354,10 @@ export class MirrorEngine {
         uidValidity,
         uidNext,
         highestModseq: flagScanAttempted ? highestModseq : undefined,
+        qresyncHighestModseq: qresyncApplied
+          || (flagScanAttempted && reconcileAttempted && reconcileClean === true)
+          ? highestModseq
+          : undefined,
         lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,
@@ -1276,7 +1375,8 @@ export class MirrorEngine {
         flagScanAttempted,
         hitLockBudget,
         initialSyncComplete: true,
-        reconcileClean: reconcileClean === true
+        reconcileClean: reconcileClean === true,
+        qresyncReplayComplete: qresyncApplied
       };
     } finally {
       mailboxLock.release();

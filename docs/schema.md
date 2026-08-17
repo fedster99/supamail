@@ -43,6 +43,10 @@ Mailbox Account. The runtime uses this marker to reject a protected adapter
 before migration completes and to reject the identity adapter after cutover.
 The migration also rejects exact-match tokens that have no opaque envelope.
 
+`0025_qresync_cursor` adds a nullable per-folder QRESYNC mod-sequence cursor.
+It advances only after deletion-complete replay or an exact UID reconciliation,
+so flag-only CONDSTORE scans cannot move QRESYNC past unseen VANISHED history.
+
 `0022_content_extract_body_store` adds `search_extract`, a maximum 32 KiB UTF-8
 prefix of the parser's selected normalized plain text, plus an FTS expression
 index that does not store a duplicate generated vector. It also adds
