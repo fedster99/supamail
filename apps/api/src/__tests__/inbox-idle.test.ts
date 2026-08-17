@@ -590,6 +590,77 @@ describe("waitForInboxIdleWake", () => {
     opened.session.close();
   });
 
+  it("records a deferred NOTIFY signal that the active sync already reconciled", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 21,
+      messages: 20,
+      unseen: 2,
+      highestModseq: 30n
+    });
+    const traces = vi.fn();
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive", "Projects"],
+      onNotifyTrace: traces
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const signal = (sequence: number) => ({
+      sequence,
+      receivedAt: new Date("2026-08-17T18:00:00.000Z"),
+      monotonicReceivedAtMs: sequence,
+      eventType: "STATUS" as const,
+      connectionState: "SELECTED",
+      activeCommand: "IDLE"
+    });
+
+    const firstWait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("status", {
+      path: "Archive",
+      unseen: 2,
+      highestModseq: 21n,
+      notifySignal: signal(20)
+    });
+    await expect(firstWait).resolves.toMatchObject({ status: "wake" });
+
+    client.emit("status", {
+      path: "Projects",
+      unseen: 3,
+      highestModseq: 31n,
+      notifySignal: signal(21)
+    });
+    const handled = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    opened.session.syncClient.acknowledgeMailboxChanges?.(handled);
+
+    const firstIdleFinish = client.finishIdle;
+    const secondWait = opened.session.wait();
+    await vi.waitFor(() => expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 21 }),
+      result: "coalesced",
+      reason: "covered_by_reconciliation"
+    })));
+    await vi.waitFor(() => expect(client.finishIdle).not.toBe(firstIdleFinish));
+    client.finishIdle!(true);
+    await expect(secondWait).resolves.toEqual({ status: "renew" });
+    opened.session.close();
+  });
+
   it("records a parser-root NOTIFY signal that does not change the folder snapshot", async () => {
     const client = new FakeIdleClient();
     client.capabilities.set("NOTIFY", true);

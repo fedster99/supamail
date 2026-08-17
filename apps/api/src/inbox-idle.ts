@@ -53,6 +53,7 @@ type InboxIdleNotifyTraceDetail =
         | "deferred_wake_delivered"
         | "replay_in_progress"
         | "deferred_replaced"
+        | "covered_by_reconciliation"
         | "session_closed"
         | "connection_closed"
         | "not_accepting_events"
@@ -847,10 +848,15 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     const pendingChange = this.deferredNotifyWake ? this.changeFeed.peek(1)[0] : undefined;
     if (pendingChange) {
       this.deferredNotifyWake = false;
-      const signal = this.deferredNotifySignal?.folderPath === pendingChange.path
-        ? this.deferredNotifySignal.signal
+      const deferredSignal = this.deferredNotifySignal;
+      const signal = deferredSignal?.folderPath === pendingChange.path
+        ? deferredSignal.signal
         : null;
       this.deferredNotifySignal = null;
+      if (deferredSignal && !signal) this.traceHandoff({
+        folderPath: deferredSignal.folderPath,
+        notifySignal: deferredSignal.signal
+      }, "coalesced", "covered_by_reconciliation");
       const wake: InboxIdleWake = {
         kind: pendingChange.forceReconcile ? "exists" : "flags",
         accountId: this.accountId,
@@ -863,6 +869,15 @@ class ReusableInboxIdleSession implements InboxIdleSession {
         status: "wake",
         wake
       };
+    }
+    if (this.deferredNotifyWake) {
+      this.deferredNotifyWake = false;
+      const covered = this.deferredNotifySignal;
+      this.deferredNotifySignal = null;
+      if (covered) this.traceHandoff({
+        folderPath: covered.folderPath,
+        notifySignal: covered.signal
+      }, "coalesced", "covered_by_reconciliation");
     }
     if (!this.deferredInboxWake) return null;
     this.deferredInboxWake = false;
