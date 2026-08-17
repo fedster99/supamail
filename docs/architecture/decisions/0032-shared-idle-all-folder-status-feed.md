@@ -39,6 +39,14 @@ Unsolicited STATUS is routed safely even when another STATUS or LIST command is
 in flight, so a cross-folder signal cannot corrupt the active command response.
 Reconnect installs a fresh subscription because NOTIFY state is connection-local.
 
+Hosts may observe this boundary without changing sync behavior. Each raw
+EXISTS, EXPUNGE, FETCH-flags, STATUS, or NOTIFICATIONOVERFLOW response carries
+a connection-local sequence, receive time, connection state, and active
+command. The optional session observer reports NOTIFY arm state, ImapFlow event
+creation, and a fixed emitted, coalesced, ignored, or dropped handoff result.
+Observer failures are ignored. A hosted deployment can replace folder paths
+with its own anonymous tokens before it writes telemetry.
+
 When NOTIFY is unavailable, rejected, or disconnected, every
 60 seconds the shared connection checks tracked non-Inbox folders with the
 LIST-STATUS or bounded STATUS layers below. Inbox stays on IDLE so the same
@@ -114,6 +122,8 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 - STATUS is not deletion truth. Exact UID reconciliation remains mandatory.
 - No persistent connection is added per folder. LIST-STATUS, QRESYNC, and
   NOTIFY are independently flagged layers.
+- NOTIFY observation is passive. It adds no IMAP command and cannot block a
+  mailbox wake or sync.
 - LIST-STATUS reduces polling commands. It does not make its counts
   authoritative and does not replace the bounded STATUS fallback.
 - The public session API remains compatible with hosts already passing its

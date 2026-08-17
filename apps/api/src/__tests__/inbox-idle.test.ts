@@ -441,6 +441,246 @@ describe("waitForInboxIdleWake", () => {
     opened.session.close();
   });
 
+  it("reports and carries the parser-root NOTIFY signal without exposing content", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const traces = vi.fn();
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"],
+      onNotifyTrace: traces
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "notify_state",
+      reason: "armed",
+      notifyArmed: true,
+      notifyGeneration: 1,
+      observedAt: expect.any(Date),
+      monotonicObservedAtMs: expect.any(Number)
+    }));
+
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    const receivedAt = new Date("2026-08-17T18:00:00.000Z");
+    const notifySignal = {
+      sequence: 7,
+      receivedAt,
+      monotonicReceivedAtMs: 12,
+      eventType: "STATUS",
+      connectionState: "SELECTED",
+      activeCommand: "IDLE"
+    } as const;
+    client.emit("notifyResponse", notifySignal);
+    client.emit("status", {
+      path: "Archive",
+      highestModseq: 21n,
+      unseen: 2,
+      notifySignal
+    });
+
+    await expect(wait).resolves.toMatchObject({
+      status: "wake",
+      wake: {
+        kind: "flags",
+        folderPath: "Archive",
+        notifySignal
+      }
+    });
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "response_received",
+      signal: notifySignal,
+      notifyArmed: true,
+      notifyGeneration: 1
+    }));
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "imapflow_event_created",
+      signal: notifySignal,
+      folderPath: "Archive",
+    }));
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: notifySignal,
+      folderPath: "Archive",
+      result: "emitted",
+      reason: "wake_delivered"
+    }));
+    expect(JSON.stringify(traces.mock.calls)).not.toContain("highestModseq");
+    opened.session.close();
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "notify_state",
+      reason: "closed",
+      notifyArmed: false,
+      notifyGeneration: 1
+    }));
+  });
+
+  it("records which NOTIFY signal was coalesced before wake delivery", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const traces = vi.fn();
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"],
+      onNotifyTrace: traces
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    const signal = (sequence: number) => ({
+      sequence,
+      receivedAt: new Date("2026-08-17T18:00:00.000Z"),
+      monotonicReceivedAtMs: sequence,
+      eventType: "STATUS" as const,
+      connectionState: "SELECTED",
+      activeCommand: "IDLE"
+    });
+    client.emit("status", {
+      path: "Archive",
+      unseen: 2,
+      highestModseq: 21n,
+      notifySignal: signal(10)
+    });
+    client.emit("status", {
+      path: "Archive",
+      unseen: 3,
+      highestModseq: 22n,
+      notifySignal: signal(11)
+    });
+
+    await expect(wait).resolves.toMatchObject({
+      status: "wake",
+      wake: { notifySignal: { sequence: 11 } }
+    });
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 10 }),
+      result: "coalesced",
+      reason: "superseded"
+    }));
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 11 }),
+      result: "emitted",
+      reason: "wake_delivered"
+    }));
+    opened.session.close();
+  });
+
+  it("records a parser-root NOTIFY signal that does not change the folder snapshot", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const traces = vi.fn();
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"],
+      onNotifyTrace: traces
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const receivedAt = new Date("2026-08-17T18:00:00.000Z");
+    const notifySignal = {
+      sequence: 8,
+      receivedAt,
+      monotonicReceivedAtMs: 13,
+      eventType: "STATUS",
+      connectionState: "SELECTED",
+      activeCommand: "IDLE"
+    } as const;
+
+    client.emit("notifyResponse", notifySignal);
+    client.emit("status", {
+      ...client.statuses.get("Archive"),
+      notifySignal
+    });
+
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: notifySignal,
+      folderPath: "Archive",
+      result: "ignored",
+      reason: "unchanged"
+    }));
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+    opened.session.close();
+  });
+
+  it("does not let a NOTIFY observer failure block a mailbox wake", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"],
+      onNotifyTrace: () => { throw new Error("telemetry failed"); }
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("status", {
+      path: "Archive",
+      highestModseq: 21n,
+      notifySignal: {
+        sequence: 9,
+        receivedAt: new Date(),
+        monotonicReceivedAtMs: 14,
+        eventType: "STATUS",
+        connectionState: "SELECTED",
+        activeCommand: "IDLE"
+      }
+    });
+
+    await expect(wait).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "Archive", notifySignal: { sequence: 9 } }
+    });
+    opened.session.close();
+  });
+
   it("delivers a NOTIFY status received while Inbox selection is in flight", async () => {
     const client = new FakeIdleClient();
     client.capabilities.set("NOTIFY", true);
