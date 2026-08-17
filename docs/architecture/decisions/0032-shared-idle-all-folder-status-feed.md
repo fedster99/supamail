@@ -45,14 +45,17 @@ LIST-STATUS or bounded STATUS layers below. Inbox stays on IDLE so the same
 change is not queued twice.
 
 An independently deployable `IMAP_LIST_STATUS_ENABLED` layer may replace that
-batch with one LIST-STATUS command when the authenticated server advertises the
-extension. It is off by default. The command contains only the current tracked
-folder patterns. The response is filtered back to those exact paths, and every
-tracked folder must have a complete snapshot. The pinned ImapFlow dependency is
-patched to send this as one strict status-only command: no subscription lookup,
-auxiliary metadata, retry ladder, folder-cache update, or implicit per-mailbox
-STATUS fallback can bypass SupaMail's command throttle. A rejected, failed,
-empty, malformed, or partial response disables LIST-STATUS for that session and
+batch with one LIST-STATUS command on a conforming server, or two commands on a
+server that needs the compatibility retry. It is off by default. The first
+command contains only the current
+tracked folder patterns. The response is filtered back to those exact paths,
+and every tracked folder must have a complete snapshot. A server that accepts
+but truncates the multi-pattern form gets one `*` retry whose result is filtered
+back to the same bounded tracked set. The pinned ImapFlow dependency sends each
+attempt as a strict status-only command: no subscription lookup, auxiliary
+metadata, retry ladder, folder-cache update, or implicit per-mailbox STATUS
+fallback can bypass SupaMail's command throttle. A rejected, failed, empty,
+malformed, or still-partial response disables LIST-STATUS for that session and
 immediately returns to the bounded STATUS path. The dirty-signal and exact
 reconciliation semantics below do not change.
 

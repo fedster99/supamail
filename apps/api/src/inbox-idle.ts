@@ -387,14 +387,32 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     }
     const tracked = new Set(this.folderPaths);
     const statuses = await this.syncClient.listWithStatus!(STATUS_QUERY, this.folderPaths);
-    if (this.client.skipListStatusArgs === true) {
+    if (this.listStatusWasRejected()) {
       throw new Error("IMAP server rejected LIST-STATUS");
     }
-    const trackedStatuses = statuses.filter((status) => tracked.has(status.path));
+    let trackedStatuses = statuses.filter((status) => tracked.has(status.path));
     if (trackedStatuses.some((status) => !isCompleteStatus(status))) {
       throw new Error("IMAP server returned incomplete LIST-STATUS data");
     }
+    // Some otherwise capable servers accept LIST-EXTENDED pattern lists but
+    // return only the first match. Retry once with the standard wildcard form,
+    // then filter the result back to the bounded tracked set. A partial or
+    // malformed wildcard response still latches the existing STATUS fallback.
+    if (new Set(trackedStatuses.map((status) => status.path)).size !== tracked.size) {
+      const wildcardStatuses = await this.syncClient.listWithStatus!(STATUS_QUERY, ["*"]);
+      if (this.listStatusWasRejected()) {
+        throw new Error("IMAP server rejected LIST-STATUS");
+      }
+      trackedStatuses = wildcardStatuses.filter((status) => tracked.has(status.path));
+      if (trackedStatuses.some((status) => !isCompleteStatus(status))) {
+        throw new Error("IMAP server returned incomplete LIST-STATUS data");
+      }
+    }
     return trackedStatuses;
+  }
+
+  private listStatusWasRejected(): boolean {
+    return this.client.skipListStatusArgs === true;
   }
 
   private async probeMailboxChanges(): Promise<MailboxChange | null> {
