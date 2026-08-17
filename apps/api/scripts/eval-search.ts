@@ -1,50 +1,13 @@
-import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
-import { setTimeout as delay } from "node:timers/promises";
+import {
+  EphemeralPostgres,
+  installEphemeralPostgresSignalHandlers
+} from "./ephemeral-postgres.js";
 
-const execFileAsync = promisify(execFile);
 const dockerImage = process.env.LIVE_DB_POSTGRES_IMAGE ?? "postgres:16-alpine";
 
 type Scorecard = import("../src/eval/run.js").Scorecard;
 type ComparisonReport = import("../src/eval/run.js").ComparisonReport;
 type QueryMetrics = import("../src/eval/metrics.js").QueryMetrics;
-
-async function docker(args: string[], allowFailure = false): Promise<string> {
-  try {
-    const { stdout, stderr } = await execFileAsync("docker", args, { maxBuffer: 10 * 1024 * 1024 });
-    return `${stdout}${stderr}`.trim();
-  } catch (error) {
-    if (allowFailure) return "";
-    throw new Error(`docker ${args.join(" ")} failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-async function startDisposablePostgres(): Promise<{ url: string; cleanup: () => Promise<void> }> {
-  const name = `supamail-eval-${process.pid}-${randomUUID().slice(0, 8)}`;
-  await docker([
-    "run", "-d", "--rm", "--name", name,
-    "-e", "POSTGRES_PASSWORD=postgres", "-e", "POSTGRES_DB=postgres",
-    "-p", "127.0.0.1::5432", dockerImage
-  ]);
-  const cleanup = async (): Promise<void> => {
-    await docker(["rm", "-f", name], true);
-  };
-  try {
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const ready = await docker(["exec", name, "pg_isready", "-U", "postgres", "-d", "postgres"], true);
-      if (ready.includes("accepting connections")) break;
-      await delay(500);
-    }
-    const portOutput = await docker(["port", name, "5432/tcp"]);
-    const match = portOutput.match(/:(\d+)\s*$/m) ?? portOutput.match(/:(\d+)/);
-    if (!match) throw new Error(`Could not parse mapped Postgres port from: ${portOutput}`);
-    return { url: `postgresql://postgres:postgres@127.0.0.1:${match[1]}/postgres`, cleanup };
-  } catch (error) {
-    await cleanup();
-    throw error;
-  }
-}
 
 function pct(value: number): string {
   return (value * 100).toFixed(1).padStart(5) + "%";
@@ -152,13 +115,20 @@ function printComparison(report: ComparisonReport): void {
 
 async function main(): Promise<void> {
   const compareMode = process.argv.includes("--compare") || process.argv.includes("--baseline");
-  let cleanup: (() => Promise<void>) | null = null;
+  let disposable: EphemeralPostgres | null = null;
+  let removeSignalHandlers: (() => void) | null = null;
 
   if (!process.env.DATABASE_URL) {
     console.error(`[eval:search] no DATABASE_URL set; starting disposable ${dockerImage}`);
-    const disposable = await startDisposablePostgres();
-    process.env.DATABASE_URL = disposable.url;
-    cleanup = disposable.cleanup;
+    disposable = new EphemeralPostgres({
+      image: dockerImage,
+      namePrefix: "supamail-eval",
+      purpose: "search-evaluation"
+    });
+    removeSignalHandlers = installEphemeralPostgresSignalHandlers(disposable, {
+      logPrefix: "[eval:search]"
+    });
+    process.env.DATABASE_URL = await disposable.start();
   }
   process.env.IMAP_ENCRYPTION_KEY ??= "local-eval-encryption-key";
   process.env.IMAP_ALLOW_PRIVATE_HOSTS ??= "true";
@@ -184,7 +154,11 @@ async function main(): Promise<void> {
     // Machine-readable scorecard to stdout (summary went to stderr).
     process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
   } finally {
-    if (cleanup) await cleanup();
+    try {
+      if (disposable) await disposable.cleanup("completion");
+    } finally {
+      removeSignalHandlers?.();
+    }
   }
 }
 
