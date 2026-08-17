@@ -67,6 +67,7 @@ describe("config Inbox IDLE timeouts", () => {
     expect(config.IMAP_FOLDER_STATUS_INTERVAL_MS).toBe(60_000);
     expect(config.IMAP_LIST_STATUS_ENABLED).toBe(false);
     expect(config.IMAP_QRESYNC_ENABLED).toBe(false);
+    expect(config.IMAP_NOTIFY_ENABLED).toBe(false);
     expect(config.IMAP_IDLE_SOCKET_TIMEOUT_MS).toBe(30 * 60_000);
   });
 
@@ -77,6 +78,11 @@ describe("config Inbox IDLE timeouts", () => {
 
   it("accepts an independent QRESYNC rollout flag", () => {
     expect(getConfig({ ...baseEnv, IMAP_QRESYNC_ENABLED: "true" }).IMAP_QRESYNC_ENABLED)
+      .toBe(true);
+  });
+
+  it("accepts an independent NOTIFY rollout flag", () => {
+    expect(getConfig({ ...baseEnv, IMAP_NOTIFY_ENABLED: "true" }).IMAP_NOTIFY_ENABLED)
       .toBe(true);
   });
 

@@ -58,7 +58,7 @@ The real-server smoke suite currently covers:
 - Dovecot Maildir folder discovery without `SPECIAL-USE`
 - Dovecot slash delimiters, UID search, raw body fetch, and attachment metadata
 - Dovecot Archive folders staying trackable while Trash stays provider-excluded
-- Dovecot LIST-STATUS detection followed by complete QRESYNC flag and VANISHED replay
+- Dovecot real-time NOTIFY detection followed by complete QRESYNC flag and VANISHED replay
 
 LIST-STATUS is an optional command-reduction layer, not part of the minimum
 compatibility contract. Enable `IMAP_LIST_STATUS_ENABLED=true` only for a
@@ -76,6 +76,17 @@ flag-only CONDSTORE cursor, forces a real re-select, and applies changed flags
 and VANISHED UIDs in bounded batches. A rejected or incomplete replay falls back to
 CONDSTORE and exact UID reconciliation. Periodic exact reconciliation stays
 enabled even after successful QRESYNC replay.
+
+NOTIFY is an optional real-time wake layer, not a correctness dependency.
+Enable `IMAP_NOTIFY_ENABLED=true` only for a canary whose capability evidence
+confirms NOTIFY. SupaMail registers the selected mailbox plus the explicit
+tracked non-Inbox paths and treats each unsolicited STATUS as a dirty signal.
+A rejected command returns to LIST-STATUS or bounded STATUS. A
+`NOTIFICATIONOVERFLOW` disables NOTIFY for that connection, marks Inbox and all
+tracked folders dirty, then replaces the connection after all bounded catch-up
+batches are acknowledged.
+The periodic exact UID audit remains
+enabled in every case.
 
 ## Manual Smoke Checklist
 

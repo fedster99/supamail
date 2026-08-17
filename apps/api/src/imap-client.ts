@@ -122,6 +122,7 @@ export interface MirrorImapClient {
     path: string,
     query: Record<string, boolean>
   ): Promise<MailboxStatus>;
+  notify?(mailboxes: readonly string[]): Promise<MailboxStatus[] | false>;
   peekMailboxChanges?(limit?: number): readonly MailboxChange[];
   acknowledgeMailboxChanges?(changes: readonly MailboxChange[]): void;
   getMailboxLock(path: string, options?: { qresync?: QresyncRequest }): Promise<MailboxLock>;
@@ -214,6 +215,14 @@ export class ThrottledImapClient implements MirrorImapClient {
     );
     if (!status) throw new Error("IMAP STATUS returned no mailbox state");
     return status as MailboxStatus;
+  }
+
+  async notify(mailboxes: readonly string[]): Promise<MailboxStatus[] | false> {
+    await this.throttle.acquire(this.signal);
+    return await this.withCommandTimeout(
+      "notify",
+      async () => await this.client.notify([...mailboxes]) as MailboxStatus[] | false
+    );
   }
 
   peekMailboxChanges(limit?: number): readonly MailboxChange[] {
@@ -385,18 +394,31 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   private async withCommandTimeout<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    this.signal?.throwIfAborted();
     let timeout: NodeJS.Timeout | null = null;
+    let onAbort: (() => void) | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => {
         this.client.close();
         reject(new Error(`IMAP_COMMAND_TIMEOUT_MS exceeded during ${operation}`));
       }, this.commandTimeoutMs);
     });
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (!this.signal) return;
+      onAbort = () => {
+        this.client.close();
+        reject(this.signal!.reason instanceof Error
+          ? this.signal!.reason
+          : new DOMException(`IMAP ${operation} aborted`, "AbortError"));
+      };
+      this.signal.addEventListener("abort", onAbort, { once: true });
+    });
 
     try {
-      return await Promise.race([run(), timeoutPromise]);
+      return await Promise.race([run(), timeoutPromise, abortPromise]);
     } finally {
       if (timeout) clearTimeout(timeout);
+      if (onAbort) this.signal?.removeEventListener("abort", onAbort);
     }
   }
 }

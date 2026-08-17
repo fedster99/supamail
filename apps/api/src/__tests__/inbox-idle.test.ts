@@ -27,6 +27,10 @@ class FakeIdleClient extends EventEmitter {
     status
   })));
   status = vi.fn(async (path: string) => this.statuses.get(path)!);
+  notify = vi.fn(async (paths: string[]) => paths.flatMap((path) => {
+    const status = this.statuses.get(path);
+    return status ? [status] : [];
+  }));
   getMailboxLock = vi.fn(async (path: string, options?: { uidValidity?: bigint; changedSince?: bigint }) => {
     this.mailbox = {
       path,
@@ -379,6 +383,216 @@ describe("waitForInboxIdleWake", () => {
       wake: { folderPath: "Projects" }
     });
     expect(client.list).toHaveBeenCalledTimes(2);
+    expect(client.status).not.toHaveBeenCalled();
+    opened.session.close();
+  });
+
+  it("uses NOTIFY as the primary all-folder wake signal when enabled", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("notify");
+    expect(client.notify).toHaveBeenCalledWith(["Archive"]);
+    expect(client.list).not.toHaveBeenCalled();
+    expect(client.status).not.toHaveBeenCalled();
+
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("status", {
+      path: "Archive",
+      highestModseq: 21n,
+      unseen: 2
+    });
+
+    await expect(wait).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "flags", folderPath: "Archive" }
+    });
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Archive",
+        forceReconcile: false,
+        forceFlagScan: true,
+        observed: expect.objectContaining({
+          uidValidity: 2n,
+          uidNext: 11,
+          messages: 10,
+          highestModseq: 21n
+        })
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it("delivers a NOTIFY status received while Inbox selection is in flight", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    client.mailboxOpen.mockImplementationOnce(async () => {
+      client.emit("status", { path: "Archive", highestModseq: 21n });
+      return {};
+    });
+
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "flags", folderPath: "Archive" }
+    });
+    expect(client.idleStarted).toBe(false);
+    opened.session.close();
+  });
+
+  it("ignores NOTIFY status for a path outside the tracked set", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    client.emit("status", { path: "Provider/Ghost", uidNext: 2, messages: 1 });
+
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+    opened.session.close();
+  });
+
+  it("aborts a stalled NOTIFY command and closes the provider session", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.notify.mockImplementationOnce(async () => await new Promise<never>(() => undefined));
+    const controller = new AbortController();
+    const opening = openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      signal: controller.signal,
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    await vi.waitFor(() => expect(client.notify).toHaveBeenCalledTimes(1));
+
+    controller.abort(new DOMException("stop", "AbortError"));
+
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(client.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back after NOTIFICATIONOVERFLOW and marks every tracked folder dirty", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("LIST-STATUS", true);
+    for (const [path, uidValidity] of [["Archive", 2n], ["Projects", 3n]] as const) {
+      client.statuses.set(path, {
+        path,
+        uidValidity,
+        uidNext: 11,
+        messages: 10,
+        unseen: 1,
+        highestModseq: 20n
+      });
+    }
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive", "Projects"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    client.emit("notificationOverflow");
+
+    expect(opened.session.folderProbeStrategy).toBe("list_status");
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "INBOX" }
+    });
+    const overflowChanges = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    expect(overflowChanges).toEqual([
+      expect.objectContaining({ path: "INBOX", forceReconcile: true, forceFlagScan: true }),
+      expect.objectContaining({ path: "Archive", forceReconcile: true, forceFlagScan: true }),
+      expect.objectContaining({ path: "Projects", forceReconcile: true, forceFlagScan: true })
+    ]);
+    opened.session.syncClient.acknowledgeMailboxChanges?.(overflowChanges.slice(0, 1));
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { folderPath: "Archive" }
+    });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(overflowChanges.slice(1));
+    await expect(opened.session.wait()).resolves.toEqual({ status: "disconnected" });
+    expect(client.close).toHaveBeenCalledTimes(1);
+    opened.session.close();
+  });
+
+  it("falls back to LIST-STATUS when the NOTIFY command is rejected", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.notify.mockRejectedValueOnce(new Error("NOTIFY rejected"));
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderProbeStrategy).toBe("list_status");
+    expect(client.notify).toHaveBeenCalledTimes(1);
+    expect(client.list).toHaveBeenCalledTimes(1);
     expect(client.status).not.toHaveBeenCalled();
     opened.session.close();
   });

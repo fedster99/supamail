@@ -11,8 +11,8 @@ authoritative. That leaves changes in Archive, Sent, custom folders, and other
 tracked mailboxes waiting for the outer loop.
 
 Current Gmail, Microsoft Graph, JMAP, and Thunderbird designs separate lossy
-notification from durable replay. Current ImapFlow supports STATUS, CONDSTORE
-`CHANGEDSINCE`, and QRESYNC, but not NOTIFY. QRESYNC couples SELECT state to
+notification from durable replay. The pinned ImapFlow release supports STATUS,
+CONDSTORE `CHANGEDSINCE`, and QRESYNC, but has no NOTIFY API. QRESYNC couples SELECT state to
 VANISHED and flag events, so SupaMail must capture that replay before treating
 a persisted cursor as advanced.
 GreenMail 2.1.8 also lacks CONDSTORE and QRESYNC, so a correct generic path must
@@ -20,9 +20,29 @@ retain plain UID reconciliation.
 
 ## Decision
 
-Keep one read-only Inbox IDLE connection per Mailbox Account. Every 60 seconds,
-use that connection to STATUS a bounded, rotating batch of tracked non-Inbox
-folders. Inbox stays on IDLE so the same change is not queued twice.
+Keep one read-only Inbox IDLE connection per Mailbox Account. An independently
+deployable `IMAP_NOTIFY_ENABLED` layer uses RFC 5465 `NOTIFY SET STATUS` as the
+primary wake source when the server advertises NOTIFY. It registers
+MessageNew, MessageExpunge, and FlagChange for the selected mailbox and every
+explicitly named tracked non-Inbox mailbox. Initial STATUS snapshots establish
+the baseline; later unsolicited partial STATUS responses are merged into the
+existing dirty feed. The pinned ImapFlow dependency is patched with the
+command, unsolicited STATUS parsing, and response-code handling.
+
+NOTIFY rejection disables it for that session. An untagged
+`NOTIFICATIONOVERFLOW` also disables it and marks Inbox plus every tracked
+folder dirty for exact replay. After all bounded catch-up batches are
+acknowledged, the runtime replaces the connection because RFC 5465 defines
+overflow as `NOTIFY NONE`, which also suppresses selected-mailbox events. The
+next session registers NOTIFY again.
+Unsolicited STATUS is routed safely even when another STATUS or LIST command is
+in flight, so a cross-folder signal cannot corrupt the active command response.
+Reconnect installs a fresh subscription because NOTIFY state is connection-local.
+
+When NOTIFY is unavailable, rejected, or disconnected, every
+60 seconds the shared connection checks tracked non-Inbox folders with the
+LIST-STATUS or bounded STATUS layers below. Inbox stays on IDLE so the same
+change is not queued twice.
 
 An independently deployable `IMAP_LIST_STATUS_ENABLED` layer may replace that
 batch with one LIST-STATUS command when the authenticated server advertises the
@@ -71,7 +91,7 @@ disables QRESYNC for that connection. A successful QRESYNC replay may satisfy a
 dirty structural wake, but it never stamps the periodic full-reconcile cursor;
 the scheduled exact UID audit remains independent.
 
-Each renewal probes at most
+On the bounded STATUS fallback, each renewal probes at most
 `MAX_PRIORITY_FOLDERS_PER_CYCLE + MAX_RR_FOLDERS_PER_CYCLE` folders. With the
 defaults, 15 folders are checked per minute; larger tracked sets rotate, so the
 worst-case detection bound is `ceil(non-Inbox tracked folders / 15)` minutes.
@@ -83,14 +103,14 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 
 ## Consequences
 
-- Adds, moves, and deletes in every tracked folder normally wake sync within
-  one rotation instead of waiting for the outer loop.
+- Adds, moves, deletes, and flag changes in tracked folders normally wake sync
+  in real time on NOTIFY servers. Other servers remain bounded by one rotation.
 - Dovecot-class servers also detect arbitrary flag changes through modseq.
 - Servers without CONDSTORE detect read/unread changes through `UNSEEN`; other
   flag-only changes still rely on bounded flag scans and the periodic loop.
 - STATUS is not deletion truth. Exact UID reconciliation remains mandatory.
-- No persistent connection is added per folder. QRESYNC is independently
-  flagged, and NOTIFY remains a separate future layer.
+- No persistent connection is added per folder. LIST-STATUS, QRESYNC, and
+  NOTIFY are independently flagged layers.
 - LIST-STATUS reduces polling commands. It does not make its counts
   authoritative and does not replace the bounded STATUS fallback.
 - The public session API remains compatible with hosts already passing its
@@ -103,8 +123,9 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
   and CONDSTORE `CHANGEDSINCE` requests.
 - Live-DB integration proves that an Archive replacement targets only Archive,
   inserts the new UID, tombstones the removed UID, and acknowledges afterward.
-- Dovecot 2.4.1 smoke proves structural plus flag convergence through the
-  QRESYNC path, confirms VANISHED replay, and records mutation-to-wake latency.
+- Dovecot 2.4.1 smoke proves real-time Archive detection through NOTIFY,
+  structural plus flag convergence through QRESYNC, confirms VANISHED replay,
+  and records mutation-to-wake latency.
 - GreenMail 2.1.8 smoke proves a non-Inbox addition through basic STATUS without
   CONDSTORE and records mutation-to-wake latency.
 - The full typecheck, unit, build, live-DB, and both protocol smoke lanes remain
@@ -124,3 +145,4 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 - GreenMail 2.1.8, released 2025-12-14:
   <https://github.com/greenmail-mail-test/greenmail/releases/tag/release-2.1.8>
 - CONDSTORE and QRESYNC semantics: <https://www.rfc-editor.org/rfc/rfc7162.html>
+- NOTIFY semantics: <https://www.rfc-editor.org/rfc/rfc5465.html>
