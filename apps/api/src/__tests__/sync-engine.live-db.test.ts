@@ -131,6 +131,21 @@ liveDb("live DB reliability lane", () => {
     await closePool();
   });
 
+  it("leaves INITIAL_SYNC accounts to the outer scheduler", async () => {
+    const h = await setupIntegration("live-idle-bootstrap-ownership");
+    activeAccountIds.push(h.account.id);
+
+    expect((await h.repository.getIdleWatchAccounts()).map((account) => account.id))
+      .not.toContain(h.account.id);
+
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET sync_state = 'HEALTHY' WHERE id = $1",
+      [h.account.id]
+    );
+    expect((await h.repository.getIdleWatchAccounts()).map((account) => account.id))
+      .toContain(h.account.id);
+  });
+
   it("stores only a fixed code in pending-folder event diagnostics", async () => {
     const h = await setupIntegration("live-folder-diagnostic-code");
     activeAccountIds.push(h.account.id);
@@ -1751,6 +1766,18 @@ liveDb("live DB reliability lane", () => {
     const result = await engine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("success");
     expect(result.reconcileGapsFound).toBeGreaterThanOrEqual(1);
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    expect(result.reconcileProviderUidsSeen).toBe(2);
+    expect(result.reconcileDurationMs).toBeGreaterThanOrEqual(0);
+
+    const run = await h.pool.query<{ metadata: Record<string, unknown> }>(
+      "SELECT metadata FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0]?.metadata).toMatchObject({
+      reconcileFoldersAttempted: 1,
+      reconcileProviderUidsSeen: 2
+    });
 
     const uids = await h.pool.query<{ uid: string }>(
       `
@@ -1988,6 +2015,134 @@ liveDb("live DB reliability lane", () => {
 
     expect(result.missingInDbUids).toHaveLength(5_000);
     expect(result.missingInDbTruncated).toBe(true);
+  });
+
+  it("does not hold a database transaction while it waits for provider UIDs", async () => {
+    const h = await setupIntegration("live-reconcile-short-transaction", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+
+    const folder = await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
+
+    let idleInTransaction = true;
+    async function* providerUids() {
+      yield 1;
+      const activity = await h.pool.query<{ idle_in_transaction: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM pg_stat_activity
+           WHERE pid <> pg_backend_pid()
+             AND state = 'idle in transaction'
+             AND query ILIKE '%INSERT INTO supamail_live_uids%'
+         ) AS idle_in_transaction`
+      );
+      idleInTransaction = activity.rows[0]?.idle_in_transaction ?? true;
+      yield 2;
+    }
+
+    await h.repository.markMissingMessagesFromLiveUidStream(
+      h.account.id,
+      folder.rows[0],
+      Number(folder.rows[0].uidvalidity),
+      providerUids(),
+      { batchSize: 1 }
+    );
+
+    expect(idleInTransaction).toBe(false);
+  });
+
+  it("keeps real streamed UID progress when provider iteration fails", async () => {
+    const h = await setupIntegration("live-reconcile-stream-failure-progress", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 1) }).syncAccount(h.account.id, "manual");
+
+    const folder = await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
+    const progress = { providerUidsSeen: 0 };
+
+    async function* providerUids() {
+      yield 1;
+      yield 2;
+      throw new Error("provider UID stream failed");
+    }
+
+    await expect(h.repository.markMissingMessagesFromLiveUidStream(
+      h.account.id,
+      folder.rows[0],
+      Number(folder.rows[0].uidvalidity),
+      providerUids(),
+      { batchSize: 1, progress }
+    )).rejects.toThrow(/provider UID stream failed/i);
+    expect(progress.providerUidsSeen).toBe(2);
+
+    const message = await h.pool.query<{
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `SELECT deleted_in_provider, deleted_reason
+         FROM public.imap_messages
+        WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1`,
+      [h.account.id]
+    );
+    expect(message.rows[0]).toEqual({
+      deleted_in_provider: false,
+      deleted_reason: null
+    });
+  });
+
+  it("does not apply a staged reconcile after UIDVALIDITY changes", async () => {
+    const h = await setupIntegration("live-reconcile-generation-race", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 1) }).syncAccount(h.account.id, "manual");
+
+    const folder = await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
+    const originalUidValidity = Number(folder.rows[0].uidvalidity);
+
+    async function* providerUids() {
+      await h.pool.query(
+        "UPDATE public.imap_folders SET uidvalidity = $2 WHERE id = $1",
+        [folder.rows[0]!.id, originalUidValidity + 1]
+      );
+      if (false) yield 0;
+    }
+
+    await expect(h.repository.markMissingMessagesFromLiveUidStream(
+      h.account.id,
+      folder.rows[0],
+      originalUidValidity,
+      providerUids()
+    )).rejects.toThrow(/lost folder generation/i);
+
+    const message = await h.pool.query<{
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `SELECT deleted_in_provider, deleted_reason
+         FROM public.imap_messages
+        WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1`,
+      [h.account.id]
+    );
+    expect(message.rows[0]).toEqual({
+      deleted_in_provider: false,
+      deleted_reason: null
+    });
   });
 
   it("schedules an early retry when reconcile repair remains incomplete", async () => {

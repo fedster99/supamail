@@ -62,6 +62,34 @@ describe("repository safety", () => {
     expect(source).toContain(
       "metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null"
     );
+    expect(source).toContain("reconcileFoldersAttempted: result.reconcileFoldersAttempted ?? 0");
+    expect(source).toContain("reconcileProviderUidsSeen: result.reconcileProviderUidsSeen ?? 0");
+    expect(source).toContain("reconcileDurationMs: result.reconcileDurationMs ?? 0");
+  });
+
+  it("keeps initial-sync accounts in the outer scheduler instead of IDLE ownership", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const method = source.slice(
+      source.indexOf("async getIdleWatchAccounts("),
+      source.indexOf("async getAccountDetails(")
+    );
+
+    expect(method).toContain("sync_state <> 'INITIAL_SYNC'");
+  });
+
+  it("streams reconcile UIDs outside the final mutation transaction", async () => {
+    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
+    const method = source.slice(
+      source.indexOf("async markMissingMessagesFromLiveUidStream("),
+      source.indexOf("async getMessage(")
+    );
+
+    expect(method).toContain("ON COMMIT PRESERVE ROWS");
+    expect(method).toContain("DROP TABLE IF EXISTS pg_temp.supamail_live_uids");
+    expect(method.indexOf("for await (const uid of liveUids)")).toBeLessThan(
+      method.indexOf('client.query("BEGIN")')
+    );
+    expect(method).not.toContain("ON COMMIT DROP");
   });
 
   it("stores NULL raw_mime when BODY_STORAGE_MODE is parsed_only", async () => {
@@ -273,7 +301,7 @@ describe("repository safety", () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("CREATE TEMP TABLE supamail_live_uids");
-    expect(source).toContain("ON COMMIT DROP");
+    expect(source).toContain("ON COMMIT PRESERVE ROWS");
     expect(source).toContain("SELECT DISTINCT unnest($1::bigint[])");
   });
 

@@ -396,9 +396,17 @@ export class SentFolderAppender {
   }
 
   /** List mailboxes so the caller can resolve the Sent folder by special-use. */
-  async list(): Promise<Array<{ path: string; specialUse?: string | null }>> {
+  async list(): Promise<Array<{
+    path: string;
+    specialUse?: string | null;
+    delimiter?: string | null;
+  }>> {
     const boxes = await this.client.list();
-    return boxes.map((b) => ({ path: b.path, specialUse: b.specialUse ?? null }));
+    return boxes.map((b) => ({
+      path: b.path,
+      specialUse: b.specialUse ?? null,
+      delimiter: b.delimiter ?? null
+    }));
   }
 
   /**

@@ -1178,6 +1178,60 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(acknowledge).not.toHaveBeenCalled();
   });
 
+  it("records exact-reconcile cost when the reconcile attempt fails", async () => {
+    const h = await setupIntegration("failed-reconcile-telemetry", {
+      IMAP_QRESYNC_ENABLED: false,
+      INITIAL_SYNC_BATCH_SIZE: 500
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const engine = h.buildEngine({ folders });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET next_sync_due_at = now() - interval '1 second',
+           next_reconcile_at = now() - interval '1 second'
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    const reconcile = vi.spyOn(h.repository, "markMissingMessagesFromLiveUidStream")
+      .mockImplementation(async (_accountId, _folder, _uidValidity, liveUids, options) => {
+        let consumed = 0;
+        for await (const _uid of liveUids) {
+          consumed += 1;
+          if (options?.progress) options.progress.providerUidsSeen += 1;
+          if (consumed === 2) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            throw new Error("staged reconcile failed");
+          }
+        }
+        throw new Error("reconcile fixture did not yield two UIDs");
+      });
+
+    const idleClient = new FixtureImapClient(folders);
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    expect(result.reconcileProviderUidsSeen).toBe(2);
+    expect(result.reconcileDurationMs).toBeGreaterThan(0);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    const run = await h.pool.query<{ metadata: Record<string, unknown> }>(
+      "SELECT metadata FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0]?.metadata).toMatchObject({
+      reconcileFoldersAttempted: 1,
+      reconcileProviderUidsSeen: 2,
+      reconcileDurationMs: result.reconcileDurationMs
+    });
+  });
+
   it("chunks a CONDSTORE flag delta larger than the repository write limit", async () => {
     const h = await setupIntegration("condstore-large-delta", {
       INITIAL_SYNC_BATCH_SIZE: 500,

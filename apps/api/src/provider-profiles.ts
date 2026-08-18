@@ -3,7 +3,7 @@ export interface ProviderProfile {
   displayName: string;
   compatibilityStatus: "generic-core" | "profiled";
   knownQuirks: ProviderQuirk[];
-  priorityForFolder(path: string, specialUse?: string | null): number;
+  priorityForFolder(path: string, specialUse?: string | null, delimiter?: string | null): number;
   excludedReason(path: string, specialUse?: string | null): string | null;
   /**
    * Default IMAP coordinates for connect-time autodiscovery (email-008), used
@@ -56,19 +56,39 @@ function isAllMail(path: string, specialUse?: string | null): boolean {
   return normalizedSpecialUse === "all" || /(^|[/.])all\s*mail$/.test(normalizedFolder);
 }
 
+const sentFolderLeafNames = new Set(["sent", "sent items", "sent mail", "sent messages"]);
+
+function folderLeaf(path: string, delimiter?: string | null): string {
+  const normalized = normalizedPath(path);
+  const separator = delimiter && delimiter.length > 0 ? delimiter.toLowerCase() : null;
+  const leaf = separator
+    ? normalized.slice(normalized.lastIndexOf(separator) + separator.length)
+    : normalized.split(/[/.]/).pop() ?? "";
+  return leaf.replace(/\s+/g, " ").trim();
+}
+
+function isSentFolder(
+  path: string,
+  specialUse?: string | null,
+  delimiter?: string | null
+): boolean {
+  if (normalizedPath(specialUse ?? "").trim() === "sent") return true;
+  return sentFolderLeafNames.has(folderLeaf(path, delimiter));
+}
+
 export const genericImapProfile: ProviderProfile = {
   id: "generic-imap",
   displayName: "Generic IMAP",
   compatibilityStatus: "generic-core",
   knownQuirks: [],
-  priorityForFolder(path, specialUse) {
+  priorityForFolder(path, specialUse, delimiter) {
     const normalized = normalizedPath(specialUse || path);
     // IMAP hierarchy names commonly prefix every child with `INBOX.`. Only the
     // exact inbox role belongs in the hottest lane; treating every descendant
     // as Inbox can consume the bounded priority set and starve the real Sent
     // folder that outbound reconciliation depends on.
     if (normalized === "inbox") return 1;
-    if (normalized.includes("sent")) return 5;
+    if (isSentFolder(path, specialUse, delimiter)) return 5;
     return 100;
   },
   excludedReason(path, specialUse) {
@@ -96,10 +116,10 @@ export const rackspaceProfile: ProviderProfile = {
       handling: "The sync engine excludes INBOX.INBOX only after mailbox metadata fingerprint verification."
     }
   ],
-  priorityForFolder(path, specialUse) {
+  priorityForFolder(path, specialUse, delimiter) {
     const normalized = normalizedPath(specialUse || path);
     if (normalized === "inbox") return 1;
-    if (normalized.includes("sent")) return 5;
+    if (isSentFolder(path, specialUse, delimiter)) return 5;
     return 100;
   }
 };
@@ -266,18 +286,18 @@ interface SpecialUseRoleSpec {
    * follow-up that would CHANGE behavior and must be done knowingly.
    */
   fallback: (
-    mailboxes: Array<{ path: string; specialUse?: string | null }>,
+    mailboxes: Array<{ path: string; specialUse?: string | null; delimiter?: string | null }>,
     profile: ProviderProfile
   ) => string | null;
 }
 
-/** Leaf-name match used by the Trash/Drafts fallback: the last path segment
- * (split on `/` or `.`), lowercased, equals `name`. */
+/** Leaf-name match used by the Trash/Drafts fallback: the last path segment,
+ * using the advertised delimiter when available, lowercased, equals `name`. */
 function byLeafName(
-  mailboxes: Array<{ path: string; specialUse?: string | null }>,
+  mailboxes: Array<{ path: string; specialUse?: string | null; delimiter?: string | null }>,
   name: string
 ): string | null {
-  const found = mailboxes.find((m) => m.path.toLowerCase().split(/[/.]/).pop() === name);
+  const found = mailboxes.find((m) => folderLeaf(m.path, m.delimiter) === name);
   return found ? found.path : null;
 }
 
@@ -287,7 +307,9 @@ const SPECIAL_USE_ROLES: Record<SpecialUseRole, SpecialUseRoleSpec> = {
     specialUse: "\\sent",
     conventional: "Sent",
     fallback: (mailboxes, profile) => {
-      const found = mailboxes.find((m) => profile.priorityForFolder(m.path, m.specialUse) === 5);
+      const found = mailboxes.find(
+        (m) => profile.priorityForFolder(m.path, m.specialUse, m.delimiter) === 5
+      );
       return found ? found.path : null;
     }
   },
@@ -320,7 +342,7 @@ const SPECIAL_USE_ROLES: Record<SpecialUseRole, SpecialUseRoleSpec> = {
  * byte-equivalent to this in-memory predicate.
  */
 export function resolveSpecialUseFolder(
-  mailboxes: Array<{ path: string; specialUse?: string | null }>,
+  mailboxes: Array<{ path: string; specialUse?: string | null; delimiter?: string | null }>,
   role: SpecialUseRole,
   profile: ProviderProfile
 ): string {

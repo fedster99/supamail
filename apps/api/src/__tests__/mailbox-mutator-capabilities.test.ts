@@ -29,6 +29,11 @@ const fake = vi.hoisted(() => {
     close: vi.fn(),
     logout: vi.fn(async () => undefined),
     getMailboxLock: vi.fn(async (_path: string): Promise<FakeLock> => ({ release: vi.fn() })),
+    list: vi.fn(async () => [] as Array<{
+      path: string;
+      specialUse?: string | null;
+      delimiter?: string | null;
+    }>),
     messageFlagsAdd: vi.fn(async () => true),
     messageFlagsRemove: vi.fn(async () => true),
     messageMove: vi.fn(async () => ({ uidMap: new Map<number, number>([[42, 99]]) })),
@@ -48,6 +53,7 @@ vi.mock("imapflow", async () => {
       close = fake.close;
       logout = fake.logout;
       getMailboxLock = fake.getMailboxLock;
+      list = fake.list;
       messageFlagsAdd = fake.messageFlagsAdd;
       messageFlagsRemove = fake.messageFlagsRemove;
       messageMove = fake.messageMove;
@@ -86,10 +92,28 @@ beforeEach(() => {
   fake.mailbox = { uidValidity: 100 };
   fake.connectImpl.mockResolvedValue(undefined);
   fake.getMailboxLock.mockImplementation(async () => ({ release: vi.fn() }));
+  fake.list.mockResolvedValue([]);
   fake.messageFlagsAdd.mockResolvedValue(true);
   fake.messageFlagsRemove.mockResolvedValue(true);
   fake.messageMove.mockResolvedValue({ uidMap: new Map<number, number>([[42, 99]]) });
   fake.messageDelete.mockResolvedValue(true);
+});
+
+describe("mailbox discovery metadata", () => {
+  it("preserves a provider's custom hierarchy delimiter", async () => {
+    fake.list.mockResolvedValue([{
+      path: "INBOX|Deleted Items",
+      specialUse: null,
+      delimiter: "|"
+    }]);
+    const mutator = await MailboxMutator.connect({} as never, config, account);
+
+    await expect(mutator.list()).resolves.toEqual([{
+      path: "INBOX|Deleted Items",
+      specialUse: null,
+      delimiter: "|"
+    }]);
+  });
 });
 
 describe("B1: capability gates refuse rather than risk a blanket EXPUNGE", () => {

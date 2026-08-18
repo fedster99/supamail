@@ -301,6 +301,9 @@ export interface SyncResult {
   bodiesFetched: number;
   flagsUpdated: number;
   reconcileGapsFound: number;
+  reconcileFoldersAttempted?: number;
+  reconcileProviderUidsSeen?: number;
+  reconcileDurationMs?: number;
   hitLockBudget: boolean;
   errors: string[];
 }

@@ -21,6 +21,20 @@ describe("provider profiles", () => {
     expect(profile.priorityForFolder("INBOX.Sent")).toBe(5);
   });
 
+  it("does not mistake a folder that contains the word sent for Sent", () => {
+    for (const id of ["generic-imap", "rackspace"]) {
+      const profile = getProviderProfile(id);
+      expect(profile.priorityForFolder("Consent")).toBe(100);
+      expect(profile.priorityForFolder("Sentimental")).toBe(100);
+      expect(profile.priorityForFolder("INBOX.Consent")).toBe(100);
+      expect(profile.priorityForFolder("Sent Mail")).toBe(5);
+      expect(profile.priorityForFolder("Sent Messages")).toBe(5);
+      expect(profile.priorityForFolder("INBOX|Sent Items", null, "|")).toBe(5);
+      expect(profile.priorityForFolder("INBOX\\Sent", null, "\\")).toBe(5);
+      expect(profile.priorityForFolder("Unusual", "\\Sent")).toBe(5);
+    }
+  });
+
   it("keeps hierarchical generic-IMAP child folders out of the inbox lane", () => {
     const profile = getProviderProfile("generic-imap");
 
