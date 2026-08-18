@@ -101,11 +101,20 @@ type FolderSyncResult = {
   flagsUpdated: number;
   reconcileGapsFound: number;
   reconcileAttempted: boolean;
+  reconcileProviderUidsSeen: number;
+  reconcileDurationMs: number;
   flagScanAttempted: boolean;
   hitLockBudget: boolean;
   initialSyncComplete: boolean;
   reconcileClean: boolean;
   qresyncReplayComplete?: boolean;
+};
+
+type ReconcileAttemptTelemetry = {
+  attempted: boolean;
+  providerUidsSeen: number;
+  startedAt?: number;
+  durationMs: number;
 };
 
 type HistoryBatchResult = {
@@ -412,6 +421,9 @@ export class MirrorEngine {
       bodiesFetched: 0,
       flagsUpdated: 0,
       reconcileGapsFound: 0,
+      reconcileFoldersAttempted: 0,
+      reconcileProviderUidsSeen: 0,
+      reconcileDurationMs: 0,
       hitLockBudget: false,
       errors: []
     };
@@ -501,6 +513,11 @@ export class MirrorEngine {
           }
           if (mailboxChange !== undefined) attemptedMailboxChanges += 1;
 
+          const reconcileTelemetry: ReconcileAttemptTelemetry = {
+            attempted: false,
+            providerUidsSeen: 0,
+            durationMs: 0
+          };
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
               allowReconcile: !options.sentOnly && remainingReconciles > 0,
@@ -508,6 +525,7 @@ export class MirrorEngine {
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
+              reconcileTelemetry,
               forceReconcile: options.liveInboxOnly
                 && (mailboxChange?.forceReconcile === true
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
@@ -524,7 +542,6 @@ export class MirrorEngine {
             if (folderResult.hitLockBudget || this.isLockBudgetExpired(lockDeadline)) {
               result.hitLockBudget = true;
             }
-            if (folderResult.reconcileAttempted) remainingReconciles -= 1;
             if (folderResult.flagScanAttempted) remainingFlagScans -= 1;
             if (mailboxChange !== undefined
               && folderResult.initialSyncComplete
@@ -569,6 +586,13 @@ export class MirrorEngine {
             }
             if (isPriorityFolder) priorityFolderFailed = true;
             result.errors.push(sanitizeErrorReason(`${sanitizedPath}: ${message}`));
+          } finally {
+            if (reconcileTelemetry.attempted) {
+              result.reconcileFoldersAttempted! += 1;
+              result.reconcileProviderUidsSeen! += reconcileTelemetry.providerUidsSeen;
+              result.reconcileDurationMs! += reconcileTelemetry.durationMs;
+              remainingReconciles -= 1;
+            }
           }
         }
 
@@ -922,6 +946,7 @@ export class MirrorEngine {
       enforceLockDeadline: boolean;
       lockDeadline: number;
       metadataWriteStats: MetadataWriteStats;
+      reconcileTelemetry: ReconcileAttemptTelemetry;
       forceReconcile?: boolean;
       forceFlagScan?: boolean;
       signal?: AbortSignal;
@@ -987,6 +1012,8 @@ export class MirrorEngine {
           flagsUpdated: 0,
           reconcileGapsFound: 0,
           reconcileAttempted: false,
+          reconcileProviderUidsSeen: 0,
+          reconcileDurationMs: 0,
           flagScanAttempted: false,
           hitLockBudget: false,
           initialSyncComplete: false,
@@ -998,6 +1025,8 @@ export class MirrorEngine {
       let messagesUpserted = 0;
       let flagsUpdated = 0;
       let reconcileGapsFound = 0;
+      let reconcileProviderUidsSeen = 0;
+      let reconcileDurationMs = 0;
       let reconcileAttempted = false;
       let flagScanAttempted = false;
       let hitLockBudget = false;
@@ -1023,6 +1052,8 @@ export class MirrorEngine {
           flagsUpdated: 0,
           reconcileGapsFound: 0,
           reconcileAttempted: false,
+          reconcileProviderUidsSeen: 0,
+          reconcileDurationMs: 0,
           flagScanAttempted: false,
           hitLockBudget: this.folderHitLockBudget(options),
           initialSyncComplete: initial.initialSyncComplete,
@@ -1246,6 +1277,9 @@ export class MirrorEngine {
       let backfilled = 0;
       if (!hitLockBudget && options.allowReconcile && reconcileDue) {
         reconcileAttempted = true;
+        const reconcileStartedAt = Date.now();
+        options.reconcileTelemetry.attempted = true;
+        options.reconcileTelemetry.startedAt = reconcileStartedAt;
         const reconcileDeadline = Date.now() + this.config.RECONCILE_TOTAL_TIMEOUT_MS;
         // Spec §10.7: only reconcile once initial sync is complete and only
         // inside the active sync window. HISTORICAL/EXPIRED rows are static
@@ -1288,9 +1322,11 @@ export class MirrorEngine {
             // The unfiltered fallback confirms provider deletions only. Feeding its
             // archive UIDs into missing-in-DB repair would violate the live-window
             // boundary and turn a rare safety probe into unbounded history backfill.
-            findMissingInDb: !needsAllUidConfirmation
+            findMissingInDb: !needsAllUidConfirmation,
+            progress: options.reconcileTelemetry
           }
         );
+        reconcileProviderUidsSeen += reconcile.liveUidCount;
 
         // Spec §10.7 step 3: missingInDb → fetch + upsert (closes the gap).
         if (reconcile.missingInDbUids.length > 0) {
@@ -1348,6 +1384,7 @@ export class MirrorEngine {
         reconcileClean = !hitLockBudget
           && !reconcile.missingInDbTruncated
           && backfilled === reconcile.missingInDbUids.length;
+        reconcileDurationMs += Math.max(0, Date.now() - reconcileStartedAt);
       }
 
       await this.repository.markFolderSynced(folder.id, {
@@ -1372,6 +1409,8 @@ export class MirrorEngine {
         flagsUpdated,
         reconcileGapsFound,
         reconcileAttempted,
+        reconcileProviderUidsSeen,
+        reconcileDurationMs,
         flagScanAttempted,
         hitLockBudget,
         initialSyncComplete: true,
@@ -1379,6 +1418,12 @@ export class MirrorEngine {
         qresyncReplayComplete: qresyncApplied
       };
     } finally {
+      if (options.reconcileTelemetry.startedAt !== undefined) {
+        options.reconcileTelemetry.durationMs = Math.max(
+          0,
+          Date.now() - options.reconcileTelemetry.startedAt
+        );
+      }
       mailboxLock.release();
     }
   }

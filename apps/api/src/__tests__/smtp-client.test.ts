@@ -25,10 +25,22 @@ const transport = vi.hoisted(() => ({
 const createTransport = vi.hoisted(() =>
   vi.fn((_options: Record<string, unknown>) => transport)
 );
+const imap = vi.hoisted(() => ({
+  list: vi.fn(async () => [] as Array<{
+    path: string;
+    specialUse?: string | null;
+    delimiter?: string | null;
+  }>),
+  logout: vi.fn(async () => undefined),
+  close: vi.fn()
+}));
+const connectImap = vi.hoisted(() => vi.fn(async () => imap));
 
 vi.mock("nodemailer", () => ({
   default: { createTransport }
 }));
+
+vi.mock("../imap-connect.js", () => ({ connectImap }));
 
 const FROM = { email: "sender@example.test" };
 
@@ -44,6 +56,30 @@ const base: SendRequest = {
   subject: "Hello",
   body: { format: "plain", text: "Body" }
 };
+
+describe("SentFolderAppender mailbox discovery", () => {
+  beforeEach(() => {
+    connectImap.mockClear();
+    imap.list.mockReset();
+    imap.list.mockResolvedValue([]);
+  });
+
+  it("preserves a provider's custom hierarchy delimiter", async () => {
+    imap.list.mockResolvedValue([{
+      path: "INBOX|Sent Items",
+      specialUse: null,
+      delimiter: "|"
+    }]);
+    const { SentFolderAppender } = await import("../smtp-client.js");
+    const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
+
+    await expect(appender.list()).resolves.toEqual([{
+      path: "INBOX|Sent Items",
+      specialUse: null,
+      delimiter: "|"
+    }]);
+  });
+});
 
 describe("buildRawMime header denylist", () => {
   it("rejects forged structural/identity headers (Bcc/From/To/Cc/Sender/Reply-To/Content-Type/MIME-Version)", async () => {

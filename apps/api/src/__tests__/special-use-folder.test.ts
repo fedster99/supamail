@@ -67,6 +67,18 @@ describe("resolveSpecialUseFolder", () => {
     ).toBe("Sent Items");
   });
 
+  it("uses the advertised hierarchy delimiter for conventional role leaves", () => {
+    const boxes = [
+      { path: "INBOX|Sent Items", specialUse: null, delimiter: "|" },
+      { path: "INBOX|Drafts", specialUse: null, delimiter: "|" },
+      { path: "INBOX|Trash", specialUse: null, delimiter: "|" }
+    ];
+
+    expect(resolveSpecialUseFolder(boxes, "sent", genericImapProfile)).toBe("INBOX|Sent Items");
+    expect(resolveSpecialUseFolder(boxes, "drafts", genericImapProfile)).toBe("INBOX|Drafts");
+    expect(resolveSpecialUseFolder(boxes, "trash", genericImapProfile)).toBe("INBOX|Trash");
+  });
+
   it("sent does NOT use the Trash/Drafts leaf-name strategy (a Trash-named folder never wins sent)", () => {
     // No special-use, no priority-5 folder → sent falls through to conventional "Sent",
     // proving sent ignores the leaf-name fallback that trash/drafts use.

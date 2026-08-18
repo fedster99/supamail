@@ -106,6 +106,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
   - Inbox remains first in bounded full-sweep priority selection. Sent stays at priority 5 and receives a supplemental lightweight refresh on its separate cadence.
+  - Sent discovery accepts RFC SPECIAL-USE or an exact conventional Sent leaf name. A folder that only contains the letters `sent`, such as `Consent`, must stay in the normal lane.
   - Body fetch is capped at up to 100 live bodies per worker tick.
   - Raw MIME fetch is capped at 25 MB per message by default. In `parsed_only`, a known-complete message up to 4 MiB can use the bounded UID-set fast path. One FETCH covers at most 10 same-folder messages and at most 8 MiB of aggregate source. The fetch and parse complete before body storage, and the loop issues no nested IMAP commands. Larger, unknown-size, and cap-limited messages must use the streaming full-message download. `raw_mime` may buffer because persistence explicitly requires the bytes.
   - For every body path, commit search/threading evidence first, then call `BodyStore`, then mark body completion. A batch failure can leave earlier messages complete, but every uncommitted message must remain retryable.
@@ -119,6 +120,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   `last_uid`; continuous arrivals must not reset or postpone historical
   snapshot progress.
 - Initial sync SEARCH/FETCH work is bounded by `INITIAL_SYNC_BATCH_TIMEOUT_MS`; a timeout aborts the IMAP client and must not advance the initial-sync watermark.
+- Hosts must leave `INITIAL_SYNC` Mailbox Accounts in the outer scheduler. A passive IDLE owner must not make a bounded bootstrap batch wait for the periodic listener audit.
 - A failed initial sync batch must not advance watermarks.
 - `live_window_days` is immutable after account creation in v0.1; changing it requires a future window-status migration story.
 - `PATCH /accounts/:id/settings` may change `bodyFetchPolicy` only to `immediate`, `lazy`, or `priority_then_backfill`. The endpoint stays strict and rejects invalid, empty, or unknown input.
@@ -138,6 +140,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Reconcile must handle both sides: mark provider-missing local rows and backfill missing-in-DB provider UIDs.
 - If a live-window UID stream is empty while live-window mirror rows remain, confirm against an unfiltered UID stream before tombstoning. Use that fallback only for deletion evidence; never backfill provider-only archive UIDs from it, and keep a second empty response fail-closed.
 - Reconcile gap telemetry describes drift observed before repair; `last_reconcile_clean` and account health describe the mirror after repair. A pass that tombstones every provider-missing row and backfills every returned missing-in-DB UID is clean even when `reconcile_gaps_found` is nonzero.
+- Exact reconcile stages provider UIDs in a session-local temporary table outside the final mutation transaction. The short final transaction validates the folder UIDVALIDITY, applies tombstones, and selects missing rows. Sync-run metadata records attempted folders, provider UID count, and elapsed time without mailbox content.
 - Missing-in-DB repair is bounded to 5,000 UIDs per pass and must detect overflow with a sentinel row. Overflow, lock-budget interruption, or incomplete backfill leaves reconcile unclean and schedules another reconcile on the next full-sync cadence instead of the normal six-hour cadence.
 
 ## Health And Backoff

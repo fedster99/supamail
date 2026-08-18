@@ -159,9 +159,17 @@ export class MailboxMutator {
   }
 
   /** List mailboxes so callers can resolve Trash (or validate a move target). */
-  async list(): Promise<Array<{ path: string; specialUse?: string | null }>> {
+  async list(): Promise<Array<{
+    path: string;
+    specialUse?: string | null;
+    delimiter?: string | null;
+  }>> {
     const boxes = await this.client.list();
-    return boxes.map((b) => ({ path: b.path, specialUse: b.specialUse ?? null }));
+    return boxes.map((b) => ({
+      path: b.path,
+      specialUse: b.specialUse ?? null,
+      delimiter: b.delimiter ?? null
+    }));
   }
 
   /**

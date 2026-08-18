@@ -819,6 +819,7 @@ export class MirrorRepository {
       `SELECT *
        FROM public.imap_accounts
        WHERE sync_state <> 'PAUSED'
+         AND sync_state <> 'INITIAL_SYNC'
          AND (sync_state <> 'BROKEN' OR backoff_until IS NOT NULL)
          AND (backoff_until IS NULL OR backoff_until <= now())
        ORDER BY id`
@@ -1104,7 +1105,10 @@ export class MirrorRepository {
           metadataWriteDurationMs: result.metadataWriteDurationMs ?? 0,
           metadataWriteBatchesAttempted: result.metadataWriteBatchesAttempted ?? 0,
           metadataWriteBatchesFailed: result.metadataWriteBatchesFailed ?? 0,
-          metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null
+          metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null,
+          reconcileFoldersAttempted: result.reconcileFoldersAttempted ?? 0,
+          reconcileProviderUidsSeen: result.reconcileProviderUidsSeen ?? 0,
+          reconcileDurationMs: result.reconcileDurationMs ?? 0
         })
       ]
     );
@@ -1789,7 +1793,11 @@ export class MirrorRepository {
 
     for (const folder of folders) {
       seen.add(folder.path);
-      const syncPriority = profile.priorityForFolder(folder.path, folder.specialUse);
+      const syncPriority = profile.priorityForFolder(
+        folder.path,
+        folder.specialUse,
+        folder.delimiter
+      );
       const manuallyTracked = manualOverridePaths.has(folder.path);
       const providerExcludedReason = folder.excludedReasonOverride
         ?? profile.excludedReason(folder.path, folder.specialUse);
@@ -3450,10 +3458,9 @@ export class MirrorRepository {
   }
 
   // Reconcile via a streamed temp table rather than a `bigint[]` parameter:
-  // heavy mailboxes (e.g. Gmail "All Mail") routinely surface 100k+ UIDs,
-  // which blows up array-parameter encoding and forces the entire UID set
-  // into Node memory. The TEMP TABLE … ON COMMIT DROP scopes lifetime to
-  // the surrounding transaction, so no cleanup is needed on failure.
+  // heavy mailboxes routinely surface 100k+ UIDs. Provider iteration and
+  // staging are intentionally outside the final mutation transaction so a slow
+  // IMAP stream cannot leave Postgres idle in transaction.
   async markMissingMessagesFromLiveUidStream(
     accountId: string,
     folder: ImapFolder,
@@ -3464,6 +3471,7 @@ export class MirrorRepository {
       emptyError?: string;
       batchSize?: number;
       findMissingInDb?: boolean;
+      progress?: { providerUidsSeen: number };
     } = {}
   ): Promise<{
     markedCount: number;
@@ -3475,6 +3483,8 @@ export class MirrorRepository {
     const client = await this.pool.connect();
     const batch: number[] = [];
     let liveUidCount = 0;
+    let inTransaction = false;
+    let discardClient = false;
 
     const flush = async () => {
       if (batch.length === 0) return;
@@ -3488,12 +3498,15 @@ export class MirrorRepository {
       );
     };
 
-    await client.query("BEGIN");
     try {
-      await client.query("CREATE TEMP TABLE supamail_live_uids (uid bigint PRIMARY KEY) ON COMMIT DROP");
+      await client.query("DROP TABLE IF EXISTS pg_temp.supamail_live_uids");
+      await client.query(
+        "CREATE TEMP TABLE supamail_live_uids (uid bigint PRIMARY KEY) ON COMMIT PRESERVE ROWS"
+      );
 
       for await (const uid of liveUids) {
         liveUidCount += 1;
+        if (options.progress) options.progress.providerUidsSeen += 1;
         batch.push(uid);
         if (batch.length >= batchSize) await flush();
       }
@@ -3501,6 +3514,19 @@ export class MirrorRepository {
 
       if (liveUidCount === 0 && options.failIfEmpty) {
         throw new Error(options.emptyError ?? `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`);
+      }
+
+      await client.query("BEGIN");
+      inTransaction = true;
+      const generation = await client.query<{ uidvalidity: string | null }>(
+        `SELECT uidvalidity::text AS uidvalidity
+           FROM public.imap_folders
+          WHERE id = $1 AND account_id = $2
+          FOR SHARE`,
+        [folder.id, accountId]
+      );
+      if (Number(generation.rows[0]?.uidvalidity) !== uidValidity) {
+        throw new Error(`Reconcile lost folder generation ${folder.id}`);
       }
 
       const markedResult = await client.query<{ count: string }>(
@@ -3556,6 +3582,7 @@ export class MirrorRepository {
       );
 
       await client.query("COMMIT");
+      inTransaction = false;
       return {
         markedCount: Number(markedResult.rows[0].count),
         liveUidCount,
@@ -3565,10 +3592,20 @@ export class MirrorRepository {
         missingInDbTruncated: missingResult.rows.length > RECONCILE_MISSING_UID_LIMIT
       };
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      if (inTransaction) {
+        await client.query("ROLLBACK").catch(() => {
+          discardClient = true;
+        });
+        inTransaction = false;
+      }
       throw error;
     } finally {
-      client.release();
+      if (!discardClient) {
+        await client.query("DROP TABLE IF EXISTS pg_temp.supamail_live_uids").catch(() => {
+          discardClient = true;
+        });
+      }
+      client.release(discardClient);
     }
   }
 
