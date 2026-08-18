@@ -99,7 +99,11 @@ Hosts may reduce mailbox latency with the exported `openInboxIdleSession`
 primitive. It keeps one read-only Inbox IDLE session for `exists`, `expunge`,
 and `flags` hints. When enabled and advertised, NOTIFY supplies real-time dirty
 signals for the explicit tracked non-Inbox paths; LIST-STATUS or bounded STATUS
-is the fallback. These signals are not mirror truth. The host
+is the fallback. On reconnect, the session arms NOTIFY and compares current
+folder snapshots with persisted cursors. Unless the deletion-complete QRESYNC
+cursor matches the provider modseq, the folder is reconciled once; the
+flag-only CONDSTORE cursor is not deletion proof. Without a comparable flag
+modseq, it is also flag-scanned. These signals are not mirror truth. The host
 passes the session into the compatibility-named `liveInboxOnly` path, which
 targets the exact changed folders and forces their indicated UID reconcile or
 flag work under the existing per-cycle operation caps; unfinished snapshots

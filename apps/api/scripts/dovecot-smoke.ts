@@ -90,6 +90,25 @@ async function mappedPort(name: string): Promise<number> {
   return Number(match[1]);
 }
 
+async function withInjector<T>(
+  port: number,
+  run: (client: ImapFlow) => Promise<T>
+): Promise<T> {
+  const client = new ImapFlow({
+    host: "127.0.0.1",
+    port,
+    secure: false,
+    auth: { user: mailbox, pass: password },
+    logger: false
+  });
+  await client.connect();
+  try {
+    return await run(client);
+  } finally {
+    await client.logout().catch(() => client.close());
+  }
+}
+
 function dovecotConfig(): string {
   return [
     "dovecot_config_version = 2.4.1",
@@ -329,19 +348,9 @@ async function main(): Promise<void> {
     const waitForWake = async (message: string) => {
       const waiting = session.wait();
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const injector = new ImapFlow({
-        host: "127.0.0.1",
-        port: imapPort,
-        secure: false,
-        auth: { user: mailbox, pass: password },
-        logger: false
-      });
-      await injector.connect();
-      try {
+      await withInjector(imapPort, async (injector) => {
         await injector.append("INBOX", Buffer.from(message));
-      } finally {
-        await injector.logout().catch(() => injector.close());
-      }
+      });
       return await Promise.race([
         waiting,
         new Promise<never>((_, reject) => setTimeout(
@@ -368,16 +377,8 @@ async function main(): Promise<void> {
       }
       const archiveWaiting = session.wait();
       await new Promise((resolve) => setTimeout(resolve, 100));
-      const injector = new ImapFlow({
-        host: "127.0.0.1",
-        port: imapPort,
-        secure: false,
-        auth: { user: mailbox, pass: password },
-        logger: false
-      });
-      await injector.connect();
       let mutationCompletedAt = 0;
-      try {
+      await withInjector(imapPort, async (injector) => {
         const archiveLock = await injector.getMailboxLock("Archive");
         const oldUids: number[] = [];
         try {
@@ -404,9 +405,7 @@ async function main(): Promise<void> {
           mutationLock.release();
         }
         mutationCompletedAt = Date.now();
-      } finally {
-        await injector.logout().catch(() => injector.close());
-      }
+      });
       const archiveWake = await Promise.race([
         archiveWaiting,
         new Promise<never>((_, reject) => setTimeout(
@@ -436,6 +435,29 @@ async function main(): Promise<void> {
     } finally {
       session.close();
     }
+    const beforeReconnect = await countRows(account.id);
+    await withInjector(imapPort, async (gapInjector) => {
+      await gapInjector.append(
+        "Sent",
+        Buffer.from(plainMessage("sent-gap", "Dovecot reconnect Sent", "Sent during disconnect."))
+      );
+    });
+    const reconnected = await openInboxIdleSession(pool, config, idleAccount);
+    if (reconnected.status !== "ready") throw new Error("Dovecot reconnect did not advertise IDLE");
+    const reconnectSession = reconnected.session;
+    const reconnectPending = reconnectSession.syncClient.peekMailboxChanges?.() ?? [];
+    const sentPending = reconnectPending.some((change) => change.path === "Sent");
+    let reconnectResult: Awaited<ReturnType<MirrorEngine["syncAccount"]>>;
+    try {
+      reconnectResult = await engine.syncAccount(account.id, "scheduled", {
+        liveInboxOnly: true,
+        client: reconnectSession.syncClient,
+        clientAccountId: reconnectSession.accountId,
+        keepClientOpen: true
+      });
+    } finally {
+      reconnectSession.close();
+    }
     const idleCounts = await countRows(account.id);
     const qresyncEvent = await pool.query<{
       payload: {
@@ -464,8 +486,12 @@ async function main(): Promise<void> {
       ["kept Archive trackable", counts.trackedArchive],
       ["excluded Trash by provider profile", counts.excludedTrash],
       ["no false provider deletes before live changes", counts.deletedMessages === 0],
-      ["same-session IDLE and NOTIFY sync stored both arrivals", idleCounts.messages === 6],
+      ["same-session IDLE and NOTIFY sync stored both arrivals", beforeReconnect.messages === 6],
       ["Archive NOTIFY sync reconciled the removed row", idleCounts.deletedMessages === 1],
+      ["reconnect marked Sent changed before the periodic audit", sentPending],
+      ["reconnect catch-up targeted one changed folder", reconnectResult.outcome === "success"
+        && reconnectResult.foldersProcessed === 1],
+      ["reconnect catch-up stored the Sent arrival", idleCounts.messages === beforeReconnect.messages + 1],
       ["Archive NOTIFY wake stayed below the polling fallback interval", archiveWakeLatencyMs !== null && archiveWakeLatencyMs < 3_000],
       ["Archive NOTIFY sync targeted one folder", archiveLiveResult?.foldersProcessed === 1],
       ["Archive replay used complete QRESYNC", archiveQresync?.accepted === true
@@ -487,6 +513,8 @@ async function main(): Promise<void> {
       cursorResult,
       counts,
       idleCounts,
+      reconnectSentPending: sentPending,
+      reconnectResult,
       archiveWakeLatencyMs,
       archiveLiveResult,
       archiveQresync
