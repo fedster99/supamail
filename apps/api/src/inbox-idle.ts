@@ -13,7 +13,7 @@ import {
   type MirrorImapClient
 } from "./imap-client.js";
 import { MirrorRepository } from "./repository.js";
-import type { ImapAccount } from "./types.js";
+import type { ImapAccount, ImapFolder } from "./types.js";
 
 export type InboxIdleWakeKind = "exists" | "expunge" | "flags";
 
@@ -113,12 +113,31 @@ export type OpenInboxIdleSessionResult =
   | { status: "ready"; session: InboxIdleSession }
   | { status: "unsupported"; connectedAt: Date };
 
+type InitialFolderStatus = Partial<MailboxStatus> & Pick<MailboxStatus, "path"> & {
+  qresyncHighestModseq?: bigint | number;
+  reconnectCursor?: boolean;
+};
+
 export interface OpenInboxIdleSessionOptions {
   signal?: AbortSignal;
   now?: () => Date;
   clientFactory?: () => Promise<InboxIdleClient>;
   folderPathsFactory?: () => Promise<string[]>;
+  initialFolderStatuses?: InitialFolderStatus[];
   onNotifyTrace?: (trace: InboxIdleNotifyTrace) => void;
+}
+
+function persistedFolderStatus(folder: ImapFolder): InitialFolderStatus {
+  return {
+    path: folder.path,
+    uidValidity: folder.uidvalidity === null ? undefined : BigInt(folder.uidvalidity),
+    uidNext: folder.uid_next === null ? undefined : Number(folder.uid_next),
+    highestModseq: folder.highest_modseq === null ? undefined : BigInt(folder.highest_modseq),
+    qresyncHighestModseq: folder.qresync_highest_modseq === null
+      ? undefined
+      : BigInt(folder.qresync_highest_modseq),
+    reconnectCursor: true
+  };
 }
 
 const STATUS_QUERY = {
@@ -141,20 +160,32 @@ function statusValue(value: bigint | number | undefined): string | null {
   return value === undefined ? null : String(value);
 }
 
-function sameStatus(left: MailboxStatus, right: MailboxStatus): boolean {
-  return statusValue(left.uidValidity) === statusValue(right.uidValidity)
-    && left.uidNext === right.uidNext
-    && left.messages === right.messages
-    && left.unseen === right.unseen
-    && statusValue(left.highestModseq) === statusValue(right.highestModseq);
+function knownValueChanged(
+  previous: bigint | number | undefined,
+  observed: bigint | number | undefined
+): boolean {
+  return previous !== undefined
+    && observed !== undefined
+    && statusValue(previous) !== statusValue(observed);
 }
 
-function mailboxChange(previous: MailboxStatus, observed: MailboxStatus): MailboxChange {
-  const structural = statusValue(previous.uidValidity) !== statusValue(observed.uidValidity)
-    || previous.uidNext !== observed.uidNext
-    || previous.messages !== observed.messages;
-  const flags = statusValue(previous.highestModseq) !== statusValue(observed.highestModseq)
-    || previous.unseen !== observed.unseen;
+function sameKnownStatus(previous: InitialFolderStatus, observed: MailboxStatus): boolean {
+  return !knownValueChanged(previous.uidValidity, observed.uidValidity)
+    && !knownValueChanged(previous.uidNext, observed.uidNext)
+    && !knownValueChanged(previous.messages, observed.messages)
+    && !knownValueChanged(previous.unseen, observed.unseen)
+    && !knownValueChanged(previous.highestModseq, observed.highestModseq);
+}
+
+function mailboxChange(previous: InitialFolderStatus, observed: MailboxStatus): MailboxChange {
+  const modseqChanged = knownValueChanged(previous.highestModseq, observed.highestModseq);
+  const structural = knownValueChanged(previous.uidValidity, observed.uidValidity)
+    || knownValueChanged(previous.uidNext, observed.uidNext)
+    || knownValueChanged(previous.messages, observed.messages)
+    // Persisted folder cursors do not include MESSAGES. A MODSEQ change while
+    // disconnected can therefore be an expunge, so retain exact reconciliation.
+    || (previous.messages === undefined && modseqChanged);
+  const flags = modseqChanged || knownValueChanged(previous.unseen, observed.unseen);
   return {
     path: observed.path,
     forceReconcile: structural,
@@ -164,9 +195,16 @@ function mailboxChange(previous: MailboxStatus, observed: MailboxStatus): Mailbo
 }
 
 class SessionMailboxChangeFeed implements MailboxChangeFeed {
-  private readonly baseline = new Map<string, MailboxStatus>();
+  private readonly baseline = new Map<string, InitialFolderStatus>();
   private readonly pending = new Map<string, MailboxChange>();
   private readonly replayDepth = new Map<string, number>();
+  private initializing = true;
+
+  constructor(private readonly qresyncDeletionHistory: boolean) {}
+
+  finishInitialization(): void {
+    this.initializing = false;
+  }
 
   beginReplay(path: string): void {
     this.replayDepth.set(path, (this.replayDepth.get(path) ?? 0) + 1);
@@ -182,7 +220,7 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
     return (this.replayDepth.get(path) ?? 0) > 0;
   }
 
-  seed(statuses: readonly MailboxStatus[]): void {
+  seed(statuses: readonly InitialFolderStatus[]): void {
     for (const status of statuses) this.baseline.set(status.path, status);
   }
 
@@ -209,9 +247,48 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
       ...observed,
       path: observed.path
     };
-    if (pending && sameStatus(pending.observed, status)) return null;
-    if (sameStatus(previous, status)) return null;
-    const detected = mailboxChange(previous, status);
+    if (status.uidValidity === undefined) {
+      return this.signal(observed.path, true, true);
+    }
+    const {
+      qresyncHighestModseq: _qresyncHighestModseq,
+      reconnectCursor: _reconnectCursor,
+      ...providerStatus
+    } = status;
+    const completeStatus = providerStatus as MailboxStatus;
+    if (pending && sameKnownStatus(pending.observed, completeStatus)) {
+      if (this.initializing) {
+        this.pending.set(observed.path, { ...pending, observed: completeStatus });
+      }
+      return null;
+    }
+    // Persisted folder state has no MESSAGES/UNSEEN snapshot. Only a
+    // deletion-complete QRESYNC cursor can prove that no expunge occurred;
+    // the flag-only CONDSTORE cursor cannot. Otherwise reconcile this folder
+    // once and retain the real provider snapshot after acknowledgement.
+    if (!pending && previous.reconnectCursor === true) {
+      const hasComparableModseq = previous.highestModseq !== undefined
+        && completeStatus.highestModseq !== undefined;
+      const deletionCursorIsCurrent = this.qresyncDeletionHistory
+        && previous.qresyncHighestModseq !== undefined
+        && completeStatus.highestModseq !== undefined
+        && statusValue(previous.qresyncHighestModseq) === statusValue(completeStatus.highestModseq);
+      if (!deletionCursorIsCurrent) {
+        const detected = mailboxChange(previous, completeStatus);
+        const change = {
+          ...detected,
+          forceReconcile: true,
+          forceFlagScan: detected.forceFlagScan || !hasComparableModseq
+        };
+        this.pending.set(observed.path, change);
+        return change;
+      }
+    }
+    if (!pending && sameKnownStatus(previous, completeStatus)) {
+      this.baseline.set(observed.path, completeStatus);
+      return null;
+    }
+    const detected = mailboxChange(previous, completeStatus);
     const change = {
       ...detected,
       forceReconcile: detected.forceReconcile || pending?.forceReconcile === true,
@@ -346,7 +423,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     readonly connectedAt: Date,
     private readonly client: InboxIdleClient,
     config: AppConfig,
-    private readonly folderPathsFactory: () => Promise<string[]>,
+    private readonly folderStatusesFactory: () => Promise<InitialFolderStatus[]>,
     private readonly changeFeed: SessionMailboxChangeFeed,
     private readonly probeBatchSize: number,
     private readonly statusIntervalMs: number,
@@ -408,11 +485,13 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.traceNotify({ stage: "notify_state", reason });
   }
 
-  private async refreshFolderPaths(): Promise<void> {
-    const paths = [...new Set(await this.folderPathsFactory())]
+  private async refreshFolderPaths(seed = false): Promise<void> {
+    const folders = await this.folderStatusesFactory();
+    if (seed) this.changeFeed.seed(folders);
+    const paths = [...new Set(folders.map((folder) => folder.path))]
       .filter((path) => path.toLowerCase() !== "inbox");
     if (paths.length > 0 && typeof this.client.status !== "function") {
-      throw new Error("IMAP STATUS is required when folderPathsFactory returns folders");
+      throw new Error("IMAP STATUS is required when tracked folders are configured");
     }
     this.folderPaths = paths;
     this.changeFeed.retainPaths(new Set(paths));
@@ -450,12 +529,14 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   }
 
   async initialize(): Promise<void> {
-    await this.refreshFolderPaths();
+    await this.refreshFolderPaths(true);
     if (!this.notifyEnabled) {
       this.setNotifyState(false, this.notifyConfigured ? "unsupported" : "disabled");
     }
     const baseline: MailboxStatus[] = await this.armNotify();
-    const notifySeen = new Set(baseline.map((status) => status.path));
+    const notifySeen = new Set(
+      baseline.filter(isCompleteStatus).map((status) => status.path)
+    );
     if (this.listStatusEnabled
       && this.folderPaths.length > 0
       && notifySeen.size !== this.folderPaths.length) {
@@ -472,7 +553,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
         this.listStatusEnabled = false;
       }
     }
-    const seen = new Set(baseline.map((status) => status.path));
+    const seen = new Set(baseline.filter(isCompleteStatus).map((status) => status.path));
     for (const path of this.folderPaths) {
       if (seen.has(path)) continue;
       try {
@@ -485,7 +566,8 @@ class ReusableInboxIdleSession implements InboxIdleSession {
         this.changeFeed.signal(path, true, true);
       }
     }
-    this.changeFeed.seed(baseline);
+    for (const status of baseline) this.changeFeed.observe(status);
+    this.changeFeed.finishInitialization();
   }
 
   private async listStatusSnapshots(): Promise<MailboxStatus[]> {
@@ -1042,17 +1124,26 @@ export async function openInboxIdleSession(
   }
 
   const repository = new MirrorRepository(pool, config);
-  const folderPathsFactory = options.folderPathsFactory
-    ?? (options.clientFactory
-      ? async () => []
-      : async () => (await repository.getTrackedFoldersForWake(account.id)).map((folder) => folder.path));
-  const changeFeed = new SessionMailboxChangeFeed();
+  const suppliedStatuses = new Map(
+    (options.initialFolderStatuses ?? []).map((status) => [status.path, {
+      ...status,
+      reconnectCursor: true
+    }])
+  );
+  const folderStatusesFactory = options.folderPathsFactory
+    ? async () => (await options.folderPathsFactory!()).map(
+        (path) => suppliedStatuses.get(path) ?? { path }
+      )
+    : options.clientFactory
+      ? async () => [...suppliedStatuses.values()]
+      : async () => (await repository.getTrackedFoldersForWake(account.id)).map(persistedFolderStatus);
+  const changeFeed = new SessionMailboxChangeFeed(client.capabilities.has("QRESYNC"));
   const session = new ReusableInboxIdleSession(
     account.id,
     connectedAt,
     client,
     config,
-    folderPathsFactory,
+    folderStatusesFactory,
     changeFeed,
     config.MAX_PRIORITY_FOLDERS_PER_CYCLE + config.MAX_RR_FOLDERS_PER_CYCLE,
     config.IMAP_FOLDER_STATUS_INTERVAL_MS,

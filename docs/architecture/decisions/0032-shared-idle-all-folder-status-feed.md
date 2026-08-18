@@ -38,6 +38,13 @@ next session registers NOTIFY again.
 Unsolicited STATUS is routed safely even when another STATUS or LIST command is
 in flight, so a cross-folder signal cannot corrupt the active command response.
 Reconnect installs a fresh subscription because NOTIFY state is connection-local.
+Before it installs that subscription, the session seeds its change feed from each
+tracked folder's persisted `UIDVALIDITY`, `UIDNEXT`, and `HIGHESTMODSEQ`. NOTIFY
+is then armed before its returned snapshots, LIST-STATUS, or bounded STATUS are
+compared with those cursors. A folder that changed while the connection was
+absent is therefore pending when the host starts reconnect catch-up. A new
+notification that arrives during catch-up is buffered by the already-armed
+subscription.
 
 Hosts may observe this boundary without changing sync behavior. Each raw
 EXISTS, EXPUNGE, FETCH-flags, STATUS, or NOTIFICATIONOVERFLOW response carries
@@ -109,6 +116,13 @@ worst-case detection bound is `ceil(non-Inbox tracked folders / 15)` minutes.
 Each live pass consumes at most the same configured batch. Initial connection
 setup records a baseline for every tracked folder, capped by the Mailbox
 Account's effective folder limit.
+Persisted cursors do not include `MESSAGES` or `UNSEEN`. Only the separate,
+deletion-complete QRESYNC cursor can prove that no expunge occurred; the
+flag-only CONDSTORE cursor cannot. Unless that QRESYNC cursor matches the
+current provider modseq, reconnect requests exact reconciliation once. Without
+a comparable flag modseq, it also requests a flag scan. The real provider
+snapshot becomes the new baseline only after that work is acknowledged, so the
+fallback does not create a retry loop.
 Forced UID reconciles and flag scans still respect their existing per-cycle
 caps; unfinished snapshots remain pending and wake later bounded passes.
 
@@ -116,7 +130,8 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 
 - Adds, moves, deletes, and flag changes in tracked folders normally wake sync
   in real time on NOTIFY servers. Other servers remain bounded by one rotation.
-- Dovecot-class servers also detect arbitrary flag changes through modseq.
+- Dovecot-class QRESYNC servers can use equal modseq values as proof that no
+  offline expunge occurred and detect arbitrary flag changes through modseq.
 - Servers without CONDSTORE detect read/unread changes through `UNSEEN`; other
   flag-only changes still rely on bounded flag scans and the periodic loop.
 - STATUS is not deletion truth. Exact UID reconciliation remains mandatory.
@@ -132,8 +147,8 @@ caps; unfinished snapshots remain pending and wake later bounded passes.
 ## Verification Plan
 
 - Unit tests cover non-Inbox STATUS wake creation, pending snapshot retention,
-  bounded change-feed behavior, LIST-STATUS command reduction and fallback,
-  and CONDSTORE `CHANGEDSINCE` requests.
+  reconnect comparison with persisted Sent cursors, bounded change-feed behavior,
+  LIST-STATUS command reduction and fallback, and CONDSTORE `CHANGEDSINCE` requests.
 - Live-DB integration proves that an Archive replacement targets only Archive,
   inserts the new UID, tombstones the removed UID, and acknowledges afterward.
 - Dovecot 2.4.1 smoke proves real-time Archive detection through NOTIFY,

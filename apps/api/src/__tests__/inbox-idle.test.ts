@@ -441,6 +441,279 @@ describe("waitForInboxIdleWake", () => {
     opened.session.close();
   });
 
+  it.each([
+    ["unchanged", { uidValidity: 2n, uidNext: 11, highestModseq: 20n }, null],
+    ["UIDNEXT", { uidValidity: 2n, uidNext: 12, highestModseq: 20n }, {
+      forceReconcile: true,
+      forceFlagScan: false
+    }],
+    ["HIGHESTMODSEQ", { uidValidity: 2n, uidNext: 11, highestModseq: 21n }, {
+      forceReconcile: true,
+      forceFlagScan: true
+    }],
+    ["UIDVALIDITY", { uidValidity: 3n, uidNext: 11, highestModseq: 20n }, {
+      forceReconcile: true,
+      forceFlagScan: false
+    }]
+  ] as const)("classifies the persisted %s cursor during reconnect", async (
+    _name,
+    observed,
+    expected
+  ) => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("QRESYNC", true);
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("Sent", {
+      path: "Sent",
+      ...observed,
+      messages: 11,
+      unseen: 0
+    });
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Sent"],
+      initialFolderStatuses: [{
+        path: "Sent",
+        uidValidity: 2n,
+        uidNext: 11,
+        highestModseq: 20n,
+        qresyncHighestModseq: 20n
+      }]
+    });
+
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(client.notify).toHaveBeenCalledWith(["Sent"]);
+    const changes = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    if (expected === null) expect(changes).toEqual([]);
+    else expect(changes).toEqual([expect.objectContaining({ path: "Sent", ...expected })]);
+    opened.session.close();
+  });
+
+  it("reconciles a no-MODSEQ reconnect once and retains the real provider snapshot", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    const sentStatus = {
+      path: "Sent",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 9,
+      unseen: 0
+    };
+    client.statuses.set("Sent", sentStatus);
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Sent"],
+      initialFolderStatuses: [{ path: "Sent", uidValidity: 2n, uidNext: 11 }]
+    });
+
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const changes = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    expect(changes).toEqual([
+      expect.objectContaining({
+        path: "Sent",
+        forceReconcile: true,
+        forceFlagScan: true,
+        observed: sentStatus
+      })
+    ]);
+    opened.session.syncClient.acknowledgeMailboxChanges?.(changes);
+    client.emit("status", sentStatus);
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+    opened.session.close();
+  });
+
+  it("completes a partial reconnect snapshot without letting old work acknowledge a later delete", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.notify.mockResolvedValueOnce([{
+      path: "Sent",
+      uidValidity: 2n,
+      uidNext: 11
+    }] as never);
+    const completeStatus = {
+      path: "Sent",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 9,
+      unseen: 0
+    };
+    client.statuses.set("Sent", completeStatus);
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Sent"],
+      initialFolderStatuses: [{ path: "Sent", uidValidity: 2n, uidNext: 11 }]
+    });
+
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const changes = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    expect(changes).toEqual([
+      expect.objectContaining({ observed: completeStatus })
+    ]);
+
+    client.emit("status", { ...completeStatus, messages: 8 });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(changes);
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Sent",
+        forceReconcile: true,
+        observed: expect.objectContaining({ messages: 8 })
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it("does not use an equal CONDSTORE MODSEQ as proof that no offline delete occurred", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("CONDSTORE", true);
+    client.statuses.set("Sent", {
+      path: "Sent",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 9,
+      unseen: 0,
+      highestModseq: 20n
+    });
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Sent"],
+      initialFolderStatuses: [{
+        path: "Sent",
+        uidValidity: 2n,
+        uidNext: 11,
+        highestModseq: 20n
+      }]
+    });
+
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Sent",
+        forceReconcile: true,
+        forceFlagScan: false
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it("requires the deletion-complete QRESYNC cursor to match the provider snapshot", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("QRESYNC", true);
+    client.statuses.set("Sent", {
+      path: "Sent",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 9,
+      unseen: 0,
+      highestModseq: 20n
+    });
+
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Sent"],
+      initialFolderStatuses: [{
+        path: "Sent",
+        uidValidity: 2n,
+        uidNext: 11,
+        highestModseq: 20n,
+        qresyncHighestModseq: 19n
+      }]
+    });
+
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Sent",
+        forceReconcile: true,
+        forceFlagScan: false
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it.each(["LIST-STATUS", "STATUS"] as const)(
+    "arms NOTIFY before %s reconnect comparison",
+    async (fallback) => {
+      const client = new FakeIdleClient();
+      client.capabilities.set("NOTIFY", true);
+      client.capabilities.set("QRESYNC", true);
+      if (fallback === "LIST-STATUS") client.capabilities.set("LIST-STATUS", true);
+      client.notify.mockResolvedValueOnce([]);
+      client.statuses.set("Sent", {
+        path: "Sent",
+        uidValidity: 2n,
+        uidNext: 12,
+        messages: 11,
+        unseen: 0,
+        highestModseq: 21n
+      });
+      client.statuses.set("Archive", {
+        path: "Archive",
+        uidValidity: 3n,
+        uidNext: 5,
+        messages: 4,
+        unseen: 0,
+        highestModseq: 8n
+      });
+      const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+        IMAP_NOTIFY_ENABLED: true,
+        IMAP_LIST_STATUS_ENABLED: true
+      }) as never, account, {
+        clientFactory: async () => client,
+        folderPathsFactory: async () => ["Sent", "Archive"],
+        initialFolderStatuses: [
+          {
+            path: "Sent",
+            uidValidity: 2n,
+            uidNext: 11,
+            highestModseq: 20n,
+            qresyncHighestModseq: 20n
+          },
+          {
+            path: "Archive",
+            uidValidity: 3n,
+            uidNext: 5,
+            highestModseq: 8n,
+            qresyncHighestModseq: 8n
+          }
+        ]
+      });
+
+      expect(opened.status).toBe("ready");
+      if (opened.status !== "ready") throw new Error("session was not ready");
+      const fallbackCall = fallback === "LIST-STATUS" ? client.list : client.status;
+      expect(client.notify.mock.invocationCallOrder[0]).toBeLessThan(
+        fallbackCall.mock.invocationCallOrder[0]!
+      );
+      expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+        expect.objectContaining({ path: "Sent" })
+      ]);
+      opened.session.close();
+    }
+  );
+
   it("reports and carries the parser-root NOTIFY signal without exposing content", async () => {
     const client = new FakeIdleClient();
     client.capabilities.set("NOTIFY", true);
