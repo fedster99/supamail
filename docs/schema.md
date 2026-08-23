@@ -14,6 +14,7 @@ The mirror owns these neutral tables in `public`:
 - `imap_thread_state`
 - `imap_thread_evidence_clock`
 - `imap_thread_assignments`
+- `imap_thread_closure_edges`
 - `imap_thread_work_queue`
 - `imap_thread_subject_work`
 - `imap_thread_operations`
@@ -46,6 +47,13 @@ The migration also rejects exact-match tokens that have no opaque envelope.
 `0025_qresync_cursor` adds a nullable per-folder QRESYNC mod-sequence cursor.
 It advances only after deletion-complete replay or an exact UID reconciliation,
 so flag-only CONDSTORE scans cannot move QRESYNC past unseen VANISHED history.
+
+`0026_threading_closure_edges` normalizes each assignment's conversation,
+delivery, reference, provider-thread, and delivery-fingerprint keys into
+`imap_thread_closure_edges`. A run-scoped composite index lets closure expansion
+find related messages with one indexed join. Statement triggers update the
+edges in the same transaction as assignment inserts and relationship changes.
+The migration backfills existing assignments; assignments remain authoritative.
 
 `0022_content_extract_body_store` adds `search_extract`, a maximum 32 KiB UTF-8
 prefix of the parser's selected normalized plain text, plus an FTS expression
@@ -135,7 +143,7 @@ Threading algorithm v3 adds two deliberately narrow corrections while retaining 
 
 There is one `imap_thread_assignments` row per physical message row per run. It records the strict Message-ID, fixed-size delivery/conversation evidence keys, hashed delivery-fingerprint evidence, raw root/parent/reference evidence, provider hint, normalized subject, assignment method, coarse confidence tier, provisional flag, evidence, input hash, generation, and algorithm version. Raw evidence is inspectable but unindexed; indexed adversarial header/provider/fingerprint values are SHA-256 digests. The RFC/provider inputs in `imap_messages` and `imap_message_bodies` remain authoritative.
 
-`imap_thread_work_queue` receives new rows and changes to thread-relevant metadata, recovered full-body headers, or copy fingerprints independently for every state-referenced run. Repository writes enqueue explicitly, while a database trigger provides the rolling-deploy backstop. A targeted `delivery_evidence_bridge` item is protected from ordinary queue deletion until the bounded preflight derives its eligible authored digest; the authored-evidence trigger then converts it into normal recomputation work. The worker drains ready items in bounded account-scoped batches and expands only the affected RFC/provider/prior-conversation closure, with independent row, evidence-byte, and criteria-key limits. `imap_thread_subject_work` evaluates one exact subject digest at a time; buckets above the configured cap are recorded and skipped only after any older weak merge in that bucket has been dissolved.
+`imap_thread_work_queue` receives new rows and changes to thread-relevant metadata, recovered full-body headers, or copy fingerprints independently for every state-referenced run. Repository writes enqueue explicitly, while a database trigger provides the rolling-deploy backstop. A targeted `delivery_evidence_bridge` item is protected from ordinary queue deletion until the bounded preflight derives its eligible authored digest; the authored-evidence trigger then converts it into normal recomputation work. The worker drains ready items in bounded account-scoped batches and expands only the affected RFC/provider/prior-conversation closure through `imap_thread_closure_edges`, with independent row, evidence-byte, and criteria-key limits. `imap_thread_subject_work` evaluates one exact subject digest at a time; buckets above the configured cap are recorded and skipped only after any older weak merge in that bucket has been dissolved.
 
 `imap_thread_operations` records bounded build batches, incremental recomputes, activation, rollback, and failures. `imap_thread_run_comparisons` stores quality thresholds and merge/split/provisional metrics for exact baseline/candidate generations at one evidence revision; replacing an active run requires a still-current passing certificate. `imap_thread_assignment_history` stores per-message before/after snapshots for incremental material changes and intentionally has no message/run foreign key, so audit evidence survives retention. Build snapshots retain compact operation summaries rather than duplicating every assignment as JSON. Incremental rollback may reverse only the latest material operation in the active run. Activation rollback swaps back only to a still-caught-up standby. Both paths record a new operation and pause automatic work pending a clean rebuild. Old terminal projection runs are pruned daily in bounded batches without deleting these audit tables.
 

@@ -806,6 +806,81 @@ liveDb("ThreadingRepository live DB", () => {
     expect(unchanged.every((step) => step.assignmentsChanged === 0)).toBe(true);
   });
 
+  it("keeps normalized closure edges equal to assignment evidence", async () => {
+    const accountId = await createAccount("closure-edges");
+    const rootId = await seedMessage(accountId, {
+      uid: 1,
+      rfcMessageId: "<closure-edge-root@example.test>",
+      providerThreadId: "provider-thread-1",
+      providerThreadNamespace: "test",
+      rawMime: Buffer.from("Message-ID: <closure-edge-root@example.test>\r\n\r\nroot")
+    });
+    await seedMessage(accountId, {
+      uid: 2,
+      rfcMessageId: "<closure-edge-reply@example.test>",
+      inReplyTo: "<closure-edge-root@example.test>",
+      referencesHeader: "<closure-edge-root@example.test>",
+      providerThreadId: "provider-thread-1",
+      providerThreadNamespace: "test",
+      rawMime: Buffer.from(
+        "Message-ID: <closure-edge-reply@example.test>\r\n" +
+        "In-Reply-To: <closure-edge-root@example.test>\r\n\r\nreply"
+      )
+    });
+
+    const result = await drainUntilReady(accountId);
+    if (!result.runId) throw new Error("threading run missing");
+    const runId = result.runId;
+    const kinds = await pool.query<{ edge_kind: string }>(
+      `SELECT DISTINCT edge_kind
+       FROM public.imap_thread_closure_edges
+       WHERE run_id = $1
+       ORDER BY edge_kind`,
+      [runId]
+    );
+    expect(kinds.rows.map((row) => row.edge_kind)).toEqual([
+      "conversation",
+      "delivery",
+      "delivery_fingerprint",
+      "provider_thread",
+      "reference"
+    ]);
+
+    const oldConversation = await pool.query<{ conversation_id: string }>(
+      `SELECT conversation_id FROM public.imap_thread_assignments
+       WHERE run_id = $1 AND message_id = $2`,
+      [runId, rootId]
+    );
+    const replacement = `thread_${"d".repeat(32)}`;
+    await pool.query(
+      `UPDATE public.imap_thread_assignments
+       SET conversation_id = $3
+       WHERE run_id = $1 AND message_id = $2`,
+      [runId, rootId, replacement]
+    );
+    const refreshed = await pool.query<{ old_edges: string; new_edges: string }>(
+      `SELECT
+         count(*) FILTER (WHERE edge_key = $3)::text AS old_edges,
+         count(*) FILTER (WHERE edge_key = $4)::text AS new_edges
+       FROM public.imap_thread_closure_edges
+       WHERE run_id = $1 AND message_id = $2 AND edge_kind = 'conversation'`,
+      [runId, rootId, oldConversation.rows[0]?.conversation_id, replacement]
+    );
+    expect(refreshed.rows[0]).toEqual({ old_edges: "0", new_edges: "1" });
+
+    await pool.query(
+      "DELETE FROM public.imap_thread_assignments WHERE run_id = $1 AND message_id = $2",
+      [runId, rootId]
+    );
+    const deleted = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM public.imap_thread_closure_edges
+       WHERE run_id = $1 AND message_id = $2`,
+      [runId, rootId]
+    );
+    expect(deleted.rows[0]?.count).toBe("0");
+  });
+
   it("blocks a protected adapter until the account migration activates its mode", async () => {
     const accountId = await createAccount("protected-mode-not-active");
     await seedMessage(accountId, {

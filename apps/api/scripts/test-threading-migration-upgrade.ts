@@ -25,6 +25,12 @@ const fingerprintClosureIndex = manifest.migrations.findIndex(
 if (fingerprintClosureIndex <= threadingIndex) {
   throw new Error("0020_threading_fingerprint_closure must follow the threading schema");
 }
+const closureEdgesIndex = manifest.migrations.findIndex(
+  (migration) => migration.id === "0026_threading_closure_edges"
+);
+if (closureEdgesIndex <= fingerprintClosureIndex) {
+  throw new Error("0026_threading_closure_edges must follow fingerprint closure");
+}
 
 const databaseName = `sm_thread_upgrade_${process.pid}_${randomUUID().slice(0, 8)}`.replace(/-/g, "_");
 const quotedDatabaseName = `"${databaseName}"`;
@@ -114,6 +120,9 @@ try {
     const fingerprintClosureMigration = manifest.migrations[fingerprintClosureIndex];
     await applyFiles([fingerprintClosureMigration]);
     await applyFiles([fingerprintClosureMigration]);
+    const closureEdgesMigration = manifest.migrations[closureEdgesIndex];
+    await applyFiles([closureEdgesMigration]);
+    await applyFiles([closureEdgesMigration]);
     const elapsedMs = Math.round(performance.now() - startedAt);
 
     const result = await target.query<{
@@ -127,6 +136,7 @@ try {
       assignments: string;
       empty_fingerprint_arrays: string;
       fingerprint_constraint_not_valid: string;
+      closure_edges: string;
     }>(
       `SELECT
          (SELECT count(*)::text FROM public.imap_messages WHERE account_id = $1) AS messages,
@@ -157,7 +167,9 @@ try {
          (SELECT count(*)::text FROM pg_constraint
           WHERE conrelid = 'public.imap_thread_assignments'::regclass
             AND conname = 'imap_thread_assignments_delivery_fingerprint_hashes_check'
-            AND NOT convalidated) AS fingerprint_constraint_not_valid`,
+            AND NOT convalidated) AS fingerprint_constraint_not_valid,
+         (SELECT count(*)::text FROM public.imap_thread_closure_edges
+          WHERE run_id = $2) AS closure_edges`,
       [account.rows[0].id, run.rows[0].id]
     );
     const observed = result.rows[0];
@@ -171,7 +183,8 @@ try {
       invalid_constraints: "0",
       assignments: "1",
       empty_fingerprint_arrays: "1",
-      fingerprint_constraint_not_valid: "1"
+      fingerprint_constraint_not_valid: "1",
+      closure_edges: "2"
     };
     if (JSON.stringify(observed) !== JSON.stringify(expected)) {
       throw new Error(`Populated threading migration changed legacy data: ${JSON.stringify(observed)}`);
