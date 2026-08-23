@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0025_qresync_cursor",
+  "schemaVersion": "0026_threading_closure_edges",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -100,6 +100,10 @@
     {
       "id": "0025_qresync_cursor",
       "file": "0025_qresync_cursor.sql"
+    },
+    {
+      "id": "0026_threading_closure_edges",
+      "file": "0026_threading_closure_edges.sql"
     }
   ]
 }

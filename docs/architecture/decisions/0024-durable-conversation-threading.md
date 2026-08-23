@@ -124,9 +124,12 @@ Thread-relevant metadata changes enqueue the physical message. The drainer
 recomputes the affected closure (referenced/referencing deliveries, provider
 group, and prior conversation) rather than rescanning the account. The closure
 has independent row, logical-evidence-byte, and criteria-key budgets; the
-expansion query uses indexed probes for small known-ID sets and an ordered run
-scan for larger sets while applying the same evidence predicates. The
-subject bucket and write batch also have hard caps. If a previously accepted
+assignment write transaction normalizes the same relationship evidence into
+`imap_thread_closure_edges`. Expansion uses one run-scoped indexed join for all
+closure sizes while applying the same evidence predicates. This adds projection
+storage and relationship-change write work, but removes repeated array and
+predicate reconstruction from each closure read. The subject bucket and write
+batch also have hard caps. If a previously accepted
 weak subject bucket later grows beyond its cap, the worker first dissolves the
 old weak edges in bounded components. Work is serialized per account, retries
 are persisted before releasing the account lock, and processing is idempotent
@@ -281,3 +284,4 @@ unrelated mail.
 - `apps/api/src/threading.ts`
 - `apps/api/supabase/migrations/public/0014_conversation_threading.sql`
 - `apps/api/supabase/migrations/public/0020_threading_fingerprint_closure.sql`
+- `apps/api/supabase/migrations/public/0026_threading_closure_edges.sql`

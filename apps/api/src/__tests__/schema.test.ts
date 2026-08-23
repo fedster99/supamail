@@ -60,6 +60,10 @@ const qresyncCursorMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0025_qresync_cursor.sql"
 );
+const threadingClosureEdgesMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0026_threading_closure_edges.sql"
+);
 
 describe("initial schema", () => {
   it("adds a bounded search extract without moving full body payloads into metadata", async () => {
@@ -190,9 +194,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0025_qresync_cursor");
+    expect(version).toBe("0026_threading_closure_edges");
     expect(manifest).toEqual({
-      schemaVersion: "0025_qresync_cursor",
+      schemaVersion: "0026_threading_closure_edges",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -218,7 +222,8 @@ describe("initial schema", () => {
         { id: "0022_content_extract_body_store", file: "0022_content_extract_body_store.sql" },
         { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" },
         { id: "0024_metadata_protection_mode", file: "0024_metadata_protection_mode.sql" },
-        { id: "0025_qresync_cursor", file: "0025_qresync_cursor.sql" }
+        { id: "0025_qresync_cursor", file: "0025_qresync_cursor.sql" },
+        { id: "0026_threading_closure_edges", file: "0026_threading_closure_edges.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -250,6 +255,23 @@ describe("initial schema", () => {
     expect(sql).toContain("current_live_body_progress AS");
     expect(sql).toContain("FUNCTION public.imap_search_extract_fts");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS protected_metadata bytea");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_closure_edges");
+  });
+
+  it("normalizes threading closure evidence into one indexed edge relation", async () => {
+    const sql = await readFile(threadingClosureEdgesMigrationPath, "utf8");
+
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_thread_closure_edges");
+    expect(sql).toContain("PRIMARY KEY (run_id, message_id, edge_kind, edge_key)");
+    expect(sql).toContain("FOREIGN KEY (run_id, message_id)");
+    expect(sql).toContain("ON DELETE CASCADE");
+    expect(sql).toContain("imap_thread_closure_edges_lookup_idx");
+    expect(sql).toContain("(run_id, edge_kind, edge_key, message_id)");
+    expect(sql).toContain("REFERENCING NEW TABLE AS changed_assignments");
+    expect(sql).toContain("ALTER TABLE public.imap_thread_closure_edges ENABLE ROW LEVEL SECURITY");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_closure_edges FROM PUBLIC");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_closure_edges FROM anon");
+    expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_closure_edges FROM authenticated");
   });
 
   it("adds a deletion-complete cursor that is separate from CONDSTORE", async () => {
