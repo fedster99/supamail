@@ -8,6 +8,7 @@ import {
   ThrottledImapClient,
   type ImapNotifySignal,
   type MailboxChange,
+  type MailboxChangeObservation,
   type MailboxChangeFeed,
   type MailboxStatus,
   type MirrorImapClient
@@ -80,6 +81,7 @@ interface InboxIdleClient extends Pick<EventEmitter, "on" | "removeListener"> {
   capabilities: ReadonlyMap<string, boolean | number>;
   enabled?: ReadonlySet<string>;
   usable?: boolean;
+  mailbox?: MailboxStatus | false | null;
   skipListStatusArgs?: boolean;
   mailboxOpen(path: string, options?: { readOnly?: boolean }): Promise<unknown>;
   list?(options?: {
@@ -105,6 +107,8 @@ export interface InboxIdleSession {
   readonly connectedAt: Date;
   readonly syncClient: MirrorImapClient;
   readonly folderProbeStrategy?: "notify" | "list_status" | "status";
+  readonly folderVerificationStrategy?: "list_status" | "status";
+  verifyMailboxChanges?(): Promise<InboxIdleWake | null>;
   wait(options?: { signal?: AbortSignal; now?: () => Date }): Promise<InboxIdleWaitResult>;
   close(): void;
 }
@@ -198,6 +202,9 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
   private readonly baseline = new Map<string, InitialFolderStatus>();
   private readonly pending = new Map<string, MailboxChange>();
   private readonly replayDepth = new Map<string, number>();
+  private readonly unverifiableEventFlagPaths = new Set<string>();
+  private readonly unverifiedFlagStatusPaths = new Set<string>();
+  private readonly unverifiableReconcilePaths = new Set<string>();
   private initializing = true;
 
   constructor(private readonly qresyncDeletionHistory: boolean) {}
@@ -298,15 +305,54 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
     return change;
   }
 
-  signal(path: string, forceReconcile: boolean, forceFlagScan: boolean): MailboxChange {
+  signal(
+    path: string,
+    forceReconcile: boolean,
+    forceFlagScan: boolean,
+    observed: Partial<MailboxStatus> = {}
+  ): MailboxChange {
     const pending = this.pending.get(path);
+    const previous = this.baseline.get(path);
     const change = {
       path,
       forceReconcile: forceReconcile || pending?.forceReconcile === true,
       forceFlagScan: forceFlagScan || pending?.forceFlagScan === true,
-      observed: { path, uidValidity: 0 }
+      observed: {
+        ...previous,
+        ...pending?.observed,
+        ...observed,
+        path,
+        uidValidity: observed.uidValidity
+          ?? pending?.observed.uidValidity
+          ?? previous?.uidValidity
+          ?? 0
+      }
     };
     this.pending.set(path, change);
+    return change;
+  }
+
+  signalEvent(
+    path: string,
+    kind: InboxIdleWakeKind,
+    data: { count?: unknown; modseq?: unknown }
+  ): MailboxChange {
+    const previous = this.pending.get(path)?.observed ?? this.baseline.get(path);
+    const observed: Partial<MailboxStatus> = {};
+    if (kind === "exists" && isNonNegativeInteger(data.count)) {
+      observed.messages = data.count;
+      observed.exists = data.count;
+    } else if (kind === "expunge" && typeof previous?.messages === "number") {
+      observed.messages = Math.max(0, previous.messages - 1);
+      observed.exists = observed.messages;
+    } else if (kind === "flags"
+      && (typeof data.modseq === "bigint" || isNonNegativeInteger(data.modseq))) {
+      observed.highestModseq = data.modseq;
+    }
+    const change = this.signal(path, kind === "expunge", kind === "flags", observed);
+    if (kind === "flags" && observed.highestModseq === undefined) {
+      this.unverifiableEventFlagPaths.add(path);
+    }
     return change;
   }
 
@@ -316,6 +362,21 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
     }
     for (const path of this.pending.keys()) {
       if (path.toLowerCase() !== "inbox" && !paths.has(path)) this.pending.delete(path);
+    }
+    for (const path of this.unverifiableEventFlagPaths) {
+      if (path.toLowerCase() !== "inbox" && !paths.has(path)) {
+        this.unverifiableEventFlagPaths.delete(path);
+      }
+    }
+    for (const path of this.unverifiedFlagStatusPaths) {
+      if (path.toLowerCase() !== "inbox" && !paths.has(path)) {
+        this.unverifiedFlagStatusPaths.delete(path);
+      }
+    }
+    for (const path of this.unverifiableReconcilePaths) {
+      if (path.toLowerCase() !== "inbox" && !paths.has(path)) {
+        this.unverifiableReconcilePaths.delete(path);
+      }
     }
   }
 
@@ -327,12 +388,77 @@ class SessionMailboxChangeFeed implements MailboxChangeFeed {
   }
 
   acknowledge(changes: readonly MailboxChange[]): void {
+    this.acknowledgeWithStatuses(changes, []);
+  }
+
+  acknowledgeWithStatuses(
+    changes: readonly MailboxChange[],
+    observations: readonly MailboxChangeObservation[]
+  ): void {
+    const observationByPath = new Map(
+      observations.map((observation) => [observation.status.path, observation])
+    );
     for (const change of changes) {
       const pending = this.pending.get(change.path);
       if (pending?.observed !== change.observed) continue;
-      this.baseline.set(change.path, change.observed);
+      const observation = observationByPath.get(change.path);
+      if (!observation) {
+        this.baseline.set(change.path, change.observed);
+        this.pending.delete(change.path);
+        continue;
+      }
+      const status = observation.status;
+      const acknowledged: MailboxStatus = {
+        ...change.observed,
+        path: change.path,
+        uidValidity: status.uidValidity,
+        uidNext: status.uidNext
+      };
+      if (observation.reconcileComplete) {
+        acknowledged.exists = status.exists;
+        acknowledged.messages = status.messages;
+        this.unverifiableReconcilePaths.delete(change.path);
+      } else {
+        this.unverifiableReconcilePaths.add(change.path);
+      }
+      const hasComparableFlagStatus = status.highestModseq !== undefined
+        || status.unseen !== undefined;
+      if (observation.flagScanComplete && hasComparableFlagStatus) {
+        if (status.unseen !== undefined) acknowledged.unseen = status.unseen;
+        if (status.highestModseq !== undefined) {
+          acknowledged.highestModseq = status.highestModseq;
+        }
+        this.unverifiedFlagStatusPaths.delete(change.path);
+        if (status.highestModseq !== undefined) {
+          this.unverifiableEventFlagPaths.delete(change.path);
+        }
+      } else {
+        this.unverifiedFlagStatusPaths.add(change.path);
+      }
+      this.baseline.set(change.path, acknowledged);
       this.pending.delete(change.path);
     }
+  }
+
+  markAuthoritativelyProbed(status: MailboxStatus, change: MailboxChange | null): void {
+    if (change) return;
+    if (status.highestModseq !== undefined || status.unseen !== undefined) {
+      this.unverifiedFlagStatusPaths.delete(status.path);
+    }
+    if (status.highestModseq !== undefined) {
+      this.unverifiableEventFlagPaths.delete(status.path);
+    }
+  }
+
+  takeUnverifiableChange(): MailboxChange | null {
+    const path = this.unverifiableReconcilePaths.values().next().value
+      ?? this.unverifiableEventFlagPaths.values().next().value
+      ?? this.unverifiedFlagStatusPaths.values().next().value;
+    if (typeof path !== "string") return null;
+    const forceReconcile = this.unverifiableReconcilePaths.delete(path);
+    const forceFlagScan = this.unverifiableEventFlagPaths.delete(path)
+      || this.unverifiedFlagStatusPaths.delete(path);
+    return this.signal(path, forceReconcile, forceFlagScan);
   }
 }
 
@@ -416,6 +542,10 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   private pendingOverflowSignal: ImapNotifySignal | null = null;
   private queuedWake: InboxIdleWake | null = null;
   private wakeDeliveryScheduled = false;
+  private verificationPromise: Promise<InboxIdleWake | null> | null = null;
+  private waitInProgress = false;
+  private readonly lifecycleAbort = new AbortController();
+  private readonly operationSignal: AbortSignal;
   private closed = false;
 
   constructor(
@@ -428,10 +558,13 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     private readonly probeBatchSize: number,
     private readonly statusIntervalMs: number,
     private readonly onNotifyTraceObserved?: (trace: InboxIdleNotifyTrace) => void,
-    signal?: AbortSignal,
+    private readonly signal?: AbortSignal,
     now: () => Date = () => new Date()
   ) {
     this.now = now;
+    this.operationSignal = signal
+      ? AbortSignal.any([signal, this.lifecycleAbort.signal])
+      : this.lifecycleAbort.signal;
     this.listStatusEnabled = config.IMAP_LIST_STATUS_ENABLED
       && (client.capabilities.has("LIST-STATUS") || isRev2Active(client))
       && typeof client.list === "function";
@@ -443,7 +576,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       client as unknown as ImapFlow,
       config.IMAP_MAX_COMMANDS_PER_MINUTE,
       config.IMAP_COMMAND_TIMEOUT_MS,
-      signal,
+      this.operationSignal,
       changeFeed
     );
     this.client.on("exists", this.onExists);
@@ -459,6 +592,10 @@ class ReusableInboxIdleSession implements InboxIdleSession {
 
   get folderProbeStrategy(): "notify" | "list_status" | "status" {
     if (this.notifyEnabled) return "notify";
+    return this.listStatusEnabled ? "list_status" : "status";
+  }
+
+  get folderVerificationStrategy(): "list_status" | "status" {
     return this.listStatusEnabled ? "list_status" : "status";
   }
 
@@ -486,7 +623,31 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   }
 
   private async refreshFolderPaths(seed = false): Promise<void> {
-    const folders = await this.folderStatusesFactory();
+    const signal = this.operationSignal;
+    signal.throwIfAborted();
+    const folders = await new Promise<InitialFolderStatus[]>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        reject(abortError(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      void this.folderStatusesFactory().then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        }
+      );
+    });
     if (seed) this.changeFeed.seed(folders);
     const paths = [...new Set(folders.map((folder) => folder.path))]
       .filter((path) => path.toLowerCase() !== "inbox");
@@ -570,15 +731,18 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.changeFeed.finishInitialization();
   }
 
-  private async listStatusSnapshots(): Promise<MailboxStatus[]> {
+  private async listStatusSnapshots(
+    paths = this.folderPaths,
+    options: { allowWildcardFallback?: boolean } = {}
+  ): Promise<MailboxStatus[]> {
     // LIST mailbox patterns have no escape for their `*` and `%` wildcards.
     // An exact probe is therefore impossible for these otherwise legal names.
     // Keep the whole session on bounded STATUS instead of broadening the query.
-    if (this.folderPaths.some((path) => /[*%]/.test(path))) {
+    if (paths.some((path) => /[*%]/.test(path))) {
       throw new Error("Tracked mailbox name cannot be represented as an exact LIST pattern");
     }
-    const tracked = new Set(this.folderPaths);
-    const statuses = await this.syncClient.listWithStatus!(STATUS_QUERY, this.folderPaths);
+    const tracked = new Set(paths);
+    const statuses = await this.syncClient.listWithStatus!(STATUS_QUERY, paths);
     if (this.listStatusWasRejected()) {
       throw new Error("IMAP server rejected LIST-STATUS");
     }
@@ -590,7 +754,8 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     // return only the first match. Retry once with the standard wildcard form,
     // then filter the result back to the bounded tracked set. A partial or
     // malformed wildcard response still latches the existing STATUS fallback.
-    if (new Set(trackedStatuses.map((status) => status.path)).size !== tracked.size) {
+    if (options.allowWildcardFallback !== false
+      && new Set(trackedStatuses.map((status) => status.path)).size !== tracked.size) {
       const wildcardStatuses = await this.syncClient.listWithStatus!(STATUS_QUERY, ["*"]);
       if (this.listStatusWasRejected()) {
         throw new Error("IMAP server rejected LIST-STATUS");
@@ -605,6 +770,25 @@ class ReusableInboxIdleSession implements InboxIdleSession {
 
   private listStatusWasRejected(): boolean {
     return this.client.skipListStatusArgs === true;
+  }
+
+  private probeWasInterrupted(error: unknown): boolean {
+    return this.closed
+      || this.operationSignal.aborted
+      || (error instanceof DOMException && error.name === "AbortError")
+      || (error instanceof Error && (
+        error.name === "AbortError"
+        || error.message.startsWith("IMAP_COMMAND_TIMEOUT_MS exceeded")
+      ))
+      || this.client.usable === false;
+  }
+
+  private statusProbePaths(): string[] {
+    const count = Math.min(this.probeBatchSize, this.folderPaths.length);
+    return Array.from(
+      { length: count },
+      (_, index) => this.folderPaths[(this.probeCursor + index) % this.folderPaths.length]
+    );
   }
 
   private async probeMailboxChanges(): Promise<MailboxChange | null> {
@@ -636,11 +820,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
         this.listStatusEnabled = false;
       }
     }
-    const count = Math.min(this.probeBatchSize, this.folderPaths.length);
-    const paths = Array.from(
-      { length: count },
-      (_, index) => this.folderPaths[(this.probeCursor + index) % this.folderPaths.length]
-    );
+    const paths = this.statusProbePaths();
     for (const path of paths) {
       this.probeCursor = (this.probeCursor + 1) % this.folderPaths.length;
       try {
@@ -655,10 +835,85 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     return pending ?? null;
   }
 
+  verifyMailboxChanges(): Promise<InboxIdleWake | null> {
+    if (this.closed) return Promise.reject(new Error("Inbox IDLE session is closed"));
+    if (this.waitInProgress || this.waiter || this.acceptingEvents) {
+      return Promise.reject(new Error("Mailbox verification cannot run during IDLE wait"));
+    }
+    if (this.verificationPromise) return this.verificationPromise;
+    const verification = this.runMailboxVerification();
+    this.verificationPromise = verification;
+    void verification.finally(() => {
+      if (this.verificationPromise === verification) this.verificationPromise = null;
+    }).catch(() => undefined);
+    return verification;
+  }
+
+  private async runMailboxVerification(): Promise<InboxIdleWake | null> {
+    await this.refreshFolderPaths();
+    const listStatusPaths = ["INBOX", ...this.folderPaths];
+    let statuses: MailboxStatus[] = [];
+    if (this.listStatusEnabled) {
+      try {
+        // Verification runs after every wake-driven sync. Do not use the
+        // compatibility wildcard retry here: it can enumerate the provider's
+        // entire mailbox tree on every delivery. A partial exact response
+        // instead latches the bounded STATUS fallback below.
+        statuses = await this.listStatusSnapshots(listStatusPaths, {
+          allowWildcardFallback: false
+        });
+        if (new Set(statuses.map((status) => status.path)).size !== listStatusPaths.length) {
+          this.listStatusEnabled = false;
+          statuses = [];
+        }
+      } catch (error) {
+        if (this.probeWasInterrupted(error)) throw error;
+        this.listStatusEnabled = false;
+      }
+    }
+    if (!this.listStatusEnabled) {
+      const folderPaths = this.statusProbePaths();
+      const paths = [
+        "INBOX",
+        ...folderPaths
+      ];
+      if (this.folderPaths.length > 0) {
+        this.probeCursor = (this.probeCursor + folderPaths.length) % this.folderPaths.length;
+      }
+      for (const path of paths) {
+        try {
+          const status = await this.syncClient.status!(path, STATUS_QUERY);
+          if (status.path !== path || !isCompleteStatus(status)) {
+            throw new Error("IMAP server returned incomplete STATUS data");
+          }
+          statuses.push(status);
+        } catch (error) {
+          if (this.probeWasInterrupted(error)) throw error;
+          this.changeFeed.signal(path, true, true);
+        }
+      }
+    }
+    for (const status of statuses) {
+      const observedChange = this.changeFeed.observe(status);
+      this.changeFeed.markAuthoritativelyProbed(status, observedChange);
+    }
+    const change = this.changeFeed.takeUnverifiableChange()
+      ?? this.changeFeed.peek(1)[0];
+    return change
+      ? {
+          kind: change.forceReconcile ? "exists" : "flags",
+          accountId: this.accountId,
+          folderPath: change.path,
+          observedAt: this.now()
+        }
+      : null;
+  }
+
   close(): void {
     if (this.closed) return;
     if (this.notifyArmed) this.setNotifyState(false, "closed");
     this.closed = true;
+    this.lifecycleAbort.abort(new Error("Inbox IDLE session closed"));
     this.acceptingEvents = false;
     if (this.queuedWake) this.traceHandoff(this.queuedWake, "dropped", "session_closed");
     this.queuedWake = null;
@@ -720,6 +975,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       prevCount?: unknown;
       seq?: unknown;
       uid?: unknown;
+      modseq?: unknown;
       notifySignal?: unknown;
     }
   ): void {
@@ -732,7 +988,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     }
     if (!this.acceptingEvents) {
       if (!this.closed && folderPath.toLowerCase() === "inbox") {
-        this.changeFeed.signal(folderPath, kind === "expunge", kind === "flags");
+        this.changeFeed.signalEvent(folderPath, kind, data);
         this.deferredInboxWake = true;
         if (this.deferredInboxSignal) this.traceHandoff({
           folderPath,
@@ -745,11 +1001,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       }
       return;
     }
-    this.changeFeed.signal(
-      folderPath,
-      kind === "expunge",
-      kind === "flags"
-    );
+    this.changeFeed.signalEvent(folderPath, kind, data);
     const wake: InboxIdleWake = {
       kind,
       accountId: this.accountId,
@@ -900,6 +1152,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.queuedWake = null;
     this.detach();
     this.deliver({ status: "disconnected" });
+    this.lifecycleAbort.abort(new Error("Inbox IDLE connection closed"));
   };
 
   private takeDeferredWake(): InboxIdleWaitResult | null {
@@ -987,6 +1240,12 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     options: { signal?: AbortSignal; now?: () => Date } = {}
   ): Promise<InboxIdleWaitResult> {
     options.signal?.throwIfAborted();
+    if (this.waitInProgress) {
+      throw new Error("Inbox IDLE wait is already in progress");
+    }
+    if (this.verificationPromise) {
+      throw new Error("Inbox IDLE wait cannot start during mailbox verification");
+    }
     const queued = this.pending.shift();
     if (queued) return queued;
     if (this.closed) return { status: "disconnected" };
@@ -995,6 +1254,21 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     // bounded catch-up batch before replacing this connection.
     const deferred = this.takeDeferredWake();
     if (deferred) return deferred;
+    const waitSignal = options.signal
+      ? AbortSignal.any([options.signal, this.operationSignal])
+      : this.operationSignal;
+    waitSignal.throwIfAborted();
+    this.waitInProgress = true;
+    try {
+      return await this.runWait({ ...options, signal: waitSignal });
+    } finally {
+      this.waitInProgress = false;
+    }
+  }
+
+  private async runWait(
+    options: { signal?: AbortSignal; now?: () => Date }
+  ): Promise<InboxIdleWaitResult> {
     await this.refreshFolderPaths();
     for (const status of await this.armNotify()) {
       this.changeFeed.observe(status);
@@ -1006,6 +1280,13 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     options.signal?.addEventListener("abort", abortOpen, { once: true });
     try {
       await this.client.mailboxOpen("INBOX", { readOnly: true });
+      if (this.client.mailbox && typeof this.client.mailbox === "object") {
+        this.changeFeed.observe({
+          ...this.client.mailbox,
+          path: "INBOX",
+          messages: this.client.mailbox.messages ?? this.client.mailbox.exists
+        });
+      }
       if (options.signal?.aborted) throw abortError(options.signal);
     } catch (error) {
       this.close();

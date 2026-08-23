@@ -2,6 +2,7 @@ import type {
   DownloadResult,
   FetchMessage,
   MailboxChange,
+  MailboxChangeObservation,
   MailboxListItem,
   MailboxLock,
   MailboxStatus,
@@ -32,6 +33,10 @@ export class FixtureImapClient implements MirrorImapClient {
   mailbox: MailboxStatus | false | null = null;
   peekMailboxChanges?: (limit?: number) => readonly MailboxChange[];
   acknowledgeMailboxChanges?: (changes: readonly MailboxChange[]) => void;
+  acknowledgeMailboxChangesWithStatuses?: (
+    changes: readonly MailboxChange[],
+    observations: readonly MailboxChangeObservation[]
+  ) => void;
 
   private readonly foldersByPath: Map<string, FixtureFolder>;
 

@@ -371,8 +371,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     };
     const acknowledge = vi.fn();
+    const acknowledgeWithStatuses = vi.fn();
     idleClient.peekMailboxChanges = () => [change];
     idleClient.acknowledgeMailboxChanges = acknowledge;
+    idleClient.acknowledgeMailboxChangesWithStatuses = acknowledgeWithStatuses;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
       liveInboxOnly: true,
@@ -384,7 +386,19 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(result.foldersProcessed).toBe(1);
     expect(result.reconcileGapsFound).toBe(1);
-    expect(acknowledge).toHaveBeenCalledWith([change]);
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(acknowledgeWithStatuses).toHaveBeenCalledWith([change], [{
+      status: {
+        path: "Archive",
+        uidValidity: 50_003,
+        uidNext: 303,
+        exists: 1,
+        messages: 1,
+        highestModseq: undefined
+      },
+      reconcileComplete: true,
+      flagScanComplete: true
+    }]);
     const rows = await h.pool.query<{
       uid: string;
       deleted_in_provider: boolean;

@@ -18,7 +18,14 @@ import {
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
-import type { MailboxChange, MailboxListItem, MailboxLock, MirrorImapClient } from "./imap-client.js";
+import type {
+  MailboxChange,
+  MailboxChangeObservation,
+  MailboxListItem,
+  MailboxLock,
+  MailboxStatus,
+  MirrorImapClient
+} from "./imap-client.js";
 import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -108,6 +115,7 @@ type FolderSyncResult = {
   initialSyncComplete: boolean;
   reconcileClean: boolean;
   qresyncReplayComplete?: boolean;
+  observedStatus: MailboxStatus;
 };
 
 type ReconcileAttemptTelemetry = {
@@ -497,6 +505,7 @@ export class MirrorEngine {
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
         let attemptedMailboxChanges = 0;
         const handledMailboxChanges: MailboxChange[] = [];
+        const handledMailboxObservations: MailboxChangeObservation[] = [];
         for (const folder of folders) {
           throwIfInterrupted();
           const mailboxChange = mailboxChangeByPath.get(folder.path);
@@ -551,6 +560,13 @@ export class MirrorEngine {
                 || folderResult.qresyncReplayComplete === true)
               && (!mailboxChange.forceFlagScan || folderResult.flagScanAttempted)) {
               handledMailboxChanges.push(mailboxChange);
+              handledMailboxObservations.push({
+                status: folderResult.observedStatus,
+                reconcileComplete: folderResult.qresyncReplayComplete === true
+                  || (folderResult.reconcileAttempted && folderResult.reconcileClean),
+                flagScanComplete: folderResult.qresyncReplayComplete === true
+                  || folderResult.flagScanAttempted
+              });
             }
             await this.repository.heartbeat(account.id);
           } catch (error) {
@@ -632,7 +648,14 @@ export class MirrorEngine {
         }
 
         if (handledMailboxChanges.length > 0) {
-          client.acknowledgeMailboxChanges?.(handledMailboxChanges);
+          if (client.acknowledgeMailboxChangesWithStatuses) {
+            client.acknowledgeMailboxChangesWithStatuses(
+              handledMailboxChanges,
+              handledMailboxObservations
+            );
+          } else {
+            client.acknowledgeMailboxChanges?.(handledMailboxChanges);
+          }
         }
 
         if (supplemental) {
@@ -984,6 +1007,11 @@ export class MirrorEngine {
     try {
       const mailbox = client.mailbox;
       if (!mailbox) throw new Error("Mailbox not available after lock");
+      const observedStatus: MailboxStatus = {
+        ...mailbox,
+        path: folder.path,
+        messages: mailbox.messages ?? mailbox.exists
+      };
 
       const uidValidity = Number(mailbox.uidValidity);
       const uidNext = mailbox.uidNext ?? undefined;
@@ -1017,7 +1045,8 @@ export class MirrorEngine {
           flagScanAttempted: false,
           hitLockBudget: false,
           initialSyncComplete: false,
-          reconcileClean: false
+          reconcileClean: false,
+          observedStatus
         };
       }
 
@@ -1057,7 +1086,8 @@ export class MirrorEngine {
           flagScanAttempted: false,
           hitLockBudget: this.folderHitLockBudget(options),
           initialSyncComplete: initial.initialSyncComplete,
-          reconcileClean: false
+          reconcileClean: false,
+          observedStatus
         };
       }
 
@@ -1415,7 +1445,8 @@ export class MirrorEngine {
         hitLockBudget,
         initialSyncComplete: true,
         reconcileClean: reconcileClean === true,
-        qresyncReplayComplete: qresyncApplied
+        qresyncReplayComplete: qresyncApplied,
+        observedStatus
       };
     } finally {
       if (options.reconcileTelemetry.startedAt !== undefined) {
