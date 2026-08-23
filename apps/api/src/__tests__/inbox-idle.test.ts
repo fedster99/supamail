@@ -1,13 +1,14 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { openInboxIdleSession, waitForInboxIdleWake } from "../inbox-idle.js";
+import type { MailboxStatus } from "../imap-client.js";
 import type { ImapAccount } from "../types.js";
 
 class FakeIdleClient extends EventEmitter {
   capabilities = new Map<string, boolean | number>([["IDLE", true]]);
   enabled = new Set<string>();
   usable = true;
-  mailbox: Record<string, unknown> | false = false;
+  mailbox: (MailboxStatus & { qresync?: boolean }) | false = false;
   skipListStatusArgs = false;
   mailboxOpen = vi.fn(async () => ({}));
   logout = vi.fn(async () => undefined);
@@ -486,7 +487,7 @@ describe("waitForInboxIdleWake", () => {
       highestModseq: 21n
     });
 
-    await expect(opened.session.verifyMailboxChanges()).resolves.toMatchObject({
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
       kind: "exists",
       folderPath: "INBOX"
     });
@@ -528,7 +529,7 @@ describe("waitForInboxIdleWake", () => {
     });
     expect(opened.status).toBe("ready");
     if (opened.status !== "ready") throw new Error("session was not ready");
-    await opened.session.verifyMailboxChanges();
+    await opened.session.verifyMailboxChanges!();
     opened.session.syncClient.acknowledgeMailboxChanges?.(
       opened.session.syncClient.peekMailboxChanges?.() ?? []
     );
@@ -540,12 +541,751 @@ describe("waitForInboxIdleWake", () => {
       highestModseq: 21n
     });
 
-    await expect(opened.session.verifyMailboxChanges()).resolves.toMatchObject({
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
       kind: "exists",
       folderPath: "Filtered"
     });
     expect(client.status.mock.calls.map(([path]) => path)).toEqual(["INBOX", "Filtered"]);
     opened.session.close();
+  });
+
+  it("bounds and rotates verification STATUS probes after the Inbox", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    for (const [index, path] of ["INBOX", "A", "B", "C", "D"].entries()) {
+      client.statuses.set(path, {
+        path,
+        uidValidity: BigInt(index + 1),
+        uidNext: 11,
+        messages: 10,
+        unseen: 1,
+        highestModseq: 20n
+      });
+    }
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      MAX_PRIORITY_FOLDERS_PER_CYCLE: 1,
+      MAX_RR_FOLDERS_PER_CYCLE: 1
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => [...client.statuses.keys()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    client.status.mockClear();
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toBeNull();
+    expect(client.status.mock.calls.map(([path]) => path)).toEqual(["INBOX", "A", "B"]);
+    client.status.mockClear();
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toBeNull();
+    expect(client.status.mock.calls.map(([path]) => path)).toEqual(["INBOX", "C", "D"]);
+    opened.session.close();
+  });
+
+  it("latches bounded STATUS when verification gets partial LIST-STATUS data", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("LIST-STATUS", true);
+    for (const [index, path] of ["INBOX", "Archive", "Filtered"].entries()) {
+      client.statuses.set(path, {
+        path,
+        uidValidity: BigInt(index + 1),
+        uidNext: 11,
+        messages: 10,
+        unseen: 1,
+        highestModseq: 20n
+      });
+    }
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => [...client.statuses.keys()],
+      initialFolderStatuses: [...client.statuses.values()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    await opened.session.verifyMailboxChanges!();
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.list.mockClear();
+    client.list.mockResolvedValueOnce([{
+      path: "INBOX",
+      status: client.statuses.get("INBOX")!
+    }]);
+    client.status.mockClear();
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toBeNull();
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.list).toHaveBeenCalledWith(expect.objectContaining({
+      mailboxPatterns: ["INBOX", "Archive", "Filtered"]
+    }));
+    expect(client.list).not.toHaveBeenCalledWith(expect.objectContaining({
+      mailboxPatterns: ["*"]
+    }));
+    expect(opened.session.folderVerificationStrategy).toBe("status");
+    expect(client.status.mock.calls.map(([path]) => path))
+      .toEqual(["INBOX", "Archive", "Filtered"]);
+    opened.session.close();
+  });
+
+  it("keeps checking bounded folders after a transient verification STATUS failure", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    for (const [index, path] of ["INBOX", "Archive", "Filtered"].entries()) {
+      client.statuses.set(path, {
+        path,
+        uidValidity: BigInt(index + 1),
+        uidNext: 11,
+        messages: 10,
+        unseen: 1,
+        highestModseq: 20n
+      });
+    }
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => [...client.statuses.keys()],
+      initialFolderStatuses: [...client.statuses.values()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    await opened.session.verifyMailboxChanges!();
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.status.mockClear();
+    client.status.mockImplementation(async (path: string) => {
+      if (path === "Archive") throw new Error("transient STATUS failure");
+      return client.statuses.get(path)!;
+    });
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "Archive"
+    });
+    expect(client.status.mock.calls.map(([path]) => path))
+      .toEqual(["INBOX", "Archive", "Filtered"]);
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Archive",
+        forceReconcile: true,
+        forceFlagScan: true
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it("turns incomplete verification STATUS data into conservative recovery work", async () => {
+    const client = new FakeIdleClient();
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX", "Archive"],
+      initialFolderStatuses: [...client.statuses.values()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    await opened.session.verifyMailboxChanges!();
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.status.mockImplementation(async (path: string) => path === "Archive"
+      ? { path: "Wrong", uidValidity: 2n } as never
+      : client.statuses.get(path)!);
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "Archive"
+    });
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Archive",
+        forceReconcile: true,
+        forceFlagScan: true
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it("returns a flags wake for a verification-only flag fingerprint change", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX"],
+      initialFolderStatuses: [...client.statuses.values()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    await opened.session.verifyMailboxChanges!();
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.statuses.set("INBOX", {
+      ...client.statuses.get("INBOX")!,
+      unseen: 2,
+      highestModseq: 21n
+    });
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "flags",
+      folderPath: "INBOX"
+    });
+    opened.session.close();
+  });
+
+  it("uses the Inbox event snapshot without turning the original wake into recovery work", async () => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 11, prevCount: 10 });
+    await expect(wait).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "exists", folderPath: "INBOX" }
+    });
+
+    const syncedInbox = {
+      ...initialInbox,
+      uidNext: 17,
+      messages: 11,
+      highestModseq: 25n
+    };
+    client.statuses.set("INBOX", syncedInbox);
+    const handled = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    opened.session.syncClient.acknowledgeMailboxChangesWithStatuses?.(
+      handled,
+      [{ status: syncedInbox, reconcileComplete: true, flagScanComplete: true }]
+    );
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toBeNull();
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+
+    client.statuses.set("INBOX", {
+      ...syncedInbox,
+      uidNext: 18,
+      messages: 12,
+      highestModseq: 26n
+    });
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "INBOX"
+    });
+    opened.session.close();
+  });
+
+  it("detects a net-neutral second Inbox change after acknowledging an EXISTS wake", async () => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 11, prevCount: 10 });
+    await expect(wait).resolves.toMatchObject({ status: "wake" });
+    const syncedInbox = {
+      ...initialInbox,
+      uidNext: 17,
+      messages: 11,
+      highestModseq: 25n
+    };
+    opened.session.syncClient.acknowledgeMailboxChangesWithStatuses?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? [],
+      [{ status: syncedInbox, reconcileComplete: true, flagScanComplete: true }]
+    );
+
+    client.statuses.set("INBOX", {
+      ...syncedInbox,
+      uidNext: 18,
+      messages: 11,
+      highestModseq: 26n
+    });
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "INBOX"
+    });
+    opened.session.close();
+  });
+
+  it.each([
+    ["missed expunge", { messages: 10, exists: 10, unseen: 1, highestModseq: 26n }],
+    ["missed flags", { messages: 11, exists: 11, unseen: 2, highestModseq: 26n }]
+  ] as const)("does not acknowledge %s without completed recovery proof", async (
+    _scenario,
+    concurrentChange
+  ) => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 11, prevCount: 10 });
+    await wait;
+    const syncStart = {
+      ...initialInbox,
+      uidNext: 17,
+      ...concurrentChange
+    };
+    opened.session.syncClient.acknowledgeMailboxChangesWithStatuses?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? [],
+      [{ status: syncStart, reconcileComplete: false, flagScanComplete: false }]
+    );
+    client.statuses.set("INBOX", syncStart);
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "INBOX"
+    });
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "INBOX",
+        forceReconcile: true,
+        forceFlagScan: true
+      })
+    ]);
+    opened.session.close();
+  });
+
+  it("requires reconcile proof when aggregate STATUS matches after a net-neutral delete", async () => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 11, prevCount: 10 });
+    await wait;
+    const syncStart = {
+      ...initialInbox,
+      uidNext: 18,
+      messages: 11,
+      exists: 11,
+      highestModseq: 26n
+    };
+    opened.session.syncClient.acknowledgeMailboxChangesWithStatuses?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? [],
+      [{ status: syncStart, reconcileComplete: false, flagScanComplete: true }]
+    );
+    client.statuses.set("INBOX", syncStart);
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "INBOX"
+    });
+    opened.session.close();
+  });
+
+  it("preserves the last flag fingerprint when a sync-start snapshot omits it", async () => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 11, prevCount: 10 });
+    await wait;
+    const syncStart = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 12,
+      messages: 11
+    };
+    opened.session.syncClient.acknowledgeMailboxChangesWithStatuses?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? [],
+      [{ status: syncStart, reconcileComplete: true, flagScanComplete: true }]
+    );
+    client.statuses.set("INBOX", {
+      ...syncStart,
+      unseen: 2
+    });
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "flags",
+      folderPath: "INBOX"
+    });
+    opened.session.close();
+  });
+
+  it("runs one conservative flag recovery when a FLAGS event has no MODSEQ", async () => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("flags", { path: "INBOX", seq: 1, uid: 7 });
+    await expect(wait).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "flags" }
+    });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "flags",
+      folderPath: "INBOX"
+    });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toBeNull();
+    opened.session.close();
+  });
+
+  it("does not repeat a no-MODSEQ flag recovery after STATUS supplies a cursor", async () => {
+    const client = new FakeIdleClient();
+    const initialInbox = {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    };
+    client.statuses.set("INBOX", initialInbox);
+    client.mailboxOpen.mockImplementation(async () => {
+      client.mailbox = initialInbox;
+      return {};
+    });
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("flags", { path: "INBOX", seq: 1, uid: 7 });
+    await wait;
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.statuses.set("INBOX", {
+      ...initialInbox,
+      unseen: 2,
+      highestModseq: 21n
+    });
+
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toMatchObject({
+      kind: "flags",
+      folderPath: "INBOX"
+    });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    await expect(opened.session.verifyMailboxChanges!()).resolves.toBeNull();
+    opened.session.close();
+  });
+
+  it("rejects verification while Inbox selection is still in progress", async () => {
+    const client = new FakeIdleClient();
+    let selectionStarted = false;
+    let releaseSelection!: () => void;
+    client.mailboxOpen.mockImplementation(async () => {
+      selectionStarted = true;
+      await new Promise<void>((resolve) => {
+        releaseSelection = resolve;
+      });
+      return {};
+    });
+    client.idle = vi.fn(async () => true);
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(selectionStarted).toBe(true));
+    await expect(opened.session.verifyMailboxChanges!())
+      .rejects.toThrow("Mailbox verification cannot run during IDLE wait");
+    releaseSelection();
+    await expect(wait).resolves.toEqual({ status: "renew" });
+    opened.session.close();
+  });
+
+  it("rejects a second wait while Inbox selection is in progress", async () => {
+    const client = new FakeIdleClient();
+    let selectionStarted = false;
+    let releaseSelection!: () => void;
+    client.mailboxOpen.mockImplementation(async () => {
+      selectionStarted = true;
+      await new Promise<void>((resolve) => {
+        releaseSelection = resolve;
+      });
+      return {};
+    });
+    client.idle = vi.fn(async () => true);
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const first = opened.session.wait();
+    await vi.waitFor(() => expect(selectionStarted).toBe(true));
+    await expect(opened.session.wait())
+      .rejects.toThrow("Inbox IDLE wait is already in progress");
+    releaseSelection();
+    await expect(first).resolves.toEqual({ status: "renew" });
+    opened.session.close();
+  });
+
+  it("cancels a folder refresh when the session closes", async () => {
+    const client = new FakeIdleClient();
+    let refreshCalls = 0;
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => {
+        refreshCalls += 1;
+        if (refreshCalls === 1) return ["INBOX"];
+        return await new Promise<string[]>(() => undefined);
+      }
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const verification = opened.session.verifyMailboxChanges!();
+    await vi.waitFor(() => expect(refreshCalls).toBe(2));
+    opened.session.close();
+    await expect(verification).rejects.toThrow("Inbox IDLE session closed");
+  });
+
+  it("rejects wait while verification is blocked and coalesces duplicate verification", async () => {
+    const client = new FakeIdleClient();
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    let statusStarted = false;
+    let releaseStatus!: () => void;
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    client.status.mockImplementation(async (path: string) => {
+      statusStarted = true;
+      await new Promise<void>((resolve) => {
+        releaseStatus = resolve;
+      });
+      return client.statuses.get(path)!;
+    });
+
+    const first = opened.session.verifyMailboxChanges!();
+    await vi.waitFor(() => expect(statusStarted).toBe(true));
+    const duplicate = opened.session.verifyMailboxChanges!();
+    expect(duplicate).toBe(first);
+    await expect(opened.session.wait())
+      .rejects.toThrow("Inbox IDLE wait cannot start during mailbox verification");
+    releaseStatus();
+    await expect(first).resolves.toBeNull();
+    await expect(duplicate).resolves.toBeNull();
+    expect(client.status).toHaveBeenCalledTimes(1);
+    opened.session.close();
+  });
+
+  it("cancels an in-flight verification command when the session closes", async () => {
+    const client = new FakeIdleClient();
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    let statusStarted = false;
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    client.status.mockImplementation(async () => {
+      statusStarted = true;
+      return await new Promise<never>(() => undefined);
+    });
+
+    const verification = opened.session.verifyMailboxChanges!();
+    await vi.waitFor(() => expect(statusStarted).toBe(true));
+    opened.session.close();
+    await expect(verification).rejects.toThrow("Inbox IDLE session closed");
+  });
+
+  it("propagates shutdown during an in-flight verification command", async () => {
+    const client = new FakeIdleClient();
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const shutdown = new AbortController();
+    const opened = await openInboxIdleSession(pool, config, account, {
+      signal: shutdown.signal,
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    let statusStarted = false;
+    client.status.mockImplementation(async () => {
+      statusStarted = true;
+      return await new Promise<never>(() => undefined);
+    });
+    const verification = opened.session.verifyMailboxChanges!();
+    await vi.waitFor(() => expect(statusStarted).toBe(true));
+    shutdown.abort(new Error("shutdown"));
+
+    await expect(verification).rejects.toThrow("shutdown");
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+    opened.session.close();
+  });
+
+  it("uses the session shutdown signal for an active wait", async () => {
+    const client = new FakeIdleClient();
+    const shutdown = new AbortController();
+    const opened = await openInboxIdleSession(pool, config, account, {
+      signal: shutdown.signal,
+      clientFactory: async () => client
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    shutdown.abort(new Error("shutdown"));
+
+    await expect(wait).rejects.toThrow("shutdown");
+    expect(client.close).toHaveBeenCalledTimes(1);
   });
 
   it.each([

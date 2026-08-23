@@ -109,8 +109,13 @@ targets the exact changed folders and forces their indicated UID reconcile or
 flag work under the existing per-cycle operation caps; unfinished snapshots
 remain pending for later passes. After a wake-driven sync, the host may call
 `verifyMailboxChanges` on the same session. That check fingerprints Inbox and
-every tracked non-Inbox folder with one LIST-STATUS command, or bounded STATUS
-commands after fallback. If it finds a change that the notification path did
+every tracked non-Inbox folder with one strict LIST-STATUS command. If that
+command is unavailable or incomplete, it checks Inbox plus a rotating bounded
+set of tracked folders with STATUS. The sync engine advances only the mailbox
+fields proved by completed work: new-message cursors after incremental fetch,
+deletion state after clean reconcile or QRESYNC, and flag state after a flag
+scan or QRESYNC. Unproved state schedules one bounded recovery pass instead of
+accepting a guessed provider cursor. If verification finds a change that the notification path did
 not report, the host runs at most one immediate selective recovery pass; any
 remaining work stays pending for the periodic safety sync. `EXPUNGE` forces the normal Inbox UID reconcile; `FLAGS` forces the
 normal Inbox flag scan. CONDSTORE deltas are used when available; the periodic

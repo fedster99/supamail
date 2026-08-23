@@ -67,9 +67,19 @@ export interface MailboxChange {
   observed: MailboxStatus;
 }
 
+export interface MailboxChangeObservation {
+  status: MailboxStatus;
+  reconcileComplete: boolean;
+  flagScanComplete: boolean;
+}
+
 export interface MailboxChangeFeed {
   peek(limit?: number): readonly MailboxChange[];
   acknowledge(changes: readonly MailboxChange[]): void;
+  acknowledgeWithStatuses?(
+    changes: readonly MailboxChange[],
+    observations: readonly MailboxChangeObservation[]
+  ): void;
   beginReplay?(path: string): void;
   endReplay?(path: string): void;
 }
@@ -142,6 +152,10 @@ export interface MirrorImapClient {
   notify?(mailboxes: readonly string[]): Promise<MailboxStatus[] | false>;
   peekMailboxChanges?(limit?: number): readonly MailboxChange[];
   acknowledgeMailboxChanges?(changes: readonly MailboxChange[]): void;
+  acknowledgeMailboxChangesWithStatuses?(
+    changes: readonly MailboxChange[],
+    observations: readonly MailboxChangeObservation[]
+  ): void;
   getMailboxLock(path: string, options?: { qresync?: QresyncRequest }): Promise<MailboxLock>;
   fetch(
     range: string | number[] | Record<string, unknown>,
@@ -247,6 +261,17 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   acknowledgeMailboxChanges(changes: readonly MailboxChange[]): void {
+    this.mailboxChangeFeed?.acknowledge(changes);
+  }
+
+  acknowledgeMailboxChangesWithStatuses(
+    changes: readonly MailboxChange[],
+    observations: readonly MailboxChangeObservation[]
+  ): void {
+    if (this.mailboxChangeFeed?.acknowledgeWithStatuses) {
+      this.mailboxChangeFeed.acknowledgeWithStatuses(changes, observations);
+      return;
+    }
     this.mailboxChangeFeed?.acknowledge(changes);
   }
 
