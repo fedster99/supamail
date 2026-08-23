@@ -102,7 +102,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Sent metadata has a separate 30-second default cadence. Its lightweight pass skips discovery, flag scan, reconcile, bodies, history, and full-account health/backoff transitions.
   - Supplemental Sent work must yield at the next full-sweep deadline: abort connection setup, throttle waits, or the active Sent connection; start no further Sent accounts; and re-check the full lane without another poll sleep. Any Sent-lane account-lock contention yields without stale-lock recovery. These yields are not outage/failure signals.
   - Folder discovery runs every 15 minutes.
-  - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder. An Inbox `EXPUNGE` wake may force this reconcile earlier; other folders keep the normal cadence.
+  - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder. An Inbox `EXPUNGE` wake or a tracked non-Inbox dirty signal may force this reconcile earlier; folders without a dirty signal keep the normal cadence.
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
   - Inbox remains first in bounded full-sweep priority selection. Sent stays at priority 5 and receives a supplemental lightweight refresh on its separate cadence.

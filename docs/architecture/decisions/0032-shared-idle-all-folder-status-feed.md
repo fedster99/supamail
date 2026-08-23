@@ -88,11 +88,15 @@ changes cannot shadow one another.
 
 When CONDSTORE is available, flag work streams `CHANGEDSINCE` from the
 persisted folder modseq in bounded write batches and advances the cursor only
-after every batch succeeds. A folder snapshot is acknowledged individually
-only after its required flag and reconcile work completes cleanly. Retained
-snapshots are re-emitted while the rotation continues probing other folders.
-The periodic full loop and its UID-set comparison remain the correctness
-backstop.
+after every batch succeeds. After a live pass, the sync engine acknowledges the
+provider snapshot field by field: new-message cursors after incremental fetch,
+deletion counts after a clean reconcile or QRESYNC replay, and flag state after
+a flag scan or QRESYNC replay. Any deletion or flag dimension that the pass did
+not prove becomes a one-shot recovery marker rather than an accepted cursor;
+even a later matching aggregate STATUS result cannot erase that missing proof.
+Recovery markers are re-emitted while the rotation continues probing other
+folders. The periodic full loop and its UID-set comparison remain the
+correctness backstop.
 
 An independently deployable `IMAP_QRESYNC_ENABLED` layer requests a real
 QRESYNC re-selection when a completed folder has persisted UIDVALIDITY and a
@@ -120,9 +124,11 @@ Persisted cursors do not include `MESSAGES` or `UNSEEN`. Only the separate,
 deletion-complete QRESYNC cursor can prove that no expunge occurred; the
 flag-only CONDSTORE cursor cannot. Unless that QRESYNC cursor matches the
 current provider modseq, reconnect requests exact reconciliation once. Without
-a comparable flag modseq, it also requests a flag scan. The real provider
-snapshot becomes the new baseline only after that work is acknowledged, so the
-fallback does not create a retry loop.
+a comparable flag modseq, it also requests a flag scan. Each real provider
+field becomes the new baseline only after the corresponding incremental,
+reconcile, or flag work proves it safe; unproved dimensions retain one-shot
+recovery markers, so the fallback does not create a retry loop or accept a
+guessed cursor.
 Forced UID reconciles and flag scans still respect their existing per-cycle
 caps; unfinished snapshots remain pending and wake later bounded passes.
 
