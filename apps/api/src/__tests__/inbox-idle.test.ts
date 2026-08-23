@@ -441,6 +441,113 @@ describe("waitForInboxIdleWake", () => {
     opened.session.close();
   });
 
+  it("finds an Inbox delivery that NOTIFY did not report during the host sync", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.capabilities.set("LIST-STATUS", true);
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX", "Archive"],
+      initialFolderStatuses: [...client.statuses.values()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    expect(opened.session.folderVerificationStrategy).toBe("list_status");
+
+    client.statuses.set("INBOX", {
+      ...client.statuses.get("INBOX")!,
+      uidNext: 12,
+      messages: 11,
+      highestModseq: 21n
+    });
+    client.statuses.set("Archive", {
+      ...client.statuses.get("Archive")!,
+      uidNext: 12,
+      messages: 11,
+      highestModseq: 21n
+    });
+
+    await expect(opened.session.verifyMailboxChanges()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "INBOX"
+    });
+    expect(opened.session.syncClient.peekMailboxChanges?.().map((change) => change.path))
+      .toEqual(["INBOX", "Archive"]);
+    expect(client.list).toHaveBeenCalledTimes(1);
+    expect(client.list).toHaveBeenCalledWith(expect.objectContaining({
+      mailboxPatterns: ["INBOX", "Archive"]
+    }));
+    opened.session.close();
+  });
+
+  it("checks filtered folders with bounded STATUS when LIST-STATUS is unavailable", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("INBOX", {
+      path: "INBOX",
+      uidValidity: 1n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Filtered", {
+      path: "Filtered",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true,
+      IMAP_LIST_STATUS_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["INBOX", "Filtered"],
+      initialFolderStatuses: [...client.statuses.values()]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    await opened.session.verifyMailboxChanges();
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.status.mockClear();
+    client.statuses.set("Filtered", {
+      ...client.statuses.get("Filtered")!,
+      uidNext: 12,
+      messages: 11,
+      highestModseq: 21n
+    });
+
+    await expect(opened.session.verifyMailboxChanges()).resolves.toMatchObject({
+      kind: "exists",
+      folderPath: "Filtered"
+    });
+    expect(client.status.mock.calls.map(([path]) => path)).toEqual(["INBOX", "Filtered"]);
+    opened.session.close();
+  });
+
   it.each([
     ["unchanged", { uidValidity: 2n, uidNext: 11, highestModseq: 20n }, null],
     ["UIDNEXT", { uidValidity: 2n, uidNext: 12, highestModseq: 20n }, {

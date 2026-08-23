@@ -105,6 +105,8 @@ export interface InboxIdleSession {
   readonly connectedAt: Date;
   readonly syncClient: MirrorImapClient;
   readonly folderProbeStrategy?: "notify" | "list_status" | "status";
+  readonly folderVerificationStrategy?: "list_status" | "status";
+  verifyMailboxChanges(): Promise<InboxIdleWake | null>;
   wait(options?: { signal?: AbortSignal; now?: () => Date }): Promise<InboxIdleWaitResult>;
   close(): void;
 }
@@ -462,6 +464,10 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     return this.listStatusEnabled ? "list_status" : "status";
   }
 
+  get folderVerificationStrategy(): "list_status" | "status" {
+    return this.listStatusEnabled ? "list_status" : "status";
+  }
+
   private traceNotify(trace: InboxIdleNotifyTraceDetail): void {
     try {
       this.onNotifyTraceObserved?.({
@@ -570,15 +576,15 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     this.changeFeed.finishInitialization();
   }
 
-  private async listStatusSnapshots(): Promise<MailboxStatus[]> {
+  private async listStatusSnapshots(paths = this.folderPaths): Promise<MailboxStatus[]> {
     // LIST mailbox patterns have no escape for their `*` and `%` wildcards.
     // An exact probe is therefore impossible for these otherwise legal names.
     // Keep the whole session on bounded STATUS instead of broadening the query.
-    if (this.folderPaths.some((path) => /[*%]/.test(path))) {
+    if (paths.some((path) => /[*%]/.test(path))) {
       throw new Error("Tracked mailbox name cannot be represented as an exact LIST pattern");
     }
-    const tracked = new Set(this.folderPaths);
-    const statuses = await this.syncClient.listWithStatus!(STATUS_QUERY, this.folderPaths);
+    const tracked = new Set(paths);
+    const statuses = await this.syncClient.listWithStatus!(STATUS_QUERY, paths);
     if (this.listStatusWasRejected()) {
       throw new Error("IMAP server rejected LIST-STATUS");
     }
@@ -653,6 +659,44 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       }
     }
     return pending ?? null;
+  }
+
+  async verifyMailboxChanges(): Promise<InboxIdleWake | null> {
+    await this.refreshFolderPaths();
+    const paths = ["INBOX", ...this.folderPaths];
+    let statuses: MailboxStatus[] = [];
+    if (this.listStatusEnabled) {
+      try {
+        statuses = await this.listStatusSnapshots(paths);
+        if (new Set(statuses.map((status) => status.path)).size !== paths.length) {
+          this.listStatusEnabled = false;
+          statuses = [];
+        }
+      } catch (error) {
+        if (this.client.usable === false) throw error;
+        this.listStatusEnabled = false;
+      }
+    }
+    if (!this.listStatusEnabled) {
+      for (const path of paths) {
+        try {
+          statuses.push(await this.syncClient.status!(path, STATUS_QUERY));
+        } catch (error) {
+          if (this.client.usable === false) throw error;
+          this.changeFeed.signal(path, true, true);
+        }
+      }
+    }
+    for (const status of statuses) this.changeFeed.observe(status);
+    const change = this.changeFeed.peek(1)[0];
+    return change
+      ? {
+          kind: change.forceReconcile ? "exists" : "flags",
+          accountId: this.accountId,
+          folderPath: change.path,
+          observedAt: this.now()
+        }
+      : null;
   }
 
   close(): void {
