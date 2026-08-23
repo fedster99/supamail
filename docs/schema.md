@@ -77,6 +77,8 @@ requires a higher `BODY_RAW_MAX_BYTES` first.
 
 Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY resets, or provider deletion indicate they are no longer visible.
 
+`imap_sync_events` is the append-only, retention-bounded sync audit trail. Every account health change writes a `SYNC_HEALTH_CHANGED` event in the same SQL statement as the account update. Its payload records `previous_state`, `previous_reason`, `next_state`, and `next_reason`. Consumers can therefore explain a temporary degradation after the account recovers.
+
 `imap_accounts.last_priority_sync_succeeded_at` records the last sync cycle where priority folders succeeded. It powers stuck-degraded escalation: after the configured 24h threshold, a degraded account becomes retryable `BROKEN` with reason `STUCK_DEGRADED_24H`; after the terminal threshold, it becomes `STUCK_DEGRADED_TERMINAL`.
 
 `imap_accounts.folder_count_cap_override` lets operators raise the folder-count enforce threshold for known-large accounts. Without an override, `FOLDER_COUNT_WARN_THRESHOLD` records `MANY_FOLDERS_PERFORMANCE_NOTE`, and `FOLDER_COUNT_ENFORCE_THRESHOLD` records `TOO_MANY_FOLDERS_REQUIRES_MANUAL_CONFIG` while tracking only priority folders such as INBOX and Sent.

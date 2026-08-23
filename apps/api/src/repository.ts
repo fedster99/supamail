@@ -1180,7 +1180,13 @@ export class MirrorRepository {
     const result = await runOptionalDeadlineWrite<{ id: string }>(
       this.pool,
       `
-      WITH folder_health AS (
+      WITH previous_health AS MATERIALIZED (
+        SELECT sync_state, sync_state_reason
+        FROM public.imap_accounts
+        WHERE id = $1
+        FOR UPDATE
+      ),
+      folder_health AS (
         SELECT
           count(*) FILTER (WHERE tracked = true AND status != 'MISSING') AS tracked_count,
           count(*) FILTER (
@@ -1251,8 +1257,9 @@ export class MirrorRepository {
           ) AS enforce_threshold
         FROM public.imap_folders
         WHERE account_id = $1
-      )
-      UPDATE public.imap_accounts
+      ),
+      updated AS (
+      UPDATE public.imap_accounts a
       SET
         currently_syncing = false,
         sync_started_by = NULL,
@@ -1302,10 +1309,27 @@ export class MirrorRepository {
           WHEN $8::boolean THEN NULL
           ELSE backoff_until
         END
-      FROM folder_health, folder_cap
-      WHERE id = $1
+      FROM folder_health, folder_cap, previous_health
+      WHERE a.id = $1
         AND ($12::text IS NULL OR sync_started_by = $12)
-      RETURNING id
+      RETURNING a.id, a.sync_state, a.sync_state_reason
+      ),
+      health_event AS (
+        INSERT INTO public.imap_sync_events (account_id, event_type, payload)
+        SELECT
+          updated.id,
+          'SYNC_HEALTH_CHANGED',
+          jsonb_build_object(
+            'previous_state', previous_health.sync_state,
+            'previous_reason', previous_health.sync_state_reason,
+            'next_state', updated.sync_state,
+            'next_reason', updated.sync_state_reason
+          )
+        FROM updated, previous_health
+        WHERE (previous_health.sync_state, previous_health.sync_state_reason)
+          IS DISTINCT FROM (updated.sync_state, updated.sync_state_reason)
+      )
+      SELECT id FROM updated
       `,
       [
         accountId,
@@ -1341,7 +1365,14 @@ export class MirrorRepository {
     const result = await runOptionalDeadlineWrite<{ id: string }>(
       this.pool,
       `
-      UPDATE public.imap_accounts
+      WITH previous_health AS MATERIALIZED (
+        SELECT sync_state, sync_state_reason
+        FROM public.imap_accounts
+        WHERE id = $1
+        FOR UPDATE
+      ),
+      updated AS (
+      UPDATE public.imap_accounts a
       SET
         currently_syncing = false,
         sync_started_by = NULL,
@@ -1366,9 +1397,27 @@ export class MirrorRepository {
           WHEN $3::boolean THEN NULL
           ELSE backoff_until
         END
-      WHERE id = $1
+      FROM previous_health
+      WHERE a.id = $1
         AND ($4::text IS NULL OR sync_started_by = $4)
-      RETURNING id
+      RETURNING a.id, a.sync_state, a.sync_state_reason
+      ),
+      health_event AS (
+        INSERT INTO public.imap_sync_events (account_id, event_type, payload)
+        SELECT
+          updated.id,
+          'SYNC_HEALTH_CHANGED',
+          jsonb_build_object(
+            'previous_state', previous_health.sync_state,
+            'previous_reason', previous_health.sync_state_reason,
+            'next_state', updated.sync_state,
+            'next_reason', updated.sync_state_reason
+          )
+        FROM updated, previous_health
+        WHERE (previous_health.sync_state, previous_health.sync_state_reason)
+          IS DISTINCT FROM (updated.sync_state, updated.sync_state_reason)
+      )
+      SELECT id FROM updated
       `,
       [accountId, diagnosticErrorCode(error), countsTowardBackoff, options.expectedSyncOwner ?? null],
       options
@@ -1389,7 +1438,14 @@ export class MirrorRepository {
     const result = await runOptionalDeadlineWrite<{ id: string }>(
       this.pool,
       `
-      UPDATE public.imap_accounts
+      WITH previous_health AS MATERIALIZED (
+        SELECT sync_state, sync_state_reason
+        FROM public.imap_accounts
+        WHERE id = $1
+        FOR UPDATE
+      ),
+      updated AS (
+      UPDATE public.imap_accounts a
       SET
         currently_syncing = false,
         sync_started_by = NULL,
@@ -1400,9 +1456,27 @@ export class MirrorRepository {
         consecutive_successes = 0,
         current_backoff_ms = 0,
         backoff_until = NULL
-      WHERE id = $1
+      FROM previous_health
+      WHERE a.id = $1
         AND ($3::text IS NULL OR sync_started_by = $3)
-      RETURNING id
+      RETURNING a.id, a.sync_state, a.sync_state_reason
+      ),
+      health_event AS (
+        INSERT INTO public.imap_sync_events (account_id, event_type, payload)
+        SELECT
+          updated.id,
+          'SYNC_HEALTH_CHANGED',
+          jsonb_build_object(
+            'previous_state', previous_health.sync_state,
+            'previous_reason', previous_health.sync_state_reason,
+            'next_state', updated.sync_state,
+            'next_reason', updated.sync_state_reason
+          )
+        FROM updated, previous_health
+        WHERE (previous_health.sync_state, previous_health.sync_state_reason)
+          IS DISTINCT FROM (updated.sync_state, updated.sync_state_reason)
+      )
+      SELECT id FROM updated
       `,
       [accountId, diagnosticErrorCode(`AUTH_ERROR: ${error}`), options.expectedSyncOwner ?? null],
       options
@@ -1436,6 +1510,7 @@ export class MirrorRepository {
           ) AS stuck_degraded_eligible
         FROM public.imap_accounts
         WHERE id = $1
+        FOR UPDATE
       ),
       stuck_state AS (
         SELECT
@@ -1457,7 +1532,8 @@ export class MirrorRepository {
           SELECT LEAST(GREATEST(current_backoff_ms * 2, $4::int), $5::int) AS base_ms
           FROM stuck_state
         ) base
-      )
+      ),
+      updated AS (
       UPDATE public.imap_accounts a
       SET
         currently_syncing = false,
@@ -1497,7 +1573,24 @@ export class MirrorRepository {
       FROM stuck_state, next_backoff
       WHERE a.id = $1
         AND ($9::text IS NULL OR a.sync_started_by = $9)
-      RETURNING a.id
+      RETURNING a.id, a.sync_state, a.sync_state_reason
+      ),
+      health_event AS (
+        INSERT INTO public.imap_sync_events (account_id, event_type, payload)
+        SELECT
+          updated.id,
+          'SYNC_HEALTH_CHANGED',
+          jsonb_build_object(
+            'previous_state', account_state.sync_state,
+            'previous_reason', account_state.sync_state_reason,
+            'next_state', updated.sync_state,
+            'next_reason', updated.sync_state_reason
+          )
+        FROM updated, account_state
+        WHERE (account_state.sync_state, account_state.sync_state_reason)
+          IS DISTINCT FROM (updated.sync_state, updated.sync_state_reason)
+      )
+      SELECT id FROM updated
       `,
       [
         accountId,
