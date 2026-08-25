@@ -39,7 +39,7 @@ const libs = vi.hoisted(() => ({
     to: [{ email: "peer@example.test" }],
     cc: [],
     subject: "Re: Hi",
-    body: { text: "reply body" },
+    body: { text: "reply body", html: "<div>reply body</div>" },
     headers: { "In-Reply-To": "<src@x>", References: "<src@x>" }
   })),
   runReadThread: vi.fn(async (..._a: unknown[]) => ({ thread: { messages: [] } })),
@@ -185,7 +185,12 @@ describe("the --confirm send gate", () => {
     expect(req).toMatchObject({
       accountId: "acc-1",
       inReplyTo: "<src@x>",
-      references: "<src@x>"
+      references: "<src@x>",
+      body: {
+        format: "plain",
+        text: "reply body",
+        html: "<div>reply body</div>"
+      }
     });
   });
 

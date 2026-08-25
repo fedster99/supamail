@@ -109,8 +109,12 @@ These capabilities are not exposed in v1:
 - **No sending or appending.** There is no send tool, no send flag, and
   `draft_reply` only produces a draft object (ADR 0016). Its quote includes the
   full available source body; it does not silently apply a quote-size cap.
-  Plain-text quotes use `>` prefixes and a readable attribution date labeled
-  `UTC`, because the server has no user-time-zone setting.
+  The draft includes equivalent plain and HTML bodies: plain-text quotes use `>`
+  prefixes, while HTML removes visible quote markers and places the full history
+  in one compact `<blockquote type="cite">`. Gmail quote classes are included as
+  progressive hints; inline border and spacing provide the cross-client fallback.
+  The readable attribution date is labeled `UTC` because the server has no
+  user-time-zone setting.
 - **No attachment bytes or content extraction.** Only attachment *metadata*
   (filename, mime type, size, disposition) is mirrored; the bytes are not.
 - **No mutations.** No labels, flags, moves, deletes, marking read, or scheduling.

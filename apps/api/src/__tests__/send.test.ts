@@ -1,5 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { simpleParser } from "mailparser";
 import { buildRawMime, buildSendEnvelope } from "../smtp-client.js";
+import { buildReplyBody } from "../mcp/tools/draft-reply.js";
 import type { SendRequest } from "../types.js";
 
 /**
@@ -87,6 +89,49 @@ describe("buildRawMime", () => {
     };
     const raw = decode((await buildRawMime(req, FROM)).raw);
     expect(headerValue(raw, "X-SupaMail-Send")).toBe("primitive");
+  });
+
+  it("composes text and HTML bodies as multipart/alternative when both are supplied", async () => {
+    const req: SendRequest = {
+      ...base,
+      body: {
+        format: "plain",
+        text: "Thanks!\n\n> Earlier message",
+        html: '<div>Thanks!</div><blockquote type="cite">Earlier message</blockquote>'
+      }
+    };
+
+    const raw = decode((await buildRawMime(req, FROM)).raw);
+
+    expect(raw.toLowerCase()).toContain("multipart/alternative");
+    expect(raw.toLowerCase()).toContain("content-type: text/plain");
+    expect(raw.toLowerCase()).toContain("content-type: text/html");
+    expect(raw).toContain("Earlier message");
+  });
+
+  it("round-trips a nested reply with full plain markers and one compact cross-client HTML quote", async () => {
+    const body = buildReplyBody(
+      "Please let me know if a call works in 8 minutes.",
+      "Hi Federico,\n\nOn Fri, Julian wrote:\n> My bad, here he is.\n>\n> On Thu, Gavin wrote:\n> > Jake was not added.",
+      "On Mon, Jake <jake@example.test> wrote:"
+    );
+    const { raw } = await buildRawMime({ ...base, subject: "Re: Atoms", body }, FROM);
+    const parsed = await simpleParser(raw);
+    const html = String(parsed.html);
+
+    expect(parsed.headerLines.find(({ key }) => key === "content-type")?.line.toLowerCase())
+      .toContain("multipart/alternative");
+    expect(parsed.text).toContain("> My bad, here he is.");
+    expect(parsed.text).toContain("> > > Jake was not added.");
+    expect(html).toContain('<div class="gmail_quote gmail_quote_container">');
+    expect(html).toContain(
+      '<blockquote class="gmail_quote" type="cite" style="margin:0 0 0 8px;border-left:1px solid #ccc;padding-left:10px">'
+    );
+    expect(html.match(/<blockquote/g)).toHaveLength(1);
+    expect(html).toContain("My bad, here he is.");
+    expect(html).toContain("Jake was not added.");
+    expect(html).not.toContain("&gt; My bad, here he is.");
+    expect(html).not.toContain("> My bad, here he is.");
   });
 
   // ── Attachment compose seam (email-004): toComposerAttachment was untested —
