@@ -13,7 +13,7 @@ import {
 /**
  * draft_reply — PRODUCE ONLY, NEVER SENDS (ADR 0016). Reads one source message
  * from the Postgres mirror and returns a structured, ready-to-send reply draft:
- * From/To/Cc/Subject, RFC 5322 threading headers, and a quoted body. It never
+ * From/To/Cc/Subject, RFC 5322 threading headers, and plain/HTML quoted bodies. It never
  * touches IMAP, never writes the filesystem, and has NO send flag — the agent (or
  * a human) takes the payload elsewhere to actually send. There is no schema knob
  * that could trigger a send. `X-SupaMail-Draft: produced-not-sent` makes the
@@ -75,7 +75,7 @@ export interface DraftReply {
     "X-SupaMail-Draft": "produced-not-sent";
   };
   threadId: string | null;
-  body: { format: "plain"; text: string };
+  body: { format: "plain"; text: string; html: string };
   warnings: string[];
 }
 
@@ -87,7 +87,7 @@ export const draftReplyDefinition: ToolDefinition = {
     "SupaMail mirror. Reads the source message and its account, then derives the From " +
     "address (the mirror account), To (the original sender), optional reply-all Cc " +
     "(original To+Cc minus self), a single 'Re:' subject, RFC 5322 threading headers " +
-    "(In-Reply-To / References), and a quoted body. PRODUCE-ONLY: this NEVER sends, " +
+    "(In-Reply-To / References), and equivalent plain/HTML quoted bodies. PRODUCE-ONLY: this NEVER sends, " +
     "saves drafts to IMAP, or writes any file — there is no send flag. The returned " +
     "draftId is a local handle (drf_<source id>), not an IMAP UID. Delivery requires " +
     "a separate send path outside this MCP server.",
@@ -210,6 +210,67 @@ export function quoteText(text: string): string {
   return output.toString("utf8");
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function plainTextToHtml(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => `<div>${line.length > 0 ? escapeHtml(line) : "<br>"}</div>`)
+    .join("\n");
+}
+
+function quotedTextToHtml(text: string): string {
+  const output = ['<blockquote type="cite">'];
+  let depth = 0;
+
+  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+    const prefix = line.match(/^(?:[ \t]*>[ \t]?)+/)?.[0] ?? "";
+    const nextDepth = prefix.match(/>/g)?.length ?? 0;
+    while (depth < nextDepth) {
+      output.push('<blockquote type="cite">');
+      depth += 1;
+    }
+    while (depth > nextDepth) {
+      output.push("</blockquote>");
+      depth -= 1;
+    }
+    const content = line.slice(prefix.length);
+    output.push(`<div>${content.length > 0 ? escapeHtml(content) : "<br>"}</div>`);
+  }
+
+  while (depth > 0) {
+    output.push("</blockquote>");
+    depth -= 1;
+  }
+  output.push("</blockquote>");
+  return output.join("\n");
+}
+
+/** Build equivalent plain and HTML alternatives from plain, already-normalized source text. */
+export function buildReplyBody(
+  authoredText: string,
+  sourceText: string | null,
+  attribution: string
+): DraftReply["body"] {
+  const fullSource = cleanBody(sourceText, { includeQuoted: true }).text ?? "";
+  return {
+    format: "plain",
+    text: `${authoredText}\n\n${attribution}\n${quoteText(fullSource)}`,
+    html:
+      `${plainTextToHtml(authoredText)}\n` +
+      `<div><br></div>\n<div>${escapeHtml(attribution)}</div>\n` +
+      quotedTextToHtml(fullSource)
+  };
+}
+
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = [
   "Jan",
@@ -235,15 +296,12 @@ export function formatReplyDate(date: Date): string {
   return `${day} at ${hour12}:${minute} ${hour < 12 ? "AM" : "PM"} UTC`;
 }
 
-/** Quote the full available original body without allocating one string per line. */
-function quoteOriginal(row: SourceRow): string {
+/** Resolve the immediate source body and its human-readable attribution. */
+function replySource(row: SourceRow): { text: string | null; attribution: string } {
   const raw = row.body_text ?? row.body_plain ?? row.selected_text_part ?? null;
-  const cleaned = cleanBody(raw, { includeQuoted: true });
-  const text = cleaned.text ?? "";
   const fromLabel = row.from_name ? `${row.from_name} <${row.from_email ?? ""}>` : row.from_email ?? "unknown sender";
   const attribution = `On ${formatReplyDate(row.internal_date)}, ${fromLabel} wrote:`;
-  const quoted = quoteText(text);
-  return `${attribution}\n${quoted}`;
+  return { text: raw, attribution };
 }
 
 export async function runDraftReply(
@@ -346,8 +404,8 @@ export async function runDraftReply(
 
   const cc = request.reply_all === true ? buildCc(source) : [];
 
-  const quoted = quoteOriginal(source);
-  const text = `${request.body}\n\n${quoted}`;
+  const original = replySource(source);
+  const body = buildReplyBody(request.body, original.text, original.attribution);
 
   return {
     draftId: `drf_${source.id}`,
@@ -357,7 +415,7 @@ export async function runDraftReply(
     subject: reSubject(source.subject),
     headers,
     threadId: source.provider_thread_id,
-    body: { format: "plain", text },
+    body,
     warnings
   };
 }

@@ -39,6 +39,9 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
 - **Compose with nodemailer's `MailComposer`, deliver the EXACT composed bytes.**
   MIME folding / quoted-printable / multipart / Message-ID generation is the
   long-tail correctness surface where hand-rolling bites, so we do not hand-roll.
+  When a request supplies both plain and HTML bodies, both are passed to
+  `MailComposer`, which emits `multipart/alternative` with the plain fallback
+  before the richer HTML representation.
   A Message-ID is stamped at compose time (caller-supplied wins) so the mirrored
   Sent copy's `rfc_message_id` is known at send time and dedups against the later
   synced copy. The same `raw` bytes are BOTH submitted over SMTP (`raw:`) and

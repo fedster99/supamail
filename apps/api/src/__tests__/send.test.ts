@@ -89,6 +89,24 @@ describe("buildRawMime", () => {
     expect(headerValue(raw, "X-SupaMail-Send")).toBe("primitive");
   });
 
+  it("composes text and HTML bodies as multipart/alternative when both are supplied", async () => {
+    const req: SendRequest = {
+      ...base,
+      body: {
+        format: "plain",
+        text: "Thanks!\n\n> Earlier message",
+        html: '<div>Thanks!</div><blockquote type="cite">Earlier message</blockquote>'
+      }
+    };
+
+    const raw = decode((await buildRawMime(req, FROM)).raw);
+
+    expect(raw.toLowerCase()).toContain("multipart/alternative");
+    expect(raw.toLowerCase()).toContain("content-type: text/plain");
+    expect(raw.toLowerCase()).toContain("content-type: text/html");
+    expect(raw).toContain("Earlier message");
+  });
+
   // ── Attachment compose seam (email-004): toComposerAttachment was untested —
   //    send.test.ts never passed req.attachments. Cover one regular base64 part +
   //    one inline cid image (Content-ID + inline disposition) in one multipart MIME.

@@ -480,7 +480,7 @@ program
       to: draft.to,
       cc: draft.cc.length > 0 ? draft.cc : undefined,
       subject: draft.subject,
-      body: { format: "plain", text: draft.body.text },
+      body: { format: "plain", text: draft.body.text, html: draft.body.html },
       inReplyTo: draft.headers["In-Reply-To"],
       references: draft.headers.References
     };

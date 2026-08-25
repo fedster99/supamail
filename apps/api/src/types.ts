@@ -369,6 +369,7 @@ export interface SendRequest {
   cc?: SendRecipient[];
   bcc?: SendRecipient[];
   subject: string;
+  /** Supplying both text and html produces multipart/alternative. */
   body: { format: "plain" | "html"; text?: string; html?: string };
   /** In-Reply-To / References / custom headers (merged with the convenience fields below). */
   headers?: Record<string, string>;

@@ -26,7 +26,10 @@ engine and is never imported by the agent surface; `imapflow`, `imap-client`, an
 
 `draft_reply` is a **produce-only** tool. It returns a structured, ready-to-send
 reply object — `from`, `to[]`, `cc[]`, a single `Re:` subject, RFC 5322 §3.6.4
-threading headers (`In-Reply-To`, `References`), and the body — and then stops.
+threading headers (`In-Reply-To`, `References`), and equivalent plain/HTML bodies
+— and then stops. The plain body uses interoperable `>` quote prefixes; the HTML
+body represents the same history with escaped text and semantic nested
+`<blockquote type="cite">` elements.
 It does not send, does not IMAP-APPEND a draft, and does not mutate any row.
 
 The boundary is enforced in the schema, not just by convention:
