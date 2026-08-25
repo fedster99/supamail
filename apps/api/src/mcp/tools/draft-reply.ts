@@ -228,28 +228,16 @@ function plainTextToHtml(text: string): string {
 }
 
 function quotedTextToHtml(text: string): string {
-  const output = ['<blockquote type="cite">'];
-  let depth = 0;
+  const output = [
+    '<blockquote class="gmail_quote" type="cite" style="margin:0 0 0 8px;border-left:1px solid #ccc;padding-left:10px">'
+  ];
 
   for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
     const prefix = line.match(/^(?:[ \t]*>[ \t]?)+/)?.[0] ?? "";
-    const nextDepth = prefix.match(/>/g)?.length ?? 0;
-    while (depth < nextDepth) {
-      output.push('<blockquote type="cite">');
-      depth += 1;
-    }
-    while (depth > nextDepth) {
-      output.push("</blockquote>");
-      depth -= 1;
-    }
     const content = line.slice(prefix.length);
     output.push(`<div>${content.length > 0 ? escapeHtml(content) : "<br>"}</div>`);
   }
 
-  while (depth > 0) {
-    output.push("</blockquote>");
-    depth -= 1;
-  }
   output.push("</blockquote>");
   return output.join("\n");
 }
@@ -266,8 +254,9 @@ export function buildReplyBody(
     text: `${authoredText}\n\n${attribution}\n${quoteText(fullSource)}`,
     html:
       `${plainTextToHtml(authoredText)}\n` +
-      `<div><br></div>\n<div>${escapeHtml(attribution)}</div>\n` +
-      quotedTextToHtml(fullSource)
+      `<div><br></div>\n<div class="gmail_quote gmail_quote_container">\n` +
+      `<div>${escapeHtml(attribution)}</div>\n` +
+      `${quotedTextToHtml(fullSource)}\n</div>`
   };
 }
 

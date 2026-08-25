@@ -165,7 +165,9 @@ liveDb("draft_reply live DB", () => {
     expect(draft.body.text).toContain("> Line two.");
     const quotedLines = draft.body.text.split("\n").filter((l) => l.startsWith("> "));
     expect(quotedLines.length).toBeGreaterThan(1);
-    expect(draft.body.html).toContain('<blockquote type="cite">');
+    expect(draft.body.html).toContain('<div class="gmail_quote gmail_quote_container">');
+    expect(draft.body.html).toContain('<blockquote class="gmail_quote" type="cite"');
+    expect(draft.body.html.match(/<blockquote/g)).toHaveLength(1);
     expect(draft.body.html).toContain("Here are the numbers.");
     expect(draft.body.html).not.toContain("> Here are the numbers.");
     expect(draft.warnings).toEqual([]);

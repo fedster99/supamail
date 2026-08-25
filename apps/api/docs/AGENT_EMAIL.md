@@ -110,7 +110,9 @@ These capabilities are not exposed in v1:
   `draft_reply` only produces a draft object (ADR 0016). Its quote includes the
   full available source body; it does not silently apply a quote-size cap.
   The draft includes equivalent plain and HTML bodies: plain-text quotes use `>`
-  prefixes, while HTML uses semantic nested `<blockquote type="cite">` elements.
+  prefixes, while HTML removes visible quote markers and places the full history
+  in one compact `<blockquote type="cite">`. Gmail quote classes are included as
+  progressive hints; inline border and spacing provide the cross-client fallback.
   The readable attribution date is labeled `UTC` because the server has no
   user-time-zone setting.
 - **No attachment bytes or content extraction.** Only attachment *metadata*

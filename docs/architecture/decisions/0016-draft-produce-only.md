@@ -28,8 +28,11 @@ engine and is never imported by the agent surface; `imapflow`, `imap-client`, an
 reply object — `from`, `to[]`, `cc[]`, a single `Re:` subject, RFC 5322 §3.6.4
 threading headers (`In-Reply-To`, `References`), and equivalent plain/HTML bodies
 — and then stops. The plain body uses interoperable `>` quote prefixes; the HTML
-body represents the same history with escaped text and semantic nested
-`<blockquote type="cite">` elements.
+body represents the same escaped history in one compact `<blockquote
+type="cite">`. Its Gmail quote classes are progressive hints, while minimal
+inline border and spacing remain the fallback for other HTML clients. Existing
+plain-text quote depth is flattened visually in HTML so long threads do not
+accumulate indentation.
 It does not send, does not IMAP-APPEND a draft, and does not mutate any row.
 
 The boundary is enforced in the schema, not just by convention:

@@ -109,7 +109,7 @@ describe("buildRawMime", () => {
     expect(raw).toContain("Earlier message");
   });
 
-  it("round-trips a nested reply with markers only in plain text and semantic quotes in HTML", async () => {
+  it("round-trips a nested reply with full plain markers and one compact cross-client HTML quote", async () => {
     const body = buildReplyBody(
       "Please let me know if a call works in 8 minutes.",
       "Hi Federico,\n\nOn Fri, Julian wrote:\n> My bad, here he is.\n>\n> On Thu, Gavin wrote:\n> > Jake was not added.",
@@ -123,8 +123,13 @@ describe("buildRawMime", () => {
       .toContain("multipart/alternative");
     expect(parsed.text).toContain("> My bad, here he is.");
     expect(parsed.text).toContain("> > > Jake was not added.");
-    expect(html.match(/<blockquote type="cite">/g)).toHaveLength(3);
+    expect(html).toContain('<div class="gmail_quote gmail_quote_container">');
+    expect(html).toContain(
+      '<blockquote class="gmail_quote" type="cite" style="margin:0 0 0 8px;border-left:1px solid #ccc;padding-left:10px">'
+    );
+    expect(html.match(/<blockquote/g)).toHaveLength(1);
     expect(html).toContain("My bad, here he is.");
+    expect(html).toContain("Jake was not added.");
     expect(html).not.toContain("&gt; My bad, here he is.");
     expect(html).not.toContain("> My bad, here he is.");
   });

@@ -19,7 +19,7 @@ describe("formatReplyDate", () => {
 });
 
 describe("buildReplyBody", () => {
-  it("returns a plain fallback and semantic, escaped HTML for the full nested quote history", () => {
+  it("keeps full plain quote depth while flattening HTML history into one compact client-compatible quote", () => {
     const body = buildReplyBody(
       "Thanks <team> & talk soon.",
       "Latest answer.\n\nOn Thu, Alice wrote:\n> Older answer.\n> Oldest answer.",
@@ -29,11 +29,14 @@ describe("buildReplyBody", () => {
     expect(body.format).toBe("plain");
     expect(body.text).toContain("> Latest answer.");
     expect(body.text).toContain("> > Older answer.");
-    expect(body.html).toContain("<blockquote type=\"cite\">");
+    expect(body.html).toContain('<div class="gmail_quote gmail_quote_container">');
+    expect(body.html).toContain(
+      '<blockquote class="gmail_quote" type="cite" style="margin:0 0 0 8px;border-left:1px solid #ccc;padding-left:10px">'
+    );
     expect(body.html).toContain("Thanks &lt;team&gt; &amp; talk soon.");
     expect(body.html).toContain("Latest answer.");
     expect(body.html).toContain("Older answer.");
-    expect(body.html.match(/<blockquote type=\"cite\">/g)).toHaveLength(2);
+    expect(body.html.match(/<blockquote/g)).toHaveLength(1);
     expect(body.html).not.toContain("> Latest answer.");
     expect(body.html).not.toContain("&gt; Older answer.");
   });
