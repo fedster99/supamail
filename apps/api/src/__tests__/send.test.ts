@@ -1,5 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { simpleParser } from "mailparser";
 import { buildRawMime, buildSendEnvelope } from "../smtp-client.js";
+import { buildReplyBody } from "../mcp/tools/draft-reply.js";
 import type { SendRequest } from "../types.js";
 
 /**
@@ -105,6 +107,26 @@ describe("buildRawMime", () => {
     expect(raw.toLowerCase()).toContain("content-type: text/plain");
     expect(raw.toLowerCase()).toContain("content-type: text/html");
     expect(raw).toContain("Earlier message");
+  });
+
+  it("round-trips a nested reply with markers only in plain text and semantic quotes in HTML", async () => {
+    const body = buildReplyBody(
+      "Please let me know if a call works in 8 minutes.",
+      "Hi Federico,\n\nOn Fri, Julian wrote:\n> My bad, here he is.\n>\n> On Thu, Gavin wrote:\n> > Jake was not added.",
+      "On Mon, Jake <jake@example.test> wrote:"
+    );
+    const { raw } = await buildRawMime({ ...base, subject: "Re: Atoms", body }, FROM);
+    const parsed = await simpleParser(raw);
+    const html = String(parsed.html);
+
+    expect(parsed.headerLines.find(({ key }) => key === "content-type")?.line.toLowerCase())
+      .toContain("multipart/alternative");
+    expect(parsed.text).toContain("> My bad, here he is.");
+    expect(parsed.text).toContain("> > > Jake was not added.");
+    expect(html.match(/<blockquote type="cite">/g)).toHaveLength(3);
+    expect(html).toContain("My bad, here he is.");
+    expect(html).not.toContain("&gt; My bad, here he is.");
+    expect(html).not.toContain("> My bad, here he is.");
   });
 
   // ── Attachment compose seam (email-004): toComposerAttachment was untested —
