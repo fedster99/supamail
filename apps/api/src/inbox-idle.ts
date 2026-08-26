@@ -160,6 +160,12 @@ const NOTIFY_EVENT_TYPES = new Set<ImapNotifySignal["eventType"]>([
   "NOTIFICATIONOVERFLOW"
 ]);
 
+const WAKE_PRIORITY: Record<InboxIdleWakeKind, number> = {
+  exists: 1,
+  flags: 2,
+  expunge: 3
+};
+
 function statusValue(value: bigint | number | undefined): string | null {
   return value === undefined ? null : String(value);
 }
@@ -537,8 +543,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   private reconnectAfterNotifyOverflow = false;
   private deferredNotifyWake = false;
   private deferredNotifySignal: { folderPath: string; signal: ImapNotifySignal } | null = null;
-  private deferredInboxWake = false;
-  private deferredInboxSignal: ImapNotifySignal | null = null;
+  private deferredEventWake: Pick<InboxIdleWake, "kind" | "folderPath" | "notifySignal"> | null = null;
   private pendingOverflowSignal: ImapNotifySignal | null = null;
   private queuedWake: InboxIdleWake | null = null;
   private wakeDeliveryScheduled = false;
@@ -987,17 +992,28 @@ class ReusableInboxIdleSession implements InboxIdleSession {
       return;
     }
     if (!this.acceptingEvents) {
-      if (!this.closed && folderPath.toLowerCase() === "inbox") {
+      const tracked = folderPath.toLowerCase() === "inbox" || this.folderPaths.includes(folderPath);
+      if (!this.closed && tracked) {
         this.changeFeed.signalEvent(folderPath, kind, data);
-        this.deferredInboxWake = true;
-        if (this.deferredInboxSignal) this.traceHandoff({
-          folderPath,
-          notifySignal: this.deferredInboxSignal
-        }, "coalesced", "deferred_replaced");
-        this.deferredInboxSignal = signal;
+        const previous = this.deferredEventWake;
+        if (!previous || WAKE_PRIORITY[kind] >= WAKE_PRIORITY[previous.kind]) {
+          if (previous) this.traceHandoff(previous, "coalesced", "deferred_replaced");
+          this.deferredEventWake = {
+            kind,
+            folderPath,
+            ...(signal ? { notifySignal: signal } : {})
+          };
+        } else {
+          if (signal) {
+            this.traceHandoff({ folderPath, notifySignal: signal }, "coalesced", "lower_priority");
+          }
+        }
       } else if (signal) {
-        this.traceHandoff({ folderPath, notifySignal: signal }, "dropped",
-          this.closed ? "session_closed" : "not_accepting_events");
+        this.traceHandoff(
+          { folderPath, notifySignal: signal },
+          this.closed ? "dropped" : "ignored",
+          this.closed ? "session_closed" : "untracked_folder"
+        );
       }
       return;
     }
@@ -1017,8 +1033,7 @@ class ReusableInboxIdleSession implements InboxIdleSession {
   }
 
   private enqueueWake(wake: InboxIdleWake): void {
-    const priority: Record<InboxIdleWakeKind, number> = { exists: 1, flags: 2, expunge: 3 };
-    if (!this.queuedWake || priority[wake.kind] >= priority[this.queuedWake.kind]) {
+    if (!this.queuedWake || WAKE_PRIORITY[wake.kind] >= WAKE_PRIORITY[this.queuedWake.kind]) {
       if (this.queuedWake) this.traceHandoff(this.queuedWake, "coalesced", "superseded");
       this.queuedWake = wake;
     } else {
@@ -1214,20 +1229,31 @@ class ReusableInboxIdleSession implements InboxIdleSession {
         notifySignal: covered.signal
       }, "coalesced", "covered_by_reconciliation");
     }
-    if (!this.deferredInboxWake) return null;
-    this.deferredInboxWake = false;
-    const inboxChange = this.changeFeed.peek().find(
-      (candidate) => candidate.path.toLowerCase() === "inbox"
-    );
-    if (!inboxChange) return null;
-    const signal = this.deferredInboxSignal;
-    this.deferredInboxSignal = null;
+    const deferredEvent = this.deferredEventWake;
+    if (!deferredEvent) return null;
+    this.deferredEventWake = null;
+    const pendingChanges = this.changeFeed.peek();
+    const eventChange = pendingChanges.find(
+      (candidate) => candidate.path === deferredEvent.folderPath
+    ) ?? pendingChanges[0];
+    if (!eventChange) {
+      this.traceHandoff(deferredEvent, "coalesced", "covered_by_reconciliation");
+      return null;
+    }
+    const sameEvent = deferredEvent.folderPath === eventChange.path;
+    if (!sameEvent) {
+      this.traceHandoff(deferredEvent, "coalesced", "covered_by_reconciliation");
+    }
     const wake: InboxIdleWake = {
-      kind: inboxChange.forceReconcile ? "exists" : "flags",
+      kind: sameEvent
+        ? deferredEvent.kind
+        : eventChange.forceReconcile ? "exists" : "flags",
       accountId: this.accountId,
-      folderPath: inboxChange.path,
+      folderPath: eventChange.path,
       observedAt: this.now(),
-      ...(signal ? { notifySignal: signal } : {})
+      ...(sameEvent && deferredEvent.notifySignal
+        ? { notifySignal: deferredEvent.notifySignal }
+        : {})
     };
     this.traceHandoff(wake, "emitted", "deferred_wake_delivered");
     return {
