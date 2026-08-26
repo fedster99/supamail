@@ -1781,6 +1781,230 @@ describe("waitForInboxIdleWake", () => {
     opened.session.close();
   });
 
+  it("delivers a tracked non-Inbox event that arrives while the host sync owns the session", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"]
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const firstWait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 1, prevCount: 0 });
+    await expect(firstWait).resolves.toMatchObject({ status: "wake" });
+    const handled = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    opened.session.syncClient.acknowledgeMailboxChanges?.(handled);
+
+    client.emit("exists", { path: "Archive", count: 11, prevCount: 10 });
+
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({ path: "Archive" })
+    ]);
+    const result = await opened.session.wait();
+    expect(result).toMatchObject({
+      status: "wake",
+      wake: { kind: "exists", folderPath: "Archive" }
+    });
+    opened.session.close();
+  });
+
+  it("coalesces deferred tracked-folder NOTIFY events and delivers the newest signal", async () => {
+    const client = new FakeIdleClient();
+    client.capabilities.set("NOTIFY", true);
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    const traces = vi.fn();
+    const opened = await openInboxIdleSession(pool, Object.assign({}, config, {
+      IMAP_NOTIFY_ENABLED: true
+    }) as never, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive"],
+      onNotifyTrace: traces
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const firstWait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 1, prevCount: 0 });
+    await expect(firstWait).resolves.toMatchObject({ status: "wake" });
+    const handled = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    opened.session.syncClient.acknowledgeMailboxChanges?.(handled);
+
+    const signal = (sequence: number, eventType: "EXISTS" | "EXPUNGE" | "FETCH_FLAGS") => ({
+      sequence,
+      receivedAt: new Date("2026-08-17T18:00:00.000Z"),
+      monotonicReceivedAtMs: sequence,
+      eventType,
+      connectionState: "SELECTED",
+      activeCommand: "IDLE"
+    });
+    client.emit("exists", {
+      path: "Archive",
+      count: 11,
+      prevCount: 10,
+      notifySignal: signal(30, "EXISTS")
+    });
+    client.emit("flags", {
+      path: "Archive",
+      seq: 2,
+      uid: 11,
+      notifySignal: signal(31, "FETCH_FLAGS")
+    });
+
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([
+      expect.objectContaining({
+        path: "Archive",
+        forceFlagScan: true,
+        observed: expect.objectContaining({ messages: 11 })
+      })
+    ]);
+
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "flags", folderPath: "Archive", notifySignal: { sequence: 31 } }
+    });
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 30 }),
+      result: "coalesced",
+      reason: "deferred_replaced"
+    }));
+
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.emit("expunge", {
+      path: "Archive",
+      seq: 3,
+      uid: 10,
+      notifySignal: signal(32, "EXPUNGE")
+    });
+    client.emit("flags", {
+      path: "Archive",
+      seq: 4,
+      uid: 11,
+      notifySignal: signal(33, "FETCH_FLAGS")
+    });
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "expunge", folderPath: "Archive", notifySignal: { sequence: 32 } }
+    });
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 33 }),
+      result: "coalesced",
+      reason: "lower_priority"
+    }));
+    opened.session.close();
+  });
+
+  it("falls back to an older pending folder when the newest deferred event was reconciled", async () => {
+    const client = new FakeIdleClient();
+    client.statuses.set("Archive", {
+      path: "Archive",
+      uidValidity: 2n,
+      uidNext: 11,
+      messages: 10,
+      unseen: 1,
+      highestModseq: 20n
+    });
+    client.statuses.set("Projects", {
+      path: "Projects",
+      uidValidity: 3n,
+      uidNext: 21,
+      messages: 20,
+      unseen: 2,
+      highestModseq: 30n
+    });
+    const traces = vi.fn();
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client,
+      folderPathsFactory: async () => ["Archive", "Projects"],
+      onNotifyTrace: traces
+    });
+    expect(opened.status).toBe("ready");
+    if (opened.status !== "ready") throw new Error("session was not ready");
+
+    const firstWait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.emit("exists", { path: "INBOX", count: 1, prevCount: 0 });
+    await expect(firstWait).resolves.toMatchObject({ status: "wake" });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+
+    const signal = (sequence: number) => ({
+      sequence,
+      receivedAt: new Date("2026-08-17T18:00:00.000Z"),
+      monotonicReceivedAtMs: sequence,
+      eventType: "EXISTS" as const,
+      connectionState: "SELECTED",
+      activeCommand: "IDLE"
+    });
+    client.emit("exists", { path: "Archive", count: 11, prevCount: 10, notifySignal: signal(40) });
+    client.emit("exists", { path: "Projects", count: 21, prevCount: 20, notifySignal: signal(41) });
+    const pending = opened.session.syncClient.peekMailboxChanges?.() ?? [];
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      pending.filter((change) => change.path === "Projects")
+    );
+
+    await expect(opened.session.wait()).resolves.toMatchObject({
+      status: "wake",
+      wake: { kind: "flags", folderPath: "Archive" }
+    });
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 41 }),
+      result: "coalesced",
+      reason: "covered_by_reconciliation"
+    }));
+
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.emit("exists", {
+      path: "Archive",
+      count: 12,
+      prevCount: 11,
+      notifySignal: signal(42)
+    });
+    opened.session.syncClient.acknowledgeMailboxChanges?.(
+      opened.session.syncClient.peekMailboxChanges?.() ?? []
+    );
+    client.idleStarted = false;
+    const nextWait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    client.finishIdle!(true);
+    await expect(nextWait).resolves.toEqual({ status: "renew" });
+    expect(traces).toHaveBeenCalledWith(expect.objectContaining({
+      stage: "handoff",
+      signal: expect.objectContaining({ sequence: 42 }),
+      result: "coalesced",
+      reason: "covered_by_reconciliation"
+    }));
+    opened.session.close();
+  });
+
   it("records a parser-root NOTIFY signal that does not change the folder snapshot", async () => {
     const client = new FakeIdleClient();
     client.capabilities.set("NOTIFY", true);
