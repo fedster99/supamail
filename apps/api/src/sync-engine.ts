@@ -319,6 +319,8 @@ export interface SyncAccountOptions {
   sentOnly?: boolean;
   /** Run the supplemental live-change lane (the name is retained for host compatibility). */
   liveInboxOnly?: boolean;
+  /** Fetch the current live body backlog without running folder or history work. */
+  bodyBacklogOnly?: boolean;
   /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
   forceInboxReconcile?: boolean;
   /** A flags notification may arrive before the normal flag deadline. */
@@ -393,8 +395,13 @@ export class MirrorEngine {
     triggerType: SyncTriggerType = "manual",
     options: SyncAccountOptions = {}
   ): Promise<SyncResult> {
-    if (options.sentOnly && options.liveInboxOnly) {
-      throw new Error("sentOnly and liveInboxOnly cannot be combined");
+    const supplementalModes = [
+      options.sentOnly === true,
+      options.liveInboxOnly === true,
+      options.bodyBacklogOnly === true
+    ].filter(Boolean).length;
+    if (supplementalModes > 1) {
+      throw new Error("sentOnly, liveInboxOnly, and bodyBacklogOnly cannot be combined");
     }
     if (options.client && options.keepClientOpen !== true) {
       throw new Error("A host-owned client requires keepClientOpen");
@@ -407,7 +414,7 @@ export class MirrorEngine {
     }
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
-    const supplemental = options.sentOnly === true || options.liveInboxOnly === true;
+    const supplemental = supplementalModes === 1;
 
     const runId = await this.repository.startSyncRun(account.id, triggerType);
     const metadataWriteStats: MetadataWriteStats = {
@@ -489,7 +496,9 @@ export class MirrorEngine {
           await this.discoverFolders(account, client);
         }
 
-        const folders = sentFolders ?? (options.liveInboxOnly
+        const folders = options.bodyBacklogOnly
+          ? []
+          : sentFolders ?? (options.liveInboxOnly
           ? mailboxChanges.length > 0
             ? await this.repository.getFoldersForWake(
                 account.id,
@@ -628,7 +637,10 @@ export class MirrorEngine {
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
+        } else if (!options.sentOnly
+          && !options.liveInboxOnly
+          && !options.bodyBacklogOnly
+          && !connectionLost) {
           const historyResult = await this.runHistoryLane(
             account,
             client,
@@ -1984,29 +1996,9 @@ export class MirrorEngine {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
       }
 
-      const candidates = await searchUidsBefore(client, windowCutoff);
-      const inSnapshot = [...new Set(candidates)]
-        .filter((uid) => uid <= targetMaxUid!)
-        .sort((a, b) => a - b);
-
-      if (inSnapshot.length === 0) {
-        await this.repository.markHistoryBackfillComplete(folder.id, uidValidity, {
-          deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS,
-          signal
-        });
-        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
-      }
-
       const batchSize = this.config.BODY_BACKFILL_BATCH_SIZE;
-      const descending: number[] = [];
-      for (let i = inSnapshot.length - 1; i >= 0; i--) {
-        if (inSnapshot[i] < oldestSynced!) {
-          descending.push(inSnapshot[i]);
-          if (descending.length >= batchSize) break;
-        }
-      }
-
-      if (descending.length === 0) {
+      const scanUpperUid = Math.min(targetMaxUid!, oldestSynced! - 1);
+      if (scanUpperUid < 1) {
         await this.repository.markHistoryBackfillComplete(folder.id, uidValidity, {
           deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS,
           signal
@@ -2014,9 +2006,50 @@ export class MirrorEngine {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
       }
 
-      const batch = descending.slice().reverse();
+      // Search only the next bounded UID-address range. The previous implementation
+      // fetched every historical UID again for each small metadata batch, making a
+      // refresh quadratic in mailbox size. Advancing across an empty range is safe:
+      // this exact date-and-UID query proved that no snapshot candidate exists there.
+      const scanLowerUid = Math.max(1, scanUpperUid - batchSize + 1);
+      const candidates = await searchUidsBefore(
+        client,
+        windowCutoff,
+        `${scanLowerUid}:${scanUpperUid}`
+      );
+      const batch = [...new Set(candidates)]
+        .filter((uid) => uid >= scanLowerUid && uid <= scanUpperUid)
+        .sort((a, b) => a - b);
+      const stillRemaining = scanLowerUid > 1;
+
+      if (batch.length === 0) {
+        await this.repository.advanceHistoryBackfillWatermark(
+          folder.id,
+          scanLowerUid,
+          scanLowerUid,
+          uidValidity,
+          {
+            complete: !stillRemaining,
+            deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS,
+            signal
+          }
+        );
+        return {
+          messagesUpserted: 0,
+          bodiesFetched: 0,
+          processed: true,
+          hitLockBudget: this.isLockBudgetExpired(lockDeadline)
+        };
+      }
+
+      if (batch.length > batchSize) {
+        throw new Error(`Historical UID scan exceeded bounded batch size for ${folder.path}`);
+      }
+
+      if (this.isLockBudgetExpired(lockDeadline)) {
+        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
+      }
+
       const metadata = await fetchMessageMetadata(client, batch, batchSize);
-      const stillRemaining = inSnapshot.some((uid) => uid < batch[0]);
       const historyWriteDeadline = Date.now() + Math.min(
         HISTORY_METADATA_COMMIT_GRACE_MS,
         this.config.INCREMENTAL_TOTAL_TIMEOUT_MS
@@ -2056,7 +2089,7 @@ export class MirrorEngine {
       const progressDeadline = Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS;
       await this.repository.advanceHistoryBackfillWatermark(
         folder.id,
-        batch[0],
+        scanLowerUid,
         batch[batch.length - 1],
         uidValidity,
         { complete: !stillRemaining, deadlineAt: progressDeadline, signal }

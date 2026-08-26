@@ -205,6 +205,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
        WHERE account_id = $1 AND folder_path = 'Sent' AND uid = 201`,
       [h.account.id]
     );
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1",
+      [h.account.id]
+    );
 
     const moved = folders[0].messages.find((message) => message.uid === 103)!;
     folders[0].messages = folders[0].messages.filter(
@@ -318,6 +322,38 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id]
     );
     expect(unrelatedBody.rows[0].body_fetched_at).toBeNull();
+
+    const followupAccount = await h.repository.getAccount(h.account.id);
+    expect(followupAccount).not.toBeNull();
+    const followupBacklog = await h.repository.getBodyBacklog(followupAccount!, 10);
+    const followupKeys = followupBacklog.map((message) => `${message.folder_path}:${message.uid}`);
+    expect(followupKeys).toContain("INBOX:106");
+    expect(followupKeys).toContain("Sent:201");
+    const bodyFollowup = await engine.syncAccount(h.account.id, "scheduled", {
+      bodyBacklogOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+    expect(bodyFollowup.outcome).toBe("success");
+    expect(bodyFollowup.foldersProcessed).toBe(0);
+    expect(bodyFollowup.messagesUpserted).toBe(0);
+    expect(bodyFollowup.bodiesFetched).toBeGreaterThanOrEqual(2);
+    expect(list).not.toHaveBeenCalled();
+    const fetchedByFollowup = await h.pool.query<{ body_fetched_at: Date | null }>(
+      `SELECT body_fetched_at
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Sent' AND uid = 201`,
+      [h.account.id]
+    );
+    expect(fetchedByFollowup.rows[0].body_fetched_at).not.toBeNull();
+    const afterBodyFollowup = await h.pool.query<{ last_sync_finished_at: Date | null }>(
+      "SELECT last_sync_finished_at FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(afterBodyFollowup.rows[0].last_sync_finished_at?.toISOString()).toBe(
+      beforeWake.rows[0].last_sync_finished_at?.toISOString()
+    );
 
     await dueAllFolders(h.pool, h.account.id);
     await engine.syncAccount(h.account.id, "scheduled");
@@ -4420,6 +4456,74 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     }
     expect((await historyState()).backfill_in_progress).toBe(false);
     expect(await historicalCount()).toBe(3);
+  });
+
+  it("bounds each resumed history query to one batch of UID address space", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const h = await setupIntegration("history-bounded-uid-ranges", {
+      BODY_BACKFILL_BATCH_SIZE: 3,
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET body_fetch_policy = 'lazy',
+           historical_backfill_mode = 'metadata_only',
+           max_backfill_rate = 'normal'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 83_101,
+      messages: [
+        ...Array.from({ length: 30 }, (_, index) => makeTextMessage({
+          uid: index + 1,
+          subject: `old-${index + 1}`,
+          from: "a@x.test",
+          to: "u@x.test",
+          body: `old-${index + 1}`,
+          internalDate: oldDate
+        })),
+        makeTextMessage({
+          uid: 100,
+          subject: "fresh",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: new Date()
+        })
+      ]
+    }];
+    const historyRanges: string[] = [];
+    class HistoryRangeClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (typeof range === "object"
+          && !Array.isArray(range)
+          && range.before instanceof Date
+          && typeof range.uid === "string") {
+          historyRanges.push(range.uid);
+        }
+        yield* super.fetch(range, query);
+      }
+    }
+
+    await h.buildEngine({
+      folders,
+      clientFactory: async () => new HistoryRangeClient(folders)
+    }).syncAccount(h.account.id, "manual");
+
+    expect(historyRanges).toEqual(["28:30", "25:27", "22:24"]);
+    expect(historyRanges.every((range) => {
+      const [start, end] = range.split(":").map(Number);
+      return end - start + 1 <= 3;
+    })).toBe(true);
   });
 
   it("Scenario O — re-running history backfill over mirrored UIDs is idempotent", async () => {
