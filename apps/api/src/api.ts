@@ -107,14 +107,13 @@ interface ApiAppOptions {
    *  semantic free-text query with structured field/state/date/folder filters. */
   search: (req: SearchRequest) => Promise<SearchResponse>;
   /** Draft CRUD (email-003, ADR 0019). Create/update/send APPEND to Drafts (and
-   * delete-old where needed); list/get read the mirror. Drafts carry neither Bcc nor
-   * attachments — neither can round-trip the saved bytes, so both are send-time-only
-   * fields (see ADR 0019 / 0020). */
+   * delete-old where needed); list/get read the mirror. Draft MIME may carry
+   * attachments; Bcc remains send-time-only. */
   drafts: {
     create: (req: DraftInput) => Promise<CreateDraftResult>;
     list: (accountId: string, options: { limit?: number }) => Promise<DraftSummary[]>;
     get: (messageId: string) => Promise<DraftDetail | null>;
-    update: (messageId: string, input: Omit<SendRequest, "accountId" | "bcc" | "attachments">) => Promise<UpdateDraftResult>;
+    update: (messageId: string, input: Omit<SendRequest, "accountId" | "bcc">) => Promise<UpdateDraftResult>;
     send: (messageId: string) => Promise<SendDraftResult>;
     delete: (messageId: string, options: { hard?: boolean }) => Promise<DeleteDraftResult>;
   };
@@ -240,13 +239,8 @@ const SEND_SCHEMA = z.object({
 // here with a clear message rather than accept-and-drop. Bcc is a send-time-only
 // field — set it on the /accounts/:id/send envelope (see ADR 0019).
 //
-// Attachments are likewise NOT a draft field: createDraft/updateDraft compose the
-// saved bytes via `buildRawMime` from a draft input that carries no attachment
-// bytes, so any attachment passed here would be silently dropped from the SAVED
-// draft. We REJECT it here, exactly like Bcc — attachments are a send-time-only
-// field; attach files on the /accounts/:id/send envelope (see ADR 0020). (sendDraft
-// now resends the draft's RAW bytes — ADR 0019 addendum — so this is a save-time
-// limitation, not a send-time loss.)
+// Attachments use the same bounded base64 transport and MIME composer as direct
+// sends. sendDraft later resends the saved raw MIME, preserving every part.
 const DRAFT_SCHEMA = z.object({
   to: z.array(SEND_RECIPIENT_SCHEMA).optional(),
   cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
@@ -263,9 +257,7 @@ const DRAFT_SCHEMA = z.object({
   inReplyTo: headerSafe(2000).optional(),
   references: headerSafe(8000).optional(),
   messageId: headerSafe(2000).optional(),
-  attachments: z.any().optional().refine((v) => v === undefined, {
-    message: "Attachments are not supported on saved drafts — attach files when you send the draft"
-  })
+  attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
 });
 
 const TRACK_FOLDER_SCHEMA = z.object({
@@ -799,7 +791,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
   // Draft CRUD (email-003, ADR 0019). Create files a `\Draft` APPEND to the
   // account's Drafts folder; list/get read the mirror; update is APPEND-new +
   // delete-old; send-draft reuses the email-001 send path then deletes the draft.
-  app.post("/accounts/:id/drafts", async (c) => {
+  app.post("/accounts/:id/drafts", sendBodyLimit, async (c) => {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
@@ -836,7 +828,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     return c.json({ draft });
   });
 
-  app.patch("/drafts/:id", async (c) => {
+  app.patch("/drafts/:id", sendBodyLimit, async (c) => {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
     const result = await options.drafts.update(id, { ...input, to: input.to ?? [], subject: input.subject ?? "" });

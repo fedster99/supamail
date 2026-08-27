@@ -129,13 +129,9 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   type as an oversight: Bcc is dropped from the saved bytes by design (nodemailer's
   `keepBcc`), so accepting it on a draft would silently lose recipients. Set Bcc on
   the `send`/`reply` envelope instead.
-- Drafts carry neither Bcc nor attachments; both are send-time-only fields.
-  `createDraft`/`updateDraft` reject `attachments` because they compose the saved
-  bytes via `buildRawMime` from a `DraftInput` that has no attachment-bytes field —
-  so a passed attachment would be silently dropped from the SAVED draft. (Note: the
-  send-side reason no longer applies — `sendDraft` now resends the draft's RAW bytes,
-  so a draft composed elsewhere WITH attachments would round-trip on send. The create
-  rejection is independent; see the addendum.) Attach files on the `send` envelope.
+- Drafts still exclude Bcc, but may carry attachments. `createDraft`/`updateDraft`
+  compose attachment parts into the saved MIME through `buildRawMime`; `sendDraft`
+  later resends those exact bytes. See ADR 0020's 2026-08-27 addendum.
 - HTML drafts are sent as HTML, never flattened — now automatically, because
   `sendDraft` resends the draft's real bytes (whatever Content-Type/parts they
   carry). The `getDraft` `bodyHtml` + `isHtml` distinction is kept for read/display
@@ -211,7 +207,4 @@ invariants hold: no `src/mcp/` write verb / no
 sixth tool, `agent-surface-zero-send` + `sync-adapter-read-only` green, the frozen
 AES-256-GCM envelope untouched.
 
-Open follow-up: the draft-attachment rejection on `createDraft`/`updateDraft` could
-now be revisited — `sendDraft` would round-trip attachments present in the draft's
-raw bytes — but SupaMail-authored drafts still have no path to carry attachment bytes
-into `buildRawMime`, so the create/update rejection stays for now (not lifted here).
+The draft-attachment follow-up was completed on 2026-08-27; see ADR 0020.

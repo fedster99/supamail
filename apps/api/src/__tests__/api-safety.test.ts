@@ -811,23 +811,20 @@ describe("API safety", () => {
     expect(drafts.create).not.toHaveBeenCalled();
   });
 
-  it("rejects a draft create carrying attachments with a clear message (attachments are send-time only)", async () => {
+  it("accepts draft attachments and passes them to the draft composer", async () => {
     const { app, drafts } = buildApp();
+    const attachments = [{ filename: "report.pdf", content: "AAAA" }];
     const res = await app.request(`/accounts/${accountId}/drafts`, {
       method: "POST",
       headers: { ...auth(), "content-type": "application/json" },
       body: JSON.stringify({
         subject: "Draft",
-        attachments: [{ filename: "report.pdf", content: "AAAA" }],
+        attachments,
         body: { format: "plain", text: "hello" }
       })
     });
-    expect(res.status).toBe(400);
-    const json = await res.json() as { error: string; issues: Array<{ message: string }> };
-    expect(json.error).toBe("invalid_input");
-    expect(json.issues.some((i) => i.message === "Attachments are not supported on saved drafts — attach files when you send the draft")).toBe(true);
-    // The draft is never filed when attachments are present (before any append).
-    expect(drafts.create).not.toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(drafts.create).toHaveBeenCalledWith(expect.objectContaining({ attachments }));
   });
 
   it("returns 404 from POST /accounts/:id/drafts for an unknown account", async () => {
