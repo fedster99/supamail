@@ -14,7 +14,7 @@ email-004 adds the Nylas content-parity surface: attachments on send/draft, atta
 ## Decision
 
 - **Compose half** rides email-001: `SendRequest.attachments` (filename/contentType/base64 content, optional `cid` + `inline`) flow through the existing `buildRawMime` (nodemailer MailComposer handles MIME + inline `cid`) on the **send** path — no new compose path.
-- **Attachments are a send-time-only field; saved drafts REJECT them** (exactly like Bcc, ADR 0019). `createDraft`/`updateDraft` compose the saved bytes via `buildRawMime` from a draft input that carries no attachment-bytes field, so an attachment passed there would be silently dropped from the SAVED draft. Rather than accept-and-drop, `DRAFT_SCHEMA` errors with `"Attachments are not supported on saved drafts — attach files when you send the draft"`, the `createDraft`/`updateDraft` input types omit `attachments` (`Omit<…, "bcc" | "attachments">`), the lib re-checks at runtime (`rejectAttachments`) for an untyped caller, and the CLI `draft-create`/`draft-update` expose no attachment option. Attachments remain fully supported on the email-001 **send** envelope. (Note: as of the ADR 0019 addendum, `sendDraft` resends the draft's RAW bytes, so a draft composed elsewhere WITH attachments would round-trip on send — this rejection is a SupaMail-authored-draft save-time limitation, not a send-time loss.)
+- **Attachments use the same MIME composer for sends and saved drafts.** `createDraft`/`updateDraft` pass `SendAttachment[]` through `buildRawMime`, so the APPENDed draft owns the complete attachment parts. `sendDraft` resends those exact raw bytes. Bcc remains send-time-only because nodemailer's default intentionally omits it from saved MIME.
 - **Content-Disposition is hardened against attacker-influenced filenames.** The attachment-download route sanitizes the ASCII `filename=` token (strips CR/LF/`"`/`;`/`\`/control chars so it can't break the quoted string or inject extra disposition params) and adds an RFC 5987 `filename*=UTF-8''<percent-encoded>` token so non-ASCII names round-trip losslessly.
 - **Invalid `max_chars` falls back to the content-operation default.** A non-numeric `?max_chars=abc` / `--max-chars abc` yields `NaN`; the HTTP route and CLI guard with `Number.isFinite`, and `cleanMessageBody` applies its 4,096-character default.
 - **Dedicated content operations live in a new `content.ts`, OUTSIDE `src/mcp/`**, reachable via the lib barrel + `API_TOKEN` HTTP routes + the CLI — **never as a sixth MCP tool** (so `agent-surface-zero-send.test.ts` stays unchanged and still asserts exactly five tools). Those existing operations remain bounded to 4,096 characters by default. MCP message/thread reads return the full available cleaned body from the mirror through the shared `cleanBody` helper.
@@ -34,4 +34,14 @@ email-004 adds the Nylas content-parity surface: attachments on send/draft, atta
 - The agent MCP surface is unchanged: attachment bytes, raw MIME, and dedicated header/content operations are operator/automation reads behind `API_TOKEN`, not agent tools. Attachment metadata and the full available cleaned body remain fields on the existing MCP read tools. A future agent must NOT add a sixth MCP content tool (it would break the five-tool assertion).
 - `cleanBody` is deterministic text parsing reused from the shared read layer — it must stay model-free (the "no LLM inside the product" rule).
 - Byte reads inherit the UIDVALIDITY guard, so a mailbox reset fails closed rather than returning the wrong part.
-- Drafts carry neither Bcc (ADR 0019) nor attachments — both are send-time-only fields. A future change must NOT "re-add" `attachments` to `DRAFT_SCHEMA`, the `DraftInput` type, or the CLI as an oversight: `createDraft`/`updateDraft` compose the saved bytes via `buildRawMime`, which has no attachment-bytes field, so an attachment passed there is dropped from the SAVED draft. Attach files on the `send`/`reply` envelope instead. (`sendDraft` resends the draft's RAW bytes — ADR 0019 addendum — so attachments already present in a draft's bytes do round-trip; the rejection is a save-time limitation.)
+- Draft attachments increase create/update request size, so those routes share the existing bounded attachment schema and whole-request body limit with direct sends. Attachment bytes live in the provider draft MIME, not the mirror database.
+
+## Addendum (2026-08-27): saved drafts carry attachments
+
+The earlier rejection was removed after the hosted direct-upload workflow made
+agent-authored draft attachments necessary. No new compose path was added:
+`DraftInput` now carries the existing `SendAttachment[]`, and `buildRawMime`
+places those parts in the bytes APPENDed to Drafts. The CLI and HTTP draft
+create/update surfaces accept the same bounded attachment representation. Because
+`sendDraft` already resends the saved raw MIME, later delivery preserves the parts
+without refetching or reconstructing them.

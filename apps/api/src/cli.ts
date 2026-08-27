@@ -500,17 +500,21 @@ program
   .requiredOption("--account-id <id>", "Account UUID to file the draft under")
   .option("--to <addr>", "Recipient (repeatable; 'Name <email>' or 'email')", collect, [])
   .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
+  .option("--attach <path>", "Attach a file (repeatable)", collect, [])
+  .option("--inline <cid=path>", "Inline image as cid=path (repeatable; referenced as cid:<cid>)", collect, [])
   .option("--subject <text>", "Subject line", "")
   .option("--body <text>", "Plain-text body", "")
   .action(async (options) => {
     // No --bcc: Bcc can't round-trip through the saved draft bytes, so it is a
     // send-time-only field (set it on `send`/`reply`). See ADR 0019.
+    const attachments = await readAttachments(options.attach as string[], options.inline as string[]);
     const result = await createDraft(pool, config, {
       accountId: options.accountId,
       to: parseRecipients(options.to as string[]),
       cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
       subject: options.subject,
-      body: { format: "plain", text: options.body }
+      body: { format: "plain", text: options.body },
+      attachments: attachments.length > 0 ? attachments : undefined
     });
     console.log(JSON.stringify(result, null, 2));
   });
@@ -542,15 +546,19 @@ program
   .description("Update a draft (append-new + delete-old; IMAP drafts are immutable)")
   .option("--to <addr>", "Recipient (repeatable)", collect, [])
   .option("--cc <addr>", "Cc recipient (repeatable)", collect, [])
+  .option("--attach <path>", "Attach a file (repeatable)", collect, [])
+  .option("--inline <cid=path>", "Inline image as cid=path (repeatable; referenced as cid:<cid>)", collect, [])
   .option("--subject <text>", "Subject line", "")
   .option("--body <text>", "Plain-text body", "")
   .action(async (messageId: string, options) => {
     // No --bcc: Bcc is a send-time-only field, not a saved-draft field. See ADR 0019.
+    const attachments = await readAttachments(options.attach as string[], options.inline as string[]);
     const result = await updateDraft(pool, config, messageId, {
       to: parseRecipients(options.to as string[]),
       cc: (options.cc as string[]).length > 0 ? parseRecipients(options.cc as string[]) : undefined,
       subject: options.subject,
-      body: { format: "plain", text: options.body }
+      body: { format: "plain", text: options.body },
+      attachments: attachments.length > 0 ? attachments : undefined
     });
     console.log(JSON.stringify(result, null, 2));
   });

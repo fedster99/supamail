@@ -51,17 +51,12 @@ import {
  * {@link import("./mailbox-mutations.js").MailboxMutator}.
  */
 
-/** What a draft create/update carries — a SendRequest minus `bcc` and
- * `attachments`. Bcc can't round-trip the APPENDed bytes (nodemailer's keepBcc
- * default omits it from the composed MIME). Attachments aren't carried into our
- * OWN drafts either: createDraft/updateDraft compose the bytes via `buildRawMime`
- * from this input, which has no attachment-bytes field, so accepting `attachments`
- * here would silently file a draft WITHOUT them. (sendDraft now resends the draft's
- * RAW bytes — see ADR 0019 — so a provider-composed draft with attachments would
- * round-trip; but SupaMail-authored drafts still can't carry them at create time.)
- * Both stay send-time-only — set them on the send envelope, not on a draft (ADR
- * 0019 / 0020). `accountId` selects the mailbox whose Drafts folder we file to. */
-export type DraftInput = Omit<SendRequest, "bcc" | "attachments"> & {
+/** What a draft create/update carries. Bcc remains send-time-only because
+ * nodemailer's default omits it from the APPENDed MIME. Attachments are composed
+ * into that MIME by the same `buildRawMime` path as direct sends, and sendDraft
+ * later resends those exact saved bytes. `accountId` selects the mailbox whose
+ * Drafts folder we file to. */
+export type DraftInput = Omit<SendRequest, "bcc"> & {
   /** Optional idempotency key: a retried create with the same key derives the same
    * Message-ID and returns the EXISTING draft (search-before-APPEND) instead of a dup.
    * The key is the operation identity (Stripe-style) — reusing it with a different
@@ -75,18 +70,6 @@ export type DraftInput = Omit<SendRequest, "bcc" | "attachments"> & {
 function rejectBcc(input: unknown): void {
   if (input && typeof input === "object" && (input as { bcc?: unknown }).bcc !== undefined) {
     throw new Error("Bcc is not supported on saved drafts — set Bcc when you send the draft");
-  }
-}
-
-/** Reject attachments smuggled past the type system (e.g. an untyped HTTP/JSON
- * caller). createDraft/updateDraft compose the draft bytes via `buildRawMime` from
- * this input, which carries no attachment bytes, so an attachment passed here would
- * be silently dropped from the saved draft — refuse it loudly instead. (Attach
- * files on the send envelope; sendDraft resends the real raw bytes, so a draft
- * composed elsewhere WITH attachments still round-trips on send.) */
-function rejectAttachments(input: unknown): void {
-  if (input && typeof input === "object" && (input as { attachments?: unknown }).attachments !== undefined) {
-    throw new Error("Attachments are not supported on saved drafts — attach files when you send the draft");
   }
 }
 
@@ -235,7 +218,6 @@ export async function createDraft(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<CreateDraftResult> {
   rejectBcc(input);
-  rejectAttachments(input);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
@@ -443,7 +425,6 @@ export async function updateDraft(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<UpdateDraftResult> {
   rejectBcc(input);
-  rejectAttachments(input);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const existing = await repository.getMessage(messageId);
   if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
