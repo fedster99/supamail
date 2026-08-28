@@ -1958,7 +1958,20 @@ liveDb("live DB reliability lane", () => {
     const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
     await engine.syncAccount(h.account.id, "manual");
 
-    folders[0].messages = [];
+    class EmptyUidStreamClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (typeof range === "object" && !Array.isArray(range)) return;
+        yield* super.fetch(range, query);
+      }
+    }
+    const contradictoryEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50 },
+      clientFactory: async () => new EmptyUidStreamClient(folders)
+    });
     await h.pool.query(
       `
       UPDATE public.imap_folders
@@ -1969,7 +1982,7 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
 
-    const result = await engine.syncAccount(h.account.id, "manual");
+    const result = await contradictoryEngine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("failed");
 
     const message = await h.pool.query<{

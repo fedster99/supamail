@@ -42,7 +42,7 @@ SupaMail owns a conservative mailbox mirror:
 | Do not reconcile unfinished initial sync folders. | Implemented | Reconcile runs only after initial sync completion; health remains `INITIAL_SYNC` while any tracked folder is incomplete. |
 | Incremental sync must not advance through partial metadata fetches. | Implemented | Metadata fetch fails if any requested UID is missing; unit coverage pins partial-batch behavior. |
 | Incremental sync must respect a hard operation deadline. | Implemented | `INCREMENTAL_TOTAL_TIMEOUT_MS` aborts IMAP work, treats the cycle as transient failure, and does not advance `last_uid`. |
-| Reconcile provider deletes and missing-in-DB rows. | Implemented | Temp-table UID stream finds missing local rows and provider-only rows. Provider iteration and staging run outside the short final database transaction, which validates UIDVALIDITY before applying changes. When the live-window search is empty but mirrored live rows exist, an unfiltered UID stream confirms real deletion without backfilling provider-only archive UIDs; a second empty response still fails closed. Live DB tests verify provider tombstones, transaction scope, this empty-window edge, and `RECONCILE_BACKFILL`. |
+| Reconcile provider deletes and missing-in-DB rows. | Implemented | Temp-table UID stream finds missing local rows and provider-only rows. Provider iteration and staging run outside the short final database transaction, which validates UIDVALIDITY before applying changes. When the live-window search is empty but mirrored live rows exist, an unfiltered UID stream confirms real deletion without backfilling provider-only archive UIDs. Two empty streams tombstone only when the selected mailbox also reports zero messages; contradictory or unknown counts still fail closed. Live DB tests verify provider tombstones, transaction scope, this empty-window edge, and `RECONCILE_BACKFILL`. |
 | Reconcile health must describe post-repair state. | Implemented | Observed gaps remain run telemetry, while fully repaired provider deletes or missing-in-DB rows finish with `last_reconcile_clean = true`; bounded overflow or interrupted repair remains degraded and retries on the next full-sync cadence. |
 | Reconcile must be staggered and budgeted. | Implemented | `next_reconcile_at`, `RECONCILE_INTERVAL_MS`, and `MAX_RECONCILES_PER_CYCLE` keep clean reconciliation due-based instead of every-folder/every-cycle; incomplete repair retries early. |
 | Flag scans are due-based and diff actual flag changes. | Implemented | `applyFlagScan` compares normalized old/new flags, logs `FLAGS_CHANGED`, and does not backfill unknown UIDs. |
@@ -107,7 +107,9 @@ modseq, it is also flag-scanned. These signals are not mirror truth. The host
 passes the session into the compatibility-named `liveInboxOnly` path, which
 targets the exact changed folders and forces their indicated UID reconcile or
 flag work under the existing per-cycle operation caps; unfinished snapshots
-remain pending for later passes. After a wake-driven sync, the host may call
+remain pending for later passes. A host-requested Inbox reconcile or flag scan
+also includes Inbox when another folder change is pending; that change cannot
+hide the Inbox work. After a wake-driven sync, the host may call
 `verifyMailboxChanges` on the same session. That check fingerprints Inbox and
 every tracked non-Inbox folder with one strict LIST-STATUS command. If that
 command is unavailable or incomplete, it checks Inbox plus a rotating bounded
