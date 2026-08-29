@@ -1182,10 +1182,15 @@ export class MirrorRepository {
       `
       WITH folder_health AS (
         SELECT
-          count(*) FILTER (WHERE tracked = true AND status != 'MISSING') AS tracked_count,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
+          ) AS tracked_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND missing_since IS NULL
               AND initial_sync_complete = false
           ) AS incomplete_count,
           count(*) FILTER (
@@ -1197,12 +1202,14 @@ export class MirrorRepository {
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND sync_priority <= $3
               AND last_reconcile_clean = false
           ) AS priority_reconcile_gap_count,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND sync_priority <= $3
               AND (
                 last_reconcile_clean IS DISTINCT FROM true
@@ -1213,6 +1220,7 @@ export class MirrorRepository {
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND (
                 last_reconcile_clean IS DISTINCT FROM true
                 OR last_full_reconcile_at IS NULL
@@ -1222,17 +1230,20 @@ export class MirrorRepository {
           max(extract(epoch from (now() - last_synced_at))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND sync_priority <= $3
               AND last_synced_at IS NOT NULL
           ) AS priority_lag_seconds,
           max(extract(epoch from (now() - last_synced_at))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND last_synced_at IS NOT NULL
           ) AS overall_lag_seconds,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND last_uidvalidity_reset_at IS NOT NULL
               AND last_uidvalidity_reset_at > now() - ($11::bigint * interval '1 millisecond')
           ) AS recent_uidvalidity_reset_count
