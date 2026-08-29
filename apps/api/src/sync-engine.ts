@@ -508,6 +508,14 @@ export class MirrorEngine {
                 (folder): folder is ImapFolder => folder !== null
               )
           : await this.repository.getFoldersDueForSync(account.id));
+        if (options.liveInboxOnly
+          && (options.forceInboxReconcile === true || options.forceInboxFlagScan === true)) {
+          const inboxIndex = folders.findIndex((folder) => folder.path.toLowerCase() === "inbox");
+          const inboxFolder = inboxIndex >= 0
+            ? folders.splice(inboxIndex, 1)[0]
+            : await this.repository.getInboxFolderForWake(account.id);
+          if (inboxFolder) folders.unshift(inboxFolder);
+        }
         let priorityFolderFailed = false;
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
@@ -621,7 +629,8 @@ export class MirrorEngine {
           }
         }
 
-        if (mailboxChanges.length > 0 && folders.length !== mailboxChanges.length) {
+        const selectedFolderPaths = new Set(folders.map((folder) => folder.path));
+        if (mailboxChanges.some((change) => !selectedFolderPaths.has(change.path))) {
           priorityFolderFailed = true;
           result.errors.push("Mailbox change set no longer matches tracked folders");
         }
@@ -1337,6 +1346,7 @@ export class MirrorEngine {
           folder,
           uidValidity
         );
+        const selectedMailboxIsAuthoritativelyEmpty = mailbox.exists === 0;
         const windowUidStream = await peekAsyncIterable(this.withAsyncIterableDeadline(
           client,
           reconcileDeadline,
@@ -1359,7 +1369,10 @@ export class MirrorEngine {
               )
             : windowUidStream.values,
           {
-            failIfEmpty: shouldFailOnEmptyReconcile,
+            // Two empty UID streams are valid when SELECT also reports zero
+            // messages. Keep failing closed for every contradictory or unknown
+            // mailbox count so a transient empty SEARCH cannot mass-tombstone.
+            failIfEmpty: shouldFailOnEmptyReconcile && !selectedMailboxIsAuthoritativelyEmpty,
             emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`,
             // The unfiltered fallback confirms provider deletions only. Feeding its
             // archive UIDs into missing-in-DB repair would violate the live-window

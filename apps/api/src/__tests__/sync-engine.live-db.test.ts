@@ -665,6 +665,65 @@ liveDb("live DB reliability lane", () => {
     expect(dueBodies.map((message) => message.folder_path)).toEqual(["INBOX"]);
   });
 
+  it("does not let a discovery-missing folder block account health or IDLE during grace", async () => {
+    const h = await setupIntegration("live-missing-folder-health");
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+
+    await h.repository.upsertDiscoveredFolders(account, [
+      { path: "INBOX", delimiter: "/" },
+      { path: "Projects", delimiter: "/" },
+    ]);
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET tracked = true,
+          status = 'ACTIVE',
+          initial_sync_complete = true,
+          last_synced_at = now(),
+          last_full_reconcile_at = now(),
+          last_reconcile_clean = true,
+          last_uidvalidity_reset_at = NULL
+      WHERE account_id = $1
+      `,
+      [h.account.id],
+    );
+    await h.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET missing_since = now(),
+          initial_sync_complete = false,
+          last_synced_at = NULL,
+          last_full_reconcile_at = NULL,
+          last_reconcile_clean = false,
+          last_uidvalidity_reset_at = now()
+      WHERE account_id = $1 AND path = 'Projects'
+      `,
+      [h.account.id],
+    );
+
+    await h.repository.markAccountSyncSucceeded(h.account.id);
+    const duringGrace = await h.pool.query<{ sync_state: string; sync_state_reason: string | null }>(
+      "SELECT sync_state, sync_state_reason FROM public.imap_accounts WHERE id = $1",
+      [h.account.id],
+    );
+    expect(duringGrace.rows[0]).toEqual({ sync_state: "HEALTHY", sync_state_reason: null });
+    expect((await h.repository.getIdleWatchAccounts()).map((row) => row.id)).toContain(h.account.id);
+
+    await backdateMissingSince(h.pool, h.account.id, "Projects", "8 days");
+    await h.repository.markAccountSyncSucceeded(h.account.id);
+    const afterGrace = await h.pool.query<{ sync_state: string; sync_state_reason: string | null }>(
+      "SELECT sync_state, sync_state_reason FROM public.imap_accounts WHERE id = $1",
+      [h.account.id],
+    );
+    expect(afterGrace.rows[0]).toEqual({
+      sync_state: "DEGRADED",
+      sync_state_reason: "FOLDER_MISSING_GRACE_EXCEEDED",
+    });
+    expect((await h.repository.getIdleWatchAccounts()).map((row) => row.id)).toContain(h.account.id);
+  });
+
   it("self-heals a threshold-BROKEN account after its retry cadence, never an AUTH_ERROR one", async () => {
     // An account bricked by transient failures (e.g. the now-fixed deleted-folder
     // brick) must recover on its own once the cause clears — not stay dead until an
@@ -1958,7 +2017,20 @@ liveDb("live DB reliability lane", () => {
     const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
     await engine.syncAccount(h.account.id, "manual");
 
-    folders[0].messages = [];
+    class EmptyUidStreamClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (typeof range === "object" && !Array.isArray(range)) return;
+        yield* super.fetch(range, query);
+      }
+    }
+    const contradictoryEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50 },
+      clientFactory: async () => new EmptyUidStreamClient(folders)
+    });
     await h.pool.query(
       `
       UPDATE public.imap_folders
@@ -1969,7 +2041,7 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
 
-    const result = await engine.syncAccount(h.account.id, "manual");
+    const result = await contradictoryEngine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("failed");
 
     const message = await h.pool.query<{

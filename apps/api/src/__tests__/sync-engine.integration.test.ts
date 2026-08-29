@@ -451,6 +451,80 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ]);
   });
 
+  it("accepts an empty selected mailbox as authoritative deletion evidence", async () => {
+    const h = await setupIntegration("idle-empty-archive-reconcile", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_004,
+      messages: [makeTextMessage({
+        uid: 301,
+        subject: "last archive message",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "last"
+      })]
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    folders[2].messages = [];
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_004,
+        uidNext: 302,
+        messages: 0
+      }
+    };
+    const acknowledgeWithStatuses = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChangesWithStatuses = acknowledgeWithStatuses;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(acknowledgeWithStatuses).toHaveBeenCalledWith([change], [{
+      status: {
+        path: "Archive",
+        uidValidity: 50_004,
+        uidNext: 1,
+        exists: 0,
+        messages: 0,
+        highestModseq: undefined
+      },
+      reconcileComplete: true,
+      flagScanComplete: true
+    }]);
+    const row = await h.pool.query<{
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `SELECT deleted_in_provider, deleted_reason
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 301`,
+      [h.account.id]
+    );
+    expect(row.rows[0]).toEqual({
+      deleted_in_provider: true,
+      deleted_reason: "RECONCILE_MISSING"
+    });
+  });
+
   it("uses QRESYNC replay for flags and deletions without an immediate exact UID scan", async () => {
     const h = await setupIntegration("qresync-archive-replay", {
       INITIAL_SYNC_BATCH_SIZE: 50,
@@ -990,16 +1064,18 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   it("does not let a pending non-Inbox hint shadow a concurrent Inbox wake", async () => {
     const h = await setupIntegration("idle-inbox-with-archive", {
       INITIAL_SYNC_BATCH_SIZE: 50,
-      MAX_RECONCILES_PER_CYCLE: 2
+      MAX_RECONCILES_PER_CYCLE: 1
     });
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
     folders.push({ path: "Archive", delimiter: "/", uidValidity: 50_006, messages: [] });
     const engine = h.buildEngine({
       folders,
-      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 2 }
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 1 }
     });
     await engine.syncAccount(h.account.id, "manual");
+    const removedInboxUid = folders[0].messages[0].uid;
+    folders[0].messages.shift();
     folders[0].messages.push(makeTextMessage({
       uid: 106,
       subject: "new inbox",
@@ -1010,37 +1086,39 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     const archiveChange: MailboxChange = {
       path: "Archive",
-      forceReconcile: false,
+      forceReconcile: true,
       forceFlagScan: false,
       observed: { path: "Archive", uidValidity: 50_006, uidNext: 1, messages: 0 }
     };
-    const inboxChange: MailboxChange = {
-      path: "INBOX",
-      forceReconcile: true,
-      forceFlagScan: false,
-      observed: { path: "INBOX", uidValidity: 0 }
-    };
     const idleClient = new FixtureImapClient(folders);
     const acknowledge = vi.fn();
-    idleClient.peekMailboxChanges = () => [archiveChange, inboxChange];
+    idleClient.peekMailboxChanges = () => [archiveChange];
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
       liveInboxOnly: true,
       client: idleClient,
       clientAccountId: h.account.id,
-      keepClientOpen: true
+      keepClientOpen: true,
+      forceInboxReconcile: true
     });
 
     expect(result.outcome).toBe("success");
     expect(result.foldersProcessed).toBe(2);
-    expect(acknowledge).toHaveBeenCalledWith([archiveChange, inboxChange]);
+    expect(acknowledge).not.toHaveBeenCalled();
     const inbox = await h.pool.query<{ uid: string }>(
       `SELECT uid::text FROM public.imap_messages
        WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 106`,
       [h.account.id]
     );
     expect(inbox.rows).toEqual([{ uid: "106" }]);
+    const removedInbox = await h.pool.query<{ deleted_in_provider: boolean }>(
+      `SELECT deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = $2`,
+      [h.account.id, removedInboxUid]
+    );
+    expect(removedInbox.rows).toEqual([{ deleted_in_provider: true }]);
   });
 
   it("drains forced mailbox reconciles across bounded live passes", async () => {
@@ -3814,9 +3892,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     class MissingProjectClient extends FixtureImapClient {
       async getMailboxLock(path: string) {
         if (path === "Project-Alpha") {
-          throw Object.assign(new Error("NO [NONEXISTENT] Mailbox doesn't exist"), {
-            serverResponseCode: "NONEXISTENT"
-          });
+          throw new Error("Command failed — NO Mailbox doesn't exist: Project-Alpha");
         }
         return super.getMailboxLock(path);
       }
