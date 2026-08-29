@@ -242,6 +242,9 @@ describe("sync engine safety", () => {
       responseCode: "TRYCREATE"
     }))).toBe(true);
     expect(isMissingMailboxError(new Error("No such mailbox: Archive"))).toBe(true);
+    expect(isMissingMailboxError(
+      new Error("Command failed — NO Mailbox doesn't exist: Project-Alpha")
+    )).toBe(true);
     expect(isMissingMailboxError(Object.assign(new Error("No such mailbox"), {
       serverResponseCode: "OVERQUOTA"
     }))).toBe(false);

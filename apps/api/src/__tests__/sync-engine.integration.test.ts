@@ -3892,9 +3892,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     class MissingProjectClient extends FixtureImapClient {
       async getMailboxLock(path: string) {
         if (path === "Project-Alpha") {
-          throw Object.assign(new Error("NO [NONEXISTENT] Mailbox doesn't exist"), {
-            serverResponseCode: "NONEXISTENT"
-          });
+          throw new Error("Command failed — NO Mailbox doesn't exist: Project-Alpha");
         }
         return super.getMailboxLock(path);
       }
