@@ -19,7 +19,8 @@
     "test:db:live": "pnpm --filter @supamail/api test:db:live",
     "smoke:greenmail": "pnpm --filter @supamail/api smoke:greenmail",
     "smoke:dovecot": "pnpm --filter @supamail/api smoke:dovecot",
-    "smoke:load": "pnpm --filter @supamail/api smoke:load"
+    "smoke:load": "pnpm --filter @supamail/api smoke:load",
+    "smoke:idle-scale": "pnpm --filter @supamail/api smoke:idle-scale"
   },
   "devDependencies": {
     "turbo": "^2.3.3"
