@@ -120,6 +120,50 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await closePool();
   });
 
+  it("forces folder discovery during an authoritative safety pass", async () => {
+    const h = await setupIntegration("forced-safety-discovery");
+    activeAccountIds.push(h.account.id);
+    const initialFolders = buildInboxAndSentFolders();
+
+    await h.buildEngine({ folders: initialFolders }).syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET next_folder_discovery_at = now() + interval '10 minutes'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+
+    const newFolder: FixtureFolder = {
+      path: "Projects/New",
+      delimiter: "/",
+      uidValidity: 70_001,
+      messages: [makeTextMessage({
+        uid: 1,
+        subject: "created after listener startup",
+        from: "sender@example.test",
+        to: "owner@example.test",
+        body: "new folder safety proof"
+      })]
+    };
+    const result = await h.buildEngine({
+      folders: [...initialFolders, newFolder]
+    }).syncAccount(h.account.id, "scheduled", {
+      forceFolderDiscovery: true
+    });
+
+    expect(result.outcome).toBe("success");
+    const mirrored = await h.pool.query<{ folder_path: string; subject: string | null }>(
+      `SELECT folder_path, subject
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = $2`,
+      [h.account.id, newFolder.path]
+    );
+    expect(mirrored.rows).toEqual([{
+      folder_path: newFolder.path,
+      subject: "created after listener startup"
+    }]);
+  });
+
   it("runs a lightweight Sent-only pass without consuming other due folder work", async () => {
     const h = await setupIntegration("sent-fast-pass");
     activeAccountIds.push(h.account.id);

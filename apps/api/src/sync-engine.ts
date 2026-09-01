@@ -317,6 +317,8 @@ export interface MirrorEngineOptions {
 
 export interface SyncAccountOptions {
   sentOnly?: boolean;
+  /** Run one authoritative folder LIST even when the discovery timer is not due. */
+  forceFolderDiscovery?: boolean;
   /** Run the supplemental live-change lane (the name is retained for host compatibility). */
   liveInboxOnly?: boolean;
   /**
@@ -514,7 +516,8 @@ export class MirrorEngine {
             .filter((path) => !forcedReconcilePaths.has(path))
         ];
 
-        if (!supplemental && this.shouldDiscoverFolders(account)) {
+        if (!supplemental
+          && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
           await this.discoverFolders(account, client);
         }
 
