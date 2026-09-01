@@ -656,7 +656,11 @@ export class MirrorEngine {
         }
 
         const selectedFolderPaths = new Set(folders.map((folder) => folder.path));
-        if (liveFolderPaths.some((path) => !selectedFolderPaths.has(path))) {
+        // Provider events for a folder that stopped matching the tracked set
+        // must remain pending. A host-supplied known destination may be
+        // intentionally untracked (for example Trash); in that case exactness
+        // covers only the tracked source and the durable due marker is a no-op.
+        if (mailboxChanges.some((change) => !selectedFolderPaths.has(change.path))) {
           priorityFolderFailed = true;
           result.errors.push("Live folder set no longer matches tracked folders");
         }

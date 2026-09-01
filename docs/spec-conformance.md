@@ -112,7 +112,10 @@ also includes Inbox when another folder change is pending; that change cannot
 hide the Inbox work. After a provider-acknowledged move, a host may instead
 supply the known source and destination through `forceReconcileFolders`. This
 input is live-lane only, rejects more than two paths, and forces exact
-reconciliation without pretending that a provider event occurred. The move
+reconciliation for named paths that are currently tracked without pretending
+that a provider event occurred. An intentionally untracked destination is
+ignored; a real provider event for a path that no longer matches the tracked
+set remains pending and fails the selective pass. The move
 primitive marks both tracked paths due before it sends the provider command, so
 the periodic lane remains a durable crash fallback. After a wake-driven sync,
 the host may call

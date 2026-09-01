@@ -60,8 +60,10 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   after provider acknowledgement cannot strand the change. A host that receives
   the successful move result may immediately run the supplemental live lane with
   those two known folder paths. The lane reads the provider; it never fabricates
-  destination identity from the intended operation. Other moves and deletes
-  converge when the next UID reconcile runs.
+  destination identity from the intended operation. It reconciles only paths
+  that are currently tracked; an intentionally untracked destination such as
+  Trash is not a live-lane failure. Other moves and deletes converge when the
+  next UID reconcile runs.
 - **Destructive verbs require server capabilities** so a fallback can never run a
   blanket EXPUNGE. Hard delete (EXPUNGE) requires `UIDPLUS` (UID-scoped EXPUNGE);
   move requires `MOVE` or `UIDPLUS` (native move, or COPY + UID-scoped EXPUNGE). If
