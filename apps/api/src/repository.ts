@@ -2154,6 +2154,29 @@ export class MirrorRepository {
     return result.rows;
   }
 
+  /**
+   * Persist the authoritative verification work for a provider mutation before
+   * the network command runs. An extra reconcile after a failed command is safe;
+   * missing this write after a successful command is not.
+   */
+  async markFoldersForReconcile(accountId: string, paths: readonly string[]): Promise<void> {
+    const uniquePaths = [...new Set(paths)];
+    if (uniquePaths.length === 0) return;
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET next_sync_due_at = now(),
+          next_reconcile_at = now()
+      WHERE account_id = $1
+        AND path = ANY($2::text[])
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      `,
+      [accountId, uniquePaths]
+    );
+  }
+
   async getSentFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
     const result = await this.pool.query<ImapFolder>(
       `

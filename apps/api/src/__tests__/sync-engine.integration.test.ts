@@ -451,6 +451,75 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ]);
   });
 
+  it("reconciles known move folders without waiting for a provider wake", async () => {
+    const h = await setupIntegration("known-move-folders", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].messages = [makeTextMessage({
+      uid: 101,
+      subject: "move me",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "known move"
+    })];
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_003,
+      messages: []
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    folders[0].messages = [];
+    folders[2].messages = [makeTextMessage({
+      uid: 301,
+      subject: "move me",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "known move"
+    })];
+    const workClient = new FixtureImapClient(folders);
+    const acknowledge = vi.fn();
+    workClient.peekMailboxChanges = () => [];
+    workClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceReconcileFolders: ["INBOX", "Archive"],
+      client: workClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.foldersProcessed).toBe(2);
+    // Inbox needs a delete reconcile. Archive inserts its new UID through the
+    // ordinary incremental path, so that side is exact without a second gap.
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(acknowledge).not.toHaveBeenCalled();
+    const rows = await h.pool.query<{
+      folder_path: string;
+      uid: string;
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT folder_path, uid::text, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND (
+         (folder_path = 'INBOX' AND uid = 101)
+         OR (folder_path = 'Archive' AND uid = 301)
+       )
+       ORDER BY folder_path, uid`,
+      [h.account.id]
+    );
+    expect(rows.rows).toEqual([
+      { folder_path: "Archive", uid: "301", deleted_in_provider: false },
+      { folder_path: "INBOX", uid: "101", deleted_in_provider: true }
+    ]);
+  });
+
   it("accepts an empty selected mailbox as authoritative deletion evidence", async () => {
     const h = await setupIntegration("idle-empty-archive-reconcile", {
       INITIAL_SYNC_BATCH_SIZE: 50
