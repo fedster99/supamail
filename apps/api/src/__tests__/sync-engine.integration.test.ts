@@ -518,6 +518,36 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       { folder_path: "Archive", uid: "301", deleted_in_provider: false },
       { folder_path: "INBOX", uid: "101", deleted_in_provider: true }
     ]);
+
+    const lateClient = new FixtureImapClient(folders);
+    const lateChange: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_003,
+        uidNext: 302,
+        messages: 1
+      }
+    };
+    const acknowledgeLate = vi.fn();
+    lateClient.peekMailboxChanges = () => [lateChange];
+    lateClient.acknowledgeMailboxChangesWithStatuses = acknowledgeLate;
+
+    const duplicate = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: lateClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(duplicate.outcome).toBe("success");
+    expect(duplicate.reconcileGapsFound).toBe(0);
+    expect(acknowledgeLate).toHaveBeenCalledWith([lateChange], [expect.objectContaining({
+      reconcileComplete: true,
+      flagScanComplete: false
+    })]);
   });
 
   it("accepts an empty selected mailbox as authoritative deletion evidence", async () => {
