@@ -202,6 +202,10 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   async logout(): Promise<void> {
+    if (this.invalidated || this.client.usable === false) {
+      this.close();
+      return;
+    }
     await this.withCommandTimeout("logout", () => this.client.logout());
   }
 
@@ -408,10 +412,14 @@ export class ThrottledImapClient implements MirrorImapClient {
       }
     } finally {
       if (!completed && iterator.return) {
-        try {
-          await this.withCommandTimeout("fetch cancel", () => iterator.return!());
-        } catch {
-          this.client.close();
+        if (!this.invalidated && this.client.usable === false) {
+          this.close();
+        } else if (!this.invalidated) {
+          try {
+            await this.withCommandTimeout("fetch cancel", () => iterator.return!());
+          } catch {
+            this.close();
+          }
         }
       }
     }

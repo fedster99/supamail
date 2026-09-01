@@ -147,6 +147,38 @@ describe("fetchMessageMetadata", () => {
     }
   });
 
+  it("does not send LOGOUT after a command timeout invalidated the client", async () => {
+    vi.useFakeTimers();
+    try {
+      const rawClient = Object.assign(new EventEmitter(), {
+        mailbox: false,
+        usable: true,
+        capabilities: new Map<string, boolean | number>(),
+        close: vi.fn(() => undefined),
+        logout: vi.fn(async () => await new Promise<never>(() => undefined)),
+        getMailboxLock: vi.fn(async () => await new Promise<never>(() => undefined))
+      });
+      const client = new ThrottledImapClient(rawClient as never, 60, 10);
+      const timedOut = client.getMailboxLock("INBOX").catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(11);
+      await timedOut;
+
+      let loggedOut = false;
+      const logout = client.logout().then(
+        () => { loggedOut = true; },
+        () => { loggedOut = false; }
+      );
+      await Promise.resolve();
+
+      expect(loggedOut).toBe(true);
+      expect(rawClient.logout).not.toHaveBeenCalled();
+      await logout;
+    } finally {
+      await vi.advanceTimersByTimeAsync(20);
+      vi.useRealTimers();
+    }
+  });
+
   it("handles non-contiguous UID search results across date boundaries", async () => {
     const client = new FixtureImapClient([
       {
@@ -498,6 +530,42 @@ describe("ThrottledImapClient fetch cancellation", () => {
     }
 
     expect(rawClient.close).toHaveBeenCalledOnce();
+  });
+
+  it("does not wait for iterator cancellation after the fetch command timed out", async () => {
+    vi.useFakeTimers();
+    const rawIterator = {
+      next: vi.fn(async () => await new Promise<never>(() => undefined)),
+      return: vi.fn(async () => await new Promise<never>(() => undefined)),
+      [Symbol.asyncIterator]() {
+        return this;
+      }
+    };
+    const rawClient = {
+      usable: true,
+      fetch: vi.fn(() => rawIterator),
+      close: vi.fn()
+    };
+    const client = new ThrottledImapClient(rawClient as never, 1_000, 10);
+    let outcome: string | undefined;
+    const next = client.fetch([1], { source: true }, { uid: true })
+      [Symbol.asyncIterator]().next()
+      .then(
+        () => { outcome = "resolved"; },
+        (error: Error) => { outcome = error.message; }
+      );
+
+    try {
+      await vi.advanceTimersByTimeAsync(11);
+
+      expect(outcome).toBe("IMAP_COMMAND_TIMEOUT_MS exceeded during fetch");
+      expect(rawIterator.return).not.toHaveBeenCalled();
+      expect(rawClient.close).toHaveBeenCalledOnce();
+    } finally {
+      await vi.advanceTimersByTimeAsync(20);
+      await next;
+      vi.useRealTimers();
+    }
   });
 });
 
