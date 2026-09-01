@@ -109,7 +109,13 @@ targets the exact changed folders and forces their indicated UID reconcile or
 flag work under the existing per-cycle operation caps; unfinished snapshots
 remain pending for later passes. A host-requested Inbox reconcile or flag scan
 also includes Inbox when another folder change is pending; that change cannot
-hide the Inbox work. After a wake-driven sync, the host may call
+hide the Inbox work. After a provider-acknowledged move, a host may instead
+supply the known source and destination through `forceReconcileFolders`. This
+input is live-lane only, rejects more than two paths, and forces exact
+reconciliation without pretending that a provider event occurred. The move
+primitive marks both tracked paths due before it sends the provider command, so
+the periodic lane remains a durable crash fallback. After a wake-driven sync,
+the host may call
 `verifyMailboxChanges` on the same session. That check fingerprints Inbox and
 every tracked non-Inbox folder with one strict LIST-STATUS command. If that
 command is unavailable or incomplete, it checks Inbox plus a rotating bounded
