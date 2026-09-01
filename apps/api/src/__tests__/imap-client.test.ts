@@ -121,6 +121,32 @@ describe("fetchMessageMetadata", () => {
     expect(source).toContain("this.client.close()");
   });
 
+  it("marks a command-timed-out client unusable", async () => {
+    vi.useFakeTimers();
+    try {
+      const rawClient = Object.assign(new EventEmitter(), {
+        mailbox: false,
+        usable: true,
+        capabilities: new Map<string, boolean | number>(),
+        close: vi.fn(() => undefined),
+        getMailboxLock: vi.fn(async () => await new Promise<never>(() => undefined))
+      });
+      const client = new ThrottledImapClient(rawClient as never, 60, 10);
+      const pending = client.getMailboxLock("INBOX");
+      const rejected = expect(pending).rejects.toThrow(
+        "IMAP_COMMAND_TIMEOUT_MS exceeded during getMailboxLock"
+      );
+
+      await vi.advanceTimersByTimeAsync(11);
+
+      await rejected;
+      expect(rawClient.close).toHaveBeenCalledTimes(1);
+      expect(client.usable).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("handles non-contiguous UID search results across date boundaries", async () => {
     const client = new FixtureImapClient([
       {

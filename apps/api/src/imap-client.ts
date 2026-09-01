@@ -173,6 +173,7 @@ export interface MirrorImapClient {
 export class ThrottledImapClient implements MirrorImapClient {
   private readonly throttle: ImapThrottle;
   private qresyncDisabled = false;
+  private invalidated = false;
 
   constructor(
     private readonly client: ImapFlow,
@@ -189,7 +190,7 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   get usable(): boolean {
-    return this.client.usable;
+    return !this.invalidated && this.client.usable;
   }
 
   get capabilities(): ReadonlyMap<string, boolean | number> {
@@ -205,6 +206,7 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   close(): void {
+    this.invalidated = true;
     this.client.close();
   }
 
@@ -441,14 +443,14 @@ export class ThrottledImapClient implements MirrorImapClient {
     let onAbort: (() => void) | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => {
-        this.client.close();
+        this.close();
         reject(new Error(`IMAP_COMMAND_TIMEOUT_MS exceeded during ${operation}`));
       }, this.commandTimeoutMs);
     });
     const abortPromise = new Promise<never>((_, reject) => {
       if (!this.signal) return;
       onAbort = () => {
-        this.client.close();
+        this.close();
         reject(this.signal!.reason instanceof Error
           ? this.signal!.reason
           : new DOMException(`IMAP ${operation} aborted`, "AbortError"));
