@@ -793,10 +793,9 @@ export class MirrorEngine {
         }
       } finally {
         options.signal?.removeEventListener("abort", interruptActiveClient);
-        if (
-          client
-          && (!options.keepClientOpen || client.usable === false || options.signal?.aborted)
-        ) {
+        if (client && (client.usable === false || options.signal?.aborted)) {
+          this.abortClient(client);
+        } else if (client && !options.keepClientOpen) {
           await client.logout().catch(() => this.abortClient(client!));
         }
       }

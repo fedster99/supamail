@@ -3464,6 +3464,54 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(account.rows[0].consecutive_failures).toBe(0);
   });
 
+  it("hard-closes an unusable host-owned client without waiting for LOGOUT", async () => {
+    const h = await setupIntegration("G-unusable-host-client-cleanup");
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 423,
+        messages: []
+      }
+    ];
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+
+    let releaseLogout: (() => void) | undefined;
+    class UnusableFixtureImapClient extends FixtureImapClient {
+      usable = false;
+      close = vi.fn(() => undefined);
+      override logout = vi.fn(async () => await new Promise<void>((resolve) => {
+        releaseLogout = resolve;
+      }));
+
+      override async getMailboxLock(): Promise<MailboxLock> {
+        throw Object.assign(new Error("Connection not available"), { code: "NoConnection" });
+      }
+    }
+
+    const client = new UnusableFixtureImapClient(folders);
+    const engine = h.buildEngine({ folders });
+    const run = engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceReconcileFolders: ["INBOX"],
+      client,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+    const completion = await Promise.race([
+      run.then(() => "completed" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100))
+    ]);
+    releaseLogout?.();
+    await run;
+
+    expect(completion).toBe("completed");
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(client.logout).not.toHaveBeenCalled();
+  });
+
   it("stores parsed bodies without raw MIME when BODY_STORAGE_MODE is parsed_only", async () => {
     const h = await setupIntegration("G-parsed-only-bodies", { BODY_STORAGE_MODE: "parsed_only" });
     activeAccountIds.push(h.account.id);
