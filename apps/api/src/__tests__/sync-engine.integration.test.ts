@@ -142,7 +142,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
 
     const newFolder: FixtureFolder = {
-      path: "Projects/00-New",
+      path: "Projects/99-New",
       delimiter: "/",
       uidValidity: 70_001,
       messages: [makeTextMessage({

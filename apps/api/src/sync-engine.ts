@@ -516,9 +516,10 @@ export class MirrorEngine {
             .filter((path) => !forcedReconcilePaths.has(path))
         ];
 
+        let newlyTrackedFolderPaths: string[] = [];
         if (!supplemental
           && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
-          await this.discoverFolders(account, client);
+          newlyTrackedFolderPaths = await this.discoverFolders(account, client);
         }
 
         const folders = options.bodyBacklogOnly
@@ -532,7 +533,7 @@ export class MirrorEngine {
             : [await this.repository.getInboxFolderForWake(account.id)].filter(
                 (folder): folder is ImapFolder => folder !== null
               )
-          : await this.repository.getFoldersDueForSync(account.id));
+          : await this.repository.getFoldersDueForSync(account.id, newlyTrackedFolderPaths));
         if (options.liveInboxOnly
           && (options.forceInboxReconcile === true || options.forceInboxFlagScan === true)) {
           const inboxIndex = folders.findIndex((folder) => folder.path.toLowerCase() === "inbox");
@@ -889,7 +890,10 @@ export class MirrorEngine {
     return new Date(account.next_folder_discovery_at).getTime() <= Date.now();
   }
 
-  private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<void> {
+  private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<string[]> {
+    const trackedBefore = new Set(
+      await this.repository.getTrackedFolderPaths(account.id)
+    );
     const folders = await client.list();
     if (folders.length === 0) {
       throw new Error(`Provider returned no folders for ${account.email_address}`);
@@ -913,6 +917,9 @@ export class MirrorEngine {
     for (const folder of upserted) {
       await this.hooks.onFolderChanged?.(folder);
     }
+    return upserted
+      .filter((folder) => folder.tracked && !trackedBefore.has(folder.path))
+      .map((folder) => folder.path);
   }
 
   private async applyVerifiedFolderAliasExclusions(

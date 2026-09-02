@@ -1938,6 +1938,21 @@ export class MirrorRepository {
     return rows;
   }
 
+  async getTrackedFolderPaths(accountId: string): Promise<string[]> {
+    const result = await this.pool.query<{ path: string }>(
+      `
+      SELECT path
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      `,
+      [accountId]
+    );
+    return result.rows.map((row) => row.path);
+  }
+
   async markFolderPendingVerification(
     accountId: string,
     folderId: string,
@@ -2048,7 +2063,10 @@ export class MirrorRepository {
     return result.rows[0] ?? null;
   }
 
-  async getFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
+  async getFoldersDueForSync(
+    accountId: string,
+    preferredRoundRobinPaths: readonly string[] = []
+  ): Promise<ImapFolder[]> {
     const priority = await this.pool.query<ImapFolder>(
       `
       SELECT *
@@ -2097,7 +2115,15 @@ export class MirrorRepository {
     const rotated = rrRows.length === 0
       ? []
       : [...rrRows.slice(cursor % rrRows.length), ...rrRows.slice(0, cursor % rrRows.length)];
-    const rr = rotated.slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
+    const rrByPath = new Map(rrRows.map((folder) => [folder.path, folder]));
+    const preferred = [...new Set(preferredRoundRobinPaths)]
+      .map((path) => rrByPath.get(path))
+      .filter((folder): folder is ImapFolder => folder !== undefined);
+    const preferredPaths = new Set(preferred.map((folder) => folder.path));
+    const rr = [
+      ...preferred,
+      ...rotated.filter((folder) => !preferredPaths.has(folder.path))
+    ].slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
 
     if (rrRows.length > 0 && rr.length > 0) {
       await this.pool.query(
