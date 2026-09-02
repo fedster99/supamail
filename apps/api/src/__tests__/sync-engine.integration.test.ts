@@ -910,6 +910,89 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
   });
 
+  it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
+    const h = await setupIntegration("qresync-forced-inbox-barrier", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    const removedUid = folders[0].messages[0].uid;
+    const initialEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+    await initialEngine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+
+    folders[0].highestModseq = 11n;
+    folders[0].messages.shift();
+
+    class CompleteQresyncWithoutVanishedClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        const lock = await super.getMailboxLock(path);
+        if (!options.qresync || path !== "INBOX") return lock;
+        return {
+          ...lock,
+          qresync: {
+            accepted: true,
+            complete: true,
+            vanishedUids: [],
+            changedFlags: []
+          }
+        };
+      }
+    }
+
+    const recoveryClient = new CompleteQresyncWithoutVanishedClient(folders);
+    const fetch = vi.spyOn(recoveryClient, "fetch");
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceInboxReconcile: true,
+      client: recoveryClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(fetch.mock.calls.some(([range]) => typeof range === "object"
+      && range !== null
+      && "since" in range
+      && !("uid" in range))).toBe(true);
+    const removed = await h.pool.query<{ deleted_in_provider: boolean; deleted_reason: string | null }>(
+      `SELECT deleted_in_provider, deleted_reason
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = $2`,
+      [h.account.id, removedUid]
+    );
+    expect(removed.rows).toEqual([{
+      deleted_in_provider: true,
+      deleted_reason: "RECONCILE_MISSING"
+    }]);
+  });
+
   it("falls back to exact UID reconciliation when QRESYNC capture is incomplete", async () => {
     const h = await setupIntegration("qresync-incomplete-fallback", {
       INITIAL_SYNC_BATCH_SIZE: 50,

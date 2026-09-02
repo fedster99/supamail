@@ -585,6 +585,9 @@ export class MirrorEngine {
                 && (forceKnownReconcile
                   || mailboxChange?.forceReconcile === true
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
+              forceAuthoritativeReconcile: options.liveInboxOnly
+                && (forceKnownReconcile
+                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
               forceFlagScan: options.liveInboxOnly
                 && (mailboxChange?.forceFlagScan === true
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true)),
@@ -1031,6 +1034,8 @@ export class MirrorEngine {
       metadataWriteStats: MetadataWriteStats;
       reconcileTelemetry: ReconcileAttemptTelemetry;
       forceReconcile?: boolean;
+      /** Host recovery barriers require a complete UID proof even after QRESYNC replay. */
+      forceAuthoritativeReconcile?: boolean;
       forceFlagScan?: boolean;
       signal?: AbortSignal;
     }
@@ -1360,6 +1365,7 @@ export class MirrorEngine {
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
       const reconcileDue = qresyncFallbackRequired
+        || options.forceAuthoritativeReconcile
         || (!qresyncApplied && options.forceReconcile)
         || !folder.last_full_reconcile_at
         || !folder.next_reconcile_at
