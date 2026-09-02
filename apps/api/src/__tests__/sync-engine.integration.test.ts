@@ -121,11 +121,19 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   });
 
   it("forces folder discovery during an authoritative safety pass", async () => {
-    const h = await setupIntegration("forced-safety-discovery");
+    const h = await setupIntegration("forced-safety-discovery", {
+      MAX_RR_FOLDERS_PER_CYCLE: 1
+    });
     activeAccountIds.push(h.account.id);
     const initialFolders = buildInboxAndSentFolders();
 
     await h.buildEngine({ folders: initialFolders }).syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET status = 'ACTIVE', initial_sync_complete = true
+       WHERE account_id = $1 AND lower(path) = 'inbox'`,
+      [h.account.id]
+    );
     await h.pool.query(
       `UPDATE public.imap_accounts
        SET next_folder_discovery_at = now() + interval '10 minutes'
@@ -134,7 +142,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
 
     const newFolder: FixtureFolder = {
-      path: "Projects/New",
+      path: "Projects/00-New",
       delimiter: "/",
       uidValidity: 70_001,
       messages: [makeTextMessage({
@@ -145,8 +153,12 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         body: "new folder safety proof"
       })]
     };
+    const deferredFolders: FixtureFolder[] = [
+      { path: "Projects/10-Deferred", delimiter: "/", uidValidity: 70_002, messages: [] },
+      { path: "Projects/20-Deferred", delimiter: "/", uidValidity: 70_003, messages: [] }
+    ];
     const result = await h.buildEngine({
-      folders: [...initialFolders, newFolder]
+      folders: [...initialFolders, newFolder, ...deferredFolders]
     }).syncAccount(h.account.id, "scheduled", {
       forceFolderDiscovery: true
     });
@@ -162,6 +174,16 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       folder_path: newFolder.path,
       subject: "created after listener startup"
     }]);
+    const state = await h.pool.query<{ sync_state: string }>(
+      "SELECT sync_state FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]?.sync_state).toBe("INITIAL_SYNC");
+    expect((await h.repository.getIdleWatchAccounts()).map((row) => row.id))
+      .not.toContain(h.account.id);
+    expect((await h.repository.getIdleWatchAccounts({
+      includeWarmInitialSync: true
+    })).map((row) => row.id)).toContain(h.account.id);
   });
 
   it("runs a lightweight Sent-only pass without consuming other due folder work", async () => {
@@ -1476,7 +1498,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
 
     expect(result.outcome).toBe("failed");
-    expect(result.errors).toContain("Mailbox change set no longer matches tracked folders");
+    expect(result.errors).toContain("Live folder set no longer matches tracked folders");
     expect(acknowledge).not.toHaveBeenCalled();
   });
 

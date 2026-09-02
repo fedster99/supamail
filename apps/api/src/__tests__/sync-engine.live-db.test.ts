@@ -146,6 +146,39 @@ liveDb("live DB reliability lane", () => {
       .toContain(h.account.id);
   });
 
+  it("keeps a warm account listener eligible while a newly discovered folder initializes", async () => {
+    const h = await setupIntegration("live-idle-warm-folder-ownership");
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    expect(account).not.toBeNull();
+
+    await h.repository.upsertDiscoveredFolders(account!, [
+      { path: "INBOX", delimiter: "/", specialUse: "\\Inbox" },
+      { path: "Projects/New", delimiter: "/" }
+    ]);
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET status = 'ACTIVE', initial_sync_complete = true
+       WHERE account_id = $1 AND lower(path) = 'inbox'`,
+      [h.account.id]
+    );
+    await h.repository.markAccountSyncSucceeded(h.account.id);
+
+    const state = await h.pool.query<{ sync_state: string; sync_state_reason: string | null }>(
+      "SELECT sync_state, sync_state_reason FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]).toEqual({
+      sync_state: "INITIAL_SYNC",
+      sync_state_reason: "INITIAL_SYNC_IN_PROGRESS"
+    });
+    expect((await h.repository.getIdleWatchAccounts()).map((row) => row.id))
+      .not.toContain(h.account.id);
+    expect((await h.repository.getIdleWatchAccounts({
+      includeWarmInitialSync: true
+    })).map((row) => row.id)).toContain(h.account.id);
+  });
+
   it("stores only a fixed code in pending-folder event diagnostics", async () => {
     const h = await setupIntegration("live-folder-diagnostic-code");
     activeAccountIds.push(h.account.id);

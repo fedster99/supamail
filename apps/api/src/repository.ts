@@ -814,15 +814,33 @@ export class MirrorRepository {
   }
 
   /** Active Mailbox Accounts that a host may keep on an Inbox IDLE session. */
-  async getIdleWatchAccounts(): Promise<ImapAccount[]> {
+  async getIdleWatchAccounts(
+    options: { includeWarmInitialSync?: boolean } = {}
+  ): Promise<ImapAccount[]> {
     const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
       `SELECT *
-       FROM public.imap_accounts
+       FROM public.imap_accounts a
        WHERE sync_state <> 'PAUSED'
-         AND sync_state <> 'INITIAL_SYNC'
+         AND (
+           sync_state <> 'INITIAL_SYNC'
+           OR (
+             $1::boolean = true
+             AND EXISTS (
+               SELECT 1
+               FROM public.imap_folders f
+               WHERE f.account_id = a.id
+                 AND lower(f.path) = 'inbox'
+                 AND f.tracked = true
+                 AND f.missing_since IS NULL
+                 AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+                 AND f.initial_sync_complete = true
+             )
+           )
+         )
          AND (sync_state <> 'BROKEN' OR backoff_until IS NOT NULL)
          AND (backoff_until IS NULL OR backoff_until <= now())
-       ORDER BY id`
+       ORDER BY id`,
+      [options.includeWarmInitialSync === true]
     );
     return await Promise.all(result.rows.map((row) => this.revealAccount(row)));
   }
