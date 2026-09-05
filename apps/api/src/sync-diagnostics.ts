@@ -20,7 +20,7 @@ const MISSING_MAILBOX_PATTERNS = [
   /\bNONEXISTENT\b/i,
   /\bTRYCREATE\b/i,
   /mailbox.*missing/i,
-  /does not exist/i,
+  /does(?: not|n't) exist/i,
   /no such mailbox/i,
   /mailbox not found/i,
 ];

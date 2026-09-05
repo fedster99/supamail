@@ -34,8 +34,10 @@ import type { ImapAccount, ImapMessage } from "./types.js";
  * update of a KNOWN row to a KNOWN value (not fabricating identity), and it is
  * required because the flag-scan sync only re-reads flags within
  * FLAG_DIFF_WINDOW_DAYS, so a change to older mail would otherwise never reconcile.
- * Moves and deletes still rely on the next sync's UID reconcile (which can lag by
- * more than the flag window); see ADR 0018.
+ * Moves mark their known source and destination folders due before the provider
+ * command. The host can reconcile them immediately after acknowledgement; the
+ * periodic sync remains the crash-safe fallback. Deletes retain the older next-
+ * sync behavior until their action path receives the same qualification.
  *
  * Destructive verbs require server capabilities so a fallback can never run a
  * blanket EXPUNGE: hard delete requires UIDPLUS (UID-scoped EXPUNGE); move
@@ -406,8 +408,9 @@ export interface MoveResult {
   newUid: number | null;
 }
 
-/** Move one mirrored message to `destination` by UID. The next reconcile sync
- * marks the source row deleted and the destination copy is mirrored. */
+/** Move one mirrored message to `destination` by UID. The source and destination
+ * are durably due before the provider command so a host can reconcile them after
+ * acknowledgement without depending on a prompt IDLE/NOTIFY event. */
 export async function moveMessage(
   pool: PgPool,
   config: AppConfig,
@@ -421,6 +424,8 @@ export async function moveMessage(
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
+
+  await repository.markFoldersForReconcile(account.id, [target.folderPath, destination]);
 
   const mutator = await MailboxMutator.connect(pool, config, account);
   try {

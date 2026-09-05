@@ -51,7 +51,8 @@ const mutator = vi.hoisted(() => ({
 const repo = vi.hoisted(() => ({
   getMessage: vi.fn(),
   getAccount: vi.fn(),
-  applyMessageFlags: vi.fn(async () => ["\\Seen"] as string[])
+  applyMessageFlags: vi.fn(async () => ["\\Seen"] as string[]),
+  markFoldersForReconcile: vi.fn(async () => undefined)
 }));
 
 // MailboxMutator.connect is intercepted via vi.spyOn (the real lib functions call
@@ -65,6 +66,7 @@ vi.mock("../repository.js", () => ({
     getMessage = repo.getMessage;
     getAccount = repo.getAccount;
     applyMessageFlags = repo.applyMessageFlags;
+    markFoldersForReconcile = repo.markFoldersForReconcile;
   }
 }));
 
@@ -167,10 +169,17 @@ describe("setMessageFlags", () => {
 });
 
 describe("moveMessage", () => {
-  it("moves by UID and surfaces the new UID from COPYUID", async () => {
+  it("marks the known folders durable before moving by UID", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { moveMessage } = await import("../mailbox-mutations.js");
     const result = await moveMessage({} as never, config, "msg-1", "Archive");
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith(
+      "acc-1",
+      ["INBOX", "Archive"]
+    );
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.move.mock.invocationCallOrder[0]
+    );
     expect(mutator.move).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), "Archive");
     expect(result).toMatchObject({ fromFolder: "INBOX", toFolder: "Archive", newUid: 99 });
   });

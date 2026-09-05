@@ -814,15 +814,33 @@ export class MirrorRepository {
   }
 
   /** Active Mailbox Accounts that a host may keep on an Inbox IDLE session. */
-  async getIdleWatchAccounts(): Promise<ImapAccount[]> {
+  async getIdleWatchAccounts(
+    options: { includeWarmInitialSync?: boolean } = {}
+  ): Promise<ImapAccount[]> {
     const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
       `SELECT *
-       FROM public.imap_accounts
+       FROM public.imap_accounts a
        WHERE sync_state <> 'PAUSED'
-         AND sync_state <> 'INITIAL_SYNC'
+         AND (
+           sync_state <> 'INITIAL_SYNC'
+           OR (
+             $1::boolean = true
+             AND EXISTS (
+               SELECT 1
+               FROM public.imap_folders f
+               WHERE f.account_id = a.id
+                 AND lower(f.path) = 'inbox'
+                 AND f.tracked = true
+                 AND f.missing_since IS NULL
+                 AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+                 AND f.initial_sync_complete = true
+             )
+           )
+         )
          AND (sync_state <> 'BROKEN' OR backoff_until IS NOT NULL)
          AND (backoff_until IS NULL OR backoff_until <= now())
-       ORDER BY id`
+       ORDER BY id`,
+      [options.includeWarmInitialSync === true]
     );
     return await Promise.all(result.rows.map((row) => this.revealAccount(row)));
   }
@@ -1182,10 +1200,15 @@ export class MirrorRepository {
       `
       WITH folder_health AS (
         SELECT
-          count(*) FILTER (WHERE tracked = true AND status != 'MISSING') AS tracked_count,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
+          ) AS tracked_count,
+          count(*) FILTER (
+            WHERE tracked = true
+              AND status != 'MISSING'
+              AND missing_since IS NULL
               AND initial_sync_complete = false
           ) AS incomplete_count,
           count(*) FILTER (
@@ -1197,12 +1220,14 @@ export class MirrorRepository {
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND sync_priority <= $3
               AND last_reconcile_clean = false
           ) AS priority_reconcile_gap_count,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND sync_priority <= $3
               AND (
                 last_reconcile_clean IS DISTINCT FROM true
@@ -1213,6 +1238,7 @@ export class MirrorRepository {
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND (
                 last_reconcile_clean IS DISTINCT FROM true
                 OR last_full_reconcile_at IS NULL
@@ -1222,17 +1248,20 @@ export class MirrorRepository {
           max(extract(epoch from (now() - last_synced_at))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND sync_priority <= $3
               AND last_synced_at IS NOT NULL
           ) AS priority_lag_seconds,
           max(extract(epoch from (now() - last_synced_at))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND last_synced_at IS NOT NULL
           ) AS overall_lag_seconds,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
+              AND missing_since IS NULL
               AND last_uidvalidity_reset_at IS NOT NULL
               AND last_uidvalidity_reset_at > now() - ($11::bigint * interval '1 millisecond')
           ) AS recent_uidvalidity_reset_count
@@ -1909,6 +1938,21 @@ export class MirrorRepository {
     return rows;
   }
 
+  async getTrackedFolderPaths(accountId: string): Promise<string[]> {
+    const result = await this.pool.query<{ path: string }>(
+      `
+      SELECT path
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      `,
+      [accountId]
+    );
+    return result.rows.map((row) => row.path);
+  }
+
   async markFolderPendingVerification(
     accountId: string,
     folderId: string,
@@ -2019,7 +2063,10 @@ export class MirrorRepository {
     return result.rows[0] ?? null;
   }
 
-  async getFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {
+  async getFoldersDueForSync(
+    accountId: string,
+    preferredRoundRobinPaths: readonly string[] = []
+  ): Promise<ImapFolder[]> {
     const priority = await this.pool.query<ImapFolder>(
       `
       SELECT *
@@ -2068,7 +2115,15 @@ export class MirrorRepository {
     const rotated = rrRows.length === 0
       ? []
       : [...rrRows.slice(cursor % rrRows.length), ...rrRows.slice(0, cursor % rrRows.length)];
-    const rr = rotated.slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
+    const rrByPath = new Map(rrRows.map((folder) => [folder.path, folder]));
+    const preferred = [...new Set(preferredRoundRobinPaths)]
+      .map((path) => rrByPath.get(path))
+      .filter((folder): folder is ImapFolder => folder !== undefined);
+    const preferredPaths = new Set(preferred.map((folder) => folder.path));
+    const rr = [
+      ...preferred,
+      ...rotated.filter((folder) => !preferredPaths.has(folder.path))
+    ].slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
 
     if (rrRows.length > 0 && rr.length > 0) {
       await this.pool.query(
@@ -2141,6 +2196,29 @@ export class MirrorRepository {
       [accountId, paths]
     );
     return result.rows;
+  }
+
+  /**
+   * Persist the authoritative verification work for a provider mutation before
+   * the network command runs. An extra reconcile after a failed command is safe;
+   * missing this write after a successful command is not.
+   */
+  async markFoldersForReconcile(accountId: string, paths: readonly string[]): Promise<void> {
+    const uniquePaths = [...new Set(paths)];
+    if (uniquePaths.length === 0) return;
+    await this.pool.query(
+      `
+      UPDATE public.imap_folders
+      SET next_sync_due_at = now(),
+          next_reconcile_at = now()
+      WHERE account_id = $1
+        AND path = ANY($2::text[])
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      `,
+      [accountId, uniquePaths]
+    );
   }
 
   async getSentFoldersDueForSync(accountId: string): Promise<ImapFolder[]> {

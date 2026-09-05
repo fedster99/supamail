@@ -120,6 +120,72 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await closePool();
   });
 
+  it("forces folder discovery during an authoritative safety pass", async () => {
+    const h = await setupIntegration("forced-safety-discovery", {
+      MAX_RR_FOLDERS_PER_CYCLE: 1
+    });
+    activeAccountIds.push(h.account.id);
+    const initialFolders = buildInboxAndSentFolders();
+
+    await h.buildEngine({ folders: initialFolders }).syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET status = 'ACTIVE', initial_sync_complete = true
+       WHERE account_id = $1 AND lower(path) = 'inbox'`,
+      [h.account.id]
+    );
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET next_folder_discovery_at = now() + interval '10 minutes'
+       WHERE id = $1`,
+      [h.account.id]
+    );
+
+    const newFolder: FixtureFolder = {
+      path: "Projects/99-New",
+      delimiter: "/",
+      uidValidity: 70_001,
+      messages: [makeTextMessage({
+        uid: 1,
+        subject: "created after listener startup",
+        from: "sender@example.test",
+        to: "owner@example.test",
+        body: "new folder safety proof"
+      })]
+    };
+    const deferredFolders: FixtureFolder[] = [
+      { path: "Projects/10-Deferred", delimiter: "/", uidValidity: 70_002, messages: [] },
+      { path: "Projects/20-Deferred", delimiter: "/", uidValidity: 70_003, messages: [] }
+    ];
+    const result = await h.buildEngine({
+      folders: [...initialFolders, newFolder, ...deferredFolders]
+    }).syncAccount(h.account.id, "scheduled", {
+      forceFolderDiscovery: true
+    });
+
+    expect(result.outcome).toBe("success");
+    const mirrored = await h.pool.query<{ folder_path: string; subject: string | null }>(
+      `SELECT folder_path, subject
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = $2`,
+      [h.account.id, newFolder.path]
+    );
+    expect(mirrored.rows).toEqual([{
+      folder_path: newFolder.path,
+      subject: "created after listener startup"
+    }]);
+    const state = await h.pool.query<{ sync_state: string }>(
+      "SELECT sync_state FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(state.rows[0]?.sync_state).toBe("INITIAL_SYNC");
+    expect((await h.repository.getIdleWatchAccounts()).map((row) => row.id))
+      .not.toContain(h.account.id);
+    expect((await h.repository.getIdleWatchAccounts({
+      includeWarmInitialSync: true
+    })).map((row) => row.id)).toContain(h.account.id);
+  });
+
   it("runs a lightweight Sent-only pass without consuming other due folder work", async () => {
     const h = await setupIntegration("sent-fast-pass");
     activeAccountIds.push(h.account.id);
@@ -451,6 +517,245 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ]);
   });
 
+  it("reconciles known move folders without waiting for a provider wake", async () => {
+    const h = await setupIntegration("known-move-folders", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].messages = [makeTextMessage({
+      uid: 101,
+      subject: "move me",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "known move"
+    })];
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_003,
+      messages: []
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    folders[0].messages = [];
+    folders[2].messages = [makeTextMessage({
+      uid: 301,
+      subject: "move me",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "known move"
+    })];
+    const workClient = new FixtureImapClient(folders);
+    const acknowledge = vi.fn();
+    workClient.peekMailboxChanges = () => [];
+    workClient.acknowledgeMailboxChanges = acknowledge;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceReconcileFolders: ["INBOX", "Archive"],
+      client: workClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.foldersProcessed).toBe(2);
+    // Inbox needs a delete reconcile. Archive inserts its new UID through the
+    // ordinary incremental path, so that side is exact without a second gap.
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(acknowledge).not.toHaveBeenCalled();
+    const rows = await h.pool.query<{
+      folder_path: string;
+      uid: string;
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT folder_path, uid::text, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND (
+         (folder_path = 'INBOX' AND uid = 101)
+         OR (folder_path = 'Archive' AND uid = 301)
+       )
+       ORDER BY folder_path, uid`,
+      [h.account.id]
+    );
+    expect(rows.rows).toEqual([
+      { folder_path: "Archive", uid: "301", deleted_in_provider: false },
+      { folder_path: "INBOX", uid: "101", deleted_in_provider: true }
+    ]);
+
+    const lateClient = new FixtureImapClient(folders);
+    const lateChange: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_003,
+        uidNext: 302,
+        messages: 1
+      }
+    };
+    const acknowledgeLate = vi.fn();
+    lateClient.peekMailboxChanges = () => [lateChange];
+    lateClient.acknowledgeMailboxChangesWithStatuses = acknowledgeLate;
+
+    const duplicate = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: lateClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(duplicate.outcome).toBe("success");
+    expect(duplicate.reconcileGapsFound).toBe(0);
+    expect(acknowledgeLate).toHaveBeenCalledWith([lateChange], [expect.objectContaining({
+      reconcileComplete: true,
+      flagScanComplete: false
+    })]);
+  });
+
+  it("reconciles the tracked side of a known move when its destination is intentionally untracked", async () => {
+    const h = await setupIntegration("known-move-untracked-destination", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].messages = [makeTextMessage({
+      uid: 101,
+      subject: "delete me",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "known delete"
+    })];
+    folders.push({
+      path: "Trash",
+      delimiter: "/",
+      uidValidity: 50_004,
+      messages: []
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders SET tracked = false WHERE account_id = $1 AND path = 'Trash'`,
+      [h.account.id]
+    );
+
+    folders[0].messages = [];
+    folders[2].messages = [makeTextMessage({
+      uid: 401,
+      subject: "delete me",
+      from: "a@x.test",
+      to: "u@x.test",
+      body: "known delete"
+    })];
+    const workClient = new FixtureImapClient(folders);
+    workClient.peekMailboxChanges = () => [];
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceReconcileFolders: ["INBOX", "Trash"],
+      client: workClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.errors).toEqual([]);
+    expect(result.foldersProcessed).toBe(1);
+    expect(result.reconcileGapsFound).toBe(1);
+    const rows = await h.pool.query<{
+      folder_path: string;
+      uid: string;
+      deleted_in_provider: boolean;
+    }>(
+      `SELECT folder_path, uid::text, deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1
+         AND folder_path IN ('INBOX', 'Trash')
+       ORDER BY folder_path, uid`,
+      [h.account.id]
+    );
+    expect(rows.rows).toEqual([
+      { folder_path: "INBOX", uid: "101", deleted_in_provider: true }
+    ]);
+  });
+
+  it("accepts an empty selected mailbox as authoritative deletion evidence", async () => {
+    const h = await setupIntegration("idle-empty-archive-reconcile", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_004,
+      messages: [makeTextMessage({
+        uid: 301,
+        subject: "last archive message",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "last"
+      })]
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+
+    folders[2].messages = [];
+    const idleClient = new FixtureImapClient(folders);
+    const change: MailboxChange = {
+      path: "Archive",
+      forceReconcile: true,
+      forceFlagScan: false,
+      observed: {
+        path: "Archive",
+        uidValidity: 50_004,
+        uidNext: 302,
+        messages: 0
+      }
+    };
+    const acknowledgeWithStatuses = vi.fn();
+    idleClient.peekMailboxChanges = () => [change];
+    idleClient.acknowledgeMailboxChangesWithStatuses = acknowledgeWithStatuses;
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: idleClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(acknowledgeWithStatuses).toHaveBeenCalledWith([change], [{
+      status: {
+        path: "Archive",
+        uidValidity: 50_004,
+        uidNext: 1,
+        exists: 0,
+        messages: 0,
+        highestModseq: undefined
+      },
+      reconcileComplete: true,
+      flagScanComplete: true
+    }]);
+    const row = await h.pool.query<{
+      deleted_in_provider: boolean;
+      deleted_reason: string | null;
+    }>(
+      `SELECT deleted_in_provider, deleted_reason
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 301`,
+      [h.account.id]
+    );
+    expect(row.rows[0]).toEqual({
+      deleted_in_provider: true,
+      deleted_reason: "RECONCILE_MISSING"
+    });
+  });
+
   it("uses QRESYNC replay for flags and deletions without an immediate exact UID scan", async () => {
     const h = await setupIntegration("qresync-archive-replay", {
       INITIAL_SYNC_BATCH_SIZE: 50,
@@ -603,6 +908,89 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       changedFlagCount: 1,
       vanishedUidCount: 1
     });
+  });
+
+  it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
+    const h = await setupIntegration("qresync-forced-inbox-barrier", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    const removedUid = folders[0].messages[0].uid;
+    const initialEngine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+    await initialEngine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+
+    folders[0].highestModseq = 11n;
+    folders[0].messages.shift();
+
+    class CompleteQresyncWithoutVanishedClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        const lock = await super.getMailboxLock(path);
+        if (!options.qresync || path !== "INBOX") return lock;
+        return {
+          ...lock,
+          qresync: {
+            accepted: true,
+            complete: true,
+            vanishedUids: [],
+            changedFlags: []
+          }
+        };
+      }
+    }
+
+    const recoveryClient = new CompleteQresyncWithoutVanishedClient(folders);
+    const fetch = vi.spyOn(recoveryClient, "fetch");
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
+    });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceInboxReconcile: true,
+      client: recoveryClient,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    expect(result.reconcileGapsFound).toBe(1);
+    expect(fetch.mock.calls.some(([range]) => typeof range === "object"
+      && range !== null
+      && "since" in range
+      && !("uid" in range))).toBe(true);
+    const removed = await h.pool.query<{ deleted_in_provider: boolean; deleted_reason: string | null }>(
+      `SELECT deleted_in_provider, deleted_reason
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = $2`,
+      [h.account.id, removedUid]
+    );
+    expect(removed.rows).toEqual([{
+      deleted_in_provider: true,
+      deleted_reason: "RECONCILE_MISSING"
+    }]);
   });
 
   it("falls back to exact UID reconciliation when QRESYNC capture is incomplete", async () => {
@@ -990,16 +1378,18 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   it("does not let a pending non-Inbox hint shadow a concurrent Inbox wake", async () => {
     const h = await setupIntegration("idle-inbox-with-archive", {
       INITIAL_SYNC_BATCH_SIZE: 50,
-      MAX_RECONCILES_PER_CYCLE: 2
+      MAX_RECONCILES_PER_CYCLE: 1
     });
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
     folders.push({ path: "Archive", delimiter: "/", uidValidity: 50_006, messages: [] });
     const engine = h.buildEngine({
       folders,
-      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 2 }
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 1 }
     });
     await engine.syncAccount(h.account.id, "manual");
+    const removedInboxUid = folders[0].messages[0].uid;
+    folders[0].messages.shift();
     folders[0].messages.push(makeTextMessage({
       uid: 106,
       subject: "new inbox",
@@ -1010,37 +1400,39 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     const archiveChange: MailboxChange = {
       path: "Archive",
-      forceReconcile: false,
+      forceReconcile: true,
       forceFlagScan: false,
       observed: { path: "Archive", uidValidity: 50_006, uidNext: 1, messages: 0 }
     };
-    const inboxChange: MailboxChange = {
-      path: "INBOX",
-      forceReconcile: true,
-      forceFlagScan: false,
-      observed: { path: "INBOX", uidValidity: 0 }
-    };
     const idleClient = new FixtureImapClient(folders);
     const acknowledge = vi.fn();
-    idleClient.peekMailboxChanges = () => [archiveChange, inboxChange];
+    idleClient.peekMailboxChanges = () => [archiveChange];
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
       liveInboxOnly: true,
       client: idleClient,
       clientAccountId: h.account.id,
-      keepClientOpen: true
+      keepClientOpen: true,
+      forceInboxReconcile: true
     });
 
     expect(result.outcome).toBe("success");
     expect(result.foldersProcessed).toBe(2);
-    expect(acknowledge).toHaveBeenCalledWith([archiveChange, inboxChange]);
+    expect(acknowledge).not.toHaveBeenCalled();
     const inbox = await h.pool.query<{ uid: string }>(
       `SELECT uid::text FROM public.imap_messages
        WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 106`,
       [h.account.id]
     );
     expect(inbox.rows).toEqual([{ uid: "106" }]);
+    const removedInbox = await h.pool.query<{ deleted_in_provider: boolean }>(
+      `SELECT deleted_in_provider
+       FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = $2`,
+      [h.account.id, removedInboxUid]
+    );
+    expect(removedInbox.rows).toEqual([{ deleted_in_provider: true }]);
   });
 
   it("drains forced mailbox reconciles across bounded live passes", async () => {
@@ -1189,7 +1581,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
 
     expect(result.outcome).toBe("failed");
-    expect(result.errors).toContain("Mailbox change set no longer matches tracked folders");
+    expect(result.errors).toContain("Live folder set no longer matches tracked folders");
     expect(acknowledge).not.toHaveBeenCalled();
   });
 
@@ -3221,6 +3613,54 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(account.rows[0].consecutive_failures).toBe(0);
   });
 
+  it("hard-closes an unusable host-owned client without waiting for LOGOUT", async () => {
+    const h = await setupIntegration("G-unusable-host-client-cleanup");
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 423,
+        messages: []
+      }
+    ];
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+
+    let releaseLogout: (() => void) | undefined;
+    class UnusableFixtureImapClient extends FixtureImapClient {
+      usable = false;
+      close = vi.fn(() => undefined);
+      override logout = vi.fn(async () => await new Promise<void>((resolve) => {
+        releaseLogout = resolve;
+      }));
+
+      override async getMailboxLock(): Promise<MailboxLock> {
+        throw Object.assign(new Error("Connection not available"), { code: "NoConnection" });
+      }
+    }
+
+    const client = new UnusableFixtureImapClient(folders);
+    const engine = h.buildEngine({ folders });
+    const run = engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceReconcileFolders: ["INBOX"],
+      client,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+    const completion = await Promise.race([
+      run.then(() => "completed" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100))
+    ]);
+    releaseLogout?.();
+    await run;
+
+    expect(completion).toBe("completed");
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(client.logout).not.toHaveBeenCalled();
+  });
+
   it("stores parsed bodies without raw MIME when BODY_STORAGE_MODE is parsed_only", async () => {
     const h = await setupIntegration("G-parsed-only-bodies", { BODY_STORAGE_MODE: "parsed_only" });
     activeAccountIds.push(h.account.id);
@@ -3814,9 +4254,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     class MissingProjectClient extends FixtureImapClient {
       async getMailboxLock(path: string) {
         if (path === "Project-Alpha") {
-          throw Object.assign(new Error("NO [NONEXISTENT] Mailbox doesn't exist"), {
-            serverResponseCode: "NONEXISTENT"
-          });
+          throw new Error("Command failed — NO Mailbox doesn't exist: Project-Alpha");
         }
         return super.getMailboxLock(path);
       }

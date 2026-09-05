@@ -317,8 +317,16 @@ export interface MirrorEngineOptions {
 
 export interface SyncAccountOptions {
   sentOnly?: boolean;
+  /** Run one authoritative folder LIST even when the discovery timer is not due. */
+  forceFolderDiscovery?: boolean;
   /** Run the supplemental live-change lane (the name is retained for host compatibility). */
   liveInboxOnly?: boolean;
+  /**
+   * Authoritative folders changed by one provider-acknowledged mutation. The
+   * live lane verifies these paths even when IDLE/NOTIFY has not reported them.
+   * Limited to the source and destination of one mutation.
+   */
+  forceReconcileFolders?: readonly string[];
   /** Fetch the current live body backlog without running folder or history work. */
   bodyBacklogOnly?: boolean;
   /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
@@ -488,26 +496,52 @@ export class MirrorEngine {
               this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE + this.config.MAX_RR_FOLDERS_PER_CYCLE
             ) ?? [])]
           : [];
+        const forceReconcileFolders = options.liveInboxOnly
+          ? [...new Set(options.forceReconcileFolders ?? [])]
+          : [];
+        if (forceReconcileFolders.length > 2) {
+          throw new Error("forceReconcileFolders accepts at most one source and one destination");
+        }
+        if (forceReconcileFolders.some((path) => path.length === 0)) {
+          throw new Error("forceReconcileFolders requires non-empty folder paths");
+        }
+        const forcedReconcilePaths = new Set(forceReconcileFolders);
         const mailboxChangeByPath = new Map(
           mailboxChanges.map((change) => [change.path, change] as const)
         );
+        const liveFolderPaths = [
+          ...forceReconcileFolders,
+          ...mailboxChanges
+            .map((change) => change.path)
+            .filter((path) => !forcedReconcilePaths.has(path))
+        ];
 
-        if (!supplemental && this.shouldDiscoverFolders(account)) {
-          await this.discoverFolders(account, client);
+        let newlyTrackedFolderPaths: string[] = [];
+        if (!supplemental
+          && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
+          newlyTrackedFolderPaths = await this.discoverFolders(account, client);
         }
 
         const folders = options.bodyBacklogOnly
           ? []
           : sentFolders ?? (options.liveInboxOnly
-          ? mailboxChanges.length > 0
+          ? liveFolderPaths.length > 0
             ? await this.repository.getFoldersForWake(
                 account.id,
-                mailboxChanges.map((change) => change.path)
+                liveFolderPaths
               )
             : [await this.repository.getInboxFolderForWake(account.id)].filter(
                 (folder): folder is ImapFolder => folder !== null
               )
-          : await this.repository.getFoldersDueForSync(account.id));
+          : await this.repository.getFoldersDueForSync(account.id, newlyTrackedFolderPaths));
+        if (options.liveInboxOnly
+          && (options.forceInboxReconcile === true || options.forceInboxFlagScan === true)) {
+          const inboxIndex = folders.findIndex((folder) => folder.path.toLowerCase() === "inbox");
+          const inboxFolder = inboxIndex >= 0
+            ? folders.splice(inboxIndex, 1)[0]
+            : await this.repository.getInboxFolderForWake(account.id);
+          if (inboxFolder) folders.unshift(inboxFolder);
+        }
         let priorityFolderFailed = false;
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
@@ -518,7 +552,9 @@ export class MirrorEngine {
         for (const folder of folders) {
           throwIfInterrupted();
           const mailboxChange = mailboxChangeByPath.get(folder.path);
-          const isPriorityFolder = mailboxChange !== undefined
+          const forceKnownReconcile = forcedReconcilePaths.has(folder.path);
+          const isPriorityFolder = forceKnownReconcile
+            || mailboxChange !== undefined
             || folder.sync_priority <= this.config.PRIORITY_CUTOFF;
           if (this.isLockBudgetExpired(lockDeadline) && !isPriorityFolder) {
             result.hitLockBudget = true;
@@ -538,14 +574,19 @@ export class MirrorEngine {
           };
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
-              allowReconcile: !options.sentOnly && remainingReconciles > 0,
+              allowReconcile: !options.sentOnly
+                && (forceKnownReconcile || remainingReconciles > 0),
               allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
               reconcileTelemetry,
               forceReconcile: options.liveInboxOnly
-                && (mailboxChange?.forceReconcile === true
+                && (forceKnownReconcile
+                  || mailboxChange?.forceReconcile === true
+                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
+              forceAuthoritativeReconcile: options.liveInboxOnly
+                && (forceKnownReconcile
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
               forceFlagScan: options.liveInboxOnly
                 && (mailboxChange?.forceFlagScan === true
@@ -616,14 +657,19 @@ export class MirrorEngine {
               result.reconcileFoldersAttempted! += 1;
               result.reconcileProviderUidsSeen! += reconcileTelemetry.providerUidsSeen;
               result.reconcileDurationMs! += reconcileTelemetry.durationMs;
-              remainingReconciles -= 1;
+              if (!forceKnownReconcile) remainingReconciles -= 1;
             }
           }
         }
 
-        if (mailboxChanges.length > 0 && folders.length !== mailboxChanges.length) {
+        const selectedFolderPaths = new Set(folders.map((folder) => folder.path));
+        // Provider events for a folder that stopped matching the tracked set
+        // must remain pending. A host-supplied known destination may be
+        // intentionally untracked (for example Trash); in that case exactness
+        // covers only the tracked source and the durable due marker is a no-op.
+        if (mailboxChanges.some((change) => !selectedFolderPaths.has(change.path))) {
           priorityFolderFailed = true;
-          result.errors.push("Mailbox change set no longer matches tracked folders");
+          result.errors.push("Live folder set no longer matches tracked folders");
         }
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
@@ -754,10 +800,9 @@ export class MirrorEngine {
         }
       } finally {
         options.signal?.removeEventListener("abort", interruptActiveClient);
-        if (
-          client
-          && (!options.keepClientOpen || client.usable === false || options.signal?.aborted)
-        ) {
+        if (client && (client.usable === false || options.signal?.aborted)) {
+          this.abortClient(client);
+        } else if (client && !options.keepClientOpen) {
           await client.logout().catch(() => this.abortClient(client!));
         }
       }
@@ -848,7 +893,10 @@ export class MirrorEngine {
     return new Date(account.next_folder_discovery_at).getTime() <= Date.now();
   }
 
-  private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<void> {
+  private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<string[]> {
+    const trackedBefore = new Set(
+      await this.repository.getTrackedFolderPaths(account.id)
+    );
     const folders = await client.list();
     if (folders.length === 0) {
       throw new Error(`Provider returned no folders for ${account.email_address}`);
@@ -872,6 +920,9 @@ export class MirrorEngine {
     for (const folder of upserted) {
       await this.hooks.onFolderChanged?.(folder);
     }
+    return upserted
+      .filter((folder) => folder.tracked && !trackedBefore.has(folder.path))
+      .map((folder) => folder.path);
   }
 
   private async applyVerifiedFolderAliasExclusions(
@@ -983,6 +1034,8 @@ export class MirrorEngine {
       metadataWriteStats: MetadataWriteStats;
       reconcileTelemetry: ReconcileAttemptTelemetry;
       forceReconcile?: boolean;
+      /** Host recovery barriers require a complete UID proof even after QRESYNC replay. */
+      forceAuthoritativeReconcile?: boolean;
       forceFlagScan?: boolean;
       signal?: AbortSignal;
     }
@@ -1312,6 +1365,7 @@ export class MirrorEngine {
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
       const reconcileDue = qresyncFallbackRequired
+        || options.forceAuthoritativeReconcile
         || (!qresyncApplied && options.forceReconcile)
         || !folder.last_full_reconcile_at
         || !folder.next_reconcile_at
@@ -1337,6 +1391,7 @@ export class MirrorEngine {
           folder,
           uidValidity
         );
+        const selectedMailboxIsAuthoritativelyEmpty = mailbox.exists === 0;
         const windowUidStream = await peekAsyncIterable(this.withAsyncIterableDeadline(
           client,
           reconcileDeadline,
@@ -1359,7 +1414,10 @@ export class MirrorEngine {
               )
             : windowUidStream.values,
           {
-            failIfEmpty: shouldFailOnEmptyReconcile,
+            // Two empty UID streams are valid when SELECT also reports zero
+            // messages. Keep failing closed for every contradictory or unknown
+            // mailbox count so a transient empty SEARCH cannot mass-tombstone.
+            failIfEmpty: shouldFailOnEmptyReconcile && !selectedMailboxIsAuthoritativelyEmpty,
             emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`,
             // The unfiltered fallback confirms provider deletions only. Feeding its
             // archive UIDs into missing-in-DB repair would violate the live-window

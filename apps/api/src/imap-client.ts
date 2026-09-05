@@ -173,6 +173,7 @@ export interface MirrorImapClient {
 export class ThrottledImapClient implements MirrorImapClient {
   private readonly throttle: ImapThrottle;
   private qresyncDisabled = false;
+  private invalidated = false;
 
   constructor(
     private readonly client: ImapFlow,
@@ -189,7 +190,7 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   get usable(): boolean {
-    return this.client.usable;
+    return !this.invalidated && this.client.usable;
   }
 
   get capabilities(): ReadonlyMap<string, boolean | number> {
@@ -201,10 +202,15 @@ export class ThrottledImapClient implements MirrorImapClient {
   }
 
   async logout(): Promise<void> {
+    if (this.invalidated || this.client.usable === false) {
+      this.close();
+      return;
+    }
     await this.withCommandTimeout("logout", () => this.client.logout());
   }
 
   close(): void {
+    this.invalidated = true;
     this.client.close();
   }
 
@@ -406,10 +412,14 @@ export class ThrottledImapClient implements MirrorImapClient {
       }
     } finally {
       if (!completed && iterator.return) {
-        try {
-          await this.withCommandTimeout("fetch cancel", () => iterator.return!());
-        } catch {
-          this.client.close();
+        if (!this.invalidated && this.client.usable === false) {
+          this.close();
+        } else if (!this.invalidated) {
+          try {
+            await this.withCommandTimeout("fetch cancel", () => iterator.return!());
+          } catch {
+            this.close();
+          }
         }
       }
     }
@@ -441,14 +451,14 @@ export class ThrottledImapClient implements MirrorImapClient {
     let onAbort: (() => void) | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => {
-        this.client.close();
+        this.close();
         reject(new Error(`IMAP_COMMAND_TIMEOUT_MS exceeded during ${operation}`));
       }, this.commandTimeoutMs);
     });
     const abortPromise = new Promise<never>((_, reject) => {
       if (!this.signal) return;
       onAbort = () => {
-        this.client.close();
+        this.close();
         reject(this.signal!.reason instanceof Error
           ? this.signal!.reason
           : new DOMException(`IMAP ${operation} aborted`, "AbortError"));

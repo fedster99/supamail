@@ -228,8 +228,8 @@ The spec's reactive rediscovery is implemented as **deferred**: when a folder op
 
 Detection prefers ImapFlow's structured fields over regex on message text:
 
-1. **Primary: structured response code.** ImapFlow attaches `err.serverResponseCode` to errors thrown from IMAP NO responses that carry an RFC-5530-style code (e.g., `* a NO [NONEXISTENT] Mailbox doesn't exist`). The extractor lives in `node_modules/.../imapflow/lib/tools.js`. Match against `err.serverResponseCode === 'NONEXISTENT' || err.serverResponseCode === 'TRYCREATE'`. This covers compliant servers including Gmail, Outlook, and Rackspace.
-2. **Fallback: regex on `err.message`.** Only when `serverResponseCode` is absent (older or non-compliant servers). Patterns are case-insensitive: `/does not exist/`, `/no such mailbox/`, `/mailbox not found/`. The fallback exists to avoid silently swallowing real missing-mailbox conditions from a long tail of weird providers — not as the primary path.
+1. **Primary: structured response code.** ImapFlow attaches `err.serverResponseCode` to errors thrown from IMAP NO responses that carry an RFC-5530-style code (e.g., `* a NO [NONEXISTENT] Mailbox doesn't exist`). The extractor lives in `node_modules/.../imapflow/lib/tools.js`. Match against `err.serverResponseCode === 'NONEXISTENT' || err.serverResponseCode === 'TRYCREATE'`. This covers compliant servers including Gmail and Outlook.
+2. **Fallback: regex on `err.message`.** Only when `serverResponseCode` is absent (older or non-compliant servers, including observed Rackspace responses). Patterns are case-insensitive: `/does not exist/`, `/doesn't exist/`, `/no such mailbox/`, `/mailbox not found/`. The fallback exists to avoid silently swallowing real missing-mailbox conditions from a long tail of weird providers — not as the primary path.
 3. **False positives are cheap** — one extra discovery cycle. Better to over-trigger than to miss the case.
 
 Detection is centralized in a helper (`isMissingMailboxError(err)`) alongside `isAuthError` in `sync-engine.ts` for symmetry. Both helpers prefer structured codes when available.
