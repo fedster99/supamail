@@ -192,6 +192,25 @@ function batchConversationPool() {
 }
 
 describe("read_thread stored assignments", () => {
+  it.each([true, false])("reuses the canonical selector instead of re-reading assignments (includeBody=%s)", async (includeBody) => {
+    const { pool, query } = assignedConversationPool();
+    const out = await runReadThread(
+      pool as never,
+      { conversation_id: "conversation-1", account: ACCOUNT_ID },
+      undefined,
+      { includeBody }
+    );
+
+    expect(isResult(out)).toBe(true);
+    const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"));
+    expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20]);
+    // Membership still comes from the active view, once, in this snapshot.
+    expect(call?.[0].match(/public\.imap_thread_active_assignments/g)).toHaveLength(1);
+    expect(call?.[0]).toContain("assignment.conversation_id = $2");
+    expect(call?.[0]).toContain("$2::text AS conversation_id");
+    expect(call?.[0]).not.toContain("ta.conversation_id");
+  });
+
   it("can select metadata without inline body columns for hosted hydration", async () => {
     const { pool, query } = assignedConversationPool();
 
