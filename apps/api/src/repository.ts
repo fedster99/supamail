@@ -2095,9 +2095,9 @@ export class MirrorRepository {
 
     const account = await this.getAccount(accountId);
     const cursor = account?.folder_rr_cursor ?? 0;
-    const rrCandidates = await this.pool.query<ImapFolder>(
+    const rrCandidates = await this.pool.query<ImapFolder & { sync_due: boolean }>(
       `
-      SELECT *
+      SELECT *, (next_sync_due_at IS NULL OR next_sync_due_at <= now()) AS sync_due
       FROM public.imap_folders
       WHERE account_id = $1
         AND tracked = true
@@ -2106,7 +2106,6 @@ export class MirrorRepository {
         AND missing_since IS NULL
         AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND sync_priority > $2
-        AND (next_sync_due_at IS NULL OR next_sync_due_at <= now())
       ORDER BY path
       `,
       [accountId, this.config.PRIORITY_CUTOFF]
@@ -2115,20 +2114,25 @@ export class MirrorRepository {
     const rotated = rrRows.length === 0
       ? []
       : [...rrRows.slice(cursor % rrRows.length), ...rrRows.slice(0, cursor % rrRows.length)];
-    const rrByPath = new Map(rrRows.map((folder) => [folder.path, folder]));
+    // The cursor indexes the full eligible folder list. Filtering before
+    // rotation shifts its position whenever a recently visited folder is not due.
+    const due = rotated.filter((folder) => folder.sync_due);
+    const rrByPath = new Map(due.map((folder) => [folder.path, folder]));
     const preferred = [...new Set(preferredRoundRobinPaths)]
       .map((path) => rrByPath.get(path))
-      .filter((folder): folder is ImapFolder => folder !== undefined);
+      .filter((folder) => folder !== undefined);
     const preferredPaths = new Set(preferred.map((folder) => folder.path));
     const rr = [
       ...preferred,
-      ...rotated.filter((folder) => !preferredPaths.has(folder.path))
+      ...due.filter((folder) => !preferredPaths.has(folder.path))
     ].slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
 
-    if (rrRows.length > 0 && rr.length > 0) {
+    // Discovery's preferred slots do not skip ordinary work we did not select.
+    const lastRotated = rr.filter((folder) => !preferredPaths.has(folder.path)).at(-1);
+    if (lastRotated) {
       await this.pool.query(
         "UPDATE public.imap_accounts SET folder_rr_cursor = $2 WHERE id = $1",
-        [accountId, (cursor + rr.length) % rrRows.length]
+        [accountId, (rrRows.findIndex((folder) => folder.id === lastRotated.id) + 1) % rrRows.length]
       );
     }
 

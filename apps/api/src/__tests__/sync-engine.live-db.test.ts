@@ -559,6 +559,34 @@ liveDb("live DB reliability lane", () => {
     expect(second.map((folder) => folder.path)).toEqual(["Priority", "RR-C", "RR-A"]);
   });
 
+  it("keeps round-robin position stable when recently visited folders are not due", async () => {
+    const h = await setupIntegration("live-stable-round-robin", {
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    await h.repository.upsertDiscoveredFolders(account, Array.from({ length: 40 }, (_,index) => ({
+      path: `RR-${String(index).padStart(2,"0")}`, delimiter: "/"
+    })));
+    const seen = new Set<string>();
+    let previous: string[] = [];
+    for (let cycle=0;cycle<16;cycle++) {
+      // A slightly early periodic poll sees the previous batch not due while
+      // older folders are due. No real waiting or IMAP work in this SQL test.
+      await h.pool.query(`UPDATE public.imap_folders
+        SET sync_priority=100, next_sync_due_at=CASE WHEN path=ANY($2::text[])
+          THEN now()+interval '1 minute' ELSE now()-interval '1 minute' END
+        WHERE account_id=$1`,[h.account.id,previous]);
+      const selected = await h.repository.getFoldersDueForSync(h.account.id);
+      expect(selected).toHaveLength(5);
+      expect(selected.every(folder=>!previous.includes(folder.path))).toBe(true);
+      previous = selected.map(folder=>folder.path);
+      previous.forEach(path=>seen.add(path));
+    }
+    expect(seen.size).toBe(40);
+  });
+
   it("keeps Inbox first in the bounded full-sweep priority set", async () => {
     const h = await setupIntegration("live-sent-priority-slot", {
       PRIORITY_CUTOFF: 10,
