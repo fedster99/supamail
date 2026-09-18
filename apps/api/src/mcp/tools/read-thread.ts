@@ -32,7 +32,11 @@ import {
 const DEFAULT_MAX_MESSAGES = 20;
 const MAX_MESSAGES_CEILING = 100;
 const MAX_THREAD_BATCH = 10;
-const THREAD_BATCH_CONCURRENCY = 4;
+type ReadThreadSnapshot = {
+  client: PgClient;
+  trustByAccount: Map<string, SyncTrust>;
+  seedsById: Map<string, SeedRow>;
+};
 
 /**
  * Collapse physical mailbox occurrences only when we have delivery-identity
@@ -67,13 +71,13 @@ const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
  * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
-function threadSelect(includeBody: boolean): string {
+function threadSelect(includeBody: boolean, conversationColumn = "ta.conversation_id"): string {
   return `
   m.id,
   m.account_id,
   m.folder_path,
   m.provider_thread_id,
-  ta.conversation_id,
+  ${conversationColumn},
   m.subject,
   m.from_email,
   m.from_name,
@@ -362,6 +366,8 @@ async function fetchThreadRows(
   { includeBody = true }: ReadThreadOptions
 ): Promise<FetchedThread> {
   if (selector.kind === "conversation") {
+    // Every representative already belongs to this bound conversation in the
+    // same snapshot. Do not rejoin all active assignments to rediscover its id.
     const result = await client.query<ThreadRow>(
       `
       WITH delivery_representatives AS (
@@ -380,12 +386,9 @@ async function fetchThreadRows(
           m.folder_path ASC,
           m.id ASC
       )${boundedThreadCtes("$3")}
-      SELECT ${threadSelect(includeBody)}
+      SELECT ${threadSelect(includeBody, "$2::text AS conversation_id")}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
-      LEFT JOIN public.imap_thread_active_assignments ta
-        ON ta.message_id = m.id
-       AND ta.account_id = m.account_id
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
@@ -476,11 +479,28 @@ async function fetchThreadRows(
   return summarizeFetchedRows(result.rows);
 }
 
+async function fetchThreadSeeds(client: PgClient, messageIds: string[], accountScope: string | null) {
+  return client.query<SeedRow>(`
+    SELECT id, provider_thread_id, rfc_message_id, message_id_normalized,
+           in_reply_to, references_header, m.account_id,
+           assignment.conversation_id
+    FROM public.imap_messages m
+    LEFT JOIN public.imap_thread_active_assignments assignment
+      ON assignment.message_id = m.id
+     AND assignment.account_id = m.account_id
+     AND assignment.message_id = ANY($1::uuid[])
+    WHERE m.id = ANY($1::uuid[])
+      AND ($2::uuid IS NULL OR m.account_id = $2)
+      AND m.deleted_in_provider = false
+  `, [messageIds, accountScope]);
+}
+
 async function runReadThreadInternal(
   pool: PgPool,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter,
-  options: ReadThreadOptions
+  options: ReadThreadOptions,
+  snapshot?: ReadThreadSnapshot
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
   let input: ReadThreadArgs;
   try {
@@ -510,43 +530,46 @@ async function runReadThreadInternal(
   if (input.message_ids) {
     const messageIds = [...new Set(input.message_ids)];
     const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
-    let nextIndex = 0;
-    // Each item owns one snapshot, including sync_trust. Sharing trust across
-    // items could describe a different mirror state than the returned thread.
-    await Promise.all(Array.from(
-      { length: Math.min(THREAD_BATCH_CONCURRENCY, messageIds.length) },
-      async () => {
-        while (nextIndex < messageIds.length) {
-          const index = nextIndex++;
-          const messageId = messageIds[index];
-          try {
-            const result = await runReadThreadInternal(pool, {
-              message_id: messageId,
-              account: input.account,
-              include_quoted: input.include_quoted,
-              max_messages: input.max_messages
-            }, metadataProtection, options);
-            if ("thread" in result) {
-              threads[index] = { message_id: messageId, result };
-            } else if ("error" in result) {
-              threads[index] = { message_id: messageId, error: result.error };
-            } else {
-              throw new Error("unexpected nested read_thread batch result");
-            }
-          } catch {
-            threads[index] = {
-              message_id: messageId,
-              error: toolError(
-                "tool_failed",
-                "Thread could not be read.",
-                "Retry this thread or remove it from the batch."
-              ).error
-            };
+    // One read-only snapshot owns every thread and its completeness evidence.
+    // Savepoints preserve per-item errors without poisoning later reads.
+    return withReadOnlyTx(pool, async (client) => {
+      const seeds = await fetchThreadSeeds(client, messageIds, input.account ?? null);
+      const batchSnapshot: ReadThreadSnapshot = {
+        client, trustByAccount: new Map(), seedsById: new Map(seeds.rows.map(seed => [seed.id, seed]))
+      };
+      for (let index = 0; index < messageIds.length; index += 1) {
+        const messageId = messageIds[index];
+        await client.query("SAVEPOINT read_thread_item");
+        try {
+          const result = await runReadThreadInternal(pool, {
+            message_id: messageId,
+            account: input.account,
+            include_quoted: input.include_quoted,
+            max_messages: input.max_messages
+          }, metadataProtection, options, batchSnapshot);
+          if ("thread" in result) {
+            threads[index] = { message_id: messageId, result };
+          } else if ("error" in result) {
+            threads[index] = { message_id: messageId, error: result.error };
+          } else {
+            throw new Error("unexpected nested read_thread batch result");
           }
+        } catch {
+          await client.query("ROLLBACK TO SAVEPOINT read_thread_item");
+          threads[index] = {
+            message_id: messageId,
+            error: toolError(
+              "tool_failed",
+              "Thread could not be read.",
+              "Retry this thread or remove it from the batch."
+            ).error
+          };
+        } finally {
+          await client.query("RELEASE SAVEPOINT read_thread_item");
         }
       }
-    ));
-    return { threads };
+      return { threads };
+    });
   }
 
   const messageId = typeof input.message_id === "string" ? input.message_id : undefined;
@@ -572,7 +595,7 @@ async function runReadThreadInternal(
   }
   const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;
 
-  return withReadOnlyTx(pool, async (client) => {
+  const readSnapshot = async (client: PgClient): Promise<ReadThreadResult | ReturnType<typeof toolError>> => {
     let fetched: FetchedThread;
     let accountIds: string[] | null;
 
@@ -593,22 +616,9 @@ async function runReadThreadInternal(
       }, maxMessages, options);
       accountIds = [accountScope!];
     } else {
-      const seedResult = await client.query<SeedRow>(
-        `
-        SELECT id, provider_thread_id, rfc_message_id, message_id_normalized,
-               in_reply_to, references_header, m.account_id,
-               assignment.conversation_id
-        FROM public.imap_messages m
-        LEFT JOIN public.imap_thread_active_assignments assignment
-          ON assignment.message_id = m.id
-         AND assignment.account_id = m.account_id
-        WHERE m.id = $1
-          AND ($2::uuid IS NULL OR m.account_id = $2)
-          AND m.deleted_in_provider = false
-        `,
-        [messageId, accountScope]
-      );
-      const seed = seedResult.rows[0];
+      const seed = snapshot
+        ? snapshot.seedsById.get(messageId!.toLowerCase())
+        : (await fetchThreadSeeds(client, [messageId!], accountScope)).rows[0];
       if (!seed) {
         return toolError(
           "not_found",
@@ -639,7 +649,14 @@ async function runReadThreadInternal(
       );
     }
 
-    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
+    // Every selector resolves exactly one account. Reuse only inside this same
+    // transaction, never across requests or independently opened snapshots.
+    const accountId = accountIds[0];
+    let syncTrust = snapshot?.trustByAccount.get(accountId);
+    if (!syncTrust) {
+      syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
+      snapshot?.trustByAccount.set(accountId, syncTrust);
+    }
 
     const attachments = await loadMessageAttachments(
       client,
@@ -696,7 +713,8 @@ async function runReadThreadInternal(
       thread_omissions: omitted > 0 ? ["older_messages"] : [],
       sync_trust: syncTrust
     };
-  });
+  };
+  return snapshot ? readSnapshot(snapshot.client) : withReadOnlyTx(pool, readSnapshot);
 }
 
 export function runReadThread(

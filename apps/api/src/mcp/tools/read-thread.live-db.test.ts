@@ -511,6 +511,37 @@ liveDb("read_thread live DB", () => {
     expect(out.messages.map((message) => message.message_id)).not.toContain(idByUid.get(5));
   });
 
+  it.each([true, false])("preserves canonical membership and caps (includeBody=%s)", async (includeBody) => {
+    const selector = { conversation_id: ACTIVE_CONVERSATION_ID, account: accountId };
+    const full = await runReadThread(pool, selector, undefined, { includeBody });
+    expect(isResult(full)).toBe(true);
+    if (!isResult(full)) return;
+    expect(full.thread.conversation_id).toBe(ACTIVE_CONVERSATION_ID);
+    expect(full.messages.map((message) => message.message_id)).toEqual([
+      idByUid.get(20), idByUid.get(21)
+    ]);
+    expect(full.thread.message_count).toBe(2);
+
+    const capped = await runReadThread(pool, { ...selector, max_messages: 1 }, undefined, { includeBody });
+    expect(isResult(capped)).toBe(true);
+    if (!isResult(capped)) return;
+    expect(capped.thread.conversation_id).toBe(ACTIVE_CONVERSATION_ID);
+    expect(capped.messages.map((message) => message.message_id)).toEqual([idByUid.get(21)]);
+    expect(capped.thread.message_count).toBe(2);
+    expect(capped.omitted_message_count).toBe(1);
+    expect(capped.thread_content_status).toBe("partial");
+    expect(capped.thread_omissions).toEqual(["older_messages"]);
+
+    const wrongAccount = await runReadThread(pool, {
+      ...selector, account: "00000000-0000-0000-0000-000000000000"
+    }, undefined, { includeBody });
+    expect(wrongAccount).toMatchObject({ error: { code: "not_found" } });
+    const missing = await runReadThread(pool, {
+      ...selector, conversation_id: "unknown-conversation"
+    }, undefined, { includeBody });
+    expect(missing).toMatchObject({ error: { code: "not_found" } });
+  });
+
   it("returns a sync_trust block", async () => {
     const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId });
     expect(isResult(out)).toBe(true);
