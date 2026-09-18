@@ -21,6 +21,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - A truncated body remains incomplete coverage but must not enter an automatic retry loop. Use explicit body refetch only after correcting the cause; raise `BODY_RAW_MAX_BYTES` first when the configured cap caused truncation.
 - Progress counters live on `imap_folders` and must be updated in the same write path as the underlying header/body state they summarize. They are cumulative telemetry, not the source of truth for current live or priority body completeness.
 - A single-account sync-trust read explicitly scopes the progress view to that account so its grouped body scans need not include unrelated accounts. Keep the same row-accurate view and request snapshot; do not substitute cached completeness or change multi-account and unrestricted results.
+- A batched `read_thread` owns one read-only repeatable-read transaction and resolves its bounded seed set in one query. All thread rows and per-account sync-trust evidence use that snapshot; each account's trust is read once inside the batch, never reused across requests. Per-item savepoints preserve ordered partial errors after a thread-read SQL failure without aborting subsequent items. The ten-seed and per-thread message caps remain unchanged.
 
 ## Conversation Threading
 

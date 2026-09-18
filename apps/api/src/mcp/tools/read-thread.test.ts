@@ -28,7 +28,7 @@ function assignedConversationPool() {
     sql: string,
     values?: unknown[]
   ): Promise<{ rows: Array<Record<string, unknown>> }> => {
-    if (sql.includes("WHERE m.id = $1")) {
+    if (sql.includes("WHERE m.id = ANY")) {
       return {
         rows: [
           {
@@ -79,7 +79,7 @@ function assignedConversationPool() {
 
 function unassignedSeedPool() {
   const query = vi.fn(async (sql: string): Promise<{ rows: Array<Record<string, unknown>> }> => {
-    if (sql.includes("WHERE m.id = $1")) {
+    if (sql.includes("WHERE m.id = ANY")) {
       return {
         rows: [
           {
@@ -130,17 +130,17 @@ function unassignedSeedPool() {
 
 function batchConversationPool() {
   let syncTrustQueryCount = 0;
+  let seedQueryCount = 0;
   const connect = vi.fn(async () => {
     const query = vi.fn(async (
       sql: string,
       values?: unknown[]
     ): Promise<{ rows: Array<Record<string, unknown>> }> => {
-      if (sql.includes("WHERE m.id = $1")) {
-        const messageId = String(values?.[0]);
-        if (messageId === MISSING_MESSAGE) return { rows: [] };
-        if (messageId === BROKEN_MESSAGE) throw new Error("temporary database failure");
+      if (sql.includes("WHERE m.id = ANY")) {
+        seedQueryCount += 1;
+        const messageIds = values?.[0] as string[];
         return {
-          rows: [{
+          rows: messageIds.map(id => id.toLowerCase()).filter(id => id !== MISSING_MESSAGE).map(messageId => ({
             id: messageId,
             provider_thread_id: `provider-${messageId}`,
             rfc_message_id: `<${messageId}@example.test>`,
@@ -149,11 +149,12 @@ function batchConversationPool() {
             references_header: null,
             account_id: ACCOUNT_ID,
             conversation_id: conversationFor(messageId)
-          }]
+          }))
         };
       }
       if (sql.includes("WITH delivery_representatives")) {
         const conversationId = String(values?.[1]);
+        if (conversationId === conversationFor(BROKEN_MESSAGE)) throw new Error("temporary database failure");
         return {
           rows: [{
             id: `representative-${conversationId}`,
@@ -187,11 +188,41 @@ function batchConversationPool() {
   return {
     pool: { connect },
     connect,
-    getSyncTrustQueryCount: () => syncTrustQueryCount
+    getSyncTrustQueryCount: () => syncTrustQueryCount,
+    getSeedQueryCount: () => seedQueryCount
   };
 }
 
 describe("read_thread stored assignments", () => {
+  it("looks up canonical database UUIDs while preserving uppercase input order", async () => {
+    const { pool } = batchConversationPool();
+    const uppercase = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const out = await runReadThread(pool as never, { message_ids: [uppercase, MESSAGE_ONE] });
+    expect(out).toMatchObject({ threads: [
+      { message_id: uppercase, result: { thread: { conversation_id: conversationFor(uppercase.toLowerCase()) } } },
+      { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } }
+    ] });
+  });
+
+  it.each([true, false])("reuses the canonical selector instead of re-reading assignments (includeBody=%s)", async (includeBody) => {
+    const { pool, query } = assignedConversationPool();
+    const out = await runReadThread(
+      pool as never,
+      { conversation_id: "conversation-1", account: ACCOUNT_ID },
+      undefined,
+      { includeBody }
+    );
+
+    expect(isResult(out)).toBe(true);
+    const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"));
+    expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20]);
+    // Membership still comes from the active view, once, in this snapshot.
+    expect(call?.[0].match(/public\.imap_thread_active_assignments/g)).toHaveLength(1);
+    expect(call?.[0]).toContain("assignment.conversation_id = $2");
+    expect(call?.[0]).toContain("$2::text AS conversation_id");
+    expect(call?.[0]).not.toContain("ta.conversation_id");
+  });
+
   it("can select metadata without inline body columns for hosted hydration", async () => {
     const { pool, query } = assignedConversationPool();
 
@@ -227,8 +258,8 @@ describe("read_thread stored assignments", () => {
         }
       ]
     });
-    expect(connect).toHaveBeenCalledTimes(2);
-    expect(getSyncTrustQueryCount()).toBe(2);
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(getSyncTrustQueryCount()).toBe(1);
   });
 
   it("returns a per-item error without discarding the other requested threads", async () => {
@@ -300,7 +331,7 @@ describe("read_thread stored assignments", () => {
         { message_id: MESSAGE_TWO }
       ]
     });
-    expect(connect).toHaveBeenCalledTimes(2);
+    expect(connect).toHaveBeenCalledTimes(1);
   });
 
   it("returns the batch envelope for one message seed", async () => {
@@ -365,7 +396,7 @@ describe("read_thread stored assignments", () => {
     }
   );
 
-  it("runs at most four thread reads concurrently", async () => {
+  it("owns one batch snapshot and reads same-account trust once", async () => {
     const base = batchConversationPool();
     let active = 0;
     let peak = 0;
@@ -389,9 +420,10 @@ describe("read_thread stored assignments", () => {
       message_ids: CONCURRENCY_IDS
     });
 
-    expect(peak).toBe(4);
+    expect(peak).toBe(1);
     expect(active).toBe(0);
-    expect(base.getSyncTrustQueryCount()).toBe(10);
+    expect(base.getSyncTrustQueryCount()).toBe(1);
+    expect(base.getSeedQueryCount()).toBe(1);
   });
 
   it("resolves an assigned seed to the full stored conversation and exposes its id", async () => {
@@ -427,7 +459,7 @@ describe("read_thread stored assignments", () => {
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
     expect(out.thread.conversation_id).toBe("conversation-1");
-    expect(query.mock.calls.some(([sql]) => sql.includes("WHERE m.id = $1"))).toBe(false);
+    expect(query.mock.calls.some(([sql]) => sql.includes("WHERE m.id = ANY"))).toBe(false);
     const select = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"))?.[0];
     expect(select).toContain("b.raw_truncated");
     expect(select).not.toContain("b.body_text");
@@ -527,8 +559,9 @@ describe("read_thread stored assignments", () => {
     expect(out.thread.conversation_id).toBeNull();
     expect(out.messages.map((message) => message.message_id)).toEqual(["legacy-seed"]);
 
-    const seedCall = query.mock.calls.find(([sql]) => sql.includes("WHERE m.id = $1"));
+    const seedCall = query.mock.calls.find(([sql]) => sql.includes("WHERE m.id = ANY"));
     expect(seedCall?.[0]).toContain("public.imap_thread_active_assignments assignment");
+    expect(seedCall?.[0]).toContain("AND assignment.message_id = ANY($1::uuid[])");
     const legacyCall = query.mock.calls.find(([sql]) => sql.includes("WITH legacy_candidates"));
     expect(legacyCall?.[0]).toContain("DISTINCT ON (m.account_id");
     expect(legacyCall?.[0]).toContain("public.imap_thread_active_assignments ta");
