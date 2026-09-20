@@ -549,6 +549,37 @@ liveDb("read_thread live DB", () => {
     expect(out.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);
   });
 
+  it("reuses prepared SQL without caching selector values, scope or body variants", async () => {
+    const client = await pool.connect();
+    const sharedConnection = { connect: async () => ({
+      query: client.query.bind(client), release() {}
+    }) };
+    try {
+      for (let i = 0; i < 18; i++) {
+        const uid = i % 2 === 0 ? 20 : 5;
+        const out = await runReadThread(sharedConnection as never,
+          { message_id: idByUid.get(uid), account: accountId }, undefined,
+          { includeBody: i % 3 === 0 });
+        expect(isResult(out)).toBe(true);
+        if (!isResult(out)) throw new Error("thread read failed");
+        expect(out.messages.some(message => message.message_id === idByUid.get(uid))).toBe(true);
+      }
+      expect(await runReadThread(sharedConnection as never, {
+        message_id: idByUid.get(20), account: "00000000-0000-0000-0000-000000000000"
+      })).toMatchObject({ error: { code: "not_found" } });
+      const prepared = await client.query<{ name: string }>(
+        "SELECT name FROM pg_prepared_statements WHERE name LIKE 'supamail-read-thread-%' ORDER BY name"
+      );
+      expect(prepared.rows.map(row => row.name)).toEqual([
+        "supamail-read-thread-canonical-body-v1",
+        "supamail-read-thread-canonical-metadata-v1",
+        "supamail-read-thread-seed-v1"
+      ]);
+    } finally {
+      client.release();
+    }
+  });
+
   it("returns a not_found error for an unknown message_id", async () => {
     const out = await runReadThread(pool, { message_id: "00000000-0000-0000-0000-000000000000" });
     expect(out).toHaveProperty("error");
