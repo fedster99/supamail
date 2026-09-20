@@ -3,6 +3,28 @@ import { test } from "vitest";
 import type { MetadataProtectionAdapter } from "../metadata-protection.js";
 import { buildSyncTrust } from "./sync-trust.js";
 
+test("sync trust bounds the progress lookup to each requested Mailbox Account", async () => {
+  const accountIds = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"];
+  let sql = "";
+  const db = { query: async (text: string, values: unknown[]) => {
+    sql = text;
+    assert.deepEqual(values, [accountIds]);
+    return { rows: [] };
+  } };
+  await buildSyncTrust(db as unknown as Parameters<typeof buildSyncTrust>[0], accountIds);
+  assert.match(sql, /LEFT JOIN LATERAL\s*\([\s\S]*FROM public\.imap_account_progress progress\s+WHERE progress\.account_id = a\.id\s+LIMIT 1\s*\) p ON true/);
+});
+
+test("bulk and unfiltered sync trust retain the set-based progress lookup", async () => {
+  for (const scope of [null, [], ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]]) {
+    let sql = "";
+    const db = { query: async (text: string) => { sql = text; return { rows: [] }; } };
+    await buildSyncTrust(db as unknown as Parameters<typeof buildSyncTrust>[0], scope);
+    assert.match(sql, /LEFT JOIN public\.imap_account_progress p ON p\.account_id = a\.id/);
+    assert.doesNotMatch(sql, /LATERAL/);
+  }
+});
+
 test("sync trust reveals the Mailbox Account email through the injected adapter", async () => {
   const accountId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const envelope = Buffer.from("ciphertext");
