@@ -35,6 +35,15 @@ export async function buildSyncTrust(
   accountIds: string[] | null,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<SyncTrust> {
+  // The view has one row per account. Bound a single-account read before its
+  // aggregates; retain the cheaper set-based plan for bulk/unfiltered reads.
+  const progressJoin = accountIds?.length === 1
+    ? `LEFT JOIN LATERAL (
+      SELECT * FROM public.imap_account_progress progress
+      WHERE progress.account_id = a.id
+      LIMIT 1
+    ) p ON true`
+    : "LEFT JOIN public.imap_account_progress p ON p.account_id = a.id";
   const result = await db.query<TrustRow>(
     `
     SELECT
@@ -57,7 +66,7 @@ export async function buildSyncTrust(
       coalesce(p.live_bodies_complete_pct, 0) AS live_bodies_complete_pct,
       coalesce(p.historical_bodies_complete_pct, 0) AS historical_bodies_complete_pct
     FROM public.imap_accounts a
-    LEFT JOIN public.imap_account_progress p ON p.account_id = a.id
+    ${progressJoin}
     WHERE ($1::uuid[] IS NULL OR a.id = ANY($1::uuid[]))
     ORDER BY a.id
     `,

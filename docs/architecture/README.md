@@ -32,6 +32,11 @@ connection to avoid repeated parsing and planning. This caches SQL plans, not
 message results, authorization, or session context. Body and metadata-only selects
 have distinct names; change a statement's versioned name when changing its SQL.
 
+Single-Mailbox-Account sync-trust reads use a correlated, single-row lookup into
+`imap_account_progress`, avoiding aggregation of unrelated mailbox histories.
+Bulk and unfiltered reads retain the set-based query. Both use the same view's
+completeness rules, without a result cache or change to the caller's snapshot.
+
 ## Documentation Map
 
 - Product and setup: `README.md`
