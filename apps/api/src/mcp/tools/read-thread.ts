@@ -364,8 +364,10 @@ async function fetchThreadRows(
   if (selector.kind === "conversation") {
     // Every representative already belongs to this bound conversation in the
     // same snapshot. Do not rejoin all active assignments to rediscover its id.
-    const result = await client.query<ThreadRow>(
-      `
+    const result = await client.query<ThreadRow>({
+      // Cache parsed/planned SQL per connection, never results or tenant state.
+      name: `supamail-read-thread-canonical-${includeBody ? "body" : "metadata"}-v1`,
+      text: `
       WITH delivery_representatives AS (
         SELECT DISTINCT ON (assignment.delivery_key)
           m.id
@@ -389,8 +391,8 @@ async function fetchThreadRows(
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
       `,
-      [selector.accountId, selector.conversationId, maxMessages]
-    );
+      values: [selector.accountId, selector.conversationId, maxMessages]
+    });
     return summarizeFetchedRows(result.rows);
   }
 
@@ -592,8 +594,9 @@ async function runReadThreadInternal(
       }, maxMessages, options);
       accountIds = [accountScope!];
     } else {
-      const seedResult = await client.query<SeedRow>(
-        `
+      const seedResult = await client.query<SeedRow>({
+        name: "supamail-read-thread-seed-v1",
+        text: `
         SELECT id, provider_thread_id, rfc_message_id, message_id_normalized,
                in_reply_to, references_header, m.account_id,
                assignment.conversation_id
@@ -605,8 +608,8 @@ async function runReadThreadInternal(
           AND ($2::uuid IS NULL OR m.account_id = $2)
           AND m.deleted_in_provider = false
         `,
-        [messageId, accountScope]
-      );
+        values: [messageId, accountScope]
+      });
       const seed = seedResult.rows[0];
       if (!seed) {
         return toolError(

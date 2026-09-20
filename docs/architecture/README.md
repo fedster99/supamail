@@ -27,6 +27,11 @@ IMAP provider -> worker/API -> repository -> public.imap_* tables -> user applic
 
 The worker and API share the same repository and account-locking model. Any IMAP operation that can affect an account must use the account advisory lock. Threading is a separate, account-scoped derived lane: sync writes authoritative message metadata and fans changed inputs out to each active/candidate/rollback run; a database trigger is the rolling-deploy backstop and advances the evidence clock. The threading worker materializes isolated assignments under its own advisory lock. Mirror writes share-lock `imap_thread_state`, while build activation and rollback lock it exclusively. Readers see only the security-invoker active-assignment view, so a rebuild cannot leak partially computed membership. Replacement activation additionally requires a current, passing comparison certificate for the exact projection generations and evidence revision.
 
+Canonical thread reads reuse named, parameterized PostgreSQL statements per
+connection to avoid repeated parsing and planning. This caches SQL plans, not
+message results, authorization, or session context. Body and metadata-only selects
+have distinct names; change a statement's versioned name when changing its SQL.
+
 ## Documentation Map
 
 - Product and setup: `README.md`

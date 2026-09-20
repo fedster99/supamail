@@ -19,6 +19,14 @@ const CONCURRENCY_IDS = Array.from(
 );
 const conversationFor = (messageId: string) => `conversation-${messageId}`;
 
+function queryAdapter<T>(query: (sql: string, values?: unknown[]) => Promise<T>) {
+  return (input: string | { text: string; values?: unknown[] }, values?: unknown[]) => {
+    const sql = typeof input === "string" ? input : input.text;
+    const parameters = typeof input === "string" ? values : input.values;
+    return parameters === undefined ? query(sql) : query(sql, parameters);
+  };
+}
+
 function isResult(value: unknown): value is ReadThreadResult {
   return typeof value === "object" && value !== null && "thread" in value;
 }
@@ -72,7 +80,7 @@ function assignedConversationPool() {
     if (sql.includes("FROM public.imap_accounts a")) return { rows: [] };
     return { rows: [] };
   });
-  const client = { query, release: vi.fn() };
+  const client = { query: queryAdapter(query), release: vi.fn() };
   const pool = { connect: vi.fn(async () => client) };
   return { pool, query };
 }
@@ -123,7 +131,7 @@ function unassignedSeedPool() {
     if (sql.includes("FROM public.imap_accounts a")) return { rows: [] };
     return { rows: [] };
   });
-  const client = { query, release: vi.fn() };
+  const client = { query: queryAdapter(query), release: vi.fn() };
   const pool = { connect: vi.fn(async () => client) };
   return { pool, query };
 }
@@ -182,7 +190,7 @@ function batchConversationPool() {
       }
       return { rows: [] };
     });
-    return { query, release: vi.fn() };
+    return { query: queryAdapter(query), release: vi.fn() };
   });
   return {
     pool: { connect },
@@ -192,6 +200,27 @@ function batchConversationPool() {
 }
 
 describe("read_thread stored assignments", () => {
+  it("prepares only stable seed and canonical SQL, with separate body variants", async () => {
+    const base = assignedConversationPool();
+    const client = await base.pool.connect();
+    const query = vi.fn(client.query);
+    const pool = { connect: async () => ({ ...client, query }) };
+    for (const includeBody of [false, true, false]) {
+      await runReadThread(pool as never, { message_id: MESSAGE_SEED }, undefined, { includeBody });
+    }
+    const prepared = query.mock.calls.map(([input]) => input)
+      .filter((input): input is { text: string; values?: unknown[]; name: string } => typeof input !== "string");
+    expect(prepared.map(input => input.name)).toEqual([
+      "supamail-read-thread-seed-v1", "supamail-read-thread-canonical-metadata-v1",
+      "supamail-read-thread-seed-v1", "supamail-read-thread-canonical-body-v1",
+      "supamail-read-thread-seed-v1", "supamail-read-thread-canonical-metadata-v1"
+    ]);
+    expect(prepared[0].values).toEqual([MESSAGE_SEED, null]);
+    expect(prepared[1].values).toEqual([ACCOUNT_ID, "conversation-1", 20]);
+    expect(prepared[1].text).toBe(prepared[5].text);
+    expect(prepared[1].text).not.toContain("b.body_text");
+    expect(prepared[3].text).toContain("b.body_text");
+  });
   it.each([true, false])("reuses the canonical selector instead of re-reading assignments (includeBody=%s)", async (includeBody) => {
     const { pool, query } = assignedConversationPool();
     const out = await runReadThread(
