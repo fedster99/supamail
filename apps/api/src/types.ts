@@ -364,6 +364,8 @@ export interface SendAttachment {
  * with no threading headers. "Build once," exposed as two product verbs.
  */
 export interface SendRequest {
+  /** Display name only; the sender address always comes from the mailbox. */
+  senderName?: string;
   accountId: string;
   to: SendRecipient[];
   cc?: SendRecipient[];

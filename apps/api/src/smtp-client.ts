@@ -172,7 +172,12 @@ function assertSafeCustomHeaders(headers: Record<string, string>): void {
  * envelope only. Attachments + inline `cid` images (email-004) are passed straight
  * through to MailComposer, which builds the multipart MIME deterministically.
  */
+export const SENDER_NAME_SUPPORTED = true;
+
 export async function buildRawMime(req: SendRequest, from: SendRecipient): Promise<BuiltMime> {
+  if (req.senderName !== undefined && (typeof req.senderName !== "string" || req.senderName.length > 120 || /[\x00-\x1f\x7f]/.test(req.senderName))) {
+    throw new Error("Sender name must be a single line of at most 120 characters");
+  }
   const messageId = req.messageId ?? `<${randomUUID()}@${domainOf(from.email)}>`;
 
   // Merge convenience threading fields into custom headers without letting an
@@ -183,7 +188,7 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
   assertSafeCustomHeaders(headers);
 
   const composer = new MailComposer({
-    from: toAddress(from),
+    from: toAddress({ ...from, name: req.senderName?.trim() || from.name }),
     to: req.to.map(toAddress),
     cc: req.cc?.map(toAddress),
     bcc: req.bcc?.map(toAddress),
