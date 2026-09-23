@@ -1019,10 +1019,19 @@ export class MirrorRepository {
 
   async getRunnableAccounts(
     limit = 25,
-    options: { sentDueOnly?: boolean } = {}
+    options: { sentDueOnly?: boolean; flagContinuationOnly?: boolean } = {}
   ): Promise<ImapAccount[]> {
     const effectiveLimit = Math.min(limit, this.config.SYNC_MAX_ACCOUNTS);
-    const sentDueClause = options.sentDueOnly
+    const sentDueClause = options.flagContinuationOnly
+      ? `AND sync_state <> 'INITIAL_SYNC' AND EXISTS (
+          SELECT 1 FROM public.imap_folders sf
+          WHERE sf.account_id = public.imap_accounts.id AND sf.tracked
+            AND sf.missing_since IS NULL AND sf.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+            AND sf.initial_sync_complete AND sf.flag_scan_after_uid IS NOT NULL
+            AND (sf.next_flag_scan_at IS NULL OR sf.next_flag_scan_at <= now())
+            AND (sf.next_reconcile_at IS NULL OR sf.next_reconcile_at > now())
+        )`
+      : options.sentDueOnly
       ? `AND EXISTS (
           SELECT 1
           FROM public.imap_folders sf
@@ -1119,6 +1128,7 @@ export class MirrorRepository {
         JSON.stringify({
           errors: diagnosticCodes,
           hitLockBudget: result.hitLockBudget,
+          flagRowsChecked: result.flagRowsChecked ?? 0,
           metadataRowsCommitted: result.metadataRowsCommitted ?? 0,
           metadataWriteDurationMs: result.metadataWriteDurationMs ?? 0,
           metadataWriteBatchesAttempted: result.metadataWriteBatchesAttempted ?? 0,
@@ -2338,6 +2348,80 @@ export class MirrorRepository {
     }
   }
 
+  /** Existing account lock must cover page read, provider FETCH, writes and checkpoint. */
+  async beginFlagScan(accountId: string, folder: ImapFolder, uidValidity: number, throughUid: number,
+    options: { deadlineAt: number; signal?: AbortSignal }): Promise<{ afterUid: number; throughUid: number }> {
+    if (folder.account_id !== accountId || !Number.isSafeInteger(throughUid) || throughUid < 0
+      || !Number.isSafeInteger(uidValidity) || uidValidity < 1) throw new Error("Invalid flag scan scope");
+    const result = await runMetadataWriteWithDeadline<{ flag_scan_after_uid: string; flag_scan_through_uid: string }>(
+      this.pool, `UPDATE public.imap_folders SET
+        flag_scan_after_uid = COALESCE(flag_scan_after_uid, 0),
+        flag_scan_through_uid = COALESCE(flag_scan_through_uid, $4::bigint),
+        flag_scan_started_at = COALESCE(flag_scan_started_at, now())
+      WHERE id = $1 AND account_id = $2 AND path = $5 AND uidvalidity = $3 AND initial_sync_complete
+      RETURNING flag_scan_after_uid::text, flag_scan_through_uid::text`,
+      [folder.id, accountId, uidValidity, throughUid, folder.path], options.deadlineAt, options.signal);
+    if (result.rows.length !== 1) throw new Error("Flag scan lost folder generation");
+    return { afterUid: Number(result.rows[0].flag_scan_after_uid), throughUid: Number(result.rows[0].flag_scan_through_uid) };
+  }
+
+  async readFlagScanPage(accountId: string, folder: ImapFolder, uidValidity: number,
+    cursor: { afterUid: number; throughUid: number }, cutoff: Date, limit: number,
+    options: { deadlineAt: number; signal?: AbortSignal }): Promise<number[]> {
+    if (!Number.isInteger(limit) || limit < 2 || limit > MAX_SYNC_BATCH_SIZE + 1) throw new Error("Invalid flag page limit");
+    const result = await runMetadataWriteWithDeadline<{ uid: string }>(this.pool,
+      `SELECT uid::text FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = $2 AND uidvalidity = $3
+         AND uid > $4 AND uid <= $5 AND deleted_in_provider = false
+         AND window_status = 'IN_WINDOW' AND internal_date >= $6
+       ORDER BY imap_messages.uid LIMIT $7`,
+      [accountId, folder.path, uidValidity, cursor.afterUid, cursor.throughUid, cutoff, limit],
+      options.deadlineAt, options.signal);
+    return result.rows.map((row) => Number(row.uid));
+  }
+
+  async advanceFlagScan(accountId: string, folder: ImapFolder, uidValidity: number,
+    cursor: { afterUid: number; throughUid: number }, afterUid: number, complete: boolean,
+    options: { deadlineAt: number; signal?: AbortSignal }): Promise<void> {
+    if (afterUid < cursor.afterUid || afterUid > cursor.throughUid) throw new Error("Invalid flag checkpoint");
+    const result = await runMetadataWriteWithDeadline(this.pool,
+      `UPDATE public.imap_folders SET
+         flag_scan_after_uid = CASE WHEN $7 THEN NULL ELSE $6::bigint END,
+         flag_scan_through_uid = CASE WHEN $7 THEN NULL ELSE flag_scan_through_uid END,
+         flag_scan_started_at = CASE WHEN $7 THEN NULL ELSE flag_scan_started_at END,
+         flag_scan_updated_at = now(),
+         next_flag_scan_at = CASE WHEN $7 THEN now() +
+           ((CASE WHEN sync_priority <= $8 THEN $9::bigint ELSE $10::bigint END) * interval '1 millisecond')
+           ELSE next_flag_scan_at END
+       WHERE id = $1 AND account_id = $2 AND uidvalidity = $3 AND path = $11
+         AND flag_scan_after_uid = $4 AND flag_scan_through_uid = $5 RETURNING id`,
+      [folder.id, accountId, uidValidity, cursor.afterUid, cursor.throughUid, afterUid, complete,
+        this.config.PRIORITY_CUTOFF, this.config.PRIORITY_FLAG_SCAN_INTERVAL_MS, this.config.RR_FLAG_SCAN_INTERVAL_MS, folder.path],
+      options.deadlineAt, options.signal);
+    if (result.rows.length !== 1) throw new Error("Flag scan lost checkpoint generation");
+  }
+
+  async getFlagScanContinuations(accountId: string): Promise<ImapFolder[]> {
+    const result = await this.pool.query<ImapFolder>(`SELECT * FROM public.imap_folders
+      WHERE account_id = $1 AND tracked AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION') AND initial_sync_complete
+        AND flag_scan_after_uid IS NOT NULL
+        AND (next_flag_scan_at IS NULL OR next_flag_scan_at <= now())
+        AND (next_reconcile_at IS NULL OR next_reconcile_at > now())
+      ORDER BY flag_scan_updated_at NULLS FIRST, path LIMIT $2`,
+      [accountId, this.config.MAX_FLAG_SCANS_PER_CYCLE]);
+    return result.rows;
+  }
+
+  async deferFlagScan(accountId: string, folder: ImapFolder, reconcile: boolean): Promise<void> {
+    await this.pool.query(`UPDATE public.imap_folders
+      SET next_flag_scan_at = now() + ($4::bigint * interval '1 millisecond'),
+          next_sync_due_at = CASE WHEN $3 THEN now() ELSE next_sync_due_at END,
+          next_reconcile_at = CASE WHEN $3 THEN now() ELSE next_reconcile_at END
+      WHERE id = $1 AND account_id = $2 AND uidvalidity = $5`,
+      [folder.id, accountId, reconcile, this.config.SYNC_INTERVAL_MS, folder.uidvalidity]);
+  }
+
   async markFolderSynced(folderId: string, patch: {
     uidValidity: number;
     uidNext?: number;
@@ -2356,6 +2440,10 @@ export class MirrorRepository {
         uid_next = COALESCE($3, uid_next),
         highest_modseq = COALESCE($14::numeric, highest_modseq),
         qresync_highest_modseq = COALESCE($15::numeric, qresync_highest_modseq),
+        flag_scan_after_uid = CASE WHEN $7::boolean THEN NULL ELSE flag_scan_after_uid END,
+        flag_scan_through_uid = CASE WHEN $7::boolean THEN NULL ELSE flag_scan_through_uid END,
+        flag_scan_started_at = CASE WHEN $7::boolean THEN NULL ELSE flag_scan_started_at END,
+        flag_scan_updated_at = CASE WHEN $7::boolean THEN now() ELSE flag_scan_updated_at END,
         last_uid = COALESCE($4, last_uid),
         initial_sync_complete = COALESCE($5, initial_sync_complete),
         last_synced_at = now(),
@@ -2466,6 +2554,10 @@ export class MirrorRepository {
         SET uidvalidity = $3,
             highest_modseq = NULL,
             qresync_highest_modseq = NULL,
+            flag_scan_after_uid = NULL,
+            flag_scan_through_uid = NULL,
+            flag_scan_started_at = NULL,
+            flag_scan_updated_at = NULL,
             last_uid = NULL,
             initial_sync_complete = false,
             initial_sync_target_max_uid = NULL,
@@ -3698,9 +3790,8 @@ export class MirrorRepository {
   /**
    * Write a flag change through to a KNOWN message row (organize mutations,
    * email-002/ADR 0018). After a successful IMAP STORE we update the mirrored
-   * `flags` array so mark-read/star reflect immediately — the flag-scan sync only
-   * re-reads flags within FLAG_DIFF_WINDOW_DAYS, so older mail would otherwise
-   * never reconcile. This is a deterministic update of a known row to a known
+   * `flags` array so mark-read/star reflect immediately instead of waiting for
+   * background verification. This is a deterministic update of a known row to a known
    * value, account-scoped and parameterized; it does NOT fabricate identity.
    *
    * `add`/`remove` are raw IMAP flag tokens (e.g. "\\Seen"). Matching is

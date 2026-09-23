@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0026_threading_closure_edges",
+  "schemaVersion": "0027_bounded_flag_scan",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -104,6 +104,10 @@
     {
       "id": "0026_threading_closure_edges",
       "file": "0026_threading_closure_edges.sql"
+    },
+    {
+      "id": "0027_bounded_flag_scan",
+      "file": "0027_bounded_flag_scan.sql"
     }
   ]
 }

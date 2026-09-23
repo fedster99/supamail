@@ -138,6 +138,14 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Metadata, history, and flag batch sizes are capped at 500 at configuration and repository boundaries. A metadata FETCH or direct logical write fails closed at an estimated 32 MiB or 20,000 retained attachments. Persistence keeps the logical batch atomic while splitting SQL statements at 8 MiB or 5,000 attachments; a single record beyond either statement boundary fails closed. Flag FETCH retention is capped at 4 MiB or 20,000 keywords; projected updates and events split at 1 MiB or 5,000 keywords using both stored and incoming representations and reject a pathological single UID.
 - `metadataRowsCommitted` counts acknowledged message-record upserts, including conflict updates (not new-email count or attachment rows). Write-service rate divides those rows by cumulative persistence-path time; worker throughput divides them by monotonic tick wall time. Failed batches add service time and zero rows; no-batch or incomplete mixed-version telemetry reports no rate.
 - Flag scans are due-based, compare normalized flags, and keep FETCH/write locks bounded to incremental-size batches under one overall deadline.
+- Routine no-MODSEQ flag scans cover the live window in durable pages, not only
+  recent mail. Freeze the upper UID, fence progress by account/folder/UIDVALIDITY,
+  and write flags before acknowledging the page. A live metadata pass cannot
+  retire an unfinished sweep. Explicit flag and reconnect proofs remain complete.
+  Resume eligible pages through existing scheduling without holding resources
+  between turns or advancing the full-sync clock. Missing provider UIDs require
+  normal reconciliation; failed pages leave immediate continuation. Do not let
+  recurring Inbox scans consume every flag slot while other due folders wait.
 - Reconcile only runs after initial sync is complete for the folder.
 - Reconcile must handle both sides: mark provider-missing local rows and backfill missing-in-DB provider UIDs.
 - If a live-window UID stream is empty while live-window mirror rows remain, confirm against an unfiltered UID stream before tombstoning. Use that fallback only for deletion evidence; never backfill provider-only archive UIDs from it. Accept two empty streams only when the selected mailbox also reports zero messages; contradictory or unknown counts stay fail-closed.

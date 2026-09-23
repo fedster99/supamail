@@ -713,6 +713,9 @@ export class FlagFetchBudgetExceededError extends Error {
   }
 }
 
+/** Missing UIDs need authoritative reconciliation before a flag page can advance. */
+export class MissingFlagUidError extends Error {}
+
 export async function fetchMessageFlags(
   client: MirrorImapClient,
   uids: number[],
@@ -758,7 +761,7 @@ export async function fetchMessageFlags(
       if (omitted !== undefined) {
         throw new Error(`IMAP flag fetch omitted FLAGS for requested UID ${omitted}`);
       }
-      throw new Error(
+      throw new MissingFlagUidError(
         `IMAP flag fetch returned ${returned.size}/${expected.size} requested UIDs; missing ${missing
           .slice(0, 10)
           .join(",")}`

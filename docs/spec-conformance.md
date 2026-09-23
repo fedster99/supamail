@@ -46,7 +46,7 @@ SupaMail owns a conservative mailbox mirror:
 | Reconcile health must describe post-repair state. | Implemented | Observed gaps remain run telemetry, while fully repaired provider deletes or missing-in-DB rows finish with `last_reconcile_clean = true`; bounded overflow or interrupted repair remains degraded and retries on the next full-sync cadence. |
 | Reconcile must be staggered and budgeted. | Implemented | `next_reconcile_at`, `RECONCILE_INTERVAL_MS`, and `MAX_RECONCILES_PER_CYCLE` keep clean reconciliation due-based instead of every-folder/every-cycle; incomplete repair retries early. |
 | Flag scans are due-based and diff actual flag changes. | Implemented | `applyFlagScan` compares normalized old/new flags, logs `FLAGS_CHANGED`, and does not backfill unknown UIDs. |
-| Flag scans must be budgeted. | Implemented | Priority and round-robin flag scan intervals are separate, and `MAX_FLAG_SCANS_PER_CYCLE` limits per-cycle work. |
+| Flag scans must be budgeted. | Implemented | Priority and round-robin intervals remain separate. Routine no-MODSEQ scans cover the full live window through durable incremental-size pages. `MAX_FLAG_SCANS_PER_CYCLE` limits each turn; least-recently-served due folders receive routine slots. |
 | Exclude folder explosions such as Spam/Trash/All Mail by default. | Implemented | Provider profiles exclude dangerous/system folders including SPECIAL-USE `\All` and `All Mail`. |
 | Archive-like folders are not excluded by default. | Implemented | Provider profile tests cover that archive folders stay trackable unless explicitly configured otherwise. |
 | Generic IMAP support must be validated provider by provider. | Implemented | `docs/imap-compatibility.md` defines the minimum contract, provider matrix, and manual smoke checklist; `provider-compatibility.integration.test.ts` covers deterministic protocol fixtures; GreenMail and Dovecot smokes cover two real IMAP server implementations. |
@@ -88,6 +88,25 @@ New or changed threading inputs are upserted into a separate `imap_thread_work_q
 Migration `0014_conversation_threading` performs no mailbox-wide backfill. Initial builds and algorithm upgrades are versioned shadow runs: bounded body-evidence and protocol keyset scans are followed by subject buckets and a catch-up stage. `threads-drain --account-id` runs one bounded step; `threads-rebuild --account-id` builds a complete shadow; `threads-compare` persists thresholded metrics for exact generations/evidence revision; confirmed `threads-activate` requires that current passing certificate, coverage, and empty queues before atomically switching the active view; confirmed `threads-rollback` reverses a rollout pointer or the latest active material operation and pauses work pending a clean rebuild. Deployments may opt into automatic activation only for a first `mode='initial'` projection after the same coverage, caught-up evidence revision, and empty-queue checks pass. The scheduler keeps that ready first run eligible until activation commits, so process failure or transient lock contention cannot strand it. Upgrades and rebuilds remain explicit and comparison-gated. A dedicated account advisory lock serializes thread workers, while a shared/exclusive `imap_thread_state` row lock closes the race with mirror writes; neither lock authorizes an IMAP command. A persisted three-active/one-standby/one-building schedule prevents sustained ingress from starving rollout work. Literal version executors keep the active, shadow, and standby projections current during rolling upgrades; startup and direct operator paths fail fast if a referenced executor is absent.
 
 ### Folder Discovery And Scheduling
+
+Routine flag verification without MODSEQ no longer stops at seven days. It
+pages over active mirrored UIDs within `WINDOW_DAYS`, with a frozen upper bound
+and an account/folder/UIDVALIDITY-fenced cursor. A page commits flags before
+acknowledging progress. A failed acknowledgement repeats an idempotent diff;
+missing provider UIDs leave the cursor unchanged and defer to the existing
+authoritative reconciliation. Partial progress never acknowledges complete
+flags or moves a MODSEQ cursor.
+
+The built-in worker resumes eligible pages between ordinary ticks, releasing
+account and IMAP resources between turns. Full/Sent scheduling and limits stay
+unchanged. A hosted listener may call the mutually exclusive
+`syncAccount(..., { flagVerificationOnly: true })` after a result reports
+`flagVerificationPending`; hosts without listeners may use `syncDueFlagScans`.
+This supplemental mode does not run discovery, metadata, body, history, or
+advance full-account health/cadence. It yields to account-lock contention and
+unfinished activation. Full-window completion advances the existing per-folder
+flag due time; it does not promise a full 90-day audit every five minutes.
+Real provider and mixed-load costs remain deployment qualification gates.
 
 Folder discovery is due-based and persists provider seen/missing state. A host may force one discovery inside an authoritative full safety pass; the same successful LIST advances the normal discovery deadline, and supplemental live, Sent, and body-only lanes do not use the override. Full sync cycles process priority folders first, then a bounded number of non-priority folders using a stable round-robin cursor. Newly tracked non-priority folders take those existing round-robin slots before older due folders during the discovery pass; this does not add work beyond the configured folder budget. Inbox remains first in that bounded priority set. Sent retains its normal priority 5 position and gets a supplemental due-based metadata refresh on the separate fast lane. The cursor advances by attempted folders so one bad lower-priority folder cannot starve the rest.
 

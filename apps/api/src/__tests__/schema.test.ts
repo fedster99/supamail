@@ -194,9 +194,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0026_threading_closure_edges");
+    expect(version).toBe("0027_bounded_flag_scan");
     expect(manifest).toEqual({
-      schemaVersion: "0026_threading_closure_edges",
+      schemaVersion: "0027_bounded_flag_scan",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -223,7 +223,8 @@ describe("initial schema", () => {
         { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" },
         { id: "0024_metadata_protection_mode", file: "0024_metadata_protection_mode.sql" },
         { id: "0025_qresync_cursor", file: "0025_qresync_cursor.sql" },
-        { id: "0026_threading_closure_edges", file: "0026_threading_closure_edges.sql" }
+        { id: "0026_threading_closure_edges", file: "0026_threading_closure_edges.sql" },
+        { id: "0027_bounded_flag_scan", file: "0027_bounded_flag_scan.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");

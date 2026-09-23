@@ -12,6 +12,7 @@ import {
   iterateChangedMessageFlagBatches,
   iterateAllUids,
   MessageMovedError,
+  MissingFlagUidError,
   PARSED_BODY_BATCH_MAX_MESSAGES,
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
@@ -111,6 +112,8 @@ type FolderSyncResult = {
   reconcileProviderUidsSeen: number;
   reconcileDurationMs: number;
   flagScanAttempted: boolean;
+  flagScanComplete?: boolean;
+  flagRowsChecked?: number;
   hitLockBudget: boolean;
   initialSyncComplete: boolean;
   reconcileClean: boolean;
@@ -329,6 +332,8 @@ export interface SyncAccountOptions {
   forceReconcileFolders?: readonly string[];
   /** Fetch the current live body backlog without running folder or history work. */
   bodyBacklogOnly?: boolean;
+  /** Resume pending bounded flag pages; never advance the full-sync cadence. */
+  flagVerificationOnly?: boolean;
   /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
   forceInboxReconcile?: boolean;
   /** A flags notification may arrive before the normal flag deadline. */
@@ -379,6 +384,18 @@ export class MirrorEngine {
     return results;
   }
 
+  /** One bounded turn per runnable account; account locks are released between turns. */
+  async syncDueFlagScans(limit = this.config.SYNC_MAX_ACCOUNTS,
+    options: { signal?: AbortSignal } = {}): Promise<SyncResult[]> {
+    const accounts = await this.repository.getRunnableAccounts(limit, { flagContinuationOnly: true });
+    const results: SyncResult[] = [];
+    for (const account of accounts) {
+      if (options.signal?.aborted) break;
+      results.push(await this.syncAccount(account.id, "scheduled", { flagVerificationOnly: true, signal: options.signal }));
+    }
+    return results;
+  }
+
   /** Refresh only due Sent folders, leaving expensive secondary lanes to the full sweep. */
   async syncDueSentFolders(
     limit = this.config.SYNC_MAX_ACCOUNTS,
@@ -406,10 +423,11 @@ export class MirrorEngine {
     const supplementalModes = [
       options.sentOnly === true,
       options.liveInboxOnly === true,
-      options.bodyBacklogOnly === true
+      options.bodyBacklogOnly === true,
+      options.flagVerificationOnly === true
     ].filter(Boolean).length;
     if (supplementalModes > 1) {
-      throw new Error("sentOnly, liveInboxOnly, and bodyBacklogOnly cannot be combined");
+      throw new Error("sentOnly, liveInboxOnly, bodyBacklogOnly, and flagVerificationOnly cannot be combined");
     }
     if (options.client && options.keepClientOpen !== true) {
       throw new Error("A host-owned client requires keepClientOpen");
@@ -443,6 +461,8 @@ export class MirrorEngine {
       metadataWriteServiceRowsPerSecond: null,
       bodiesFetched: 0,
       flagsUpdated: 0,
+      flagRowsChecked: 0,
+      ...(options.flagVerificationOnly ? { flagVerificationPending: false } : {}),
       reconcileGapsFound: 0,
       reconcileFoldersAttempted: 0,
       reconcileProviderUidsSeen: 0,
@@ -475,10 +495,16 @@ export class MirrorEngine {
         });
         accountSyncStarted = true;
         throwIfInterrupted();
+        const flagFolders = options.flagVerificationOnly
+          ? !["HEALTHY", "DEGRADED"].includes(account.sync_state)
+            || (account.backoff_until && new Date(account.backoff_until).getTime() > Date.now())
+            ? [] : await this.repository.getFlagScanContinuations(account.id)
+          : null;
         const sentFolders = options.sentOnly
           ? await this.repository.getSentFoldersDueForSync(account.id)
           : null;
-        if (options.sentOnly && sentFolders?.length === 0) {
+        if ((options.sentOnly && sentFolders?.length === 0)
+          || (options.flagVerificationOnly && flagFolders?.length === 0)) {
           await this.repository.markAccountSyncYielded(account.id, {
             deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
             signal: options.signal,
@@ -524,7 +550,7 @@ export class MirrorEngine {
 
         const folders = options.bodyBacklogOnly
           ? []
-          : sentFolders ?? (options.liveInboxOnly
+          : flagFolders ?? sentFolders ?? (options.liveInboxOnly
           ? liveFolderPaths.length > 0
             ? await this.repository.getFoldersForWake(
                 account.id,
@@ -546,6 +572,16 @@ export class MirrorEngine {
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
+        // Keep metadata ordering (Inbox first), but allocate routine flag slots
+        // by oldest due time. Otherwise two always-due priority folders can
+        // consume the entire flag budget on every five-minute safety pass.
+        const scheduledFlagPaths = new Set([...folders]
+          .filter((folder) => !folder.next_flag_scan_at
+            || new Date(folder.next_flag_scan_at).getTime() <= Date.now()
+            || folder.flag_scan_after_uid != null)
+          .sort((a, b) => (a.flag_scan_updated_at ? new Date(a.flag_scan_updated_at).getTime() : 0)
+            - (b.flag_scan_updated_at ? new Date(b.flag_scan_updated_at).getTime() : 0))
+          .slice(0, remainingFlagScans).map((folder) => folder.path));
         let attemptedMailboxChanges = 0;
         const handledMailboxChanges: MailboxChange[] = [];
         const handledMailboxObservations: MailboxChangeObservation[] = [];
@@ -576,7 +612,9 @@ export class MirrorEngine {
             const folderResult = await this.syncFolder(account, folder, client, {
               allowReconcile: !options.sentOnly
                 && (forceKnownReconcile || remainingReconciles > 0),
-              allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
+              allowFlagScan: !options.sentOnly && remainingFlagScans > 0
+                && (options.liveInboxOnly === true || options.flagVerificationOnly === true
+                  || scheduledFlagPaths.has(folder.path)),
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
@@ -591,12 +629,15 @@ export class MirrorEngine {
               forceFlagScan: options.liveInboxOnly
                 && (mailboxChange?.forceFlagScan === true
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true)),
-              signal: options.signal
+              signal: options.signal,
+              flagVerificationOnly: options.flagVerificationOnly,
+              boundedFlagScan: !supplemental
             });
             throwIfInterrupted();
             result.foldersProcessed += 1;
             result.messagesUpserted += folderResult.messagesUpserted;
             result.flagsUpdated += folderResult.flagsUpdated;
+            result.flagRowsChecked! += folderResult.flagRowsChecked ?? 0;
             result.reconcileGapsFound += folderResult.reconcileGapsFound;
             if (folderResult.hitLockBudget || this.isLockBudgetExpired(lockDeadline)) {
               result.hitLockBudget = true;
@@ -608,19 +649,25 @@ export class MirrorEngine {
               && (!mailboxChange.forceReconcile
                 || (folderResult.reconcileAttempted && folderResult.reconcileClean)
                 || folderResult.qresyncReplayComplete === true)
-              && (!mailboxChange.forceFlagScan || folderResult.flagScanAttempted)) {
+              && (!mailboxChange.forceFlagScan || (folderResult.flagScanComplete ?? folderResult.flagScanAttempted))) {
               handledMailboxChanges.push(mailboxChange);
               handledMailboxObservations.push({
                 status: folderResult.observedStatus,
                 reconcileComplete: folderResult.qresyncReplayComplete === true
                   || (folderResult.reconcileAttempted && folderResult.reconcileClean),
                 flagScanComplete: folderResult.qresyncReplayComplete === true
-                  || folderResult.flagScanAttempted
+                  || (folderResult.flagScanComplete ?? folderResult.flagScanAttempted)
               });
             }
             await this.repository.heartbeat(account.id);
           } catch (error) {
             throwIfInterrupted();
+            if (options.flagVerificationOnly) {
+              // A failed page stays durable but leaves immediate continuation.
+              // The normal full cadence owns retry; missing UIDs require its
+              // existing authoritative reconciliation, not a guessed cursor.
+              await this.repository.deferFlagScan(account.id, folder, error instanceof MissingFlagUidError);
+            }
             // Account-finalising errors (e.g. UIDVALIDITY reset cap exceeded)
             // must escape the per-folder catch so the outer handler sees them
             // and skips re-marking; otherwise markAccountSyncPartial overrides
@@ -674,7 +721,7 @@ export class MirrorEngine {
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
+        } else if (!options.sentOnly && !options.liveInboxOnly && !options.flagVerificationOnly && !connectionLost) {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
@@ -686,6 +733,7 @@ export class MirrorEngine {
         } else if (!options.sentOnly
           && !options.liveInboxOnly
           && !options.bodyBacklogOnly
+          && !options.flagVerificationOnly
           && !connectionLost) {
           const historyResult = await this.runHistoryLane(
             account,
@@ -699,6 +747,11 @@ export class MirrorEngine {
           result.bodiesFetched += historyResult.bodiesFetched;
           result.errors.push(...historyResult.errors);
           if (historyResult.hitLockBudget) result.hitLockBudget = true;
+        }
+
+        if (!supplemental || options.flagVerificationOnly) {
+          result.flagVerificationPending = account.sync_state !== "INITIAL_SYNC"
+            && (await this.repository.getFlagScanContinuations(account.id)).length > 0;
         }
 
         if (result.errors.length > 0) {
@@ -1022,6 +1075,36 @@ export class MirrorEngine {
     return left.sample.every((value, index) => value === right.sample[index]);
   }
 
+  private async verifyFlagPage(account: ImapAccount, folder: ImapFolder, client: MirrorImapClient,
+    uidValidity: number, throughUid: number, signal?: AbortSignal
+  ): Promise<{ checked: number; complete: boolean; flagsUpdated: number }> {
+    const deadlineAt = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
+    const options = { deadlineAt, signal };
+    const batchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+    const cursor = await this.repository.beginFlagScan(account.id, folder, uidValidity, throughUid, options);
+    const page = await this.repository.readFlagScanPage(account.id, folder, uidValidity, cursor,
+      getWindowCutoff(this.config), batchSize + 1, options);
+    if (page.length > batchSize + 1 || page.some((uid, i) => !Number.isSafeInteger(uid)
+      || uid <= (i ? page[i - 1] : cursor.afterUid) || uid > cursor.throughUid)) {
+      throw new Error("Invalid flag verification page");
+    }
+    const uids = page.slice(0, batchSize);
+    let flagsUpdated = 0;
+    if (uids.length > 0) {
+      const flags = await this.withOperationDeadline(client, deadlineAt, "FLAG_SCAN_TOTAL_TIMEOUT_MS",
+        "flag page FETCH", () => fetchMessageFlags(client, uids, batchSize));
+      const scan = await this.repository.applyFlagScan(account.id, folder, uidValidity, flags, options);
+      flagsUpdated = scan.flagsChanged;
+      for (const message of scan.messages) await this.hooks.onMessageUpsert?.(message);
+    }
+    const complete = page.length <= batchSize;
+    // Replay after a lost acknowledgement is safe: applyFlagScan is idempotent.
+    // Never persist progress before both provider proof and flag writes succeed.
+    await this.repository.advanceFlagScan(account.id, folder, uidValidity, cursor,
+      uids.at(-1) ?? cursor.afterUid, complete, options);
+    return { checked: uids.length, complete, flagsUpdated };
+  }
+
   private async syncFolder(
     account: ImapAccount,
     folder: ImapFolder,
@@ -1037,16 +1120,19 @@ export class MirrorEngine {
       /** Host recovery barriers require a complete UID proof even after QRESYNC replay. */
       forceAuthoritativeReconcile?: boolean;
       forceFlagScan?: boolean;
+      flagVerificationOnly?: boolean;
+      boundedFlagScan?: boolean;
       signal?: AbortSignal;
     }
   ): Promise<FolderSyncResult> {
-    await this.repository.markFolderSyncStarted(folder.id, {
+    if (!options.flagVerificationOnly) await this.repository.markFolderSyncStarted(folder.id, {
       deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
       signal: options.signal
     });
     const qresyncRequest = this.config.IMAP_QRESYNC_ENABLED
       && options.allowFlagScan
       && options.allowReconcile
+      && !options.flagVerificationOnly
       && folder.initial_sync_complete
       && folder.uidvalidity !== null
       && folder.qresync_highest_modseq !== null
@@ -1116,6 +1202,14 @@ export class MirrorEngine {
       }
 
       const windowCutoff = getWindowCutoff(this.config);
+      if (options.flagVerificationOnly) {
+        const page = await this.verifyFlagPage(account, folder, client, uidValidity,
+          Number(folder.last_uid ?? 0), options.signal);
+        return { messagesUpserted: 0, flagsUpdated: page.flagsUpdated, flagRowsChecked: page.checked,
+          flagScanAttempted: true, flagScanComplete: page.complete, reconcileGapsFound: 0,
+          reconcileAttempted: false, reconcileProviderUidsSeen: 0, reconcileDurationMs: 0,
+          hitLockBudget: false, initialSyncComplete: true, reconcileClean: false, observedStatus };
+      }
       let messagesUpserted = 0;
       let flagsUpdated = 0;
       let reconcileGapsFound = 0;
@@ -1123,6 +1217,8 @@ export class MirrorEngine {
       let reconcileDurationMs = 0;
       let reconcileAttempted = false;
       let flagScanAttempted = false;
+      let flagScanComplete: boolean | undefined;
+      let flagRowsChecked = 0;
       let hitLockBudget = false;
       let qresyncApplied = false;
       let qresyncFallbackRequired = qresyncCommandRejected;
@@ -1268,10 +1364,15 @@ export class MirrorEngine {
         );
       }
 
-      const flagScanDue = qresyncFallbackRequired
+      const flagScanDue = (qresyncFallbackRequired
         || options.forceFlagScan
         || !folder.next_flag_scan_at
-        || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
+        || new Date(folder.next_flag_scan_at).getTime() <= Date.now())
+        // A selective live metadata pass must not retire a pending full-window
+        // sweep after checking only recent flags. Explicit flag hints and
+        // comparable MODSEQ still use their existing immediate proof paths.
+        && (options.boundedFlagScan !== false || highestModseq !== undefined
+          || options.forceFlagScan || qresyncFallbackRequired);
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       if (!qresyncApplied && !hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
@@ -1312,13 +1413,36 @@ export class MirrorEngine {
               await this.hooks.onMessageUpsert?.(message);
             }
           }
+        } else if (!condstoreCursorUnchanged && highestModseq === undefined
+          && options.boundedFlagScan === true && !options.forceFlagScan && !qresyncFallbackRequired) {
+          // A routine no-MODSEQ scan is a resumable full-window sweep, not a
+          // seven-day approximation. Explicit live/reconnect proofs stay exact.
+          if (folder.next_reconcile_at && new Date(folder.next_reconcile_at).getTime() <= Date.now()) {
+            // Repair missing mirror/provider rows before requesting known UID flags.
+            // Freeze the sweep now so the existing continuation sees it after repair.
+            await this.repository.beginFlagScan(account.id, folder, uidValidity,
+              lastProcessedUid ?? Number(folder.last_uid ?? 0), { deadlineAt: flagScanDeadline, signal: options.signal });
+            flagScanComplete = false;
+          } else {
+            try {
+              const page = await this.verifyFlagPage(account, folder, client, uidValidity,
+                lastProcessedUid ?? Number(folder.last_uid ?? 0), options.signal);
+              flagsUpdated += page.flagsUpdated;
+              flagRowsChecked += page.checked;
+              flagScanComplete = page.complete;
+            } catch (error) {
+              await this.repository.deferFlagScan(account.id, folder, error instanceof MissingFlagUidError);
+              throw error;
+            }
+          }
         } else if (!condstoreCursorUnchanged) {
           // Establishing a CONDSTORE cursor must cover the entire active mirror
           // window. Otherwise a flag changed before the first persisted modseq
           // could be skipped forever when the cursor advances.
           const establishingCondstoreCursor = folder.highest_modseq === null
             && highestModseq !== undefined;
-          const scanEntireWindow = establishingCondstoreCursor || options.forceFlagScan === true;
+          const scanEntireWindow = establishingCondstoreCursor || highestModseq !== undefined
+            || options.forceFlagScan === true || qresyncFallbackRequired;
           const flagCutoff = scanEntireWindow ? windowCutoff : new Date();
           if (!scanEntireWindow) {
             flagCutoff.setDate(flagCutoff.getDate() - this.config.FLAG_DIFF_WINDOW_DAYS);
@@ -1498,7 +1622,7 @@ export class MirrorEngine {
         lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,
-        flagScanCompleted: flagScanAttempted ? true : undefined
+        flagScanCompleted: flagScanAttempted ? (flagScanComplete ?? true) : undefined
       }, {
         deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
         signal: options.signal
@@ -1512,6 +1636,8 @@ export class MirrorEngine {
         reconcileProviderUidsSeen,
         reconcileDurationMs,
         flagScanAttempted,
+        flagScanComplete,
+        flagRowsChecked,
         hitLockBudget,
         initialSyncComplete: true,
         reconcileClean: reconcileClean === true,

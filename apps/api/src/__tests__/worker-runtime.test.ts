@@ -114,6 +114,30 @@ afterEach(() => {
 describe("worker Sent polling cadence", () => {
   const config = { SYNC_INTERVAL_MS: 60_000, SENT_SYNC_INTERVAL_MS: 30_000 };
 
+  it("continues flag pages without sleeping a full cadence or repeating the full sweep", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const syncDueAccounts = vi.fn(async () => []);
+    const syncDueFlagScans = vi.fn()
+      .mockResolvedValueOnce([{ flagRowsChecked: 50, errors: [] }])
+      .mockResolvedValueOnce([{ flagRowsChecked: 1, errors: [] }])
+      .mockResolvedValue([]);
+    const runtime = await startWorkerRuntime({
+      config: { SYNC_INTERVAL_MS: 60_000, SENT_SYNC_INTERVAL_MS: 30_000,
+        STALE_HEARTBEAT_MS: 300_000, SYNC_MAX_ACCOUNTS: 40 } as AppConfig,
+      pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
+      engine: { syncDueAccounts, syncDueSentFolders: vi.fn(async () => []), syncDueFlagScans },
+      threading: null,
+      repository: { runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 })) } as never
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      expect(syncDueFlagScans).toHaveBeenCalledTimes(3);
+      expect(syncDueAccounts).toHaveBeenCalledTimes(1);
+    } finally { runtime.stop(); await runtime.done; }
+  });
+
   it("interleaves a lightweight Sent pass between full mailbox sweeps", () => {
     expect(selectSyncLane(0, null, config)).toBe("full");
     expect(selectSyncLane(30_000, 0, config)).toBe("sent");

@@ -149,6 +149,11 @@ export interface ImapFolder {
   last_progress_note: string | null;
   next_sync_due_at: Date | null;
   next_flag_scan_at: Date | null;
+  /** Optional for host/test compatibility; NULL means no pending sweep. */
+  flag_scan_after_uid?: string | null;
+  flag_scan_through_uid?: string | null;
+  flag_scan_started_at?: Date | null;
+  flag_scan_updated_at?: Date | null;
   next_reconcile_at: Date | null;
   last_full_reconcile_at: Date | null;
   last_reconcile_clean: boolean | null;
@@ -300,6 +305,10 @@ export interface SyncResult {
   metadataWriteServiceRowsPerSecond?: number | null;
   bodiesFetched: number;
   flagsUpdated: number;
+  /** Bounded no-MODSEQ flag rows verified by this turn, not necessarily changed. */
+  flagRowsChecked?: number;
+  /** Eligible durable flag pages remain; a host may schedule one bounded continuation. */
+  flagVerificationPending?: boolean;
   reconcileGapsFound: number;
   reconcileFoldersAttempted?: number;
   reconcileProviderUidsSeen?: number;

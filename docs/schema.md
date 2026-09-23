@@ -48,6 +48,14 @@ The migration also rejects exact-match tokens that have no opaque envelope.
 It advances only after deletion-complete replay or an exact UID reconciliation,
 so flag-only CONDSTORE scans cannot move QRESYNC past unseen VANISHED history.
 
+`0027_bounded_flag_scan` adds four nullable progress fields to `imap_folders`:
+`flag_scan_after_uid`, `flag_scan_through_uid`, `flag_scan_started_at`, and
+`flag_scan_updated_at`. A routine no-MODSEQ scan freezes the mirrored UID upper
+bound, checks one incremental-size page, and acknowledges its cursor only after
+flag persistence. UIDVALIDITY reset clears all four fields. Completion clears
+the cursor and returns to the existing flag-scan cadence. No new table, queue,
+index, role, or policy is created; folder RLS remains authoritative.
+
 `0026_threading_closure_edges` normalizes each assignment's conversation,
 delivery, reference, provider-thread, and delivery-fingerprint keys into
 `imap_thread_closure_edges`. A run-scoped composite index lets closure expansion

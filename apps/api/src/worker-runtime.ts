@@ -28,12 +28,15 @@ export interface WorkerSyncResult {
   metadataWriteBatchesFailed?: number;
   metadataWriteServiceRowsPerSecond?: number | null;
   bodiesFetched: number;
+  flagRowsChecked?: number;
+  flagVerificationPending?: boolean;
   errors: string[];
 }
 
 interface WorkerEngine {
   syncDueAccounts(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
   syncDueSentFolders(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
+  syncDueFlagScans?(limit?: number, options?: { signal?: AbortSignal }): Promise<WorkerSyncResult[]>;
 }
 
 interface WorkerThreading {
@@ -404,12 +407,29 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   }
 
   async function loop(): Promise<void> {
+    let nextRegularTickAt = 0;
     while (!stopping) {
       let lane: "full" | "sent" | null = null;
+      let flagProgress = false;
       try {
         const startedAt = Date.now();
         lane = selectSyncLane(startedAt, lastFullSyncStartedAtMs, config);
-        await tick(lane, startedAt);
+        if (lane === "full" || startedAt >= nextRegularTickAt) {
+          await tick(lane, startedAt);
+          nextRegularTickAt = Date.now() + workerPollIntervalMs(config);
+        }
+        if (!stopping && engine.syncDueFlagScans && lastFullSyncStartedAtMs !== null
+          && Date.now() < lastFullSyncStartedAtMs + config.SYNC_INTERVAL_MS) {
+          // Reuse the existing loop and full-sweep cancellation boundary. Each
+          // page turn releases account/IMAP/DB resources; hot work runs first.
+          const continuation = sentLaneSignal(abort.signal,
+            Math.max(1, lastFullSyncStartedAtMs + config.SYNC_INTERVAL_MS - Date.now()));
+          try {
+            const results = await engine.syncDueFlagScans(undefined, { signal: continuation.signal });
+            flagProgress = results.some((result) => ((result.flagRowsChecked ?? 0) > 0
+              || result.flagVerificationPending === true) && result.errors.length === 0);
+          } finally { continuation.dispose(); }
+        }
       } catch (error) {
         console.error(JSON.stringify({
           event: "sync.tick.failed",
@@ -424,7 +444,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
           Math.max(0, lastFullSyncStartedAtMs + config.SYNC_INTERVAL_MS - Date.now())
         )
         : pollDelay;
-      await sleep(delay);
+      await sleep(flagProgress ? 0 : Math.min(delay, Math.max(0, nextRegularTickAt - Date.now())));
     }
   }
 

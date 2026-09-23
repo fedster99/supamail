@@ -120,6 +120,145 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await closePool();
   });
 
+  it("resumes full-window flag verification after restart without waiting for the next full sweep", async () => {
+    const h = await setupIntegration("flag-pages", { INITIAL_SYNC_BATCH_SIZE: 50, INCREMENTAL_SYNC_BATCH_SIZE: 2 });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [{ path: "INBOX", delimiter: "/", uidValidity: 123,
+      messages: Array.from({ length: 5 }, (_, i) => makeTextMessage({ uid: i + 1,
+        subject: "older flag", from: "sender@example.test", to: "owner@example.test", body: "fixture",
+        internalDate: new Date(Date.now() - 30 * 86400_000) })) }];
+    await h.buildEngine({ folders }).syncAccount(h.account.id);
+    await dueAllFolders(h.pool, h.account.id);
+    await h.pool.query(`UPDATE public.imap_folders SET next_reconcile_at = now() + interval '1 day'
+      WHERE account_id = $1`, [h.account.id]);
+    for (const message of folders[0].messages) message.flags = ["\\Seen", "\\Flagged"];
+    const first = await h.buildEngine({ folders }).syncAccount(h.account.id);
+    expect(first.flagsUpdated).toBe(2);
+    const state = () => h.pool.query(`SELECT flag_scan_after_uid, flag_scan_through_uid, next_flag_scan_at
+      FROM public.imap_folders WHERE account_id = $1`, [h.account.id]);
+    expect((await state()).rows[0].flag_scan_after_uid).toBe("2");
+    folders[0].messages.push(makeTextMessage({ uid: 6, subject: "new arrival",
+      from: "sender@example.test", to: "owner@example.test", body: "live fixture" }));
+    // A live metadata pass is not proof that the pending full-window sweep ran.
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "scheduled", { liveInboxOnly: true });
+    expect((await state()).rows[0].flag_scan_after_uid).toBe("2");
+    const restarted = h.buildEngine({ folders });
+    const healthBefore = await accountHealthSnapshot(h.pool, h.account.id);
+    expect((await restarted.syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true })).flagsUpdated).toBe(2);
+    expect((await state()).rows[0].flag_scan_after_uid).toBe("4");
+    expect((await restarted.syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true })).flagsUpdated).toBe(1);
+    expect((await state()).rows[0].flag_scan_after_uid).toBeNull();
+    expect(await accountHealthSnapshot(h.pool, h.account.id)).toEqual(healthBefore);
+    expect(new Date((await state()).rows[0].next_flag_scan_at).getTime()).toBeGreaterThan(Date.now());
+    expect((await restarted.syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true })).flagsUpdated).toBe(0);
+  });
+
+  it("does not skip an expunged flag-page UID or retry it in a tight loop; full reconciliation repairs it", async () => {
+    const h = await setupIntegration("flag-expunge", { INITIAL_SYNC_BATCH_SIZE: 50, INCREMENTAL_SYNC_BATCH_SIZE: 2 });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [{ path: "INBOX", delimiter: "/", uidValidity: 123,
+      messages: Array.from({ length: 5 }, (_, i) => makeTextMessage({ uid: i + 1,
+        subject: "older flag", from: "sender@example.test", to: "owner@example.test", body: "fixture",
+        internalDate: new Date(Date.now() - 30 * 86400_000) })) }];
+    const engine = h.buildEngine({ folders });
+    await engine.syncAccount(h.account.id);
+    await dueAllFolders(h.pool, h.account.id);
+    await h.pool.query(`UPDATE public.imap_folders SET next_reconcile_at = now() + interval '1 day'
+      WHERE account_id = $1`, [h.account.id]);
+    await engine.syncAccount(h.account.id);
+    folders[0].messages = folders[0].messages.filter((message) => message.uid !== 3);
+    const failed = await engine.syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true });
+    expect(failed.errors.length).toBe(1);
+    expect((await h.pool.query(`SELECT flag_scan_after_uid FROM public.imap_folders WHERE account_id = $1`,
+      [h.account.id])).rows[0].flag_scan_after_uid).toBe("2");
+    expect(await h.repository.getFlagScanContinuations(h.account.id)).toEqual([]);
+    // An ordinary safety pass, not another special repair loop, proves deletion.
+    const repaired = await engine.syncAccount(h.account.id);
+    expect(repaired.errors).toEqual([]);
+    expect((await h.pool.query(`SELECT deleted_in_provider FROM public.imap_messages
+      WHERE account_id = $1 AND uid = 3`, [h.account.id])).rows[0].deleted_in_provider).toBe(true);
+  });
+
+  it("fences flag checkpoints by account and UIDVALIDITY and retains other folders across turns", async () => {
+    const h = await setupIntegration("flag-isolation", { INITIAL_SYNC_BATCH_SIZE: 50,
+      INCREMENTAL_SYNC_BATCH_SIZE: 2, MAX_FLAG_SCANS_PER_CYCLE: 1 });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = ["INBOX", "Archive"].map((path) => ({ path, delimiter: "/", uidValidity: 123,
+      messages: Array.from({ length: 5 }, (_, i) => makeTextMessage({ uid: i + 1,
+        subject: "older flag", from: "sender@example.test", to: "owner@example.test", body: "fixture",
+        internalDate: new Date(Date.now() - 30 * 86400_000) })) }));
+    await h.buildEngine({ folders }).syncAccount(h.account.id);
+    const mirrored = await h.repository.getFoldersForWake(h.account.id, ["INBOX", "Archive"]);
+    const options = { deadlineAt: Date.now() + 30_000 };
+    for (const folder of mirrored) await h.repository.beginFlagScan(h.account.id, folder, 123, 5, options);
+    await expect(h.repository.beginFlagScan("00000000-0000-0000-0000-000000000000", mirrored[0], 123, 5, options)).rejects.toThrow();
+    await expect(h.repository.advanceFlagScan(h.account.id, mirrored[0], 124,
+      { afterUid: 0, throughUid: 5 }, 2, false, options)).rejects.toThrow();
+    await h.pool.query(`UPDATE public.imap_folders SET next_reconcile_at = now() + interval '1 day',
+      next_flag_scan_at = now() WHERE account_id = $1`, [h.account.id]);
+    const firstPath = (await h.repository.getFlagScanContinuations(h.account.id))[0].path;
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true });
+    expect((await h.repository.getFlagScanContinuations(h.account.id))[0].path).not.toBe(firstPath);
+    const account = (await h.repository.getAccount(h.account.id))!;
+    await h.repository.handleUidValidityReset(account, mirrored[0], 124);
+    await expect(h.repository.advanceFlagScan(h.account.id, mirrored[0], 123,
+      { afterUid: 0, throughUid: 5 }, 2, false, options)).rejects.toThrow();
+    const reset = (await h.repository.getFoldersForWake(h.account.id, [mirrored[0].path]))[0];
+    expect(reset.flag_scan_after_uid).toBeNull();
+    expect(reset.flag_scan_through_uid).toBeNull();
+  });
+
+  it("gives overdue unscanned folders a flag slot before restarting a completed sweep", async () => {
+    const h = await setupIntegration("flag-start-fairness", { INITIAL_SYNC_BATCH_SIZE: 50,
+      INCREMENTAL_SYNC_BATCH_SIZE: 2, MAX_FLAG_SCANS_PER_CYCLE: 1 });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = ["INBOX", "Sent"].map((path) => ({ path, delimiter: "/", uidValidity: 123,
+      messages: [makeTextMessage({ uid: 1, subject: "old", from: "sender@example.test", to: "owner@example.test",
+        body: "fixture", internalDate: new Date(Date.now() - 30 * 86400_000) })] }));
+    const engine = h.buildEngine({ folders });
+    await engine.syncAccount(h.account.id);
+    await dueAllFolders(h.pool, h.account.id);
+    await h.pool.query(`UPDATE public.imap_folders SET next_reconcile_at = now() + interval '1 day'
+      WHERE account_id = $1`, [h.account.id]);
+    for (const folder of folders) folder.messages[0].flags = ["\\Flagged"];
+    expect((await engine.syncAccount(h.account.id)).flagsUpdated).toBe(1);
+    // Model the next safety cycle occurring after Inbox becomes due again.
+    await dueAllFolders(h.pool, h.account.id);
+    await h.pool.query(`UPDATE public.imap_folders SET next_flag_scan_at = now() - interval '1 second'
+      WHERE account_id = $1 AND path = 'INBOX'`, [h.account.id]);
+    expect((await engine.syncAccount(h.account.id)).flagsUpdated).toBe(1);
+  });
+
+  it("replays committed flag rows after a failed checkpoint write without losing progress or duplicating changes", async () => {
+    const h = await setupIntegration("flag-write-failure", { INITIAL_SYNC_BATCH_SIZE: 50, INCREMENTAL_SYNC_BATCH_SIZE: 2 });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders().slice(0, 1);
+    const engine = h.buildEngine({ folders });
+    await engine.syncAccount(h.account.id);
+    await dueAllFolders(h.pool, h.account.id);
+    await h.pool.query(`UPDATE public.imap_folders SET next_reconcile_at=now()+interval '1 day'
+      WHERE account_id=$1`, [h.account.id]);
+    for (const message of folders[0].messages) message.flags = ["\\Flagged"];
+    await h.pool.query(`ALTER TABLE public.imap_folders ADD CONSTRAINT flag_test_ack
+      CHECK (flag_scan_after_uid IS DISTINCT FROM 102) NOT VALID`);
+    try {
+      expect((await engine.syncAccount(h.account.id)).errors.length).toBe(1);
+      const state = (await h.pool.query(`SELECT flag_scan_after_uid FROM public.imap_folders WHERE account_id=$1`,
+        [h.account.id])).rows[0];
+      expect(state.flag_scan_after_uid).toBe("0");
+      expect(Number((await h.pool.query(`SELECT count(*) FROM public.imap_messages
+        WHERE account_id=$1 AND flags @> ARRAY['\\Flagged']`, [h.account.id])).rows[0].count)).toBe(2);
+    } finally { await h.pool.query("ALTER TABLE public.imap_folders DROP CONSTRAINT flag_test_ack"); }
+    await h.pool.query(`UPDATE public.imap_folders SET next_flag_scan_at=now() WHERE account_id=$1`, [h.account.id]);
+    // Background work respects the failed full run's existing account backoff.
+    expect((await engine.syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true })).flagRowsChecked).toBe(0);
+    await h.pool.query("UPDATE public.imap_accounts SET backoff_until=NULL WHERE id=$1", [h.account.id]);
+    const replay = await h.buildEngine({ folders }).syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true });
+    expect(replay.errors).toEqual([]);
+    expect(replay.flagRowsChecked).toBe(2);
+    expect(replay.flagsUpdated).toBe(0);
+  });
+
   it("forces folder discovery during an authoritative safety pass", async () => {
     const h = await setupIntegration("forced-safety-discovery", {
       MAX_RR_FOLDERS_PER_CYCLE: 1
@@ -499,7 +638,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         highestModseq: undefined
       },
       reconcileComplete: true,
-      flagScanComplete: true
+      flagScanComplete: false
     }]);
     const rows = await h.pool.query<{
       uid: string;
@@ -739,7 +878,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         highestModseq: undefined
       },
       reconcileComplete: true,
-      flagScanComplete: true
+      flagScanComplete: false
     }]);
     const row = await h.pool.query<{
       deleted_in_provider: boolean;

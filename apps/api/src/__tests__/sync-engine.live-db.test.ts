@@ -891,6 +891,9 @@ liveDb("live DB reliability lane", () => {
     const result = await engine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("success");
     expect(result.flagsUpdated).toBe(1);
+    expect(hookUids).toEqual([2, 3]);
+    expect(flagWrites).toHaveBeenCalledTimes(1);
+    expect((await engine.syncAccount(h.account.id, "scheduled", { flagVerificationOnly: true })).outcome).toBe("success");
     expect(hookUids).toEqual([2, 3, 4]);
     expect(flagWrites).toHaveBeenCalledTimes(2);
     expect(flagWrites.mock.calls.every((call) => call[3].length <= 2)).toBe(true);
