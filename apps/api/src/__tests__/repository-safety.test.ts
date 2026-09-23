@@ -280,7 +280,12 @@ describe("repository safety", () => {
     // STUCK_DEGRADED_RETRY_INTERVAL_MS), so it self-heals but is not hammered.
     expect(source).toMatch(/WHEN a\.consecutive_failures \+ 1 >= \$3 THEN now\(\) \+ \(\$8::bigint/);
     // AUTH_ERROR stays terminal: BROKEN with backoff_until NULLed.
-    expect(source).toMatch(/markAccountSyncAuthFailed[\s\S]{0,400}sync_state = 'BROKEN'[\s\S]{0,400}backoff_until = NULL/);
+    const authFailureMethod = source.slice(
+      source.indexOf("async markAccountSyncAuthFailed"),
+      source.indexOf("async markAccountSyncFailed")
+    );
+    expect(authFailureMethod).toContain("sync_state = 'BROKEN'");
+    expect(authFailureMethod).toContain("backoff_until = NULL");
   });
 
   it("enforces the account cap at create time and worker startup", async () => {
