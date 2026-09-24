@@ -8,8 +8,9 @@ function scheduler(count: number, limit: number) {
   let now = 0;
   let cursor = 0;
   const folders = Array.from({ length: count }, (_,index) => ({
-    id: String(index), path: `RR-${String(index).padStart(2,"0")}`,
-    nextDue: 0
+    id: String(index), path: `RR-${String(index).padStart(Math.max(2, String(count - 1).length), "0")}`,
+    nextDue: 0,
+    next_reconcile_at: new Date(0).toISOString()
   }));
   const pool = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     if (sql.startsWith("UPDATE public.imap_accounts SET folder_rr_cursor")) {
@@ -59,6 +60,28 @@ describe("round-robin scheduling", () => {
     const h = scheduler(3,1), seen = new Set<string>();
     for(let cycle=0;cycle<3;cycle++) (await h.repository.getFoldersDueForSync("mailbox")).forEach(f=>seen.add(f.id));
     expect(seen.size).toBe(3);
+  });
+
+  it("shares a single reconcile slot across repeated five-folder batches", async () => {
+    const h = scheduler(155, 5);
+    const reconciled = new Set<string>();
+    let now = 0;
+    for (let cycle = 0; cycle < 576; cycle++) {
+      const selected = await h.repository.getFoldersDueForSync("mailbox");
+      expect(selected).toHaveLength(5);
+      // The engine admits one due reconcile per pass. Completed folders become
+      // due again after six hours, before every fixed batch position gets a turn.
+      const due = selected.find(folder => new Date(folder.next_reconcile_at!).getTime() <= now);
+      if (due) {
+        reconciled.add(due.id);
+        h.folders.find(folder => folder.id === due.id)!.next_reconcile_at =
+          new Date(now + 6 * 60 * 60_000 + 450_000).toISOString();
+      }
+      h.complete(selected.map(folder => folder.id));
+      h.advance(285_000);
+      now += 285_000;
+    }
+    expect(reconciled.size).toBe(155);
   });
 
   it("keeps ordinary position when preferred discovery work fills the budget", async () => {

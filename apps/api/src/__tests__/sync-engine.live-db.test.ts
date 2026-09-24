@@ -587,6 +587,34 @@ liveDb("live DB reliability lane", () => {
     expect(seen.size).toBe(40);
   });
 
+  it("orders selected ordinary folders by reconcile due time without moving the rotation cursor", async () => {
+    const h = await setupIntegration("live-reconcile-order", {
+      MAX_RR_FOLDERS_PER_CYCLE: 3
+    });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    await h.repository.upsertDiscoveredFolders(account, [
+      { path: "INBOX", delimiter: "/", specialUse: "\\Inbox" },
+      ...["RR-A", "RR-B", "RR-C", "RR-D"].map(path => ({ path, delimiter: "/" }))
+    ]);
+    await h.pool.query(`UPDATE public.imap_folders
+      SET next_sync_due_at = now() - interval '1 minute',
+          next_reconcile_at = now() - CASE path
+            WHEN 'RR-D' THEN interval '4 hours'
+            WHEN 'RR-B' THEN interval '3 hours'
+            WHEN 'RR-C' THEN interval '2 hours'
+            ELSE interval '1 hour' END
+      WHERE account_id = $1`, [h.account.id]);
+
+    const first = await h.repository.getFoldersDueForSync(h.account.id);
+    expect(first.map(folder => folder.path)).toEqual(["INBOX", "RR-B", "RR-C", "RR-A"]);
+    expect((await h.repository.getAccount(h.account.id))!.folder_rr_cursor).toBe(3);
+    const preferred = await h.repository.getFoldersDueForSync(h.account.id, ["RR-C"]);
+    expect(preferred.map(folder => folder.path)).toEqual(["INBOX", "RR-C", "RR-D", "RR-A"]);
+    expect((await h.repository.getAccount(h.account.id))!.folder_rr_cursor).toBe(1);
+  });
+
   it("keeps Inbox first in the bounded full-sweep priority set", async () => {
     const h = await setupIntegration("live-sent-priority-slot", {
       PRIORITY_CUTOFF: 10,

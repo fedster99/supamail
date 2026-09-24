@@ -2136,6 +2136,16 @@ export class MirrorRepository {
       );
     }
 
+    // Selection/cursor own folder fairness; execution order shares the smaller
+    // reconcile budget. Fixed batch positions can otherwise starve indefinitely
+    // when earlier folders become reconcile-due again before later ones run.
+    // Keep discovery's preferred work first without changing the selected set.
+    rr.sort((a, b) =>
+      Number(preferredPaths.has(b.path)) - Number(preferredPaths.has(a.path))
+      || new Date(a.next_reconcile_at ?? 0).getTime()
+        - new Date(b.next_reconcile_at ?? 0).getTime()
+    );
+
     return [...priority.rows, ...rr];
   }
 
