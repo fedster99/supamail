@@ -506,134 +506,55 @@ export async function runLockSelfTestWithRetry(
   }
 }
 
-export async function clearOrphanedLockForAccount(
-  pool: PgPool,
-  lockId: string | number,
-  staleThresholdMs: number
-): Promise<boolean> {
-  try {
-    const result = await pool.query<{
-      pid: number;
-      email_address: string;
-      last_heartbeat_at: Date | null;
-      sync_started_by: string | null;
-    }>(
-      `
-      SELECT pl.pid,
-             account.email_address,
-             account.last_heartbeat_at,
-             account.sync_started_by
-      FROM pg_locks pl
-      JOIN public.imap_accounts account
-        ON pl.classid::bigint = 0
-       AND pl.objid::bigint = account.lock_id
-      WHERE pl.locktype = 'advisory'
-        AND pl.objid::bigint = $1::bigint
-        AND pl.granted = true
-        AND (
-          account.last_heartbeat_at IS NULL
-          OR account.last_heartbeat_at < now() - ($2::bigint * interval '1 millisecond')
-        )
-        AND pl.pid != pg_backend_pid()
-      LIMIT 1
-      `,
-      [lockId, staleThresholdMs]
-    );
-
-    const row = result.rows[0];
-    if (!row) return false;
-
-    await pool.query("SELECT pg_terminate_backend($1)", [row.pid]);
-    await pool.query(
-      `
-      UPDATE public.imap_accounts
-      SET currently_syncing = false,
-          sync_started_by = NULL
-      WHERE lock_id = $1
-        AND sync_started_by IS NOT DISTINCT FROM $2::text
-      `,
-      [lockId, row.sync_started_by]
-    );
-    // Close the sync run the killed process left open, so it stops reading as
-    // perpetually 'running' (previously only the account lock was reaped). The
-    // started_at guard ensures a run a concurrent worker just opened (before it
-    // refreshed the heartbeat) is not mistaken for the dead worker's orphan.
-    await pool.query(
-      `
-      UPDATE public.imap_sync_runs r
-      SET status = 'failed',
-          finished_at = now(),
-          error = COALESCE(r.error, 'WORKER_REAPED')
-      FROM public.imap_accounts a
-      WHERE r.account_id = a.id
-        AND a.lock_id = $1
-        AND r.status = 'running'
-        AND r.finished_at IS NULL
-        AND r.started_at < now() - ($2::bigint * interval '1 millisecond')
-      `,
-      [lockId, staleThresholdMs]
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export interface OrphanedLockSweep {
-  /** Stale advisory-lock backends terminated via pg_terminate_backend. */
-  terminatedBackends: number;
   /** Accounts whose currently_syncing flag was reset. */
   accountsReset: number;
   /** Open imap_sync_runs rows force-closed as failed (reaped). */
   runsClosed: number;
 }
 
+/**
+ * Reset sync state left by workers that no longer hold their account lock.
+ *
+ * This never terminates a lock-holding session. A stale heartbeat cannot tell a
+ * dead worker from a frozen one, and a frozen worker that resumes after losing
+ * its lock could write stale mailbox state. Sessions of vanished workers are
+ * released by the server-side TCP settings in `createPool`; until then the
+ * account stays busy and only its own worker can write.
+ */
 export async function clearOrphanedLocks(
   pool: PgPool,
   staleThresholdMs: number
 ): Promise<OrphanedLockSweep> {
+  const unlocked = `NOT EXISTS (
+          SELECT 1
+          FROM pg_locks pl
+          WHERE pl.locktype = 'advisory'
+            AND pl.granted = true
+            AND pl.classid::bigint = 0
+            AND pl.objid::bigint = a.lock_id
+        )`;
   try {
-    const result = await pool.query<{ pid: number }>(
-      `
-      SELECT DISTINCT pl.pid
-      FROM pg_locks pl
-      JOIN public.imap_accounts account
-        ON pl.classid::bigint = 0
-       AND pl.objid::bigint = account.lock_id
-      WHERE pl.locktype = 'advisory'
-        AND pl.granted = true
-        AND (
-          account.last_heartbeat_at IS NULL
-          OR account.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
-        )
-        AND pl.pid != pg_backend_pid()
-      `,
-      [staleThresholdMs]
-    );
-
-    for (const row of result.rows) {
-      await pool.query("SELECT pg_terminate_backend($1)", [row.pid]).catch(() => undefined);
-    }
-
     const reset = await pool.query(
       `
-      UPDATE public.imap_accounts
+      UPDATE public.imap_accounts a
       SET currently_syncing = false,
           sync_started_by = NULL
-      WHERE currently_syncing = true
+      WHERE a.currently_syncing = true
         AND (
-          last_heartbeat_at IS NULL
-          OR last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
+          a.last_heartbeat_at IS NULL
+          OR a.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
         )
+        AND ${unlocked}
       `,
       [staleThresholdMs]
     );
 
-    // Close the sync runs those reaped accounts left open. A SIGKILL/OOM leaves the
-    // run row at status='running' forever (only the account lock was reaped before),
-    // so any sync_runs-based UI/metrics show a phantom perpetually-active run. The
-    // started_at guard ensures a run a concurrent worker just opened (before it
-    // refreshed the heartbeat) is not mistaken for a dead worker's orphan.
+    // Close the sync runs those orphaned accounts left open. A SIGKILL/OOM leaves the
+    // run row at status='running' forever, so any sync_runs-based UI/metrics show a
+    // phantom perpetually-active run. The started_at guard ensures a run a concurrent
+    // worker just opened (before it refreshed the heartbeat) is not mistaken for a
+    // dead worker's orphan.
     const closed = await pool.query(
       `
       UPDATE public.imap_sync_runs r
@@ -649,16 +570,16 @@ export async function clearOrphanedLocks(
           a.last_heartbeat_at IS NULL
           OR a.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
         )
+        AND ${unlocked}
       `,
       [staleThresholdMs]
     );
 
     return {
-      terminatedBackends: result.rows.length,
       accountsReset: reset.rowCount ?? 0,
       runsClosed: closed.rowCount ?? 0
     };
   } catch {
-    return { terminatedBackends: 0, accountsReset: 0, runsClosed: 0 };
+    return { accountsReset: 0, runsClosed: 0 };
   }
 }

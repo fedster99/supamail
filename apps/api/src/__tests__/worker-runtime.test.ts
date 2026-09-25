@@ -12,7 +12,6 @@ const defaultThreading = vi.hoisted(() => ({
 
 const lockRuntime = vi.hoisted(() => ({
   clearOrphanedLocks: vi.fn(async () => ({
-    terminatedBackends: 0,
     accountsReset: 0,
     runsClosed: 0
   })),

@@ -104,8 +104,10 @@ describe("repository safety", () => {
     expect(source).toContain("pg_try_advisory_lock");
     expect(source).toContain("pg_advisory_unlock");
     expect(source).toContain("runLockSelfTest");
-    expect(source).toContain("clearOrphanedLockForAccount");
-    expect(source).toContain("pg_terminate_backend");
+    expect(source).toContain("clearOrphanedLocks");
+    // A stale heartbeat cannot tell a dead worker from a frozen one; recovery
+    // must never end a lock-holding session.
+    expect(source).not.toContain("pg_terminate_backend");
     expect(source).not.toContain("pg_try_advisory_xact_lock");
     expect(source).not.toContain('client.query("BEGIN")');
   });
