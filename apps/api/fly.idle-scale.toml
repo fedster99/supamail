@@ -1,0 +1,21 @@
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile.idle-scale"
+
+[processes]
+  server = "node dist/smoke/idle-scale.js server"
+  client = "node dist/smoke/idle-scale.js client"
+
+[env]
+  IDLE_SCALE_WATCHERS = "1000"
+  IDLE_SCALE_RAMP_CONCURRENCY = "50"
+  IDLE_SCALE_DURATION_MS = "600000"
+  IDLE_SCALE_HOLD_AFTER_RESULT_MS = "3600000"
+  IDLE_SCALE_MAX_IDLE_MS = "1500000"
+  IDLE_SCALE_IMAP_PORT = "11143"
+  IDLE_SCALE_CONTROL_PORT = "8080"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
