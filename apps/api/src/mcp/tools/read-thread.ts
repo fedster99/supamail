@@ -67,13 +67,13 @@ const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
  * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
-function threadSelect(includeBody: boolean): string {
+function threadSelect(includeBody: boolean, conversationColumn = "ta.conversation_id"): string {
   return `
   m.id,
   m.account_id,
   m.folder_path,
   m.provider_thread_id,
-  ta.conversation_id,
+  ${conversationColumn},
   m.subject,
   m.from_email,
   m.from_name,
@@ -362,6 +362,8 @@ async function fetchThreadRows(
   { includeBody = true }: ReadThreadOptions
 ): Promise<FetchedThread> {
   if (selector.kind === "conversation") {
+    // Every representative already belongs to this bound conversation in the
+    // same snapshot. Do not rejoin all active assignments to rediscover its id.
     const result = await client.query<ThreadRow>(
       `
       WITH delivery_representatives AS (
@@ -380,12 +382,9 @@ async function fetchThreadRows(
           m.folder_path ASC,
           m.id ASC
       )${boundedThreadCtes("$3")}
-      SELECT ${threadSelect(includeBody)}
+      SELECT ${threadSelect(includeBody, "$2::text AS conversation_id")}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
-      LEFT JOIN public.imap_thread_active_assignments ta
-        ON ta.message_id = m.id
-       AND ta.account_id = m.account_id
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
