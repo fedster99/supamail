@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
-import { AccountBusyError, NoRecipientsError, NotFoundError } from "./errors.js";
+import { AccountBusyError, NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
 import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
-import { deleteMessage } from "./mailbox-mutations.js";
+import { deleteMessage, type MailboxActionOptions } from "./mailbox-mutations.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import {
@@ -43,6 +43,12 @@ import {
  *   delete the draft. NOT a rebuild from the mirror's parsed body — that lost the
  *   body when it hadn't been lazily fetched yet (see ADR 0019, revised).
  * - Delete  = email-002 `deleteMessage` (reuses the capability-gated mutation).
+ *
+ * Create, update, send, and delete accept an optional AbortSignal. After abort no
+ * new IMAP or SMTP work starts and an open IMAP client closes. Before SMTP
+ * delivery the call rejects with `AbortError`. SMTP submission itself is never
+ * interrupted or retried: once the provider accepts the message, abort only skips
+ * the Sent APPEND and draft cleanup, which are reported as warnings.
  *
  * This module lives OUTSIDE src/mcp/ on purpose: the agent surface is zero-send /
  * zero-mutate (ADR 0014/0016), so APPEND + delete must never be importable there.
@@ -155,7 +161,8 @@ async function appendDraft(
   config: AppConfig,
   account: ImapAccount,
   req: SendRequest,
-  idempotencyKey?: string | null
+  idempotencyKey?: string | null,
+  signal?: AbortSignal
 ): Promise<{ draftsFolderPath: string; rfcMessageId: string; appendedUid: number | null }> {
   const from = { email: account.email_address };
   // With an idempotency key, stamp a deterministic Message-ID (buildRawMime honors
@@ -172,7 +179,7 @@ async function appendDraft(
   // error instead of colliding. (deleteMessage / content reads still need the same
   // treatment; that broader on-demand-IMAP serialization is a follow-up.)
   const result = await withAccountLock(pool, account.lock_id, async () => {
-    const appender = await SentFolderAppender.connect(pool, config, account);
+    const appender = await SentFolderAppender.connect(pool, config, account, { signal });
     try {
       const profile = getProviderProfile(account.provider_profile);
       const mailboxes = await appender.list();
@@ -215,9 +222,11 @@ export async function createDraft(
   pool: PgPool,
   config: AppConfig,
   input: DraftInput,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<CreateDraftResult> {
   rejectBcc(input);
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
@@ -227,7 +236,8 @@ export async function createDraft(
     config,
     account,
     input,
-    input.idempotencyKey
+    input.idempotencyKey,
+    options.signal
   );
   return { accountId: account.id, draftsFolderPath, rfcMessageId, appendedUid };
 }
@@ -422,9 +432,11 @@ export async function updateDraft(
   config: AppConfig,
   messageId: string,
   input: Omit<DraftInput, "accountId">,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<UpdateDraftResult> {
   rejectBcc(input);
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const existing = await repository.getMessage(messageId);
   if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
@@ -433,7 +445,14 @@ export async function updateDraft(
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${existing.account_id}`);
 
   const req: SendRequest = { ...input, accountId: account.id };
-  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(pool, config, account, req);
+  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
+    pool,
+    config,
+    account,
+    req,
+    undefined,
+    options.signal
+  );
 
   // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
   // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
@@ -442,7 +461,7 @@ export async function updateDraft(
   const warnings: string[] = [];
   let replacedDraftDeleted = true;
   try {
-    await deleteMessage(pool, config, messageId, { hard: true, metadataProtection });
+    await deleteMessage(pool, config, messageId, { hard: true, metadataProtection, signal: options.signal });
   } catch (error) {
     replacedDraftDeleted = false;
     warnings.push(
@@ -487,11 +506,12 @@ export async function sendDraft(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<SendDraftResult> {
   let deliveryConfirmed = false;
   try {
-    return await sendDraftAttempt(pool, config, messageId, metadataProtection, () => {
+    return await sendDraftAttempt(pool, config, messageId, metadataProtection, options.signal, () => {
       deliveryConfirmed = true;
     });
   } catch (error) {
@@ -499,6 +519,7 @@ export async function sendDraft(
     if (
       !deliveryConfirmed &&
       [
+        "AbortError",
         "AccountBusyError",
         "HostValidationError",
         "NoRecipientsError",
@@ -520,8 +541,10 @@ async function sendDraftAttempt(
   config: AppConfig,
   messageId: string,
   metadataProtection: MetadataProtectionAdapter,
+  signal: AbortSignal | undefined,
   confirmDelivery: () => void
 ): Promise<SendDraftResult> {
+  throwIfAborted(signal);
   const draft = await getDraft(pool, config, messageId, metadataProtection);
   if (!draft) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (draft.toEmails.length === 0) {
@@ -553,7 +576,7 @@ async function sendDraftAttempt(
     // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
     // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
     // body + HTML + formatting regardless of lazy mirror-body state.
-    const { raw, truncated } = await getRawMime(pool, config, messageId, metadataProtection);
+    const { raw, truncated } = await getRawMime(pool, config, messageId, metadataProtection, { signal });
     if (truncated) {
       // Fail closed before SMTP: the capped bytes would be a corrupt MIME message.
       throw new Error(
@@ -564,6 +587,7 @@ async function sendDraftAttempt(
     // Re-prove heartbeat + session ownership immediately before crossing the
     // irreversible SMTP boundary (the raw fetch may have taken time).
     await lock.assertLive();
+    throwIfAborted(signal);
     const delivery = await deliverSmtp(creds, raw, envelope, config, {
       isPrivateHost,
       onPostDeliveryWarning: addWarning
@@ -588,7 +612,7 @@ async function sendDraftAttempt(
 
       if (providerWorkAllowed) {
         try {
-          appender = await SentFolderAppender.connect(pool, config, account);
+          appender = await SentFolderAppender.connect(pool, config, account, { signal });
           const profile = getProviderProfile(account.provider_profile);
           const mailboxes = await appender.list();
           sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
@@ -643,7 +667,7 @@ async function sendDraftAttempt(
     }
     if (providerWorkAllowed) {
       try {
-        await deleteMessage(pool, config, messageId, { hard: true, metadataProtection });
+        await deleteMessage(pool, config, messageId, { hard: true, metadataProtection, signal });
         draftDeleted = true;
       } catch (error) {
         addWarning(
@@ -672,7 +696,7 @@ export async function deleteDraft(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  options: { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
+  options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
   const result = await deleteMessage(pool, config, messageId, options);
   return { messageId: result.messageId, fromFolder: result.fromFolder };

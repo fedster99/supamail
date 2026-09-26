@@ -1,8 +1,14 @@
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
-import { NotFoundError } from "./errors.js";
-import { closeImap, connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
+import { NotFoundError, throwIfAborted } from "./errors.js";
+import {
+  closeImap,
+  connectAbortableImap,
+  uidValidityMatches,
+  uidValidityMismatchMessage,
+  type ImapAbortBinding
+} from "./imap-connect.js";
 import { loadMessageAndAccount } from "./message-loader.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
@@ -43,7 +49,17 @@ import type { ImapAccount, ImapMessage } from "./types.js";
  * blanket EXPUNGE: hard delete requires UIDPLUS (UID-scoped EXPUNGE); move
  * requires MOVE or UIDPLUS (native move, or COPY + UID-scoped EXPUNGE). Both
  * absent → the verb refuses rather than risk purging unrelated \Deleted messages.
+ *
+ * Every library function accepts an optional AbortSignal. After abort no new
+ * IMAP command starts, the IMAP client closes (releasing its folder lock), and
+ * the call rejects with `AbortError`. A command in flight at abort time has an
+ * unknown provider outcome; the next sync reconciles it.
  */
+
+/** Caller controls for one direct mailbox action. */
+export interface MailboxActionOptions {
+  signal?: AbortSignal;
+}
 
 /** A SupaMail well-known flag name mapped to its IMAP system flag. */
 export const SYSTEM_FLAGS = {
@@ -139,19 +155,21 @@ export function toImapFlag(token: string): string {
 export class MailboxMutator {
   private constructor(
     private readonly client: ImapFlow,
-    private readonly host: string
+    private readonly host: string,
+    private readonly abort: ImapAbortBinding
   ) {}
 
   static async connect(
     pool: PgPool,
     config: AppConfig,
-    account: ImapAccount
+    account: ImapAccount,
+    options: MailboxActionOptions = {}
   ): Promise<MailboxMutator> {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
     // mutation verb surface on top (ADR 0018/0022).
-    const client = await connectImap(pool, config, account);
-    return new MailboxMutator(client, account.host);
+    const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
+    return new MailboxMutator(client, account.host, abort);
   }
 
   /** True iff the connected server advertises `name` (e.g. "UIDPLUS", "MOVE").
@@ -166,7 +184,7 @@ export class MailboxMutator {
     specialUse?: string | null;
     delimiter?: string | null;
   }>> {
-    const boxes = await this.client.list();
+    const boxes = await this.abort.run(() => this.client.list());
     return boxes.map((b) => ({
       path: b.path,
       specialUse: b.specialUse ?? null,
@@ -181,27 +199,29 @@ export class MailboxMutator {
    * is deliberate: we refuse to act on a possibly-wrong message and let the next
    * sync re-establish identity.
    */
-  private async withUidScope<T>(target: ResolvedMessageTarget, op: () => Promise<T>): Promise<T> {
-    const lock = await this.client.getMailboxLock(target.folderPath);
-    try {
-      const mailbox = this.client.mailbox;
-      // Shared fail-closed UIDVALIDITY check (imap-connect.ts) — same property as
-      // ContentImapClient's fetch guard, but the mutate path keeps its own
-      // MailboxConflictError (mapped to HTTP 409 by api.ts).
-      if (!uidValidityMatches(mailbox, target.uidValidity)) {
-        throw new MailboxConflictError(
-          uidValidityMismatchMessage(
-            target.folderPath,
-            target.uidValidity,
-            (mailbox as { uidValidity?: bigint | number }).uidValidity,
-            "mutate"
-          )
-        );
+  private withUidScope<T>(target: ResolvedMessageTarget, op: () => Promise<T>): Promise<T> {
+    return this.abort.run(async () => {
+      const lock = await this.client.getMailboxLock(target.folderPath);
+      try {
+        const mailbox = this.client.mailbox;
+        // Shared fail-closed UIDVALIDITY check (imap-connect.ts) — same property as
+        // ContentImapClient's fetch guard, but the mutate path keeps its own
+        // MailboxConflictError (mapped to HTTP 409 by api.ts).
+        if (!uidValidityMatches(mailbox, target.uidValidity)) {
+          throw new MailboxConflictError(
+            uidValidityMismatchMessage(
+              target.folderPath,
+              target.uidValidity,
+              (mailbox as { uidValidity?: bigint | number }).uidValidity,
+              "mutate"
+            )
+          );
+        }
+        return await op();
+      } finally {
+        lock.release();
       }
-      return await op();
-    } finally {
-      lock.release();
-    }
+    });
   }
 
   /** STORE +FLAGS on the message's folder by UID. imapflow returns `false` on a
@@ -285,26 +305,26 @@ export class MailboxMutator {
   }
 
   async createFolder(path: string): Promise<{ path: string; created: boolean }> {
-    const result = await this.client.mailboxCreate(path);
+    const result = await this.abort.run(() => this.client.mailboxCreate(path));
     return { path: result.path, created: result.created };
   }
 
   async renameFolder(path: string, newPath: string): Promise<{ path: string; newPath: string }> {
-    const result = await this.client.mailboxRename(path, newPath);
+    const result = await this.abort.run(() => this.client.mailboxRename(path, newPath));
     return { path: result.path, newPath: result.newPath };
   }
 
   async deleteFolder(path: string): Promise<{ path: string }> {
-    const result = await this.client.mailboxDelete(path);
+    const result = await this.abort.run(() => this.client.mailboxDelete(path));
     return { path: result.path };
   }
 
   async logout(): Promise<void> {
-    await this.client.logout();
+    await this.abort.logout();
   }
 
   close(): void {
-    this.client.close();
+    this.abort.close();
   }
 }
 
@@ -375,19 +395,21 @@ export async function setMessageFlags(
   config: AppConfig,
   messageId: string,
   change: FlagChange,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<FlagResult> {
   const add = (change.add ?? []).map(toImapFlag);
   const remove = (change.remove ?? []).map(toImapFlag);
   if (add.length === 0 && remove.length === 0) {
     throw new Error("setMessageFlags requires at least one flag to add or remove");
   }
+  throwIfAborted(options.signal);
 
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     if (add.length > 0) await mutator.addFlags(target, add);
     if (remove.length > 0) await mutator.removeFlags(target, remove);
@@ -416,18 +438,20 @@ export async function moveMessage(
   config: AppConfig,
   messageId: string,
   destination: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<MoveResult> {
   if (!destination || destination.trim().length === 0) {
     throw new Error("moveMessage requires a non-empty destination folder");
   }
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
   await repository.markFoldersForReconcile(account.id, [target.folderPath, destination]);
 
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     const { uidMap } = await mutator.move(target, destination);
     const newUid = uidMap?.get(target.uid) ?? null;
@@ -456,8 +480,9 @@ export async function deleteMessage(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  options: { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
+  options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteResult> {
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(
     pool,
     config,
@@ -466,7 +491,7 @@ export async function deleteMessage(
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
 
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
   try {
     if (options.hard) {
       await mutator.expunge(target);
@@ -635,13 +660,15 @@ export async function setThreadFlags(
   config: AppConfig,
   messageId: string,
   change: FlagChange,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<ThreadFlagResult> {
   const add = (change.add ?? []).map(toImapFlag);
   const remove = (change.remove ?? []).map(toImapFlag);
   if (add.length === 0 && remove.length === 0) {
     throw new Error("setThreadFlags requires at least one flag to add or remove");
   }
+  throwIfAborted(options.signal);
 
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId, metadataProtection);
@@ -655,7 +682,7 @@ export async function setThreadFlags(
   // STORE-all-then-write-all shape lost all mirror writes on any failure).
   const appliedIds: string[] = [];
   let mirrorWriteThroughStale = 0;
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     for (const target of targets) {
       if (add.length > 0) await mutator.addFlags(target, add);
@@ -696,18 +723,20 @@ export async function moveThread(
   config: AppConfig,
   messageId: string,
   destination: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<ThreadMoveResult> {
   if (!destination || destination.trim().length === 0) {
     throw new Error("moveThread requires a non-empty destination folder");
   }
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
   const moved: string[] = [];
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     for (const target of targets) {
       if (target.folderPath === destination) continue;
@@ -737,14 +766,16 @@ export async function createFolder(
   config: AppConfig,
   accountId: string,
   path: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<FolderMutationResult> {
   if (!path || path.trim().length === 0) throw new Error("createFolder requires a non-empty path");
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     const result = await mutator.createFolder(path);
     return { accountId, path: result.path, created: result.created };
@@ -759,14 +790,16 @@ export async function renameFolder(
   accountId: string,
   path: string,
   newPath: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<FolderMutationResult> {
   if (!path || !newPath) throw new Error("renameFolder requires both path and newPath");
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     const result = await mutator.renameFolder(path, newPath);
     return { accountId, path: result.path, newPath: result.newPath };
@@ -780,14 +813,16 @@ export async function deleteFolder(
   config: AppConfig,
   accountId: string,
   path: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
 ): Promise<FolderMutationResult> {
   if (!path || path.trim().length === 0) throw new Error("deleteFolder requires a non-empty path");
+  throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(accountId);
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
-  const mutator = await MailboxMutator.connect(pool, config, account);
+  const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     const result = await mutator.deleteFolder(path);
     return { accountId, path: result.path };

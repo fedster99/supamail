@@ -48,3 +48,32 @@ export class AccountBusyError extends Error {
     this.name = "AccountBusyError";
   }
 }
+
+/** The caller's AbortSignal stopped a direct mailbox action (lost lease, shutdown,
+ * client disconnect). `cause` is the signal's reason. No provider command starts
+ * after the abort; a command that was in flight has an unknown provider outcome. */
+export class AbortError extends Error {
+  constructor(reason?: unknown) {
+    super("Mailbox action aborted", { cause: reason });
+    this.name = "AbortError";
+  }
+}
+
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new AbortError(signal.reason);
+}
+
+/** Refuse to start `work` after abort, and report any failure that races an
+ * abort as {@link AbortError}. Without a signal this is just `work()`. */
+export async function runAbortable<T>(
+  signal: AbortSignal | undefined,
+  work: () => Promise<T>
+): Promise<T> {
+  throwIfAborted(signal);
+  try {
+    return await work();
+  } catch (error) {
+    if (signal?.aborted && !(error instanceof AbortError)) throw new AbortError(signal.reason);
+    throw error;
+  }
+}

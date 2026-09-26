@@ -2,6 +2,7 @@ import { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
+import { runAbortable } from "./errors.js";
 import { assertSafeImapTarget } from "./host-validation.js";
 import type { ImapAccount } from "./types.js";
 
@@ -117,6 +118,50 @@ export async function connectImap(
     }
   }
   return client;
+}
+
+/**
+ * Connect an action client (mutator, appender, content reader) under an optional
+ * caller AbortSignal. The returned binding closes the socket on abort, which
+ * rejects the in-flight command and every pending mailbox lock at once. Its `run`
+ * refuses to start a command after abort and reports an interrupted command as
+ * `AbortError`; its `logout` closes without sending LOGOUT after abort. Without a
+ * signal every method behaves like the unbound client.
+ */
+export async function connectAbortableImap(
+  pool: PgPool,
+  config: AppConfig,
+  account: ImapAccount,
+  signal?: AbortSignal
+): Promise<{ client: ImapFlow; abort: ImapAbortBinding }> {
+  const client = await runAbortable(signal, () => connectImap(pool, config, account, { signal }));
+  return { client, abort: new ImapAbortBinding(client, signal) };
+}
+
+export class ImapAbortBinding {
+  private readonly closeOnAbort = () => this.client.close();
+
+  constructor(private readonly client: ImapFlow, private readonly signal?: AbortSignal) {
+    signal?.addEventListener("abort", this.closeOnAbort, { once: true });
+  }
+
+  run<T>(command: () => Promise<T>): Promise<T> {
+    return runAbortable(this.signal, command);
+  }
+
+  async logout(): Promise<void> {
+    try {
+      if (this.signal?.aborted) this.client.close();
+      else await this.client.logout();
+    } finally {
+      this.signal?.removeEventListener("abort", this.closeOnAbort);
+    }
+  }
+
+  close(): void {
+    this.signal?.removeEventListener("abort", this.closeOnAbort);
+    this.client.close();
+  }
 }
 
 /**

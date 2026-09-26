@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { ImapAbortBinding } from "../imap-connect.js";
 import { MailboxMutator, toImapFlag } from "../mailbox-mutations.js";
 
 /**
@@ -382,5 +383,61 @@ describe("setThreadFlags / moveThread fan-out", () => {
     // Every capped member is in INBOX, none already in Archive, so all 100 move.
     expect(mutator.move).toHaveBeenCalledTimes(100);
     expect(result.messageCount).toBe(100);
+  });
+});
+
+describe("abort signal", () => {
+  it("rejects with AbortError before loading or connecting when already aborted", async () => {
+    const { setMessageFlags } = await import("../mailbox-mutations.js");
+    const error = await setMessageFlags({} as never, config, "msg-1", { add: ["seen"] }, undefined, {
+      signal: AbortSignal.abort()
+    }).catch((value) => value);
+
+    expect(error.name).toBe("AbortError");
+    expect(repo.getMessage).not.toHaveBeenCalled();
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("closes the client and releases the folder lock mid-STORE, then starts no more IMAP work", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    const abort = new AbortController();
+    const release = vi.fn();
+    let failStore: (error: Error) => void = () => undefined;
+    const imap = {
+      mailbox: { uidValidity: 100 },
+      getMailboxLock: vi.fn(async () => ({ release })),
+      messageFlagsAdd: vi.fn(() => new Promise((_, reject) => {
+        failStore = reject;
+      })),
+      messageFlagsRemove: vi.fn(async () => true),
+      logout: vi.fn(async () => undefined),
+      // ImapFlow.close() rejects the in-flight command.
+      close: vi.fn(() => failStore(new Error("Connection not available")))
+    };
+    connectSpy.mockImplementationOnce(async (_pool, _config, _account, options) => Reflect.construct(
+      MailboxMutator as unknown as new (...args: unknown[]) => MailboxMutator,
+      [imap, "imap.example.test", new ImapAbortBinding(imap as never, options?.signal)]
+    ));
+    const { setMessageFlags } = await import("../mailbox-mutations.js");
+    const pending = setMessageFlags(
+      {} as never,
+      config,
+      "msg-1",
+      { add: ["seen"], remove: ["flagged"] },
+      undefined,
+      { signal: abort.signal }
+    );
+    await vi.waitFor(() => expect(imap.messageFlagsAdd).toHaveBeenCalledTimes(1));
+
+    abort.abort(new Error("lease lost"));
+
+    const error = await pending.catch((value) => value);
+    expect(error.name).toBe("AbortError");
+    expect(error.cause).toBe(abort.signal.reason);
+    expect(imap.close).toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(imap.messageFlagsRemove).not.toHaveBeenCalled();
+    expect(imap.logout).not.toHaveBeenCalled();
+    expect(repo.applyMessageFlags).not.toHaveBeenCalled();
   });
 });

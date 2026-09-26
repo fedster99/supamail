@@ -5,7 +5,7 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import type { PgPool } from "./db.js";
-import { connectImap } from "./imap-connect.js";
+import { connectAbortableImap, type ImapAbortBinding } from "./imap-connect.js";
 import { getProviderProfile } from "./provider-profiles.js";
 import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
@@ -386,18 +386,22 @@ export function buildSendEnvelope(from: string, req: SendRequest): SmtpEnvelope 
  * write; the send path can never read-sync.
  */
 export class SentFolderAppender {
-  private constructor(private readonly client: ImapFlow) {}
+  private constructor(
+    private readonly client: ImapFlow,
+    private readonly abort: ImapAbortBinding
+  ) {}
 
   static async connect(
     pool: PgPool,
     config: AppConfig,
-    account: ImapAccount
+    account: ImapAccount,
+    options: { signal?: AbortSignal } = {}
   ): Promise<SentFolderAppender> {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
     // append-only verb surface on top (ADR 0017/0022).
-    const client = await connectImap(pool, config, account);
-    return new SentFolderAppender(client);
+    const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
+    return new SentFolderAppender(client, abort);
   }
 
   /** List mailboxes so the caller can resolve the Sent folder by special-use. */
@@ -406,7 +410,7 @@ export class SentFolderAppender {
     specialUse?: string | null;
     delimiter?: string | null;
   }>> {
-    const boxes = await this.client.list();
+    const boxes = await this.abort.run(() => this.client.list());
     return boxes.map((b) => ({
       path: b.path,
       specialUse: b.specialUse ?? null,
@@ -419,7 +423,7 @@ export class SentFolderAppender {
    * provides one (else null — the next sync mirrors the copy regardless).
    */
   async append(path: string, raw: Buffer, flags: string[], date?: Date): Promise<{ uid: number | null }> {
-    const result = await this.client.append(path, raw, flags, date);
+    const result = await this.abort.run(() => this.client.append(path, raw, flags, date));
     const uid = result && typeof result === "object" && "uid" in result ? (result as { uid?: number }).uid : undefined;
     return { uid: typeof uid === "number" ? uid : null };
   }
@@ -430,21 +434,23 @@ export class SentFolderAppender {
    * create derives the same Message-ID, so a prior APPEND is found instead of duped.
    * SEARCH needs the mailbox selected, so it takes the folder lock for the search.
    */
-  async searchByMessageId(folderPath: string, rfcMessageId: string): Promise<number[]> {
-    const lock = await this.client.getMailboxLock(folderPath);
-    try {
-      const uids = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
-      return Array.isArray(uids) ? uids : [];
-    } finally {
-      lock.release();
-    }
+  searchByMessageId(folderPath: string, rfcMessageId: string): Promise<number[]> {
+    return this.abort.run(async () => {
+      const lock = await this.client.getMailboxLock(folderPath);
+      try {
+        const uids = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
+        return Array.isArray(uids) ? uids : [];
+      } finally {
+        lock.release();
+      }
+    });
   }
 
   async logout(): Promise<void> {
-    await this.client.logout();
+    await this.abort.logout();
   }
 
   close(): void {
-    this.client.close();
+    this.abort.close();
   }
 }

@@ -67,6 +67,11 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Send lock contention must raise `AccountBusyError` before delivery. Once SMTP is
   confirmed, heartbeat/unlock, SMTP transport close, APPEND, appender teardown,
   and draft-cleanup failures are warnings, never thrown retry signals.
+- Direct mailbox actions (mutations, drafts, send) accept an optional AbortSignal.
+  After abort they start no new IMAP or SMTP command, close their own IMAP client
+  (releasing its folder lock), and reject with `AbortError`. SMTP submission is
+  never interrupted, so abort cannot make delivery `unknown`; after SMTP
+  confirmation, abort only skips the Sent APPEND and draft cleanup as warnings.
 - Use session-scoped Postgres advisory locks, not transaction locks.
 - `DATABASE_URL` must be direct or session-affine. Transaction poolers are unsafe for this architecture.
 - `DATABASE_POOL_MAX` (default 10) caps Postgres connections per process. It does not change advisory-lock semantics: each pooled connection is its own session. Raise it for many concurrent accounts; keep it within a connection-capped pooler's limit.

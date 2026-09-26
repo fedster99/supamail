@@ -225,6 +225,7 @@ function mockAccountLock() {
 
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
+  const { throwIfAborted } = await import("../errors.js");
   return {
     ...actual,
     deliverSmtp: mocks.deliverSmtp,
@@ -236,12 +237,15 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
       password: "secret"
     })),
     SentFolderAppender: {
-      connect: vi.fn(async () => ({
-        list: mocks.appenderList,
-        append: mocks.appenderAppend,
-        logout: mocks.appenderLogout,
-        close: mocks.appenderClose
-      }))
+      connect: vi.fn(async (_pool: unknown, _config: unknown, _account: unknown, options?: { signal?: AbortSignal }) => {
+        throwIfAborted(options?.signal);
+        return {
+          list: mocks.appenderList,
+          append: mocks.appenderAppend,
+          logout: mocks.appenderLogout,
+          close: mocks.appenderClose
+        };
+      })
     }
   };
 });
@@ -398,6 +402,66 @@ describe("sendMessage orchestration", () => {
     expect(error.message).toMatch(/lock session lost/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.lockConfirmIrreversible).not.toHaveBeenCalled();
+  });
+
+  it("rejects with AbortError before any lookup when the signal is already aborted", async () => {
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const error = await sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    }, undefined, { signal: AbortSignal.abort() }).catch((value) => value);
+
+    expect(error.name).toBe("AbortError");
+    expect(mocks.getAccount).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+  });
+
+  it("never submits over SMTP when aborted while the account lock is acquired", async () => {
+    const abort = new AbortController();
+    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => {
+      abort.abort(new Error("lease lost"));
+      return fn(mockAccountLock());
+    });
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const error = await sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    }, undefined, { signal: abort.signal }).catch((value) => value);
+
+    // AbortError, not SmtpDeliveryError: the message was proven not submitted.
+    expect(error.name).toBe("AbortError");
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.lockConfirmIrreversible).not.toHaveBeenCalled();
+  });
+
+  it("keeps a send delivered when aborted during SMTP and skips the Sent APPEND", async () => {
+    const abort = new AbortController();
+    mocks.deliverSmtp.mockImplementationOnce(async () => {
+      abort.abort(new Error("lease lost"));
+      return { accepted: ["rcpt@example.test"], rejected: [], response: "250 queued" };
+    });
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const result = await sendMessage({} as never, config, {
+      accountId: "acc-1",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    }, undefined, { signal: abort.signal });
+
+    expect(result.delivered).toBe(true);
+    expect(result.appendedToSent).toBe(false);
+    expect(mocks.appenderAppend).not.toHaveBeenCalled();
+    expect(result.warnings.join(" ")).toMatch(/filing to Sent failed: Mailbox action aborted/);
   });
 
   it("returns delivered with a warning when liveness is lost after SMTP confirmation", async () => {
