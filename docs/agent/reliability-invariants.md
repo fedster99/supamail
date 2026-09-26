@@ -20,6 +20,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Current live and priority body coverage must derive from active `IN_WINDOW` `imap_messages` in tracked folders whose `missing_since` is NULL and whose status is neither `MISSING` nor `PENDING_VERIFICATION`, excluding provider-deleted rows. A body is complete only when `body_fetched_at` marks a successful store, its `imap_message_bodies` evidence row exists, and `raw_truncated = false`.
 - A truncated body remains incomplete coverage but must not enter an automatic retry loop. Use explicit body refetch only after correcting the cause; raise `BODY_RAW_MAX_BYTES` first when the configured cap caused truncation.
 - Progress counters live on `imap_folders` and must be updated in the same write path as the underlying header/body state they summarize. They are cumulative telemetry, not the source of truth for current live or priority body completeness.
+- A single-account sync-trust read explicitly scopes the progress view to that account so its grouped body scans need not include unrelated accounts. Keep the same row-accurate view and request snapshot; do not substitute cached completeness or change multi-account and unrestricted results.
 
 ## Conversation Threading
 
