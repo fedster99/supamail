@@ -270,7 +270,9 @@ const ATTRIBUTION_START = /^On\b/i;
 const ATTRIBUTION_END = /\bwrote:\s*$/i;
 const MAX_ATTRIBUTION_LINES = 4;
 const MIN_QUOTED_TAIL_LINES = 2;
-const REPLY_SUBJECT = /^\s*re\s*:/i;
+// A reply subject, after optional tags such as "[EXTERNAL]" or "EXT:": "RE:",
+// the German/Nordic "AW:"/"SV:", or a numbered "RE[2]:".
+const REPLY_SUBJECT = /^\s*(?:\[[^\]]*\]\s*|ext(?:ernal)?\s*:\s*)*(?:re|aw|sv)\s*(?:\[\d+\])?\s*:/i;
 const QUOTED_HEADER_FROM = /^\s*From:\s*\S/i;
 const QUOTED_HEADER_DATE = /^\s*(Sent|Date):\s*\S/i;
 const QUOTED_HEADER_SUBJECT = /^\s*Subject:/i;

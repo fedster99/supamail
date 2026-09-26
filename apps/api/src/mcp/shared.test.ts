@@ -105,6 +105,19 @@ describe("cleanBody", () => {
     }
   });
 
+  it.each(["[EXTERNAL] RE: Plan", "EXT: RE: Plan", "AW: Plan", "SV: Plan", "RE[2]: Plan", "Re : Plan"])(
+    "treats %s as a reply subject",
+    (subject) => {
+      const body = "Thanks.\n\nFrom: Alice <alice@example.com>\nSent: Friday\nTo: Bob\nSubject: Plan\n\nEarlier text.";
+      expect(cleanBody(body, { includeQuoted: false, subject }).text).toBe("Thanks.");
+    }
+  );
+
+  it.each(["[EXTERNAL] FW: RE: Plan", "Fwd: Plan", "Report: Plan"])("does not treat %s as a reply subject", (subject) => {
+    const body = "FYI\n\nFrom: Alice <alice@example.com>\nSent: Friday\nTo: Bob\nSubject: Plan\n\nEarlier text.";
+    expect(cleanBody(body, { includeQuoted: false, subject }).text).toBe(body);
+  });
+
   it("keeps Outlook header blocks in forwards, unknown subjects, and replies without authored text", () => {
     const body = "FYI\n\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: RE: Plan\n\nThe incident started here.";
     const quotedOnly = "From: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThe incident started here.";
