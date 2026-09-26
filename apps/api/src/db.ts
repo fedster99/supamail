@@ -20,6 +20,10 @@ export interface PublicMigrationManifest {
 
 let cachedPool: PgPool | null = null;
 
+export const SERVER_TCP_LIVENESS_SQL =
+  "SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; " +
+  "SET tcp_keepalives_count = 3; SET tcp_user_timeout = 60000";
+
 export function assertSessionConnectionUrl(databaseUrl: string): void {
   const lowered = databaseUrl.toLowerCase();
   const url = new URL(databaseUrl);
@@ -54,6 +58,20 @@ export function createPool(
   // restart, failover, or administrator termination) to an uncaught exception
   // and takes down the whole API/worker process. The pool has already removed
   // the failed client; log it and let the next checkout establish a new one.
+  // An abruptly vanished worker VM leaves its sessions, and their account locks,
+  // alive on the server until TCP notices (about 39 minutes with common server
+  // defaults). Server-side probes release them in about a minute, while a stalled
+  // but alive worker's kernel keeps answering, so it keeps its locks. The user
+  // timeout covers unacknowledged data, which suspends keepalive probing. These
+  // settings are no-ops on Unix sockets, where the kernel reports process exit.
+  pool.on("connect", (client) => {
+    client.query(SERVER_TCP_LIVENESS_SQL).catch((error: Error) => {
+      console.error(JSON.stringify({
+        event: "database.pool.tcp_liveness_setup_error",
+        error: { message: error.message, code: (error as NodeJS.ErrnoException).code }
+      }));
+    });
+  });
   pool.on("error", (error) => {
     console.error(JSON.stringify({
       event: "database.pool.idle_client_error",

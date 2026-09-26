@@ -16,6 +16,10 @@ Use session-scoped Postgres advisory locks as the account mutex, require direct/
 
 Unlock is also a proof obligation: `pg_advisory_unlock` must return true. A false result or query error causes `pg.Pool` to evict/destroy that client so a possibly lock-owning session is never returned to the pool.
 
+### Amendment: no live-lock takeover (2026-09)
+
+Recovery no longer terminates a lock-holding session whose heartbeat is stale. A stale heartbeat cannot distinguish a dead worker from a frozen one. A frozen worker that resumes after losing its lock could write stale mailbox state with no database fence. Instead, every pooled session sets server-side TCP keepalive and `tcp_user_timeout`. Postgres then releases the sessions of a vanished worker in about a minute, while a stalled but alive worker keeps its locks. Sync proves ownership with `assertLive` at folder and history-batch boundaries and stops on loss. Startup cleanup touches only accounts whose lock no session holds.
+
 ## Consequences
 
 - Supabase transaction pooler URLs are not supported.
@@ -24,7 +28,9 @@ Unlock is also a proof obligation: `pg_advisory_unlock` must return true. A fals
 - Worker startup fails fast if lock semantics are unsafe.
 - Provider work never starts when the initial lock heartbeat cannot be persisted.
 - Known-lost/unknown lock liveness cannot cross an irreversible boundary.
-- Long outbound sends cannot be reaped as stale while still holding a live lock.
+- No live lock holder is ever terminated; contention reports "Account lock busy".
+- Through a session pooler, server-side probes reach the pooler, so a vanished
+  worker's locks persist until the pooler drops that client.
 - Confirmed delivery is never converted into a retry signal by later heartbeat or
   unlock diagnostics.
 - Failed/false advisory unlock destroys the pool session; it cannot leave a
@@ -36,8 +42,11 @@ Unlock is also a proof obligation: `pg_advisory_unlock` must return true. A fals
 - `apps/api/src/db.ts` rejects transaction-pooler URLs and allows direct/session-pooler URLs.
 - `apps/api/src/locks.ts` implements `withAccountLock` and `runLockSelfTest`.
 - `apps/api/src/worker.ts` runs the lock self-test on startup.
-- `send.live-db.test.ts` holds a send beyond the stale threshold and proves the
-  orphan reaper leaves its periodically refreshed lock untouched.
+- `send.live-db.test.ts` holds a send beyond the stale threshold and proves its
+  heartbeat stays fresh for the whole send.
+- `sync-engine.live-db.test.ts` proves a stale-heartbeat holder and a slow live
+  sync are never taken over, lost ownership stops further folder writes, and
+  every pooled session has the TCP liveness settings.
 - The same live suite fault-injects `unlock=false`, then proves another real
   Postgres session can acquire the lock after the faulty client is evicted.
 - `pnpm test:db:live` exercises advisory lock behavior against real Postgres.

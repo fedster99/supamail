@@ -26,7 +26,7 @@ import type {
   MailboxStatus,
   MirrorImapClient
 } from "./imap-client.js";
-import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
+import { AccountLockLivenessError, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import {
@@ -454,7 +454,7 @@ export class MirrorEngine {
     let cancellationCleanupRequired = false;
     const syncOwner = `supamail:${process.pid}:${runId}`;
 
-    const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async () => {
+    const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async (lock) => {
       const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
       let accountSyncStarted = false;
       let client: MirrorImapClient | null = null;
@@ -555,6 +555,10 @@ export class MirrorEngine {
         const handledMailboxObservations: MailboxChangeObservation[] = [];
         for (const folder of folders) {
           throwIfInterrupted();
+          // Prove this session still owns the account before each folder writes
+          // anything. A worker that lost its lock (for example across a network
+          // partition) must stop rather than write over the next owner's work.
+          await lock.assertLive();
           const mailboxChange = mailboxChangeByPath.get(folder.path);
           const forceKnownReconcile = forcedReconcilePaths.has(folder.path);
           const isPriorityFolder = forceKnownReconcile
@@ -679,6 +683,7 @@ export class MirrorEngine {
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
+          await lock.assertLive();
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
@@ -696,7 +701,8 @@ export class MirrorEngine {
             client,
             lockDeadline,
             metadataWriteStats,
-            options.signal
+            options.signal,
+            lock.assertLive
           );
           throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
@@ -776,6 +782,9 @@ export class MirrorEngine {
               signal: options.signal,
               expectedSyncOwner: syncOwner
             });
+          } else if (error instanceof AccountLockLivenessError) {
+            // This worker no longer owns the account. Another worker may, so
+            // write no account state; the next owner records its own.
           } else if (error instanceof AccountAlreadyFinalizedError) {
             // Account state was already persisted (e.g. UIDVALIDITY reset limit
             // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
@@ -814,20 +823,13 @@ export class MirrorEngine {
 
     let runFinished = false;
     try {
-      let locked = await runLockedSync();
-      // Supplemental Sent and live Inbox lanes defer to the authoritative full
-      // sweep when another worker owns the Mailbox Account.
+      // A busy lock is never taken over: its owner may be frozen rather than
+      // dead, and could resume writing. Vanished workers' sessions are released
+      // by the server (see createPool). Supplemental Sent and live Inbox lanes
+      // defer to the authoritative full sweep when another worker owns the
+      // Mailbox Account.
+      const locked = await runLockedSync();
       const yieldedBeforeLock = locked === null && supplemental;
-      if (locked === null && !yieldedBeforeLock) {
-        const recovered = await clearOrphanedLockForAccount(
-          this.pool,
-          account.lock_id,
-          this.config.STALE_HEARTBEAT_MS
-        );
-        if (recovered) {
-          locked = await runLockedSync();
-        }
-      }
 
       if (cancellationCleanupRequired) {
         await this.repository.markAccountSyncYielded(account.id, {
@@ -1964,7 +1966,8 @@ export class MirrorEngine {
     client: MirrorImapClient,
     lockDeadline: number,
     metadataWriteStats: MetadataWriteStats,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    assertLive: () => Promise<void>
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
@@ -1985,6 +1988,7 @@ export class MirrorEngine {
         hitLockBudget = true;
         break;
       }
+      await assertLive();
 
       const [folder] = await this.repository.getHistoryBacklog(account, 1);
       if (!folder) break;

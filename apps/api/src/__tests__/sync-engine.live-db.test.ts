@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Client as PostgresClient, Pool as PostgresPool } from "pg";
 import { getConfig, resetConfigForTests } from "../config.js";
-import { closePool, getPool, type PgClient } from "../db.js";
-import { clearOrphanedLockForAccount, clearOrphanedLocks } from "../locks.js";
+import { SERVER_TCP_LIVENESS_SQL, closePool, createPool, getPool, type PgClient } from "../db.js";
+import { AccountLockLivenessError, clearOrphanedLocks } from "../locks.js";
 import { MirrorRepository } from "../repository.js";
 import type { FetchMessage, MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
@@ -73,6 +73,27 @@ function oneFolder(path = "INBOX", messages = 2): FixtureFolder[] {
   }];
 }
 
+function twoFolders(): FixtureFolder[] {
+  const [inbox] = oneFolder("INBOX");
+  const [archive] = oneFolder("Archive");
+  return [inbox, { ...archive, uidValidity: 42_002 }];
+}
+
+/** Runs `beforeSelect` when the sync opens a folder, before any of its writes. */
+class HookedFixtureImapClient extends FixtureImapClient {
+  constructor(
+    folders: FixtureFolder[],
+    private readonly beforeSelect: (path: string) => Promise<void>
+  ) {
+    super(folders);
+  }
+
+  override async getMailboxLock(path: string) {
+    await this.beforeSelect(path);
+    return await super.getMailboxLock(path);
+  }
+}
+
 function messageMetadata(uid: number, overrides: Partial<MessageMetadata> = {}): MessageMetadata {
   return {
     uid,
@@ -100,16 +121,6 @@ function messageMetadata(uid: number, overrides: Partial<MessageMetadata> = {}):
     providerThreadId: overrides.providerThreadId ?? null,
     providerThreadIdNamespace: overrides.providerThreadIdNamespace ?? null
   };
-}
-
-async function releaseKilledClient(client: PgClient): Promise<void> {
-  try {
-    await client.query("SELECT pg_advisory_unlock_all()");
-  } catch {
-    // The orphan-lock test intentionally terminates this backend.
-  } finally {
-    (client.release as (err?: Error | boolean) => void)(true);
-  }
 }
 
 liveDb("live DB reliability lane", () => {
@@ -282,8 +293,8 @@ liveDb("live DB reliability lane", () => {
     }
   });
 
-  it("reclaims stale advisory locks from pg_locks, closes the orphaned run, and then syncs", async () => {
-    const h = await setupIntegration("live-orphan-lock", {
+  it("never takes over a busy lock, even when its heartbeat is stale", async () => {
+    const h = await setupIntegration("live-busy-lock-no-takeover", {
       INITIAL_SYNC_BATCH_SIZE: 50,
       STALE_HEARTBEAT_MS: 1_000
     });
@@ -291,112 +302,142 @@ liveDb("live DB reliability lane", () => {
     const account = await h.repository.getAccount(h.account.id);
     if (!account) throw new Error("missing account");
 
-    const locker = await h.pool.connect();
-    locker.on("error", () => undefined);
-    await locker.query("SELECT pg_advisory_lock($1::bigint)", [account.lock_id]);
-    await h.pool.query(
-      `
-      UPDATE public.imap_accounts
-      SET currently_syncing = true,
-          sync_started_by = 'dead-worker',
-          last_heartbeat_at = now() - interval '10 minutes'
-      WHERE id = $1
-      `,
-      [h.account.id]
-    );
-    // The dead worker also left its sync run open at status='running'. Reaping the
-    // stale lock must close it, or it reads as a phantom perpetually-active sync.
-    // The run started before the worker died, so it predates the stale window.
-    const orphanRunId = await h.repository.startSyncRun(h.account.id, "manual");
-    await h.pool.query(
-      `UPDATE public.imap_sync_runs SET started_at = now() - interval '10 minutes' WHERE id = $1`,
-      [orphanRunId]
-    );
-
-    try {
-      const engine = h.buildEngine({ folders: oneFolder(), overrides: { STALE_HEARTBEAT_MS: 1_000 } });
-      const result = await engine.syncAccount(h.account.id, "manual");
-      expect(result.outcome).toBe("success");
-
-      const locks = await h.pool.query<{ count: string }>(
-        `
-        SELECT count(*)::text AS count
-        FROM pg_locks
-        WHERE locktype = 'advisory'
-          AND granted = true
-          AND objid::bigint = $1::bigint
-        `,
-        [account.lock_id]
-      );
-      expect(Number(locks.rows[0].count)).toBe(0);
-
-      const orphanRun = await h.pool.query<{
-        status: string;
-        finished_at: Date | null;
-        error: string | null;
-      }>(
-        `SELECT status, finished_at, error FROM public.imap_sync_runs WHERE id = $1`,
-        [orphanRunId]
-      );
-      expect(orphanRun.rows[0].status).toBe("failed");
-      expect(orphanRun.rows[0].finished_at).not.toBeNull();
-      expect(orphanRun.rows[0].error).toBe("WORKER_REAPED");
-    } finally {
-      await releaseKilledClient(locker);
-    }
-  });
-
-  it("does not let stale-lock recovery erase a newly acquired sync owner", async () => {
-    const h = await setupIntegration("live-orphan-lock-owner-fence", {
-      STALE_HEARTBEAT_MS: 1_000
-    });
-    activeAccountIds.push(h.account.id);
-    const account = await h.repository.getAccount(h.account.id);
-    if (!account) throw new Error("missing account");
-
-    const locker = await h.pool.connect();
-    locker.on("error", () => undefined);
-    await locker.query("SELECT pg_advisory_lock($1::bigint)", [account.lock_id]);
+    // A frozen worker looks exactly like this: its session still holds the
+    // lock, but its heartbeat stopped long ago. It may resume and keep writing,
+    // so nobody else may take the lock from it.
+    const frozenOwner = await h.pool.connect();
+    await frozenOwner.query("SELECT pg_advisory_lock($1::bigint)", [account.lock_id]);
     await h.pool.query(
       `UPDATE public.imap_accounts
        SET currently_syncing = true,
-           sync_started_by = 'dead-owner',
+           sync_started_by = 'frozen-worker',
            last_heartbeat_at = now() - interval '10 minutes'
        WHERE id = $1`,
       [h.account.id]
     );
-
-    const reaperPool = {
-      query: vi.fn(async (query: string, params: unknown[] = []) => {
-        const result = await h.pool.query(query, params);
-        if (query.includes("pg_terminate_backend")) {
-          await h.repository.markAccountSyncStarted(h.account.id, "new-owner");
-        }
-        return result;
-      })
-    } as unknown as typeof h.pool;
+    const frozenRunId = await h.repository.startSyncRun(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_sync_runs SET started_at = now() - interval '10 minutes' WHERE id = $1`,
+      [frozenRunId]
+    );
 
     try {
-      await expect(clearOrphanedLockForAccount(
-        reaperPool,
-        account.lock_id,
-        1_000
-      )).resolves.toBe(true);
+      const engine = h.buildEngine({ folders: oneFolder(), overrides: { STALE_HEARTBEAT_MS: 1_000 } });
+      const busy = await engine.syncAccount(h.account.id, "manual");
+      expect(busy.outcome).toBe("failed");
+      expect(busy.errors).toEqual(["Account lock busy"]);
+      await expect(clearOrphanedLocks(h.pool, 1_000)).resolves.toEqual({ accountsReset: 0, runsClosed: 0 });
 
-      const state = await h.pool.query<{
-        currently_syncing: boolean;
-        sync_started_by: string | null;
-      }>(
-        "SELECT currently_syncing, sync_started_by FROM public.imap_accounts WHERE id = $1",
+      const owner = await frozenOwner.query<{ alive: number }>("SELECT 1 AS alive");
+      expect(owner.rows[0].alive).toBe(1);
+      const state = await h.pool.query<{ sync_started_by: string | null; messages: string }>(
+        `SELECT a.sync_started_by,
+                (SELECT count(*)::text FROM public.imap_messages m WHERE m.account_id = a.id) AS messages
+         FROM public.imap_accounts a WHERE a.id = $1`,
         [h.account.id]
       );
-      expect(state.rows[0]).toEqual({
-        currently_syncing: true,
-        sync_started_by: "new-owner"
-      });
+      expect(state.rows[0]).toEqual({ sync_started_by: "frozen-worker", messages: "0" });
     } finally {
-      await releaseKilledClient(locker);
-      await h.repository.markAccountSyncYielded(h.account.id);
+      await frozenOwner.query("SELECT pg_advisory_unlock_all()");
+      frozenOwner.release();
+    }
+
+    // Once the owner's session is gone, startup cleanup closes its run and a
+    // new sync proceeds normally.
+    await expect(clearOrphanedLocks(h.pool, 1_000)).resolves.toEqual({ accountsReset: 1, runsClosed: 1 });
+    const orphanRun = await h.pool.query<{ status: string; error: string | null }>(
+      "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
+      [frozenRunId]
+    );
+    expect(orphanRun.rows[0]).toEqual({ status: "failed", error: "WORKER_REAPED" });
+    const engine = h.buildEngine({ folders: oneFolder(), overrides: { STALE_HEARTBEAT_MS: 1_000 } });
+    await expect(engine.syncAccount(h.account.id, "manual")).resolves.toMatchObject({ outcome: "success" });
+  });
+
+  it("leaves a slow live sync alone however stale its heartbeat looks", async () => {
+    const h = await setupIntegration("live-slow-sync-not-taken-over", { STALE_HEARTBEAT_MS: 500 });
+    activeAccountIds.push(h.account.id);
+    let contender: Awaited<ReturnType<ReturnType<typeof h.buildEngine>["syncAccount"]>> | null = null;
+    const engine = h.buildEngine({
+      folders: oneFolder(),
+      clientFactory: async () => new HookedFixtureImapClient(oneFolder(), async () => {
+        // One folder operation outlasts the stale threshold several times over.
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        contender = await h.buildEngine({ folders: oneFolder() }).syncAccount(h.account.id, "manual");
+      })
+    });
+
+    await expect(timeout(engine.syncAccount(h.account.id, "manual"), "slow sync", 15_000))
+      .resolves.toMatchObject({ outcome: "success" });
+    expect(contender).toMatchObject({ outcome: "failed", errors: ["Account lock busy"] });
+  });
+
+  it("stops before the next folder writes once the account lock is lost", async () => {
+    const h = await setupIntegration("live-lost-lock-stops-writes", { STALE_HEARTBEAT_MS: 60_000 });
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    const before = await h.pool.query<{ sync_state: string; consecutive_failures: number }>(
+      "SELECT sync_state, consecutive_failures FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+
+    // Without a listener the terminated lock session crashes the process, which
+    // also stops its writes. Prove the engine stops even when the process survives.
+    const survive = (client: PgClient) => client.on("error", () => undefined);
+    h.pool.on("acquire", survive);
+    const engine = h.buildEngine({
+      folders: twoFolders(),
+      clientFactory: async () => new HookedFixtureImapClient(twoFolders(), async (path) => {
+        if (path !== "INBOX") return;
+        // Model the lock being released under a live sync, as a server-side
+        // session loss would. Writes already under way may land; nothing after.
+        await h.pool.query(
+          `SELECT pg_terminate_backend(pid)
+           FROM pg_locks
+           WHERE locktype = 'advisory' AND granted AND objid::bigint = $1::bigint`,
+          [account.lock_id]
+        );
+      })
+    });
+
+    try {
+      await expect(timeout(engine.syncAccount(h.account.id, "manual"), "lost-lock sync", 15_000))
+        .rejects.toBeInstanceOf(AccountLockLivenessError);
+    } finally {
+      h.pool.removeListener("acquire", survive);
+    }
+    const archived = await h.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_messages WHERE account_id = $1 AND folder_path = 'Archive'",
+      [h.account.id]
+    );
+    expect(archived.rows[0].count).toBe("0");
+    const after = await h.pool.query<{ sync_state: string; consecutive_failures: number }>(
+      "SELECT sync_state, consecutive_failures FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(after.rows[0]).toEqual(before.rows[0]);
+  });
+
+  it("configures server-side TCP liveness on every pooled session", async () => {
+    const pool = createPool({ DATABASE_URL: process.env.DATABASE_URL!, DATABASE_POOL_MAX: 2 });
+    try {
+      const clients = await Promise.all([pool.connect(), pool.connect()]);
+      try {
+        for (const client of clients) {
+          const settings = await client.query(`SELECT
+            current_setting('tcp_keepalives_idle') AS idle,
+            current_setting('tcp_keepalives_interval') AS interval,
+            current_setting('tcp_keepalives_count') AS count,
+            current_setting('tcp_user_timeout') AS user_timeout`);
+          expect(settings.rows[0]).toEqual({ idle: "30", interval: "10", count: "3", user_timeout: "60000" });
+        }
+      } finally {
+        for (const client of clients) client.release();
+      }
+      expect(SERVER_TCP_LIVENESS_SQL).not.toMatch(/idle_session_timeout/);
+    } finally {
+      await pool.end();
     }
   });
 
@@ -454,9 +495,8 @@ liveDb("live DB reliability lane", () => {
 
     const sweep = await clearOrphanedLocks(h.pool, 1_000);
 
-    // The sweep reports what it reaped, so a SIGKILL/OOM (no pg_locks PID to
-    // terminate) is still observable at startup rather than silent.
-    expect(sweep.terminatedBackends).toBe(0);
+    // The sweep reports what it reaped, so a SIGKILL/OOM is still observable at
+    // startup rather than silent.
     expect(sweep.accountsReset).toBe(1);
     expect(sweep.runsClosed).toBe(1);
 

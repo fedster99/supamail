@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import type { AppConfig } from "../config.js";
 import { closePool, getPool, type PgClient } from "../db.js";
 import { AccountBusyError } from "../errors.js";
-import { clearOrphanedLockForAccount, withAccountLock } from "../locks.js";
+import { withAccountLock } from "../locks.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
 const liveDb = LIVE_DB_AVAILABLE ? describe : describe.skip;
@@ -210,7 +210,7 @@ liveDb("send account lock (live DB)", () => {
     expect(await anotherSessionCanAcquireLock()).toBe(true);
   });
 
-  it("refreshes the heartbeat for the full send so stale-lock recovery cannot reap it", async () => {
+  it("refreshes the heartbeat for the full send so it never looks abandoned", async () => {
     let releaseDelivery: () => void = () => undefined;
     const deliveryMayFinish = new Promise<void>((resolve) => {
       releaseDelivery = resolve;
@@ -236,7 +236,12 @@ liveDb("send account lock (live DB)", () => {
     await deliveryStarted;
     try {
       await new Promise((resolve) => setTimeout(resolve, config.STALE_HEARTBEAT_MS * 2));
-      expect(await clearOrphanedLockForAccount(pool, lockId, config.STALE_HEARTBEAT_MS)).toBe(false);
+      const heartbeat = await pool.query<{ fresh: boolean }>(
+        `SELECT last_heartbeat_at > now() - ($2::bigint * interval '1 millisecond') AS fresh
+         FROM public.imap_accounts WHERE lock_id = $1`,
+        [lockId, config.STALE_HEARTBEAT_MS]
+      );
+      expect(heartbeat.rows[0].fresh).toBe(true);
       expect(await anotherSessionCanAcquireLock()).toBe(false);
     } finally {
       releaseDelivery();

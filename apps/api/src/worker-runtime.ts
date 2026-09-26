@@ -457,10 +457,9 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
 
   const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
   if (stopping) return finishStoppedRuntime();
-  if (sweep.terminatedBackends > 0 || sweep.accountsReset > 0 || sweep.runsClosed > 0) {
+  if (sweep.accountsReset > 0 || sweep.runsClosed > 0) {
     console.warn(JSON.stringify({
       event: "worker.orphaned_locks_cleared",
-      terminatedBackends: sweep.terminatedBackends,
       accountsReset: sweep.accountsReset,
       runsClosed: sweep.runsClosed
     }));
