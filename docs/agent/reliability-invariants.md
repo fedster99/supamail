@@ -107,6 +107,8 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder. An Inbox `EXPUNGE` wake or a tracked non-Inbox dirty signal may force this reconcile earlier; folders without a dirty signal keep the normal cadence.
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.
+  - The round-robin cursor indexes the full eligible non-priority folder list. Due-time changes must not shift its position; skip not-due folders after rotation and advance past selected ordinary work even if that work later fails. Preferred discovery slots must not skip ordinary folders that were not selected.
+  - After selection and cursor advancement, execute ordinary selected folders in oldest reconcile-due order. Fixed positions inside recurring batches must not monopolize the smaller reconcile budget. Priority folders and preferred discovery work stay first; folder and reconcile budgets are unchanged.
   - Inbox remains first in bounded full-sweep priority selection. Sent stays at priority 5 and receives a supplemental lightweight refresh on its separate cadence.
   - Sent discovery accepts RFC SPECIAL-USE or an exact conventional Sent leaf name. A folder that only contains the letters `sent`, such as `Consent`, must stay in the normal lane.
   - Body fetch is capped at up to 100 live bodies per worker tick.
