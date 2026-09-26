@@ -189,6 +189,8 @@ export interface CleanBodyOptions {
   includeQuoted: boolean;
   maxChars?: number;
   offset?: number;
+  /** The message's own subject. A reply subject lets Outlook-style quoted headers end the body. */
+  subject?: string | null;
 }
 
 /**
@@ -219,7 +221,8 @@ export function mapMessageRow(
   const cleaned = cleanBody(rawBody, {
     includeQuoted: opts.includeQuoted,
     maxChars: opts.maxChars,
-    offset: opts.offset
+    offset: opts.offset,
+    subject: row.subject
   });
   // `body_truncated` below describes only an explicitly requested response range.
   // Sync's raw-source limit is a separate completeness signal, even when parsing
@@ -267,14 +270,21 @@ const ATTRIBUTION_START = /^On\b/i;
 const ATTRIBUTION_END = /\bwrote:\s*$/i;
 const MAX_ATTRIBUTION_LINES = 4;
 const MIN_QUOTED_TAIL_LINES = 2;
+const REPLY_SUBJECT = /^\s*re\s*:/i;
+const QUOTED_HEADER_FROM = /^\s*From:\s*\S/i;
+const QUOTED_HEADER_DATE = /^\s*(Sent|Date):\s*\S/i;
+const QUOTED_HEADER_SUBJECT = /^\s*Subject:/i;
+const QUOTED_HEADER_SEPARATOR = /^\s*(-{3,}\s*Original Message\s*-{3,}|_{10,})\s*$/i;
+const MAX_QUOTED_HEADER_LINES = 8;
 
 /**
  * Clean a plain-text body for an agent. `body_text` is already HTML-stripped
  * (ADR 0015). When `includeQuoted=false` (the default for read tools) we drop the
  * quoted reply tail introduced by a recognized attribution or trailing
  * quote-only block. It also drops a trailing signature after a `-- ` delimiter.
- * Ambiguous Outlook and Original Message blocks stay intact because email
- * clients use the same shape for forwarded content. It returns the full cleaned
+ * Outlook and Original Message header blocks end the body only when the
+ * message's own subject is a reply; a forward uses the same shape for new
+ * evidence, so it and messages without a known subject stay intact. It returns the full cleaned
  * body unless the caller explicitly supplies `maxChars`. No heavy markdown conversion.
  */
 export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBodyResult {
@@ -298,7 +308,7 @@ export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBod
   let working = text.replace(/\r\n?/g, "\n");
   const omissions: BodyContentOmission[] = [];
   if (!opts.includeQuoted) {
-    const withoutQuotedTail = stripQuotedTail(working);
+    const withoutQuotedTail = stripQuotedTail(working, REPLY_SUBJECT.test(opts.subject ?? ""));
     if (withoutQuotedTail !== working) omissions.push("quoted_reply_tail");
     working = withoutQuotedTail;
     const withoutSignature = stripSignature(working);
@@ -363,7 +373,7 @@ function sliceCodePoints(
  * Forwarded-message separators are intentionally not boundaries because a
  * forward can be new evidence rather than a duplicate thread tail.
  */
-function stripQuotedTail(text: string): string {
+function stripQuotedTail(text: string, isReply: boolean): string {
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     if (
@@ -372,8 +382,25 @@ function stripQuotedTail(text: string): string {
     ) {
       return lines.slice(0, i).join("\n");
     }
+    if (isReply && isQuotedHeaderBoundary(lines, i)) {
+      let end = i;
+      while (end > 0 && lines[end - 1].trim() === "") end--;
+      if (end > 0 && QUOTED_HEADER_SEPARATOR.test(lines[end - 1])) end--;
+      // A reply with no authored text before the block keeps its content.
+      if (lines.slice(0, end).some((line) => line.trim() !== "")) {
+        return lines.slice(0, end).join("\n");
+      }
+    }
   }
   return text;
+}
+
+/** Match an Outlook-style `From:` / `Sent:` or `Date:` / `Subject:` quoted header block. */
+function isQuotedHeaderBoundary(lines: string[], start: number): boolean {
+  if (!QUOTED_HEADER_FROM.test(lines[start])) return false;
+  const block = lines.slice(start + 1, start + MAX_QUOTED_HEADER_LINES);
+  const subjectAt = block.findIndex((line) => QUOTED_HEADER_SUBJECT.test(line));
+  return subjectAt > 0 && block.slice(0, subjectAt).some((line) => QUOTED_HEADER_DATE.test(line));
 }
 
 /** Match one-line and conservatively wrapped `On ... wrote:` attributions. */
