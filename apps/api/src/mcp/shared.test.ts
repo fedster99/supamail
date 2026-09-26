@@ -92,6 +92,28 @@ describe("cleanBody", () => {
     expect(cleanBody(originalMessage, { includeQuoted: false }).text).toBe(originalMessage);
   });
 
+  it("ends a reply at an Outlook quoted header block", () => {
+    const mac = "Hi Paul,\n\nNotes attached.\n\nFrom: Paul <paul@example.com>\nDate: Monday, August 31, 2026 at 8:22 PM\nTo: Namuka <n@example.com>\nCc: Team <t@example.com>\nSubject: Re: Next steps\n\nWhat was the outcome?";
+    const windows = "Thanks.\n\n________________________________\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: RE: Plan\n\nThe incident started here.";
+    const original = "Agreed.\n\n-----Original Message-----\nFrom: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThe incident started here.";
+
+    for (const [body, authored] of [[mac, "Hi Paul,\n\nNotes attached."], [windows, "Thanks."], [original, "Agreed."]]) {
+      const out = cleanBody(body, { includeQuoted: false, subject: "RE: Plan" });
+      expect(out.text).toBe(authored);
+      expect(out.omissions).toEqual(["quoted_reply_tail"]);
+      expect(cleanBody(body, { includeQuoted: true, subject: "RE: Plan" }).text).toBe(body);
+    }
+  });
+
+  it("keeps Outlook header blocks in forwards, unknown subjects, and replies without authored text", () => {
+    const body = "FYI\n\nFrom: Alice <alice@example.com>\nSent: Friday, August 1, 2026 10:00\nTo: Bob <bob@example.com>\nSubject: RE: Plan\n\nThe incident started here.";
+    const quotedOnly = "From: Alice\nSent: Friday\nTo: Bob\nSubject: Plan\n\nThe incident started here.";
+
+    expect(cleanBody(body, { includeQuoted: false, subject: "FW: RE: Plan" }).text).toBe(body);
+    expect(cleanBody(body, { includeQuoted: false }).text).toBe(body);
+    expect(cleanBody(quotedOnly, { includeQuoted: false, subject: "Re: Plan" }).text).toBe(quotedOnly);
+  });
+
   it("reports a removed signature", () => {
     const out = cleanBody("New answer.\n-- \nAlice", { includeQuoted: false });
     expect(out.text).toBe("New answer.");
