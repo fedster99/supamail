@@ -5673,6 +5673,161 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     expect(after.rows[0].count).toBe("1");
   });
+
+  describe("provider proof that folders are unchanged", () => {
+    const PROOF = { IMAP_LIST_STATUS_ENABLED: true };
+    const archivePaths = ["Archive-003", "Archive-004"];
+
+    async function setupProofMailbox(suite: string) {
+      const h = await setupIntegration(suite, PROOF);
+      activeAccountIds.push(h.account.id);
+      const folders = buildEmptyFolders(4);
+      await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+      // Every folder was last exactly synced and audited seven hours ago with a
+      // deletion-complete cursor, and none is due for work in this pass.
+      await h.pool.query(
+        `UPDATE public.imap_folders
+         SET status = 'ACTIVE',
+             initial_sync_complete = true,
+             uid_next = 10,
+             highest_modseq = 500,
+             qresync_highest_modseq = 500,
+             last_reconcile_clean = true,
+             last_synced_at = now() - interval '7 hours',
+             last_full_reconcile_at = now() - interval '7 hours',
+             next_sync_due_at = now() + interval '1 hour',
+             next_reconcile_at = now() + interval '1 hour',
+             next_flag_scan_at = now() + interval '1 hour'
+         WHERE account_id = $1 AND tracked = true`,
+        [h.account.id]
+      );
+      await h.pool.query(
+        `UPDATE public.imap_accounts
+         SET next_folder_discovery_at = now() + interval '1 hour'
+         WHERE id = $1`,
+        [h.account.id]
+      );
+      const uidValidityByPath = new Map(folders.map((folder) => [folder.path, folder.uidValidity]));
+      const clientWith = (
+        statuses: (path: string) => { uidNext: number; highestModseq: bigint } | null | "throw"
+      ) => async () => {
+        const client = new FixtureImapClient(folders);
+        const calls: string[][] = [];
+        Object.assign(client, {
+          capabilities: new Map<string, boolean>([["LIST-STATUS", true], ["QRESYNC", true]]),
+          async listWithStatus(_query: Record<string, boolean>, patterns: readonly string[]) {
+            calls.push([...patterns]);
+            const expanded = patterns.includes("*") ? folders.map((folder) => folder.path) : patterns;
+            return expanded.flatMap((path) => {
+              const status = statuses(path);
+              if (status === "throw") throw new Error("LIST-STATUS failed");
+              return status ? [{ path, uidValidity: uidValidityByPath.get(path)!, ...status }] : [];
+            });
+          }
+        });
+        proofCalls.push(calls);
+        return client;
+      };
+      const proofCalls: string[][][] = [];
+      return { h, clientWith, proofCalls };
+    }
+
+    async function folderState(h: Awaited<ReturnType<typeof setupIntegration>>, path: string) {
+      return (await h.pool.query<{
+        last_verified_unchanged_at: Date | null;
+        last_synced_at: Date;
+        last_full_reconcile_at: Date;
+        next_reconcile_at: Date;
+      }>(
+        `SELECT last_verified_unchanged_at, last_synced_at, last_full_reconcile_at, next_reconcile_at
+         FROM public.imap_folders WHERE account_id = $1 AND path = $2`,
+        [h.account.id, path]
+      )).rows[0];
+    }
+
+    it("counts proven-unchanged non-priority folders as current without moving the audit schedule", async () => {
+      const { h, clientWith } = await setupProofMailbox("unchanged-proof-health");
+      const before = await folderState(h, "Archive-003");
+      const unchanged = (path: string) => (
+        archivePaths.includes(path) ? { uidNext: 10, highestModseq: 500n } : null
+      );
+
+      const result = await h.buildEngine({
+        folders: [],
+        clientFactory: clientWith(unchanged)
+      }).syncAccount(h.account.id, "scheduled");
+
+      expect(result.outcome).toBe("success");
+      const after = await folderState(h, "Archive-003");
+      expect(after.last_verified_unchanged_at).not.toBeNull();
+      expect(after.last_synced_at).toEqual(before.last_synced_at);
+      expect(after.last_full_reconcile_at).toEqual(before.last_full_reconcile_at);
+      expect(after.next_reconcile_at).toEqual(before.next_reconcile_at);
+      // Priority folders get no proof credit and keep their strict windows.
+      const priorityHealth = await accountHealthSnapshot(h.pool, h.account.id);
+      expect(priorityHealth.sync_state).toBe("DEGRADED");
+      expect(priorityHealth.sync_state_reason).toMatch(/^PRIORITY_/);
+
+      await h.pool.query(
+        `UPDATE public.imap_folders
+         SET last_synced_at = now(), last_full_reconcile_at = now()
+         WHERE account_id = $1 AND sync_priority <= $2`,
+        [h.account.id, h.config.PRIORITY_CUTOFF]
+      );
+      await h.repository.markAccountSyncSucceeded(h.account.id);
+      expect(await accountHealthSnapshot(h.pool, h.account.id)).toMatchObject({
+        sync_state: "HEALTHY",
+        sync_state_reason: null
+      });
+    });
+
+    it("does not prove a folder whose provider state moved or whose last audit was unclean", async () => {
+      const { h, clientWith } = await setupProofMailbox("unchanged-proof-mismatch");
+      await h.pool.query(
+        `UPDATE public.imap_folders
+         SET last_synced_at = now(), last_full_reconcile_at = now()
+         WHERE account_id = $1 AND sync_priority <= $2`,
+        [h.account.id, h.config.PRIORITY_CUTOFF]
+      );
+      await h.pool.query(
+        `UPDATE public.imap_folders SET last_reconcile_clean = false
+         WHERE account_id = $1 AND path = 'Archive-004'`,
+        [h.account.id]
+      );
+      const modseqMoved = (path: string) => (
+        path === "Archive-003" ? { uidNext: 10, highestModseq: 501n }
+          : path === "Archive-004" ? { uidNext: 10, highestModseq: 500n }
+          : null
+      );
+
+      await h.buildEngine({ folders: [], clientFactory: clientWith(modseqMoved) })
+        .syncAccount(h.account.id, "scheduled");
+
+      expect((await folderState(h, "Archive-003")).last_verified_unchanged_at).toBeNull();
+      expect((await folderState(h, "Archive-004")).last_verified_unchanged_at).toBeNull();
+      expect(await accountHealthSnapshot(h.pool, h.account.id)).toMatchObject({
+        sync_state: "DEGRADED",
+        sync_state_reason: "OVERALL_RECONCILE_STALE"
+      });
+    });
+
+    it("keeps sync successful when the proof command fails and skips supplemental passes", async () => {
+      const { h, clientWith, proofCalls } = await setupProofMailbox("unchanged-proof-optional");
+
+      const failed = await h.buildEngine({ folders: [], clientFactory: clientWith(() => "throw") })
+        .syncAccount(h.account.id, "scheduled");
+      expect(failed.outcome).toBe("success");
+      expect((await folderState(h, "Archive-003")).last_verified_unchanged_at).toBeNull();
+
+      const live = await h.buildEngine({
+        folders: [],
+        clientFactory: clientWith(() => ({ uidNext: 10, highestModseq: 500n }))
+      }).syncAccount(h.account.id, "scheduled", { liveInboxOnly: true });
+      expect(live.outcome).toBe("success");
+      expect(proofCalls.at(-1)).toEqual([]);
+      expect((await folderState(h, "Archive-003")).last_verified_unchanged_at).toBeNull();
+    });
+  });
 });
 
 // Helpful diagnostic when the suite is silently skipped.

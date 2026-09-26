@@ -1235,14 +1235,18 @@ export class MirrorRepository {
                 OR last_full_reconcile_at < now() - ($6::bigint * interval '1 millisecond')
               )
           ) AS priority_reconcile_unhealthy_count,
+          -- Non-priority folders may count provider proof that nothing changed
+          -- since a clean deletion-complete pass. Priority folders keep the
+          -- strict exact-audit window above.
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
               AND missing_since IS NULL
               AND (
                 last_reconcile_clean IS DISTINCT FROM true
-                OR last_full_reconcile_at IS NULL
-                OR last_full_reconcile_at < now() - ($7::bigint * interval '1 millisecond')
+                OR greatest(last_full_reconcile_at, last_verified_unchanged_at) IS NULL
+                OR greatest(last_full_reconcile_at, last_verified_unchanged_at)
+                  < now() - ($7::bigint * interval '1 millisecond')
               )
           ) AS overall_reconcile_unhealthy_count,
           max(extract(epoch from (now() - last_synced_at))) FILTER (
@@ -1252,7 +1256,9 @@ export class MirrorRepository {
               AND sync_priority <= $3
               AND last_synced_at IS NOT NULL
           ) AS priority_lag_seconds,
-          max(extract(epoch from (now() - last_synced_at))) FILTER (
+          max(extract(epoch from (
+            now() - greatest(last_synced_at, last_verified_unchanged_at)
+          ))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
               AND missing_since IS NULL
@@ -2350,6 +2356,51 @@ export class MirrorRepository {
     if (result.rows.length !== 1) {
       throw new Error(`Initial sync live head lost folder generation ${folderId}`);
     }
+  }
+
+  /**
+   * Record provider proof that tracked folders did not change since their last
+   * deletion-complete pass. The proof holds only when UIDVALIDITY, UIDNEXT, and
+   * HIGHESTMODSEQ still equal the stored cursors, the stored flag and QRESYNC
+   * cursors agree, and the last exact audit was clean. It never moves
+   * last_synced_at, last_full_reconcile_at, or any due time.
+   */
+  async markFoldersVerifiedUnchanged(
+    accountId: string,
+    statuses: readonly { path: string; uidValidity: string; uidNext: string; highestModseq: string }[],
+    options: SyncStateWriteOptions = {}
+  ): Promise<string[]> {
+    if (statuses.length === 0) return [];
+    const result = await runOptionalDeadlineWrite<{ path: string }>(
+      this.pool,
+      `
+      UPDATE public.imap_folders AS folder
+      SET last_verified_unchanged_at = now()
+      FROM unnest($2::text[], $3::bigint[], $4::bigint[], $5::numeric[])
+        AS observed(path, uidvalidity, uid_next, highest_modseq)
+      WHERE folder.account_id = $1
+        AND folder.path = observed.path
+        AND folder.tracked = true
+        AND folder.status = 'ACTIVE'
+        AND folder.missing_since IS NULL
+        AND folder.initial_sync_complete = true
+        AND folder.last_reconcile_clean = true
+        AND folder.uidvalidity = observed.uidvalidity
+        AND folder.uid_next = observed.uid_next
+        AND folder.highest_modseq = observed.highest_modseq
+        AND folder.qresync_highest_modseq = observed.highest_modseq
+      RETURNING folder.path
+      `,
+      [
+        accountId,
+        statuses.map((status) => status.path),
+        statuses.map((status) => status.uidValidity),
+        statuses.map((status) => status.uidNext),
+        statuses.map((status) => status.highestModseq)
+      ],
+      options
+    );
+    return result.rows.map((row) => row.path);
   }
 
   async markFolderSynced(folderId: string, patch: {

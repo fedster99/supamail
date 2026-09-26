@@ -54,6 +54,7 @@ import { createImapClient } from "./imap-client.js";
 // a missed auth error means burning through retries on bad creds).
 const HISTORY_METADATA_COMMIT_GRACE_MS = 30_000;
 const SYNC_STATE_WRITE_GRACE_MS = 30_000;
+const UNCHANGED_PROOF_QUERY = { uidValidity: true, uidNext: true, highestModseq: true } as const;
 const SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS = 1_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
 
@@ -521,6 +522,9 @@ export class MirrorEngine {
           && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
           newlyTrackedFolderPaths = await this.discoverFolders(account, client);
         }
+        if (!supplemental) {
+          await this.recordUnchangedFolders(account, client, options.signal);
+        }
 
         const folders = options.bodyBacklogOnly
           ? []
@@ -891,6 +895,67 @@ export class MirrorEngine {
   private shouldDiscoverFolders(account: ImapAccount): boolean {
     if (!account.next_folder_discovery_at) return true;
     return new Date(account.next_folder_discovery_at).getTime() <= Date.now();
+  }
+
+  /**
+   * One LIST-STATUS command proves which tracked folders did not change since
+   * their last deletion-complete pass. The proof only feeds non-priority
+   * health; folder selection, sync, and the exact audit schedule are unchanged.
+   * A rejected, partial, or failed command proves nothing and never fails sync.
+   */
+  private async recordUnchangedFolders(
+    account: ImapAccount,
+    client: MirrorImapClient,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (!this.config.IMAP_LIST_STATUS_ENABLED
+      || !client.listWithStatus
+      || !client.capabilities?.has("LIST-STATUS")
+      || !client.capabilities.has("QRESYNC")) {
+      return;
+    }
+    // LIST patterns cannot escape "*" or "%", so such names are never probed.
+    const paths = (await this.repository.getTrackedFoldersForWake(account.id))
+      .filter((folder) => folder.qresync_highest_modseq !== null
+        && folder.last_reconcile_clean === true
+        && !/[*%]/.test(folder.path))
+      .map((folder) => folder.path);
+    if (paths.length === 0) return;
+    const tracked = new Set(paths);
+    const statuses = new Map<string, MailboxStatus>();
+    try {
+      for (const status of await client.listWithStatus(UNCHANGED_PROOF_QUERY, paths)) {
+        if (tracked.has(status.path)) statuses.set(status.path, status);
+      }
+      // Some servers answer a pattern list with only its first match.
+      if (statuses.size < tracked.size) {
+        for (const status of await client.listWithStatus(UNCHANGED_PROOF_QUERY, ["*"])) {
+          if (tracked.has(status.path) && !statuses.has(status.path)) statuses.set(status.path, status);
+        }
+      }
+    } catch (error) {
+      if (signal?.aborted || client.usable === false) throw error;
+      return;
+    }
+    const proofs = [...statuses.values()].flatMap((status) => (
+      status.uidNext === undefined || status.highestModseq === undefined
+        ? []
+        : [{
+            path: status.path,
+            uidValidity: String(status.uidValidity),
+            uidNext: String(status.uidNext),
+            highestModseq: String(status.highestModseq)
+          }]
+    ));
+    const verified = await this.repository.markFoldersVerifiedUnchanged(account.id, proofs, {
+      deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
+      signal
+    });
+    await this.repository.logEvent(account.id, null, null, null, null, "FOLDERS_VERIFIED_UNCHANGED", {
+      probed: paths.length,
+      answered: proofs.length,
+      verified: verified.length
+    });
   }
 
   private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<string[]> {

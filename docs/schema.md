@@ -48,6 +48,12 @@ The migration also rejects exact-match tokens that have no opaque envelope.
 It advances only after deletion-complete replay or an exact UID reconciliation,
 so flag-only CONDSTORE scans cannot move QRESYNC past unseen VANISHED history.
 
+`0027_folder_unchanged_proof` adds nullable `imap_folders.last_verified_unchanged_at`.
+A scheduled pass sets it when one LIST-STATUS answer proves the folder still
+matches its stored flag and deletion-complete QRESYNC cursors after a clean
+audit. Only non-priority health reads it; sync and audit timestamps and due
+times are unchanged.
+
 `0026_threading_closure_edges` normalizes each assignment's conversation,
 delivery, reference, provider-thread, and delivery-fingerprint keys into
 `imap_thread_closure_edges`. A run-scoped composite index lets closure expansion

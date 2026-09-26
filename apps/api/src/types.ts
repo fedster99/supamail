@@ -139,6 +139,7 @@ export interface ImapFolder {
   uid_next: string | null;
   highest_modseq: string | null;
   qresync_highest_modseq: string | null;
+  last_verified_unchanged_at?: Date | null;
   last_uid: string | null;
   last_synced_at: Date | null;
   initial_sync_complete: boolean;
