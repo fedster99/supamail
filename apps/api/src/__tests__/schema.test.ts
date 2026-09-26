@@ -60,6 +60,10 @@ const qresyncCursorMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0025_qresync_cursor.sql"
 );
+const folderUnchangedProofMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0027_folder_unchanged_proof.sql"
+);
 const threadingClosureEdgesMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0026_threading_closure_edges.sql"
@@ -194,9 +198,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0026_threading_closure_edges");
+    expect(version).toBe("0027_folder_unchanged_proof");
     expect(manifest).toEqual({
-      schemaVersion: "0026_threading_closure_edges",
+      schemaVersion: "0027_folder_unchanged_proof",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -223,7 +227,8 @@ describe("initial schema", () => {
         { id: "0023_metadata_protection_seam", file: "0023_metadata_protection_seam.sql" },
         { id: "0024_metadata_protection_mode", file: "0024_metadata_protection_mode.sql" },
         { id: "0025_qresync_cursor", file: "0025_qresync_cursor.sql" },
-        { id: "0026_threading_closure_edges", file: "0026_threading_closure_edges.sql" }
+        { id: "0026_threading_closure_edges", file: "0026_threading_closure_edges.sql" },
+        { id: "0027_folder_unchanged_proof", file: "0027_folder_unchanged_proof.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -272,6 +277,13 @@ describe("initial schema", () => {
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_closure_edges FROM PUBLIC");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_closure_edges FROM anon");
     expect(sql).toContain("REVOKE ALL ON TABLE public.imap_thread_closure_edges FROM authenticated");
+  });
+
+  it("records provider-proven unchanged folders without touching sync or audit timestamps", async () => {
+    const sql = await readFile(folderUnchangedProofMigrationPath, "utf8");
+
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_verified_unchanged_at timestamptz");
+    expect(sql).not.toMatch(/last_synced_at\s*=|last_full_reconcile_at\s*=/);
   });
 
   it("adds a deletion-complete cursor that is separate from CONDSTORE", async () => {

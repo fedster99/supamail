@@ -168,7 +168,7 @@ All account-scoped IMAP work goes through the account advisory lock. `sendMessag
 
 ### Health, Backoff, And Retention
 
-Health is a reliability statement, not a cosmetic status. `HEALTHY` requires completed initial sync, fresh priority folders, acceptable overall lag, and recent clean reconciles. `DEGRADED` is the correct state for drift, priority lag, missing folders, UIDVALIDITY resync, or incremental timeout. `BROKEN` is for non-retryable auth failure and pathological repeated failures.
+Health is a reliability statement, not a cosmetic status. `HEALTHY` requires completed initial sync, fresh priority folders, acceptable overall lag, and recent clean reconciles. For non-priority folders only, recent provider proof of no change since a clean deletion-complete pass counts as fresh and as recently reconciled; priority folders always need their own sync and exact audit. `DEGRADED` is the correct state for drift, priority lag, missing folders, UIDVALIDITY resync, or incremental timeout. `BROKEN` is for non-retryable auth failure and pathological repeated failures.
 
 Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge is limited to strict trapdoor reasons and must not purge `RECONCILE_MISSING` rows.
 
