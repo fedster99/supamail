@@ -49,7 +49,13 @@ vi.mock("../crypto.js", () => ({
   decryptPassword: decrypt
 }));
 
-const { connectImap, uidValidityMatches, uidValidityMismatchMessage } = await import("../imap-connect.js");
+const {
+  connectAbortableImap,
+  connectImap,
+  ImapAbortBinding,
+  uidValidityMatches,
+  uidValidityMismatchMessage
+} = await import("../imap-connect.js");
 
 const config = {
   IMAP_ENCRYPTION_KEY: "0123456789abcdef",
@@ -193,6 +199,57 @@ describe("connectImap (the one shared connect prelude)", () => {
     await expect(connectImap({} as never, config, account)).rejects.toThrow(/private_host_denied/);
     expect(decrypt).not.toHaveBeenCalled();
     expect(fake.connectImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("action-client abort binding", () => {
+  it("never validates, decrypts, or connects when the action signal is already aborted", async () => {
+    const abort = new AbortController();
+    abort.abort(new Error("lease lost"));
+
+    const error = await connectAbortableImap({} as never, config, account, abort.signal).catch((value) => value);
+
+    expect(error.name).toBe("AbortError");
+    expect(error.cause).toBe(abort.signal.reason);
+    expect(assertSafe).not.toHaveBeenCalled();
+    expect(decrypt).not.toHaveBeenCalled();
+    expect(fake.connectImpl).not.toHaveBeenCalled();
+  });
+
+  it("closes the client on abort, fails the in-flight command as AbortError, and sends nothing after", async () => {
+    const abort = new AbortController();
+    let failCommand: (error: Error) => void = () => undefined;
+    const client = {
+      // ImapFlow.close() rejects the in-flight command and pending mailbox locks.
+      close: vi.fn(() => failCommand(new Error("Connection not available"))),
+      logout: vi.fn(async () => undefined)
+    };
+    const binding = new ImapAbortBinding(client as never, abort.signal);
+    const inFlight = binding.run(() => new Promise((_, reject) => {
+      failCommand = reject;
+    }));
+
+    abort.abort(new Error("lease lost"));
+
+    const error = await inFlight.catch((value: Error) => value) as Error;
+    expect(error.name).toBe("AbortError");
+    expect(error.cause).toBe(abort.signal.reason);
+    const later = vi.fn(async () => "never");
+    await expect(binding.run(later)).rejects.toMatchObject({ name: "AbortError" });
+    expect(later).not.toHaveBeenCalled();
+    await binding.logout();
+    expect(client.logout).not.toHaveBeenCalled();
+    expect(client.close).toHaveBeenCalled();
+  });
+
+  it("passes command errors through and logs out normally without a signal", async () => {
+    const client = { close: vi.fn(), logout: vi.fn(async () => undefined) };
+    const binding = new ImapAbortBinding(client as never);
+
+    await expect(binding.run(async () => { throw new Error("NO [TRYCREATE]"); })).rejects.toThrow("NO [TRYCREATE]");
+    await binding.logout();
+    expect(client.logout).toHaveBeenCalledTimes(1);
+    expect(client.close).not.toHaveBeenCalled();
   });
 });
 

@@ -12,6 +12,7 @@ import {
   listAttachments,
   selectFields
 } from "../content.js";
+import { ImapAbortBinding } from "../imap-connect.js";
 
 /** Consume an async-iterable/stream to a string (test helper). */
 async function drain(stream: AsyncIterable<unknown>): Promise<string> {
@@ -446,7 +447,10 @@ describe("ContentImapClient (UIDVALIDITY guard + verb surface)", () => {
 
   /** Build a ContentImapClient around a stub ImapFlow (bypassing connect()). */
   function clientFrom(stub: Record<string, unknown>): ContentImapClient {
-    return Reflect.construct(ContentImapClient as unknown as new (c: unknown) => ContentImapClient, [stub]);
+    return Reflect.construct(
+      ContentImapClient as unknown as new (c: unknown, a: unknown) => ContentImapClient,
+      [stub, new ImapAbortBinding(stub as never)]
+    );
   }
 
   it("downloadPart returns the decoded part bytes under a matching UIDVALIDITY", async () => {

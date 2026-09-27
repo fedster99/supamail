@@ -418,7 +418,7 @@ describe("sendDraft", () => {
 
     // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
     // parsed mirror fields — there is no SendRequest reconstruction anymore.
-    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1", expect.anything());
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1", expect.anything(), { signal: undefined });
     const rawBytes = mocks.getRawMime.mock.results[0].value as Promise<{ raw: Buffer }>;
     const expectedRaw = (await rawBytes).raw;
 
@@ -535,6 +535,44 @@ describe("sendDraft", () => {
 
   // ── Review PR-A (decision 1): the post-send cleanup is best-effort. The send
   //    is irreversible, so a delete failure must NEVER throw a delivered send. ─
+  it("rejects with AbortError before any lookup when the signal is already aborted", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    const { sendDraft } = await import("../drafts.js");
+
+    const error = await sendDraft(pool, config, "draft-1", undefined, { signal: AbortSignal.abort() })
+      .catch((value) => value);
+
+    expect(error.name).toBe("AbortError");
+    expect(mocks.getAccount).not.toHaveBeenCalled();
+    expect(mocks.withAccountLock).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+  });
+
+  it("never crosses the SMTP boundary when aborted during the raw fetch", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    const abort = new AbortController();
+    mocks.getRawMime.mockImplementationOnce(async () => {
+      abort.abort(new Error("lease lost"));
+      return {
+        messageId: "draft-1",
+        raw: Buffer.from("From: user@example.test\r\n\r\nHello there"),
+        source: "fetch" as const,
+        truncated: false
+      };
+    });
+    const { sendDraft } = await import("../drafts.js");
+
+    const error = await sendDraft(pool, config, "draft-1", undefined, { signal: abort.signal })
+      .catch((value) => value);
+
+    // AbortError, not SmtpDeliveryError: the message was proven not submitted.
+    expect(error.name).toBe("AbortError");
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1", expect.anything(), { signal: abort.signal });
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
   it("STILL reports delivered when the post-send draft delete rejects (best-effort cleanup)", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     // The cleanup EXPUNGE fails (e.g. no UIDPLUS) AFTER a successful send.

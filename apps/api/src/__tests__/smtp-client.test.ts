@@ -40,7 +40,16 @@ vi.mock("nodemailer", () => ({
   default: { createTransport }
 }));
 
-vi.mock("../imap-connect.js", () => ({ connectImap }));
+vi.mock("../imap-connect.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../imap-connect.js")>();
+  return {
+    ...actual,
+    connectAbortableImap: async () => {
+      const client = await connectImap();
+      return { client, abort: new actual.ImapAbortBinding(client as never) };
+    }
+  };
+});
 
 const FROM = { email: "sender@example.test" };
 

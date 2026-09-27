@@ -2,8 +2,14 @@ import type { Readable } from "node:stream";
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
-import { NotFoundError, UnfetchableContentError } from "./errors.js";
-import { closeImap, connectImap, uidValidityMatches, uidValidityMismatchMessage } from "./imap-connect.js";
+import { NotFoundError, UnfetchableContentError, throwIfAborted } from "./errors.js";
+import {
+  closeImap,
+  connectAbortableImap,
+  uidValidityMatches,
+  uidValidityMismatchMessage,
+  type ImapAbortBinding
+} from "./imap-connect.js";
 import { cleanBody } from "./mcp/shared.js";
 import { loadMessageAndAccount } from "./message-loader.js";
 import { MirrorRepository } from "./repository.js";
@@ -147,14 +153,22 @@ function toAttachmentInfo(row: AttachmentRow): AttachmentInfo {
  * message source) — both reads. Never used by the sync engine; never writes.
  */
 export class ContentImapClient {
-  private constructor(private readonly client: ImapFlow) {}
+  private constructor(
+    private readonly client: ImapFlow,
+    private readonly abort: ImapAbortBinding
+  ) {}
 
-  static async connect(pool: PgPool, config: AppConfig, account: ImapAccount): Promise<ContentImapClient> {
+  static async connect(
+    pool: PgPool,
+    config: AppConfig,
+    account: ImapAccount,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ContentImapClient> {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
     // download/fetch read verb surface on top (ADR 0020/0022).
-    const client = await connectImap(pool, config, account);
-    return new ContentImapClient(client);
+    const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
+    return new ContentImapClient(client, abort);
   }
 
   /**
@@ -165,14 +179,16 @@ export class ContentImapClient {
    * (it keeps the fetch path's own plain-Error assertion via `assertUidValidity`).
    * Extracted so `downloadPart`/`fetchOneSource` no longer copy-paste the scope.
    */
-  private async withUidScope<T>(folderPath: string, uidValidity: number, op: () => Promise<T>): Promise<T> {
-    const lock = await this.client.getMailboxLock(folderPath);
-    try {
-      this.assertUidValidity(folderPath, uidValidity);
-      return await op();
-    } finally {
-      lock.release();
-    }
+  private withUidScope<T>(folderPath: string, uidValidity: number, op: () => Promise<T>): Promise<T> {
+    return this.abort.run(async () => {
+      const lock = await this.client.getMailboxLock(folderPath);
+      try {
+        this.assertUidValidity(folderPath, uidValidity);
+        return await op();
+      } finally {
+        lock.release();
+      }
+    });
   }
 
   /**
@@ -265,11 +281,11 @@ export class ContentImapClient {
   }
 
   async logout(): Promise<void> {
-    await this.client.logout();
+    await this.abort.logout();
   }
 
   close(): void {
-    this.client.close();
+    this.abort.close();
   }
 }
 
@@ -463,8 +479,10 @@ export async function getRawMime(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: { signal?: AbortSignal } = {}
 ): Promise<RawMimeResult> {
+  throwIfAborted(options.signal);
   const stored = await pool.connect();
   let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean } | undefined;
   try {
@@ -488,7 +506,7 @@ export async function getRawMime(
   // raw_mime not stored (parsed_only) or no body row yet → on-demand FETCH.
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId);
-  const reader = await ContentImapClient.connect(pool, config, account);
+  const reader = await ContentImapClient.connect(pool, config, account, options);
   try {
     const raw = await reader.fetchOneSource(
       message.folder_path,

@@ -1,6 +1,6 @@
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
-import { AccountBusyError } from "./errors.js";
+import { AccountBusyError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
 import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
@@ -43,23 +43,29 @@ import {
  * the provider receipt or throws `SmtpDeliveryError` with `not_delivered` or
  * `unknown`. A durable caller may retry only `not_delivered`; it must reconcile
  * `unknown` and never submit it again. Remote wrappers own that durable ledger.
+ *
+ * ABORT: an optional AbortSignal stops the send before SMTP with `AbortError`
+ * (proven not delivered). SMTP submission itself is never interrupted, so abort
+ * cannot turn a delivery into `unknown`. After delivery, abort only skips or
+ * closes the Sent APPEND, which is reported as a warning.
  */
 export async function sendMessage(
   pool: PgPool,
   config: AppConfig,
   req: SendRequest,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: { signal?: AbortSignal } = {}
 ): Promise<SendResult> {
   let deliveryConfirmed = false;
   try {
-    return await sendMessageAttempt(pool, config, req, metadataProtection, () => {
+    return await sendMessageAttempt(pool, config, req, metadataProtection, options.signal, () => {
       deliveryConfirmed = true;
     });
   } catch (error) {
     if (error instanceof SmtpDeliveryError) throw error;
     if (
       !deliveryConfirmed &&
-      ["AccountBusyError", "HostValidationError"].includes(
+      ["AbortError", "AccountBusyError", "HostValidationError"].includes(
         error instanceof Error ? error.name : ""
       )
     ) {
@@ -78,8 +84,10 @@ async function sendMessageAttempt(
   config: AppConfig,
   req: SendRequest,
   metadataProtection: MetadataProtectionAdapter,
+  signal: AbortSignal | undefined,
   confirmDelivery: () => void
 ): Promise<SendResult> {
+  throwIfAborted(signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(req.accountId);
   if (!account) {
@@ -110,6 +118,7 @@ async function sendMessageAttempt(
     // Do not cross the irreversible SMTP boundary until heartbeat persistence and
     // ownership by this exact Postgres session are both re-proven.
     await lock.assertLive();
+    throwIfAborted(signal);
 
     // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
     // it relaxes only when the target actually resolved private/loopback.
@@ -140,7 +149,7 @@ async function sendMessageAttempt(
 
       if (lockLiveForFiling) {
         try {
-          appender = await SentFolderAppender.connect(pool, config, account);
+          appender = await SentFolderAppender.connect(pool, config, account, { signal });
           const profile = getProviderProfile(account.provider_profile);
           const mailboxes = await appender.list();
           // Resolve Sent via the shared role-keyed resolver: the "sent" role consults the
