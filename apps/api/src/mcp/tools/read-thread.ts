@@ -64,6 +64,25 @@ const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
   END
 )`;
 
+/**
+ * Each message's active assignment, looked up per row. A plain LEFT JOIN to the
+ * `imap_thread_active_assignments` view makes the planner build the account's
+ * whole active projection (about 20,000 buffer blocks for a 45,000-message
+ * mailbox) before matching twenty rows; when those blocks are cold the join
+ * takes seconds. The LATERAL form pushes `message_id` into the view, so each
+ * row costs a few index reads. `LIMIT 1` keeps the planner from pulling the
+ * subquery back up into that same hash join; the view yields at most one row
+ * per message (one active run per account), so the alias, columns and NULL
+ * semantics are unchanged.
+ */
+const ACTIVE_ASSIGNMENT_JOIN = `LEFT JOIN LATERAL (
+        SELECT active.conversation_id, active.delivery_key
+        FROM public.imap_thread_active_assignments active
+        WHERE active.message_id = m.id
+          AND active.account_id = m.account_id
+        LIMIT 1
+      ) ta ON true`;
+
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
  * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
@@ -383,9 +402,7 @@ async function fetchThreadRows(
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
-      LEFT JOIN public.imap_thread_active_assignments ta
-        ON ta.message_id = m.id
-       AND ta.account_id = m.account_id
+      ${ACTIVE_ASSIGNMENT_JOIN}
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
@@ -402,9 +419,7 @@ async function fetchThreadRows(
         SELECT DISTINCT ON (m.account_id, ${DELIVERY_REPRESENTATIVE_KEY})
           m.id
         FROM public.imap_messages m
-        LEFT JOIN public.imap_thread_active_assignments ta
-          ON ta.message_id = m.id
-         AND ta.account_id = m.account_id
+        ${ACTIVE_ASSIGNMENT_JOIN}
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
         WHERE m.provider_thread_id = $1
           AND m.account_id = $2
@@ -419,9 +434,7 @@ async function fetchThreadRows(
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
-      LEFT JOIN public.imap_thread_active_assignments ta
-        ON ta.message_id = m.id
-       AND ta.account_id = m.account_id
+      ${ACTIVE_ASSIGNMENT_JOIN}
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
@@ -450,9 +463,7 @@ async function fetchThreadRows(
         m.id
       FROM legacy_candidates candidate
       JOIN public.imap_messages m ON m.id = candidate.id
-      LEFT JOIN public.imap_thread_active_assignments ta
-        ON ta.message_id = m.id
-       AND ta.account_id = m.account_id
+      ${ACTIVE_ASSIGNMENT_JOIN}
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       ORDER BY
         m.account_id,
@@ -464,9 +475,7 @@ async function fetchThreadRows(
     SELECT ${threadSelect(includeBody)}
     FROM limited_representatives representative
     JOIN public.imap_messages m ON m.id = representative.id
-    LEFT JOIN public.imap_thread_active_assignments ta
-      ON ta.message_id = m.id
-     AND ta.account_id = m.account_id
+    ${ACTIVE_ASSIGNMENT_JOIN}
     LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
     CROSS JOIN thread_stats stats
     ORDER BY m.internal_date ASC, m.id ASC
