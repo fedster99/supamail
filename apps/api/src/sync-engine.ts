@@ -522,9 +522,9 @@ export class MirrorEngine {
           && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
           newlyTrackedFolderPaths = await this.discoverFolders(account, client);
         }
-        if (!supplemental) {
-          await this.recordUnchangedFolders(account, client, options.signal);
-        }
+        const catchUpPaths = supplemental
+          ? new Set<string>()
+          : await this.recordUnchangedFolders(account, client, options.signal);
 
         const folders = options.bodyBacklogOnly
           ? []
@@ -545,6 +545,21 @@ export class MirrorEngine {
             ? folders.splice(inboxIndex, 1)[0]
             : await this.repository.getInboxFolderForWake(account.id);
           if (inboxFolder) folders.unshift(inboxFolder);
+        }
+        if (catchUpPaths.size > 0) {
+          // Replay provider-proven changes with QRESYNC in this pass instead of
+          // waiting for the rotation. Added folders do not move the rotation
+          // cursor, are bounded by the rotation budget, and run right after
+          // priority folders so the lock budget cannot always starve them.
+          const selected = new Set(folders.map((folder) => folder.path));
+          const extra = (await this.repository.getFoldersForWake(
+            account.id,
+            [...catchUpPaths].filter((path) => !selected.has(path))
+          )).slice(0, this.config.MAX_RR_FOLDERS_PER_CYCLE);
+          const firstOrdinary = folders.findIndex(
+            (folder) => folder.sync_priority > this.config.PRIORITY_CUTOFF
+          );
+          folders.splice(firstOrdinary < 0 ? folders.length : firstOrdinary, 0, ...extra);
         }
         let priorityFolderFailed = false;
         let connectionLost = false;
@@ -576,8 +591,10 @@ export class MirrorEngine {
             providerUidsSeen: 0,
             durationMs: 0
           };
+          const qresyncCatchUp = catchUpPaths.has(folder.path);
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
+              qresyncCatchUp,
               allowReconcile: !options.sentOnly
                 && (forceKnownReconcile || remainingReconciles > 0),
               allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
@@ -605,7 +622,12 @@ export class MirrorEngine {
             if (folderResult.hitLockBudget || this.isLockBudgetExpired(lockDeadline)) {
               result.hitLockBudget = true;
             }
-            if (folderResult.flagScanAttempted) remainingFlagScans -= 1;
+            // A catch-up replay is bounded by the provider's changes, not the
+            // folder size, so it does not spend the shared flag-scan slots.
+            if (folderResult.flagScanAttempted
+              && !(qresyncCatchUp && folderResult.qresyncReplayComplete === true)) {
+              remainingFlagScans -= 1;
+            }
             if (mailboxChange !== undefined
               && folderResult.initialSyncComplete
               && !folderResult.hitLockBudget
@@ -907,12 +929,13 @@ export class MirrorEngine {
     account: ImapAccount,
     client: MirrorImapClient,
     signal?: AbortSignal
-  ): Promise<void> {
+  ): Promise<Set<string>> {
+    const changed = new Set<string>();
     if (!this.config.IMAP_LIST_STATUS_ENABLED
       || !client.listWithStatus
       || !client.capabilities?.has("LIST-STATUS")
       || !client.capabilities.has("QRESYNC")) {
-      return;
+      return changed;
     }
     // LIST patterns cannot escape "*" or "%", so such names are never probed.
     const paths = (await this.repository.getTrackedFoldersForWake(account.id))
@@ -920,7 +943,7 @@ export class MirrorEngine {
         && folder.last_reconcile_clean === true
         && !/[*%]/.test(folder.path))
       .map((folder) => folder.path);
-    if (paths.length === 0) return;
+    if (paths.length === 0) return changed;
     const tracked = new Set(paths);
     const statuses = new Map<string, MailboxStatus>();
     try {
@@ -935,7 +958,7 @@ export class MirrorEngine {
       }
     } catch (error) {
       if (signal?.aborted || client.usable === false) throw error;
-      return;
+      return changed;
     }
     const proofs = [...statuses.values()].flatMap((status) => (
       status.uidNext === undefined || status.highestModseq === undefined
@@ -951,11 +974,18 @@ export class MirrorEngine {
       deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
       signal
     });
+    // An answered folder that failed the proof changed since its last
+    // deletion-complete pass (or its cursors fell behind the provider).
+    const verifiedPaths = new Set(verified);
+    for (const proof of proofs) {
+      if (!verifiedPaths.has(proof.path)) changed.add(proof.path);
+    }
     await this.repository.logEvent(account.id, null, null, null, null, "FOLDERS_VERIFIED_UNCHANGED", {
       probed: paths.length,
       answered: proofs.length,
       verified: verified.length
     });
+    return changed;
   }
 
   private async discoverFolders(account: ImapAccount, client: MirrorImapClient): Promise<string[]> {
@@ -1094,6 +1124,7 @@ export class MirrorEngine {
     options: {
       allowReconcile: boolean;
       allowFlagScan: boolean;
+      qresyncCatchUp?: boolean;
       enforceLockDeadline: boolean;
       lockDeadline: number;
       metadataWriteStats: MetadataWriteStats;
@@ -1109,9 +1140,10 @@ export class MirrorEngine {
       deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
       signal: options.signal
     });
+    // A catch-up replay may run without the shared slots: a rejected or partial
+    // replay applies nothing, advances no cursor, and the proof retries it.
     const qresyncRequest = this.config.IMAP_QRESYNC_ENABLED
-      && options.allowFlagScan
-      && options.allowReconcile
+      && (options.qresyncCatchUp === true || (options.allowFlagScan && options.allowReconcile))
       && folder.initial_sync_complete
       && folder.uidvalidity !== null
       && folder.qresync_highest_modseq !== null
