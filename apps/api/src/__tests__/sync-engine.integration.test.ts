@@ -5828,6 +5828,192 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect((await folderState(h, "Archive-003")).last_verified_unchanged_at).toBeNull();
     });
   });
+
+  describe("QRESYNC catch-up for provider-proven changed folders", () => {
+    const CATCH_UP = {
+      IMAP_LIST_STATUS_ENABLED: true,
+      IMAP_QRESYNC_ENABLED: true,
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      MAX_FLAG_SCANS_PER_CYCLE: 1,
+      MAX_RECONCILES_PER_CYCLE: 1
+    };
+
+    function archive(path: string, uidValidity: number, uids: number[], highestModseq: bigint): FixtureFolder {
+      return {
+        path,
+        delimiter: "/",
+        uidValidity,
+        highestModseq,
+        messages: uids.map((uid) => makeTextMessage({
+          uid,
+          subject: `${path} ${uid}`,
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "archive"
+        }))
+      };
+    }
+
+    async function setupCatchUp(suite: string, overrides: Record<string, unknown> = {}) {
+      const h = await setupIntegration(suite, { ...CATCH_UP, ...overrides });
+      activeAccountIds.push(h.account.id);
+      const folders = [
+        ...buildInboxAndSentFolders(),
+        archive("Archive-A", 60_001, [301, 302], 10n),
+        archive("Archive-B", 60_002, [401], 5n),
+        archive("Archive-C", 60_003, [501], 7n)
+      ];
+      await h.buildEngine({ folders, overrides: { ...CATCH_UP, ...overrides } })
+        .syncAccount(h.account.id, "manual");
+      // Every folder is exactly synced and audited. Only Inbox is due, and it
+      // takes the single flag-scan and reconcile slot of the next pass.
+      await h.pool.query(
+        `UPDATE public.imap_folders AS folder
+         SET status = 'ACTIVE',
+             initial_sync_complete = true,
+             last_reconcile_clean = true,
+             last_synced_at = now() - interval '1 hour',
+             last_full_reconcile_at = now() - interval '1 hour',
+             highest_modseq = CASE folder.path
+               WHEN 'Archive-A' THEN 10 WHEN 'Archive-B' THEN 5 WHEN 'Archive-C' THEN 7 ELSE 1 END,
+             qresync_highest_modseq = CASE folder.path
+               WHEN 'Archive-A' THEN 10 WHEN 'Archive-B' THEN 5 WHEN 'Archive-C' THEN 7 ELSE 1 END,
+             next_sync_due_at = CASE WHEN lower(folder.path) = 'inbox'
+               THEN now() - interval '1 minute' ELSE now() + interval '1 hour' END,
+             next_reconcile_at = CASE WHEN lower(folder.path) = 'inbox'
+               THEN now() - interval '1 minute' ELSE now() + interval '1 hour' END,
+             next_flag_scan_at = CASE WHEN lower(folder.path) = 'inbox'
+               THEN now() - interval '1 minute' ELSE now() + interval '1 hour' END
+         WHERE account_id = $1 AND tracked = true`,
+        [h.account.id]
+      );
+      await h.pool.query(
+        `UPDATE public.imap_accounts SET next_folder_discovery_at = now() + interval '1 hour' WHERE id = $1`,
+        [h.account.id]
+      );
+      const qresyncPaths: string[] = [];
+      class CatchUpClient extends FixtureImapClient {
+        capabilities = new Map<string, boolean>([["LIST-STATUS", true], ["QRESYNC", true]]);
+
+        async listWithStatus(_query: Record<string, boolean>, patterns: readonly string[]) {
+          const wanted = patterns.includes("*") ? folders.map((folder) => folder.path) : patterns;
+          return folders.filter((folder) => wanted.includes(folder.path)).map((folder) => ({
+            path: folder.path,
+            uidValidity: folder.uidValidity,
+            uidNext: Math.max(0, ...folder.messages.map((message) => message.uid)) + 1,
+            highestModseq: folder.highestModseq
+          }));
+        }
+
+        override async getMailboxLock(
+          path: string,
+          options: { qresync?: QresyncRequest } = {}
+        ): Promise<MailboxLock> {
+          const lock = await super.getMailboxLock(path);
+          if (!options.qresync || path !== "Archive-A") return lock;
+          qresyncPaths.push(path);
+          return {
+            ...lock,
+            qresync: {
+              accepted: true,
+              complete: true,
+              vanishedUids: [302],
+              changedFlags: [{ uid: 301, flags: ["\\Seen"] }]
+            }
+          };
+        }
+      }
+      const cursor = async () => (await h.pool.query<{ folder_rr_cursor: number }>(
+        "SELECT folder_rr_cursor FROM public.imap_accounts WHERE id = $1",
+        [h.account.id]
+      )).rows[0].folder_rr_cursor;
+      return { h, folders, CatchUpClient, qresyncPaths, cursor };
+    }
+
+    it("replays a changed folder with QRESYNC without taking the shared change slots", async () => {
+      const { h, folders, CatchUpClient, qresyncPaths, cursor } = await setupCatchUp("qresync-catch-up");
+      const rotationBefore = await cursor();
+      const auditBefore = (await h.pool.query<{ last_full_reconcile_at: Date }>(
+        `SELECT last_full_reconcile_at FROM public.imap_folders WHERE account_id = $1 AND path = 'Archive-A'`,
+        [h.account.id]
+      )).rows[0].last_full_reconcile_at;
+      // Archive-A changed on the provider: a flag, an expunge, and a new message.
+      const changed = folders.find((folder) => folder.path === "Archive-A")!;
+      changed.highestModseq = 12n;
+      changed.messages[0].flags = ["\\Seen"];
+      changed.messages.splice(1, 1, makeTextMessage({
+        uid: 303, subject: "new", from: "c@x.test", to: "u@x.test", body: "new"
+      }));
+
+      const result = await h.buildEngine({
+        folders: [],
+        overrides: CATCH_UP,
+        clientFactory: async () => new CatchUpClient(folders)
+      }).syncAccount(h.account.id, "scheduled");
+
+      expect(result.outcome).toBe("success");
+      expect(qresyncPaths).toEqual(["Archive-A"]);
+      const rows = await h.pool.query<{ uid: string; flags: string[]; deleted_in_provider: boolean }>(
+        `SELECT uid::text, flags, deleted_in_provider FROM public.imap_messages
+         WHERE account_id = $1 AND folder_path = 'Archive-A' ORDER BY uid`,
+        [h.account.id]
+      );
+      expect(rows.rows).toEqual([
+        { uid: "301", flags: ["\\Seen"], deleted_in_provider: false },
+        { uid: "302", flags: [], deleted_in_provider: true },
+        { uid: "303", flags: [], deleted_in_provider: false }
+      ]);
+      const folder = (await h.pool.query<{
+        highest_modseq: string; qresync_highest_modseq: string; last_full_reconcile_at: Date;
+      }>(
+        `SELECT highest_modseq::text, qresync_highest_modseq::text, last_full_reconcile_at
+         FROM public.imap_folders WHERE account_id = $1 AND path = 'Archive-A'`,
+        [h.account.id]
+      )).rows[0];
+      expect(folder.highest_modseq).toBe("12");
+      expect(folder.qresync_highest_modseq).toBe("12");
+      // QRESYNC never replaces the exact audit, and catch-up leaves the rotation alone.
+      expect(folder.last_full_reconcile_at).toEqual(auditBefore);
+      expect(await cursor()).toBe(rotationBefore);
+
+      // The next pass proves Archive-A unchanged again.
+      await h.buildEngine({
+        folders: [],
+        overrides: CATCH_UP,
+        clientFactory: async () => new CatchUpClient(folders)
+      }).syncAccount(h.account.id, "scheduled");
+      const proven = await h.pool.query<{ last_verified_unchanged_at: Date | null }>(
+        `SELECT last_verified_unchanged_at FROM public.imap_folders WHERE account_id = $1 AND path = 'Archive-A'`,
+        [h.account.id]
+      );
+      expect(proven.rows[0].last_verified_unchanged_at).not.toBeNull();
+    });
+
+    it("bounds catch-up by the rotation folder budget", async () => {
+      const { h, folders, CatchUpClient } = await setupCatchUp("qresync-catch-up-bound", {
+        MAX_RR_FOLDERS_PER_CYCLE: 1
+      });
+      for (const path of ["Archive-B", "Archive-C"]) {
+        const folder = folders.find((candidate) => candidate.path === path)!;
+        folder.highestModseq = folder.highestModseq! + 1n;
+      }
+
+      await h.buildEngine({
+        folders: [],
+        overrides: { ...CATCH_UP, MAX_RR_FOLDERS_PER_CYCLE: 1 },
+        clientFactory: async () => new CatchUpClient(folders)
+      }).syncAccount(h.account.id, "scheduled");
+
+      // Neither folder is due for rotation; only the bounded catch-up syncs one.
+      const caughtUp = await h.pool.query<{ path: string }>(
+        `SELECT path FROM public.imap_folders
+         WHERE account_id = $1 AND path IN ('Archive-B', 'Archive-C')
+           AND last_synced_at > now() - interval '1 minute'`,
+        [h.account.id]
+      );
+      expect(caughtUp.rows).toHaveLength(1);
+    });
+  });
 });
 
 // Helpful diagnostic when the suite is silently skipped.
