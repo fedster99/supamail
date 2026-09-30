@@ -270,7 +270,18 @@ const ATTRIBUTION_START = /^On\b/i;
 const ATTRIBUTION_END = /\bwrote:\s*$/i;
 const MAX_ATTRIBUTION_LINES = 4;
 const MIN_QUOTED_TAIL_LINES = 2;
-const REPLY_SUBJECT = /^\s*re\s*:/i;
+// Optional sender tags ("[EXTERNAL]", "(EXT)", "*EXTERNAL*", "EXTERNAL EMAIL:"),
+// then a reply prefix in the forms mail clients localize it to. Forwards use
+// threading's localized forward prefixes and keep their content.
+const SUBJECT_TAGS = String.raw`(?:(?:\[[^\]]{1,80}\]|\([^)]{1,80}\)|\*[^*]{1,80}\*|(?:ext|extern|external)(?:\s+(?:email|mail|sender))?\s*:?)\s*)*`;
+const REPLY_SUBJECT = new RegExp(String.raw`^${SUBJECT_TAGS}(?:re|aw|sv|antw|odp|res|r|ynt|απ|回复|答复)\s*(?:\[\d+\])?\s*:`, "iu");
+const FORWARD_SUBJECT = new RegExp(String.raw`^${SUBJECT_TAGS}(?:fw|fwd|wg|tr|rv|enc|转发|轉寄|転送)\s*:`, "iu");
+
+/** Whether a message's own subject marks it as a reply (not a forward). */
+export function isReplySubject(subject: string | null | undefined): boolean {
+  const value = subject?.normalize("NFKC").trim() ?? "";
+  return !FORWARD_SUBJECT.test(value) && REPLY_SUBJECT.test(value);
+}
 const QUOTED_HEADER_FROM = /^\s*From:\s*\S/i;
 const QUOTED_HEADER_DATE = /^\s*(Sent|Date):\s*\S/i;
 const QUOTED_HEADER_SUBJECT = /^\s*Subject:/i;
@@ -308,7 +319,7 @@ export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBod
   let working = text.replace(/\r\n?/g, "\n");
   const omissions: BodyContentOmission[] = [];
   if (!opts.includeQuoted) {
-    const withoutQuotedTail = stripQuotedTail(working, REPLY_SUBJECT.test(opts.subject ?? ""));
+    const withoutQuotedTail = stripQuotedTail(working, isReplySubject(opts.subject));
     if (withoutQuotedTail !== working) omissions.push("quoted_reply_tail");
     working = withoutQuotedTail;
     const withoutSignature = stripSignature(working);
