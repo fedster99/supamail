@@ -20,12 +20,35 @@ export interface PublicMigrationManifest {
 
 let cachedPool: PgPool | null = null;
 
+/**
+ * Server-side TCP liveness for every pooled session. An abruptly vanished worker
+ * VM leaves its sessions, and their account locks, alive on the server until TCP
+ * notices (about 39 minutes with common server defaults). These probes release
+ * them in about a minute, while a stalled but alive worker's kernel keeps
+ * answering, so it keeps its locks. The user timeout covers unacknowledged data,
+ * which suspends keepalive probing. They are no-ops on Unix sockets, where the
+ * kernel reports process exit.
+ */
+export const SERVER_TCP_LIVENESS_SQL =
+  "SET tcp_keepalives_idle = 30; SET tcp_keepalives_interval = 10; " +
+  "SET tcp_keepalives_count = 3; SET tcp_user_timeout = 60000";
+
+/**
+ * Through a session pooler, the pooler owns the server sessions: server-side
+ * probes reach it rather than the worker, so they cannot detect a vanished
+ * worker. Stale-heartbeat lock takeover remains the recovery path there.
+ */
+export function isSupabaseSessionPoolerUrl(databaseUrl: string | undefined): boolean {
+  if (!databaseUrl || !URL.canParse(databaseUrl)) return false;
+  const url = new URL(databaseUrl);
+  return url.hostname.toLowerCase().endsWith(".pooler.supabase.com") && url.port === "5432";
+}
+
 export function assertSessionConnectionUrl(databaseUrl: string): void {
   const lowered = databaseUrl.toLowerCase();
   const url = new URL(databaseUrl);
-  const host = url.hostname.toLowerCase();
   const port = url.port;
-  const isSupabaseSessionPooler = host.endsWith(".pooler.supabase.com") && port === "5432";
+  const isSupabaseSessionPooler = isSupabaseSessionPoolerUrl(databaseUrl);
 
   if (
     lowered.includes("pgbouncer") ||
@@ -49,6 +72,18 @@ export function createPool(
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000
   });
+  if (!isSupabaseSessionPoolerUrl(config.DATABASE_URL)) {
+    // Queued before the caller's first query. A proxy that refuses the SET only
+    // loses faster release of a vanished worker's locks, so log and continue.
+    pool.on("connect", (client) => {
+      client.query(SERVER_TCP_LIVENESS_SQL).catch((error: Error) => {
+        console.error(JSON.stringify({
+          event: "database.pool.tcp_liveness_setup_error",
+          error: { message: error.message, code: (error as NodeJS.ErrnoException).code }
+        }));
+      });
+    });
+  }
   // node-postgres emits errors from idle clients on the pool itself. Without a
   // listener, EventEmitter promotes a recoverable connection loss (database
   // restart, failover, or administrator termination) to an uncaught exception

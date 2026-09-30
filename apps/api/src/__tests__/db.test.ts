@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { assertSessionConnectionUrl, createPool } from "../db.js";
+import { assertSessionConnectionUrl, createPool, isSupabaseSessionPoolerUrl } from "../db.js";
 
 describe("database connection guard", () => {
   it("allows direct Postgres URLs", () => {
@@ -64,6 +64,24 @@ describe("createPool runtime errors", () => {
     } finally {
       log.mockRestore();
       await pool.end();
+    }
+  });
+});
+
+describe("createPool server-side TCP liveness", () => {
+  it("configures direct connections and skips the session pooler, where probes cannot reach the worker", async () => {
+    const direct = createPool({ DATABASE_URL: "postgresql://user@localhost:5432/db" });
+    const pooler = createPool({
+      DATABASE_URL: "postgresql://postgres.ref@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
+    });
+    try {
+      expect(direct.listenerCount("connect")).toBe(1);
+      expect(pooler.listenerCount("connect")).toBe(0);
+      expect(isSupabaseSessionPoolerUrl(undefined)).toBe(false);
+      expect(isSupabaseSessionPoolerUrl("not a url")).toBe(false);
+    } finally {
+      await direct.end();
+      await pooler.end();
     }
   });
 });
