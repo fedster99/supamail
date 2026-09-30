@@ -2,7 +2,7 @@ import type { AppConfig } from "./config.js";
 import { getConfig, getWindowCutoff, isWithinBackfillWindow } from "./config.js";
 import { DatabaseBodyStore, type BodyStore } from "./body-store.js";
 import type { PgPool } from "./db.js";
-import { getPool } from "./db.js";
+import { getPool, isSupabaseSessionPoolerUrl } from "./db.js";
 import { performance } from "node:perf_hooks";
 import {
   fetchFullMessageBody,
@@ -26,7 +26,7 @@ import type {
   MailboxStatus,
   MirrorImapClient
 } from "./imap-client.js";
-import { clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
+import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import {
@@ -454,7 +454,7 @@ export class MirrorEngine {
     let cancellationCleanupRequired = false;
     const syncOwner = `supamail:${process.pid}:${runId}`;
 
-    const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async () => {
+    const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async (lock) => {
       const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
       let accountSyncStarted = false;
       let client: MirrorImapClient | null = null;
@@ -475,6 +475,12 @@ export class MirrorEngine {
           signal: options.signal
         });
         accountSyncStarted = true;
+        // Holding the lock proves no other sync of this account is live, so any
+        // run still open is a vanished worker's orphan. Cosmetic: never fail the
+        // sync over it, and leave it to full sweeps rather than frequent lanes.
+        if (!supplemental) {
+          await this.repository.closeOrphanedSyncRuns(account.id, runId).catch(() => 0);
+        }
         throwIfInterrupted();
         const sentFolders = options.sentOnly
           ? await this.repository.getSentFoldersDueForSync(account.id)
@@ -570,6 +576,10 @@ export class MirrorEngine {
         const handledMailboxObservations: MailboxChangeObservation[] = [];
         for (const folder of folders) {
           throwIfInterrupted();
+          // Prove this session still owns the account before each folder writes.
+          // A worker that lost its lock (for example across a network partition)
+          // stops here; writes already under way in the previous folder may land.
+          await lock.assertLive();
           const mailboxChange = mailboxChangeByPath.get(folder.path);
           const forceKnownReconcile = forcedReconcilePaths.has(folder.path);
           const isPriorityFolder = forceKnownReconcile
@@ -644,7 +654,6 @@ export class MirrorEngine {
                   || folderResult.flagScanAttempted
               });
             }
-            await this.repository.heartbeat(account.id);
           } catch (error) {
             throwIfInterrupted();
             // Account-finalising errors (e.g. UIDVALIDITY reset cap exceeded)
@@ -701,7 +710,7 @@ export class MirrorEngine {
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
-          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline);
+          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
@@ -718,7 +727,8 @@ export class MirrorEngine {
             client,
             lockDeadline,
             metadataWriteStats,
-            options.signal
+            options.signal,
+            lock.assertLive
           );
           throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
@@ -798,6 +808,9 @@ export class MirrorEngine {
               signal: options.signal,
               expectedSyncOwner: syncOwner
             });
+          } else if (error instanceof AccountLockLivenessError && !error.retryable) {
+            // This worker provably no longer owns the account. Another worker
+            // may, so write no account state; the next owner records its own.
           } else if (error instanceof AccountAlreadyFinalizedError) {
             // Account state was already persisted (e.g. UIDVALIDITY reset limit
             // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
@@ -840,7 +853,12 @@ export class MirrorEngine {
       // Supplemental Sent and live Inbox lanes defer to the authoritative full
       // sweep when another worker owns the Mailbox Account.
       const yieldedBeforeLock = locked === null && supplemental;
-      if (locked === null && !yieldedBeforeLock) {
+      // On direct connections a busy lock is never taken over: its owner may be
+      // frozen rather than dead and could resume writing. Server-side TCP probes
+      // release a vanished worker's lock (see createPool). Through a session
+      // pooler those probes cannot reach the worker, so the stale-heartbeat
+      // takeover remains the recovery path there.
+      if (locked === null && !yieldedBeforeLock && isSupabaseSessionPoolerUrl(this.config.DATABASE_URL)) {
         const recovered = await clearOrphanedLockForAccount(
           this.pool,
           account.lock_id,
@@ -1996,7 +2014,8 @@ export class MirrorEngine {
     client: MirrorImapClient,
     lockDeadline: number,
     metadataWriteStats: MetadataWriteStats,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    assertLive: () => Promise<void>
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
@@ -2017,6 +2036,7 @@ export class MirrorEngine {
         hitLockBudget = true;
         break;
       }
+      await assertLive();
 
       const [folder] = await this.repository.getHistoryBacklog(account, 1);
       if (!folder) break;
@@ -2053,7 +2073,6 @@ export class MirrorEngine {
       }
 
       batchesProcessed += 1;
-      await this.repository.heartbeat(account.id);
 
       if (!batch.processed) {
         continue;
@@ -2300,7 +2319,8 @@ export class MirrorEngine {
   private async fetchBodyBacklog(
     account: ImapAccount,
     client: MirrorImapClient,
-    lockDeadline: number
+    lockDeadline: number,
+    assertLive: () => Promise<void>
   ): Promise<{ fetched: number; hitLockBudget: boolean }> {
     let fetched = 0;
     let hitLockBudget = false;
@@ -2329,6 +2349,7 @@ export class MirrorEngine {
           offset + this.config.BODY_BACKFILL_BATCH_SIZE
         );
 
+        await assertLive();
         fetched += await this.fetchAndStoreBodies(client, logicalBatch);
 
         batchesRemaining -= 1;

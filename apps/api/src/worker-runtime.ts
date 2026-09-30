@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
-import { closePool, getPool, type PgPool } from "./db.js";
+import { closePool, getPool, isSupabaseSessionPoolerUrl, type PgPool } from "./db.js";
 import { clearOrphanedLocks, runLockSelfTestWithRetry } from "./locks.js";
 import { MirrorRepository } from "./repository.js";
 import { diagnosticErrorCode } from "./sync-diagnostics.js";
@@ -455,7 +455,9 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
     console.log(JSON.stringify({ event: "threading.rollout_compatibility.passed" }));
   }
 
-  const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS);
+  const sweep = await clearOrphanedLocks(pool, config.STALE_HEARTBEAT_MS, {
+    takeOverStaleHolders: isSupabaseSessionPoolerUrl(config.DATABASE_URL)
+  });
   if (stopping) return finishStoppedRuntime();
   if (sweep.terminatedBackends > 0 || sweep.accountsReset > 0 || sweep.runsClosed > 0) {
     console.warn(JSON.stringify({

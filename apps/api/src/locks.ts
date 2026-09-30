@@ -506,6 +506,12 @@ export async function runLockSelfTestWithRetry(
   }
 }
 
+/**
+ * Stale-heartbeat takeover for session-pooler deployments only
+ * (`isSupabaseSessionPoolerUrl`). There, server-side TCP probes reach the pooler,
+ * not the worker, so this is the only recovery for a vanished worker's lock. It
+ * cannot tell a dead worker from a frozen one; direct connections never use it.
+ */
 export async function clearOrphanedLockForAccount(
   pool: PgPool,
   lockId: string | number,
@@ -580,7 +586,7 @@ export async function clearOrphanedLockForAccount(
 }
 
 export interface OrphanedLockSweep {
-  /** Stale advisory-lock backends terminated via pg_terminate_backend. */
+  /** Stale advisory-lock backends terminated (session-pooler takeover only). */
   terminatedBackends: number;
   /** Accounts whose currently_syncing flag was reset. */
   accountsReset: number;
@@ -588,7 +594,84 @@ export interface OrphanedLockSweep {
   runsClosed: number;
 }
 
+/**
+ * Reset sync state left by workers that no longer hold their account lock.
+ *
+ * On direct connections this never terminates a lock-holding session. A stale
+ * heartbeat cannot tell a dead worker from a frozen one, and a frozen worker that
+ * resumes after losing its lock could write stale mailbox state. Sessions of
+ * vanished workers are released by the server-side TCP settings in `createPool`;
+ * until then the account stays busy and only its own worker can write. Session
+ * pooler deployments keep the stale-heartbeat takeover (`takeOverStaleHolders`).
+ */
 export async function clearOrphanedLocks(
+  pool: PgPool,
+  staleThresholdMs: number,
+  options: { takeOverStaleHolders?: boolean } = {}
+): Promise<OrphanedLockSweep> {
+  if (options.takeOverStaleHolders) return await clearOrphanedLocksWithTakeover(pool, staleThresholdMs);
+  const unlocked = `NOT EXISTS (
+          SELECT 1
+          FROM pg_locks pl
+          WHERE pl.locktype = 'advisory'
+            AND pl.granted = true
+            AND pl.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            AND pl.classid::bigint = 0
+            AND pl.objid::bigint = a.lock_id
+            AND pl.objsubid = 1
+        )`;
+  try {
+    const reset = await pool.query(
+      `
+      UPDATE public.imap_accounts a
+      SET currently_syncing = false,
+          sync_started_by = NULL
+      WHERE a.currently_syncing = true
+        AND (
+          a.last_heartbeat_at IS NULL
+          OR a.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
+        )
+        AND ${unlocked}
+      `,
+      [staleThresholdMs]
+    );
+
+    // Close the sync runs those orphaned accounts left open. A SIGKILL/OOM leaves the
+    // run row at status='running' forever, so any sync_runs-based UI/metrics show a
+    // phantom perpetually-active run. The started_at guard ensures a run a concurrent
+    // worker just opened (before it refreshed the heartbeat) is not mistaken for a
+    // dead worker's orphan.
+    const closed = await pool.query(
+      `
+      UPDATE public.imap_sync_runs r
+      SET status = 'failed',
+          finished_at = now(),
+          error = COALESCE(r.error, 'WORKER_REAPED')
+      FROM public.imap_accounts a
+      WHERE r.account_id = a.id
+        AND r.status = 'running'
+        AND r.finished_at IS NULL
+        AND r.started_at < now() - ($1::bigint * interval '1 millisecond')
+        AND (
+          a.last_heartbeat_at IS NULL
+          OR a.last_heartbeat_at < now() - ($1::bigint * interval '1 millisecond')
+        )
+        AND ${unlocked}
+      `,
+      [staleThresholdMs]
+    );
+
+    return {
+      terminatedBackends: 0,
+      accountsReset: reset.rowCount ?? 0,
+      runsClosed: closed.rowCount ?? 0
+    };
+  } catch {
+    return { terminatedBackends: 0, accountsReset: 0, runsClosed: 0 };
+  }
+}
+
+async function clearOrphanedLocksWithTakeover(
   pool: PgPool,
   staleThresholdMs: number
 ): Promise<OrphanedLockSweep> {
