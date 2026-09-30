@@ -476,8 +476,11 @@ export class MirrorEngine {
         });
         accountSyncStarted = true;
         // Holding the lock proves no other sync of this account is live, so any
-        // run still open is a vanished worker's orphan.
-        await this.repository.closeOrphanedSyncRuns(account.id, runId);
+        // run still open is a vanished worker's orphan. Cosmetic: never fail the
+        // sync over it, and leave it to full sweeps rather than frequent lanes.
+        if (!supplemental) {
+          await this.repository.closeOrphanedSyncRuns(account.id, runId).catch(() => 0);
+        }
         throwIfInterrupted();
         const sentFolders = options.sentOnly
           ? await this.repository.getSentFoldersDueForSync(account.id)

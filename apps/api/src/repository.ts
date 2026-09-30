@@ -1556,7 +1556,8 @@ export class MirrorRepository {
    * Close sync runs a previous lock holder left open. The caller must hold the
    * account lock, which proves no other sync of this account is live. The age
    * guard skips a run that has only just been opened and is about to find the
-   * lock busy.
+   * lock busy. The one-hour window keeps this an index range scan; older
+   * orphans are left to the startup sweep.
    */
   async closeOrphanedSyncRuns(accountId: string, currentRunId: string): Promise<number> {
     const result = await this.pool.query(
@@ -1569,17 +1570,12 @@ export class MirrorRepository {
         AND id <> $2
         AND status = 'running'
         AND finished_at IS NULL
+        AND started_at > now() - interval '1 hour'
         AND started_at < now() - interval '1 minute'
       `,
       [accountId, currentRunId]
     );
     return result.rowCount ?? 0;
-  }
-
-  async heartbeat(accountId: string): Promise<void> {
-    await this.pool.query("UPDATE public.imap_accounts SET last_heartbeat_at = now() WHERE id = $1", [
-      accountId
-    ]);
   }
 
   private async lockThreadStateForMirrorWrite(client: PgClient, accountId: string): Promise<void> {
