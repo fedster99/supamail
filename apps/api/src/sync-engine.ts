@@ -56,6 +56,8 @@ const HISTORY_METADATA_COMMIT_GRACE_MS = 30_000;
 const SYNC_STATE_WRITE_GRACE_MS = 30_000;
 const UNCHANGED_PROOF_QUERY = { uidValidity: true, uidNext: true, highestModseq: true } as const;
 const SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS = 1_000;
+/** How long a provider that did not activate QRESYNC is left alone before the next try. */
+const QRESYNC_UNAVAILABLE_RETRY_MS = 6 * 60 * 60_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
 
 const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
@@ -349,6 +351,7 @@ export class MirrorEngine {
   private readonly repository: MirrorRepository;
   private readonly bodyStore: BodyStore;
   private readonly hooks: MirrorHooks;
+  private readonly qresyncUnavailableUntil = new Map<string, number>();
   private readonly clientFactory: (
     account: ImapAccount,
     options?: { signal?: AbortSignal }
@@ -932,6 +935,14 @@ export class MirrorEngine {
     return fetched;
   }
 
+  private qresyncKnownUnavailable(accountId: string): boolean {
+    const until = this.qresyncUnavailableUntil.get(accountId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.qresyncUnavailableUntil.delete(accountId);
+    return false;
+  }
+
   private shouldDiscoverFolders(account: ImapAccount): boolean {
     if (!account.next_folder_discovery_at) return true;
     return new Date(account.next_folder_discovery_at).getTime() <= Date.now();
@@ -1160,15 +1171,17 @@ export class MirrorEngine {
     });
     // A catch-up replay may run without the shared slots: a rejected or partial
     // replay applies nothing, advances no cursor, and the proof retries it.
-    const qresyncRequest = this.config.IMAP_QRESYNC_ENABLED
+    const qresyncWanted = this.config.IMAP_QRESYNC_ENABLED
       && (options.qresyncCatchUp === true || (options.allowFlagScan && options.allowReconcile))
       && folder.initial_sync_complete
       && folder.uidvalidity !== null
       && folder.qresync_highest_modseq !== null
-      && client.capabilities?.has("QRESYNC")
+      && client.capabilities?.has("QRESYNC") === true;
+    const qresyncRequest = qresyncWanted && !this.qresyncKnownUnavailable(account.id)
       ? {
-          uidValidity: BigInt(folder.uidvalidity),
-          changedSince: BigInt(folder.qresync_highest_modseq)
+          // qresyncWanted proved both cursors are present.
+          uidValidity: BigInt(folder.uidvalidity!),
+          changedSince: BigInt(folder.qresync_highest_modseq!)
         }
       : undefined;
     let qresyncCommandRejected = false;
@@ -1240,7 +1253,7 @@ export class MirrorEngine {
       let flagScanAttempted = false;
       let hitLockBudget = false;
       let qresyncApplied = false;
-      let qresyncFallbackRequired = qresyncCommandRejected;
+      let qresyncFallbackRequired = false;
 
       // Spec §10.4: initial sync is snapshot-based and newest-first, with a
       // watermark (`initial_sync_oldest_uid_synced`) so a crash mid-backfill
@@ -1322,7 +1335,8 @@ export class MirrorEngine {
         ? Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS
         : undefined;
       if (qresyncReplay) {
-        qresyncFallbackRequired = !qresyncReplay.accepted || !qresyncReplay.complete;
+        // An accepted but partial replay may have missed changes: check exactly.
+        qresyncFallbackRequired = qresyncReplay.accepted && !qresyncReplay.complete;
         if (qresyncReplay.accepted && qresyncReplay.complete) {
           const qresyncWriteDeadline = qresyncDeadline!;
           for (let i = 0; i < qresyncReplay.changedFlags.length; i += MAX_SYNC_BATCH_SIZE) {
@@ -1363,6 +1377,21 @@ export class MirrorEngine {
           qresyncApplied = true;
         }
       }
+      if (qresyncRequest && (qresyncCommandRejected || qresyncReplay?.accepted === false)) {
+        // The provider did not activate QRESYNC (some advertise it but never
+        // honor it). Stop asking for a while; ordinary passes then run as on a
+        // server without QRESYNC.
+        this.qresyncUnavailableUntil.set(account.id, Date.now() + QRESYNC_UNAVAILABLE_RETRY_MS);
+      }
+      // Without QRESYNC an ordinary pass behaves as on a server without it: flag
+      // scans and exact audits follow their schedules. Only a pass with a concrete
+      // reason to replay (a known change or a provider-proven changed folder)
+      // needs the exact fallback now. Forcing it on every refused routine pass
+      // let one folder take the only audit slot each pass and starve the rest.
+      const qresyncNeeded = options.qresyncCatchUp === true
+        || options.forceReconcile === true
+        || options.forceFlagScan === true;
+      if (qresyncWanted && qresyncNeeded && !qresyncApplied) qresyncFallbackRequired = true;
       if (qresyncRequest) {
         await this.repository.logEvent(
           account.id,

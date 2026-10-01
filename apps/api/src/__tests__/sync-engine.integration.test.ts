@@ -1206,6 +1206,95 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
   });
 
+  it("does not let a provider that never activates QRESYNC starve other folders' exact audits", async () => {
+    // Some providers (iCloud) advertise QRESYNC but never activate it. Refusal in
+    // an ordinary pass must not force an exact audit of the first folder every
+    // time, or that folder takes the only audit slot and the rest never get one.
+    const h = await setupIntegration("qresync-never-accepted", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true,
+      MAX_RECONCILES_PER_CYCLE: 1
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    for (const [index, path] of ["Archive", "Projects", "Receipts"].entries()) {
+      folders.push({
+        path,
+        delimiter: "/",
+        uidValidity: 50_100 + index,
+        highestModseq: 10n,
+        messages: [
+          makeTextMessage({ uid: 1, subject: path, from: "a@x.test", to: "u@x.test", body: path })
+        ]
+      });
+    }
+    await h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } })
+      .syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_reconcile_clean = true,
+           last_full_reconcile_at = CASE WHEN path IN ('INBOX', 'Sent')
+             THEN now() - interval '1 hour' ELSE now() - interval '8 days' END,
+           next_reconcile_at = CASE WHEN path IN ('INBOX', 'Sent')
+             THEN now() + interval '5 hours' ELSE now() - interval '7 days' END,
+           next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    const before = await h.pool.query<{ path: string; last_full_reconcile_at: Date }>(
+      "SELECT path, last_full_reconcile_at FROM public.imap_folders WHERE account_id = $1",
+      [h.account.id]
+    );
+    const inboxBefore = before.rows.find((row) => row.path === "INBOX")!.last_full_reconcile_at;
+
+    const qresyncRequests: string[] = [];
+    class NeverActivatingQresyncClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+
+      override async getMailboxLock(
+        path: string,
+        options: { qresync?: QresyncRequest } = {}
+      ): Promise<MailboxLock> {
+        const lock = await super.getMailboxLock(path);
+        if (!options.qresync) return lock;
+        qresyncRequests.push(path);
+        return {
+          ...lock,
+          qresync: { accepted: false, complete: false, vanishedUids: [], changedFlags: [] }
+        };
+      }
+    }
+    // A fresh connection every pass, as a hosted worker opens one per sync.
+    const engine = h.buildEngine({
+      folders,
+      overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true, MAX_RECONCILES_PER_CYCLE: 1 },
+      clientFactory: async () => new NeverActivatingQresyncClient(folders)
+    });
+    for (let pass = 0; pass < 3; pass++) {
+      await h.pool.query(
+        "UPDATE public.imap_folders SET next_sync_due_at = now() - interval '1 second' WHERE account_id = $1",
+        [h.account.id]
+      );
+      await expect(engine.syncAccount(h.account.id, "scheduled")).resolves.toMatchObject({ outcome: "success" });
+    }
+
+    const after = await h.pool.query<{ path: string; last_full_reconcile_at: Date }>(
+      "SELECT path, last_full_reconcile_at FROM public.imap_folders WHERE account_id = $1",
+      [h.account.id]
+    );
+    const audited = after.rows
+      .filter((row) => row.last_full_reconcile_at > new Date(Date.now() - 60_000))
+      .map((row) => row.path)
+      .sort();
+    // Each pass gave its one audit slot to a folder that was actually due.
+    expect(audited).toEqual(["Archive", "Projects", "Receipts"]);
+    expect(after.rows.find((row) => row.path === "INBOX")!.last_full_reconcile_at).toEqual(inboxBefore);
+    // The refusal is remembered: later passes stop asking.
+    expect(qresyncRequests).toEqual(["INBOX"]);
+  });
+
   it("keeps the QRESYNC cursor behind changes deferred by the replay budget", async () => {
     const h = await setupIntegration("qresync-replay-budget", {
       INITIAL_SYNC_BATCH_SIZE: 50,
