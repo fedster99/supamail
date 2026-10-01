@@ -113,6 +113,13 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   > normalization, operator aliases, structured key) live in one declarative table
   > (`search/filter-fields.ts`); `parseQuery` and `filtersFromStructured` both consume
   > it and the schema parity test asserts the table ⟷ Zod ⟷ JSON-Schema key sets agree.
+- **OR joins operators.** `from:a OR from:b` becomes one `or` filter, and the
+  compiler joins its members' predicates with SQL `OR`. OR binds tighter than a
+  space, so `from:a OR from:b is:unread` means (a or b) and unread. OR between two
+  words stays in the free text for `websearch_to_tsquery`. Any other uppercase OR
+  (beside an ignored operator, `sort:`, or the query edge) is dropped with a
+  warning, so it never becomes a required search word. There is no grouping with
+  parentheses.
 - **email-005 added** the precise recipient lanes the union was missing: `to` (To
   only), `cc` (Cc only), `bcc` (Bcc only — populated only on sent mail), and
   `anyEmail` (from + to + cc + bcc, the Nylas `any_email`). The pre-existing broad

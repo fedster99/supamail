@@ -90,6 +90,8 @@ export const searchEmailToolDefinition = {
     "has:attachment filename: after:7d before:2026-01-01 larger:2mb account: \"exact phrase\" -exclude) " +
     "and/or a structured filters object (from, to, cc, bcc, anyEmail, subject, body, folder, thread, " +
     "isUnread, isStarred/isFlagged, hasAttachment, after, before, …), scoped to one or all accounts. " +
+    "OR joins the operators or words beside it: from:a OR from:b is:unread means (a or b) and unread. " +
+    "Check parsed_query.warnings for an OR that was ignored. " +
     "All filters COMPOSE with the semantic free-text query — they narrow, never replace it, over the " +
     "FULL mirror history (no 90-day window). Returns ranked, " +
     "snippet-highlighted results with full mailbox identity, an optional per-result " +

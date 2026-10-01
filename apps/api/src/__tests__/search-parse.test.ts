@@ -89,6 +89,64 @@ describe("parseQuery", () => {
   });
 });
 
+describe("parseQuery OR", () => {
+  it("joins operators beside OR into one group that binds tighter than a space", () => {
+    const parsed = parseQuery("from:@nytimes.com OR from:@vcj.com or -from:bob is:unread");
+    expect(parsed.filters).toEqual([
+      {
+        kind: "or",
+        negated: false,
+        raw: "from:@nytimes.com OR from:@vcj.com OR -from:bob",
+        filters: [
+          { kind: "fromDomain", value: "nytimes.com", negated: false, raw: "from:@nytimes.com" },
+          { kind: "fromDomain", value: "vcj.com", negated: false, raw: "from:@vcj.com" },
+          { kind: "from", value: "bob", negated: true, raw: "-from:bob" }
+        ]
+      },
+      { kind: "flag", value: "\\Seen", negated: true, raw: "is:unread" }
+    ]);
+    expect(parsed.freeText).toBe("");
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  it("keeps OR between free-text words for the text search", () => {
+    const parsed = parseQuery('invoice OR "time sheet" from:acme');
+    expect(parsed.freeText).toBe('invoice OR "time sheet"');
+    expect(parsed.filters).toEqual([{ kind: "from", value: "acme", negated: false, raw: "from:acme" }]);
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  it("warns and drops an uppercase OR it cannot apply instead of searching for it", () => {
+    const mixed = parseQuery("budget OR from:alice report");
+    expect(mixed.freeText).toBe("budget report");
+    expect(mixed.filters.map((filter) => filter.kind)).toEqual(["from"]);
+    expect(mixed.warnings).toEqual([
+      'OR ignored between "budget" and "from:alice"; OR joins two operators (from:a OR from:b) or two words'
+    ]);
+
+    const edges = parseQuery("OR from:a OR sort:recent");
+    expect(edges.filters.map((filter) => filter.kind)).toEqual(["from"]);
+    expect(edges.sort).toBe("recent");
+    expect(edges.freeText).toBe("");
+    expect(edges.warnings).toHaveLength(2);
+    expect(edges.warnings[0]).toContain('between the start and "from:a"');
+    expect(edges.warnings[1]).toContain('between "from:a" and "sort:recent"');
+  });
+
+  it("does not join across an operator that was ignored", () => {
+    const parsed = parseQuery("from:a OR is:purple from:b");
+    expect(parsed.filters.map((filter) => filter.kind)).toEqual(["from", "from"]);
+    expect(parsed.warnings.join(" ")).toContain('between "from:a" and "is:purple"');
+  });
+
+  it("leaves a lowercase or that cannot join operators as an ordinary word", () => {
+    expect(parseQuery("terms or conditions").freeText).toBe("terms or conditions");
+    const parsed = parseQuery("from:a or invoice");
+    expect(parsed.freeText).toBe("or invoice");
+    expect(parsed.warnings).toEqual([]);
+  });
+});
+
 describe("filtersFromStructured", () => {
   it("maps a structured object onto the same filter union as the string parser", () => {
     const filters = filtersFromStructured({ from: "bob@acme.com", isUnread: true, hasAttachment: true });
@@ -279,6 +337,16 @@ describe("compileSearch", () => {
     });
     expect(compiled.text).toContain("m.account_id = ANY(");
     expect(compiled.values).toContainEqual(["11111111-1111-1111-1111-111111111111"]);
+  });
+
+  it("compiles an OR group to one parenthesized predicate that keeps each member's negation", () => {
+    const parsed = parseQuery("from:@nytimes.com OR -subject:sale is:unread");
+    const compiled = compileSearch("", parsed.filters, baseCompileOptions);
+    expect(compiled.text).toContain(
+      "(lower(split_part(coalesce(m.from_email,''),'@',2)) = $1 OR NOT (lower(coalesce(m.subject,'')) LIKE $2))"
+    );
+    expect(compiled.text).toContain("NOT (coalesce(m.flags,'{}'::text[]) @> ARRAY[$3]::text[])");
+    expect(compiled.values.slice(0, 3)).toEqual(["nytimes.com", "%sale%", "\\Seen"]);
   });
 
   it("resolves a relative date to a now()-relative interval, not a bound timestamp", () => {

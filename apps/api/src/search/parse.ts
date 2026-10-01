@@ -130,12 +130,31 @@ function mapIsFlag(value: string): SearchFilter | { warning: string } {
   }
 }
 
+/** What one token produced: a filter, free text, an `OR`, or nothing usable
+ * (an output control such as `sort:`, or an operator ignored with a warning). */
+type QueryItem =
+  | { kind: "filter"; token: string; filter: SearchFilter }
+  | { kind: "text"; token: string }
+  | { kind: "or"; token: string }
+  | { kind: "other"; token: string };
+
+/** Add `next` to the OR group that `previous` starts or already holds. */
+function joinOr(previous: SearchFilter, next: SearchFilter): SearchFilter {
+  const filters = previous.kind === "or" ? [...previous.filters, next] : [previous, next];
+  return { kind: "or", filters, negated: false, raw: `${previous.raw} OR ${next.raw}` };
+}
+
 /**
  * Parse a free-text superset query into the structured {@link ParsedQuery}.
  * Recognized `field:value` operators become structured filters; everything else
  * is left as free text and handed verbatim to `websearch_to_tsquery`, which
  * natively understands quoted phrases, `or`, and `-` negation. This is total —
  * it never throws; unknown operators are demoted to free text with a warning.
+ *
+ * `OR` between two operators joins them into one `or` filter, so
+ * `from:a OR from:b is:unread` means (a or b) and unread. `OR` between two
+ * free-text words stays in the free text. Any other uppercase `OR` is ignored
+ * with a warning instead of becoming a search word.
  */
 export function parseQuery(input: string): ParsedQuery {
   const filters: SearchFilter[] = [];
@@ -145,119 +164,39 @@ export function parseQuery(input: string): ParsedQuery {
   let sort: SearchSort | null = null;
   let limit: number | null = null;
 
-  for (const token of tokenize(input ?? "")) {
-    const opMatch = /^(-)?([A-Za-z][\w-]*):([\s\S]*)$/.exec(token);
-    const field = opMatch ? opMatch[2].toLowerCase() : null;
+  const items: QueryItem[] = tokenize(input ?? "").map((token) => {
+    if (/^or$/i.test(token)) return { kind: "or", token };
+    const read = readToken(token);
+    if (read === "text") return { kind: "text", token };
+    if (read === null) return { kind: "other", token };
+    return { kind: "filter", token, filter: read };
+  });
 
-    if (!opMatch || field === null || !KNOWN_OPERATORS.has(field)) {
-      // Free text (includes bare URLs, `-word` negation, "quoted phrases").
-      freeTextParts.push(token);
+  let joinNext = false;
+  for (const [index, item] of items.entries()) {
+    if (item.kind === "or") {
+      const left = items[index - 1];
+      const right = items[index + 1];
+      if (left?.kind === "filter" && right?.kind === "filter") {
+        joinNext = true;
+      } else if ((left?.kind === "text" && right?.kind === "text") || item.token !== "OR") {
+        freeTextParts.push(item.token);
+      } else {
+        warnings.push(
+          `OR ignored between ${left ? `"${left.token}"` : "the start"} and ` +
+          `${right ? `"${right.token}"` : "the end"}; ` +
+          "OR joins two operators (from:a OR from:b) or two words"
+        );
+      }
       continue;
     }
-
-    const negated = opMatch[1] === "-";
-    const rawValue = stripQuotes(opMatch[3]).trim();
-    const raw = token;
-
-    if (rawValue === "" && field !== "has") {
-      warnings.push(`empty value for operator ${field}:; ignored`);
-      continue;
+    if (item.kind === "filter") {
+      if (joinNext) filters.push(joinOr(filters.pop()!, item.filter));
+      else filters.push(item.filter);
+    } else if (item.kind === "text") {
+      freeTextParts.push(item.token);
     }
-
-    // Table-driven text fields (from:/to:/cc:/subject:/in:/filename:/…). The
-    // field table single-sources the kind, value-normalization, and value-based
-    // routing (the `from:@domain` → fromDomain split), so this one branch
-    // replaces what used to be ~15 hand-written operator cases.
-    const textField = TEXT_FIELD_BY_OPERATOR.get(field);
-    if (textField) {
-      const normalized = textField.normalize(rawValue);
-      const routed = textField.route ? textField.route(normalized) : { kind: textField.kind, value: normalized };
-      filters.push({ kind: routed.kind, value: routed.value, negated, raw } as SearchFilter);
-      continue;
-    }
-
-    switch (field) {
-      case "is": {
-        const mapped = mapIsFlag(rawValue);
-        if ("warning" in mapped) warnings.push(mapped.warning);
-        else filters.push(negated ? { ...mapped, negated: !mapped.negated } : mapped);
-        break;
-      }
-      case "has": {
-        const v = rawValue.toLowerCase();
-        if (v === "attachment" || v === "attachments" || v === "file" || v === "") {
-          filters.push({ kind: "hasAttachment", negated, raw });
-        } else if (v === "noattachment" || v === "noattachments") {
-          filters.push({ kind: "hasAttachment", negated: !negated, raw });
-        } else if (v === "body") {
-          filters.push({ kind: "hasBody", negated, raw });
-        } else {
-          warnings.push(`unknown has:${rawValue} operator; ignored`);
-        }
-        break;
-      }
-      case "after":
-      case "since":
-      case "newer_than":
-      case "newer": {
-        if (isValidDate(rawValue)) {
-          filters.push({ kind: "date", op: "after", value: rawValue, negated, raw });
-        } else {
-          warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
-        }
-        break;
-      }
-      case "before":
-      case "until":
-      case "older_than":
-      case "older": {
-        if (isValidDate(rawValue)) {
-          filters.push({ kind: "date", op: "before", value: rawValue, negated, raw });
-        } else {
-          warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
-        }
-        break;
-      }
-      case "larger":
-      case "bigger":
-      case "smaller": {
-        const bytes = parseSizeToBytes(rawValue);
-        if (bytes === null) {
-          warnings.push(`unparseable size "${rawValue}" for ${field}:; ignored`);
-        } else {
-          filters.push({ kind: "size", op: field === "smaller" ? "smaller" : "larger", value: bytes, negated, raw });
-        }
-        break;
-      }
-      case "account":
-        accounts.push(rawValue);
-        break;
-      case "window":
-      case "lane": {
-        const upper = rawValue.toUpperCase() as WindowStatus;
-        if (WINDOW_VALUES.includes(upper)) {
-          filters.push({ kind: "window", value: upper, negated, raw });
-        } else {
-          warnings.push(`unknown window/lane "${rawValue}"; ignored`);
-        }
-        break;
-      }
-      case "sort": {
-        const candidate = rawValue.toLowerCase();
-        const aliased = candidate === "date" ? "recent" : candidate;
-        if ((SEARCH_SORTS as string[]).includes(aliased)) sort = aliased as SearchSort;
-        else warnings.push(`unknown sort "${rawValue}"; ignored`);
-        break;
-      }
-      case "limit": {
-        const parsed = Number.parseInt(rawValue, 10);
-        if (Number.isFinite(parsed) && parsed > 0) limit = Math.min(parsed, 100);
-        else warnings.push(`invalid limit "${rawValue}"; ignored`);
-        break;
-      }
-      default:
-        freeTextParts.push(token);
-    }
+    joinNext = false;
   }
 
   return {
@@ -268,6 +207,112 @@ export function parseQuery(input: string): ParsedQuery {
     limit,
     warnings
   };
+
+  /** Read one token. Returns its filter, `"text"` for free text, or null when
+   * it sets an output control or is ignored with a warning. */
+  function readToken(token: string): SearchFilter | "text" | null {
+    const opMatch = /^(-)?([A-Za-z][\w-]*):([\s\S]*)$/.exec(token);
+    const field = opMatch ? opMatch[2].toLowerCase() : null;
+
+    if (!opMatch || field === null || !KNOWN_OPERATORS.has(field)) {
+      // Free text (includes bare URLs, `-word` negation, "quoted phrases").
+      return "text";
+    }
+
+    const negated = opMatch[1] === "-";
+    const rawValue = stripQuotes(opMatch[3]).trim();
+    const raw = token;
+
+    if (rawValue === "" && field !== "has") {
+      warnings.push(`empty value for operator ${field}:; ignored`);
+      return null;
+    }
+
+    // Table-driven text fields (from:/to:/cc:/subject:/in:/filename:/…). The
+    // field table single-sources the kind, value-normalization, and value-based
+    // routing (the `from:@domain` → fromDomain split), so this one branch
+    // replaces what used to be ~15 hand-written operator cases.
+    const textField = TEXT_FIELD_BY_OPERATOR.get(field);
+    if (textField) {
+      const normalized = textField.normalize(rawValue);
+      const routed = textField.route ? textField.route(normalized) : { kind: textField.kind, value: normalized };
+      return { kind: routed.kind, value: routed.value, negated, raw } as SearchFilter;
+    }
+
+    switch (field) {
+      case "is": {
+        const mapped = mapIsFlag(rawValue);
+        if ("warning" in mapped) {
+          warnings.push(mapped.warning);
+          return null;
+        }
+        return negated ? { ...mapped, negated: !mapped.negated } : mapped;
+      }
+      case "has": {
+        const v = rawValue.toLowerCase();
+        if (v === "attachment" || v === "attachments" || v === "file" || v === "") {
+          return { kind: "hasAttachment", negated, raw };
+        }
+        if (v === "noattachment" || v === "noattachments") {
+          return { kind: "hasAttachment", negated: !negated, raw };
+        }
+        if (v === "body") return { kind: "hasBody", negated, raw };
+        warnings.push(`unknown has:${rawValue} operator; ignored`);
+        return null;
+      }
+      case "after":
+      case "since":
+      case "newer_than":
+      case "newer": {
+        if (isValidDate(rawValue)) return { kind: "date", op: "after", value: rawValue, negated, raw };
+        warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
+        return null;
+      }
+      case "before":
+      case "until":
+      case "older_than":
+      case "older": {
+        if (isValidDate(rawValue)) return { kind: "date", op: "before", value: rawValue, negated, raw };
+        warnings.push(`unparseable date "${rawValue}" for ${field}:; ignored`);
+        return null;
+      }
+      case "larger":
+      case "bigger":
+      case "smaller": {
+        const bytes = parseSizeToBytes(rawValue);
+        if (bytes === null) {
+          warnings.push(`unparseable size "${rawValue}" for ${field}:; ignored`);
+          return null;
+        }
+        return { kind: "size", op: field === "smaller" ? "smaller" : "larger", value: bytes, negated, raw };
+      }
+      case "account":
+        accounts.push(rawValue);
+        return null;
+      case "window":
+      case "lane": {
+        const upper = rawValue.toUpperCase() as WindowStatus;
+        if (WINDOW_VALUES.includes(upper)) return { kind: "window", value: upper, negated, raw };
+        warnings.push(`unknown window/lane "${rawValue}"; ignored`);
+        return null;
+      }
+      case "sort": {
+        const candidate = rawValue.toLowerCase();
+        const aliased = candidate === "date" ? "recent" : candidate;
+        if ((SEARCH_SORTS as string[]).includes(aliased)) sort = aliased as SearchSort;
+        else warnings.push(`unknown sort "${rawValue}"; ignored`);
+        return null;
+      }
+      case "limit": {
+        const parsed = Number.parseInt(rawValue, 10);
+        if (Number.isFinite(parsed) && parsed > 0) limit = Math.min(parsed, 100);
+        else warnings.push(`invalid limit "${rawValue}"; ignored`);
+        return null;
+      }
+      default:
+        return "text";
+    }
+  }
 }
 
 /** Map a typed {@link StructuredFilters} object onto the same filter union the
