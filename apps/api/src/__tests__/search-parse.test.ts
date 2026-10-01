@@ -139,11 +139,14 @@ describe("parseQuery OR", () => {
     expect(parsed.warnings.join(" ")).toContain('between "from:a" and "is:purple"');
   });
 
-  it("leaves a lowercase or that cannot join operators as an ordinary word", () => {
+  it("treats a lowercase or like OR: kept between words, dropped beside an operator", () => {
     expect(parseQuery("terms or conditions").freeText).toBe("terms or conditions");
-    const parsed = parseQuery("from:a or invoice");
-    expect(parsed.freeText).toBe("or invoice");
-    expect(parsed.warnings).toEqual([]);
+    // Kept as text, "or" would join "budget" and "report" across the operator.
+    const parsed = parseQuery("budget or from:alice report");
+    expect(parsed.freeText).toBe("budget report");
+    expect(parsed.warnings).toEqual([
+      'OR ignored between "budget" and "from:alice"; OR joins two operators (from:a OR from:b) or two words'
+    ]);
   });
 });
 

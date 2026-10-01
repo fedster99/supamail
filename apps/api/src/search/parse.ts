@@ -153,8 +153,9 @@ function joinOr(previous: SearchFilter, next: SearchFilter): SearchFilter {
  *
  * `OR` between two operators joins them into one `or` filter, so
  * `from:a OR from:b is:unread` means (a or b) and unread. `OR` between two
- * free-text words stays in the free text. Any other uppercase `OR` is ignored
- * with a warning instead of becoming a search word.
+ * free-text words stays in the free text. Any other `OR`, in any case, is
+ * ignored with a warning: kept as text, it would join the words around the
+ * operator instead.
  */
 export function parseQuery(input: string): ParsedQuery {
   const filters: SearchFilter[] = [];
@@ -179,7 +180,7 @@ export function parseQuery(input: string): ParsedQuery {
       const right = items[index + 1];
       if (left?.kind === "filter" && right?.kind === "filter") {
         joinNext = true;
-      } else if ((left?.kind === "text" && right?.kind === "text") || item.token !== "OR") {
+      } else if (left?.kind === "text" && right?.kind === "text") {
         freeTextParts.push(item.token);
       } else {
         warnings.push(
