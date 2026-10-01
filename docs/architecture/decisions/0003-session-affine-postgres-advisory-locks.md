@@ -20,6 +20,10 @@ Unlock is also a proof obligation: `pg_advisory_unlock` must return true. A fals
 
 On direct connections, recovery no longer terminates a lock-holding session whose heartbeat is stale. A stale heartbeat cannot distinguish a dead worker from a frozen one. A frozen worker that resumes after losing its lock could write stale mailbox state with no database fence. Instead, every direct pooled session sets server-side TCP keepalive and `tcp_user_timeout`. Postgres then releases the sessions of a vanished worker in about a minute, while a stalled but alive worker keeps its locks. Through a Supabase session pooler, probes cannot reach the worker, so stale-heartbeat takeover remains there. Sync proves ownership with `assertLive` before each folder, body batch and history batch, and stops on proven loss. The next lock holder closes runs a vanished worker left open.
 
+### Amendment: sync writes on the lock session (2026-10)
+
+The checks above still let a holder write the rest of the unit it was in when its lock was lost. Sync now runs with `fenceWrites`: every repository query inside the locked sync uses the lock's own session, serialized so transactions stay isolated. Writes and lock share one session, so no holder can write after losing the lock, with any number of workers. A cancelled or failed transaction ends the session from another connection and destroys the client, which releases the lock. Cost: one session per active sync carries its writes, the same session that already held the lock.
+
 ## Consequences
 
 - Supabase transaction pooler URLs are not supported.
@@ -30,8 +34,11 @@ On direct connections, recovery no longer terminates a lock-holding session whos
 - Known-lost/unknown lock liveness cannot cross an irreversible boundary.
 - On direct connections no live lock holder is ever terminated; contention
   reports "Account lock busy".
-- Session-pooler deployments keep the stale-heartbeat takeover and its frozen
-  worker risk, because server-side probes cannot reach the worker there.
+- Session-pooler deployments keep the stale-heartbeat takeover, because
+  server-side probes cannot reach the worker there. Fenced sync writes make that
+  takeover safe: the terminated holder cannot write afterwards.
+- Writes outside Postgres (body objects, external search indexes) are not
+  fenced; they are keyed by message and repeat the same content.
 - Confirmed delivery is never converted into a retry signal by later heartbeat or
   unlock diagnostics.
 - Failed/false advisory unlock destroys the pool session; it cannot leave a

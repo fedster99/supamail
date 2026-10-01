@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { PgClient, PgPool } from "./db.js";
 
 export interface AccountLock {
@@ -20,6 +21,10 @@ export interface AccountLockOptions {
   /** Receive a diagnostic that happened only after an irreversible action was
    * confirmed. Callers should add it to their success warnings. */
   onPostIrreversibleWarning?: (warning: string) => void;
+  /** Run `fn` so that every query issued through `lockedSessionPool` uses the
+   * lock's own session. Writes then share fate with the lock: once that session
+   * ends, the holder cannot write anything else, however long it was frozen. */
+  fenceWrites?: boolean;
 }
 
 export class AccountLockLivenessError extends Error {
@@ -27,6 +32,114 @@ export class AccountLockLivenessError extends Error {
     super(message);
     this.name = "AccountLockLivenessError";
   }
+}
+
+/**
+ * The lock's own session presented as a pool. Work runs one at a time, so a
+ * transaction never interleaves with other queries, as on a real pool. After the
+ * lock ends it refuses all work. A lease released with an error (a cancelled or
+ * failed transaction) abandons the session: it is ended from another connection,
+ * which stops any query still waiting on it and releases the lock, and the lock
+ * client is then destroyed rather than returned to the pool.
+ */
+class LockedSession {
+  private tail: Promise<void> = Promise.resolve();
+  private closed = false;
+  abandoned = false;
+  backendPid: number | null = null;
+
+  constructor(
+    private readonly client: PgClient,
+    private readonly lockId: string | number,
+    private readonly basePool: PgPool
+  ) {}
+
+  abandon(): void {
+    if (this.abandoned) return;
+    this.abandoned = true;
+    if (this.backendPid !== null) {
+      void this.basePool.query("SELECT pg_terminate_backend($1)", [this.backendPid]).catch(() => undefined);
+    }
+  }
+
+  private async turn(): Promise<() => void> {
+    const previous = this.tail;
+    let done!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      done = resolve;
+    });
+    await previous;
+    return done;
+  }
+
+  async exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const done = await this.turn();
+    try {
+      return await work();
+    } finally {
+      done();
+    }
+  }
+
+  assertUsable(): void {
+    if (this.closed || this.abandoned) {
+      throw new AccountLockLivenessError(
+        `Account lock session for lock ${this.lockId} is no longer usable`,
+        false
+      );
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  readonly pool = {
+    query: async (...args: unknown[]) => {
+      this.assertUsable();
+      return await this.exclusive(async () => {
+        this.assertUsable();
+        return await (this.client.query as (...queryArgs: unknown[]) => Promise<unknown>)(...args);
+      });
+    },
+    connect: async () => {
+      this.assertUsable();
+      const done = await this.turn();
+      try {
+        this.assertUsable();
+      } catch (error) {
+        done();
+        throw error;
+      }
+      let released = false;
+      return {
+        query: async (...args: unknown[]) => {
+          if (released) throw new Error("Locked session lease was already released");
+          return await (this.client.query as (...queryArgs: unknown[]) => Promise<unknown>)(...args);
+        },
+        release: (discard?: Error | boolean) => {
+          if (released) return;
+          released = true;
+          if (discard) this.abandon();
+          done();
+        }
+      };
+    }
+  } as unknown as PgPool;
+}
+
+const lockedSessionContext = new AsyncLocalStorage<LockedSession>();
+
+function ignoreLockedSessionError(): void {
+  // The failure surfaces on the next query through the session.
+}
+
+/**
+ * Inside a `fenceWrites` account lock, the lock's own session; otherwise
+ * `fallback`. Repositories resolve their pool through this on every query.
+ */
+export function lockedSessionPool(fallback: PgPool): PgPool {
+  return lockedSessionContext.getStore()?.pool ?? fallback;
 }
 
 const LOCK_SELF_TEST_TIMEOUT_MS = 5_000;
@@ -157,6 +270,32 @@ async function queryWithTimeout<T>(
 }
 
 /**
+ * Close a fenced session to further work, wait for queued work, then unlock.
+ * Returns false for an abandoned session: it was already ended (which released
+ * the lock) and may hold an open transaction, so the caller must destroy the
+ * client instead of returning it to the pool.
+ */
+async function unlockSession(
+  client: PgClient,
+  lockId: string | number,
+  session: LockedSession | null
+): Promise<boolean> {
+  if (!session) {
+    await validateAccountUnlock(client, lockId);
+    return true;
+  }
+  session.close();
+  return await session.exclusive(async () => {
+    if (session.abandoned) return false;
+    await validateAccountUnlock(client, lockId);
+    return true;
+  });
+}
+
+const abandonedSessionError = (lockId: string | number) =>
+  new Error(`Account lock session for lock ${lockId} was abandoned and ended`);
+
+/**
  * Run `fn` while holding a Postgres advisory lock on a dedicated connection.
  * The lock is released explicitly before the connection returns to the pool;
  * if the process exits, Postgres releases it when the session closes.
@@ -198,12 +337,35 @@ export async function withAccountLock<T>(
       options.onPostIrreversibleWarning?.(warning);
     };
 
+    const session = options.fenceWrites ? new LockedSession(client, lockId, pool) : null;
+    if (session) {
+      // Writes are fenced by this session, so losing it must fail this operation,
+      // not crash the process through an unhandled client error.
+      client.on?.("error", ignoreLockedSessionError);
+      try {
+        const backend = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        session.backendPid = backend.rows[0]?.pid ?? null;
+      } catch (error) {
+        try {
+          await validateAccountUnlock(client, lockId);
+        } catch (unlockError) {
+          releaseError = asError(unlockError, `Account lock release failed for lock ${lockId}`);
+        }
+        throw asError(error, `Account lock session setup failed for lock ${lockId}`);
+      }
+    }
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatPending: Promise<void> | null = null;
     let lastHeartbeatError: unknown = null;
     const refreshHeartbeat = async (): Promise<void> => {
       if (heartbeatPending) return await heartbeatPending;
-      const pending = persistAndValidateAccountLockWithRetry(client, lockId)
+      const persist = () => persistAndValidateAccountLockWithRetry(client, lockId);
+      const pending = (session
+        ? session.exclusive(async () => {
+            session.assertUsable();
+            await persist();
+          })
+        : persist())
         .then(() => {
           lastHeartbeatError = null;
         })
@@ -247,7 +409,9 @@ export async function withAccountLock<T>(
       }
 
       try {
-        callbackValue = await fn(lock);
+        callbackValue = session
+          ? await lockedSessionContext.run(session, () => fn(lock))
+          : await fn(lock);
       } catch (error) {
         callbackFailed = true;
         callbackError = error;
@@ -281,7 +445,7 @@ export async function withAccountLock<T>(
 
       try {
         unlockAttempted = true;
-        await validateAccountUnlock(client, lockId);
+        if (!(await unlockSession(client, lockId, session))) releaseError = abandonedSessionError(lockId);
       } catch (error) {
         releaseError = asError(error, `Account lock release failed for lock ${lockId}`);
         if (irreversibleConfirmed) {
@@ -300,7 +464,7 @@ export async function withAccountLock<T>(
       if (!unlockAttempted) {
         try {
           unlockAttempted = true;
-          await validateAccountUnlock(client, lockId);
+          if (!(await unlockSession(client, lockId, session))) releaseError = abandonedSessionError(lockId);
         } catch (unlockError) {
           releaseError = asError(unlockError, `Account lock release failed for lock ${lockId}`);
         }
@@ -308,6 +472,7 @@ export async function withAccountLock<T>(
       throw error;
     }
   } finally {
+    if (options.fenceWrites) client.removeListener?.("error", ignoreLockedSessionError);
     // Passing an error makes pg.Pool destroy this session. That is mandatory when
     // unlock is false/throws: returning a possibly lock-owning client to the pool
     // could deadlock later work on an invisible re-entrant lock.
