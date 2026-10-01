@@ -2,8 +2,15 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { Client as PostgresClient, Pool as PostgresPool } from "pg";
 import { getConfig, resetConfigForTests } from "../config.js";
 import { SERVER_TCP_LIVENESS_SQL, closePool, createPool, getPool, type PgClient } from "../db.js";
-import { AccountLockLivenessError, clearOrphanedLockForAccount, clearOrphanedLocks } from "../locks.js";
+import {
+  AccountLockLivenessError,
+  clearOrphanedLockForAccount,
+  clearOrphanedLocks,
+  lockedSessionPool,
+  withAccountLock
+} from "../locks.js";
 import { MirrorRepository } from "../repository.js";
+import { MirrorEngine } from "../sync-engine.js";
 import type { FetchMessage, MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { ImapFolder, MessageMetadata } from "../types.js";
@@ -384,7 +391,7 @@ liveDb("live DB reliability lane", () => {
     expect(contender).toMatchObject({ outcome: "failed", errors: ["Account lock busy"] });
   });
 
-  it("stops before the next folder writes once the account lock is lost", async () => {
+  it("writes nothing more once the account lock session is gone, not even in the current folder", async () => {
     const h = await setupIntegration("live-lost-lock-stops-writes", { STALE_HEARTBEAT_MS: 60_000 });
     activeAccountIds.push(h.account.id);
     const account = await h.repository.getAccount(h.account.id);
@@ -394,16 +401,13 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
 
-    // Without a listener the terminated lock session crashes the process, which
-    // also stops its writes. Prove the engine stops even when the process survives.
-    const survive = (client: PgClient) => client.on("error", () => undefined);
-    h.pool.on("acquire", survive);
     const engine = h.buildEngine({
       folders: twoFolders(),
       clientFactory: async () => new HookedFixtureImapClient(twoFolders(), async (path) => {
         if (path !== "INBOX") return;
-        // Model the lock being released under a live sync, as a server-side
-        // session loss would. Writes already under way may land; nothing after.
+        // The lock session ends after INBOX was selected but before any of its
+        // writes, as a server-side liveness timeout or a takeover would end it.
+        // Every later write would have used that same session.
         await h.pool.query(
           `SELECT pg_terminate_backend(pid)
            FROM pg_locks
@@ -413,22 +417,60 @@ liveDb("live DB reliability lane", () => {
       })
     });
 
-    try {
-      await expect(timeout(engine.syncAccount(h.account.id, "manual"), "lost-lock sync", 15_000))
-        .rejects.toBeInstanceOf(AccountLockLivenessError);
-    } finally {
-      h.pool.removeListener("acquire", survive);
-    }
-    const archived = await h.pool.query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM public.imap_messages WHERE account_id = $1 AND folder_path = 'Archive'",
+    // No error listener is added here: losing a fenced session must not crash the process.
+    const outcome = await timeout(engine.syncAccount(h.account.id, "manual"), "lost-lock sync", 15_000)
+      .then((result) => result.outcome, (error: Error) => error.name);
+    expect(outcome).not.toBe("success");
+    const written = await h.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_messages WHERE account_id = $1",
       [h.account.id]
     );
-    expect(archived.rows[0].count).toBe("0");
+    expect(written.rows[0].count).toBe("0");
     const after = await h.pool.query<{ sync_state: string; consecutive_failures: number }>(
       "SELECT sync_state, consecutive_failures FROM public.imap_accounts WHERE id = $1",
       [h.account.id]
     );
     expect(after.rows[0]).toEqual(before.rows[0]);
+  });
+
+  it("runs every query of a locked sync on the lock session", async () => {
+    const h = await setupIntegration("live-sync-on-lock-session");
+    activeAccountIds.push(h.account.id);
+    // With one connection, the lock holds the only session: any query that
+    // checked out another connection during the sync would wait forever.
+    const onePool = createPool({ DATABASE_URL: process.env.DATABASE_URL!, DATABASE_POOL_MAX: 1 });
+    try {
+      const repository = new MirrorRepository(onePool, h.config);
+      const engine = new MirrorEngine({
+        pool: onePool,
+        config: h.config,
+        repository,
+        clientFactory: async () => new FixtureImapClient(twoFolders())
+      });
+      await expect(timeout(engine.syncAccount(h.account.id, "manual"), "single-session sync", 15_000))
+        .resolves.toMatchObject({ outcome: "success" });
+      const written = await h.pool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM public.imap_messages WHERE account_id = $1",
+        [h.account.id]
+      );
+      expect(written.rows[0].count).toBe("4");
+    } finally {
+      await onePool.end();
+    }
+  });
+
+  it("refuses work through the lock session after the lock ends", async () => {
+    const h = await setupIntegration("live-lock-session-closed");
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    let captured: ReturnType<typeof lockedSessionPool> | null = null;
+    await withAccountLock(h.pool, account.lock_id, async () => {
+      captured = lockedSessionPool(h.pool);
+      expect(captured).not.toBe(h.pool);
+    }, { fenceWrites: true });
+    expect(lockedSessionPool(h.pool)).toBe(h.pool);
+    await expect(captured!.query("SELECT 1")).rejects.toBeInstanceOf(AccountLockLivenessError);
   });
 
   it("closes a vanished worker's open run once a new sync holds the lock", async () => {

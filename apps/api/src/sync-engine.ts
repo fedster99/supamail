@@ -845,7 +845,7 @@ export class MirrorEngine {
           await client.logout().catch(() => this.abortClient(client!));
         }
       }
-    });
+    }, { fenceWrites: true });
 
     let runFinished = false;
     try {

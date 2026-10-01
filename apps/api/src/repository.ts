@@ -6,7 +6,7 @@ import { encryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError } from "./errors.js";
 import { assertSafeImapTarget } from "./host-validation.js";
-import { withAccountLock } from "./locks.js";
+import { lockedSessionPool, withAccountLock } from "./locks.js";
 import {
   assertMetadataProtectionProjection,
   assertRevealedMetadataValues,
@@ -634,10 +634,16 @@ const ACCOUNT_DETAILS_COLUMNS = `
 
 export class MirrorRepository {
   constructor(
-    private readonly pool: PgPool,
+    private readonly basePool: PgPool,
     private readonly config: AppConfig,
     private readonly metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
   ) {}
+
+  /** Inside a write-fenced account lock, the lock's own session: a holder that
+   * lost its lock cannot write. Otherwise the shared pool. */
+  private get pool(): PgPool {
+    return lockedSessionPool(this.basePool);
+  }
 
   private async protectMetadata(
     kind: MetadataRecordKind,
