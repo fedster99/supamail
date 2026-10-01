@@ -202,6 +202,8 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
       const p = pb.add(filter.value);
       return negate(`m.window_status = ${p}`);
     }
+    case "or":
+      return negate(`(${filter.filters.map((member) => filterPredicate(member, pb, nowExpr)).join(" OR ")})`);
     default: {
       const exhaustive: never = filter;
       return exhaustive;

@@ -35,7 +35,9 @@ export type SearchFilter =
   | { kind: "mime"; value: string; negated: boolean; raw: string }
   | { kind: "date"; op: "after" | "before"; value: string; negated: boolean; raw: string }
   | { kind: "size"; op: "larger" | "smaller"; value: number; negated: boolean; raw: string }
-  | { kind: "window"; value: WindowStatus; negated: boolean; raw: string };
+  | { kind: "window"; value: WindowStatus; negated: boolean; raw: string }
+  /** `from:a OR from:b`: matches when any member matches. Members are never `or`. */
+  | { kind: "or"; filters: SearchFilter[]; negated: boolean; raw: string };
 
 /**
  * The parsed query: the residual free text (fed to websearch_to_tsquery), the

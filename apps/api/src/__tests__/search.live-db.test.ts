@@ -195,6 +195,15 @@ liveDb("search layer live DB", () => {
     expect(domainIds).not.toContain(idByUid.get(2)); // bob@other.com
   });
 
+  it("matches either sender with OR and still applies the other operators", async () => {
+    const either = await searchMessages(pool, { q: "from:@other.com OR from:@list.com", accounts: [accountId] });
+    expect(either.results.map((r) => r.identity.id).sort()).toEqual([idByUid.get(2), idByUid.get(3)].sort());
+    expect(either.parsed_query.warnings).toEqual([]);
+
+    const unread = await searchMessages(pool, { q: "from:@other.com OR from:@list.com is:unread", accounts: [accountId] });
+    expect(unread.results.map((r) => r.identity.id)).toEqual([idByUid.get(2)]);
+  });
+
   it("reports a sync-trust block for the searched account", async () => {
     const response = await searchMessages(pool, { q: "report", accounts: [accountId] });
     expect(response.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);
