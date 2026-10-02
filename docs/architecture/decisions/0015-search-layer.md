@@ -120,6 +120,14 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   case (beside a word and an operator, an ignored operator, `sort:`, or the query
   edge), is dropped with a warning. Kept as text, it would become a search word or
   join the words around the operator. There is no grouping with parentheses.
+- **One free-text grammar.** `parseTextTerms` parses free text into terms and
+  Gmail-style OR groups over the same tokens as `parseQuery`: `a b OR "c d"` is
+  a AND (b OR "c d"), and `-x` excludes. Postgres search compiles its tsquery
+  from these terms (`plainto_tsquery`/`phraseto_tsquery` joined with `&&`, `||`
+  and `!!`) instead of `websearch_to_tsquery`, whose OR binds looser than AND.
+  Other engines call the same exported function, so every engine applies the
+  same rules. `parseQuery` warns when an OR in free text or a `body:` filter was
+  ignored.
 - **email-005 added** the precise recipient lanes the union was missing: `to` (To
   only), `cc` (Cc only), `bcc` (Bcc only — populated only on sent mail), and
   `anyEmail` (from + to + cc + bcc, the Nylas `any_email`). The pre-existing broad

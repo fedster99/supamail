@@ -39,6 +39,23 @@ export type SearchFilter =
   /** `from:a OR from:b`: matches when any member matches. Members are never `or`. */
   | { kind: "or"; filters: SearchFilter[]; negated: boolean; raw: string };
 
+/** One free-text word or quoted phrase. */
+export interface TextTerm {
+  text: string;
+  phrase: boolean;
+}
+
+/**
+ * Free text parsed into terms. Every group must match, and any one term matches
+ * its group: `a b OR "c d"` is a AND (b OR "c d"). Excluded terms must not match.
+ */
+export interface TextTerms {
+  groups: TextTerm[][];
+  negative: TextTerm[];
+  /** An OR stood beside an exclusion, punctuation, another OR or an edge. */
+  ignoredOr: boolean;
+}
+
 /**
  * The parsed query: the residual free text (fed to websearch_to_tsquery), the
  * structured filters, account names to resolve, and output controls. This is the
