@@ -215,6 +215,13 @@ liveDb("search layer live DB", () => {
     // Exclusions apply to typo and concept recall too.
     const excluded = await searchMessages(pool, { q: "invoice -march", accounts: [accountId] });
     expect(excluded.results.map((r) => r.identity.id)).toEqual([idByUid.get(3)]);
+    // An excluded word is not a recall term: excluding "invoice" must not recall invoice mail.
+    const notInvoice = await searchMessages(pool, { q: "acme -invoice", accounts: [accountId] });
+    expect(notInvoice.results.map((r) => r.identity.id)).not.toContain(idByUid.get(1));
+
+    // Text without a searchable word matches nothing.
+    const punctuation = await searchMessages(pool, { q: "???", accounts: [accountId] });
+    expect(punctuation.results).toEqual([]);
   });
 
   it("reports a sync-trust block for the searched account", async () => {

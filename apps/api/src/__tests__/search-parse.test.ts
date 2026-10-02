@@ -388,8 +388,9 @@ describe("parseTextTerms", () => {
     expect(parseTextTerms("OR")).toEqual({ groups: [], negative: [], ignoredOr: true });
   });
 
-  it("uses the same tokens as parseQuery and keeps quote characters out of terms", () => {
+  it("uses the same tokens as parseQuery and treats a stray quote as a separator", () => {
     expect(parseTextTerms('"abc def').groups).toEqual([[word("abc def")]]);
+    expect(parseTextTerms('invoice"march"').groups).toEqual([[word("invoice march")]]);
     expect(parseTextTerms('-"bad deal" ok').negative).toEqual([phrase("bad deal")]);
   });
 
@@ -400,6 +401,10 @@ describe("parseTextTerms", () => {
     const warnings: string[] = [];
     filtersFromStructured({ body: "a OR -b" }, warnings);
     expect(warnings).toEqual([warning]);
+    // q and structured filters share one warning list; the warning appears once.
+    const shared = [...parseQuery("a OR -b").warnings];
+    filtersFromStructured({ body: "x OR -y" }, shared);
+    expect(shared).toEqual([warning]);
     expect(parseQuery("a OR b").warnings).toEqual([]);
   });
 });
@@ -407,13 +412,19 @@ describe("parseTextTerms", () => {
 describe("compileSearch free text", () => {
   it("compiles free text and body: filters with the shared OR grammar", () => {
     const compiled = compileSearch('a b OR "c d" -e', [], { ...baseCompileOptions, hasText: true });
+    // Each excluded term is bound once ($1) and reused by the exclusion predicate.
     expect(compiled.text).toContain(
-      "(plainto_tsquery('english', public.f_unaccent($1)) && " +
-      "(plainto_tsquery('english', public.f_unaccent($2)) || phraseto_tsquery('english', public.f_unaccent($3))) && " +
-      "!!plainto_tsquery('english', public.f_unaccent($4)))"
+      "(plainto_tsquery('english', public.f_unaccent($2)) && " +
+      "(plainto_tsquery('english', public.f_unaccent($3)) || phraseto_tsquery('english', public.f_unaccent($4))) && " +
+      "!!plainto_tsquery('english', public.f_unaccent($1)))"
     );
-    expect(compiled.values.slice(0, 4)).toEqual(["a", "b", "c d", "e"]);
+    expect(compiled.text).toContain("NOT (m.header_fts @@ plainto_tsquery('english', public.f_unaccent($1)) OR");
+    expect(compiled.values.slice(0, 4)).toEqual(["e", "a", "b", "c d"]);
     expect(compiled.text).not.toContain("websearch_to_tsquery('english', public.f_unaccent($1))");
+
+    // Text without a searchable word matches nothing instead of listing every message.
+    const punctuation = compileSearch("???", [], { ...baseCompileOptions, hasText: true });
+    expect(punctuation.text).toContain("header_fts @@ plainto_tsquery('english', '')");
 
     const body = compileSearch("", parseQuery("body:\"x OR y\"").filters, baseCompileOptions);
     expect(body.text).toContain(

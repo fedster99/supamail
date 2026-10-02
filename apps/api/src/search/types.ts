@@ -57,7 +57,7 @@ export interface TextTerms {
 }
 
 /**
- * The parsed query: the residual free text (fed to websearch_to_tsquery), the
+ * The parsed query: the residual free text (parsed by `parseTextTerms`), the
  * structured filters, account names to resolve, and output controls. This is the
  * single convergence point — `parseQuery` produces it and structured request
  * input maps onto it.

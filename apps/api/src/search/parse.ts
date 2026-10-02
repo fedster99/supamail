@@ -154,7 +154,8 @@ export function parseTextTerms(input: string): TextTerms {
     const negated = raw.startsWith("-");
     const body = negated ? raw.slice(1) : raw;
     const phrase = body.startsWith('"') && body.endsWith('"') && body.length >= 2;
-    const text = (phrase ? body.slice(1, -1) : body).replaceAll('"', "").trim();
+    // A stray quote separates words; it never joins them or stays in a term.
+    const text = (phrase ? body.slice(1, -1) : body).replaceAll('"', " ").replace(/\s+/g, " ").trim();
     const groupable = !negated && /[\p{L}\p{N}]/u.test(text);
     if (joinNext && !groupable) ignoredOr = true;
     if (negated && /[\p{L}\p{N}]/u.test(text)) negative.push({ text, phrase });
@@ -184,8 +185,8 @@ function joinOr(previous: SearchFilter, next: SearchFilter): SearchFilter {
 /**
  * Parse a free-text superset query into the structured {@link ParsedQuery}.
  * Recognized `field:value` operators become structured filters; everything else
- * is left as free text and handed verbatim to `websearch_to_tsquery`, which
- * natively understands quoted phrases, `or`, and `-` negation. This is total —
+ * is left as free text, which `parseTextTerms` turns into words, phrases, OR
+ * groups and exclusions for every search engine. This is total —
  * it never throws; unknown operators are demoted to free text with a warning.
  *
  * `OR` between two operators joins them into one `or` filter, so
@@ -383,7 +384,9 @@ export function filtersFromStructured(structured: StructuredFilters, warnings: s
     const routed = field.route ? field.route(normalized) : { kind: field.kind, value: normalized };
     const raw = field.structuredRaw ? field.structuredRaw(original) : `${field.rawPrefix}:${original}`;
     push({ kind: routed.kind, value: routed.value, negated: false, raw } as SearchFilter);
-    if (routed.kind === "body" && parseTextTerms(routed.value).ignoredOr) warnings.push(IGNORED_TEXT_OR);
+    if (routed.kind === "body" && parseTextTerms(routed.value).ignoredOr && !warnings.includes(IGNORED_TEXT_OR)) {
+      warnings.push(IGNORED_TEXT_OR);
+    }
   }
 
   // State/presence flags. `honorsFalse` fields emit on an explicit `false` (it
