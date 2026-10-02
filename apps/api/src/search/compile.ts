@@ -100,7 +100,7 @@ function filetypePredicate(value: string, pb: Params): string {
  * any excluded term, so callers can drop
  * those messages from every candidate branch, not only the exact match.
  */
-function textTsquery(text: string, pb: Params): { query: string | null; excluded: string | null } {
+function textTsquery(text: string, pb: Params): { query: string; excluded: string | null } {
   const { groups, negative } = parseTextTerms(text);
   const term = ({ text: value, phrase }: TextTerm): string =>
     `${phrase ? "phraseto_tsquery" : "plainto_tsquery"}('english', public.f_unaccent(${pb.add(value)}))`;
@@ -159,7 +159,6 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
     }
     case "body": {
       const { query } = textTsquery(filter.value, pb);
-      if (!query) return filter.negated ? "TRUE" : "FALSE";
       const match = `public.imap_search_extract_fts(b.search_extract) @@ ${query}`;
       return filter.negated ? `(b.search_extract IS NULL OR NOT (${match}))` : match;
     }
