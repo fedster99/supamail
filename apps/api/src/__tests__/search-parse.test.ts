@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileSearch, filtersFromStructured, parseQuery, tokenize } from "../search/index.js";
+import { compileSearch, filtersFromStructured, parseQuery, parseTextTerms, tokenize } from "../search/index.js";
 import type { CompileOptions } from "../search/compile.js";
 import type { SearchFilter } from "../search/types.js";
 
@@ -320,7 +320,7 @@ describe("compileSearch", () => {
     // ...and NOT inlined into the SQL string (injection safety).
     expect(compiled.text).not.toContain("invoice");
     expect(compiled.text).not.toContain("acme");
-    expect(compiled.text).toContain("websearch_to_tsquery('english', public.f_unaccent(");
+    expect(compiled.text).toContain("plainto_tsquery('english', public.f_unaccent(");
   });
 
   it("emits the soft-delete partial-index predicate by default", () => {
@@ -358,5 +358,77 @@ describe("compileSearch", () => {
     expect(compiled.text).toContain("now() - (");
     expect(compiled.text).toContain("interval '1 day'");
     expect(compiled.values).toContain(7);
+  });
+});
+
+describe("parseTextTerms", () => {
+  const word = (text: string) => ({ text, phrase: false });
+  const phrase = (text: string) => ({ text, phrase: true });
+
+  it("joins the words or phrases beside OR into one group, Gmail style", () => {
+    expect(parseTextTerms('stripe shares OR "time sheet"')).toEqual({
+      groups: [[word("stripe")], [word("shares"), phrase("time sheet")]],
+      negative: [],
+      ignoredOr: false
+    });
+    // Lowercase or is OR too.
+    expect(parseTextTerms("invoice or receipt").groups).toEqual([[word("invoice"), word("receipt")]]);
+  });
+
+  it("ends a pending OR at an exclusion, punctuation, another OR or an edge and reports it", () => {
+    const excluded = parseTextTerms("invoice OR -spam receipt");
+    expect(excluded).toEqual({ groups: [[word("invoice")], [word("receipt")]], negative: [word("spam")], ignoredOr: true });
+    expect(parseTextTerms("( invoice OR receipt )")).toEqual({
+      groups: [[word("invoice"), word("receipt")]], negative: [], ignoredOr: false
+    });
+    for (const text of ["a OR OR b", "a OR - b", 'a OR "" b']) {
+      expect(parseTextTerms(text), text).toEqual({ groups: [[word("a")], [word("b")]], negative: [], ignoredOr: true });
+    }
+    expect(parseTextTerms("stripe shares OR").ignoredOr).toBe(true);
+    expect(parseTextTerms("OR")).toEqual({ groups: [], negative: [], ignoredOr: true });
+  });
+
+  it("uses the same tokens as parseQuery and treats a stray quote as a separator", () => {
+    expect(parseTextTerms('"abc def').groups).toEqual([[word("abc def")]]);
+    expect(parseTextTerms('invoice"march"').groups).toEqual([[word("invoice march")]]);
+    expect(parseTextTerms('-"bad deal" ok').negative).toEqual([phrase("bad deal")]);
+  });
+
+  it("warns once when free text or a body: filter ignored an OR", () => {
+    const warning = "OR was ignored where it did not stand between two words or quoted phrases.";
+    expect(parseQuery("a OR -b").warnings).toEqual([warning]);
+    expect(parseQuery('body:"a OR -b"').warnings).toEqual([warning]);
+    const warnings: string[] = [];
+    filtersFromStructured({ body: "a OR -b" }, warnings);
+    expect(warnings).toEqual([warning]);
+    // q and structured filters share one warning list; the warning appears once.
+    const shared = [...parseQuery("a OR -b").warnings];
+    filtersFromStructured({ body: "x OR -y" }, shared);
+    expect(shared).toEqual([warning]);
+    expect(parseQuery("a OR b").warnings).toEqual([]);
+  });
+});
+
+describe("compileSearch free text", () => {
+  it("compiles free text and body: filters with the shared OR grammar", () => {
+    const compiled = compileSearch('a b OR "c d" -e', [], { ...baseCompileOptions, hasText: true });
+    // Each excluded term is bound once ($1) and reused by the exclusion predicate.
+    expect(compiled.text).toContain(
+      "(plainto_tsquery('english', public.f_unaccent($2)) && " +
+      "(plainto_tsquery('english', public.f_unaccent($3)) || phraseto_tsquery('english', public.f_unaccent($4))) && " +
+      "!!plainto_tsquery('english', public.f_unaccent($1)))"
+    );
+    expect(compiled.text).toContain("NOT (m.header_fts @@ plainto_tsquery('english', public.f_unaccent($1)) OR");
+    expect(compiled.values.slice(0, 4)).toEqual(["e", "a", "b", "c d"]);
+    expect(compiled.text).not.toContain("websearch_to_tsquery('english', public.f_unaccent($1))");
+
+    // Text without a searchable word matches nothing instead of listing every message.
+    const punctuation = compileSearch("???", [], { ...baseCompileOptions, hasText: true });
+    expect(punctuation.text).toContain("header_fts @@ plainto_tsquery('english', '')");
+
+    const body = compileSearch("", parseQuery("body:\"x OR y\"").filters, baseCompileOptions);
+    expect(body.text).toContain(
+      "@@ (plainto_tsquery('english', public.f_unaccent($1)) || plainto_tsquery('english', public.f_unaccent($2)))"
+    );
   });
 });

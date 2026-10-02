@@ -87,7 +87,7 @@ describe("compileSearch recall branches", () => {
       synonyms: ["flight", "hotel"]
     });
     // primary tsquery OR-ed with each synonym
-    expect(compiled.text).toMatch(/\|\| websearch_to_tsquery/);
+    expect(compiled.text).toMatch(/\|\| plainto_tsquery/);
     expect(compiled.values).toContain("flight");
     expect(compiled.values).toContain("hotel");
   });

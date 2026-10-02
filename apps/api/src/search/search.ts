@@ -2,7 +2,7 @@ import type { PgPool } from "../db.js";
 import type { WindowStatus } from "../types.js";
 import { compileSearch } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
-import { filtersFromStructured, parseQuery } from "./parse.js";
+import { filtersFromStructured, parseQuery, parseTextTerms } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
 import {
@@ -123,7 +123,9 @@ export async function searchMessages(
   // concept widens the tsquery with curated synonyms. Both no-op when empty.
   // `recall: false` (the A/B baseline) forces the lexical-only path.
   const recallEnabled = request.recall ?? true;
-  const terms = recallEnabled && hasText ? significantTerms(freeText) : [];
+  // Recall widens only the included words; excluded words never feed typo or concept matches.
+  const includedText = parseTextTerms(freeText).groups.flat().map((term) => term.text).join(" ");
+  const terms = recallEnabled && hasText ? significantTerms(includedText) : [];
   const synonyms = terms.length > 0 ? expandConcepts(terms) : [];
 
   const requestedIds = request.accounts && request.accounts !== "all" ? request.accounts : null;

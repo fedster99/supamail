@@ -1,6 +1,6 @@
-import type { SearchFilter, SearchSort } from "./types.js";
+import type { SearchFilter, SearchSort, TextTerm } from "./types.js";
 import type { WindowStatus } from "../types.js";
-import { isRelativeDate } from "./parse.js";
+import { isRelativeDate, parseTextTerms } from "./parse.js";
 
 /** Accumulates bound parameter values and hands back `$n` placeholders. User
  * input is NEVER interpolated into SQL text — only through these placeholders. */
@@ -94,6 +94,26 @@ function filetypePredicate(value: string, pb: Params): string {
   }
 }
 
+/**
+ * Compile free text with the shared grammar (`parseTextTerms`): groups are ANDed,
+ * the terms of a group are ORed, and exclusions are negated. `excluded` matches
+ * any excluded term, so callers can drop
+ * those messages from every candidate branch, not only the exact match.
+ */
+function textTsquery(text: string, pb: Params): { query: string; excluded: string | null } {
+  const { groups, negative } = parseTextTerms(text);
+  const term = ({ text: value, phrase }: TextTerm): string =>
+    `${phrase ? "phraseto_tsquery" : "plainto_tsquery"}('english', public.f_unaccent(${pb.add(value)}))`;
+  const any = (terms: string[]): string => terms.length === 1 ? terms[0] : `(${terms.join(" || ")})`;
+  const excludedTerms = negative.map(term);
+  const parts = [...groups.map((group) => any(group.map(term))), ...excludedTerms.map((excluded) => `!!${excluded}`)];
+  return {
+    // Text without a searchable word matches nothing, as an empty tsquery always did.
+    query: parts.length === 0 ? "plainto_tsquery('english', '')" : parts.length === 1 ? parts[0] : `(${parts.join(" && ")})`,
+    excluded: excludedTerms.length === 0 ? null : any(excludedTerms),
+  };
+}
+
 function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): string {
   const negate = (expr: string): string => (("negated" in filter && filter.negated) ? `NOT (${expr})` : expr);
 
@@ -138,8 +158,8 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
       return negate(`lower(coalesce(m.subject,'')) LIKE ${p}`);
     }
     case "body": {
-      const p = pb.add(filter.value);
-      const match = `public.imap_search_extract_fts(b.search_extract) @@ websearch_to_tsquery('english', public.f_unaccent(${p}))`;
+      const { query } = textTsquery(filter.value, pb);
+      const match = `public.imap_search_extract_fts(b.search_extract) @@ ${query}`;
       return filter.negated ? `(b.search_extract IS NULL OR NOT (${match}))` : match;
     }
     case "folder": {
@@ -254,8 +274,8 @@ export function compileSearch(
   // recency and relative-date filters are byte-reproducible run-to-run.
   const nowExpr = opts.now ? `${pb.add(opts.now)}::timestamptz` : "now()";
   const hasText = opts.hasText && freeText.trim() !== "";
-  const qParam = hasText ? pb.add(freeText) : null;
-  const tsq = qParam ? `websearch_to_tsquery('english', public.f_unaccent(${qParam}))` : null;
+  const textQuery = hasText ? textTsquery(freeText, pb) : { query: null, excluded: null };
+  const tsq = textQuery.query;
 
   const lexHeader = tsq ? `ts_rank_cd(m.header_fts, ${tsq})` : "0";
   const lexBody = tsq
@@ -297,7 +317,7 @@ export function compileSearch(
 
   const synonyms = hasText && tsq && opts.synonyms.length > 0 ? opts.synonyms : [];
   const expandedTsq = tsq && synonyms.length > 0
-    ? `(${tsq}${synonyms.map((s) => ` || websearch_to_tsquery('english', public.f_unaccent(${pb.add(s)}))`).join("")})`
+    ? `(${tsq}${synonyms.map((s) => ` || plainto_tsquery('english', public.f_unaccent(${pb.add(s)}))`).join("")})`
     : null;
   const semHeader = expandedTsq ? `ts_rank_cd(m.header_fts, ${expandedTsq})` : "0";
   const semBody = expandedTsq
@@ -319,6 +339,13 @@ export function compileSearch(
   // the bounded candidate set (they reference m, the joined body b, or self-contained
   // attachment EXISTS subqueries).
   const structured = filters.map((filter) => filterPredicate(filter, pb, nowExpr));
+  // Excluded words drop a message from every branch, including typo and concept recall.
+  if (textQuery.excluded) {
+    structured.push(
+      `NOT (m.header_fts @@ ${textQuery.excluded} OR ` +
+      `coalesce(public.imap_search_extract_fts(b.search_extract) @@ ${textQuery.excluded}, false))`
+    );
+  }
 
   const limitParam = pb.add(opts.limit + 1);
   const offsetParam = pb.add(opts.offset);

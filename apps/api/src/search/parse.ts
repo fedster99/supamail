@@ -1,4 +1,4 @@
-import type { ParsedQuery, SearchFilter, SearchSort, StructuredFilters } from "./types.js";
+import type { ParsedQuery, SearchFilter, SearchSort, StructuredFilters, TextTerm, TextTerms } from "./types.js";
 import { SEARCH_SORTS } from "./types.js";
 import type { WindowStatus } from "../types.js";
 import {
@@ -130,6 +130,44 @@ function mapIsFlag(value: string): SearchFilter | { warning: string } {
   }
 }
 
+const IGNORED_TEXT_OR = "OR was ignored where it did not stand between two words or quoted phrases.";
+
+/**
+ * The free-text grammar, shared by every search engine. OR in any case joins the
+ * words or quoted phrases beside it into one group; every group must match. An
+ * exclusion, a token with no letter or digit, another OR or an edge ends a
+ * pending OR and sets `ignoredOr`.
+ */
+export function parseTextTerms(input: string): TextTerms {
+  const groups: TextTerm[][] = [];
+  const negative: TextTerm[] = [];
+  let ignoredOr = false;
+  let previousGroupable = false;
+  let joinNext = false;
+  for (const raw of tokenize(input ?? "")) {
+    if (raw.toLowerCase() === "or") {
+      if (joinNext || !previousGroupable) ignoredOr = true;
+      joinNext = !joinNext && previousGroupable;
+      previousGroupable = false;
+      continue;
+    }
+    const negated = raw.startsWith("-");
+    const body = negated ? raw.slice(1) : raw;
+    const phrase = body.startsWith('"') && body.endsWith('"') && body.length >= 2;
+    // A stray quote separates words; it never joins them or stays in a term.
+    const text = (phrase ? body.slice(1, -1) : body).replaceAll('"', " ").replace(/\s+/g, " ").trim();
+    const groupable = !negated && /[\p{L}\p{N}]/u.test(text);
+    if (joinNext && !groupable) ignoredOr = true;
+    if (negated && /[\p{L}\p{N}]/u.test(text)) negative.push({ text, phrase });
+    else if (groupable && joinNext) groups[groups.length - 1].push({ text, phrase });
+    else if (groupable) groups.push([{ text, phrase }]);
+    joinNext = false;
+    previousGroupable = groupable;
+  }
+  if (joinNext) ignoredOr = true;
+  return { groups, negative, ignoredOr };
+}
+
 /** What one token produced: a filter, free text, an `OR`, or nothing usable
  * (an output control such as `sort:`, or an operator ignored with a warning). */
 type QueryItem =
@@ -147,8 +185,8 @@ function joinOr(previous: SearchFilter, next: SearchFilter): SearchFilter {
 /**
  * Parse a free-text superset query into the structured {@link ParsedQuery}.
  * Recognized `field:value` operators become structured filters; everything else
- * is left as free text and handed verbatim to `websearch_to_tsquery`, which
- * natively understands quoted phrases, `or`, and `-` negation. This is total —
+ * is left as free text, which `parseTextTerms` turns into words, phrases, OR
+ * groups and exclusions for every search engine. This is total —
  * it never throws; unknown operators are demoted to free text with a warning.
  *
  * `OR` between two operators joins them into one `or` filter, so
@@ -200,8 +238,12 @@ export function parseQuery(input: string): ParsedQuery {
     joinNext = false;
   }
 
+  const freeText = freeTextParts.join(" ").trim();
+  const bodies = filters.flatMap((filter) => filter.kind === "or" ? filter.filters : [filter])
+    .flatMap((filter) => filter.kind === "body" ? [filter.value] : []);
+  if ([freeText, ...bodies].some((text) => parseTextTerms(text).ignoredOr)) warnings.push(IGNORED_TEXT_OR);
   return {
-    freeText: freeTextParts.join(" ").trim(),
+    freeText,
     accounts,
     filters,
     sort,
@@ -342,6 +384,9 @@ export function filtersFromStructured(structured: StructuredFilters, warnings: s
     const routed = field.route ? field.route(normalized) : { kind: field.kind, value: normalized };
     const raw = field.structuredRaw ? field.structuredRaw(original) : `${field.rawPrefix}:${original}`;
     push({ kind: routed.kind, value: routed.value, negated: false, raw } as SearchFilter);
+    if (routed.kind === "body" && parseTextTerms(routed.value).ignoredOr && !warnings.includes(IGNORED_TEXT_OR)) {
+      warnings.push(IGNORED_TEXT_OR);
+    }
   }
 
   // State/presence flags. `honorsFalse` fields emit on an explicit `false` (it
