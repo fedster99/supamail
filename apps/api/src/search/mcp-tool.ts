@@ -94,7 +94,8 @@ export const searchEmailToolDefinition = {
     "Check parsed_query.warnings for an OR that was ignored. " +
     "All filters COMPOSE with the semantic free-text query — they narrow, never replace it, over the " +
     "FULL mirror history (no 90-day window). Returns ranked, " +
-    "snippet-highlighted results with full mailbox identity, an optional per-result " +
+    "snippet-highlighted results with full mailbox identity (score is null when the order ranks " +
+    "nothing: date, size or sender order, or no free-text words), an optional per-result " +
     "score_breakdown (explain), the echoed parsed query, and a sync_trust block describing " +
     "how complete the mirror is. READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {

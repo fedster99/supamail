@@ -478,6 +478,10 @@ describe("shared search rules", () => {
     expect(at("0099-01-01")).toBe("0099-01-01T00:00:00.000Z");
     expect(at("1m")).toBe("2026-02-28T12:00:00.000Z");
     expect(() => resolveDate("2026-13-01", now)).toThrow(RangeError);
+    // Instants outside years 1-9999, which Postgres rejects, are not valid dates.
+    for (const outside of ["9999-12-31T24:00", "9999-12-31T23:00-15:00", "0001-01-01T00:00+01:00"]) {
+      expect(isValidAbsoluteDate(outside), outside).toBe(false);
+    }
     // Postgres binds the same instant.
     const compiled = compileSearch(noText, parseQuery("before:2026-01-31T09:30+0200").filters, baseCompileOptions);
     expect(compiled.values).toContain("2026-01-31T07:30:00.000Z");

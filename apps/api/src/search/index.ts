@@ -5,6 +5,7 @@ export {
   filetypeMatch,
   isRelativeDate,
   isValidAbsoluteDate,
+  parseAbsoluteDate,
   resolveDate,
   resolveRelativeDate,
   type FiletypeMatch

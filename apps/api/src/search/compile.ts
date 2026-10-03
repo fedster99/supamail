@@ -195,17 +195,23 @@ function filterPredicate(filter: SearchFilter, pb: Params, now: Date): string {
   }
 }
 
-function orderClause(sort: SearchSort, hasText: boolean, alias: string): string {
+/** True when the order ranks results: smart or relevance over included free-text words.
+ * Other orders (date, size, sender, or no words) carry no score. */
+export function sortRanks(sort: SearchSort, terms: TextTerms): boolean {
+  return (sort === "smart" || sort === "relevance") && terms.groups.length > 0;
+}
+
+function orderClause(sort: SearchSort, ranked: boolean, alias: string): string {
   const a = alias;
   switch (sort) {
     case "smart":
       // is_primary first: every exact (lexical) match ranks above any fuzzy/
       // concept-only match, so the recall branches never reorder exact results.
-      return hasText
+      return ranked
         ? `${a}.is_primary DESC, (${a}.text_rel * ${a}.recency * ${a}.email_prior) DESC, ${a}.internal_date DESC, ${a}.id DESC`
         : `${a}.internal_date DESC, ${a}.id DESC`;
     case "relevance":
-      return hasText
+      return ranked
         ? `${a}.is_primary DESC, (${a}.text_rel * ${a}.email_prior) DESC, ${a}.internal_date DESC, ${a}.id DESC`
         : `${a}.internal_date DESC, ${a}.id DESC`;
     case "recent":
@@ -487,7 +493,7 @@ counted AS (
 )${groupedCte},
 page AS (
   SELECT * FROM ${pageSource} p
-  ORDER BY ${orderClause(opts.sort, hasText, "p")}
+  ORDER BY ${orderClause(opts.sort, sortRanks(opts.sort, terms), "p")}
   LIMIT ${limitParam} OFFSET ${offsetParam}
 )
 SELECT
@@ -504,7 +510,7 @@ SELECT
   ${bodyExpr} AS body
 FROM page
 LEFT JOIN public.imap_message_bodies b2 ON b2.message_id = page.id
-ORDER BY ${orderClause(opts.sort, hasText, "page")}
+ORDER BY ${orderClause(opts.sort, sortRanks(opts.sort, terms), "page")}
 `;
 
   return { text, values: pb.values };

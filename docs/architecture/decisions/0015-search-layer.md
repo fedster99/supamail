@@ -127,9 +127,12 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   matches as a substring). `resolveDate` turns every valid date value, relative
   or absolute (UTC when it has no zone), into one instant; Postgres binds that
   instant as a timestamp, so every engine reads a date filter the same way. A
-  result's `score` is null when the order ranks nothing (date, size or sender
-  order, or no free text). Other engines translate the same exports instead of keeping copies.
+  date without a zone is UTC on every database. Other engines translate the same exports instead of keeping copies.
   Stopword-only text is not yet aligned across engines.
+- **Scores only where the order ranks.** `sortRanks` decides it once: smart or
+  relevance order over included free-text words. Otherwise (date, size or sender
+  order, exclusion-only or no text) a result's `score` and `score_breakdown` are
+  null instead of a constant or meaningless number.
 - **One free-text grammar.** `parseTextTerms` parses free text into terms and
   Gmail-style OR groups over the same tokens as `parseQuery`: `a b OR "c d"` is
   a AND (b OR "c d"), and `-x` excludes. Postgres search compiles its tsquery

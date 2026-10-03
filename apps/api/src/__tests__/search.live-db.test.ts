@@ -228,10 +228,15 @@ liveDb("search layer live DB", () => {
     const ranked = await searchMessages(pool, { q: "invoice", accounts: [accountId] });
     expect(typeof ranked.results[0]?.score).toBe("number");
     const listed = await searchMessages(pool, { q: "invoice sort:recent", accounts: [accountId], explain: true });
-    expect(listed.results.map((r) => r.score)).toEqual(listed.results.map(() => null));
-    expect(listed.results[0]?.score_breakdown).toBeNull();
+    expect(listed.results.length).toBeGreaterThan(0);
+    expect(listed.results.map((r) => [r.score, r.score_breakdown])).toEqual(listed.results.map(() => [null, null]));
     const filtered = await searchMessages(pool, { q: "from:@acme.com", accounts: [accountId] });
-    expect(filtered.results[0]?.score).toBeNull();
+    expect(filtered.results.length).toBeGreaterThan(0);
+    expect(filtered.results.every((r) => r.score === null)).toBe(true);
+    // Exclusion-only text ranks nothing.
+    const excluded = await searchMessages(pool, { q: "-newsletter", accounts: [accountId] });
+    expect(excluded.results.length).toBeGreaterThan(0);
+    expect(excluded.results.every((r) => r.score === null)).toBe(true);
   });
 
   it("reports a sync-trust block for the searched account", async () => {

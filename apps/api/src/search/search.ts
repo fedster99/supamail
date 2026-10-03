@@ -1,6 +1,6 @@
 import type { PgPool } from "../db.js";
 import type { WindowStatus } from "../types.js";
-import { compileSearch } from "./compile.js";
+import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
@@ -181,8 +181,7 @@ export async function searchMessages(
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    // Only smart and relevance orders over free text rank; other orders carry no score.
-    const ranked = hasText && (sort === "smart" || sort === "relevance");
+    const ranked = sortRanks(sort, parsed.text);
     const results = pageRows.map((row) => mapRow(row, request.explain ?? false, ranked));
 
     return {
