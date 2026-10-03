@@ -10,12 +10,13 @@ function findFilter<K extends SearchFilter["kind"]>(
   return filters.find((f) => f.kind === kind) as Extract<SearchFilter, { kind: K }> | undefined;
 }
 
+const noText = parseTextTerms("");
+
 const baseCompileOptions: CompileOptions = {
   accountIds: null,
   windowStatus: null,
   includeDeleted: false,
   sort: "smart",
-  hasText: false,
   limit: 25,
   offset: 0,
   snippet: true,
@@ -121,7 +122,7 @@ describe("parseQuery OR", () => {
     expect(mixed.freeText).toBe("budget report");
     expect(mixed.filters.map((filter) => filter.kind)).toEqual(["from"]);
     expect(mixed.warnings).toEqual([
-      'OR ignored between "budget" and "from:alice"; OR joins two operators (from:a OR from:b) or two words'
+      "OR ignored between `budget` and `from:alice`; OR joins two operators (from:a OR from:b) or two words"
     ]);
 
     const edges = parseQuery("OR from:a OR sort:recent");
@@ -129,14 +130,14 @@ describe("parseQuery OR", () => {
     expect(edges.sort).toBe("recent");
     expect(edges.freeText).toBe("");
     expect(edges.warnings).toHaveLength(2);
-    expect(edges.warnings[0]).toContain('between the start and "from:a"');
-    expect(edges.warnings[1]).toContain('between "from:a" and "sort:recent"');
+    expect(edges.warnings[0]).toContain('between the start and `from:a`');
+    expect(edges.warnings[1]).toContain('between `from:a` and `sort:recent`');
   });
 
   it("does not join across an operator that was ignored", () => {
     const parsed = parseQuery("from:a OR is:purple from:b");
     expect(parsed.filters.map((filter) => filter.kind)).toEqual(["from", "from"]);
-    expect(parsed.warnings.join(" ")).toContain('between "from:a" and "is:purple"');
+    expect(parsed.warnings.join(" ")).toContain('between `from:a` and `is:purple`');
   });
 
   it("treats a lowercase or like OR: kept between words, dropped beside an operator", () => {
@@ -145,7 +146,7 @@ describe("parseQuery OR", () => {
     const parsed = parseQuery("budget or from:alice report");
     expect(parsed.freeText).toBe("budget report");
     expect(parsed.warnings).toEqual([
-      'OR ignored between "budget" and "from:alice"; OR joins two operators (from:a OR from:b) or two words'
+      "OR ignored between `budget` and `from:alice`; OR joins two operators (from:a OR from:b) or two words"
     ]);
   });
 });
@@ -202,18 +203,18 @@ describe("email-005 structured filters", () => {
   });
 
   it("compiles to/cc/bcc against their own array column and anyEmail across all of them", () => {
-    const toC = compileSearch(parseTextTerms(""), filtersFromStructured({ to: "a@x.com" }), baseCompileOptions);
+    const toC = compileSearch(noText, filtersFromStructured({ to: "a@x.com" }), baseCompileOptions);
     expect(toC.text).toContain("m.to_emails");
     expect(toC.text).not.toContain("m.cc_emails");
     expect(toC.values).toContain("%a@x.com%");
 
-    const ccC = compileSearch(parseTextTerms(""), filtersFromStructured({ cc: "b@x.com" }), baseCompileOptions);
+    const ccC = compileSearch(noText, filtersFromStructured({ cc: "b@x.com" }), baseCompileOptions);
     expect(ccC.text).toContain("m.cc_emails");
 
-    const bccC = compileSearch(parseTextTerms(""), filtersFromStructured({ bcc: "c@x.com" }), baseCompileOptions);
+    const bccC = compileSearch(noText, filtersFromStructured({ bcc: "c@x.com" }), baseCompileOptions);
     expect(bccC.text).toContain("m.bcc_emails");
 
-    const anyC = compileSearch(parseTextTerms(""), filtersFromStructured({ anyEmail: "d@x.com" }), baseCompileOptions);
+    const anyC = compileSearch(noText, filtersFromStructured({ anyEmail: "d@x.com" }), baseCompileOptions);
     expect(anyC.text).toContain("m.from_email");
     expect(anyC.text).toContain("m.to_emails");
     expect(anyC.text).toContain("m.cc_emails");
@@ -222,7 +223,7 @@ describe("email-005 structured filters", () => {
 
   it("binds an injection-shaped recipient value as a parameter, never inlining it", () => {
     const evil = `x%_'; drop table imap_messages;--`;
-    const compiled = compileSearch(parseTextTerms(""), filtersFromStructured({ cc: evil, anyEmail: evil }), baseCompileOptions);
+    const compiled = compileSearch(noText, filtersFromStructured({ cc: evil, anyEmail: evil }), baseCompileOptions);
     // The dangerous text never appears in the SQL string...
     expect(compiled.text).not.toContain("drop table");
     expect(compiled.text).not.toContain(evil);
@@ -252,7 +253,7 @@ describe("email-005 structured filters", () => {
   });
 
   it("narrows by received_after/received_before (date range) and folder scope, paginated", () => {
-    const compiled = compileSearch(parseTextTerms(""),
+    const compiled = compileSearch(noText,
       filtersFromStructured({ after: "2026-01-01", before: "2026-02-01", folder: "INBOX" }),
       { ...baseCompileOptions, limit: 10, offset: 20 }
     );
@@ -270,7 +271,6 @@ describe("compileSearch", () => {
   it("retrieves and ranks body text from the bounded search extract only", () => {
     const compiled = compileSearch(parseTextTerms("invoice"), [], {
       ...baseCompileOptions,
-      hasText: true,
       snippet: true
     });
 
@@ -281,7 +281,7 @@ describe("compileSearch", () => {
   });
 
   it("deduplicates deliveries before account-scoped conversation grouping", () => {
-    const compiled = compileSearch(parseTextTerms(""), [], baseCompileOptions);
+    const compiled = compileSearch(noText, [], baseCompileOptions);
 
     expect(compiled.text).toContain("LEFT JOIN public.imap_thread_active_assignments ta");
     expect(compiled.text).toContain("ta.delivery_key");
@@ -300,7 +300,7 @@ describe("compileSearch", () => {
 
   it("resolves a thread: selector only through the active assignment view and keeps the value bound", () => {
     const selector = `thread_' ; drop table imap_messages;--`;
-    const compiled = compileSearch(parseTextTerms(""), filtersFromStructured({ thread: selector }), baseCompileOptions);
+    const compiled = compileSearch(noText, filtersFromStructured({ thread: selector }), baseCompileOptions);
 
     expect(compiled.text).toContain("FROM public.imap_thread_active_assignments thread_assignment");
     expect(compiled.text).not.toContain("FROM public.imap_thread_assignments thread_assignment");
@@ -310,8 +310,7 @@ describe("compileSearch", () => {
 
   it("binds every user value as a parameter and never interpolates it into SQL text", () => {
     const compiled = compileSearch(parseTextTerms("invoice"), filtersFromStructured({ from: "acme" }), {
-      ...baseCompileOptions,
-      hasText: true
+      ...baseCompileOptions
     });
     // The user's free text and operator value live in the values array...
     expect(compiled.values).toContain("invoice");
@@ -323,17 +322,17 @@ describe("compileSearch", () => {
   });
 
   it("emits the soft-delete partial-index predicate by default", () => {
-    const compiled = compileSearch(parseTextTerms(""), [], baseCompileOptions);
+    const compiled = compileSearch(noText, [], baseCompileOptions);
     expect(compiled.text).toContain("m.deleted_in_provider = false");
   });
 
   it("drops the soft-delete predicate only when includeDeleted is set", () => {
-    const compiled = compileSearch(parseTextTerms(""), [], { ...baseCompileOptions, includeDeleted: true });
+    const compiled = compileSearch(noText, [], { ...baseCompileOptions, includeDeleted: true });
     expect(compiled.text).not.toContain("m.deleted_in_provider = false");
   });
 
   it("scopes by account when account ids are provided", () => {
-    const compiled = compileSearch(parseTextTerms(""), [], {
+    const compiled = compileSearch(noText, [], {
       ...baseCompileOptions,
       accountIds: ["11111111-1111-1111-1111-111111111111"]
     });
@@ -343,7 +342,7 @@ describe("compileSearch", () => {
 
   it("compiles an OR group to one parenthesized predicate that keeps each member's negation", () => {
     const parsed = parseQuery("from:@nytimes.com OR -subject:sale is:unread");
-    const compiled = compileSearch(parseTextTerms(""), parsed.filters, baseCompileOptions);
+    const compiled = compileSearch(noText, parsed.filters, baseCompileOptions);
     expect(compiled.text).toContain(
       "(lower(split_part(coalesce(m.from_email,''),'@',2)) = $1 OR NOT (lower(coalesce(m.subject,'')) LIKE $2))"
     );
@@ -353,7 +352,7 @@ describe("compileSearch", () => {
 
   it("resolves a relative date to a now()-relative interval, not a bound timestamp", () => {
     const parsed = parseQuery("after:7d");
-    const compiled = compileSearch(parseTextTerms(""), parsed.filters, baseCompileOptions);
+    const compiled = compileSearch(noText, parsed.filters, baseCompileOptions);
     expect(compiled.text).toContain("now() - (");
     expect(compiled.text).toContain("interval '1 day'");
     expect(compiled.values).toContain(7);
@@ -369,28 +368,35 @@ describe("parseTextTerms", () => {
 
   it("joins the words or phrases beside OR into one group, Gmail style", () => {
     expect(parseTextTerms('stripe shares OR "time sheet"')).toEqual({
+      hasText: true,
       groups: [[word("stripe")], [word("shares"), phrase("time sheet")]],
       negative: [],
       ignoredOr: []
     });
     // Lowercase or is OR too.
     expect(parseTextTerms("invoice or receipt").groups).toEqual([[word("invoice"), word("receipt")]]);
+    expect(parseTextTerms("")).toEqual({ hasText: false, groups: [], negative: [], ignoredOr: [] });
   });
 
-  it("ends a pending OR at an exclusion, punctuation, another OR or an edge and reports where", () => {
+  it("ends a pending OR at an exclusion, punctuation, another OR or an edge and reports each one", () => {
     expect(parseTextTerms("invoice OR -spam receipt")).toEqual({
+      hasText: true,
       groups: [[word("invoice")], [word("receipt")]],
       negative: [word("spam")],
       ignoredOr: [ignored("invoice", "-spam")]
     });
-    expect(parseTextTerms("( invoice OR receipt )")).toEqual({
-      groups: [[word("invoice"), word("receipt")]], negative: [], ignoredOr: []
+    expect(parseTextTerms("( invoice OR receipt )").ignoredOr).toEqual([]);
+    expect(parseTextTerms("( invoice OR receipt )").groups).toEqual([[word("invoice"), word("receipt")]]);
+    // Two ORs in a row join nothing; both are reported.
+    expect(parseTextTerms("a OR OR b")).toEqual({
+      hasText: true, groups: [[word("a")], [word("b")]], negative: [], ignoredOr: [ignored("a", "OR"), ignored("OR", "b")]
     });
-    expect(parseTextTerms("a OR OR b").groups).toEqual([[word("a")], [word("b")]]);
-    expect(parseTextTerms("a OR - b")).toEqual({ groups: [[word("a")], [word("b")]], negative: [], ignoredOr: [ignored("a", "-")] });
-    expect(parseTextTerms('a OR "" b').groups).toEqual([[word("a")], [word("b")]]);
+    expect(parseTextTerms("a OR - b").ignoredOr).toEqual([ignored("a", "-")]);
+    expect(parseTextTerms('a OR "" b')).toEqual({
+      hasText: true, groups: [[word("a")], [word("b")]], negative: [], ignoredOr: [ignored("a", '""')]
+    });
     expect(parseTextTerms("stripe shares OR").ignoredOr).toEqual([ignored("shares", null)]);
-    expect(parseTextTerms("OR")).toEqual({ groups: [], negative: [], ignoredOr: [ignored(null, null)] });
+    expect(parseTextTerms("OR")).toEqual({ hasText: true, groups: [], negative: [], ignoredOr: [ignored(null, null)] });
   });
 
   it("uses the same tokens as parseQuery and treats a stray quote as a separator", () => {
@@ -399,16 +405,21 @@ describe("parseTextTerms", () => {
     expect(parseTextTerms('-"bad deal" ok').negative).toEqual([phrase("bad deal")]);
   });
 
-  it("gives every ignored OR one warning that names its neighbours, once", () => {
+  it("gives every ignored OR one warning that names its neighbours", () => {
     // Beside an operator (decided by parseQuery) and beside an exclusion (decided by the grammar).
-    expect(parseQuery("budget OR from:alice").warnings).toEqual([warning('"budget"', '"from:alice"')]);
-    expect(parseQuery("a OR -b").warnings).toEqual([warning('"a"', '"-b"')]);
-    expect(parseQuery('body:"a OR -b"').warnings).toEqual([warning('"a"', '"-b"')]);
+    expect(parseQuery("budget OR from:alice").warnings).toEqual([warning("`budget`", "`from:alice`")]);
+    expect(parseQuery('invoice OR -"bad deal"').warnings).toEqual([warning("`invoice`", '`-"bad deal"`')]);
     expect(parseQuery("OR").warnings).toEqual([warning("the start", "the end")]);
-    // q and structured filters share one warning list; the same OR warns once.
+    // A body: value names its own field and gives the word hint.
+    const bodyWarning = "OR ignored in body: between `a` and `-b`; OR joins two words or quoted phrases";
+    expect(parseQuery('body:"a OR -b"').warnings).toEqual([bodyWarning]);
+    const structured: string[] = [];
+    filtersFromStructured({ body: "a OR -b" }, structured);
+    expect(structured).toEqual([bodyWarning]);
+    // The same ignored OR in q and in body: are two warnings, one per field.
     const shared = [...parseQuery("a OR -b").warnings];
     filtersFromStructured({ body: "a OR -b" }, shared);
-    expect(shared).toEqual([warning('"a"', '"-b"')]);
+    expect(shared).toEqual([warning("`a`", "`-b`"), bodyWarning]);
     expect(parseQuery("a OR b").warnings).toEqual([]);
     // parseQuery returns the terms, so engines do not parse the text again.
     expect(parseQuery("a OR b c").text.groups).toEqual([[word("a"), word("b")], [word("c")]]);
@@ -417,7 +428,7 @@ describe("parseTextTerms", () => {
 
 describe("compileSearch free text", () => {
   it("compiles free text and body: filters with the shared OR grammar", () => {
-    const compiled = compileSearch(parseTextTerms('a b OR "c d" -e'), [], { ...baseCompileOptions, hasText: true });
+    const compiled = compileSearch(parseTextTerms('a b OR "c d" -e'), [], baseCompileOptions);
     // Each excluded term is bound once ($1) and reused by the exclusion predicate.
     expect(compiled.text).toContain(
       "(plainto_tsquery('english', public.f_unaccent($2)) && " +
@@ -429,10 +440,10 @@ describe("compileSearch free text", () => {
     expect(compiled.text).not.toContain("websearch_to_tsquery('english', public.f_unaccent($1))");
 
     // Text without a searchable word matches nothing instead of listing every message.
-    const punctuation = compileSearch(parseTextTerms("???"), [], { ...baseCompileOptions, hasText: true });
+    const punctuation = compileSearch(parseTextTerms("???"), [], baseCompileOptions);
     expect(punctuation.text).toContain("header_fts @@ plainto_tsquery('english', '')");
 
-    const body = compileSearch(parseTextTerms(""), parseQuery("body:\"x OR y\"").filters, baseCompileOptions);
+    const body = compileSearch(noText, parseQuery("body:\"x OR y\"").filters, baseCompileOptions);
     expect(body.text).toContain(
       "@@ (plainto_tsquery('english', public.f_unaccent($1)) || plainto_tsquery('english', public.f_unaccent($2)))"
     );

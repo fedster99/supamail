@@ -50,6 +50,8 @@ export interface TextTerm {
  * its group: `a b OR "c d"` is a AND (b OR "c d"). Excluded terms must not match.
  */
 export interface TextTerms {
+  /** The input had at least one token. With no searchable term, it matches nothing. */
+  hasText: boolean;
   groups: TextTerm[][];
   negative: TextTerm[];
   /** Each OR that stood beside an exclusion, punctuation, another OR or an edge,

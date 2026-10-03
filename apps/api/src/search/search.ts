@@ -116,7 +116,7 @@ export async function searchMessages(
   const limit = clamp(parsed.limit ?? request.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT);
   const offset = Math.max(0, request.offset ?? 0);
   const freeText = parsed.freeText;
-  const hasText = freeText.trim() !== "";
+  const hasText = parsed.text.hasText;
   // Recall branches: fuzzy matches the (possibly misspelled) significant tokens;
   // concept widens the tsquery with curated synonyms. Both no-op when empty.
   // `recall: false` (the A/B baseline) forces the lexical-only path.
@@ -163,7 +163,6 @@ export async function searchMessages(
         windowStatus: request.windowStatus ?? null,
         includeDeleted: request.includeDeleted ?? false,
         sort,
-        hasText,
         limit,
         offset,
         snippet: request.snippet ?? true,

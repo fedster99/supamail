@@ -17,7 +17,6 @@ export interface CompileOptions {
   windowStatus: WindowStatus[] | null;
   includeDeleted: boolean;
   sort: SearchSort;
-  hasText: boolean;
   limit: number;
   offset: number;
   snippet: boolean;
@@ -272,8 +271,8 @@ export function compileSearch(
   // Frozen clock: production passes null → SQL now(); the eval pins an instant so
   // recency and relative-date filters are byte-reproducible run-to-run.
   const nowExpr = opts.now ? `${pb.add(opts.now)}::timestamptz` : "now()";
-  // `opts.hasText` says the query had free text; terms without a searchable word match nothing.
-  const hasText = opts.hasText;
+  // Free text without a searchable word matches nothing; no free text skips the text branch.
+  const hasText = terms.hasText;
   const textQuery = hasText ? textTsquery(terms, pb) : { query: null, excluded: null };
   const tsq = textQuery.query;
 

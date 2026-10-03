@@ -56,7 +56,6 @@ const baseOptions: CompileOptions = {
   windowStatus: null,
   includeDeleted: false,
   sort: "smart",
-  hasText: true,
   limit: 25,
   offset: 0,
   snippet: false,
