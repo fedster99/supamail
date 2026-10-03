@@ -124,9 +124,11 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   beyond parsing: strict calendar-date validation, relative dates (`h`/`d`/`w`/
   `m`/`y`, at most about 100 years back, months clamped to the month's end), the
   `filetype:` MIME table, and the `filename:` glob (a value without `*` or `?`
-  matches as a substring). Postgres binds the resolved relative date as a
-  timestamp instead of using interval arithmetic, so every engine uses the same
-  resolver. Other engines translate the same exports instead of keeping copies.
+  matches as a substring). `resolveDate` turns every valid date value, relative
+  or absolute (UTC when it has no zone), into one instant; Postgres binds that
+  instant as a timestamp, so every engine reads a date filter the same way. A
+  result's `score` is null when the order ranks nothing (date, size or sender
+  order, or no free text). Other engines translate the same exports instead of keeping copies.
   Stopword-only text is not yet aligned across engines.
 - **One free-text grammar.** `parseTextTerms` parses free text into terms and
   Gmail-style OR groups over the same tokens as `parseQuery`: `a b OR "c d"` is

@@ -5,6 +5,7 @@ export {
   filetypeMatch,
   isRelativeDate,
   isValidAbsoluteDate,
+  resolveDate,
   resolveRelativeDate,
   type FiletypeMatch
 } from "./rules.js";

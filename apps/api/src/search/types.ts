@@ -191,7 +191,8 @@ export interface SearchResult {
   window_status: WindowStatus;
   body_fetched_at: string | null;
   snippet: string | null;
-  score: number;
+  /** Ranking score; null when the order ranks nothing (date, size or sender order, or no text). */
+  score: number | null;
   score_breakdown: ScoreBreakdown | null;
   /** The conversation this result represents; message_count is how many of its
    *  messages matched (the collapsed duplicates when grouped by thread). */

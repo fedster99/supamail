@@ -1,7 +1,7 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
-import { filenameGlob, filetypeMatch, isRelativeDate, resolveRelativeDate } from "./rules.js";
+import { filenameGlob, filetypeMatch, resolveDate } from "./rules.js";
 
 /** Accumulates bound parameter values and hands back `$n` placeholders. User
  * input is NEVER interpolated into SQL text — only through these placeholders. */
@@ -45,10 +45,10 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
-/** Bind a date filter value as a timestamp. A relative value is resolved by the
- * shared `resolveRelativeDate` from `now` (the frozen eval clock, or compile time). */
+/** Bind a date filter value as the instant the shared `resolveDate` names, counted
+ * from `now` (the frozen eval clock, or compile time). */
 function dateExpr(value: string, pb: Params, now: Date): string {
-  return `${pb.add(isRelativeDate(value) ? resolveRelativeDate(value, now).toISOString() : value)}::timestamptz`;
+  return `${pb.add(resolveDate(value, now).toISOString())}::timestamptz`;
 }
 
 function filetypePredicate(value: string, pb: Params): string {

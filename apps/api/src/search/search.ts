@@ -52,7 +52,7 @@ function intersectAccounts(a: string[] | null, b: string[] | null): string[] | n
   return a.filter((id) => set.has(id));
 }
 
-function mapRow(row: ResultRow, explain: boolean): SearchResult {
+function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult {
   const score = Number(row.score ?? 0);
   return {
     identity: {
@@ -70,8 +70,8 @@ function mapRow(row: ResultRow, explain: boolean): SearchResult {
     window_status: row.window_status,
     body_fetched_at: row.body_fetched_at ? row.body_fetched_at.toISOString() : null,
     snippet: row.snippet ?? null,
-    score,
-    score_breakdown: explain
+    score: ranked ? score : null,
+    score_breakdown: explain && ranked
       ? {
           text_relevance: Number(row.text_rel ?? 0),
           recency: Number(row.recency ?? 0),
@@ -181,7 +181,9 @@ export async function searchMessages(
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const results = pageRows.map((row) => mapRow(row, request.explain ?? false));
+    // Only smart and relevance orders over free text rank; other orders carry no score.
+    const ranked = hasText && (sort === "smart" || sort === "relevance");
+    const results = pageRows.map((row) => mapRow(row, request.explain ?? false, ranked));
 
     return {
       results,

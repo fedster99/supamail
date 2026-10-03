@@ -224,6 +224,16 @@ liveDb("search layer live DB", () => {
     expect(punctuation.results).toEqual([]);
   });
 
+  it("scores only orders that rank: free text with smart or relevance", async () => {
+    const ranked = await searchMessages(pool, { q: "invoice", accounts: [accountId] });
+    expect(typeof ranked.results[0]?.score).toBe("number");
+    const listed = await searchMessages(pool, { q: "invoice sort:recent", accounts: [accountId], explain: true });
+    expect(listed.results.map((r) => r.score)).toEqual(listed.results.map(() => null));
+    expect(listed.results[0]?.score_breakdown).toBeNull();
+    const filtered = await searchMessages(pool, { q: "from:@acme.com", accounts: [accountId] });
+    expect(filtered.results[0]?.score).toBeNull();
+  });
+
   it("reports a sync-trust block for the searched account", async () => {
     const response = await searchMessages(pool, { q: "report", accounts: [accountId] });
     expect(response.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);

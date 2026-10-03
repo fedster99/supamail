@@ -53,6 +53,25 @@ export function resolveRelativeDate(value: string, now: Date): Date {
   return date;
 }
 
+/**
+ * The instant a valid date filter value names: a relative spec counted back from
+ * `now`, or an absolute date-time. A value without a zone is UTC. Every engine binds
+ * this instant, so all engines read a date filter the same way.
+ */
+export function resolveDate(value: string, now: Date): Date {
+  if (isRelativeDate(value)) return resolveRelativeDate(value, now);
+  const match = ABSOLUTE_DATE.exec(value);
+  if (!match || !isValidAbsoluteDate(value)) throw new RangeError(`not a valid date: ${value}`);
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map((part) => Number(part ?? 0));
+  const millis = Math.round(Number(`0${match[7] ?? ""}`) * 1000);
+  const offsetMinutes = match[8] === undefined ? 0
+    : (match[8] === "-" ? -1 : 1) * (Number(match[9]) * 60 + Number(match[10] ?? 0));
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, millis);
+  return new Date(date.getTime() - offsetMinutes * 60_000);
+}
+
 /** What a `filetype:` value matches in an attachment's lowercase MIME type. */
 export type FiletypeMatch =
   | { kind: "mimes"; mimes: readonly string[] }
