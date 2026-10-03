@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AppConfig } from "../config.js";
 import { closePool, getPool } from "../db.js";
 import { getDraft, listDrafts } from "../drafts.js";
+import { MirrorRepository } from "../repository.js";
 
 /**
  * Live-DB coverage for draft folder resolution (email-003, ADR 0019) against a
@@ -101,6 +102,18 @@ liveDb("draft folder resolution (live DB)", () => {
     const draft = await getDraft(pool, config, id);
     expect(draft).not.toBeNull();
     expect(draft!.folderPath).toBe("INBOX");
+  });
+
+  it("getLiveMessageId finds a live row by its exact physical identity only", async () => {
+    const repository = new MirrorRepository(pool, config);
+    expect(await repository.getLiveMessageId(accountId, "Drafts", 100, 1)).toBe(idBySubject.get("Folder draft"));
+    expect(await repository.getLiveMessageId(accountId, "Drafts", 101, 1)).toBeNull();
+    expect(await repository.getLiveMessageId(accountId, "INBOX", 100, 1)).toBeNull();
+    await seedMessage({ subject: "Deleted draft", folderPath: "Drafts", uid: 9 });
+    await pool.query("UPDATE public.imap_messages SET deleted_in_provider = true WHERE id = $1", [
+      idBySubject.get("Deleted draft")
+    ]);
+    expect(await repository.getLiveMessageId(accountId, "Drafts", 100, 9)).toBeNull();
   });
 
   it("getDraft returns null for a plain (non-draft) inbox message", async () => {

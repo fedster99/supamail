@@ -111,9 +111,11 @@ export interface CreateDraftResult {
   accountId: string;
   draftsFolderPath: string;
   rfcMessageId: string;
-  /** From UIDPLUS APPENDUID when the server provides one, else null. The mirrored
-   * row (and its stable message_id) appears after the next sync of Drafts. */
+  /** From UIDPLUS APPENDUID when the server provides one, else null. With
+   * `appendedUidValidity` this is the draft's physical identity; the mirrored row
+   * (and its stable message_id) appears after the next sync of Drafts. */
   appendedUid: number | null;
+  appendedUidValidity: number | null;
 }
 
 export interface UpdateDraftResult extends CreateDraftResult {
@@ -164,7 +166,12 @@ async function appendDraft(
   req: SendRequest,
   idempotencyKey?: string | null,
   signal?: AbortSignal
-): Promise<{ draftsFolderPath: string; rfcMessageId: string; appendedUid: number | null }> {
+): Promise<{
+  draftsFolderPath: string;
+  rfcMessageId: string;
+  appendedUid: number | null;
+  appendedUidValidity: number | null;
+}> {
   const from = { email: account.email_address };
   // With an idempotency key, stamp a deterministic Message-ID (buildRawMime honors
   // req.messageId) so a retry finds its own prior APPEND below instead of duping.
@@ -194,8 +201,13 @@ async function appendDraft(
       // the same lock as the APPEND, so search + append are atomic per account.
       if (idempotencyKey) {
         const existing = await appender.searchByMessageId(draftsFolderPath, messageId);
-        if (existing.length > 0) {
-          return { draftsFolderPath, rfcMessageId: messageId, appendedUid: Math.max(...existing) };
+        if (existing.uids.length > 0) {
+          return {
+            draftsFolderPath,
+            rfcMessageId: messageId,
+            appendedUid: Math.max(...existing.uids),
+            appendedUidValidity: existing.uidValidity
+          };
         }
       }
 
@@ -204,7 +216,12 @@ async function appendDraft(
       await repository.markFoldersForReconcile(account.id, [draftsFolderPath]);
       // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
       const appended = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
-      return { draftsFolderPath, rfcMessageId: messageId, appendedUid: appended.uid };
+      return {
+        draftsFolderPath,
+        rfcMessageId: messageId,
+        appendedUid: appended.uid,
+        appendedUidValidity: appended.uid === null ? null : appended.uidValidity
+      };
     } finally {
       await closeImap(appender);
     }
@@ -235,7 +252,7 @@ export async function createDraft(
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
 
-  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
+  const { draftsFolderPath, rfcMessageId, appendedUid, appendedUidValidity } = await appendDraft(
     pool,
     config,
     repository,
@@ -244,7 +261,7 @@ export async function createDraft(
     input.idempotencyKey,
     options.signal
   );
-  return { accountId: account.id, draftsFolderPath, rfcMessageId, appendedUid };
+  return { accountId: account.id, draftsFolderPath, rfcMessageId, appendedUid, appendedUidValidity };
 }
 
 /** A mirrored Drafts-folder row, joined with its stored body for the get view. */
@@ -450,7 +467,7 @@ export async function updateDraft(
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${existing.account_id}`);
 
   const req: SendRequest = { ...input, accountId: account.id };
-  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
+  const { draftsFolderPath, rfcMessageId, appendedUid, appendedUidValidity } = await appendDraft(
     pool,
     config,
     repository,
@@ -480,6 +497,7 @@ export async function updateDraft(
     draftsFolderPath,
     rfcMessageId,
     appendedUid,
+    appendedUidValidity,
     replacedMessageId: messageId,
     replacedDraftDeleted,
     warnings

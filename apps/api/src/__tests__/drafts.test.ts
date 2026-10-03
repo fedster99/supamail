@@ -20,7 +20,10 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // --- Mocked appender, send primitive, delete mutation, and repository. ---
 
 const mocks = vi.hoisted(() => ({
-  append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({ uid: 7 as number | null })),
+  append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({
+    uid: 7 as number | null,
+    uidValidity: 100 as number | null
+  })),
   list: vi.fn(async () => [{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]),
   logout: vi.fn(async () => undefined),
   close: vi.fn(),
@@ -127,8 +130,8 @@ beforeEach(() => {
   mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => fn(mockAccountLock()));
   mocks.lockAssertLive.mockResolvedValue(undefined);
   mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
-  mocks.searchByMessageId.mockResolvedValue([]); // default: no prior draft (idempotency miss)
-  mocks.append.mockResolvedValue({ uid: 7 });
+  mocks.searchByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
+  mocks.append.mockResolvedValue({ uid: 7, uidValidity: 100 });
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
   mocks.getAccount.mockResolvedValue(account);
   mocks.getRawMime.mockResolvedValue({
@@ -171,7 +174,7 @@ describe("createDraft", () => {
 
   it("returns the existing draft (no duplicate APPEND) on an idempotent retry", async () => {
     // Same Idempotency-Key -> same derived Message-ID -> search finds the prior APPEND.
-    mocks.searchByMessageId.mockResolvedValueOnce([41, 42]);
+    mocks.searchByMessageId.mockResolvedValueOnce({ uids: [41, 42], uidValidity: 100 });
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
       accountId: "acc-1",
@@ -183,6 +186,7 @@ describe("createDraft", () => {
     expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
+    expect(result.appendedUidValidity).toBe(100);
   });
 
   it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
@@ -233,7 +237,7 @@ describe("createDraft", () => {
     expect(Buffer.isBuffer(raw)).toBe(true);
     expect(flags).toContain("\\Draft");
     expect(mocks.logout).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ accountId: "acc-1", draftsFolderPath: "Drafts", appendedUid: 7 });
+    expect(result).toMatchObject({ accountId: "acc-1", draftsFolderPath: "Drafts", appendedUid: 7, appendedUidValidity: 100 });
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     // Create does NOT send or delete — it only files the draft.
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
@@ -626,7 +630,7 @@ describe("sendDraft", () => {
     });
     mocks.append.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
-      return { uid: 7 };
+      return { uid: 7, uidValidity: 100 };
     });
     mocks.logout.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);

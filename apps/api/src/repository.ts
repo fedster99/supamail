@@ -3819,6 +3819,26 @@ export class MirrorRepository {
     }
   }
 
+  /**
+   * The mirror id of the live row at one physical identity, or null when sync has
+   * not mirrored it yet or the provider already deleted it. A host uses it after an
+   * APPENDUID and a reconcile of that folder to return the new message's id.
+   */
+  async getLiveMessageId(
+    accountId: string,
+    folderPath: string,
+    uidValidity: number,
+    uid: number
+  ): Promise<string | null> {
+    const result = await this.pool.query<{ id: string }>(
+      `SELECT id FROM public.imap_messages
+        WHERE account_id = $1 AND folder_path = $2 AND uidvalidity = $3 AND uid = $4
+          AND deleted_in_provider = false`,
+      [accountId, folderPath, uidValidity, uid]
+    );
+    return result.rows[0]?.id ?? null;
+  }
+
   async getMessage(id: string): Promise<ImapMessage | null> {
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
       "SELECT * FROM public.imap_messages WHERE id = $1",
