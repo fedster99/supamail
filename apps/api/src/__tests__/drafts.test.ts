@@ -102,6 +102,9 @@ vi.mock("../repository.js", () => ({
 }));
 
 const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+/** A pool whose only query is the Drafts folder lookup used by draft actions. */
+const draftPool = { query: vi.fn(async () => ({ rows: [{ path: "Drafts" }] })) } as never;
+const draftRow = { id: "draft-1", account_id: "acc-1", folder_path: "Drafts", flags: [], deleted_in_provider: false };
 
 const account = {
   id: "acc-1",
@@ -187,6 +190,8 @@ describe("createDraft", () => {
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
     expect(result.appendedUidValidity).toBe(100);
+    // Nothing new reached the provider, so nothing new is marked.
+    expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
   });
 
   it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
@@ -216,6 +221,15 @@ describe("createDraft", () => {
     });
     expect(mocks.searchByMessageId).not.toHaveBeenCalled();
     expect(mocks.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not APPEND when Drafts cannot be marked due first", async () => {
+    mocks.markFoldersForReconcile.mockRejectedValueOnce(new Error("database unavailable"));
+    const { createDraft } = await import("../drafts.js");
+    await expect(createDraft({} as never, config, {
+      accountId: "acc-1", to: [{ email: "rcpt@example.test" }], subject: "s", body: { format: "plain", text: "b" }
+    })).rejects.toThrow(/database unavailable/);
+    expect(mocks.append).not.toHaveBeenCalled();
   });
 
   it("APPENDs the composed bytes with \\Draft to the resolved Drafts folder", async () => {
@@ -299,9 +313,9 @@ describe("createDraft", () => {
 
 describe("updateDraft", () => {
   it("APPENDs a new draft then hard-deletes the old one (IMAP drafts are immutable)", async () => {
-    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.getMessage.mockResolvedValue(draftRow);
     const { updateDraft } = await import("../drafts.js");
-    const result = await updateDraft({} as never, config, "draft-1", {
+    const result = await updateDraft(draftPool, config, "draft-1", {
       to: [{ email: "rcpt@example.test" }],
       subject: "Revised",
       body: { format: "plain", text: "v2" }
@@ -311,7 +325,7 @@ describe("updateDraft", () => {
     expect(mocks.deleteMessage).toHaveBeenCalledTimes(1);
     // Old draft removed by a hard delete (reuses email-002), not trashed.
     expect(mocks.deleteMessage).toHaveBeenCalledWith(
-      {},
+      draftPool,
       config,
       "draft-1",
       expect.objectContaining({ hard: true })
@@ -319,11 +333,37 @@ describe("updateDraft", () => {
     expect(result).toMatchObject({ replacedMessageId: "draft-1", draftsFolderPath: "Drafts" });
   });
 
+  it("refuses an ordinary email, so a draft update can never rewrite or remove it", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX" });
+    const { updateDraft } = await import("../drafts.js");
+    await expect(
+      updateDraft(draftPool, config, "draft-1", { to: [], subject: "s", body: { format: "plain", text: "b" } })
+    ).rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/Draft not found/) });
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("accepts a \\Draft-flagged message outside a Drafts folder", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX", flags: ["\\Draft"] });
+    const { updateDraft } = await import("../drafts.js");
+    await updateDraft(draftPool, config, "draft-1", { to: [], subject: "s", body: { format: "plain", text: "b" } });
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a draft already deleted in the provider as not found", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, deleted_in_provider: true });
+    const { updateDraft } = await import("../drafts.js");
+    await expect(
+      updateDraft(draftPool, config, "draft-1", { to: [], subject: "s", body: { format: "plain", text: "b" } })
+    ).rejects.toMatchObject({ name: "NotFoundError" });
+    expect(mocks.append).not.toHaveBeenCalled();
+  });
+
   it("throws for an unknown draft without appending or deleting", async () => {
     mocks.getMessage.mockResolvedValue(null);
     const { updateDraft } = await import("../drafts.js");
     await expect(
-      updateDraft({} as never, config, "missing", { to: [], subject: "s", body: { format: "plain", text: "b" } })
+      updateDraft(draftPool, config, "missing", { to: [], subject: "s", body: { format: "plain", text: "b" } })
     ).rejects.toThrow(/Draft not found/);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
@@ -332,11 +372,11 @@ describe("updateDraft", () => {
   // ── Review PR-A (decision 1): the revised draft is already filed, so a failed
   //    delete of the OLD draft must downgrade to a warning, not fail the update. ─
   it("STILL reports the update when the old-draft delete rejects (best-effort cleanup)", async () => {
-    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.getMessage.mockResolvedValue(draftRow);
     mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
     const { updateDraft } = await import("../drafts.js");
 
-    const result = await updateDraft({} as never, config, "draft-1", {
+    const result = await updateDraft(draftPool, config, "draft-1", {
       to: [{ email: "rcpt@example.test" }],
       subject: "Revised",
       body: { format: "plain", text: "v2" }
@@ -349,12 +389,12 @@ describe("updateDraft", () => {
   });
 
   it("throws AccountBusyError before the delete when the account lock is held (no partial state)", async () => {
-    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.getMessage.mockResolvedValue(draftRow);
     mocks.withAccountLock.mockResolvedValueOnce(null); // worker mid-sync holds the lock
     const { updateDraft } = await import("../drafts.js");
     const { AccountBusyError } = await import("../errors.js");
     await expect(
-      updateDraft({} as never, config, "draft-1", {
+      updateDraft(draftPool, config, "draft-1", {
         to: [{ email: "rcpt@example.test" }],
         subject: "Revised",
         body: { format: "plain", text: "v2" }
@@ -676,12 +716,21 @@ describe("deleteDraft", () => {
   it("reuses the email-002 delete mutation (trash by default, hard on request)", async () => {
     const { deleteDraft } = await import("../drafts.js");
 
-    const trashed = await deleteDraft({} as never, config, "draft-1", {});
-    expect(mocks.deleteMessage).toHaveBeenLastCalledWith({}, config, "draft-1", { hard: undefined });
-    expect(trashed).toMatchObject({ messageId: "draft-1", fromFolder: "Drafts" });
+    mocks.getMessage.mockResolvedValue(draftRow);
+    const trashed = await deleteDraft(draftPool, config, "draft-1", {});
+    expect(mocks.deleteMessage).toHaveBeenLastCalledWith(draftPool, config, "draft-1", { hard: undefined });
+    expect(trashed).toEqual({ messageId: "draft-1", fromFolder: "Drafts", trashFolder: "Trash" });
 
-    await deleteDraft({} as never, config, "draft-1", { hard: true });
-    expect(mocks.deleteMessage).toHaveBeenLastCalledWith({}, config, "draft-1", { hard: true });
+    await deleteDraft(draftPool, config, "draft-1", { hard: true });
+    expect(mocks.deleteMessage).toHaveBeenLastCalledWith(draftPool, config, "draft-1", { hard: true });
+  });
+
+  it("refuses an ordinary email, so a draft delete can never remove it", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX" });
+    const { deleteDraft } = await import("../drafts.js");
+    await expect(deleteDraft(draftPool, config, "draft-1", { hard: true }))
+      .rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/Draft not found/) });
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 });
 

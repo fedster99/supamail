@@ -393,6 +393,11 @@ describe("setThreadFlags / moveThread fan-out", () => {
     // Every capped member is in INBOX, none already in Archive, so all 100 move.
     expect(mutator.move).toHaveBeenCalledTimes(100);
     expect(result.messageCount).toBe(100);
+    // Each changed folder is marked once, before the first provider move.
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX", "Archive"]);
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.move.mock.invocationCallOrder[0]
+    );
   });
 });
 

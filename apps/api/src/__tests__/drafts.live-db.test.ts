@@ -106,14 +106,14 @@ liveDb("draft folder resolution (live DB)", () => {
 
   it("getLiveMessageId finds a live row by its exact physical identity only", async () => {
     const repository = new MirrorRepository(pool, config);
-    expect(await repository.getLiveMessageId(accountId, "Drafts", 100, 1)).toBe(idBySubject.get("Folder draft"));
-    expect(await repository.getLiveMessageId(accountId, "Drafts", 101, 1)).toBeNull();
-    expect(await repository.getLiveMessageId(accountId, "INBOX", 100, 1)).toBeNull();
+    expect(await repository.getLiveMessageId({ accountId, folderPath: "Drafts", uidValidity: 100, uid: 1 })).toBe(idBySubject.get("Folder draft"));
+    expect(await repository.getLiveMessageId({ accountId, folderPath: "Drafts", uidValidity: 101, uid: 1 })).toBeNull();
+    expect(await repository.getLiveMessageId({ accountId, folderPath: "INBOX", uidValidity: 100, uid: 1 })).toBeNull();
     await seedMessage({ subject: "Deleted draft", folderPath: "Drafts", uid: 9 });
     await pool.query("UPDATE public.imap_messages SET deleted_in_provider = true WHERE id = $1", [
       idBySubject.get("Deleted draft")
     ]);
-    expect(await repository.getLiveMessageId(accountId, "Drafts", 100, 9)).toBeNull();
+    expect(await repository.getLiveMessageId({ accountId, folderPath: "Drafts", uidValidity: 100, uid: 9 })).toBeNull();
   });
 
   it("getDraft returns null for a plain (non-draft) inbox message", async () => {

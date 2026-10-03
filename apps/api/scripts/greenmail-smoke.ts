@@ -540,6 +540,13 @@ async function main(): Promise<void> {
     // regression fix). We assert: it left Drafts, AND the DELIVERED message at the
     // recipient carries the distinctive body — the real end-to-end body proof.
     await ensureFolder("Drafts");
+    // Track Drafts before the save, so the forced reconcile below is the only pass
+    // that can mirror the new draft.
+    await pool.query(
+      "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
+      [account.id]
+    );
+    await engine.syncAccount(account.id, "manual");
     const draftMessageId = `<greenmail-draft-${Date.now()}@example.test>`;
     // A distinctive body that MUST survive the round-trip (the bug sent it empty).
     const draftBody = `Distinctive draft body ${Date.now()} that MUST survive sendDraft.`;
@@ -551,6 +558,25 @@ async function main(): Promise<void> {
       body: { format: "plain", text: draftBody },
       messageId: draftMessageId
     });
+
+    // The host contract after a provider-acknowledged save: a forced live-lane
+    // reconcile of the changed folder mirrors the draft, and the APPENDUID identity
+    // resolves to that row.
+    const appendedIdentity = createResult.appendedUid !== null && createResult.appendedUidValidity !== null
+      ? { uid: createResult.appendedUid, uidValidity: createResult.appendedUidValidity }
+      : null;
+    let forcedReconcileDraftId: string | null = null;
+    if (appendedIdentity) {
+      await engine.syncAccount(account.id, "scheduled", {
+        liveInboxOnly: true,
+        forceReconcileFolders: [createResult.draftsFolderPath]
+      });
+      forcedReconcileDraftId = await repository.getLiveMessageId({
+        accountId: account.id,
+        folderPath: createResult.draftsFolderPath,
+        ...appendedIdentity
+      });
+    }
 
     await pool.query(
       "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
@@ -619,6 +645,9 @@ async function main(): Promise<void> {
       ["draft create appended a UID or folder", typeof createResult.appendedUid === "number" || createResult.draftsFolderPath.length > 0],
       ["draft resync succeeded", draftResync.outcome === "success"],
       ["draft mirrored in Drafts", Boolean(mirroredDraft)],
+      ["draft save returned its APPENDUID identity", appendedIdentity !== null],
+      ["forced Drafts reconcile resolves the APPENDUID to the mirrored draft",
+        forcedReconcileDraftId !== null && forcedReconcileDraftId === mirroredDraft?.messageId],
       // The load-bearing draft-send assertion: the SMTP DELIVERY happened. sendDraft
       // resends the raw draft bytes whose Sent-APPEND→mirror round-trip is already
       // proven GREEN by the send-path (reply) assertions above, so we do NOT re-assert

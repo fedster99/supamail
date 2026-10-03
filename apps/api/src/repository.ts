@@ -3824,12 +3824,12 @@ export class MirrorRepository {
    * not mirrored it yet or the provider already deleted it. A host uses it after an
    * APPENDUID and a reconcile of that folder to return the new message's id.
    */
-  async getLiveMessageId(
-    accountId: string,
-    folderPath: string,
-    uidValidity: number,
-    uid: number
-  ): Promise<string | null> {
+  async getLiveMessageId({ accountId, folderPath, uidValidity, uid }: {
+    accountId: string;
+    folderPath: string;
+    uidValidity: number;
+    uid: number;
+  }): Promise<string | null> {
     const result = await this.pool.query<{ id: string }>(
       `SELECT id FROM public.imap_messages
         WHERE account_id = $1 AND folder_path = $2 AND uidvalidity = $3 AND uid = $4

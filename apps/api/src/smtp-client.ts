@@ -378,6 +378,12 @@ export function buildSendEnvelope(from: string, req: SendRequest): SmtpEnvelope 
   return { from, to };
 }
 
+/** A UIDPLUS APPENDUID: the appended message's UID within the mailbox UIDVALIDITY. */
+export interface AppendedUid {
+  uidValidity: number;
+  uid: number;
+}
+
 /**
  * Write-only, single-verb IMAP client for filing the sent copy. Its socket comes
  * from the one shared {@link connectImap} prelude (decrypt + assertSafeImapTarget +
@@ -420,20 +426,13 @@ export class SentFolderAppender {
 
   /**
    * APPEND raw bytes to `path`, returning the UIDPLUS APPENDUID (UIDVALIDITY and UID)
-   * when the server provides one (else null — the next sync mirrors the copy regardless).
+   * when the server provides one, else null — the next sync mirrors the copy regardless.
    */
-  async append(
-    path: string,
-    raw: Buffer,
-    flags: string[],
-    date?: Date
-  ): Promise<{ uid: number | null; uidValidity: number | null }> {
+  async append(path: string, raw: Buffer, flags: string[], date?: Date): Promise<AppendedUid | null> {
     const result = await this.abort.run(() => this.client.append(path, raw, flags, date));
-    const appended = result && typeof result === "object" ? result : null;
-    return {
-      uid: typeof appended?.uid === "number" ? appended.uid : null,
-      uidValidity: typeof appended?.uidValidity === "bigint" ? Number(appended.uidValidity) : null
-    };
+    return result && typeof result.uid === "number" && typeof result.uidValidity === "bigint"
+      ? { uidValidity: Number(result.uidValidity), uid: result.uid }
+      : null;
   }
 
   /**
@@ -446,16 +445,16 @@ export class SentFolderAppender {
   searchByMessageId(
     folderPath: string,
     rfcMessageId: string
-  ): Promise<{ uids: number[]; uidValidity: number | null }> {
+  ): Promise<{ uids: number[]; uidValidity: number }> {
     return this.abort.run(async () => {
       const lock = await this.client.getMailboxLock(folderPath);
       try {
         const uids = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
         const selected = this.client.mailbox;
-        return {
-          uids: Array.isArray(uids) ? uids : [],
-          uidValidity: selected && typeof selected.uidValidity === "bigint" ? Number(selected.uidValidity) : null
-        };
+        if (!selected || typeof selected.uidValidity !== "bigint") {
+          throw new Error(`Selected mailbox ${folderPath} reported no UIDVALIDITY`);
+        }
+        return { uids: Array.isArray(uids) ? uids : [], uidValidity: Number(selected.uidValidity) };
       } finally {
         lock.release();
       }

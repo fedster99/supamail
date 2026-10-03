@@ -98,15 +98,21 @@ describe("SentFolderAppender identity", () => {
   it("returns the APPENDUID UIDVALIDITY and UID, or null without UIDPLUS", async () => {
     const { SentFolderAppender } = await import("../smtp-client.js");
     const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
-    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toEqual({ uid: 42, uidValidity: 7 });
+    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toEqual({ uidValidity: 7, uid: 42 });
     imap.append.mockResolvedValueOnce(false);
-    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toEqual({ uid: null, uidValidity: null });
+    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toBeNull();
+    // APPENDUID carries both values or neither; a half answer is no identity.
+    imap.append.mockResolvedValueOnce({ destination: "Drafts", uid: 42 });
+    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toBeNull();
   });
 
   it("returns the selected mailbox UIDVALIDITY with a Message-ID search", async () => {
     const { SentFolderAppender } = await import("../smtp-client.js");
     const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
     await expect(appender.searchByMessageId("Drafts", "<d@example.test>")).resolves.toEqual({ uids: [5, 9], uidValidity: 7 });
+    imap.mailbox = false;
+    await expect(appender.searchByMessageId("Drafts", "<d@example.test>")).rejects.toThrow(/no UIDVALIDITY/);
+    imap.mailbox = { uidValidity: 7n };
   });
 });
 

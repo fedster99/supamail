@@ -325,9 +325,9 @@ export interface SyncAccountOptions {
   /** Run the supplemental live-change lane (the name is retained for host compatibility). */
   liveInboxOnly?: boolean;
   /**
-   * Authoritative folders changed by one provider-acknowledged mutation. The
-   * live lane verifies these paths even when IDLE/NOTIFY has not reported them.
-   * Limited to the source and destination of one mutation.
+   * Authoritative folders changed by one provider-acknowledged mutation (a move,
+   * draft save, or delete). The live lane verifies these paths even when
+   * IDLE/NOTIFY has not reported them. Limited to two folders.
    */
   forceReconcileFolders?: readonly string[];
   /** Fetch the current live body backlog without running folder or history work. */
@@ -510,7 +510,7 @@ export class MirrorEngine {
           ? [...new Set(options.forceReconcileFolders ?? [])]
           : [];
         if (forceReconcileFolders.length > 2) {
-          throw new Error("forceReconcileFolders accepts at most one source and one destination");
+          throw new Error("forceReconcileFolders accepts at most two folders");
         }
         if (forceReconcileFolders.some((path) => path.length === 0)) {
           throw new Error("forceReconcileFolders requires non-empty folder paths");

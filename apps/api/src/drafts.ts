@@ -145,6 +145,8 @@ export interface SendDraftResult {
 export interface DeleteDraftResult {
   messageId: string;
   fromFolder: string;
+  /** The folder a non-hard delete moved the draft to; null for a hard delete. */
+  trashFolder: string | null;
 }
 
 /** APPEND `req` to the account's Drafts folder with the `\Draft` flag, reusing the
@@ -219,8 +221,8 @@ async function appendDraft(
       return {
         draftsFolderPath,
         rfcMessageId: messageId,
-        appendedUid: appended.uid,
-        appendedUidValidity: appended.uid === null ? null : appended.uidValidity
+        appendedUid: appended?.uid ?? null,
+        appendedUidValidity: appended?.uidValidity ?? null
       };
     } finally {
       await closeImap(appender);
@@ -307,7 +309,7 @@ function toSummary(row: DraftRow): DraftSummary {
  * special_use is `\Drafts`, plus the conventional name fallback. Drafts are
  * mirrored (provider-profiles keeps them), so this reads the synced folder set.
  */
-async function draftFolderPaths(client: PgClient, accountId: string): Promise<string[]> {
+async function draftFolderPaths(client: Pick<PgClient, "query">, accountId: string): Promise<string[]> {
   // The Drafts vocabulary is shared with the in-memory role resolver
   // (DRAFTS_VOCABULARY) so the two never drift on "what names a Drafts folder";
   // the QUERY stays its own distinct encoding (mirrored folder table, not a LIST).
@@ -328,6 +330,28 @@ async function draftFolderPaths(client: PgClient, accountId: string): Promise<st
   // (or on a server that doesn't advertise special-use) is still listed.
   if (!paths.some((p) => p.toLowerCase() === DRAFTS_VOCABULARY.leafName)) paths.push(DRAFTS_VOCABULARY.conventional);
   return paths;
+}
+
+/** A draft lives in a Drafts folder or carries the `\Draft` flag. */
+function isDraft(draftFolders: string[], row: { folder_path: string; flags: string[] | null }): boolean {
+  return draftFolders.includes(row.folder_path)
+    || (row.flags ?? []).some((flag) => flag.toLowerCase() === "\\draft");
+}
+
+/**
+ * The Mailbox Account of a live draft. Any other message is "not found" to a draft
+ * action, so a draft update or delete can never rewrite or remove an ordinary email.
+ */
+async function loadDraftAccount(pool: PgPool, repository: MirrorRepository, messageId: string): Promise<ImapAccount> {
+  const message = await repository.getMessage(messageId);
+  if (!message) throw new NotFoundError(`Draft not found: ${messageId}`);
+  if (message.deleted_in_provider) throw new NotFoundError(`Draft ${messageId} is already deleted in the provider`);
+  if (!isDraft(await draftFolderPaths(pool, message.account_id), message)) {
+    throw new NotFoundError(`Draft not found: ${messageId}`);
+  }
+  const account = await repository.getAccount(message.account_id);
+  if (!account) throw new Error(`Account not found for draft ${messageId}: ${message.account_id}`);
+  return account;
 }
 
 /**
@@ -417,10 +441,7 @@ export async function getDraft(
       METADATA_PROTECTED_FIELDS.message
     );
 
-    const paths = await draftFolderPaths(client, row.account_id);
-    const isDraftFolder = paths.includes(row.folder_path);
-    const isDraftFlagged = (row.flags ?? []).some((f) => f.toLowerCase() === "\\draft");
-    if (!isDraftFolder && !isDraftFlagged) return null;
+    if (!isDraft(await draftFolderPaths(client, row.account_id), row)) return null;
 
     // The draft is HTML when its selected body part is HTML, or (defensively) when
     // there is an HTML body but no plaintext to fall back to. Send uses bodyHtml so
@@ -460,11 +481,7 @@ export async function updateDraft(
   rejectBcc(input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const existing = await repository.getMessage(messageId);
-  if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
-  if (existing.deleted_in_provider) throw new NotFoundError(`Draft ${messageId} is already deleted in the provider`);
-  const account = await repository.getAccount(existing.account_id);
-  if (!account) throw new Error(`Account not found for draft ${messageId}: ${existing.account_id}`);
+  const account = await loadDraftAccount(pool, repository, messageId);
 
   const req: SendRequest = { ...input, accountId: account.id };
   const { draftsFolderPath, rfcMessageId, appendedUid, appendedUidValidity } = await appendDraft(
@@ -642,7 +659,7 @@ async function sendDraftAttempt(
           sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
           const appended = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
           appendedToSent = true;
-          appendedUid = appended.uid;
+          appendedUid = appended?.uid ?? null;
         } catch (error) {
           // SMTP is confirmed. Sent filing is best-effort and never becomes a
           // thrown failure that could invite a duplicate send.
@@ -722,6 +739,8 @@ export async function deleteDraft(
   messageId: string,
   options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
+  const repository = new MirrorRepository(pool, config, options.metadataProtection ?? plaintextMetadataProtection);
+  await loadDraftAccount(pool, repository, messageId);
   const result = await deleteMessage(pool, config, messageId, options);
-  return { messageId: result.messageId, fromFolder: result.fromFolder };
+  return { messageId: result.messageId, fromFolder: result.fromFolder, trashFolder: result.trashFolder };
 }
