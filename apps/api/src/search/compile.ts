@@ -1,7 +1,7 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
-import { filenameGlob, filetypeMatch, resolveDate } from "./rules.js";
+import { filenameGlob, filetypeMatch, folderMatch, resolveDate } from "./rules.js";
 
 /** Accumulates bound parameter values and hands back `$n` placeholders. User
  * input is NEVER interpolated into SQL text — only through these placeholders. */
@@ -126,11 +126,12 @@ function filterPredicate(filter: SearchFilter, pb: Params, now: Date): string {
       return filter.negated ? `(b.search_extract IS NULL OR NOT (${match}))` : match;
     }
     case "folder": {
-      if (filter.value.endsWith("/*")) {
-        const p = pb.add(`${escapeLike(filter.value.slice(0, -2).toLowerCase())}/%`);
+      const { kind, path } = folderMatch(filter.value);
+      if (kind === "subtree") {
+        const p = pb.add(`${escapeLike(path.toLowerCase())}/%`);
         return negate(`lower(m.folder_path) LIKE ${p}`);
       }
-      const p = pb.add(filter.value.toLowerCase());
+      const p = pb.add(path.toLowerCase());
       return negate(`lower(m.folder_path) = ${p}`);
     }
     case "thread": {

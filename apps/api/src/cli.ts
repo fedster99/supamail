@@ -252,7 +252,7 @@ program
   .option("--body <text>", "Body full-text match")
   .option("--folder <path>", "Folder path (in:; trailing /* matches the subtree)")
   .option("--thread <id>", "Durable conversation id or legacy provider thread id")
-  .option("--filename <glob>", "Attachment filename glob (e.g. *.pdf)")
+  .option("--filename <pattern>", "Attachment filename; * and ? are wildcards (e.g. *.pdf)")
   .option("--filetype <class>", "Attachment class (pdf,image,video,audio,doc,sheet,zip,text)")
   .option("--is <flag>", "Flag state read|unread|flagged|starred|answered|draft (repeatable)", collect, [])
   .option("--unread", "Only unread messages (shortcut for --is unread)")
