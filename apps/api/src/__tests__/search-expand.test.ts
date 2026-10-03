@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileSearch } from "../search/index.js";
+import { compileSearch, parseTextTerms } from "../search/index.js";
 import type { CompileOptions } from "../search/compile.js";
 import { expandConcepts, significantTerms } from "../search/expand.js";
 
@@ -69,7 +69,7 @@ const baseOptions: CompileOptions = {
 
 describe("compileSearch recall branches", () => {
   it("emits the index-using fuzzy trigram branch and is_primary tiering when terms are present", () => {
-    const compiled = compileSearch("invioce", [], { ...baseOptions, terms: ["invioce"] });
+    const compiled = compileSearch(parseTextTerms("invioce"), [], { ...baseOptions, terms: ["invioce"] });
     // per-term `lower(col) %> term` (constant) so the gin_trgm_ops index is used;
     // candidates are collected per-index via UNION, not a cross-table OR.
     expect(compiled.text).toContain("OPERATOR(extensions.%>)");
@@ -81,7 +81,7 @@ describe("compileSearch recall branches", () => {
   });
 
   it("emits the concept-widened tsquery when synonyms are present", () => {
-    const compiled = compileSearch("vacation", [], {
+    const compiled = compileSearch(parseTextTerms("vacation"), [], {
       ...baseOptions,
       terms: ["vacation"],
       synonyms: ["flight", "hotel"]
@@ -93,7 +93,7 @@ describe("compileSearch recall branches", () => {
   });
 
   it("uses the header∪body UNION but no fuzzy/concept branch when terms/synonyms are empty", () => {
-    const compiled = compileSearch("invoice", [], baseOptions);
+    const compiled = compileSearch(parseTextTerms("invoice"), [], baseOptions);
     // any free-text query collects candidates per-index via UNION...
     expect(compiled.text).toContain("cand_ids AS (");
     // ...but with no terms there is no trigram-fuzzy branch.

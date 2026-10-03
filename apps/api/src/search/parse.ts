@@ -1,4 +1,4 @@
-import type { ParsedQuery, SearchFilter, SearchSort, StructuredFilters, TextTerm, TextTerms } from "./types.js";
+import type { IgnoredOr, ParsedQuery, SearchFilter, SearchSort, StructuredFilters, TextTerm, TextTerms } from "./types.js";
 import { SEARCH_SORTS } from "./types.js";
 import type { WindowStatus } from "../types.js";
 import {
@@ -130,24 +130,37 @@ function mapIsFlag(value: string): SearchFilter | { warning: string } {
   }
 }
 
-const IGNORED_TEXT_OR = "OR was ignored where it did not stand between two words or quoted phrases.";
+/** The one warning for an OR that joined nothing, with the tokens around it. */
+function ignoredOrWarning({ left, right }: IgnoredOr): string {
+  return `OR ignored between ${left === null ? "the start" : `"${left}"`} and ` +
+    `${right === null ? "the end" : `"${right}"`}; OR joins two operators (from:a OR from:b) or two words`;
+}
+
+function warnIgnoredOr(warnings: string[], ignored: IgnoredOr[]): void {
+  for (const or of ignored) {
+    const warning = ignoredOrWarning(or);
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+}
 
 /**
  * The free-text grammar, shared by every search engine. OR in any case joins the
  * words or quoted phrases beside it into one group; every group must match. An
  * exclusion, a token with no letter or digit, another OR or an edge ends a
- * pending OR and sets `ignoredOr`.
+ * pending OR, which `ignoredOr` reports.
  */
 export function parseTextTerms(input: string): TextTerms {
   const groups: TextTerm[][] = [];
   const negative: TextTerm[] = [];
-  let ignoredOr = false;
+  const ignoredOr: IgnoredOr[] = [];
+  const tokens = tokenize(input ?? "");
   let previousGroupable = false;
-  let joinNext = false;
-  for (const raw of tokenize(input ?? "")) {
+  let pendingOr: IgnoredOr | null = null;
+  for (const [index, raw] of tokens.entries()) {
     if (raw.toLowerCase() === "or") {
-      if (joinNext || !previousGroupable) ignoredOr = true;
-      joinNext = !joinNext && previousGroupable;
+      const or = { left: tokens[index - 1] ?? null, right: tokens[index + 1] ?? null };
+      if (pendingOr || !previousGroupable) ignoredOr.push(or);
+      pendingOr = !pendingOr && previousGroupable ? or : null;
       previousGroupable = false;
       continue;
     }
@@ -156,15 +169,16 @@ export function parseTextTerms(input: string): TextTerms {
     const phrase = body.startsWith('"') && body.endsWith('"') && body.length >= 2;
     // A stray quote separates words; it never joins them or stays in a term.
     const text = (phrase ? body.slice(1, -1) : body).replaceAll('"', " ").replace(/\s+/g, " ").trim();
-    const groupable = !negated && /[\p{L}\p{N}]/u.test(text);
-    if (joinNext && !groupable) ignoredOr = true;
-    if (negated && /[\p{L}\p{N}]/u.test(text)) negative.push({ text, phrase });
-    else if (groupable && joinNext) groups[groups.length - 1].push({ text, phrase });
+    const searchable = /[\p{L}\p{N}]/u.test(text);
+    const groupable = !negated && searchable;
+    if (pendingOr && !groupable) ignoredOr.push(pendingOr);
+    if (negated && searchable) negative.push({ text, phrase });
+    else if (groupable && pendingOr) groups[groups.length - 1].push({ text, phrase });
     else if (groupable) groups.push([{ text, phrase }]);
-    joinNext = false;
+    pendingOr = null;
     previousGroupable = groupable;
   }
-  if (joinNext) ignoredOr = true;
+  if (pendingOr) ignoredOr.push(pendingOr);
   return { groups, negative, ignoredOr };
 }
 
@@ -221,11 +235,7 @@ export function parseQuery(input: string): ParsedQuery {
       } else if (left?.kind === "text" && right?.kind === "text") {
         freeTextParts.push(item.token);
       } else {
-        warnings.push(
-          `OR ignored between ${left ? `"${left.token}"` : "the start"} and ` +
-          `${right ? `"${right.token}"` : "the end"}; ` +
-          "OR joins two operators (from:a OR from:b) or two words"
-        );
+        warnIgnoredOr(warnings, [{ left: left?.token ?? null, right: right?.token ?? null }]);
       }
       continue;
     }
@@ -239,11 +249,14 @@ export function parseQuery(input: string): ParsedQuery {
   }
 
   const freeText = freeTextParts.join(" ").trim();
-  const bodies = filters.flatMap((filter) => filter.kind === "or" ? filter.filters : [filter])
-    .flatMap((filter) => filter.kind === "body" ? [filter.value] : []);
-  if ([freeText, ...bodies].some((text) => parseTextTerms(text).ignoredOr)) warnings.push(IGNORED_TEXT_OR);
+  const text = parseTextTerms(freeText);
+  warnIgnoredOr(warnings, text.ignoredOr);
+  for (const filter of filters.flatMap((filter) => filter.kind === "or" ? filter.filters : [filter])) {
+    if (filter.kind === "body") warnIgnoredOr(warnings, parseTextTerms(filter.value).ignoredOr);
+  }
   return {
     freeText,
+    text,
     accounts,
     filters,
     sort,
@@ -384,9 +397,7 @@ export function filtersFromStructured(structured: StructuredFilters, warnings: s
     const routed = field.route ? field.route(normalized) : { kind: field.kind, value: normalized };
     const raw = field.structuredRaw ? field.structuredRaw(original) : `${field.rawPrefix}:${original}`;
     push({ kind: routed.kind, value: routed.value, negated: false, raw } as SearchFilter);
-    if (routed.kind === "body" && parseTextTerms(routed.value).ignoredOr && !warnings.includes(IGNORED_TEXT_OR)) {
-      warnings.push(IGNORED_TEXT_OR);
-    }
+    if (routed.kind === "body") warnIgnoredOr(warnings, parseTextTerms(routed.value).ignoredOr);
   }
 
   // State/presence flags. `honorsFalse` fields emit on an explicit `false` (it

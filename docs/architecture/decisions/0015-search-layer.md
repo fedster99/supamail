@@ -126,8 +126,9 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   from these terms (`plainto_tsquery`/`phraseto_tsquery` joined with `&&`, `||`
   and `!!`) instead of `websearch_to_tsquery`, whose OR binds looser than AND.
   Other engines call the same exported function, so every engine applies the
-  same rules. `parseQuery` warns when an OR in free text or a `body:` filter was
-  ignored.
+  same rules. `parseQuery` returns the parsed terms as `text`, so Postgres search
+  parses free text once. Every ignored OR, beside an operator, an exclusion or
+  the query edge, gets one warning that names its neighbours.
 - **email-005 added** the precise recipient lanes the union was missing: `to` (To
   only), `cc` (Cc only), `bcc` (Bcc only — populated only on sent mail), and
   `anyEmail` (from + to + cc + bcc, the Nylas `any_email`). The pre-existing broad

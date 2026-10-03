@@ -1,4 +1,4 @@
-import type { SearchFilter, SearchSort, TextTerm } from "./types.js";
+import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import type { WindowStatus } from "../types.js";
 import { isRelativeDate, parseTextTerms } from "./parse.js";
 
@@ -100,8 +100,7 @@ function filetypePredicate(value: string, pb: Params): string {
  * any excluded term, so callers can drop
  * those messages from every candidate branch, not only the exact match.
  */
-function textTsquery(text: string, pb: Params): { query: string; excluded: string | null } {
-  const { groups, negative } = parseTextTerms(text);
+function textTsquery({ groups, negative }: TextTerms, pb: Params): { query: string; excluded: string | null } {
   const term = ({ text: value, phrase }: TextTerm): string =>
     `${phrase ? "phraseto_tsquery" : "plainto_tsquery"}('english', public.f_unaccent(${pb.add(value)}))`;
   const any = (terms: string[]): string => terms.length === 1 ? terms[0] : `(${terms.join(" || ")})`;
@@ -158,7 +157,7 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
       return negate(`lower(coalesce(m.subject,'')) LIKE ${p}`);
     }
     case "body": {
-      const { query } = textTsquery(filter.value, pb);
+      const { query } = textTsquery(parseTextTerms(filter.value), pb);
       const match = `public.imap_search_extract_fts(b.search_extract) @@ ${query}`;
       return filter.negated ? `(b.search_extract IS NULL OR NOT (${match}))` : match;
     }
@@ -265,7 +264,7 @@ function orderClause(sort: SearchSort, hasText: boolean, alias: string): string 
  *   outer  -> attachment count + ts_headline snippet (only on the page)
  */
 export function compileSearch(
-  freeText: string,
+  terms: TextTerms,
   filters: SearchFilter[],
   opts: CompileOptions
 ): CompiledQuery {
@@ -273,8 +272,9 @@ export function compileSearch(
   // Frozen clock: production passes null → SQL now(); the eval pins an instant so
   // recency and relative-date filters are byte-reproducible run-to-run.
   const nowExpr = opts.now ? `${pb.add(opts.now)}::timestamptz` : "now()";
-  const hasText = opts.hasText && freeText.trim() !== "";
-  const textQuery = hasText ? textTsquery(freeText, pb) : { query: null, excluded: null };
+  // `opts.hasText` says the query had free text; terms without a searchable word match nothing.
+  const hasText = opts.hasText;
+  const textQuery = hasText ? textTsquery(terms, pb) : { query: null, excluded: null };
   const tsq = textQuery.query;
 
   const lexHeader = tsq ? `ts_rank_cd(m.header_fts, ${tsq})` : "0";

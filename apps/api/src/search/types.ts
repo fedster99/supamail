@@ -52,8 +52,14 @@ export interface TextTerm {
 export interface TextTerms {
   groups: TextTerm[][];
   negative: TextTerm[];
-  /** An OR stood beside an exclusion, punctuation, another OR or an edge. */
-  ignoredOr: boolean;
+  /** Each OR that stood beside an exclusion, punctuation, another OR or an edge,
+   * with the tokens around it (null at an edge). */
+  ignoredOr: IgnoredOr[];
+}
+
+export interface IgnoredOr {
+  left: string | null;
+  right: string | null;
 }
 
 /**
@@ -64,6 +70,8 @@ export interface TextTerms {
  */
 export interface ParsedQuery {
   freeText: string;
+  /** `freeText` parsed by `parseTextTerms`; engines use it instead of parsing again. */
+  text: TextTerms;
   accounts: string[];
   filters: SearchFilter[];
   sort: SearchSort | null;
