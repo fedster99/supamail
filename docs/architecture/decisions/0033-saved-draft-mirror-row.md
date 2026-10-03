@@ -24,7 +24,9 @@ wait, and a second account-lock holder for a value the save already holds.
 After a provider-acknowledged draft APPEND returns APPENDUID, `createDraft` and
 `updateDraft` write the draft's mirror row through the sync's own
 `upsertMessages`, under the account lock the save already holds, and return
-its id as `messageId`.
+its id as `messageId`. The lock fences its writes, as sync's does, so a save
+that lost the lock cannot overwrite a row that sync already read. The write has
+a 5-second deadline, so it cannot hold the lock or the caller's request long.
 
 - **Values the save knows.** UID and UIDVALIDITY come from APPENDUID. The
   Message-ID, In-Reply-To, References, subject, sender, To, Cc, size, flags
@@ -34,13 +36,17 @@ its id as `messageId`.
   still holds.
 - **Values only the server knows stay empty.** These are BODYSTRUCTURE,
   attachment parts, and provider object/thread ids. The body arrives through the
-  normal body lane, as for any new message.
+  normal body lane, as for any new message. A parsed-only body fetch for a row
+  with no BODYSTRUCTURE asks the server for it in the same session, so body-part
+  selection never runs without one.
 - **Sync stays authoritative.** The write leaves the folder's `last_uid`
   unchanged. Drafts is marked due before the APPEND, so the next sync of Drafts
   reads the UID again, replaces the saved values with the server's view through
   the same upsert, and keeps the row id.
-- **Narrow guard.** The save writes the row only into a tracked, active Drafts
-  folder that sync has already read at the APPENDUID's UIDVALIDITY. Without
+- **Narrow guard.** The save writes the row only into a Drafts folder that is
+  tracked, not missing, and already holds the APPENDUID's UIDVALIDITY from sync.
+  Sync reads a UID above `last_uid` again in both incremental sync and the
+  initial sync's new-mail batch. Without
   APPENDUID, without such a folder, or after a failed write, `messageId` is null
   and the next Drafts sync mirrors the draft as before. A failed write is a
   warning, never a thrown error: the provider already holds the draft, and a
@@ -57,10 +63,9 @@ Sent APPENDs (ADR 0017) are unchanged and still insert no row.
   delete works at once. Send already fetches the raw bytes on demand, so it does
   not wait for the body lane.
 - Until the next Drafts sync, a saved draft has no attachment rows, provider
-  ids, or BODYSTRUCTURE. If the body lane stores its body before that sync
-  (it runs after folder sync in ordinary passes, so this is rare), the stored
-  body has no selected text part and `getDraft` infers `isHtml` from the body
-  columns.
+  ids, or BODYSTRUCTURE, and reads show no attachments for it. Its body is
+  `null` until the body lane stores it, so a read right after the save shows the
+  body as not mirrored yet.
 - The new draft shows in `listDrafts` at once. Deletes stay
   provider-authoritative (ADR 0018), so after an update the replaced draft can
   also show until reconcile, as it did before this change.
@@ -70,13 +75,16 @@ Sent APPENDs (ADR 0017) are unchanged and still insert no row.
 ## Verification
 
 - `drafts.test.ts`: the row is written after the APPEND from the APPENDUID and
-  the composed values, with the sync's header subset; no APPENDUID, an untracked
+  the composed values, with the sync's header subset, under a write-fenced lock
+  and a short deadline; no APPENDUID, an untracked
   or unread Drafts folder, or another UIDVALIDITY writes nothing; a failed write
   is a warning and the save still succeeds; an idempotent retry returns the
   earlier copy's id; update returns the new id.
 - `drafts.live-db.test.ts`: against real Postgres, a saved draft is readable at
   once by its id, and a later sync upsert of the same UID keeps the id, applies
   the server's values, and leaves `headers_synced_count` at one.
+- `imap-client.test.ts`: a parsed-only body fetch, single or batched, for a row
+  with no BODYSTRUCTURE selects its text part from the server's.
 - GreenMail smoke: a draft is saved and updated by its id before any sync; the
   revised draft is readable at once; the next real sync keeps its id and fills
   BODYSTRUCTURE; sending it delivers the body.

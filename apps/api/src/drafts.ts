@@ -160,6 +160,9 @@ export interface DeleteDraftResult {
 
 /** `\Draft` marks a saved draft; `\Seen` keeps it out of unread counts. */
 const DRAFT_FLAGS = ["\\Draft", "\\Seen"];
+/** The mirror write is one small transaction; a longer wait would hold the account
+ * lock and the caller's request for a draft the provider already holds. */
+const DRAFT_MIRROR_WRITE_TIMEOUT_MS = 5_000;
 
 /**
  * Derive a stable Message-ID from an idempotency key so a retried create maps to the
@@ -177,8 +180,9 @@ type SavedDraft = Omit<CreateDraftResult, "accountId">;
  * Serialized with the sync worker on the per-account advisory lock: a second IMAP
  * connection mid-cycle races and burns the provider's shared per-account command
  * budget (Rackspace caps ~200/min). Non-blocking — if the worker holds the lock,
- * surface a retryable busy error instead of colliding. The same lock keeps sync
- * from interleaving with the mirror write.
+ * surface a retryable busy error instead of colliding. The lock fences its writes,
+ * as sync's does: a save that lost the lock cannot write a row that sync already
+ * read, and no sync interleaves with the mirror write.
  */
 async function saveDraft(
   pool: PgPool,
@@ -221,7 +225,7 @@ async function saveDraft(
       );
     }
     return saved;
-  });
+  }, { fenceWrites: true });
 
   if (result === null) {
     throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft shortly`);
@@ -291,7 +295,9 @@ async function mirrorSavedDraft(
 ): Promise<string | null> {
   const [folder] = await repository.getFoldersForWake(accountId, [folderPath]);
   if (!folder || folder.uidvalidity === null || Number(folder.uidvalidity) !== uidValidity) return null;
-  const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], getWindowCutoff(config));
+  const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], getWindowCutoff(config), {
+    deadlineAt: Date.now() + DRAFT_MIRROR_WRITE_TIMEOUT_MS
+  });
   return row.id;
 }
 

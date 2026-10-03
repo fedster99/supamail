@@ -1041,7 +1041,10 @@ export async function fetchFullMessageBodyBatch(
         source: {
           start: 0,
           maxLength: sourceLimit
-        }
+        },
+        // A row a draft save wrote has no BODYSTRUCTURE until sync reads it again
+        // (ADR 0033); select its text part from the server's.
+        ...(messages.some((message) => message.mime_structure == null) ? { bodyStructure: true } : {})
       },
       { uid: true }
     )) {
@@ -1066,7 +1069,7 @@ export async function fetchFullMessageBodyBatch(
         message,
         config.BODY_RAW_MAX_BYTES
       );
-      const mimeStructure = message.mime_structure;
+      const mimeStructure = message.mime_structure ?? fetched.bodyStructure ?? null;
       const selected = selectBodyTextPart(mimeStructure);
 
       bodies.push({
@@ -1133,14 +1136,18 @@ export async function fetchFullMessageBody(
 
     const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
     let fetched: FetchMessage | false | null = null;
-    if (!streamParsedOnly) {
+    // Parsed-only streams the source below and needs a FETCH only for a row with no
+    // BODYSTRUCTURE, which a draft save writes until sync reads it again (ADR 0033).
+    if (!streamParsedOnly || message.mime_structure == null) {
       fetched = await client.fetchOne(
         String(message.uid),
-        {
-          bodyStructure: true,
-          headers: true,
-          source: { start: 0, maxLength: config.BODY_RAW_MAX_BYTES }
-        },
+        streamParsedOnly
+          ? { bodyStructure: true }
+          : {
+              bodyStructure: true,
+              headers: true,
+              source: { start: 0, maxLength: config.BODY_RAW_MAX_BYTES }
+            },
         { uid: true }
       );
 

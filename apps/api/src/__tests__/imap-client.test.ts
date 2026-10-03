@@ -290,6 +290,7 @@ describe("fetchFullMessageBody mailbox locking", () => {
       to: "b@example.test",
       body: "parsed-only body"
     });
+    const row = { ...notesMessage, mime_structure: fixture.bodyStructure };
     const client = new FixtureImapClient([{
       path: "INBOX.Notes",
       delimiter: ".",
@@ -305,7 +306,7 @@ describe("fetchFullMessageBody mailbox locking", () => {
         BODY_RAW_MAX_BYTES: 25 * 1024 * 1024,
         BODY_STORAGE_MODE: "parsed_only"
       } as unknown as AppConfig,
-      notesMessage
+      row
     );
 
     expect(fetchOne).not.toHaveBeenCalled();
@@ -427,6 +428,7 @@ describe("fetchFullMessageBody mailbox locking", () => {
       uidValidity: 1,
       messages: []
     }]);
+    const fetchOne = vi.spyOn(client, "fetchOne");
 
     await expect(fetchFullMessageBody(
       client,
@@ -434,8 +436,35 @@ describe("fetchFullMessageBody mailbox locking", () => {
         BODY_RAW_MAX_BYTES: 25 * 1024 * 1024,
         BODY_STORAGE_MODE: "parsed_only"
       } as unknown as AppConfig,
-      notesMessage
+      { ...notesMessage, mime_structure: { part: "1", type: "text/plain" } }
     )).rejects.toBeInstanceOf(MessageMovedError);
+    expect(fetchOne).not.toHaveBeenCalled();
+  });
+
+  it("selects a parsed-only body part from the server's BODYSTRUCTURE when the row has none", async () => {
+    // A draft save writes its row without BODYSTRUCTURE until sync reads it again.
+    const fixture = makeTextMessage({
+      uid: 1273,
+      subject: "HTML draft",
+      from: "a@example.test",
+      to: "b@example.test",
+      body: "<p>saved html</p>",
+      bodyStructure: { part: "1", type: "text/html", size: 17 }
+    });
+    const config = { BODY_RAW_MAX_BYTES: 25 * 1024 * 1024, BODY_STORAGE_MODE: "parsed_only" } as unknown as AppConfig;
+    const folders = () => [{ path: "INBOX.Notes", delimiter: ".", uidValidity: 1, messages: [fixture] }];
+    const client = new FixtureImapClient(folders());
+    const fetchOne = vi.spyOn(client, "fetchOne");
+
+    const body = await fetchFullMessageBody(client, config, notesMessage);
+    expect(fetchOne).toHaveBeenCalledWith("1273", { bodyStructure: true }, { uid: true });
+    expect(body).toMatchObject({ selectedTextPart: "1", selectedTextFormat: "html", mimeStructure: fixture.bodyStructure });
+
+    const batchClient = new FixtureImapClient(folders());
+    const fetch = vi.spyOn(batchClient, "fetch");
+    const batch = await fetchFullMessageBodyBatch(batchClient, config, [{ ...notesMessage, size_bytes: fixture.raw.length }]);
+    expect(fetch.mock.calls[0][1]).toMatchObject({ bodyStructure: true });
+    expect(batch.bodies[0].body).toMatchObject({ selectedTextPart: "1", selectedTextFormat: "html" });
   });
 });
 

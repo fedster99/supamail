@@ -305,10 +305,14 @@ describe("createDraft", () => {
     expect(mocks.getFoldersForWake).toHaveBeenCalledWith("acc-1", ["Drafts"]);
     expect(mocks.upsertMessages).toHaveBeenCalledTimes(1);
     expect(mocks.upsertMessages.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
-    const [accountId, folder, uidValidity, [metadata], windowCutoff] = mocks.upsertMessages.mock.calls[0];
+    const [accountId, folder, uidValidity, [metadata], windowCutoff, writeOptions] = mocks.upsertMessages.mock.calls[0];
     const [, raw, , savedAt] = mocks.append.mock.calls[0];
     expect([accountId, folder, uidValidity]).toEqual(["acc-1", draftsFolder, 100]);
     expect(windowCutoff).toBeInstanceOf(Date);
+    // A short deadline: the provider already holds the draft.
+    expect(writeOptions.deadlineAt - Date.now()).toBeLessThanOrEqual(5_000);
+    // The lock fences the write, as sync's lock does.
+    expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), { fenceWrites: true });
     expect(metadata).toMatchObject({
       uid: 7,
       internalDate: savedAt,
