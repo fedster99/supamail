@@ -1,6 +1,6 @@
 import type { PgPool } from "../db.js";
 import type { WindowStatus } from "../types.js";
-import { compileSearch } from "./compile.js";
+import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
@@ -52,7 +52,7 @@ function intersectAccounts(a: string[] | null, b: string[] | null): string[] | n
   return a.filter((id) => set.has(id));
 }
 
-function mapRow(row: ResultRow, explain: boolean): SearchResult {
+function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult {
   const score = Number(row.score ?? 0);
   return {
     identity: {
@@ -70,8 +70,8 @@ function mapRow(row: ResultRow, explain: boolean): SearchResult {
     window_status: row.window_status,
     body_fetched_at: row.body_fetched_at ? row.body_fetched_at.toISOString() : null,
     snippet: row.snippet ?? null,
-    score,
-    score_breakdown: explain
+    score: ranked ? score : null,
+    score_breakdown: explain && ranked
       ? {
           text_relevance: Number(row.text_rel ?? 0),
           recency: Number(row.recency ?? 0),
@@ -181,7 +181,8 @@ export async function searchMessages(
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const results = pageRows.map((row) => mapRow(row, request.explain ?? false));
+    const ranked = sortRanks(sort, parsed.text);
+    const results = pageRows.map((row) => mapRow(row, request.explain ?? false, ranked));
 
     return {
       results,

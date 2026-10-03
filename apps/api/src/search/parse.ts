@@ -69,9 +69,9 @@ function stripQuotes(value: string): string {
 }
 
 
-/** A date filter value is acceptable iff it is a relative spec (`7d`) or an
- * absolute `YYYY-MM-DD[...]` date. Anything else (e.g. `garbage`) is rejected
- * here so it never reaches `$n::timestamptz`, where Postgres would 500. */
+/** A date filter value is acceptable iff it is a relative spec (`7d`, at most about
+ * 100 years) or a real absolute date-time whose instant Postgres accepts. Anything
+ * else is ignored with a warning, so `resolveDate` and every engine get valid input. */
 function isValidDate(value: string): boolean {
   return isRelativeDate(value) || isValidAbsoluteDate(value);
 }

@@ -7,6 +7,7 @@ import {
   isValidAbsoluteDate,
   parseQuery,
   parseTextTerms,
+  resolveDate,
   resolveRelativeDate,
   tokenize
 } from "../search/index.js";
@@ -463,6 +464,27 @@ describe("shared search rules", () => {
     expect(resolveRelativeDate("2w", now).toISOString()).toBe("2026-03-17T12:00:00.000Z");
     expect(resolveRelativeDate("12h", now).toISOString()).toBe("2026-03-31T00:00:00.000Z");
     expect(resolveRelativeDate("1y", new Date("2024-02-29T00:00:00Z")).toISOString()).toBe("2023-02-28T00:00:00.000Z");
+  });
+
+  it("resolves every valid date value to one instant, UTC when no zone is given", () => {
+    const now = new Date("2026-03-31T12:00:00Z");
+    const at = (value: string) => resolveDate(value, now).toISOString();
+    expect(at("2026-01-31")).toBe("2026-01-31T00:00:00.000Z");
+    expect(at("2026-01-31 09:30:00 UTC")).toBe("2026-01-31T09:30:00.000Z");
+    expect(at("2026-01-31T09:30+0200")).toBe("2026-01-31T07:30:00.000Z");
+    expect(at("2026-01-31T09:30-07:00")).toBe("2026-01-31T16:30:00.000Z");
+    expect(at("2026-01-31T09:30:15.5Z")).toBe("2026-01-31T09:30:15.500Z");
+    expect(at("2026-01-31T24:00:00")).toBe("2026-02-01T00:00:00.000Z");
+    expect(at("0099-01-01")).toBe("0099-01-01T00:00:00.000Z");
+    expect(at("1m")).toBe("2026-02-28T12:00:00.000Z");
+    expect(() => resolveDate("2026-13-01", now)).toThrow(RangeError);
+    // Instants outside years 1-9999, which Postgres rejects, are not valid dates.
+    for (const outside of ["9999-12-31T24:00", "9999-12-31T23:00-15:00", "0001-01-01T00:00+01:00"]) {
+      expect(isValidAbsoluteDate(outside), outside).toBe(false);
+    }
+    // Postgres binds the same instant.
+    const compiled = compileSearch(noText, parseQuery("before:2026-01-31T09:30+0200").filters, baseCompileOptions);
+    expect(compiled.values).toContain("2026-01-31T07:30:00.000Z");
   });
 
   it("matches filenames as substrings unless the value is a pattern, also with _ and %", () => {

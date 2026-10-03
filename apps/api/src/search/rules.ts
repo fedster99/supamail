@@ -18,18 +18,35 @@ export function isRelativeDate(value: string): boolean {
   return match !== null && Number(match[1]) <= RELATIVE_DATE_MAX[match[2]]!;
 }
 
-/** True for a real calendar date or date-time: `2026-01-31`, `2026-01-31T09:30Z`. */
-export function isValidAbsoluteDate(value: string): boolean {
+/**
+ * The instant an absolute date or date-time names, or null when it is not a real one.
+ * A value without a zone is UTC. Fractions are kept to the millisecond (IMAP dates
+ * have whole seconds). The instant must fall in years 1-9999, which Postgres accepts.
+ */
+export function parseAbsoluteDate(value: string): Date | null {
   const match = ABSOLUTE_DATE.exec(value);
-  if (!match) return false;
+  if (!match) return null;
   const [year, month, day, hour, minute, second] = match.slice(1, 7).map((part) => Number(part ?? 0));
   const end = new Date(0);
   end.setUTCFullYear(year, month, 0); // the last day of `month`, without the 0-99 → 19xx mapping
-  // 24:00 is the end of the day, with no seconds' fraction.
-  const midnight = hour === 24 && minute === 0 && second === 0 && match[7] === undefined;
+  const midnight = hour === 24 && minute === 0 && second === 0 && match[7] === undefined; // end of day
   const offsetOk = match[8] === undefined || (Number(match[9]) <= 15 && Number(match[10] ?? 0) < 60);
-  return year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= end.getUTCDate() &&
-    (hour < 24 || midnight) && minute < 60 && second < 60 && offsetOk;
+  if (!(month >= 1 && month <= 12 && day >= 1 && day <= end.getUTCDate() &&
+    (hour < 24 || midnight) && minute < 60 && second < 60 && offsetOk)) return null;
+  const millis = Math.floor(Number(`0${match[7] ?? ""}`) * 1000);
+  const offsetMinutes = match[8] === undefined ? 0
+    : (match[8] === "-" ? -1 : 1) * (Number(match[9]) * 60 + Number(match[10] ?? 0));
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, millis);
+  date.setTime(date.getTime() - offsetMinutes * 60_000);
+  const resolvedYear = date.getUTCFullYear();
+  return resolvedYear >= 1 && resolvedYear <= 9999 ? date : null;
+}
+
+/** True for a real calendar date or date-time: `2026-01-31`, `2026-01-31T09:30Z`. */
+export function isValidAbsoluteDate(value: string): boolean {
+  return parseAbsoluteDate(value) !== null;
 }
 
 /**
@@ -50,6 +67,18 @@ export function resolveRelativeDate(value: string, now: Date): Date {
   } else {
     date.setTime(date.getTime() - amount * { h: 3_600_000, d: 86_400_000, w: 604_800_000 }[match[2]]!);
   }
+  return date;
+}
+
+/**
+ * The instant a valid date filter value names: a relative spec counted back from
+ * `now`, or an absolute date-time (UTC when it has no zone). Every engine binds this
+ * instant, so all engines read a date filter the same way.
+ */
+export function resolveDate(value: string, now: Date): Date {
+  if (isRelativeDate(value)) return resolveRelativeDate(value, now);
+  const date = parseAbsoluteDate(value);
+  if (!date) throw new RangeError(`not a valid date: ${value}`);
   return date;
 }
 
