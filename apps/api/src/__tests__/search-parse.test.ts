@@ -441,12 +441,14 @@ describe("shared search rules", () => {
     for (const ok of ["2026-01-31", "2024-02-29", "2026-01-31T09:30", "2026-01-31T09:30:15.5Z", "2026-01-31 09:30+02:00"]) {
       expect(isValidAbsoluteDate(ok), ok).toBe(true);
     }
-    for (const ok of ["2026-01-31T09", "2026-01-31 09:30:00 UTC", "2026-01-31T24:00:00", "2026-01-31T09:30-0700"]) {
+    for (const ok of ["2026-01-31 09:30:00 UTC", "2026-01-31T24:00:00", "2026-01-31T09:30-0700"]) {
       expect(isValidAbsoluteDate(ok), ok).toBe(true);
     }
     for (const bad of [
       "2026-13-01", "2026-02-30", "2025-02-29", "2026-01-01Tjunk", "2026-01-31T24:30", "2026-1-1",
-      "0000-01-01", "2026-01-01T00:00+99", "2026-01-01 00:00+05:99"
+      "0000-01-01", "2026-01-01T00:00+99", "2026-01-01 00:00+05:99",
+      // Postgres rejects an hour without minutes and 24:00 with a fraction.
+      "2026-01-31T09", "2026-01-31 09", "2026-01-31T09Z", "2026-01-31T24:00:00.5"
     ]) {
       expect(isValidAbsoluteDate(bad), bad).toBe(false);
     }

@@ -7,10 +7,10 @@
 // as invalid rather than overflowing a timestamp.
 const RELATIVE_DATE_MAX: Readonly<Record<string, number>> = { h: 876_000, d: 36_500, w: 5_200, m: 1_200, y: 100 };
 const RELATIVE_DATE = /^(\d{1,6})([hdwmy])$/;
-// Date, optional time (hours, then optional minutes, seconds and fraction), and an
-// optional zone: Z, UTC, or an offset of at most ±15:59 as Postgres accepts.
+// Date, optional time (hours and minutes, then optional seconds and fraction), and an
+// optional zone: Z, UTC, or an offset of at most ±15:59, as Postgres accepts.
 const ABSOLUTE_DATE =
-  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2})(?::(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?)?(?:Z| ?UTC|([+-])(\d{2})(?::?(\d{2}))?)?)?$/;
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(?:Z| ?UTC|([+-])(\d{2})(?::?(\d{2}))?)?)?$/;
 
 /** True for a relative date spec such as `7d`, at most about 100 years back. */
 export function isRelativeDate(value: string): boolean {
@@ -25,8 +25,9 @@ export function isValidAbsoluteDate(value: string): boolean {
   const [year, month, day, hour, minute, second] = match.slice(1, 7).map((part) => Number(part ?? 0));
   const end = new Date(0);
   end.setUTCFullYear(year, month, 0); // the last day of `month`, without the 0-99 → 19xx mapping
-  const midnight = hour === 24 && minute === 0 && second === 0;
-  const offsetOk = match[7] === undefined || (Number(match[8]) <= 15 && Number(match[9] ?? 0) < 60);
+  // 24:00 is the end of the day, with no seconds' fraction.
+  const midnight = hour === 24 && minute === 0 && second === 0 && match[7] === undefined;
+  const offsetOk = match[8] === undefined || (Number(match[9]) <= 15 && Number(match[10] ?? 0) < 60);
   return year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= end.getUTCDate() &&
     (hour < 24 || midnight) && minute < 60 && second < 60 && offsetOk;
 }
