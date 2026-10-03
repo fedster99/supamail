@@ -106,8 +106,20 @@ export function filetypeMatch(value: string): FiletypeMatch {
 
 /**
  * The glob a `filename:` value matches, case-insensitively. A value with `*` or `?`
- * is the user's own pattern; any other value matches as a substring.
+ * is the user's own pattern; any other value matches as a substring. Only `*` and
+ * `?` are wildcards; an engine escapes every other character in its own syntax.
  */
 export function filenameGlob(value: string): string {
   return /[*?]/.test(value) ? value : `*${value}*`;
+}
+
+/** What a `folder:` value matches: the exact path, or with a trailing `/*`, the
+ * folders below `path`. The path is literal text. */
+export interface FolderMatch {
+  kind: "exact" | "subtree";
+  path: string;
+}
+
+export function folderMatch(value: string): FolderMatch {
+  return value.endsWith("/*") ? { kind: "subtree", path: value.slice(0, -2) } : { kind: "exact", path: value };
 }

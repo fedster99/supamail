@@ -130,7 +130,7 @@ export const searchEmailToolDefinition = {
           folder: { type: "string", description: "Folder path exact; a trailing /* matches the subtree." },
           thread: { type: "string", description: "provider_thread_id exact match." },
           msgid: { type: "string", description: "Normalized RFC Message-ID exact match." },
-          filename: { type: "string", description: "Attachment filename glob (e.g. *.pdf)." },
+          filename: { type: "string", description: "Attachment filename; * and ? are wildcards (e.g. *.pdf). Without them, matches part of the name." },
           filetype: { type: "string", description: "Attachment class: pdf,image,video,audio,doc,sheet,zip,text." },
           mime: { type: "string", description: "Attachment MIME type exact match." },
           isUnread: { type: "boolean" },

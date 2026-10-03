@@ -4,6 +4,7 @@ import {
   filenameGlob,
   filetypeMatch,
   filtersFromStructured,
+  folderMatch,
   isValidAbsoluteDate,
   parseQuery,
   parseTextTerms,
@@ -493,6 +494,16 @@ describe("shared search rules", () => {
     const compiled = compileSearch(noText, parseQuery("filename:invoice_2024 filename:*.pdf").filters, baseCompileOptions);
     expect(compiled.values).toContain("%invoice\\_2024%");
     expect(compiled.values).toContain("%.pdf");
+  });
+
+  it("reads a folder as an exact literal path, with a trailing /* for the folders below it", () => {
+    expect(folderMatch("[Gmail]/Sent Mail")).toEqual({ kind: "exact", path: "[Gmail]/Sent Mail" });
+    expect(folderMatch("Archive/*")).toEqual({ kind: "subtree", path: "Archive" });
+    // Only a trailing /* is a subtree; an inner * is part of the path.
+    expect(folderMatch("Projects/*/Notes")).toEqual({ kind: "exact", path: "Projects/*/Notes" });
+    const values = (query: string): unknown[] => compileSearch(noText, parseQuery(query).filters, baseCompileOptions).values;
+    expect(values('in:"[Gmail]/Sent Mail"')).toContain("[gmail]/sent mail");
+    expect(values("in:My_Folder/*")).toContain("my\\_folder/%");
   });
 
   it("maps filetype values to one shared MIME table", () => {

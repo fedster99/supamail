@@ -123,8 +123,9 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
 - **Shared filter rules.** `search/rules.ts` holds the rules every engine needs
   beyond parsing: strict calendar-date validation, relative dates (`h`/`d`/`w`/
   `m`/`y`, at most about 100 years back, months clamped to the month's end), the
-  `filetype:` MIME table, and the `filename:` glob (a value without `*` or `?`
-  matches as a substring). `resolveDate` turns every valid date value, relative
+  `filetype:` MIME table, the `filename:` glob (a value without `*` or `?`
+  matches as a substring), and the `folder:` subtree (a trailing `/*`).
+  `resolveDate` turns every valid date value, relative
   or absolute (UTC when it has no zone), into one instant; Postgres binds that
   instant as a timestamp, so every engine reads a date filter the same way. A
   date without a zone is UTC on every database. Other engines translate the same exports instead of keeping copies.
