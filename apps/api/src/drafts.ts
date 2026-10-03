@@ -159,6 +159,7 @@ function buildDraftMessageId(domain: string, idempotencyKey: string): string {
 async function appendDraft(
   pool: PgPool,
   config: AppConfig,
+  repository: MirrorRepository,
   account: ImapAccount,
   req: SendRequest,
   idempotencyKey?: string | null,
@@ -198,6 +199,9 @@ async function appendDraft(
         }
       }
 
+      // Drafts is durably due before the provider command, as for a move, so a host
+      // can reconcile it after acknowledgement without a prompt IDLE/NOTIFY event.
+      await repository.markFoldersForReconcile(account.id, [draftsFolderPath]);
       // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
       const appended = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
       return { draftsFolderPath, rfcMessageId: messageId, appendedUid: appended.uid };
@@ -234,6 +238,7 @@ export async function createDraft(
   const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
     pool,
     config,
+    repository,
     account,
     input,
     input.idempotencyKey,
@@ -440,7 +445,7 @@ export async function updateDraft(
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const existing = await repository.getMessage(messageId);
   if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
-  if (existing.deleted_in_provider) throw new Error(`Draft ${messageId} is already deleted in the provider`);
+  if (existing.deleted_in_provider) throw new NotFoundError(`Draft ${messageId} is already deleted in the provider`);
   const account = await repository.getAccount(existing.account_id);
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${existing.account_id}`);
 
@@ -448,6 +453,7 @@ export async function updateDraft(
   const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
     pool,
     config,
+    repository,
     account,
     req,
     undefined,

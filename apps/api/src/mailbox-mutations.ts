@@ -493,7 +493,9 @@ export async function deleteMessage(
 
   const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
   try {
+    // The changed folders are durably due before the provider command, as for a move.
     if (options.hard) {
+      await repository.markFoldersForReconcile(account.id, [target.folderPath]);
       await mutator.expunge(target);
       return { messageId, fromFolder: target.folderPath, mode: "expunge", trashFolder: null };
     }
@@ -506,6 +508,7 @@ export async function deleteMessage(
     if (trashFolder === target.folderPath) {
       return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
     }
+    await repository.markFoldersForReconcile(account.id, [target.folderPath, trashFolder]);
     await mutator.move(target, trashFolder);
     return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
   } finally {
