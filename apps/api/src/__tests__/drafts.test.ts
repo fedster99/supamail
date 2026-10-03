@@ -3,11 +3,14 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // Mirror ids are UUIDs; any other value names no row.
 const D1 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const M1 = "11111111-1111-4111-8111-111111111111";
+/** The mirror id of a draft this save wrote. */
+const N1 = "22222222-2222-4222-8222-222222222222";
 
 /**
  * Unit coverage for the draft CRUD primitives (email-003, ADR 0019). This task is
  * mostly COMPOSITION, so the tests assert the composition wiring:
- *   - create  → buildRawMime + APPEND `\Draft` to the resolved Drafts folder
+ *   - create  → buildRawMime + APPEND `\Draft` to the resolved Drafts folder, then
+ *               the draft's mirror row from its APPENDUID (ADR 0033)
  *   - update  → APPEND-new + delete-old (the email-002 hard delete)
  *   - send    → RESEND the draft's raw bytes (getRawMime → deliverSmtp → APPEND to
  *               Sent), THEN delete the draft. NOT a rebuild from the mirror body.
@@ -24,10 +27,10 @@ const M1 = "11111111-1111-4111-8111-111111111111";
 // --- Mocked appender, send primitive, delete mutation, and repository. ---
 
 const mocks = vi.hoisted(() => ({
-  append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({
-    uid: 7 as number | null,
-    uidValidity: 100 as number | null
-  })),
+  append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date): Promise<{
+    uid: number;
+    uidValidity: number;
+  } | null> => ({ uid: 7, uidValidity: 100 })),
   list: vi.fn(async () => [{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]),
   logout: vi.fn(async () => undefined),
   close: vi.fn(),
@@ -64,6 +67,9 @@ const mocks = vi.hoisted(() => ({
   getAccount: vi.fn(),
   getMessage: vi.fn(),
   markFoldersForReconcile: vi.fn(async () => undefined),
+  getFoldersForWake: vi.fn(),
+  upsertMessages: vi.fn(),
+  getLiveMessageId: vi.fn(),
   withAccountLock: vi.fn(),
   lockAssertLive: vi.fn(),
   lockConfirmIrreversible: vi.fn(),
@@ -102,6 +108,9 @@ vi.mock("../repository.js", () => ({
     getAccount = mocks.getAccount;
     getMessage = mocks.getMessage;
     markFoldersForReconcile = mocks.markFoldersForReconcile;
+    getFoldersForWake = mocks.getFoldersForWake;
+    upsertMessages = mocks.upsertMessages;
+    getLiveMessageId = mocks.getLiveMessageId;
   }
 }));
 
@@ -109,6 +118,8 @@ const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOS
 /** A pool whose only query is the Drafts folder lookup used by draft actions. */
 const draftPool = { query: vi.fn(async () => ({ rows: [{ path: "Drafts" }] })) } as never;
 const draftRow = { id: D1, account_id: "acc-1", folder_path: "Drafts", flags: [], deleted_in_provider: false };
+/** The tracked, mirrored Drafts folder at the APPENDUID's UIDVALIDITY. */
+const draftsFolder = { id: "folder-drafts", account_id: "acc-1", path: "Drafts", uidvalidity: "100" };
 
 const account = {
   id: "acc-1",
@@ -139,6 +150,9 @@ beforeEach(() => {
   mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
   mocks.searchByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
   mocks.append.mockResolvedValue({ uid: 7, uidValidity: 100 });
+  mocks.getFoldersForWake.mockResolvedValue([draftsFolder]);
+  mocks.upsertMessages.mockResolvedValue([{ id: N1 }]);
+  mocks.getLiveMessageId.mockResolvedValue(null);
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
   mocks.getAccount.mockResolvedValue(account);
   mocks.getRawMime.mockResolvedValue({
@@ -194,8 +208,20 @@ describe("createDraft", () => {
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
     expect(result.appendedUidValidity).toBe(100);
-    // Nothing new reached the provider, so nothing new is marked.
+    // Nothing new reached the provider, so nothing new is marked or written.
     expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
+    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(mocks.getLiveMessageId).toHaveBeenCalledWith({ accountId: "acc-1", folderPath: "Drafts", uidValidity: 100, uid: 42 });
+  });
+
+  it("returns the mirror id of the draft an earlier attempt saved", async () => {
+    mocks.searchByMessageId.mockResolvedValueOnce({ uids: [42], uidValidity: 100 });
+    mocks.getLiveMessageId.mockResolvedValueOnce(N1);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }, idempotencyKey: "req-key-1"
+    });
+    expect(result).toMatchObject({ messageId: N1, warnings: [] });
   });
 
   it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
@@ -255,11 +281,93 @@ describe("createDraft", () => {
     expect(Buffer.isBuffer(raw)).toBe(true);
     expect(flags).toContain("\\Draft");
     expect(mocks.logout).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ accountId: "acc-1", draftsFolderPath: "Drafts", appendedUid: 7, appendedUidValidity: 100 });
+    expect(result).toMatchObject({
+      accountId: "acc-1", draftsFolderPath: "Drafts", messageId: N1, appendedUid: 7, appendedUidValidity: 100, warnings: []
+    });
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     // Create does NOT send or delete — it only files the draft.
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("writes the saved draft's mirror row from its APPENDUID and the composed values", async () => {
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1",
+      senderName: " Ada ",
+      to: [{ email: "rcpt@example.test", name: "Rcpt" }],
+      cc: [{ email: "cc@example.test" }],
+      subject: "My draft",
+      body: { format: "plain", text: "Hello" },
+      inReplyTo: "<parent@example.test>"
+    });
+
+    expect(mocks.getFoldersForWake).toHaveBeenCalledWith("acc-1", ["Drafts"]);
+    expect(mocks.upsertMessages).toHaveBeenCalledTimes(1);
+    expect(mocks.upsertMessages.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
+    const [accountId, folder, uidValidity, [metadata], windowCutoff] = mocks.upsertMessages.mock.calls[0];
+    const [, raw, , savedAt] = mocks.append.mock.calls[0];
+    expect([accountId, folder, uidValidity]).toEqual(["acc-1", draftsFolder, 100]);
+    expect(windowCutoff).toBeInstanceOf(Date);
+    expect(metadata).toMatchObject({
+      uid: 7,
+      internalDate: savedAt,
+      sizeBytes: (raw as Buffer).length,
+      flags: ["\\Draft", "\\Seen"],
+      rfcMessageId: result.rfcMessageId,
+      inReplyTo: "<parent@example.test>",
+      subject: "My draft",
+      fromEmail: "user@example.test",
+      fromName: "Ada",
+      toEmails: ["rcpt@example.test"],
+      toNames: ["Rcpt"],
+      ccEmails: ["cc@example.test"],
+      ccNames: [null],
+      bccEmails: [],
+      providerMessageId: null,
+      mimeStructure: null,
+      attachments: []
+    });
+    // headers_json keeps the same header subset sync stores.
+    expect(Object.keys(metadata.headersJson).sort()).toEqual(["in-reply-to", "message-id"]);
+    expect(result).toMatchObject({ messageId: N1, warnings: [] });
+  });
+
+  it("leaves the id to sync when the server returns no APPENDUID", async () => {
+    mocks.append.mockResolvedValueOnce(null);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ messageId: null, appendedUid: null, warnings: [] });
+  });
+
+  it.each([
+    ["Drafts is not a tracked mirrored folder", []],
+    ["the mirrored Drafts folder has another UIDVALIDITY", [{ ...draftsFolder, uidvalidity: "99" }]],
+    ["sync has not read Drafts yet", [{ ...draftsFolder, uidvalidity: null }]]
+  ])("leaves the id to sync when %s", async (_case, folders) => {
+    mocks.getFoldersForWake.mockResolvedValueOnce(folders);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ messageId: null, appendedUid: 7, warnings: [] });
+  });
+
+  it("reports a saved draft when its mirror write fails", async () => {
+    mocks.upsertMessages.mockRejectedValueOnce(new Error("database unavailable"));
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+    expect(result.messageId).toBeNull();
+    expect(result.warnings).toEqual([
+      "Saved, but the draft id is available only after the next sync: database unavailable."
+    ]);
   });
 
   it("throws for an unknown account before connecting", async () => {
@@ -334,7 +442,9 @@ describe("updateDraft", () => {
       D1,
       expect.objectContaining({ hard: true })
     );
-    expect(result).toMatchObject({ replacedMessageId: D1, draftsFolderPath: "Drafts" });
+    expect(result).toMatchObject({
+      replacedMessageId: D1, replacedDraftDeleted: true, draftsFolderPath: "Drafts", messageId: N1, warnings: []
+    });
   });
 
   it("refuses an ordinary email, so a draft update can never rewrite or remove it", async () => {

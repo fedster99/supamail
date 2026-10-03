@@ -3822,9 +3822,9 @@ export class MirrorRepository {
   }
 
   /**
-   * The mirror id of the live row at one physical identity, or null when sync has
-   * not mirrored it yet or the provider already deleted it. A host uses it after an
-   * APPENDUID and a reconcile of that folder to return the new message's id.
+   * The mirror id of the live row at one physical identity, or null when it is not
+   * mirrored yet or the provider already deleted it. A retried draft save uses it
+   * to return the id of the copy an earlier attempt filed.
    */
   async getLiveMessageId({ accountId, folderPath, uidValidity, uid }: {
     accountId: string;

@@ -622,6 +622,21 @@ export function parseMessageMetadata(
   };
 }
 
+/** The header fields a mirror row keeps in `headers_json`. */
+export const METADATA_HEADER_FIELDS = [
+  "message-id",
+  "references",
+  "in-reply-to",
+  "auto-submitted",
+  "x-auto-response-suppress",
+  "list-unsubscribe",
+  "list-id",
+  "precedence",
+  "reply-to",
+  "thread-index",
+  "thread-topic"
+] as const;
+
 export async function fetchMessageMetadata(
   client: MirrorImapClient,
   uids: number[],
@@ -647,19 +662,7 @@ export async function fetchMessageMetadata(
       envelope: true,
       bodyStructure: true,
       threadId: true,
-      headers: [
-        "message-id",
-        "references",
-        "in-reply-to",
-        "auto-submitted",
-        "x-auto-response-suppress",
-        "list-unsubscribe",
-        "list-id",
-        "precedence",
-        "reply-to",
-        "thread-index",
-        "thread-topic"
-      ]
+      headers: [...METADATA_HEADER_FIELDS]
     }, { uid: true })) {
       // Ignore unsolicited UID-less, out-of-range, and flags-only FETCH responses.
       // A requested UID is complete only when the fundamental requested fields are

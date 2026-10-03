@@ -8,7 +8,7 @@ import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { openInboxIdleSession } from "../src/inbox-idle.js";
 import { MirrorRepository } from "../src/repository.js";
 import { sendMessage } from "../src/send.js";
-import { createDraft, listDrafts, sendDraft } from "../src/drafts.js";
+import { createDraft, getDraft, listDrafts, sendDraft, updateDraft } from "../src/drafts.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 
 const execFileAsync = promisify(execFile);
@@ -534,14 +534,13 @@ async function main(): Promise<void> {
       );
     }
 
-    // Draft path (email-003): create a draft (APPEND \Draft to Drafts), resync so
-    // it is mirrored, assert it appears via listDrafts, then send it. sendDraft now
-    // RESENDS the draft's raw bytes, so the BODY survives delivery (the empty-body
-    // regression fix). We assert: it left Drafts, AND the DELIVERED message at the
-    // recipient carries the distinctive body — the real end-to-end body proof.
+    // Draft path (email-003, ADR 0033): save a draft and update it at once by its
+    // saved id, before any sync. Then sync must read the revised draft again and
+    // keep its id, and sendDraft RESENDS its raw bytes, so the BODY survives
+    // delivery (the empty-body regression fix). We assert: the delivered message
+    // carries the distinctive body — the real end-to-end body proof.
     await ensureFolder("Drafts");
-    // Track Drafts before the save, so the forced reconcile below is the only pass
-    // that can mirror the new draft.
+    // Track Drafts before the save, so the save can write the draft's mirror row.
     await pool.query(
       "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
       [account.id]
@@ -551,32 +550,21 @@ async function main(): Promise<void> {
     // A distinctive body that MUST survive the round-trip (the bug sent it empty).
     const draftBody = `Distinctive draft body ${Date.now()} that MUST survive sendDraft.`;
     const draftSubject = `GreenMail draft smoke ${Date.now()}`;
-    const createResult = await createDraft(pool, config, {
+    const firstSave = await createDraft(pool, config, {
       accountId: account.id,
       to: [{ email: mailbox }],
-      subject: draftSubject,
-      body: { format: "plain", text: draftBody },
-      messageId: draftMessageId
+      subject: `${draftSubject} (first save)`,
+      body: { format: "plain", text: "first save" }
     });
-
-    // The host contract after a provider-acknowledged save: a forced live-lane
-    // reconcile of the changed folder mirrors the draft, and the APPENDUID identity
-    // resolves to that row.
-    const appendedIdentity = createResult.appendedUid !== null && createResult.appendedUidValidity !== null
-      ? { uid: createResult.appendedUid, uidValidity: createResult.appendedUidValidity }
-      : null;
-    let forcedReconcileDraftId: string | null = null;
-    if (appendedIdentity) {
-      await engine.syncAccount(account.id, "scheduled", {
-        liveInboxOnly: true,
-        forceReconcileFolders: [createResult.draftsFolderPath]
+    const revised = firstSave.messageId === null
+      ? null
+      : await updateDraft(pool, config, firstSave.messageId, {
+        to: [{ email: mailbox }],
+        subject: draftSubject,
+        body: { format: "plain", text: draftBody },
+        messageId: draftMessageId
       });
-      forcedReconcileDraftId = await repository.getLiveMessageId({
-        accountId: account.id,
-        folderPath: createResult.draftsFolderPath,
-        ...appendedIdentity
-      });
-    }
+    const savedDraft = revised?.messageId ? await getDraft(pool, config, revised.messageId) : null;
 
     await pool.query(
       "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
@@ -585,6 +573,12 @@ async function main(): Promise<void> {
     const draftResync = await engine.syncAccount(account.id, "manual");
     const draftsAfterCreate = await listDrafts(pool, config, account.id, {});
     const mirroredDraft = draftsAfterCreate.find((d) => d.rfcMessageId === draftMessageId);
+    const resyncedDraft = mirroredDraft
+      ? await pool.query<{ mime_structure: unknown }>(
+        "SELECT mime_structure FROM public.imap_messages WHERE id = $1",
+        [mirroredDraft.messageId]
+      )
+      : null;
 
     let sentDraftCopies = 0;
     let draftGoneFromDrafts = false;
@@ -627,7 +621,7 @@ async function main(): Promise<void> {
         [account.id, draftMessageId]
       );
       draftGoneFromDrafts = originalDraft.rows.some(
-        (row) => row.folder_path === createResult.draftsFolderPath && row.deleted_in_provider === true
+        (row) => row.folder_path === mirroredDraft.folderPath && row.deleted_in_provider === true
       );
       // The SENT copy, matched by the resent bytes' Message-ID.
       const sentCopyRows = await pool.query<{ folder_path: string; deleted_in_provider: boolean }>(
@@ -642,12 +636,12 @@ async function main(): Promise<void> {
     }
 
     const draftAssertions: Array<[string, boolean]> = [
-      ["draft create appended a UID or folder", typeof createResult.appendedUid === "number" || createResult.draftsFolderPath.length > 0],
+      ["draft save returned its mirror id", firstSave.messageId !== null],
+      ["draft update by the saved id returned the revised draft's id", Boolean(revised?.messageId)],
+      ["revised draft readable at once by its id", savedDraft?.subject === draftSubject],
       ["draft resync succeeded", draftResync.outcome === "success"],
-      ["draft mirrored in Drafts", Boolean(mirroredDraft)],
-      ["draft save returned its APPENDUID identity", appendedIdentity !== null],
-      ["forced Drafts reconcile resolves the APPENDUID to the mirrored draft",
-        forcedReconcileDraftId !== null && forcedReconcileDraftId === mirroredDraft?.messageId],
+      ["sync kept the saved draft id", Boolean(mirroredDraft) && mirroredDraft?.messageId === revised?.messageId],
+      ["sync replaced the saved values with the server view", resyncedDraft?.rows[0]?.mime_structure != null],
       // The load-bearing draft-send assertion: the SMTP DELIVERY happened. sendDraft
       // resends the raw draft bytes whose Sent-APPEND→mirror round-trip is already
       // proven GREEN by the send-path (reply) assertions above, so we do NOT re-assert
@@ -665,7 +659,8 @@ async function main(): Promise<void> {
     if (draftFailed.length > 0) {
       throw new Error(
         `GreenMail draft smoke failed: ${draftFailed.map(([name]) => name).join(", ")}` +
-          ` | createResult=${JSON.stringify(createResult)} | mirroredDraft=${JSON.stringify(mirroredDraft)}` +
+          ` | firstSave=${JSON.stringify(firstSave)} | revised=${JSON.stringify(revised)}` +
+          ` | mirroredDraft=${JSON.stringify(mirroredDraft)}` +
           ` | deliveredBody=${JSON.stringify(deliveredBody)} | expectedBody=${JSON.stringify(draftBody)}`
       );
     }
@@ -688,7 +683,7 @@ async function main(): Promise<void> {
         mirroredSentCopies: sentCopy.rows.length
       },
       draft: {
-        createResult,
+        revised,
         mirroredDraft: mirroredDraft ?? null,
         draftDelivered,
         draftBodySurvived: deliveredBodyMatches,
