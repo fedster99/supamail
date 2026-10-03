@@ -2,7 +2,7 @@ import type { PgPool } from "../db.js";
 import type { WindowStatus } from "../types.js";
 import { compileSearch } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
-import { filtersFromStructured, parseQuery, parseTextTerms } from "./parse.js";
+import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
 import {
@@ -105,9 +105,7 @@ export async function searchMessages(
 ): Promise<SearchResponse> {
   const startedAt = Date.now();
 
-  const parsed = request.q
-    ? parseQuery(request.q)
-    : { freeText: "", accounts: [], filters: [], sort: null as SearchSort | null, limit: null as number | null, warnings: [] };
+  const parsed = parseQuery(request.q ?? "");
   const warnings = [...parsed.warnings];
   // Structured-filter parsing pushes its own warnings (e.g. an ignored bad date)
   // into the same sink, so the structured surface behaves like the q-operator one.
@@ -118,13 +116,13 @@ export async function searchMessages(
   const limit = clamp(parsed.limit ?? request.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT);
   const offset = Math.max(0, request.offset ?? 0);
   const freeText = parsed.freeText;
-  const hasText = freeText.trim() !== "";
+  const hasText = parsed.text.hasText;
   // Recall branches: fuzzy matches the (possibly misspelled) significant tokens;
   // concept widens the tsquery with curated synonyms. Both no-op when empty.
   // `recall: false` (the A/B baseline) forces the lexical-only path.
   const recallEnabled = request.recall ?? true;
   // Recall widens only the included words; excluded words never feed typo or concept matches.
-  const includedText = parseTextTerms(freeText).groups.flat().map((term) => term.text).join(" ");
+  const includedText = parsed.text.groups.flat().map((term) => term.text).join(" ");
   const terms = recallEnabled && hasText ? significantTerms(includedText) : [];
   const synonyms = terms.length > 0 ? expandConcepts(terms) : [];
 
@@ -160,12 +158,11 @@ export async function searchMessages(
     let rows: ResultRow[] = [];
     // An empty (non-null) account set can never match — skip the query entirely.
     if (!(accountIds !== null && accountIds.length === 0)) {
-      const compiled = compileSearch(freeText, filters, {
+      const compiled = compileSearch(parsed.text, filters, {
         accountIds,
         windowStatus: request.windowStatus ?? null,
         includeDeleted: request.includeDeleted ?? false,
         sort,
-        hasText,
         limit,
         offset,
         snippet: request.snippet ?? true,
