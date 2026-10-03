@@ -200,32 +200,34 @@ async function saveDraft(
     : req;
   const { raw, messageId: rfcMessageId } = await buildRawMime(composeReq, { email: account.email_address });
 
-  const result = await withAccountLock(pool, account.lock_id, async () => {
+  const warnings: string[] = [];
+  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
     const savedAt = new Date();
     const filed = await fileDraft(pool, config, repository, account, raw, rfcMessageId, savedAt, idempotencyKey, signal);
+    // The provider holds the draft now. A later mirror or lock failure must not fail
+    // the save: a retry without an idempotency key would file a second draft.
+    lock.confirmIrreversible();
     const saved: SavedDraft = {
       draftsFolderPath: filed.draftsFolderPath,
       rfcMessageId,
       messageId: null,
       appendedUid: filed.appended?.uid ?? null,
       appendedUidValidity: filed.appended?.uidValidity ?? null,
-      warnings: []
+      warnings
     };
     if (!filed.appended) return saved;
-    // The provider holds the draft now, so a mirror failure must not fail the save:
-    // a retry without an idempotency key would file a second draft.
     try {
       saved.messageId = filed.retried
         ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...filed.appended })
         : await mirrorSavedDraft(repository, config, account.id, filed.draftsFolderPath, filed.appended.uidValidity,
           savedDraftMetadata(composeReq, account, { raw, rfcMessageId, uid: filed.appended.uid, savedAt }));
     } catch (error) {
-      saved.warnings.push(
+      warnings.push(
         `Saved, but the draft id is available only after the next sync: ${error instanceof Error ? error.message : String(error)}.`
       );
     }
     return saved;
-  }, { fenceWrites: true });
+  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
 
   if (result === null) {
     throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft shortly`);

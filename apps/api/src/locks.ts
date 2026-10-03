@@ -239,7 +239,7 @@ function asError(error: unknown, prefix: string): Error {
 }
 
 function postIrreversibleWarning(message: string): string {
-  return `Delivery was already confirmed; ${message}`;
+  return `The provider already accepted the change; ${message}`;
 }
 
 async function validateAccountUnlock(

@@ -952,10 +952,9 @@ export interface BodyBatchFetchResult {
 
 function isParsedOnlySourceTruncated(
   rawBytes: number,
-  message: ImapMessage,
+  expectedBytes: number,
   configuredCap: number
 ): boolean {
-  const expectedBytes = Number(message.size_bytes);
   if (
     Number.isSafeInteger(expectedBytes)
     && expectedBytes > 0
@@ -1066,7 +1065,7 @@ export async function fetchFullMessageBodyBatch(
       })());
       const rawTruncated = isParsedOnlySourceTruncated(
         parsed.rawBytes,
-        message,
+        Number(message.size_bytes),
         config.BODY_RAW_MAX_BYTES
       );
       const mimeStructure = message.mime_structure ?? fetched.bodyStructure ?? null;
@@ -1138,11 +1137,12 @@ export async function fetchFullMessageBody(
     let fetched: FetchMessage | false | null = null;
     // Parsed-only streams the source below and needs a FETCH only for a row with no
     // BODYSTRUCTURE, which a draft save writes until sync reads it again (ADR 0033).
+    // That row's size is the composed size, so take the server's size too.
     if (!streamParsedOnly || message.mime_structure == null) {
       fetched = await client.fetchOne(
         String(message.uid),
         streamParsedOnly
-          ? { bodyStructure: true }
+          ? { bodyStructure: true, size: true }
           : {
               bodyStructure: true,
               headers: true,
@@ -1197,7 +1197,11 @@ export async function fetchFullMessageBody(
     }
 
     const rawTruncated = streamParsedOnly
-      ? isParsedOnlySourceTruncated(rawBytes, message, config.BODY_RAW_MAX_BYTES)
+      ? isParsedOnlySourceTruncated(
+        rawBytes,
+        typeof fetched?.size === "number" ? fetched.size : Number(message.size_bytes),
+        config.BODY_RAW_MAX_BYTES
+      )
       : rawBytes >= config.BODY_RAW_MAX_BYTES;
     if (rawTruncated) rawMimeSha256 = null;
     const mimeStructure = fetched?.bodyStructure ?? message.mime_structure;

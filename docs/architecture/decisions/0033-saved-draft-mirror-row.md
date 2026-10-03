@@ -37,8 +37,9 @@ a 5-second deadline, so it cannot hold the lock or the caller's request long.
 - **Values only the server knows stay empty.** These are BODYSTRUCTURE,
   attachment parts, and provider object/thread ids. The body arrives through the
   normal body lane, as for any new message. A parsed-only body fetch for a row
-  with no BODYSTRUCTURE asks the server for it in the same session, so body-part
-  selection never runs without one.
+  with no BODYSTRUCTURE asks the server for it and for RFC822.SIZE in the same
+  session. Body-part selection then never runs without a structure, and the
+  truncation check uses the server's size, not the composed size.
 - **Sync stays authoritative.** The write leaves the folder's `last_uid`
   unchanged. Drafts is marked due before the APPEND, so the next sync of Drafts
   reads the UID again, replaces the saved values with the server's view through
@@ -48,9 +49,10 @@ a 5-second deadline, so it cannot hold the lock or the caller's request long.
   Sync reads a UID above `last_uid` again in both incremental sync and the
   initial sync's new-mail batch. Without
   APPENDUID, without such a folder, or after a failed write, `messageId` is null
-  and the next Drafts sync mirrors the draft as before. A failed write is a
-  warning, never a thrown error: the provider already holds the draft, and a
-  retry without an idempotency key would file a second one.
+  and the next Drafts sync mirrors the draft as before. Once the APPEND returns,
+  the save confirms the lock's irreversible step, so a failed mirror write or a
+  failed lock release is a warning, never a thrown error: the provider already
+  holds the draft, and a retry without an idempotency key would file a second one.
 - **Retries.** An idempotent retry that finds its earlier copy returns that
   copy's live mirror id, if one exists. It does not write a row, because the
   earlier attempt's bytes may differ from this request's.

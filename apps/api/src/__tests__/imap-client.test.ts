@@ -456,15 +456,31 @@ describe("fetchFullMessageBody mailbox locking", () => {
     const client = new FixtureImapClient(folders());
     const fetchOne = vi.spyOn(client, "fetchOne");
 
-    const body = await fetchFullMessageBody(client, config, notesMessage);
-    expect(fetchOne).toHaveBeenCalledWith("1273", { bodyStructure: true }, { uid: true });
-    expect(body).toMatchObject({ selectedTextPart: "1", selectedTextFormat: "html", mimeStructure: fixture.bodyStructure });
+    // The row's size is the composed size; the server stored a different one.
+    const body = await fetchFullMessageBody(client, config, { ...notesMessage, size_bytes: fixture.raw.length + 7 });
+    expect(fetchOne).toHaveBeenCalledWith("1273", { bodyStructure: true, size: true }, { uid: true });
+    expect(body).toMatchObject({
+      selectedTextPart: "1",
+      selectedTextFormat: "html",
+      mimeStructure: fixture.bodyStructure,
+      rawTruncated: false
+    });
 
-    const batchClient = new FixtureImapClient(folders());
+    // In a batch, each row with a stored structure keeps its own.
+    const plain = makeTextMessage({ uid: 1274, subject: "Plain", from: "a@example.test", to: "b@example.test", body: "plain" });
+    const batchClient = new FixtureImapClient([
+      { path: "INBOX.Notes", delimiter: ".", uidValidity: 1, messages: [fixture, plain] }
+    ]);
     const fetch = vi.spyOn(batchClient, "fetch");
-    const batch = await fetchFullMessageBodyBatch(batchClient, config, [{ ...notesMessage, size_bytes: fixture.raw.length }]);
+    const batch = await fetchFullMessageBodyBatch(batchClient, config, [
+      { ...notesMessage, size_bytes: fixture.raw.length },
+      { ...notesMessage, id: "m1274", uid: "1274", size_bytes: plain.raw.length, mime_structure: plain.bodyStructure }
+    ]);
     expect(fetch.mock.calls[0][1]).toMatchObject({ bodyStructure: true });
-    expect(batch.bodies[0].body).toMatchObject({ selectedTextPart: "1", selectedTextFormat: "html" });
+    expect(batch.bodies.map(({ body }) => [body.selectedTextFormat, body.mimeStructure])).toEqual([
+      ["html", fixture.bodyStructure],
+      ["plain", plain.bodyStructure]
+    ]);
   });
 });
 

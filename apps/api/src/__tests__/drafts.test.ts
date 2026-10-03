@@ -310,9 +310,17 @@ describe("createDraft", () => {
     expect([accountId, folder, uidValidity]).toEqual(["acc-1", draftsFolder, 100]);
     expect(windowCutoff).toBeInstanceOf(Date);
     // A short deadline: the provider already holds the draft.
-    expect(writeOptions.deadlineAt - Date.now()).toBeLessThanOrEqual(5_000);
-    // The lock fences the write, as sync's lock does.
-    expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), { fenceWrites: true });
+    expect(writeOptions.deadlineAt).toBeGreaterThan(Date.now());
+    expect(writeOptions.deadlineAt).toBeLessThanOrEqual(Date.now() + 5_000);
+    // The lock fences the write, as sync's lock does, and the save is confirmed
+    // once the provider holds the draft.
+    expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), {
+      fenceWrites: true,
+      onPostIrreversibleWarning: expect.any(Function)
+    });
+    expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
+    expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
+    expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeLessThan(mocks.upsertMessages.mock.invocationCallOrder[0]);
     expect(metadata).toMatchObject({
       uid: 7,
       internalDate: savedAt,
@@ -359,6 +367,21 @@ describe("createDraft", () => {
     });
     expect(mocks.upsertMessages).not.toHaveBeenCalled();
     expect(result).toMatchObject({ messageId: null, appendedUid: 7, warnings: [] });
+  });
+
+  it("reports a saved draft when the lock fails after the APPEND", async () => {
+    // e.g. the lock's session died, so unlock fails after the provider holds the draft.
+    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>, options: { onPostIrreversibleWarning: (warning: string) => void }) => {
+      const value = await fn(mockAccountLock());
+      options.onPostIrreversibleWarning("The provider already accepted the change; the lock release failed");
+      return value;
+    });
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(result.messageId).toBe(N1);
+    expect(result.warnings).toEqual(["The provider already accepted the change; the lock release failed"]);
   });
 
   it("reports a saved draft when its mirror write fails", async () => {
