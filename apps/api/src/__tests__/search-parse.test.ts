@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { compileSearch, filtersFromStructured, parseQuery, parseTextTerms, tokenize } from "../search/index.js";
+import {
+  compileSearch,
+  filenameGlob,
+  filetypeMatch,
+  filtersFromStructured,
+  isValidAbsoluteDate,
+  parseQuery,
+  parseTextTerms,
+  resolveRelativeDate,
+  tokenize
+} from "../search/index.js";
 import type { CompileOptions } from "../search/compile.js";
 import type { SearchFilter } from "../search/types.js";
 
@@ -350,12 +360,12 @@ describe("compileSearch", () => {
     expect(compiled.values.slice(0, 3)).toEqual(["nytimes.com", "%sale%", "\\Seen"]);
   });
 
-  it("resolves a relative date to a now()-relative interval, not a bound timestamp", () => {
-    const parsed = parseQuery("after:7d");
-    const compiled = compileSearch(noText, parsed.filters, baseCompileOptions);
-    expect(compiled.text).toContain("now() - (");
-    expect(compiled.text).toContain("interval '1 day'");
-    expect(compiled.values).toContain(7);
+  it("resolves a relative date with the shared resolver and binds the timestamp", () => {
+    // The frozen eval clock keeps the bound value reproducible.
+    const parsed = parseQuery("after:1m");
+    const compiled = compileSearch(noText, parsed.filters, { ...baseCompileOptions, now: "2026-03-31T12:00:00.000Z" });
+    expect(compiled.text).toMatch(/m\.internal_date >= \$\d+::timestamptz/);
+    expect(compiled.values).toContain("2026-02-28T12:00:00.000Z");
   });
 });
 
@@ -423,6 +433,62 @@ describe("parseTextTerms", () => {
     expect(parseQuery("a OR b").warnings).toEqual([]);
     // parseQuery returns the terms, so engines do not parse the text again.
     expect(parseQuery("a OR b c").text.groups).toEqual([[word("a"), word("b")], [word("c")]]);
+  });
+});
+
+describe("shared search rules", () => {
+  it("accepts only real calendar dates and resolves relative ones like Postgres intervals", () => {
+    for (const ok of ["2026-01-31", "2024-02-29", "2026-01-31T09:30", "2026-01-31T09:30:15.5Z", "2026-01-31 09:30+02:00"]) {
+      expect(isValidAbsoluteDate(ok), ok).toBe(true);
+    }
+    for (const ok of ["2026-01-31 09:30:00 UTC", "2026-01-31T24:00:00", "2026-01-31T09:30-0700"]) {
+      expect(isValidAbsoluteDate(ok), ok).toBe(true);
+    }
+    for (const bad of [
+      "2026-13-01", "2026-02-30", "2025-02-29", "2026-01-01Tjunk", "2026-01-31T24:30", "2026-1-1",
+      "0000-01-01", "2026-01-01T00:00+99", "2026-01-01 00:00+05:99",
+      // Postgres rejects an hour without minutes and 24:00 with a fraction.
+      "2026-01-31T09", "2026-01-31 09", "2026-01-31T09Z", "2026-01-31T24:00:00.5"
+    ]) {
+      expect(isValidAbsoluteDate(bad), bad).toBe(false);
+    }
+    // Relative dates reach back at most about 100 years instead of overflowing a timestamp.
+    expect(parseQuery("older_than:9999999d").filters).toEqual([]);
+    expect(parseQuery("newer_than:100y").filters).toHaveLength(1);
+    expect(parseQuery("newer_than:101y").filters).toEqual([]);
+    expect(parseQuery("after:2026-13-01").filters).toEqual([]);
+    expect(parseQuery("after:2026-13-01").warnings).toEqual(['unparseable date "2026-13-01" for after:; ignored']);
+    const now = new Date("2026-03-31T12:00:00Z");
+    expect(resolveRelativeDate("1m", now).toISOString()).toBe("2026-02-28T12:00:00.000Z");
+    expect(resolveRelativeDate("2w", now).toISOString()).toBe("2026-03-17T12:00:00.000Z");
+    expect(resolveRelativeDate("12h", now).toISOString()).toBe("2026-03-31T00:00:00.000Z");
+    expect(resolveRelativeDate("1y", new Date("2024-02-29T00:00:00Z")).toISOString()).toBe("2023-02-28T00:00:00.000Z");
+  });
+
+  it("matches filenames as substrings unless the value is a pattern, also with _ and %", () => {
+    expect(filenameGlob("invoice_2024")).toBe("*invoice_2024*");
+    expect(filenameGlob("report?.pdf")).toBe("report?.pdf");
+    const compiled = compileSearch(noText, parseQuery("filename:invoice_2024 filename:*.pdf").filters, baseCompileOptions);
+    expect(compiled.values).toContain("%invoice\\_2024%");
+    expect(compiled.values).toContain("%.pdf");
+  });
+
+  it("maps filetype values to one shared MIME table", () => {
+    expect(filetypeMatch("excel")).toEqual(filetypeMatch("sheet"));
+    expect(filetypeMatch("image")).toEqual({ kind: "prefix", prefix: "image/" });
+    expect(filetypeMatch("PDF")).toEqual({ kind: "mimes", mimes: ["application/pdf"] });
+    expect(filetypeMatch("x-custom")).toEqual({ kind: "contains", text: "x-custom" });
+  });
+
+  it("warns when free text or body: has no searchable word", () => {
+    expect(parseQuery("from:bob 👍").warnings).toEqual(["`👍` has no searchable word and matches nothing"]);
+    expect(parseQuery('body:"→"').warnings).toEqual(["body: `→` has no searchable word and matches nothing"]);
+    expect(parseQuery("-body:👍").warnings).toEqual(["-body: `👍` has no searchable word and excludes nothing"]);
+    // An OR-only value gets the ignored-OR warning alone.
+    expect(parseQuery("body:OR").warnings).toEqual([
+      "OR ignored in body: between its start and its end; OR joins two words or quoted phrases"
+    ]);
+    expect(parseQuery("from:bob").warnings).toEqual([]);
   });
 });
 
