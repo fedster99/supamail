@@ -1,7 +1,7 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
-import { RELATIVE_DATE_INTERVALS, filenameGlob, filetypeMatch, isRelativeDate } from "./rules.js";
+import { filenameGlob, filetypeMatch, isRelativeDate, resolveRelativeDate } from "./rules.js";
 
 /** Accumulates bound parameter values and hands back `$n` placeholders. User
  * input is NEVER interpolated into SQL text — only through these placeholders. */
@@ -45,17 +45,10 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
-/** Resolve a date filter value to a SQL timestamp expression. Relative values
- * (`7d`) become `<now> - (n * interval '1 day')` so the parser stays clock-free;
- * absolute values are bound and cast. `nowExpr` is `now()` in production and a
- * frozen instant under the eval, so relative-date filters are reproducible too. */
-function dateExpr(value: string, pb: Params, nowExpr: string): string {
-  if (isRelativeDate(value)) {
-    const amount = Number.parseInt(value.slice(0, -1), 10);
-    const unit = RELATIVE_DATE_INTERVALS[value.slice(-1)];
-    return `(${nowExpr} - (${pb.add(amount)} * interval '${unit}'))`;
-  }
-  return `${pb.add(value)}::timestamptz`;
+/** Bind a date filter value as a timestamp. A relative value is resolved by the
+ * shared `resolveRelativeDate` from `now` (the frozen eval clock, or compile time). */
+function dateExpr(value: string, pb: Params, now: Date): string {
+  return `${pb.add(isRelativeDate(value) ? resolveRelativeDate(value, now).toISOString() : value)}::timestamptz`;
 }
 
 function filetypePredicate(value: string, pb: Params): string {
@@ -84,7 +77,7 @@ function textTsquery({ groups, negative }: TextTerms, pb: Params): { query: stri
   };
 }
 
-function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): string {
+function filterPredicate(filter: SearchFilter, pb: Params, now: Date): string {
   const negate = (expr: string): string => (("negated" in filter && filter.negated) ? `NOT (${expr})` : expr);
 
   switch (filter.kind) {
@@ -167,7 +160,7 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
       return filter.negated ? `m.body_fetched_at IS NULL` : `m.body_fetched_at IS NOT NULL`;
     case "filename": {
       // The shared glob, as LIKE: escape LIKE's own wildcards, then map * and ?.
-      const like = filenameGlob(filter.value).replace(/[\\%_]/g, (ch) => `\\${ch}`).replace(/\*/g, "%").replace(/\?/g, "_");
+      const like = escapeLike(filenameGlob(filter.value)).replace(/\*/g, "%").replace(/\?/g, "_");
       const p = pb.add(like);
       const exists = `EXISTS (SELECT 1 FROM public.imap_attachments a WHERE a.message_id = m.id AND lower(coalesce(a.filename,'')) LIKE ${p})`;
       return filter.negated ? `NOT ${exists}` : exists;
@@ -183,7 +176,7 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
     }
     case "date": {
       const op = filter.op === "after" ? ">=" : "<";
-      return negate(`m.internal_date ${op} ${dateExpr(filter.value, pb, nowExpr)}`);
+      return negate(`m.internal_date ${op} ${dateExpr(filter.value, pb, now)}`);
     }
     case "size": {
       const op = filter.op === "larger" ? ">" : "<";
@@ -194,7 +187,7 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
       return negate(`m.window_status = ${p}`);
     }
     case "or":
-      return negate(`(${filter.filters.map((member) => filterPredicate(member, pb, nowExpr)).join(" OR ")})`);
+      return negate(`(${filter.filters.map((member) => filterPredicate(member, pb, now)).join(" OR ")})`);
     default: {
       const exhaustive: never = filter;
       return exhaustive;
@@ -310,7 +303,8 @@ export function compileSearch(
   // Structured operator predicates (from:/folder:/has:/date:…) — applied once over
   // the bounded candidate set (they reference m, the joined body b, or self-contained
   // attachment EXISTS subqueries).
-  const structured = filters.map((filter) => filterPredicate(filter, pb, nowExpr));
+  const now = opts.now ? new Date(opts.now) : new Date();
+  const structured = filters.map((filter) => filterPredicate(filter, pb, now));
   // Excluded words drop a message from every branch, including typo and concept recall.
   if (textQuery.excluded) {
     structured.push(

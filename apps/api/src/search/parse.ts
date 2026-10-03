@@ -141,11 +141,16 @@ function warnIgnoredOr(warnings: string[], ignored: IgnoredOr[], field?: "body")
   }
 }
 
-/** Warn about text that cannot be searched (only symbols or emoji): it matches nothing. */
-function warnText(warnings: string[], text: string, terms: TextTerms, field?: "body"): void {
+/**
+ * Warn about ignored ORs, and about text that cannot be searched (only symbols or
+ * emoji): it matches nothing, or, negated, excludes nothing. An ignored OR already
+ * explains text that is only OR, so that case gets one warning.
+ */
+function warnText(warnings: string[], text: string, terms: TextTerms, field?: "body", negated = false): void {
   warnIgnoredOr(warnings, terms.ignoredOr, field);
-  if (terms.hasText && terms.groups.length === 0 && terms.negative.length === 0) {
-    const warning = `${field === "body" ? "body: " : ""}\`${text}\` has no searchable word and matches nothing`;
+  if (terms.hasText && terms.groups.length === 0 && terms.negative.length === 0 && terms.ignoredOr.length === 0) {
+    const warning = `${field === "body" ? `${negated ? "-" : ""}body: ` : ""}\`${text}\` has no searchable word and ` +
+      (negated ? "excludes nothing" : "matches nothing");
     if (!warnings.includes(warning)) warnings.push(warning);
   }
 }
@@ -261,7 +266,7 @@ export function parseQuery(input: string): ParsedQuery {
   const text = parseTextTerms(freeText);
   warnText(warnings, freeText, text);
   for (const filter of filters.flatMap((filter) => filter.kind === "or" ? filter.filters : [filter])) {
-    if (filter.kind === "body") warnText(warnings, filter.value, parseTextTerms(filter.value), "body");
+    if (filter.kind === "body") warnText(warnings, filter.value, parseTextTerms(filter.value), "body", filter.negated);
   }
   return {
     freeText,
