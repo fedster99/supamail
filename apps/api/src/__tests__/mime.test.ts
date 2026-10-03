@@ -6,6 +6,7 @@ import {
   normalizeMessageId,
   parseHeaders,
   parseRawMime,
+  readableBodyText,
   selectBodyTextPart
 } from "../mime.js";
 
@@ -76,6 +77,44 @@ describe("mime helpers", () => {
 
   it("converts basic html to normalized text", () => {
     expect(htmlToText("<p>Hello&nbsp;<b>there</b></p><script>x()</script>")).toBe("Hello there");
+  });
+
+  it("drops head, comments and invisible preheader padding from html", () => {
+    const html = [
+      "<html><head><title>Receipt</title><style>p { color: red; }</style></head>",
+      "<!--[if gte mso 9]><xml><o:PixelsPerInch>96</o:PixelsPerInch></xml><![endif]-->",
+      "<body><div>Preview \u034F\u200C \uFEFF\u200B</div><!--[if !mso]><!--><p>Paid</p><!--<![endif]-->",
+      "<p>\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645</p></body></html>"
+    ].join("");
+    expect(htmlToText(html)).toBe("Preview\n\nPaid\n\n\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645");
+  });
+
+  it("converts crafted html in linear time", () => {
+    for (const html of ["<".repeat(500_000), "<style ".repeat(100_000), "<!--".repeat(100_000), "<p ".repeat(100_000)]) {
+      const started = performance.now();
+      htmlToText(html);
+      expect(performance.now() - started).toBeLessThan(1_000);
+    }
+  });
+
+  it("reads the html part when the plain part holds markup or css", () => {
+    const html = "<p>Your payment was received.</p>";
+    for (const plain of ["Hi Sam,\nsee you at {venue}: noon", "Reply to <head@school.example> or <p.lee@acme.example>"]) {
+      expect(readableBodyText(plain, html)).toBe(plain);
+    }
+    for (const plain of [
+      "<title></title>\n<meta charset=\"utf-8\"><style>p { margin: 0 }</style>",
+      "Weekly digest\n\np, td, span { font-family: Arial,\nsans-serif !important; }",
+      "body{max-width:740px}h1{font-size:30px}",
+      "Tickets\n<hr style=\"border: none\">",
+      "Hello\n<p>Please register</p>",
+      ""
+    ]) {
+      expect(readableBodyText(plain, html)).toBe("Your payment was received.");
+    }
+    expect(readableBodyText("body{margin:0}", "<img src=\"logo.png\">")).toBe("body{margin:0}");
+    expect(readableBodyText("body{margin:0}", null)).toBe("body{margin:0}");
+    expect(readableBodyText(null, null)).toBeNull();
   });
 
   it("does not crash on out-of-range or surrogate numeric entities", () => {
