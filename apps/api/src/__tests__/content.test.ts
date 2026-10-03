@@ -22,6 +22,13 @@ async function drain(stream: AsyncIterable<unknown>): Promise<string> {
 }
 import { NotFoundError, UnfetchableContentError } from "../errors.js";
 
+// Mirror ids are UUIDs; any other value names no row.
+const M1 = "11111111-1111-4111-8111-111111111111";
+const ACC1 = "acc1acc1-0000-4000-8000-acc1acc1acc1";
+const A1 = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+const A2 = "a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2";
+const A3 = "a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3";
+
 // A minimal fake pool: every connect() yields a client whose query() returns the
 // given rows. Covers the mirror-only read paths (no IMAP round-trip).
 function fakePool(rows: unknown[]): PgPool {
@@ -49,13 +56,13 @@ describe("selectFields", () => {
 describe("listAttachments", () => {
   it("maps mirror rows to AttachmentInfo (mime_type→contentType, size→number, inline disposition)", async () => {
     const pool = fakePool([
-      { id: "att-1", message_id: "m1", filename: "report.pdf", mime_type: "application/pdf", size_bytes: "2048", part_number: "2", content_id: null, disposition: "attachment" },
-      { id: "att-2", message_id: "m1", filename: "logo.png", mime_type: "image/png", size_bytes: "512", part_number: "1.2", content_id: "<logo>", disposition: "INLINE" }
+      { id: A1, message_id: M1, filename: "report.pdf", mime_type: "application/pdf", size_bytes: "2048", part_number: "2", content_id: null, disposition: "attachment" },
+      { id: A2, message_id: M1, filename: "logo.png", mime_type: "image/png", size_bytes: "512", part_number: "1.2", content_id: "<logo>", disposition: "INLINE" }
     ]);
-    const out = await listAttachments(pool, config, "m1");
+    const out = await listAttachments(pool, config, M1);
     expect(out).toHaveLength(2);
-    expect(out[0]).toMatchObject({ attachmentId: "att-1", contentType: "application/pdf", sizeBytes: 2048, inline: false });
-    expect(out[1]).toMatchObject({ attachmentId: "att-2", contentType: "image/png", sizeBytes: 512, contentId: "<logo>", inline: true });
+    expect(out[0]).toMatchObject({ attachmentId: A1, contentType: "application/pdf", sizeBytes: 2048, inline: false });
+    expect(out[1]).toMatchObject({ attachmentId: A2, contentType: "image/png", sizeBytes: 512, contentId: "<logo>", inline: true });
   });
 });
 
@@ -63,7 +70,7 @@ describe("getRawMime (mirror path)", () => {
   it("returns the stored raw_mime with source=mirror and no IMAP fetch", async () => {
     const raw = Buffer.from("Subject: hi\r\n\r\nbody");
     const pool = fakePool([{ raw_mime: raw, raw_bytes: null, raw_truncated: false }]);
-    const result = await getRawMime(pool, config, "m1");
+    const result = await getRawMime(pool, config, M1);
     expect(result.source).toBe("mirror");
     expect(result.truncated).toBe(false);
     expect(result.raw.equals(raw)).toBe(true);
@@ -78,11 +85,11 @@ describe("getMessageHeaders (mirror path)", () => {
         body_headers: { "in-reply-to": "<p@x>", references: "<a@x> <p@x>", "x-spam": "0" }
       }
     ]);
-    const full = await getMessageHeaders(pool, config, "m1");
+    const full = await getMessageHeaders(pool, config, M1);
     expect(full.source).toBe("mirror");
     expect(full.headers).toMatchObject({ "message-id": "<m@x>", "x-mailer": "Foo", "in-reply-to": "<p@x>" });
 
-    const basic = await getMessageHeaders(pool, config, "m1", { basic: true });
+    const basic = await getMessageHeaders(pool, config, M1, { basic: true });
     expect(basic.headers).toMatchObject({ "message-id": "<m@x>", "in-reply-to": "<p@x>", references: "<a@x> <p@x>", subject: "Hello" });
     expect(basic.headers["x-mailer"]).toBeUndefined();
     expect(basic.headers["x-spam"]).toBeUndefined();
@@ -102,7 +109,7 @@ describe("cleanMessageBody (deterministic, no LLM)", () => {
       "> second quoted line"
     ].join("\n");
     const pool = fakePool([{ body_text: body, body_plain: null, selected_text_part: null }]);
-    const clean = await cleanMessageBody(pool, config, "m1");
+    const clean = await cleanMessageBody(pool, config, M1);
     expect(clean.body).toContain("Thanks, that works for me.");
     expect(clean.body).not.toContain("the original message");
     expect(clean.body).not.toContain("Jane Doe | Acme Corp");
@@ -111,20 +118,20 @@ describe("cleanMessageBody (deterministic, no LLM)", () => {
   it("keeps the quoted tail when includeQuoted is set", async () => {
     const body = "Reply line.\n\nOn Mon, Bob <bob@x> wrote:\n> original";
     const pool = fakePool([{ body_text: body, body_plain: null, selected_text_part: null }]);
-    const clean = await cleanMessageBody(pool, config, "m1", { includeQuoted: true });
+    const clean = await cleanMessageBody(pool, config, M1, { includeQuoted: true });
     expect(clean.body).toContain("original");
   });
 
   it("keeps the existing 4,096-character default outside MCP", async () => {
     const pool = fakePool([{ body_text: "x".repeat(5_000), body_plain: null, selected_text_part: null }]);
-    const clean = await cleanMessageBody(pool, config, "m1");
+    const clean = await cleanMessageBody(pool, config, M1);
     expect(clean.body).toHaveLength(4_096);
     expect(clean.truncated).toBe(true);
   });
 
   it("does not let a non-positive limit disable the content-operation bound", async () => {
     const pool = fakePool([{ body_text: "x".repeat(5_000), body_plain: null, selected_text_part: null }]);
-    const clean = await cleanMessageBody(pool, config, "m1", { maxChars: 0 });
+    const clean = await cleanMessageBody(pool, config, M1, { maxChars: 0 });
     expect(clean.body).toHaveLength(4_096);
     expect(clean.truncated).toBe(true);
   });
@@ -157,14 +164,14 @@ function fakeReader(over: { downloadPart?: any; downloadPartStream?: any; fetchO
 const connectSpy = vi.spyOn(ContentImapClient, "connect");
 
 const MESSAGE_ROW = {
-  id: "m1",
-  account_id: "acc-1",
+  id: M1,
+  account_id: ACC1,
   folder_path: "INBOX",
   uidvalidity: "100",
   uid: "42",
   deleted_in_provider: false
 };
-const ACCOUNT_ROW = { id: "acc-1", host: "imap.example.test", provider_profile: "generic-imap" };
+const ACCOUNT_ROW = { id: ACC1, host: "imap.example.test", provider_profile: "generic-imap" };
 
 /**
  * A pool that routes BOTH `pool.query(sql)` (MirrorRepository.getMessage/getAccount)
@@ -219,16 +226,16 @@ describe("downloadAttachment (on-demand IMAP part fetch)", () => {
     const reader = fakeReader();
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({
-      attachment: { id: "att-1", message_id: "m1", filename: "report.pdf", mime_type: "application/pdf", size_bytes: "2048", part_number: "2", content_id: null, disposition: "attachment" }
+      attachment: { id: A1, message_id: M1, filename: "report.pdf", mime_type: "application/pdf", size_bytes: "2048", part_number: "2", content_id: null, disposition: "attachment" }
     });
 
-    const out = await downloadAttachment(pool, config, "att-1");
+    const out = await downloadAttachment(pool, config, A1);
 
     // Buffered download now delegates to the streaming primitive + streamToBuffer.
     expect(reader.downloadPartStream).toHaveBeenCalledTimes(1);
     // folderPath, uidValidity, uid, part, maxBytes — all from the resolved coords.
     expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "2", config.BODY_RAW_MAX_BYTES);
-    expect(out.attachmentId).toBe("att-1");
+    expect(out.attachmentId).toBe(A1);
     expect(out.filename).toBe("report.pdf");
     expect(out.content.toString()).toBe("PART-BYTES");
     // The reader is always torn down.
@@ -239,9 +246,9 @@ describe("downloadAttachment (on-demand IMAP part fetch)", () => {
     const reader = fakeReader();
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({
-      attachment: { id: "att-2", message_id: "m1", filename: "logo.png", mime_type: "image/png", size_bytes: "512", part_number: "1.2", content_id: "<logo>", disposition: "inline" }
+      attachment: { id: A2, message_id: M1, filename: "logo.png", mime_type: "image/png", size_bytes: "512", part_number: "1.2", content_id: "<logo>", disposition: "inline" }
     });
-    await downloadAttachment(pool, config, "att-2");
+    await downloadAttachment(pool, config, A2);
     expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "1.2", config.BODY_RAW_MAX_BYTES);
   });
 
@@ -253,15 +260,15 @@ describe("downloadAttachment (on-demand IMAP part fetch)", () => {
 
   it("throws UnfetchableContentError (→422) when the attachment row has no BODYSTRUCTURE part number", async () => {
     const pool = routingPool({
-      attachment: { id: "att-3", message_id: "m1", filename: "x", mime_type: null, size_bytes: null, part_number: null, content_id: null, disposition: "attachment" }
+      attachment: { id: A3, message_id: M1, filename: "x", mime_type: null, size_bytes: null, part_number: null, content_id: null, disposition: "attachment" }
     });
-    await expect(downloadAttachment(pool, config, "att-3")).rejects.toBeInstanceOf(UnfetchableContentError);
+    await expect(downloadAttachment(pool, config, A3)).rejects.toBeInstanceOf(UnfetchableContentError);
     expect(connectSpy).not.toHaveBeenCalled();
   });
 });
 
 describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
-  const ATT = { id: "att-1", message_id: "m1", filename: "big.pdf", mime_type: "application/pdf", size_bytes: "9999", part_number: "2", content_id: null, disposition: "attachment" };
+  const ATT = { id: A1, message_id: M1, filename: "big.pdf", mime_type: "application/pdf", size_bytes: "9999", part_number: "2", content_id: null, disposition: "attachment" };
 
   it("returns the decoded stream + metadata and tears down the lock + connection on close", async () => {
     const release = vi.fn();
@@ -271,9 +278,9 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
 
-    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    const dl = await downloadAttachmentStream(pool, config, A1);
     expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "2", config.BODY_RAW_MAX_BYTES);
-    expect(dl.attachmentId).toBe("att-1");
+    expect(dl.attachmentId).toBe(A1);
     expect(dl.filename).toBe("big.pdf");
     expect(await drain(dl.stream)).toBe("STREAM-BYTES");
 
@@ -286,7 +293,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     const reader = fakeReader();
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
-    await downloadAttachmentStream(pool, config, "att-1", { maxBytes: 123 });
+    await downloadAttachmentStream(pool, config, A1, { maxBytes: 123 });
     expect(reader.downloadPartStream).toHaveBeenCalledWith("INBOX", 100, 42, "2", 123);
   });
 
@@ -300,7 +307,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     const pool = routingPool({
       attachment: { ...ATT, part_number: null }
     });
-    await expect(downloadAttachmentStream(pool, config, "att-1")).rejects.toBeInstanceOf(UnfetchableContentError);
+    await expect(downloadAttachmentStream(pool, config, A1)).rejects.toBeInstanceOf(UnfetchableContentError);
     expect(connectSpy).not.toHaveBeenCalled();
   });
 
@@ -312,7 +319,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
 
-    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    const dl = await downloadAttachmentStream(pool, config, A1);
     await drain(dl.stream); // full consume -> 'close' auto-fires teardown
     await new Promise((r) => setImmediate(r)); // let the 'close' listener run
     await dl.close(); // explicit call is a no-op (memoized)
@@ -328,7 +335,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     });
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
-    await expect(downloadAttachmentStream(pool, config, "att-1")).rejects.toThrow("scope failed");
+    await expect(downloadAttachmentStream(pool, config, A1)).rejects.toThrow("scope failed");
     expect(reader.logout).toHaveBeenCalledTimes(1); // closeImap ran
   });
 
@@ -339,7 +346,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
 
-    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    const dl = await downloadAttachmentStream(pool, config, A1);
     dl.stream.destroy(); // consumer aborts before any byte is read to end
     await new Promise((r) => setImmediate(r)); // let the 'close' listener run
     expect(release).toHaveBeenCalledTimes(1);
@@ -353,7 +360,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
 
-    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    const dl = await downloadAttachmentStream(pool, config, A1);
     dl.stream.destroy(new Error("mid-flight")); // emits 'error' then 'close' — both listeners fire
     await new Promise((r) => setImmediate(r));
     expect(release).toHaveBeenCalledTimes(1); // memoized teardown runs once, not twice
@@ -370,7 +377,7 @@ describe("downloadAttachmentStream (on-demand streaming part fetch)", () => {
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ attachment: ATT });
 
-    const dl = await downloadAttachmentStream(pool, config, "att-1");
+    const dl = await downloadAttachmentStream(pool, config, A1);
     await drain(dl.stream);
     // close() must resolve, not reject — the auto-close listeners call it unawaited,
     // where a rejection would become an unhandledRejection and could crash the process.
@@ -385,7 +392,7 @@ describe("getRawMime fetch branch", () => {
     // bodyRow has raw_mime: null → the fetch fallback fires.
     const pool = routingPool({ bodyRow: { raw_mime: null, raw_truncated: false } });
 
-    const result = await getRawMime(pool, config, "m1");
+    const result = await getRawMime(pool, config, M1);
     expect(result.source).toBe("fetch");
     expect(result.raw.toString()).toBe("RAW-MIME-BYTES");
     expect(reader.fetchOneSource).toHaveBeenCalledWith("INBOX", 100, 42, config.BODY_RAW_MAX_BYTES);
@@ -399,7 +406,7 @@ describe("getRawMime fetch branch", () => {
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ bodyRow: { raw_mime: null, raw_truncated: false } });
 
-    const result = await getRawMime(pool, small, "m1");
+    const result = await getRawMime(pool, small, M1);
     expect(result.source).toBe("fetch");
     expect(result.truncated).toBe(true);
   });
@@ -409,7 +416,7 @@ describe("getRawMime fetch branch", () => {
     const reader = fakeReader({ fetchOneSource: vi.fn(async () => Buffer.from("ABCD")) });
     connectSpy.mockResolvedValue(reader as unknown as ContentImapClient);
     const pool = routingPool({ bodyRow: { raw_mime: null, raw_truncated: false } });
-    const result = await getRawMime(pool, small, "m1");
+    const result = await getRawMime(pool, small, M1);
     expect(result.truncated).toBe(false);
   });
 });
@@ -422,7 +429,7 @@ describe("getMessageHeaders fetch fallback", () => {
     // headerRow with both header maps null → merged is empty → fetch fallback.
     const pool = routingPool({ headerRow: { headers_json: null, body_headers: null } });
 
-    const result = await getMessageHeaders(pool, config, "m1");
+    const result = await getMessageHeaders(pool, config, M1);
     expect(result.source).toBe("fetch");
     expect(reader.fetchOneSource).toHaveBeenCalledTimes(1);
     // The parsed header block carries the source headers.

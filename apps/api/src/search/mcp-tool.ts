@@ -173,17 +173,32 @@ export const searchEmailToolDefinition = {
   }
 } as const;
 
+/** The tool error envelope for arguments that fail the search schema. */
+export interface SearchInputError {
+  error: { code: "invalid_input"; message: string; hint: string };
+}
+
 /**
  * Validate raw tool arguments and run the search. The injected pool keeps this
  * transport-agnostic: the local stdio binding and any remote binding call this
- * same function. Returns the typed {@link SearchResponse}; the transport layer
- * formats it for the wire.
+ * same function. Returns the typed {@link SearchResponse}, or an `invalid_input`
+ * envelope before any query when the arguments fail the schema, as the read tools
+ * do; the transport layer formats it for the wire.
  */
 export async function runSearchTool(
   pool: PgPool,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
-): Promise<SearchResponse> {
-  const request = searchRequestSchema.parse(args) as SearchRequest;
-  return searchMessages(pool, request, metadataProtection);
+): Promise<SearchResponse | SearchInputError> {
+  const parsed = searchRequestSchema.safeParse(args);
+  if (!parsed.success) {
+    return {
+      error: {
+        code: "invalid_input",
+        message: parsed.error.message,
+        hint: "Fix the arguments to match the search_email inputSchema, then retry."
+      }
+    };
+  }
+  return searchMessages(pool, parsed.data as SearchRequest, metadataProtection);
 }

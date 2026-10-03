@@ -63,6 +63,7 @@ import type {
   UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
 } from "./types.js";
+import { isMirrorId } from "./mirror-id.js";
 
 const BROKEN_FAILURE_THRESHOLD = 10;
 const BACKOFF_FLOOR_MS = 1_000;
@@ -804,6 +805,7 @@ export class MirrorRepository {
   }
 
   async getAccount(id: string): Promise<ImapAccount | null> {
+    if (!isMirrorId(id)) return null;
     const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
       "SELECT * FROM public.imap_accounts WHERE id = $1",
       [id]
@@ -3840,6 +3842,7 @@ export class MirrorRepository {
   }
 
   async getMessage(id: string): Promise<ImapMessage | null> {
+    if (!isMirrorId(id)) return null;
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
       "SELECT * FROM public.imap_messages WHERE id = $1",
       [id]

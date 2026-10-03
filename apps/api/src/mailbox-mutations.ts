@@ -21,6 +21,7 @@ import {
 } from "./metadata-protection.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
+import { isMirrorId } from "./mirror-id.js";
 
 /**
  * Mechanical IMAP write verbs — mark read/unread, star/unstar, move, trash,
@@ -552,6 +553,7 @@ async function resolveThreadTargets(
   messageId: string,
   metadataProtection: MetadataProtectionAdapter
 ): Promise<{ accountId: string; targets: ResolvedMessageTarget[]; truncated: boolean }> {
+  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
   const client: PgClient = await pool.connect();
   try {
     // Pin the active-run pointer and both membership reads to one snapshot. An

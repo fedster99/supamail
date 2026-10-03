@@ -25,6 +25,7 @@ import {
   type MetadataProtectionAdapter,
   type ProtectedMetadataColumns
 } from "./metadata-protection.js";
+import { isMirrorId } from "./mirror-id.js";
 
 /**
  * Full draft CRUD saved to the provider Drafts folder (email-003, ADR 0019).
@@ -414,6 +415,7 @@ export async function getDraft(
   messageId: string,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<DraftDetail | null> {
+  if (!isMirrorId(messageId)) return null;
   const client = await pool.connect();
   try {
     const result = await client.query<DraftRow>(
