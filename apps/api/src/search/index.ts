@@ -1,5 +1,13 @@
 export * from "./types.js";
-export { parseQuery, parseTextTerms, filtersFromStructured, tokenize, isRelativeDate } from "./parse.js";
+export { parseQuery, parseTextTerms, filtersFromStructured, tokenize } from "./parse.js";
+export {
+  filenameGlob,
+  filetypeMatch,
+  isRelativeDate,
+  isValidAbsoluteDate,
+  resolveRelativeDate,
+  type FiletypeMatch
+} from "./rules.js";
 export { compileSearch } from "./compile.js";
 export type { CompileOptions, CompiledQuery } from "./compile.js";
 export { buildSyncTrust } from "./sync-trust.js";

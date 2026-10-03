@@ -9,6 +9,7 @@ import {
   TEXT_FIELD_BY_OPERATOR,
   WINDOW_STRUCTURED_KEY
 } from "./filter-fields.js";
+import { isRelativeDate, isValidAbsoluteDate } from "./rules.js";
 
 /** The non-table operators: multi-value flag operators, validated date/size
  * operators, and the non-filter output controls. The per-field `field:value`
@@ -29,8 +30,6 @@ const KNOWN_OPERATORS = new Set<string>([
 ]);
 
 const WINDOW_VALUES: WindowStatus[] = ["IN_WINDOW", "EXPIRED", "HISTORICAL"];
-const RELATIVE_DATE = /^\d+[hdwmy]$/;
-const ABSOLUTE_DATE = /^\d{4}-\d{2}-\d{2}([T ].*)?$/;
 const SIZE_RE = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i;
 
 /** Quote-aware tokenizer: whitespace separates tokens, but a double-quoted span
@@ -69,17 +68,12 @@ function stripQuotes(value: string): string {
   return value;
 }
 
-/** True when a date value is a relative spec like `7d` / `12h` (resolved to a
- * SQL interval at compile time so this parser stays clock-free and pure). */
-export function isRelativeDate(value: string): boolean {
-  return RELATIVE_DATE.test(value);
-}
 
 /** A date filter value is acceptable iff it is a relative spec (`7d`) or an
  * absolute `YYYY-MM-DD[...]` date. Anything else (e.g. `garbage`) is rejected
  * here so it never reaches `$n::timestamptz`, where Postgres would 500. */
 function isValidDate(value: string): boolean {
-  return isRelativeDate(value) || ABSOLUTE_DATE.test(value);
+  return isRelativeDate(value) || isValidAbsoluteDate(value);
 }
 
 /** Push a `date` filter for a structured after/before value, or warn+ignore an
@@ -143,6 +137,15 @@ function ignoredOrWarning({ left, right }: IgnoredOr, field?: "body"): string {
 function warnIgnoredOr(warnings: string[], ignored: IgnoredOr[], field?: "body"): void {
   for (const or of ignored) {
     const warning = ignoredOrWarning(or, field);
+    if (!warnings.includes(warning)) warnings.push(warning);
+  }
+}
+
+/** Warn about text that cannot be searched (only symbols or emoji): it matches nothing. */
+function warnText(warnings: string[], text: string, terms: TextTerms, field?: "body"): void {
+  warnIgnoredOr(warnings, terms.ignoredOr, field);
+  if (terms.hasText && terms.groups.length === 0 && terms.negative.length === 0) {
+    const warning = `${field === "body" ? "body: " : ""}\`${text}\` has no searchable word and matches nothing`;
     if (!warnings.includes(warning)) warnings.push(warning);
   }
 }
@@ -256,9 +259,9 @@ export function parseQuery(input: string): ParsedQuery {
 
   const freeText = freeTextParts.join(" ").trim();
   const text = parseTextTerms(freeText);
-  warnIgnoredOr(warnings, text.ignoredOr);
+  warnText(warnings, freeText, text);
   for (const filter of filters.flatMap((filter) => filter.kind === "or" ? filter.filters : [filter])) {
-    if (filter.kind === "body") warnIgnoredOr(warnings, parseTextTerms(filter.value).ignoredOr, "body");
+    if (filter.kind === "body") warnText(warnings, filter.value, parseTextTerms(filter.value), "body");
   }
   return {
     freeText,
@@ -403,7 +406,7 @@ export function filtersFromStructured(structured: StructuredFilters, warnings: s
     const routed = field.route ? field.route(normalized) : { kind: field.kind, value: normalized };
     const raw = field.structuredRaw ? field.structuredRaw(original) : `${field.rawPrefix}:${original}`;
     push({ kind: routed.kind, value: routed.value, negated: false, raw } as SearchFilter);
-    if (routed.kind === "body") warnIgnoredOr(warnings, parseTextTerms(routed.value).ignoredOr, "body");
+    if (routed.kind === "body") warnText(warnings, routed.value, parseTextTerms(routed.value), "body");
   }
 
   // State/presence flags. `honorsFalse` fields emit on an explicit `false` (it

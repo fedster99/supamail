@@ -1,6 +1,7 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import type { WindowStatus } from "../types.js";
-import { isRelativeDate, parseTextTerms } from "./parse.js";
+import { parseTextTerms } from "./parse.js";
+import { RELATIVE_DATE_INTERVALS, filenameGlob, filetypeMatch, isRelativeDate } from "./rules.js";
 
 /** Accumulates bound parameter values and hands back `$n` placeholders. User
  * input is NEVER interpolated into SQL text — only through these placeholders. */
@@ -39,13 +40,6 @@ export interface CompiledQuery {
   values: unknown[];
 }
 
-const RELATIVE_UNIT: Record<string, string> = {
-  h: "1 hour",
-  d: "1 day",
-  w: "1 week",
-  m: "1 month",
-  y: "1 year"
-};
 
 function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
@@ -58,39 +52,17 @@ function escapeLike(value: string): string {
 function dateExpr(value: string, pb: Params, nowExpr: string): string {
   if (isRelativeDate(value)) {
     const amount = Number.parseInt(value.slice(0, -1), 10);
-    const unit = RELATIVE_UNIT[value.slice(-1)] ?? "1 day";
+    const unit = RELATIVE_DATE_INTERVALS[value.slice(-1)];
     return `(${nowExpr} - (${pb.add(amount)} * interval '${unit}'))`;
   }
   return `${pb.add(value)}::timestamptz`;
 }
 
 function filetypePredicate(value: string, pb: Params): string {
-  switch (value) {
-    case "pdf":
-      return `lower(a.mime_type) = 'application/pdf'`;
-    case "image":
-      return `lower(a.mime_type) LIKE 'image/%'`;
-    case "video":
-      return `lower(a.mime_type) LIKE 'video/%'`;
-    case "audio":
-      return `lower(a.mime_type) LIKE 'audio/%'`;
-    case "text":
-      return `lower(a.mime_type) LIKE 'text/%'`;
-    case "zip":
-    case "archive":
-      return `lower(a.mime_type) IN ('application/zip','application/x-zip-compressed','application/gzip','application/x-tar','application/x-7z-compressed')`;
-    case "doc":
-    case "word":
-      return `lower(a.mime_type) IN ('application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document')`;
-    case "sheet":
-    case "spreadsheet":
-    case "excel":
-      return `lower(a.mime_type) IN ('application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')`;
-    default: {
-      const p = pb.add(`%${escapeLike(value)}%`);
-      return `lower(a.mime_type) LIKE ${p}`;
-    }
-  }
+  const match = filetypeMatch(value);
+  if (match.kind === "prefix") return `lower(a.mime_type) LIKE ${pb.add(`${escapeLike(match.prefix)}%`)}`;
+  if (match.kind === "mimes") return `lower(a.mime_type) = ANY(${pb.add(match.mimes)}::text[])`;
+  return `lower(a.mime_type) LIKE ${pb.add(`%${escapeLike(match.text)}%`)}`;
 }
 
 /**
@@ -194,8 +166,9 @@ function filterPredicate(filter: SearchFilter, pb: Params, nowExpr: string): str
     case "hasBody":
       return filter.negated ? `m.body_fetched_at IS NULL` : `m.body_fetched_at IS NOT NULL`;
     case "filename": {
-      const glob = filter.value.replace(/[\\%_]/g, (ch) => `\\${ch}`).replace(/\*/g, "%").replace(/\?/g, "_");
-      const p = pb.add(glob.includes("%") || glob.includes("_") ? glob : `%${glob}%`);
+      // The shared glob, as LIKE: escape LIKE's own wildcards, then map * and ?.
+      const like = filenameGlob(filter.value).replace(/[\\%_]/g, (ch) => `\\${ch}`).replace(/\*/g, "%").replace(/\?/g, "_");
+      const p = pb.add(like);
       const exists = `EXISTS (SELECT 1 FROM public.imap_attachments a WHERE a.message_id = m.id AND lower(coalesce(a.filename,'')) LIKE ${p})`;
       return filter.negated ? `NOT ${exists}` : exists;
     }
