@@ -165,7 +165,8 @@ describe("setMessageFlags", () => {
   it("refuses a message already deleted in the provider", async () => {
     repo.getMessage.mockResolvedValue(message({ deleted_in_provider: true }));
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    await expect(setMessageFlags({} as never, config, "msg-1", { add: ["seen"] })).rejects.toThrow(/already deleted/);
+    await expect(setMessageFlags({} as never, config, "msg-1", { add: ["seen"] }))
+      .rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/already deleted/) });
   });
 });
 
@@ -200,6 +201,10 @@ describe("deleteMessage", () => {
     expect(mutator.move).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), "Trash");
     expect(mutator.expunge).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "trash", trashFolder: "Trash" });
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX", "Trash"]);
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.move.mock.invocationCallOrder[0]
+    );
   });
 
   it("is a no-op move when the message already lives in Trash", async () => {
@@ -207,6 +212,7 @@ describe("deleteMessage", () => {
     const { deleteMessage } = await import("../mailbox-mutations.js");
     const result = await deleteMessage({} as never, config, "msg-1", {});
     expect(mutator.move).not.toHaveBeenCalled();
+    expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "trash", trashFolder: "Trash" });
   });
 
@@ -217,6 +223,10 @@ describe("deleteMessage", () => {
     expect(mutator.expunge).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }));
     expect(mutator.move).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "expunge", trashFolder: null });
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX"]);
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.expunge.mock.invocationCallOrder[0]
+    );
   });
 });
 

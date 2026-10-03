@@ -56,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   })),
   getAccount: vi.fn(),
   getMessage: vi.fn(),
+  markFoldersForReconcile: vi.fn(async () => undefined),
   withAccountLock: vi.fn(),
   lockAssertLive: vi.fn(),
   lockConfirmIrreversible: vi.fn(),
@@ -93,6 +94,7 @@ vi.mock("../repository.js", () => ({
   MirrorRepository: class {
     getAccount = mocks.getAccount;
     getMessage = mocks.getMessage;
+    markFoldersForReconcile = mocks.markFoldersForReconcile;
   }
 }));
 
@@ -224,6 +226,10 @@ describe("createDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
     const [path, raw, flags] = mocks.append.mock.calls[0];
     expect(path).toBe("Drafts");
+    // Drafts is durably due before the APPEND, so a host can reconcile it at once.
+    expect(mocks.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["Drafts"]);
+    expect(mocks.markFoldersForReconcile.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.append.mock.invocationCallOrder[0]);
     expect(Buffer.isBuffer(raw)).toBe(true);
     expect(flags).toContain("\\Draft");
     expect(mocks.logout).toHaveBeenCalledTimes(1);
