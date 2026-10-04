@@ -2,6 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { AppConfig } from "./config.js";
 import { buildSearchExtract } from "./body-store.js";
+import {
+  EVIDENCE_VERSIONS_WITHOUT_REFETCH,
+  MIME_EVIDENCE_EXTRACTOR,
+  MIME_EVIDENCE_EXTRACTOR_VERSION,
+  authoredDeliveryDigestSql,
+  canonicalJsonForThreadingEvidence,
+  structuredEvidenceSha256
+} from "./delivery-evidence.js";
 import { encryptPassword } from "./crypto.js";
 import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError } from "./errors.js";
@@ -66,8 +74,6 @@ const LIVE_THREAD_RUN_STATUSES = ["building", "ready", "active", "standby"] as c
 const PURGE_MESSAGE_BATCH_SIZE = 100;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
 const RECONCILE_MISSING_UID_LIMIT = 5_000;
-const MIME_EVIDENCE_EXTRACTOR = "mime_body";
-const MIME_EVIDENCE_EXTRACTOR_VERSION = "mime_evidence_v1";
 const MAX_MESSAGE_EVIDENCE_ROWS = 100;
 const THREADING_BODY_HEADER_KEYS = [
   "message-id",
@@ -363,25 +369,6 @@ function headerText(value: unknown): string | null {
     return joined || null;
   }
   return value == null ? null : String(value).trim() || null;
-}
-
-export function canonicalJsonForThreadingEvidence(value: unknown): string {
-  if (value === null) return "null";
-  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : "null";
-  if (typeof value === "bigint") return JSON.stringify(value.toString());
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => entry === undefined ? "null" : canonicalJsonForThreadingEvidence(entry)).join(",")}]`;
-  }
-  if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
-    return `{${entries.map(([key, entry]) => (
-      `${JSON.stringify(key)}:${canonicalJsonForThreadingEvidence(entry)}`
-    )).join(",")}}`;
-  }
-  return JSON.stringify(String(value));
 }
 
 interface PreparedMessageEvidenceRow {
@@ -3935,11 +3922,9 @@ export class MirrorRepository {
     const preparedEvidence = body.rawTruncated ? [] : prepareMessageEvidence(body);
     const structuredEvidenceComplete = !body.rawTruncated
       && !body.parserWarnings.includes("artifact_evidence_truncated");
-    const structuredEvidenceSha256 = !structuredEvidenceComplete
-      ? null
-      : createHash("sha256")
-        .update(canonicalJsonForThreadingEvidence(preparedEvidence))
-        .digest("hex");
+    const evidenceSha256 = structuredEvidenceComplete
+      ? structuredEvidenceSha256(preparedEvidence)
+      : null;
       const target = await client.query<
         ImapMessage & ProtectedMetadataColumns & {
         body_raw_mime_sha256: string | null;
@@ -4056,22 +4041,18 @@ export class MirrorRepository {
              ELSE NULL
            END AS parsed_delivery_sha256,
            CASE WHEN $14::boolean
-             THEN encode(extensions.digest(convert_to(jsonb_build_object(
-               'message_id', $9::jsonb -> 'message-id',
-               'date', $9::jsonb -> 'date',
-               'subject', $1::text,
-               'from_email', $2::text,
-               'to_emails', $3::text[],
-               'cc_emails', $4::text[],
-               'bcc_emails', $5::text[],
-               'threading_payload_sha256', $8::text,
-               'content_type', $9::jsonb -> 'content-type',
-               'content_transfer_encoding', $9::jsonb -> 'content-transfer-encoding',
-               'mime_version', $9::jsonb -> 'mime-version',
-               'mime_structure', $10::jsonb,
-               'parser_warnings', $11::text[],
-               'structured_evidence_sha256', $12::text
-             )::text, 'UTF8'), 'sha256'), 'hex')
+             THEN ${authoredDeliveryDigestSql({
+               headersJson: "$9::jsonb",
+               subject: "$1::text",
+               fromEmail: "$2::text",
+               toEmails: "$3::text[]",
+               ccEmails: "$4::text[]",
+               bccEmails: "$5::text[]",
+               threadingPayloadSha256: "$8::text",
+               mimeStructure: "$10::jsonb",
+               parserWarnings: "$11::text[]",
+               structuredEvidenceSha256: "$12::text"
+             })}
              ELSE NULL
            END AS authored_delivery_sha256`,
         [
@@ -4086,14 +4067,14 @@ export class MirrorRepository {
           JSON.stringify(body.headersJson),
           JSON.stringify(body.mimeStructure),
           body.parserWarnings,
-          structuredEvidenceSha256,
+          evidenceSha256,
           !body.rawTruncated && rawMimeSha256 === null && hasThreadingEnvelope,
           !body.rawTruncated
             && hasThreadingEnvelope
             && body.headersJson.date !== undefined
             && body.mimeStructure !== null
             && structuredEvidenceComplete
-            && structuredEvidenceSha256 !== null
+            && evidenceSha256 !== null
         ]
       );
       const parsedSha256 = digests.rows[0]?.parsed_delivery_sha256 ?? null;
@@ -4204,7 +4185,7 @@ export class MirrorRepository {
           headers_json: body.headersJson,
           mime_structure: body.mimeStructure ?? null,
           parser_warnings: body.parserWarnings,
-          structured_evidence_sha256: structuredEvidenceSha256,
+          structured_evidence_sha256: evidenceSha256,
           threading_payload_sha256: payloadSha256,
           search_extract: buildSearchExtract(body.bodyText)
         }
@@ -4557,7 +4538,7 @@ export class MirrorRepository {
                   AND m.window_status = 'HISTORICAL'
                   AND (
                     m.body_fetched_at IS NULL
-                    OR b.structured_evidence_extractor_version IS DISTINCT FROM $5
+                    OR NOT coalesce(b.structured_evidence_extractor_version = ANY($5::text[]), false)
                   )
               )
             THEN 'body'
@@ -4604,7 +4585,7 @@ export class MirrorRepository {
         account.historical_backfill_mode,
         account.archive_refresh_interval,
         limit,
-        MIME_EVIDENCE_EXTRACTOR_VERSION
+        EVIDENCE_VERSIONS_WITHOUT_REFETCH
       ]
     );
     return result.rows;
@@ -4626,12 +4607,12 @@ export class MirrorRepository {
         AND m.window_status = 'HISTORICAL'
         AND (
           m.body_fetched_at IS NULL
-          OR b.structured_evidence_extractor_version IS DISTINCT FROM $4
+          OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
         )
       ORDER BY m.uid DESC
       LIMIT $3
       `,
-      [accountId, folder.path, limit, MIME_EVIDENCE_EXTRACTOR_VERSION]
+      [accountId, folder.path, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH]
     );
     return await Promise.all(result.rows.map((row) => this.revealMessage(row)));
   }
@@ -4742,7 +4723,7 @@ export class MirrorRepository {
     if (policy === "lazy") return [];
 
     const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $4" : "";
-    const params: unknown[] = [account.id, limit, MIME_EVIDENCE_EXTRACTOR_VERSION];
+    const params: unknown[] = [account.id, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH];
     if (policy === "priority_then_backfill") params.push(this.config.PRIORITY_CUTOFF);
 
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
@@ -4764,7 +4745,7 @@ export class MirrorRepository {
         AND m.window_status = 'IN_WINDOW'
         AND (
           m.body_fetched_at IS NULL
-          OR b.structured_evidence_extractor_version IS DISTINCT FROM $3
+          OR NOT coalesce(b.structured_evidence_extractor_version = ANY($3::text[]), false)
         )
         ${priorityClause}
       ORDER BY f.sync_priority, m.uid DESC
