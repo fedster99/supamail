@@ -50,7 +50,8 @@ table that fills late, we use **two** `GENERATED ALWAYS ... STORED` tsvector col
 
 - `imap_messages.header_fts` — weight A = subject, B = sender, C = recipients.
 - `imap_message_bodies.body_fts` — weight D = the HTML-stripped plain body
-  (`body_text`, which is `bodyPlain ?? htmlToText(bodyHtml)`).
+  (`body_text`, which is `readableBodyText(bodyPlain, bodyHtml)`: the plain
+  part, or the visible HTML text when the plain part is empty or holds markup).
 
 Generated columns *are* the incremental materialization: `header_fts` recomputes only
 when a weighted source column actually changes (and **not** on the flag-only rescan

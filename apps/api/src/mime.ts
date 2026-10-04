@@ -407,14 +407,14 @@ export function normalizeBodyText(text: string): string {
 // end of input, as browsers parse unclosed elements, so time stays linear even
 // for crafted input such as a megabyte of "<".
 const HTML_TOKEN_RE =
-  /<(script|style|title)\b[^>]*(?:>[\s\S]*?(?:<\/\1\s*>|$)|$)|<!--[\s\S]*?(?:-->|$)|<(\/?)([a-z][a-z0-9]*)\b[^>]*(?:>|$)|<[!?][^>]*(?:>|$)/gi;
+  /<(script|style|title)\b[^>]*(?:>[\s\S]*?(?:<\/\1\s*>|$)|$)|<!--[\s\S]*?(?:-->|$)|<\/?([a-z][a-z0-9]*)\b[^>]*(?:>|$)|<[!?][^>]*(?:>|$)/gi;
 const LINE_BREAK_TAGS = new Set(["br", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"]);
 
 /** Visible text of an HTML body: no script, style, title or comments. */
 export function htmlToText(html: string): string {
   return normalizeBodyText(
     decodeHtmlEntities(
-      html.replace(HTML_TOKEN_RE, (_token, _rawText, _slash, tag: string | undefined) =>
+      html.replace(HTML_TOKEN_RE, (_token, _rawText, tag: string | undefined) =>
         tag && LINE_BREAK_TAGS.has(tag.toLowerCase()) ? "\n" : " "
       )
     )
@@ -435,8 +435,8 @@ const MARKUP_IN_PLAIN_RE =
 export function readableBodyText(bodyPlain: string | null, bodyHtml: string | null): string | null {
   if (bodyPlain && !MARKUP_IN_PLAIN_RE.test(bodyPlain)) return bodyPlain;
   if (!bodyHtml) return bodyPlain;
-  const htmlText = htmlToText(bodyHtml);
-  return htmlText || (bodyPlain ?? htmlText);
+  // HTML with no visible text keeps a non-empty plain part.
+  return htmlToText(bodyHtml) || (bodyPlain ?? "");
 }
 
 interface StreamedAttachmentEvidence {
