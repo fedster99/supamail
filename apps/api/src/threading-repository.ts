@@ -19,6 +19,14 @@ import {
   type ProtectedMetadataColumns
 } from "./metadata-protection.js";
 import {
+  DIGEST_UPGRADE_EVIDENCE_EXTRACTOR_VERSION,
+  MIME_EVIDENCE_EXTRACTOR,
+  MIME_EVIDENCE_EXTRACTOR_VERSION,
+  authoredDeliveryDigestSql,
+  structuredEvidenceSha256,
+  type EvidenceIdentity
+} from "./delivery-evidence.js";
+import {
   THREADING_ALGORITHM_VERSION,
   computeThreadAssignments,
   computeThreadAssignmentsV1,
@@ -31,6 +39,9 @@ import {
 
 const DEFAULT_BATCH_SIZE = 500;
 const DEFAULT_BODY_EVIDENCE_BATCH_SIZE = 2;
+// Digest upgrades read compact rows only, so they take a larger page than the
+// payload-hashing repairs above.
+const EVIDENCE_DIGEST_UPGRADE_BATCH_SIZE = 100;
 const DEFAULT_BODY_EVIDENCE_STATEMENT_TIMEOUT_MS = 15_000;
 const DEFAULT_METADATA_PROTECTION_TIMEOUT_MS = 5_000;
 const METADATA_PROTECTION_CONCURRENCY = 16;
@@ -993,6 +1004,8 @@ export class ThreadingRepository {
   private readonly onStageTiming: (timing: ThreadingStageTiming) => void | Promise<void>;
   private readonly failedStages = new WeakMap<object, ThreadingStage>();
   private readonly metadataProtectionScope = new AsyncLocalStorage<MetadataProtectionScope>();
+  // Mailbox Accounts whose evidence digests this process has fully upgraded.
+  private readonly evidenceDigestsUpgraded = new Set<string>();
   private readonly metadataProtectionPermits = new AdapterPermitPool(
     METADATA_PROTECTION_CONCURRENCY
   );
@@ -1443,6 +1456,7 @@ export class ThreadingRepository {
         // then hashing that same row would invert the lock order and deadlock.
         // The update is bounded, idempotent, and its evidence trigger queues all
         // live runs before the projection transaction begins.
+        await this.upgradeEvidenceDigestsWithinDeadline(client, accountId);
         const bodyEvidenceBatchSize = Math.min(batchSize, this.bodyEvidenceBatchSize);
         const bodyHashesBackfilled = await this.backfillBodyEvidenceBatchWithinDeadline(
           client,
@@ -2695,22 +2709,18 @@ export class ThreadingRepository {
       authored_delivery_sha256: string;
     }>(
       `SELECT body.message_id,
-              encode(extensions.digest(convert_to(jsonb_build_object(
-                'message_id', body.headers_json -> 'message-id',
-                'date', body.headers_json -> 'date',
-                'subject', message.subject,
-                'from_email', message.from_email,
-                'to_emails', message.to_emails,
-                'cc_emails', message.cc_emails,
-                'bcc_emails', message.bcc_emails,
-                'threading_payload_sha256', body.threading_payload_sha256,
-                'content_type', body.headers_json -> 'content-type',
-                'content_transfer_encoding', body.headers_json -> 'content-transfer-encoding',
-                'mime_version', body.headers_json -> 'mime-version',
-                'mime_structure', body.mime_structure,
-                'parser_warnings', body.parser_warnings,
-                'structured_evidence_sha256', body.structured_evidence_sha256
-              )::text, 'UTF8'), 'sha256'), 'hex') AS authored_delivery_sha256
+              ${authoredDeliveryDigestSql({
+                headersJson: "body.headers_json",
+                subject: "message.subject",
+                fromEmail: "message.from_email",
+                toEmails: "message.to_emails",
+                ccEmails: "message.cc_emails",
+                bccEmails: "message.bcc_emails",
+                threadingPayloadSha256: "body.threading_payload_sha256",
+                mimeStructure: "body.mime_structure",
+                parserWarnings: "body.parser_warnings",
+                structuredEvidenceSha256: "body.structured_evidence_sha256"
+              })} AS authored_delivery_sha256
        FROM public.imap_message_bodies body
        JOIN public.imap_messages message ON message.id = body.message_id
        WHERE body.message_id = ANY($1::uuid[])
@@ -2886,6 +2896,207 @@ export class ThreadingRepository {
       [JSON.stringify(candidates.rows), candidates.rows.map((candidate) => candidate.message_id)]
     );
     return Number(changed.rows[0]?.count ?? 0);
+  }
+
+  /**
+   * Recompute structured-evidence digests written by mime_evidence_v1, and the
+   * authored digests built on them, from the stored evidence rows. A changed
+   * authored digest fires the database trigger that queues threading work, so
+   * stored copies of one email can join one delivery. Like the repairs above,
+   * this runs before the thread-state transaction to keep the lock order.
+   */
+  private async upgradeEvidenceDigestsWithinDeadline(
+    client: PgClient,
+    accountId: string
+  ): Promise<void> {
+    if (this.evidenceDigestsUpgraded.has(accountId)) return;
+    await client.query("BEGIN");
+    try {
+      await client.query(
+        "SELECT set_config('statement_timeout', $1, true)",
+        [`${this.bodyEvidenceStatementTimeoutMs}ms`]
+      );
+      const upgraded = await this.upgradeEvidenceDigests(client, accountId);
+      await client.query("COMMIT");
+      if (upgraded < EVIDENCE_DIGEST_UPGRADE_BATCH_SIZE) this.evidenceDigestsUpgraded.add(accountId);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async upgradeEvidenceDigests(client: PgClient, accountId: string): Promise<number> {
+    const rows = (await client.query<ProtectedMetadataColumns & Record<string, unknown> & {
+      message_id: string;
+      structured_evidence_complete: boolean;
+    }>(
+      // Compact columns only: OSS mirrors may keep raw MIME and bodies here.
+      // A row that a body write holds is skipped; that write stores a v2 digest.
+      `SELECT body.message_id, body.structured_evidence_complete,
+              ${THREADING_BODY_PROTECTED_FIELDS.map((field) => `body.${field}`).join(", ")},
+              body.protected_metadata, body.protected_metadata_version,
+              body.protected_metadata_key_version, body.protected_metadata_tokens
+       FROM public.imap_message_bodies body
+       JOIN public.imap_messages message ON message.id = body.message_id
+       WHERE message.account_id = $1
+         AND body.structured_evidence_extractor_version = $2
+       ORDER BY body.message_id
+       LIMIT $3
+       FOR UPDATE OF body SKIP LOCKED`,
+      [accountId, DIGEST_UPGRADE_EVIDENCE_EXTRACTOR_VERSION, EVIDENCE_DIGEST_UPGRADE_BATCH_SIZE]
+    )).rows;
+    if (rows.length === 0) return 0;
+    const ids = rows.map((row) => row.message_id);
+
+    const messages = new Map((await client.query<ProtectedMetadataColumns & Record<string, unknown> & { id: string }>(
+      `SELECT id, ${THREADING_MESSAGE_PROTECTED_FIELDS.join(", ")},
+              protected_metadata, protected_metadata_version,
+              protected_metadata_key_version, protected_metadata_tokens
+       FROM public.imap_messages WHERE id = ANY($1::uuid[])`,
+      [ids]
+    )).rows.map((row) => [row.id, row]));
+    const evidenceRows = (await client.query<ProtectedMetadataColumns & {
+      id: string;
+      message_id: string;
+      kind: string;
+      namespace: string;
+      evidence_key: string;
+      evidence_key_sha256: string;
+      metadata: Record<string, unknown>;
+    }>(
+      `SELECT id, message_id, kind, namespace, evidence_key, evidence_key_sha256, metadata,
+              protected_metadata, protected_metadata_version,
+              protected_metadata_key_version, protected_metadata_tokens
+       FROM public.imap_message_evidence
+       WHERE message_id = ANY($1::uuid[]) AND extractor = $2`,
+      [ids, MIME_EVIDENCE_EXTRACTOR]
+    )).rows;
+    const evidenceByMessage = new Map<string, EvidenceIdentity[]>();
+    await mapWithConcurrency(evidenceRows, METADATA_PROTECTION_CONCURRENCY, async (row) => {
+      const values = await this.revealMetadata(
+        { kind: "message_evidence", accountId, recordId: row.id },
+        storedMetadataProjection(row, {
+          evidence_key: row.evidence_key,
+          evidence_key_sha256: row.evidence_key_sha256,
+          metadata: row.metadata
+        })
+      );
+      const group = evidenceByMessage.get(row.message_id) ?? [];
+      group.push({
+        kind: row.kind,
+        namespace: row.namespace,
+        evidence_key_sha256: String(values.evidence_key_sha256),
+        metadata: values.metadata
+      });
+      evidenceByMessage.set(row.message_id, group);
+    });
+
+    const revealed = await mapWithConcurrency(rows, METADATA_PROTECTION_CONCURRENCY, async (row) => {
+      const body = await this.revealMetadata(
+        { kind: "message_body", accountId, recordId: row.message_id },
+        storedMetadataProjection(
+          row,
+          Object.fromEntries(THREADING_BODY_PROTECTED_FIELDS.map((field) => [field, row[field]]))
+        )
+      );
+      assertRevealedMetadataValues(body, THREADING_BODY_PROTECTED_FIELDS);
+      const stored = messages.get(row.message_id)!;
+      const message = await this.revealMetadata(
+        { kind: "message", accountId, recordId: row.message_id },
+        storedMetadataProjection(
+          stored,
+          Object.fromEntries(THREADING_MESSAGE_PROTECTED_FIELDS.map((field) => [field, stored[field]]))
+        )
+      );
+      const structured = row.structured_evidence_complete
+        ? structuredEvidenceSha256(evidenceByMessage.get(row.message_id) ?? [])
+        : null;
+      return { messageId: row.message_id, body, message, structured };
+    });
+
+    // Recompute only digests that exist: eligibility for one does not change.
+    const authoredInputs = revealed.filter((item) => item.body.authored_delivery_sha256 != null);
+    const authored = new Map((await client.query<{ message_id: string; authored: string }>(
+      `SELECT input.message_id, ${authoredDeliveryDigestSql({
+        headersJson: "input.headers_json",
+        subject: "input.subject",
+        fromEmail: "input.from_email",
+        toEmails: "input.to_emails",
+        ccEmails: "input.cc_emails",
+        bccEmails: "input.bcc_emails",
+        threadingPayloadSha256: "input.threading_payload_sha256",
+        mimeStructure: "input.mime_structure",
+        parserWarnings: "input.parser_warnings",
+        structuredEvidenceSha256: "input.structured_evidence_sha256"
+      })} AS authored
+       FROM jsonb_to_recordset($1::jsonb) AS input (
+         message_id uuid, headers_json jsonb, subject text, from_email text,
+         to_emails text[], cc_emails text[], bcc_emails text[],
+         threading_payload_sha256 text, mime_structure jsonb, parser_warnings text[],
+         structured_evidence_sha256 text
+       )`,
+      [JSON.stringify(authoredInputs.map((item) => ({
+        message_id: item.messageId,
+        headers_json: item.body.headers_json,
+        subject: item.message.subject,
+        from_email: item.message.from_email,
+        to_emails: item.message.to_emails,
+        cc_emails: item.message.cc_emails,
+        bcc_emails: item.message.bcc_emails,
+        threading_payload_sha256: item.body.threading_payload_sha256,
+        mime_structure: item.body.mime_structure,
+        parser_warnings: item.body.parser_warnings,
+        structured_evidence_sha256: item.structured
+      })))]
+    )).rows.map((row) => [row.message_id, row.authored]));
+
+    const writes = await mapWithConcurrency(revealed, METADATA_PROTECTION_CONCURRENCY, async (item) => {
+      const projection = await this.protectMetadata(
+        { kind: "message_body", accountId, recordId: item.messageId },
+        {
+          ...item.body,
+          structured_evidence_sha256: item.structured,
+          authored_delivery_sha256: authored.get(item.messageId) ?? null
+        }
+      );
+      return {
+        message_id: item.messageId,
+        structured_evidence_sha256: projection.values.structured_evidence_sha256,
+        authored_delivery_sha256: projection.values.authored_delivery_sha256,
+        parsed_delivery_sha256: projection.values.parsed_delivery_sha256,
+        ...protectedMetadataColumns(projection),
+        protected_metadata: projection.protectedMetadata?.toString("base64") ?? null
+      };
+    });
+    await client.query(
+      `UPDATE public.imap_message_bodies body
+       SET structured_evidence_sha256 = input.structured_evidence_sha256,
+           authored_delivery_sha256 = input.authored_delivery_sha256,
+           structured_evidence_extractor_version = $2,
+           protected_metadata = decode(input.protected_metadata, 'base64'),
+           protected_metadata_version = input.protected_metadata_version,
+           protected_metadata_key_version = input.protected_metadata_key_version,
+           protected_metadata_tokens = input.protected_metadata_tokens,
+           updated_at = now()
+       FROM jsonb_to_recordset($1::jsonb) AS input (
+         message_id uuid, structured_evidence_sha256 text, authored_delivery_sha256 text,
+         protected_metadata text, protected_metadata_version smallint,
+         protected_metadata_key_version integer, protected_metadata_tokens jsonb
+       )
+       WHERE body.message_id = input.message_id`,
+      [JSON.stringify(writes), MIME_EVIDENCE_EXTRACTOR_VERSION]
+    );
+    // The body invalidation trigger clears an unchanged parsed digest whenever
+    // the evidence digest changes, but the parsed digest never covers evidence.
+    await client.query(
+      `UPDATE public.imap_message_bodies body
+       SET parsed_delivery_sha256 = input.parsed_delivery_sha256
+       FROM jsonb_to_recordset($1::jsonb) AS input (message_id uuid, parsed_delivery_sha256 text)
+       WHERE body.message_id = input.message_id
+         AND input.parsed_delivery_sha256 IS NOT NULL`,
+      [JSON.stringify(writes)]
+    );
+    return rows.length;
   }
 
   /**
