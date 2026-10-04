@@ -1,9 +1,16 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
+// Mirror ids are UUIDs; any other value names no row.
+const D1 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const M1 = "11111111-1111-4111-8111-111111111111";
+/** The mirror id of a draft this save wrote. */
+const N1 = "22222222-2222-4222-8222-222222222222";
+
 /**
  * Unit coverage for the draft CRUD primitives (email-003, ADR 0019). This task is
  * mostly COMPOSITION, so the tests assert the composition wiring:
- *   - create  → buildRawMime + APPEND `\Draft` to the resolved Drafts folder
+ *   - create  → buildRawMime + APPEND `\Draft` to the resolved Drafts folder, then
+ *               the draft's mirror row from its APPENDUID (ADR 0033)
  *   - update  → APPEND-new + delete-old (the email-002 hard delete)
  *   - send    → RESEND the draft's raw bytes (getRawMime → deliverSmtp → APPEND to
  *               Sent), THEN delete the draft. NOT a rebuild from the mirror body.
@@ -20,7 +27,10 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // --- Mocked appender, send primitive, delete mutation, and repository. ---
 
 const mocks = vi.hoisted(() => ({
-  append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date) => ({ uid: 7 as number | null })),
+  append: vi.fn(async (_path: string, _raw: Buffer, _flags: string[], _date?: Date): Promise<{
+    uid: number;
+    uidValidity: number;
+  } | null> => ({ uid: 7, uidValidity: 100 })),
   list: vi.fn(async () => [{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]),
   logout: vi.fn(async () => undefined),
   close: vi.fn(),
@@ -28,7 +38,7 @@ const mocks = vi.hoisted(() => ({
   // sendDraft now RESENDS the draft's raw bytes: getRawMime → deliverSmtp → APPEND
   // to Sent. The raw fetch and the SMTP submit are both mocked.
   getRawMime: vi.fn(async (_pool: unknown, _config: unknown, _id: string) => ({
-    messageId: "draft-1",
+    messageId: D1,
     raw: Buffer.from("From: user@example.test\r\n\r\nHello there"),
     source: "fetch" as const,
     truncated: false
@@ -56,6 +66,10 @@ const mocks = vi.hoisted(() => ({
   })),
   getAccount: vi.fn(),
   getMessage: vi.fn(),
+  markFoldersForReconcile: vi.fn(async () => undefined),
+  getFoldersForWake: vi.fn(),
+  upsertMessages: vi.fn(),
+  getLiveMessageId: vi.fn(),
   withAccountLock: vi.fn(),
   lockAssertLive: vi.fn(),
   lockConfirmIrreversible: vi.fn(),
@@ -93,10 +107,19 @@ vi.mock("../repository.js", () => ({
   MirrorRepository: class {
     getAccount = mocks.getAccount;
     getMessage = mocks.getMessage;
+    markFoldersForReconcile = mocks.markFoldersForReconcile;
+    getFoldersForWake = mocks.getFoldersForWake;
+    upsertMessages = mocks.upsertMessages;
+    getLiveMessageId = mocks.getLiveMessageId;
   }
 }));
 
 const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+/** A pool whose only query is the Drafts folder lookup used by draft actions. */
+const draftPool = { query: vi.fn(async () => ({ rows: [{ path: "Drafts" }] })) } as never;
+const draftRow = { id: D1, account_id: "acc-1", folder_path: "Drafts", flags: [], deleted_in_provider: false };
+/** The tracked, mirrored Drafts folder at the APPENDUID's UIDVALIDITY. */
+const draftsFolder = { id: "folder-drafts", account_id: "acc-1", path: "Drafts", uidvalidity: "100" };
 
 const account = {
   id: "acc-1",
@@ -125,12 +148,15 @@ beforeEach(() => {
   mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => fn(mockAccountLock()));
   mocks.lockAssertLive.mockResolvedValue(undefined);
   mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
-  mocks.searchByMessageId.mockResolvedValue([]); // default: no prior draft (idempotency miss)
-  mocks.append.mockResolvedValue({ uid: 7 });
+  mocks.searchByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
+  mocks.append.mockResolvedValue({ uid: 7, uidValidity: 100 });
+  mocks.getFoldersForWake.mockResolvedValue([draftsFolder]);
+  mocks.upsertMessages.mockResolvedValue([{ id: N1 }]);
+  mocks.getLiveMessageId.mockResolvedValue(null);
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
   mocks.getAccount.mockResolvedValue(account);
   mocks.getRawMime.mockResolvedValue({
-    messageId: "draft-1",
+    messageId: D1,
     raw: Buffer.from("From: user@example.test\r\n\r\nHello there"),
     source: "fetch",
     truncated: false
@@ -169,7 +195,7 @@ describe("createDraft", () => {
 
   it("returns the existing draft (no duplicate APPEND) on an idempotent retry", async () => {
     // Same Idempotency-Key -> same derived Message-ID -> search finds the prior APPEND.
-    mocks.searchByMessageId.mockResolvedValueOnce([41, 42]);
+    mocks.searchByMessageId.mockResolvedValueOnce({ uids: [41, 42], uidValidity: 100 });
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
       accountId: "acc-1",
@@ -181,6 +207,20 @@ describe("createDraft", () => {
     expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
+    // Nothing new reached the provider, so nothing new is marked or written.
+    expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
+    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(mocks.getLiveMessageId).toHaveBeenCalledWith({ accountId: "acc-1", folderPath: "Drafts", uidValidity: 100, uid: 42 });
+  });
+
+  it("returns the mirror id of the draft an earlier attempt saved", async () => {
+    mocks.searchByMessageId.mockResolvedValueOnce({ uids: [42], uidValidity: 100 });
+    mocks.getLiveMessageId.mockResolvedValueOnce(N1);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }, idempotencyKey: "req-key-1"
+    });
+    expect(result).toMatchObject({ messageId: N1, warnings: [] });
   });
 
   it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
@@ -212,6 +252,15 @@ describe("createDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
   });
 
+  it("does not APPEND when Drafts cannot be marked due first", async () => {
+    mocks.markFoldersForReconcile.mockRejectedValueOnce(new Error("database unavailable"));
+    const { createDraft } = await import("../drafts.js");
+    await expect(createDraft({} as never, config, {
+      accountId: "acc-1", to: [{ email: "rcpt@example.test" }], subject: "s", body: { format: "plain", text: "b" }
+    })).rejects.toThrow(/database unavailable/);
+    expect(mocks.append).not.toHaveBeenCalled();
+  });
+
   it("APPENDs the composed bytes with \\Draft to the resolved Drafts folder", async () => {
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
@@ -224,14 +273,127 @@ describe("createDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
     const [path, raw, flags] = mocks.append.mock.calls[0];
     expect(path).toBe("Drafts");
+    // Drafts is durably due before the APPEND, so a host can reconcile it at once.
+    expect(mocks.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["Drafts"]);
+    expect(mocks.markFoldersForReconcile.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.append.mock.invocationCallOrder[0]);
     expect(Buffer.isBuffer(raw)).toBe(true);
     expect(flags).toContain("\\Draft");
     expect(mocks.logout).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ accountId: "acc-1", draftsFolderPath: "Drafts", appendedUid: 7 });
+    expect(result).toMatchObject({
+      accountId: "acc-1", draftsFolderPath: "Drafts", messageId: N1, appendedUid: 7, warnings: []
+    });
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     // Create does NOT send or delete — it only files the draft.
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("writes the saved draft's mirror row from its APPENDUID and the composed values", async () => {
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1",
+      senderName: " Ada ",
+      to: [{ email: "rcpt@example.test", name: "Rcpt" }],
+      cc: [{ email: "cc@example.test" }],
+      subject: "My draft",
+      body: { format: "plain", text: "Hello" },
+      inReplyTo: "<parent@example.test>"
+    });
+
+    expect(mocks.getFoldersForWake).toHaveBeenCalledWith("acc-1", ["Drafts"]);
+    expect(mocks.upsertMessages).toHaveBeenCalledTimes(1);
+    expect(mocks.upsertMessages.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
+    const [accountId, folder, uidValidity, [metadata], windowCutoff, writeOptions] = mocks.upsertMessages.mock.calls[0];
+    const [, raw, , savedAt] = mocks.append.mock.calls[0];
+    expect([accountId, folder, uidValidity]).toEqual(["acc-1", draftsFolder, 100]);
+    expect(windowCutoff).toBeInstanceOf(Date);
+    // A short deadline: the provider already holds the draft.
+    expect(writeOptions.deadlineAt).toBeGreaterThan(Date.now());
+    expect(writeOptions.deadlineAt).toBeLessThanOrEqual(Date.now() + 5_000);
+    // The lock fences the write, as sync's lock does, and the save is confirmed
+    // once the provider holds the draft.
+    expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), {
+      fenceWrites: true,
+      onPostIrreversibleWarning: expect.any(Function)
+    });
+    expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
+    expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
+    expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeLessThan(mocks.upsertMessages.mock.invocationCallOrder[0]);
+    expect(metadata).toMatchObject({
+      uid: 7,
+      internalDate: savedAt,
+      sizeBytes: (raw as Buffer).length,
+      flags: ["\\Draft", "\\Seen"],
+      rfcMessageId: result.rfcMessageId,
+      inReplyTo: "<parent@example.test>",
+      subject: "My draft",
+      fromEmail: "user@example.test",
+      fromName: "Ada",
+      toEmails: ["rcpt@example.test"],
+      toNames: ["Rcpt"],
+      ccEmails: ["cc@example.test"],
+      ccNames: [null],
+      bccEmails: [],
+      providerMessageId: null,
+      mimeStructure: null,
+      attachments: []
+    });
+    // headers_json keeps the same header subset sync stores.
+    expect(Object.keys(metadata.headersJson).sort()).toEqual(["in-reply-to", "message-id"]);
+    expect(result).toMatchObject({ messageId: N1, warnings: [] });
+  });
+
+  it("leaves the id to sync when the server returns no APPENDUID", async () => {
+    mocks.append.mockResolvedValueOnce(null);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ messageId: null, appendedUid: null, warnings: [] });
+  });
+
+  it.each([
+    ["Drafts is not a tracked mirrored folder", []],
+    ["the mirrored Drafts folder has another UIDVALIDITY", [{ ...draftsFolder, uidvalidity: "99" }]],
+    ["sync has not read Drafts yet", [{ ...draftsFolder, uidvalidity: null }]]
+  ])("leaves the id to sync when %s", async (_case, folders) => {
+    mocks.getFoldersForWake.mockResolvedValueOnce(folders);
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ messageId: null, appendedUid: 7, warnings: [] });
+  });
+
+  it("reports a saved draft when the lock fails after the APPEND", async () => {
+    // e.g. the lock's session died, so unlock fails after the provider holds the draft.
+    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>, options: { onPostIrreversibleWarning: (warning: string) => void }) => {
+      const value = await fn(mockAccountLock());
+      options.onPostIrreversibleWarning("The provider already accepted the change; the lock release failed");
+      return value;
+    });
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(result.messageId).toBe(N1);
+    expect(result.warnings).toEqual(["The provider already accepted the change; the lock release failed"]);
+  });
+
+  it("reports a saved draft when its mirror write fails", async () => {
+    mocks.upsertMessages.mockRejectedValueOnce(new Error("database unavailable"));
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+    expect(result.messageId).toBeNull();
+    expect(result.warnings).toEqual([
+      "Saved, but the draft id is available only after the next sync: database unavailable."
+    ]);
   });
 
   it("throws for an unknown account before connecting", async () => {
@@ -289,9 +451,9 @@ describe("createDraft", () => {
 
 describe("updateDraft", () => {
   it("APPENDs a new draft then hard-deletes the old one (IMAP drafts are immutable)", async () => {
-    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.getMessage.mockResolvedValue(draftRow);
     const { updateDraft } = await import("../drafts.js");
-    const result = await updateDraft({} as never, config, "draft-1", {
+    const result = await updateDraft(draftPool, config, D1, {
       to: [{ email: "rcpt@example.test" }],
       subject: "Revised",
       body: { format: "plain", text: "v2" }
@@ -301,19 +463,47 @@ describe("updateDraft", () => {
     expect(mocks.deleteMessage).toHaveBeenCalledTimes(1);
     // Old draft removed by a hard delete (reuses email-002), not trashed.
     expect(mocks.deleteMessage).toHaveBeenCalledWith(
-      {},
+      draftPool,
       config,
-      "draft-1",
+      D1,
       expect.objectContaining({ hard: true })
     );
-    expect(result).toMatchObject({ replacedMessageId: "draft-1", draftsFolderPath: "Drafts" });
+    expect(result).toMatchObject({
+      replacedMessageId: D1, replacedDraftDeleted: true, draftsFolderPath: "Drafts", messageId: N1, warnings: []
+    });
+  });
+
+  it("refuses an ordinary email, so a draft update can never rewrite or remove it", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX" });
+    const { updateDraft } = await import("../drafts.js");
+    await expect(
+      updateDraft(draftPool, config, D1, { to: [], subject: "s", body: { format: "plain", text: "b" } })
+    ).rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/Draft not found/) });
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("accepts a \\Draft-flagged message outside a Drafts folder", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX", flags: ["\\Draft"] });
+    const { updateDraft } = await import("../drafts.js");
+    await updateDraft(draftPool, config, D1, { to: [], subject: "s", body: { format: "plain", text: "b" } });
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a draft already deleted in the provider as not found", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, deleted_in_provider: true });
+    const { updateDraft } = await import("../drafts.js");
+    await expect(
+      updateDraft(draftPool, config, D1, { to: [], subject: "s", body: { format: "plain", text: "b" } })
+    ).rejects.toMatchObject({ name: "NotFoundError" });
+    expect(mocks.append).not.toHaveBeenCalled();
   });
 
   it("throws for an unknown draft without appending or deleting", async () => {
     mocks.getMessage.mockResolvedValue(null);
     const { updateDraft } = await import("../drafts.js");
     await expect(
-      updateDraft({} as never, config, "missing", { to: [], subject: "s", body: { format: "plain", text: "b" } })
+      updateDraft(draftPool, config, "missing", { to: [], subject: "s", body: { format: "plain", text: "b" } })
     ).rejects.toThrow(/Draft not found/);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
@@ -322,29 +512,29 @@ describe("updateDraft", () => {
   // ── Review PR-A (decision 1): the revised draft is already filed, so a failed
   //    delete of the OLD draft must downgrade to a warning, not fail the update. ─
   it("STILL reports the update when the old-draft delete rejects (best-effort cleanup)", async () => {
-    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.getMessage.mockResolvedValue(draftRow);
     mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
     const { updateDraft } = await import("../drafts.js");
 
-    const result = await updateDraft({} as never, config, "draft-1", {
+    const result = await updateDraft(draftPool, config, D1, {
       to: [{ email: "rcpt@example.test" }],
       subject: "Revised",
       body: { format: "plain", text: "v2" }
     });
     // The new draft is filed; the update is reported despite the cleanup failure.
     expect(mocks.append).toHaveBeenCalledTimes(1);
-    expect(result.replacedMessageId).toBe("draft-1");
+    expect(result.replacedMessageId).toBe(D1);
     expect(result.replacedDraftDeleted).toBe(false);
     expect(result.warnings.join(" ")).toMatch(/removing the previous draft failed/i);
   });
 
   it("throws AccountBusyError before the delete when the account lock is held (no partial state)", async () => {
-    mocks.getMessage.mockResolvedValue({ id: "draft-1", account_id: "acc-1", deleted_in_provider: false });
+    mocks.getMessage.mockResolvedValue(draftRow);
     mocks.withAccountLock.mockResolvedValueOnce(null); // worker mid-sync holds the lock
     const { updateDraft } = await import("../drafts.js");
     const { AccountBusyError } = await import("../errors.js");
     await expect(
-      updateDraft({} as never, config, "draft-1", {
+      updateDraft(draftPool, config, D1, {
         to: [{ email: "rcpt@example.test" }],
         subject: "Revised",
         body: { format: "plain", text: "v2" }
@@ -371,7 +561,7 @@ describe("sendDraft", () => {
   }
 
   const draftRow = {
-    id: "draft-1",
+    id: D1,
     account_id: "acc-1",
     folder_path: "Drafts",
     uid: "7",
@@ -397,7 +587,7 @@ describe("sendDraft", () => {
     const { AccountBusyError } = await import("../errors.js");
     const { sendDraft } = await import("../drafts.js");
 
-    await expect(sendDraft(pool, config, "draft-1")).rejects.toBeInstanceOf(AccountBusyError);
+    await expect(sendDraft(pool, config, D1)).rejects.toBeInstanceOf(AccountBusyError);
     expect(mocks.getRawMime).not.toHaveBeenCalled();
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
@@ -407,7 +597,7 @@ describe("sendDraft", () => {
   it("RESENDS the draft's raw bytes over SMTP, APPENDs them to Sent, then deletes the draft", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     const { sendDraft } = await import("../drafts.js");
-    const result = await sendDraft(pool, config, "draft-1");
+    const result = await sendDraft(pool, config, D1);
 
     expect(mocks.withAccountLock).toHaveBeenCalledWith(
       pool,
@@ -418,7 +608,7 @@ describe("sendDraft", () => {
 
     // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
     // parsed mirror fields — there is no SendRequest reconstruction anymore.
-    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1", expect.anything(), { signal: undefined });
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), { signal: undefined });
     const rawBytes = mocks.getRawMime.mock.results[0].value as Promise<{ raw: Buffer }>;
     const expectedRaw = (await rawBytes).raw;
 
@@ -443,14 +633,14 @@ describe("sendDraft", () => {
     expect(mocks.deleteMessage).toHaveBeenCalledWith(
       pool,
       config,
-      "draft-1",
+      D1,
       expect.objectContaining({ hard: true })
     );
     const deliverOrder = mocks.deliverSmtp.mock.invocationCallOrder[0];
     const deleteOrder = mocks.deleteMessage.mock.invocationCallOrder[0];
     expect(deliverOrder).toBeLessThan(deleteOrder);
     expect(result).toMatchObject({
-      deletedDraftId: "draft-1",
+      deletedDraftId: D1,
       send: {
         delivered: true,
         accepted: ["rcpt@example.test"],
@@ -470,13 +660,13 @@ describe("sendDraft", () => {
       `From: user@example.test\r\nTo: rcpt@example.test\r\nSubject: Hello\r\n\r\n${knownBody}`
     );
     mocks.getRawMime.mockResolvedValueOnce({
-      messageId: "draft-1", raw: rawWithBody, source: "fetch", truncated: false
+      messageId: D1, raw: rawWithBody, source: "fetch", truncated: false
     });
     // The mirror body is NULL (lazy body-fetch hasn't populated it) — the exact
     // condition that produced the empty send under the old rebuild-from-mirror path.
     const pool = mockPoolReturningDraft({ ...draftRow, body_text: null, body_plain: null, selected_text_part: null });
     const { sendDraft } = await import("../drafts.js");
-    await sendDraft(pool, config, "draft-1");
+    await sendDraft(pool, config, D1);
 
     // The bytes submitted over SMTP CONTAIN the real body.
     const [, deliveredRaw] = mocks.deliverSmtp.mock.calls[0];
@@ -490,7 +680,7 @@ describe("sendDraft", () => {
   it("refuses to send a draft with no recipients (and does not deliver or delete)", async () => {
     const pool = mockPoolReturningDraft({ ...draftRow, to_emails: [] });
     const { sendDraft } = await import("../drafts.js");
-    await expect(sendDraft(pool, config, "draft-1")).rejects.toThrow(/no recipients/);
+    await expect(sendDraft(pool, config, D1)).rejects.toThrow(/no recipients/);
     expect(mocks.getRawMime).not.toHaveBeenCalled();
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
@@ -507,11 +697,11 @@ describe("sendDraft", () => {
     const pool = mockPoolReturningDraft(draftRow);
     // getRawMime hit the BODY_RAW_MAX_BYTES cap → the bytes are incomplete.
     mocks.getRawMime.mockResolvedValueOnce({
-      messageId: "draft-1", raw: Buffer.from("From: user@example.test\r\n\r\npartial"), source: "fetch", truncated: true
+      messageId: D1, raw: Buffer.from("From: user@example.test\r\n\r\npartial"), source: "fetch", truncated: true
     });
     const { sendDraft } = await import("../drafts.js");
     const { SmtpDeliveryError } = await import("../smtp-client.js");
-    const error = await sendDraft(pool, config, "draft-1").catch((value) => value);
+    const error = await sendDraft(pool, config, D1).catch((value) => value);
     expect(error).toBeInstanceOf(SmtpDeliveryError);
     expect(error.outcome).toBe("not_delivered");
     expect(error.message).toMatch(/truncated/i);
@@ -525,7 +715,7 @@ describe("sendDraft", () => {
     mocks.getRawMime.mockRejectedValueOnce(new Error("UIDVALIDITY changed for Drafts"));
     const { sendDraft } = await import("../drafts.js");
     const { SmtpDeliveryError } = await import("../smtp-client.js");
-    const error = await sendDraft(pool, config, "draft-1").catch((value) => value);
+    const error = await sendDraft(pool, config, D1).catch((value) => value);
     expect(error).toBeInstanceOf(SmtpDeliveryError);
     expect(error.outcome).toBe("not_delivered");
     expect(error.message).toMatch(/UIDVALIDITY/);
@@ -539,7 +729,7 @@ describe("sendDraft", () => {
     const pool = mockPoolReturningDraft(draftRow);
     const { sendDraft } = await import("../drafts.js");
 
-    const error = await sendDraft(pool, config, "draft-1", undefined, { signal: AbortSignal.abort() })
+    const error = await sendDraft(pool, config, D1, undefined, { signal: AbortSignal.abort() })
       .catch((value) => value);
 
     expect(error.name).toBe("AbortError");
@@ -554,7 +744,7 @@ describe("sendDraft", () => {
     mocks.getRawMime.mockImplementationOnce(async () => {
       abort.abort(new Error("lease lost"));
       return {
-        messageId: "draft-1",
+        messageId: D1,
         raw: Buffer.from("From: user@example.test\r\n\r\nHello there"),
         source: "fetch" as const,
         truncated: false
@@ -562,12 +752,12 @@ describe("sendDraft", () => {
     });
     const { sendDraft } = await import("../drafts.js");
 
-    const error = await sendDraft(pool, config, "draft-1", undefined, { signal: abort.signal })
+    const error = await sendDraft(pool, config, D1, undefined, { signal: abort.signal })
       .catch((value) => value);
 
     // AbortError, not SmtpDeliveryError: the message was proven not submitted.
     expect(error.name).toBe("AbortError");
-    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, "draft-1", expect.anything(), { signal: abort.signal });
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), { signal: abort.signal });
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
@@ -579,11 +769,11 @@ describe("sendDraft", () => {
     mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
     const { sendDraft } = await import("../drafts.js");
 
-    const result = await sendDraft(pool, config, "draft-1");
+    const result = await sendDraft(pool, config, D1);
     // The send happened and is reported delivered — no throw.
     expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
     expect(result.send.delivered).toBe(true);
-    expect(result.deletedDraftId).toBe("draft-1");
+    expect(result.deletedDraftId).toBe(D1);
     expect(result.draftDeleted).toBe(false);
     expect(result.warnings.join(" ")).toMatch(/removing the draft from Drafts failed/i);
     // The warning is also threaded onto the nested SendResult.
@@ -596,7 +786,7 @@ describe("sendDraft", () => {
     mocks.append.mockRejectedValueOnce(new Error("APPEND to Sent failed"));
     const { sendDraft } = await import("../drafts.js");
 
-    const result = await sendDraft(pool, config, "draft-1");
+    const result = await sendDraft(pool, config, D1);
     expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
     expect(result.send.delivered).toBe(true);
     expect(result.send.appendedToSent).toBe(false);
@@ -620,7 +810,7 @@ describe("sendDraft", () => {
     });
     mocks.append.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
-      return { uid: 7 };
+      return { uid: 7, uidValidity: 100 };
     });
     mocks.logout.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
@@ -631,11 +821,11 @@ describe("sendDraft", () => {
     });
     mocks.deleteMessage.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
-      return { messageId: "draft-1", fromFolder: "Drafts", mode: "expunge", trashFolder: null };
+      return { messageId: D1, fromFolder: "Drafts", mode: "expunge", trashFolder: null };
     });
 
     const { sendDraft } = await import("../drafts.js");
-    const result = await sendDraft(pool, config, "draft-1");
+    const result = await sendDraft(pool, config, D1);
     expect(result.send.delivered).toBe(true);
     expect(lockHeld).toBe(false);
   });
@@ -648,7 +838,7 @@ describe("sendDraft", () => {
     });
 
     const { sendDraft } = await import("../drafts.js");
-    const result = await sendDraft(pool, config, "draft-1");
+    const result = await sendDraft(pool, config, D1);
     expect(result.send.delivered).toBe(true);
     expect(result.warnings.join(" ")).toMatch(/closing the Sent connection failed: socket close failed/i);
   });
@@ -656,7 +846,7 @@ describe("sendDraft", () => {
   it("reports draftDeleted=true and no cleanup warning on the happy path", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     const { sendDraft } = await import("../drafts.js");
-    const result = await sendDraft(pool, config, "draft-1");
+    const result = await sendDraft(pool, config, D1);
     expect(result.draftDeleted).toBe(true);
     expect(result.warnings).toEqual([]);
   });
@@ -666,12 +856,21 @@ describe("deleteDraft", () => {
   it("reuses the email-002 delete mutation (trash by default, hard on request)", async () => {
     const { deleteDraft } = await import("../drafts.js");
 
-    const trashed = await deleteDraft({} as never, config, "draft-1", {});
-    expect(mocks.deleteMessage).toHaveBeenLastCalledWith({}, config, "draft-1", { hard: undefined });
-    expect(trashed).toMatchObject({ messageId: "draft-1", fromFolder: "Drafts" });
+    mocks.getMessage.mockResolvedValue(draftRow);
+    const trashed = await deleteDraft(draftPool, config, D1, {});
+    expect(mocks.deleteMessage).toHaveBeenLastCalledWith(draftPool, config, D1, { hard: undefined });
+    expect(trashed).toEqual({ messageId: D1, fromFolder: "Drafts", trashFolder: "Trash" });
 
-    await deleteDraft({} as never, config, "draft-1", { hard: true });
-    expect(mocks.deleteMessage).toHaveBeenLastCalledWith({}, config, "draft-1", { hard: true });
+    await deleteDraft(draftPool, config, D1, { hard: true });
+    expect(mocks.deleteMessage).toHaveBeenLastCalledWith(draftPool, config, D1, { hard: true });
+  });
+
+  it("refuses an ordinary email, so a draft delete can never remove it", async () => {
+    mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX" });
+    const { deleteDraft } = await import("../drafts.js");
+    await expect(deleteDraft(draftPool, config, D1, { hard: true }))
+      .rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/Draft not found/) });
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -704,7 +903,7 @@ describe("listDrafts / getDraft read the mirror", () => {
       query: vi.fn()
         // the draft row in a non-Drafts folder, no \Draft flag
         .mockResolvedValueOnce({ rows: [{
-          id: "m1", account_id: "acc-1", folder_path: "INBOX", uid: "9", rfc_message_id: null,
+          id: M1, account_id: "acc-1", folder_path: "INBOX", uid: "9", rfc_message_id: null,
           subject: "S", from_email: "user@example.test", to_emails: [], cc_emails: [], flags: [],
           in_reply_to: null, references_header: null,
           internal_date: new Date("2026-05-19T00:00:00.000Z"), body_text: "b", body_plain: null, selected_text_part: null
@@ -715,7 +914,7 @@ describe("listDrafts / getDraft read the mirror", () => {
     };
     const pool = { connect: vi.fn(async () => client) } as never;
     const { getDraft } = await import("../drafts.js");
-    const draft = await getDraft(pool, config, "m1");
+    const draft = await getDraft(pool, config, M1);
     expect(draft).toBeNull();
   });
 });

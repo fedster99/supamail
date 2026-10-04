@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
-import type { AppConfig } from "./config.js";
+import { getWindowCutoff, type AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
+import { METADATA_HEADER_FIELDS } from "./imap-client.js";
 import { closeImap } from "./imap-connect.js";
 import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
 import { deleteMessage, type MailboxActionOptions } from "./mailbox-mutations.js";
+import { normalizeMessageId, parseHeaders } from "./mime.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import {
@@ -15,9 +17,10 @@ import {
   buildRawMime,
   deliverSmtp,
   domainOf,
-  resolveSmtpCreds
+  resolveSmtpCreds,
+  type AppendedUid
 } from "./smtp-client.js";
-import type { ImapAccount, SendRequest, SendResult } from "./types.js";
+import type { ImapAccount, ImapMessage, MessageMetadata, SendRecipient, SendRequest, SendResult } from "./types.js";
 import {
   METADATA_PROTECTED_FIELDS,
   plaintextMetadataProtection,
@@ -25,13 +28,15 @@ import {
   type MetadataProtectionAdapter,
   type ProtectedMetadataColumns
 } from "./metadata-protection.js";
+import { isMirrorId } from "./mirror-id.js";
 
 /**
  * Full draft CRUD saved to the provider Drafts folder (email-003, ADR 0019).
  * This is mostly COMPOSITION of the email-001 and email-002 primitives:
  *
  * - Create  = buildRawMime (email-001) → APPEND `\Draft` to the Drafts folder via
- *   the write-only {@link SentFolderAppender} (email-001's generic appender).
+ *   the write-only {@link SentFolderAppender} (email-001's generic appender), then
+ *   write the draft's mirror row from its APPENDUID (ADR 0033).
  * - List/Get = read the MIRROR — drafts are already-synced messages in the Drafts
  *   folder (provider-profiles.ts intentionally mirrors Drafts).
  * - Update  = APPEND-new + delete-old. IMAP drafts are immutable (a message has a
@@ -111,9 +116,17 @@ export interface CreateDraftResult {
   accountId: string;
   draftsFolderPath: string;
   rfcMessageId: string;
-  /** From UIDPLUS APPENDUID when the server provides one, else null. The mirrored
-   * row (and its stable message_id) appears after the next sync of Drafts. */
+  /** The saved draft's mirror id, ready at once for get, update, send, and delete.
+   * Null when the server returns no APPENDUID, Drafts is not mirrored yet, the
+   * mirror write failed (see `warnings`), or an idempotent retry found an earlier
+   * copy that is not mirrored yet; the next Drafts sync then mirrors it. */
+  messageId: string | null;
+  /** From UIDPLUS APPENDUID when the server provides one, else null. */
   appendedUid: number | null;
+  /** Non-fatal warnings. The draft is saved in the provider regardless; e.g. the
+   * old draft of an update could not be EXPUNGEd on a non-UIDPLUS server, which
+   * self-heals on sync. */
+  warnings: string[];
 }
 
 export interface UpdateDraftResult extends CreateDraftResult {
@@ -122,9 +135,6 @@ export interface UpdateDraftResult extends CreateDraftResult {
   /** True when the superseded draft was actually removed; false when the cleanup
    * delete failed (best-effort — the new draft is already filed). */
   replacedDraftDeleted: boolean;
-  /** Non-fatal warnings (e.g. the old draft couldn't be EXPUNGEd on a non-UIDPLUS
-   * server). The update still succeeded; a leftover duplicate self-heals on sync. */
-  warnings: string[];
 }
 
 export interface SendDraftResult {
@@ -143,10 +153,16 @@ export interface SendDraftResult {
 export interface DeleteDraftResult {
   messageId: string;
   fromFolder: string;
+  /** The folder a non-hard delete moved the draft to; null for a hard delete. */
+  trashFolder: string | null;
 }
 
-/** APPEND `req` to the account's Drafts folder with the `\Draft` flag, reusing the
- * email-001 write-only appender. Returns the resolved folder + APPENDUID. */
+/** `\Draft` marks a saved draft; `\Seen` keeps it out of unread counts. */
+const DRAFT_FLAGS = ["\\Draft", "\\Seen"];
+/** The mirror write is one small transaction; a longer wait would hold the account
+ * lock and the caller's request for a draft the provider already holds. */
+const DRAFT_MIRROR_WRITE_TIMEOUT_MS = 5_000;
+
 /**
  * Derive a stable Message-ID from an idempotency key so a retried create maps to the
  * SAME message and can be found by search-before-APPEND instead of duplicating.
@@ -156,55 +172,61 @@ function buildDraftMessageId(domain: string, idempotencyKey: string): string {
   return `<draft-${digest.slice(0, 32)}@${domain}>`;
 }
 
-async function appendDraft(
+type SavedDraft = Omit<CreateDraftResult, "accountId">;
+
+/**
+ * Compose `req`, APPEND it to the account's Drafts folder, and write its mirror row.
+ * Serialized with the sync worker on the per-account advisory lock: a second IMAP
+ * connection mid-cycle races and burns the provider's shared per-account command
+ * budget (Rackspace caps ~200/min). Non-blocking — if the worker holds the lock,
+ * surface a retryable busy error instead of colliding. The lock fences its writes,
+ * as sync's does: a save that lost the lock cannot write a row that sync already
+ * read, and no sync interleaves with the mirror write.
+ */
+async function saveDraft(
   pool: PgPool,
   config: AppConfig,
+  repository: MirrorRepository,
   account: ImapAccount,
   req: SendRequest,
   idempotencyKey?: string | null,
   signal?: AbortSignal
-): Promise<{ draftsFolderPath: string; rfcMessageId: string; appendedUid: number | null }> {
-  const from = { email: account.email_address };
+): Promise<SavedDraft> {
   // With an idempotency key, stamp a deterministic Message-ID (buildRawMime honors
-  // req.messageId) so a retry finds its own prior APPEND below instead of duping.
+  // req.messageId) so a retry finds its own prior APPEND instead of duping.
   const composeReq: SendRequest = idempotencyKey
     ? { ...req, messageId: buildDraftMessageId(domainOf(account.email_address), idempotencyKey) }
     : req;
-  const { raw, messageId } = await buildRawMime(composeReq, from);
+  const { raw, messageId: rfcMessageId } = await buildRawMime(composeReq, { email: account.email_address });
 
-  // Serialize the APPEND with the sync worker on the per-account advisory lock:
-  // opening a second IMAP connection to the account while the worker is mid-cycle
-  // races and burns the provider's shared per-account command budget (Rackspace caps
-  // ~200/min). Non-blocking — if the worker holds the lock, surface a retryable busy
-  // error instead of colliding. (deleteMessage / content reads still need the same
-  // treatment; that broader on-demand-IMAP serialization is a follow-up.)
-  const result = await withAccountLock(pool, account.lock_id, async () => {
-    const appender = await SentFolderAppender.connect(pool, config, account, { signal });
+  // One array: the lock adds its post-confirmation warnings after the callback returns.
+  const warnings: string[] = [];
+  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
+    const savedAt = new Date();
+    const filed = await fileDraft(pool, config, repository, account, raw, rfcMessageId, savedAt, idempotencyKey, signal);
+    // The provider holds the draft now. A later mirror or lock failure must not fail
+    // the save: a retry without an idempotency key would file a second draft.
+    lock.confirmIrreversible();
+    const saved: SavedDraft = {
+      draftsFolderPath: filed.draftsFolderPath,
+      rfcMessageId,
+      messageId: null,
+      appendedUid: filed.appended?.uid ?? null,
+      warnings
+    };
+    if (!filed.appended) return saved;
     try {
-      const profile = getProviderProfile(account.provider_profile);
-      const mailboxes = await appender.list();
-      // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
-      // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
-      // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
-      const draftsFolderPath = resolveSpecialUseFolder(mailboxes, "drafts", profile);
-
-      // Idempotency: a retried create (same key -> same Message-ID) finds its prior
-      // APPEND and returns that UID instead of filing a duplicate draft. Runs under
-      // the same lock as the APPEND, so search + append are atomic per account.
-      if (idempotencyKey) {
-        const existing = await appender.searchByMessageId(draftsFolderPath, messageId);
-        if (existing.length > 0) {
-          return { draftsFolderPath, rfcMessageId: messageId, appendedUid: Math.max(...existing) };
-        }
-      }
-
-      // `\Draft` marks it as a draft; `\Seen` keeps it from inflating unread counts.
-      const appended = await appender.append(draftsFolderPath, raw, ["\\Draft", "\\Seen"], new Date());
-      return { draftsFolderPath, rfcMessageId: messageId, appendedUid: appended.uid };
-    } finally {
-      await closeImap(appender);
+      saved.messageId = filed.retried
+        ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...filed.appended })
+        : await mirrorSavedDraft(repository, config, account.id, filed.draftsFolderPath, filed.appended.uidValidity,
+          savedDraftMetadata(composeReq, account, { raw, rfcMessageId, uid: filed.appended.uid, savedAt }));
+    } catch (error) {
+      warnings.push(
+        `Saved, but the draft id is available only after the next sync: ${error instanceof Error ? error.message : String(error)}.`
+      );
     }
-  });
+    return saved;
+  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
 
   if (result === null) {
     throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft shortly`);
@@ -212,11 +234,128 @@ async function appendDraft(
   return result;
 }
 
+/** File the composed bytes in Drafts, or find the copy that an earlier attempt with
+ * the same idempotency key filed. */
+async function fileDraft(
+  pool: PgPool,
+  config: AppConfig,
+  repository: MirrorRepository,
+  account: ImapAccount,
+  raw: Buffer,
+  rfcMessageId: string,
+  savedAt: Date,
+  idempotencyKey: string | null | undefined,
+  signal: AbortSignal | undefined
+): Promise<{ draftsFolderPath: string; appended: AppendedUid | null; retried: boolean }> {
+  const appender = await SentFolderAppender.connect(pool, config, account, { signal });
+  try {
+    const profile = getProviderProfile(account.provider_profile);
+    const mailboxes = await appender.list();
+    // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
+    // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
+    // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
+    const draftsFolderPath = resolveSpecialUseFolder(mailboxes, "drafts", profile);
+
+    // Idempotency: a retried create (same key -> same Message-ID) finds its prior
+    // APPEND and returns that UID instead of filing a duplicate draft. Runs under
+    // the same lock as the APPEND, so search + append are atomic per account.
+    if (idempotencyKey) {
+      const existing = await appender.searchByMessageId(draftsFolderPath, rfcMessageId);
+      if (existing.uids.length > 0) {
+        return {
+          draftsFolderPath,
+          appended: { uidValidity: existing.uidValidity, uid: Math.max(...existing.uids) },
+          retried: true
+        };
+      }
+    }
+
+    // Drafts is durably due before the provider command, as for a move, so a host
+    // can reconcile it after acknowledgement without a prompt IDLE/NOTIFY event.
+    await repository.markFoldersForReconcile(account.id, [draftsFolderPath]);
+    const appended = await appender.append(draftsFolderPath, raw, DRAFT_FLAGS, savedAt);
+    return { draftsFolderPath, appended, retried: false };
+  } finally {
+    await closeImap(appender);
+  }
+}
+
 /**
- * Create a draft: compose RFC-822 bytes (email-001 buildRawMime) and APPEND them
- * with `\Draft` to the resolved Drafts folder. We do NOT insert a mirror row — the
- * next sync of Drafts mirrors the copy with its server-assigned UID, so identity
- * is never guessed (same discipline as email-001's Sent APPEND).
+ * Write the mirror row of a draft this save just filed, and return its id. Only a
+ * tracked Drafts folder at the APPENDUID's UIDVALIDITY qualifies: sync then reads
+ * the UID again on its next pass of Drafts (it is above the folder's `last_uid`),
+ * replaces these values with the server's view, and keeps the id.
+ */
+async function mirrorSavedDraft(
+  repository: MirrorRepository,
+  config: AppConfig,
+  accountId: string,
+  folderPath: string,
+  uidValidity: number,
+  metadata: MessageMetadata
+): Promise<string | null> {
+  const [folder] = await repository.getFoldersForWake(accountId, [folderPath]);
+  if (!folder || folder.uidvalidity === null || Number(folder.uidvalidity) !== uidValidity) return null;
+  const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], getWindowCutoff(config), {
+    deadlineAt: Date.now() + DRAFT_MIRROR_WRITE_TIMEOUT_MS
+  });
+  return row.id;
+}
+
+/**
+ * The mirror metadata of a saved draft, from what the save composed. The fields
+ * only the server knows (BODYSTRUCTURE, attachment parts, provider ids) stay empty
+ * until sync reads the draft; the body arrives through the normal body lane.
+ */
+function savedDraftMetadata(
+  req: SendRequest,
+  account: ImapAccount,
+  saved: { raw: Buffer; rfcMessageId: string; uid: number; savedAt: Date }
+): MessageMetadata {
+  const headerEnd = saved.raw.indexOf("\r\n\r\n");
+  const headers = parseHeaders(headerEnd < 0 ? saved.raw : saved.raw.subarray(0, headerEnd));
+  const headersJson: Record<string, string> = {};
+  for (const name of METADATA_HEADER_FIELDS) {
+    if (headers[name] !== undefined) headersJson[name] = headers[name];
+  }
+  const recipients = (list: SendRecipient[] = []) => ({
+    emails: list.map((recipient) => recipient.email),
+    names: list.map((recipient) => recipient.name ?? null)
+  });
+  const to = recipients(req.to);
+  const cc = recipients(req.cc);
+  return {
+    uid: saved.uid,
+    internalDate: saved.savedAt,
+    sizeBytes: saved.raw.length,
+    flags: [...DRAFT_FLAGS],
+    rfcMessageId: saved.rfcMessageId,
+    messageIdNormalized: normalizeMessageId(saved.rfcMessageId),
+    providerMessageId: null,
+    providerMessageIdNamespace: null,
+    providerThreadId: null,
+    providerThreadIdNamespace: null,
+    inReplyTo: headersJson["in-reply-to"] ?? null,
+    referencesHeader: headersJson.references ?? null,
+    subject: req.subject,
+    fromEmail: account.email_address,
+    fromName: req.senderName?.trim() || null,
+    toEmails: to.emails,
+    toNames: to.names,
+    ccEmails: cc.emails,
+    ccNames: cc.names,
+    bccEmails: [],
+    headersJson,
+    mimeStructure: null,
+    attachments: []
+  };
+}
+
+/**
+ * Create a draft: compose RFC-822 bytes (email-001 buildRawMime), APPEND them with
+ * `\Draft` to the resolved Drafts folder, and write the draft's mirror row from the
+ * server's APPENDUID, so the returned `messageId` works at once (ADR 0033). Identity
+ * is never guessed: without APPENDUID the next sync of Drafts mirrors the copy.
  */
 export async function createDraft(
   pool: PgPool,
@@ -231,15 +370,8 @@ export async function createDraft(
   const account = await repository.getAccount(input.accountId);
   if (!account) throw new Error(`Account not found: ${input.accountId}`);
 
-  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
-    pool,
-    config,
-    account,
-    input,
-    input.idempotencyKey,
-    options.signal
-  );
-  return { accountId: account.id, draftsFolderPath, rfcMessageId, appendedUid };
+  const saved = await saveDraft(pool, config, repository, account, input, input.idempotencyKey, options.signal);
+  return { accountId: account.id, ...saved };
 }
 
 /** A mirrored Drafts-folder row, joined with its stored body for the get view. */
@@ -285,7 +417,7 @@ function toSummary(row: DraftRow): DraftSummary {
  * special_use is `\Drafts`, plus the conventional name fallback. Drafts are
  * mirrored (provider-profiles keeps them), so this reads the synced folder set.
  */
-async function draftFolderPaths(client: PgClient, accountId: string): Promise<string[]> {
+async function draftFolderPaths(client: Pick<PgClient, "query">, accountId: string): Promise<string[]> {
   // The Drafts vocabulary is shared with the in-memory role resolver
   // (DRAFTS_VOCABULARY) so the two never drift on "what names a Drafts folder";
   // the QUERY stays its own distinct encoding (mirrored folder table, not a LIST).
@@ -306,6 +438,26 @@ async function draftFolderPaths(client: PgClient, accountId: string): Promise<st
   // (or on a server that doesn't advertise special-use) is still listed.
   if (!paths.some((p) => p.toLowerCase() === DRAFTS_VOCABULARY.leafName)) paths.push(DRAFTS_VOCABULARY.conventional);
   return paths;
+}
+
+/** A draft lives in a Drafts folder or carries the `\Draft` flag. */
+function isDraft(draftFolders: string[], row: { folder_path: string; flags: string[] | null }): boolean {
+  return draftFolders.includes(row.folder_path)
+    || (row.flags ?? []).some((flag) => flag.toLowerCase() === "\\draft");
+}
+
+/**
+ * Prove `messageId` names a live draft. Any other message is "not found" to a draft
+ * action, so a draft update or delete can never rewrite or remove an ordinary email.
+ */
+async function loadLiveDraft(pool: PgPool, repository: MirrorRepository, messageId: string): Promise<ImapMessage> {
+  const message = await repository.getMessage(messageId);
+  if (!message) throw new NotFoundError(`Draft not found: ${messageId}`);
+  if (message.deleted_in_provider) throw new NotFoundError(`Draft ${messageId} is already deleted in the provider`);
+  if (!isDraft(await draftFolderPaths(pool, message.account_id), message)) {
+    throw new NotFoundError(`Draft not found: ${messageId}`);
+  }
+  return message;
 }
 
 /**
@@ -368,6 +520,7 @@ export async function getDraft(
   messageId: string,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<DraftDetail | null> {
+  if (!isMirrorId(messageId)) return null;
   const client = await pool.connect();
   try {
     const result = await client.query<DraftRow>(
@@ -395,10 +548,7 @@ export async function getDraft(
       METADATA_PROTECTED_FIELDS.message
     );
 
-    const paths = await draftFolderPaths(client, row.account_id);
-    const isDraftFolder = paths.includes(row.folder_path);
-    const isDraftFlagged = (row.flags ?? []).some((f) => f.toLowerCase() === "\\draft");
-    if (!isDraftFolder && !isDraftFlagged) return null;
+    if (!isDraft(await draftFolderPaths(client, row.account_id), row)) return null;
 
     // The draft is HTML when its selected body part is HTML, or (defensively) when
     // there is an HTML body but no plaintext to fall back to. Send uses bodyHtml so
@@ -423,9 +573,8 @@ export async function getDraft(
 /**
  * Update a draft. IMAP drafts are immutable (a stored message has a fixed
  * server-assigned UID and cannot be edited in place), so update is APPEND-new +
- * delete-old: file the revised draft, then hard-delete the previous one (reusing
- * the email-002 capability-gated delete). The new draft's mirror row appears after
- * the next Drafts sync.
+ * delete-old: file the revised draft (with its mirror row, as create does), then
+ * hard-delete the previous one (reusing the email-002 capability-gated delete).
  */
 export async function updateDraft(
   pool: PgPool,
@@ -438,46 +587,27 @@ export async function updateDraft(
   rejectBcc(input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const existing = await repository.getMessage(messageId);
-  if (!existing) throw new NotFoundError(`Draft not found: ${messageId}`);
-  if (existing.deleted_in_provider) throw new Error(`Draft ${messageId} is already deleted in the provider`);
-  const account = await repository.getAccount(existing.account_id);
-  if (!account) throw new Error(`Account not found for draft ${messageId}: ${existing.account_id}`);
+  const draft = await loadLiveDraft(pool, repository, messageId);
+  const account = await repository.getAccount(draft.account_id);
+  if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.account_id}`);
 
-  const req: SendRequest = { ...input, accountId: account.id };
-  const { draftsFolderPath, rfcMessageId, appendedUid } = await appendDraft(
-    pool,
-    config,
-    account,
-    req,
-    undefined,
-    options.signal
-  );
+  const saved = await saveDraft(pool, config, repository, account, { ...input, accountId: account.id }, undefined, options.signal);
 
   // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
   // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
   // EXPUNGE) must NOT fail the update — we downgrade it to a warning and report the
   // update as done. A lingering old draft self-heals on the next Drafts sync.
-  const warnings: string[] = [];
   let replacedDraftDeleted = true;
   try {
     await deleteMessage(pool, config, messageId, { hard: true, metadataProtection, signal: options.signal });
   } catch (error) {
     replacedDraftDeleted = false;
-    warnings.push(
+    saved.warnings.push(
       `Updated, but removing the previous draft failed: ${error instanceof Error ? error.message : String(error)}. The old copy self-heals on the next sync.`
     );
   }
 
-  return {
-    accountId: account.id,
-    draftsFolderPath,
-    rfcMessageId,
-    appendedUid,
-    replacedMessageId: messageId,
-    replacedDraftDeleted,
-    warnings
-  };
+  return { accountId: account.id, ...saved, replacedMessageId: messageId, replacedDraftDeleted };
 }
 
 /**
@@ -618,7 +748,7 @@ async function sendDraftAttempt(
           sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
           const appended = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
           appendedToSent = true;
-          appendedUid = appended.uid;
+          appendedUid = appended?.uid ?? null;
         } catch (error) {
           // SMTP is confirmed. Sent filing is best-effort and never becomes a
           // thrown failure that could invite a duplicate send.
@@ -698,6 +828,8 @@ export async function deleteDraft(
   messageId: string,
   options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
+  const repository = new MirrorRepository(pool, config, options.metadataProtection ?? plaintextMetadataProtection);
+  await loadLiveDraft(pool, repository, messageId);
   const result = await deleteMessage(pool, config, messageId, options);
-  return { messageId: result.messageId, fromFolder: result.fromFolder };
+  return { messageId: result.messageId, fromFolder: result.fromFolder, trashFolder: result.trashFolder };
 }

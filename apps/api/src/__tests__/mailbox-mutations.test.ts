@@ -2,6 +2,11 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ImapAbortBinding } from "../imap-connect.js";
 import { MailboxMutator, toImapFlag } from "../mailbox-mutations.js";
 
+// Mirror ids are UUIDs; any other value names no row.
+const M1 = "11111111-1111-4111-8111-111111111111";
+const M_SENT = "5e5e5e5e-5e5e-4e5e-8e5e-5e5e5e5e5e5e";
+const M_INBOX = "1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b";
+
 /**
  * Unit coverage for the organize-mutation primitives (email-002, ADR 0018). The
  * IMAP MailboxMutator and the repository are mocked, so nothing connects. The
@@ -85,7 +90,7 @@ const account = {
 
 function message(overrides: Record<string, unknown> = {}) {
   return {
-    id: "msg-1",
+    id: M1,
     account_id: "acc-1",
     folder_path: "INBOX",
     uidvalidity: "100",
@@ -108,7 +113,7 @@ describe("setMessageFlags", () => {
   it("STOREs +Seen by UID for mark-read and logs out", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    const result = await setMessageFlags({} as never, config, "msg-1", { add: ["seen"] });
+    const result = await setMessageFlags({} as never, config, M1, { add: ["seen"] });
 
     expect(mutator.addFlags).toHaveBeenCalledTimes(1);
     const [target, flags] = mutator.addFlags.mock.calls[0];
@@ -116,13 +121,13 @@ describe("setMessageFlags", () => {
     expect(flags).toEqual(["\\Seen"]);
     expect(mutator.removeFlags).not.toHaveBeenCalled();
     expect(mutator.logout).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ messageId: "msg-1", uid: 42, added: ["\\Seen"], removed: [] });
+    expect(result).toMatchObject({ messageId: M1, uid: 42, added: ["\\Seen"], removed: [] });
   });
 
   it("STOREs -Flagged by UID for unstar", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    await setMessageFlags({} as never, config, "msg-1", { remove: ["flagged"] });
+    await setMessageFlags({} as never, config, M1, { remove: ["flagged"] });
     expect(mutator.removeFlags).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), ["\\Flagged"]);
     expect(mutator.addFlags).not.toHaveBeenCalled();
   });
@@ -130,9 +135,9 @@ describe("setMessageFlags", () => {
   it("writes the flag change through to the mirror row after a successful STORE (M1)", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    await setMessageFlags({} as never, config, "msg-1", { add: ["seen"], remove: ["flagged"] });
+    await setMessageFlags({} as never, config, M1, { add: ["seen"], remove: ["flagged"] });
     expect(repo.applyMessageFlags).toHaveBeenCalledTimes(1);
-    expect(repo.applyMessageFlags).toHaveBeenCalledWith("msg-1", "acc-1", {
+    expect(repo.applyMessageFlags).toHaveBeenCalledWith(M1, "acc-1", {
       add: ["\\Seen"],
       remove: ["\\Flagged"]
     });
@@ -143,8 +148,8 @@ describe("setMessageFlags", () => {
     repo.applyMessageFlags.mockRejectedValueOnce(new Error("db down"));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    const result = await setMessageFlags({} as never, config, "msg-1", { add: ["seen"] });
-    expect(result).toMatchObject({ messageId: "msg-1", added: ["\\Seen"] });
+    const result = await setMessageFlags({} as never, config, M1, { add: ["seen"] });
+    expect(result).toMatchObject({ messageId: M1, added: ["\\Seen"] });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_failed"));
     warn.mockRestore();
   });
@@ -152,7 +157,7 @@ describe("setMessageFlags", () => {
   it("rejects an empty flag change without connecting", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    await expect(setMessageFlags({} as never, config, "msg-1", {})).rejects.toThrow(/at least one flag/i);
+    await expect(setMessageFlags({} as never, config, M1, {})).rejects.toThrow(/at least one flag/i);
   });
 
   it("throws for an unknown message", async () => {
@@ -165,7 +170,8 @@ describe("setMessageFlags", () => {
   it("refuses a message already deleted in the provider", async () => {
     repo.getMessage.mockResolvedValue(message({ deleted_in_provider: true }));
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    await expect(setMessageFlags({} as never, config, "msg-1", { add: ["seen"] })).rejects.toThrow(/already deleted/);
+    await expect(setMessageFlags({} as never, config, M1, { add: ["seen"] }))
+      .rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/already deleted/) });
   });
 });
 
@@ -173,7 +179,7 @@ describe("moveMessage", () => {
   it("marks the known folders durable before moving by UID", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { moveMessage } = await import("../mailbox-mutations.js");
-    const result = await moveMessage({} as never, config, "msg-1", "Archive");
+    const result = await moveMessage({} as never, config, M1, "Archive");
     expect(repo.markFoldersForReconcile).toHaveBeenCalledWith(
       "acc-1",
       ["INBOX", "Archive"]
@@ -188,7 +194,7 @@ describe("moveMessage", () => {
   it("rejects an empty destination", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { moveMessage } = await import("../mailbox-mutations.js");
-    await expect(moveMessage({} as never, config, "msg-1", "  ")).rejects.toThrow(/non-empty destination/);
+    await expect(moveMessage({} as never, config, M1, "  ")).rejects.toThrow(/non-empty destination/);
   });
 });
 
@@ -196,27 +202,36 @@ describe("deleteMessage", () => {
   it("moves to the resolved Trash folder by default", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { deleteMessage } = await import("../mailbox-mutations.js");
-    const result = await deleteMessage({} as never, config, "msg-1", {});
+    const result = await deleteMessage({} as never, config, M1, {});
     expect(mutator.move).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), "Trash");
     expect(mutator.expunge).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "trash", trashFolder: "Trash" });
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX", "Trash"]);
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.move.mock.invocationCallOrder[0]
+    );
   });
 
   it("is a no-op move when the message already lives in Trash", async () => {
     repo.getMessage.mockResolvedValue(message({ folder_path: "Trash" }));
     const { deleteMessage } = await import("../mailbox-mutations.js");
-    const result = await deleteMessage({} as never, config, "msg-1", {});
+    const result = await deleteMessage({} as never, config, M1, {});
     expect(mutator.move).not.toHaveBeenCalled();
+    expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "trash", trashFolder: "Trash" });
   });
 
   it("EXPUNGEs by UID for a hard delete", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { deleteMessage } = await import("../mailbox-mutations.js");
-    const result = await deleteMessage({} as never, config, "msg-1", { hard: true });
+    const result = await deleteMessage({} as never, config, M1, { hard: true });
     expect(mutator.expunge).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }));
     expect(mutator.move).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "expunge", trashFolder: null });
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX"]);
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.expunge.mock.invocationCallOrder[0]
+    );
   });
 });
 
@@ -248,7 +263,7 @@ describe("folder CRUD", () => {
 // ── Review PR-A: thread fan-out cap + interleaved write-through ────────────
 describe("setThreadFlags / moveThread fan-out", () => {
   const seedRow = {
-    id: "msg-1",
+    id: M1,
     provider_thread_id: "thread-1",
     rfc_message_id: "<m1@x>",
     message_id_normalized: "m1@x",
@@ -288,7 +303,7 @@ describe("setThreadFlags / moveThread fan-out", () => {
     // resolveThreadTargets fetches MAX+1 (101) to detect truncation, then slices to 100.
     const pool = poolReturningMembers(members(101));
     const { setThreadFlags } = await import("../mailbox-mutations.js");
-    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+    const result = await setThreadFlags(pool, config, M1, { add: ["seen"] });
 
     expect(result.messageCount).toBe(100);
     expect(result.truncated).toBe(true);
@@ -300,7 +315,7 @@ describe("setThreadFlags / moveThread fan-out", () => {
   it("does not truncate a small thread and applies the verb to every member", async () => {
     const pool = poolReturningMembers(members(3));
     const { setThreadFlags } = await import("../mailbox-mutations.js");
-    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+    const result = await setThreadFlags(pool, config, M1, { add: ["seen"] });
     expect(result.messageCount).toBe(3);
     expect(result.truncated).toBe(false);
     expect(mutator.addFlags).toHaveBeenCalledTimes(3);
@@ -310,14 +325,14 @@ describe("setThreadFlags / moveThread fan-out", () => {
     const assignedSeed = { ...seedRow, conversation_id: "conversation-1" };
     const physicalCopies = [
       {
-        id: "msg-inbox",
+        id: M_INBOX,
         account_id: "acc-1",
         folder_path: "INBOX",
         uidvalidity: "100",
         uid: "11"
       },
       {
-        id: "msg-sent",
+        id: M_SENT,
         account_id: "acc-1",
         folder_path: "Sent",
         uidvalidity: "200",
@@ -334,9 +349,9 @@ describe("setThreadFlags / moveThread fan-out", () => {
     const pool = { connect: vi.fn(async () => client) } as unknown as never;
 
     const { setThreadFlags } = await import("../mailbox-mutations.js");
-    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+    const result = await setThreadFlags(pool, config, M1, { add: ["seen"] });
 
-    expect(result.messageIds).toEqual(["msg-inbox", "msg-sent"]);
+    expect(result.messageIds).toEqual([M_INBOX, M_SENT]);
     expect(query.mock.calls.some(([sql]) =>
       sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
     )).toBe(true);
@@ -358,9 +373,10 @@ describe("setThreadFlags / moveThread fan-out", () => {
       .mockResolvedValueOnce(true)
       .mockRejectedValueOnce(new Error("STORE failed"));
     const { setThreadFlags } = await import("../mailbox-mutations.js");
-    await expect(setThreadFlags(pool, config, "msg-1", { add: ["seen"] })).rejects.toThrow(/STORE failed/);
+    await expect(setThreadFlags(pool, config, M1, { add: ["seen"] })).rejects.toThrow(/STORE failed/);
     // Member 1's mirror write-through ran before the member-2 failure aborted the loop.
     expect(repo.applyMessageFlags).toHaveBeenCalledTimes(1);
+    // Member ids come from the thread rows, not from the seed id.
     expect(repo.applyMessageFlags).toHaveBeenCalledWith("msg-1", "acc-1", { add: ["\\Seen"], remove: [] });
   });
 
@@ -369,7 +385,7 @@ describe("setThreadFlags / moveThread fan-out", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     repo.applyMessageFlags.mockResolvedValueOnce(["\\Seen"]).mockResolvedValueOnce(null as never);
     const { setThreadFlags } = await import("../mailbox-mutations.js");
-    const result = await setThreadFlags(pool, config, "msg-1", { add: ["seen"] });
+    const result = await setThreadFlags(pool, config, M1, { add: ["seen"] });
     expect(result.messageCount).toBe(2);
     expect(result.mirrorWriteThroughStale).toBe(1);
     warn.mockRestore();
@@ -378,18 +394,23 @@ describe("setThreadFlags / moveThread fan-out", () => {
   it("moveThread caps fan-out at 100 and reports truncated", async () => {
     const pool = poolReturningMembers(members(101));
     const { moveThread } = await import("../mailbox-mutations.js");
-    const result = await moveThread(pool, config, "msg-1", "Archive");
+    const result = await moveThread(pool, config, M1, "Archive");
     expect(result.truncated).toBe(true);
     // Every capped member is in INBOX, none already in Archive, so all 100 move.
     expect(mutator.move).toHaveBeenCalledTimes(100);
     expect(result.messageCount).toBe(100);
+    // Each changed folder is marked once, before the first provider move.
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX", "Archive"]);
+    expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
+      mutator.move.mock.invocationCallOrder[0]
+    );
   });
 });
 
 describe("abort signal", () => {
   it("rejects with AbortError before loading or connecting when already aborted", async () => {
     const { setMessageFlags } = await import("../mailbox-mutations.js");
-    const error = await setMessageFlags({} as never, config, "msg-1", { add: ["seen"] }, undefined, {
+    const error = await setMessageFlags({} as never, config, M1, { add: ["seen"] }, undefined, {
       signal: AbortSignal.abort()
     }).catch((value) => value);
 
@@ -422,7 +443,7 @@ describe("abort signal", () => {
     const pending = setMessageFlags(
       {} as never,
       config,
-      "msg-1",
+      M1,
       { add: ["seen"], remove: ["flagged"] },
       undefined,
       { signal: abort.signal }

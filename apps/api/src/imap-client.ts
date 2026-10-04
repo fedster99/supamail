@@ -622,6 +622,21 @@ export function parseMessageMetadata(
   };
 }
 
+/** The header fields a mirror row keeps in `headers_json`. */
+export const METADATA_HEADER_FIELDS = [
+  "message-id",
+  "references",
+  "in-reply-to",
+  "auto-submitted",
+  "x-auto-response-suppress",
+  "list-unsubscribe",
+  "list-id",
+  "precedence",
+  "reply-to",
+  "thread-index",
+  "thread-topic"
+] as const;
+
 export async function fetchMessageMetadata(
   client: MirrorImapClient,
   uids: number[],
@@ -647,19 +662,7 @@ export async function fetchMessageMetadata(
       envelope: true,
       bodyStructure: true,
       threadId: true,
-      headers: [
-        "message-id",
-        "references",
-        "in-reply-to",
-        "auto-submitted",
-        "x-auto-response-suppress",
-        "list-unsubscribe",
-        "list-id",
-        "precedence",
-        "reply-to",
-        "thread-index",
-        "thread-topic"
-      ]
+      headers: [...METADATA_HEADER_FIELDS]
     }, { uid: true })) {
       // Ignore unsolicited UID-less, out-of-range, and flags-only FETCH responses.
       // A requested UID is complete only when the fundamental requested fields are
@@ -949,10 +952,9 @@ export interface BodyBatchFetchResult {
 
 function isParsedOnlySourceTruncated(
   rawBytes: number,
-  message: ImapMessage,
+  expectedBytes: number,
   configuredCap: number
 ): boolean {
-  const expectedBytes = Number(message.size_bytes);
   if (
     Number.isSafeInteger(expectedBytes)
     && expectedBytes > 0
@@ -1038,7 +1040,10 @@ export async function fetchFullMessageBodyBatch(
         source: {
           start: 0,
           maxLength: sourceLimit
-        }
+        },
+        // A row a draft save wrote has no BODYSTRUCTURE until sync reads it again
+        // (ADR 0033); select its text part from the server's.
+        ...(messages.some((message) => message.mime_structure == null) ? { bodyStructure: true } : {})
       },
       { uid: true }
     )) {
@@ -1060,10 +1065,10 @@ export async function fetchFullMessageBodyBatch(
       })());
       const rawTruncated = isParsedOnlySourceTruncated(
         parsed.rawBytes,
-        message,
+        Number(message.size_bytes),
         config.BODY_RAW_MAX_BYTES
       );
-      const mimeStructure = message.mime_structure;
+      const mimeStructure = message.mime_structure ?? fetched.bodyStructure ?? null;
       const selected = selectBodyTextPart(mimeStructure);
 
       bodies.push({
@@ -1130,14 +1135,19 @@ export async function fetchFullMessageBody(
 
     const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
     let fetched: FetchMessage | false | null = null;
-    if (!streamParsedOnly) {
+    // Parsed-only streams the source below and needs a FETCH only for a row with no
+    // BODYSTRUCTURE, which a draft save writes until sync reads it again (ADR 0033).
+    // That row's size is the composed size, so take the server's size too.
+    if (!streamParsedOnly || message.mime_structure == null) {
       fetched = await client.fetchOne(
         String(message.uid),
-        {
-          bodyStructure: true,
-          headers: true,
-          source: { start: 0, maxLength: config.BODY_RAW_MAX_BYTES }
-        },
+        streamParsedOnly
+          ? { bodyStructure: true, size: true }
+          : {
+              bodyStructure: true,
+              headers: true,
+              source: { start: 0, maxLength: config.BODY_RAW_MAX_BYTES }
+            },
         { uid: true }
       );
 
@@ -1187,7 +1197,11 @@ export async function fetchFullMessageBody(
     }
 
     const rawTruncated = streamParsedOnly
-      ? isParsedOnlySourceTruncated(rawBytes, message, config.BODY_RAW_MAX_BYTES)
+      ? isParsedOnlySourceTruncated(
+        rawBytes,
+        typeof fetched?.size === "number" ? fetched.size : Number(message.size_bytes),
+        config.BODY_RAW_MAX_BYTES
+      )
       : rawBytes >= config.BODY_RAW_MAX_BYTES;
     if (rawTruncated) rawMimeSha256 = null;
     const mimeStructure = fetched?.bodyStructure ?? message.mime_structure;

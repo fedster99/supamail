@@ -157,7 +157,7 @@ async function sendMessageAttempt(
           sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
           const appended = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
           appendedToSent = true;
-          appendedUid = appended.uid;
+          appendedUid = appended?.uid ?? null;
         } catch (error) {
           addWarning(
             `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`

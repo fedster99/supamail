@@ -21,6 +21,7 @@ import {
 } from "./metadata-protection.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
+import { isMirrorId } from "./mirror-id.js";
 
 /**
  * Mechanical IMAP write verbs — mark read/unread, star/unstar, move, trash,
@@ -40,10 +41,9 @@ import type { ImapAccount, ImapMessage } from "./types.js";
  * update of a KNOWN row to a KNOWN value (not fabricating identity), and it is
  * required because the flag-scan sync only re-reads flags within
  * FLAG_DIFF_WINDOW_DAYS, so a change to older mail would otherwise never reconcile.
- * Moves mark their known source and destination folders due before the provider
- * command. The host can reconcile them immediately after acknowledgement; the
- * periodic sync remains the crash-safe fallback. Deletes retain the older next-
- * sync behavior until their action path receives the same qualification.
+ * Moves and deletes mark their known source and destination folders due before the
+ * provider command. The host can reconcile them immediately after acknowledgement;
+ * the periodic sync remains the crash-safe fallback.
  *
  * Destructive verbs require server capabilities so a fallback can never run a
  * blanket EXPUNGE: hard delete requires UIDPLUS (UID-scoped EXPUNGE); move
@@ -493,7 +493,9 @@ export async function deleteMessage(
 
   const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
   try {
+    // The changed folders are durably due before the provider command, as for a move.
     if (options.hard) {
+      await repository.markFoldersForReconcile(account.id, [target.folderPath]);
       await mutator.expunge(target);
       return { messageId, fromFolder: target.folderPath, mode: "expunge", trashFolder: null };
     }
@@ -506,6 +508,7 @@ export async function deleteMessage(
     if (trashFolder === target.folderPath) {
       return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
     }
+    await repository.markFoldersForReconcile(account.id, [target.folderPath, trashFolder]);
     await mutator.move(target, trashFolder);
     return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
   } finally {
@@ -550,6 +553,7 @@ async function resolveThreadTargets(
   messageId: string,
   metadataProtection: MetadataProtectionAdapter
 ): Promise<{ accountId: string; targets: ResolvedMessageTarget[]; truncated: boolean }> {
+  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
   const client: PgClient = await pool.connect();
   try {
     // Pin the active-run pointer and both membership reads to one snapshot. An
@@ -736,6 +740,8 @@ export async function moveThread(
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
   const moved: string[] = [];
+  const sources = new Set(targets.map((target) => target.folderPath).filter((path) => path !== destination));
+  if (sources.size > 0) await repository.markFoldersForReconcile(account.id, [...sources, destination]);
   const mutator = await MailboxMutator.connect(pool, config, account, options);
   try {
     for (const target of targets) {

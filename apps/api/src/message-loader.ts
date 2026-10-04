@@ -28,7 +28,7 @@ export async function loadMessageAndAccount(
   const message = await repository.getMessage(messageId);
   if (!message) throw new NotFoundError(`Message not found: ${messageId}`);
   if (options.requireLive && message.deleted_in_provider) {
-    throw new Error(`Message ${messageId} is already deleted in the provider`);
+    throw new NotFoundError(`Message ${messageId} is already deleted in the provider`);
   }
   const account = await repository.getAccount(message.account_id);
   if (!account) throw new Error(`Account not found for message ${messageId}: ${message.account_id}`);

@@ -108,7 +108,7 @@ describe("withAccountLock heartbeat", () => {
       lock.confirmIrreversible();
       return "delivered";
     }, { onPostIrreversibleWarning: warning })).resolves.toBe("delivered");
-    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/already confirmed.*unlock failed/i));
+    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/already accepted the change.*unlock failed/i));
     expect(client.release).toHaveBeenCalledWith(expect.any(Error));
   });
 });

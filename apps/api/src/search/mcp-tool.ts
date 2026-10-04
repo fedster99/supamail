@@ -173,17 +173,37 @@ export const searchEmailToolDefinition = {
   }
 } as const;
 
+/** The tool error envelope for arguments that fail the search schema. */
+export interface SearchInputError {
+  error: { code: "invalid_input"; message: string; hint: string };
+}
+
+/** One answer for arguments that fail the search schema, for every search engine. */
+export function searchInputError(error: z.ZodError): SearchInputError {
+  const detail = error.issues.slice(0, 5).map((issue) =>
+    `${issue.path.length > 0 ? issue.path.map(String).join(".") : "arguments"}: ${issue.message}`).join("; ");
+  return {
+    error: {
+      code: "invalid_input",
+      message: `Invalid search arguments. ${detail}`,
+      hint: "Fix the arguments to match the search_email inputSchema, then retry."
+    }
+  };
+}
+
 /**
  * Validate raw tool arguments and run the search. The injected pool keeps this
  * transport-agnostic: the local stdio binding and any remote binding call this
- * same function. Returns the typed {@link SearchResponse}; the transport layer
- * formats it for the wire.
+ * same function. Returns the typed {@link SearchResponse}, or an `invalid_input`
+ * envelope before any query when the arguments fail the schema, as the read tools
+ * do; the transport layer formats it for the wire.
  */
 export async function runSearchTool(
   pool: PgPool,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
-): Promise<SearchResponse> {
-  const request = searchRequestSchema.parse(args) as SearchRequest;
-  return searchMessages(pool, request, metadataProtection);
+): Promise<SearchResponse | SearchInputError> {
+  const parsed = searchRequestSchema.safeParse(args);
+  if (!parsed.success) return searchInputError(parsed.error);
+  return searchMessages(pool, parsed.data as SearchRequest, metadataProtection);
 }

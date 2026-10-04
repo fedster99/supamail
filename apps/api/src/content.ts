@@ -21,6 +21,7 @@ import {
   type MetadataProtectionAdapter,
   type ProtectedMetadataColumns
 } from "./metadata-protection.js";
+import { isMirrorId } from "./mirror-id.js";
 
 const DEFAULT_CLEAN_BODY_MAX_CHARS = 4096;
 
@@ -307,6 +308,7 @@ export async function listAttachments(
   messageId: string,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<AttachmentInfo[]> {
+  if (!isMirrorId(messageId)) return [];
   const client = await pool.connect();
   try {
     const result = await client.query<AttachmentRow>(
@@ -344,6 +346,7 @@ export async function getAttachmentMetadata(
   attachmentId: string,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<AttachmentInfo | null> {
+  if (!isMirrorId(attachmentId)) return null;
   const client = await pool.connect();
   try {
     const result = await client.query<AttachmentRow>(
@@ -483,6 +486,7 @@ export async function getRawMime(
   options: { signal?: AbortSignal } = {}
 ): Promise<RawMimeResult> {
   throwIfAborted(options.signal);
+  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
   const stored = await pool.connect();
   let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean } | undefined;
   try {
@@ -558,6 +562,7 @@ export async function getMessageHeaders(
   messageId: string,
   options: { basic?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<MessageHeadersResult> {
+  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
   const metadataProtection = options.metadataProtection ?? plaintextMetadataProtection;
   const client = await pool.connect();
   let row: MessageHeadersRow | undefined;
@@ -661,6 +666,7 @@ export async function cleanMessageBody(
   messageId: string,
   options: { includeQuoted?: boolean; maxChars?: number } = {}
 ): Promise<CleanBodyResultDetail> {
+  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
   const client: PgClient = await pool.connect();
   let row: { body_text: string | null; body_plain: string | null; selected_text_part: string | null } | undefined;
   try {

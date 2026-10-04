@@ -378,6 +378,12 @@ export function buildSendEnvelope(from: string, req: SendRequest): SmtpEnvelope 
   return { from, to };
 }
 
+/** A UIDPLUS APPENDUID: the appended message's UID within the mailbox UIDVALIDITY. */
+export interface AppendedUid {
+  uidValidity: number;
+  uid: number;
+}
+
 /**
  * Write-only, single-verb IMAP client for filing the sent copy. Its socket comes
  * from the one shared {@link connectImap} prelude (decrypt + assertSafeImapTarget +
@@ -419,27 +425,36 @@ export class SentFolderAppender {
   }
 
   /**
-   * APPEND raw bytes to `path`, returning the UIDPLUS APPENDUID when the server
-   * provides one (else null — the next sync mirrors the copy regardless).
+   * APPEND raw bytes to `path`, returning the UIDPLUS APPENDUID (UIDVALIDITY and UID)
+   * when the server provides one, else null — the next sync mirrors the copy regardless.
    */
-  async append(path: string, raw: Buffer, flags: string[], date?: Date): Promise<{ uid: number | null }> {
+  async append(path: string, raw: Buffer, flags: string[], date?: Date): Promise<AppendedUid | null> {
     const result = await this.abort.run(() => this.client.append(path, raw, flags, date));
-    const uid = result && typeof result === "object" && "uid" in result ? (result as { uid?: number }).uid : undefined;
-    return { uid: typeof uid === "number" ? uid : null };
+    return result && typeof result.uid === "number" && typeof result.uidValidity === "bigint"
+      ? { uidValidity: Number(result.uidValidity), uid: result.uid }
+      : null;
   }
 
   /**
    * SEARCH `folderPath` for messages carrying an exact Message-ID header, returning
-   * their UIDs. Used for idempotent draft creation (search-before-APPEND): a retried
-   * create derives the same Message-ID, so a prior APPEND is found instead of duped.
-   * SEARCH needs the mailbox selected, so it takes the folder lock for the search.
+   * their UIDs and the mailbox UIDVALIDITY. Used for idempotent draft creation
+   * (search-before-APPEND): a retried create derives the same Message-ID, so a prior
+   * APPEND is found instead of duped. SEARCH needs the mailbox selected, so it takes
+   * the folder lock for the search.
    */
-  searchByMessageId(folderPath: string, rfcMessageId: string): Promise<number[]> {
+  searchByMessageId(
+    folderPath: string,
+    rfcMessageId: string
+  ): Promise<{ uids: number[]; uidValidity: number }> {
     return this.abort.run(async () => {
       const lock = await this.client.getMailboxLock(folderPath);
       try {
         const uids = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
-        return Array.isArray(uids) ? uids : [];
+        const selected = this.client.mailbox;
+        if (!selected || typeof selected.uidValidity !== "bigint") {
+          throw new Error(`Selected mailbox ${folderPath} reported no UIDVALIDITY`);
+        }
+        return { uids: Array.isArray(uids) ? uids : [], uidValidity: Number(selected.uidValidity) };
       } finally {
         lock.release();
       }

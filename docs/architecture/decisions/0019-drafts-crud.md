@@ -32,6 +32,8 @@ introduced:
   draft never inflates unread counts. As with the Sent APPEND, we do **not** insert
   a mirror row — the next sync of Drafts mirrors the copy with its server-assigned
   UID, so identity (`folder + UIDVALIDITY + UID`) is never guessed.
+  *Superseded by ADR 0033:* create and update now write the draft's mirror row
+  from the server's APPENDUID and return its id.
 - **List / Get** read the **mirror**, not IMAP. Drafts are already-synced messages
   in the Drafts folder (provider-profiles intentionally keeps Drafts mirrored). We
   resolve the draft folder set by `\Drafts` special-use plus the conventional name,
@@ -116,6 +118,7 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   draft is not visible to list/get until the next Drafts sync (eventual mirror
   convergence — the same discipline as email-001's Sent APPEND). Update returns the
   superseded draft's id and the new APPENDUID so callers can observe the swap.
+  *Superseded by ADR 0033:* with APPENDUID, the saved draft is visible at once.
 - Update produces a brief window where both the old and new draft exist on the
   server (APPEND succeeds, then delete runs). If the delete fails after the APPEND,
   the result is a duplicate draft, not data loss; the next sync reconciles and the

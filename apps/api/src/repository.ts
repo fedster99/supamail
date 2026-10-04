@@ -63,6 +63,7 @@ import type {
   UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
 } from "./types.js";
+import { isMirrorId } from "./mirror-id.js";
 
 const BROKEN_FAILURE_THRESHOLD = 10;
 const BACKOFF_FLOOR_MS = 1_000;
@@ -804,6 +805,7 @@ export class MirrorRepository {
   }
 
   async getAccount(id: string): Promise<ImapAccount | null> {
+    if (!isMirrorId(id)) return null;
     const result = await this.pool.query<ImapAccount & ProtectedMetadataColumns>(
       "SELECT * FROM public.imap_accounts WHERE id = $1",
       [id]
@@ -3819,7 +3821,28 @@ export class MirrorRepository {
     }
   }
 
+  /**
+   * The mirror id of the live row at one physical identity, or null when it is not
+   * mirrored yet or the provider already deleted it. A retried draft save uses it
+   * to return the id of the copy an earlier attempt filed.
+   */
+  async getLiveMessageId({ accountId, folderPath, uidValidity, uid }: {
+    accountId: string;
+    folderPath: string;
+    uidValidity: number;
+    uid: number;
+  }): Promise<string | null> {
+    const result = await this.pool.query<{ id: string }>(
+      `SELECT id FROM public.imap_messages
+        WHERE account_id = $1 AND folder_path = $2 AND uidvalidity = $3 AND uid = $4
+          AND deleted_in_provider = false`,
+      [accountId, folderPath, uidValidity, uid]
+    );
+    return result.rows[0]?.id ?? null;
+  }
+
   async getMessage(id: string): Promise<ImapMessage | null> {
+    if (!isMirrorId(id)) return null;
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
       "SELECT * FROM public.imap_messages WHERE id = $1",
       [id]

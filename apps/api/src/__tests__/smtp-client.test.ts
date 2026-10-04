@@ -32,7 +32,11 @@ const imap = vi.hoisted(() => ({
     delimiter?: string | null;
   }>),
   logout: vi.fn(async () => undefined),
-  close: vi.fn()
+  close: vi.fn(),
+  append: vi.fn(async (..._args: unknown[]) => ({ destination: "Drafts", uidValidity: 7n, uid: 42 }) as unknown),
+  getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+  search: vi.fn(async (..._args: unknown[]) => [5, 9] as unknown),
+  mailbox: { uidValidity: 7n } as { uidValidity: bigint } | false
 }));
 const connectImap = vi.hoisted(() => vi.fn(async () => imap));
 
@@ -87,6 +91,28 @@ describe("SentFolderAppender mailbox discovery", () => {
       specialUse: null,
       delimiter: "|"
     }]);
+  });
+});
+
+describe("SentFolderAppender identity", () => {
+  it("returns the APPENDUID UIDVALIDITY and UID, or null without UIDPLUS", async () => {
+    const { SentFolderAppender } = await import("../smtp-client.js");
+    const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
+    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toEqual({ uidValidity: 7, uid: 42 });
+    imap.append.mockResolvedValueOnce(false);
+    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toBeNull();
+    // APPENDUID carries both values or neither; a half answer is no identity.
+    imap.append.mockResolvedValueOnce({ destination: "Drafts", uid: 42 });
+    await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toBeNull();
+  });
+
+  it("returns the selected mailbox UIDVALIDITY with a Message-ID search", async () => {
+    const { SentFolderAppender } = await import("../smtp-client.js");
+    const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
+    await expect(appender.searchByMessageId("Drafts", "<d@example.test>")).resolves.toEqual({ uids: [5, 9], uidValidity: 7 });
+    imap.mailbox = false;
+    await expect(appender.searchByMessageId("Drafts", "<d@example.test>")).rejects.toThrow(/no UIDVALIDITY/);
+    imap.mailbox = { uidValidity: 7n };
   });
 });
 
