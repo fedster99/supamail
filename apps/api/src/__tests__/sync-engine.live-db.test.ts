@@ -2792,7 +2792,7 @@ liveDb("live DB reliability lane", () => {
     expect(types).not.toContain("PRUNE_TEST_OLD");
   });
 
-  it("retention prunes finished imap_sync_runs older than the retention window, keeping recent and open runs", async () => {
+  it("retention prunes imap_sync_runs older than the retention window, keeping recent runs and recently opened ones", async () => {
     const h = await setupIntegration("live-run-prune");
     activeAccountIds.push(h.account.id);
     const inserted = await h.pool.query<{ id: string; label: string }>(
@@ -2800,7 +2800,8 @@ liveDb("live DB reliability lane", () => {
       INSERT INTO public.imap_sync_runs (account_id, status, started_at, finished_at, metadata)
       VALUES ($1, 'success', now() - interval '200 days', now() - interval '200 days', '{"prune_test":"old_success"}'),
              ($1, 'failed', now() - interval '200 days', now() - interval '200 days', '{"prune_test":"old_failed"}'),
-             ($1, 'running', now() - interval '200 days', NULL, '{"prune_test":"old_running"}'),
+             ($1, 'running', now() - interval '200 days', NULL, '{"prune_test":"orphan_running"}'),
+             ($1, 'running', now() - interval '2 hours', NULL, '{"prune_test":"open_running"}'),
              ($1, 'success', now(), now(), '{"prune_test":"recent_success"}')
       RETURNING id, metadata->>'prune_test' AS label
       `,
@@ -2816,13 +2817,15 @@ liveDb("live DB reliability lane", () => {
     );
 
     const retention = await h.repository.runRetentionJobs();
-    expect(retention.prunedRuns).toBeGreaterThanOrEqual(2);
+    expect(retention.prunedRuns).toBeGreaterThanOrEqual(3);
 
     const remaining = await h.pool.query<{ label: string }>(
       "SELECT metadata->>'prune_test' AS label FROM public.imap_sync_runs WHERE account_id = $1 AND metadata ? 'prune_test' ORDER BY 1",
       [h.account.id]
     );
-    expect(remaining.rows.map((row) => row.label)).toEqual(["old_running", "recent_success"]);
+    // A 200-day-old "running" row is an orphan and goes with the rest; a recent
+    // open run stays for lock reaping.
+    expect(remaining.rows.map((row) => row.label)).toEqual(["open_running", "recent_success"]);
 
     // A recent event that pointed at a pruned run survives with its link cleared.
     const event = await h.pool.query<{ sync_run_id: string | null }>(

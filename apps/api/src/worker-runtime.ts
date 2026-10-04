@@ -483,7 +483,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   }));
 
   const logRetention = (
-    r: { expired: number; purged: number; prunedEvents: number; prunedRuns: number },
+    r: Awaited<ReturnType<MirrorRepository["runRetentionJobs"]>>,
     threadRuns: { runsDeleted: number; assignmentsDeleted: number } = { runsDeleted: 0, assignmentsDeleted: 0 }
   ) =>
     console.log(JSON.stringify({

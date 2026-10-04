@@ -1807,12 +1807,16 @@ export class MirrorRepository {
   }
 
   /**
-   * Prune finished imap_sync_runs rows. The engine writes one row per sync pass, so
-   * the table grows with time per account (thousands of rows a week) rather than with
-   * mail. Open runs are kept so lock reaping can still close them. Each account is
-   * walked through its (account_id, started_at) index, and the run is bounded like
-   * the event prune; the daily retention cadence drains the rest. Runs after the
-   * event prune so referencing events are already gone before SET NULL fires.
+   * Prune old imap_sync_runs rows. The engine writes one row per sync pass, so the
+   * table grows with time per account (thousands of rows a week) rather than with
+   * mail. A row still marked running is kept while lock reaping could close it, but
+   * one older than seven days is an orphan (a pass is bounded to minutes by the
+   * cooperative lock budget) and is pruned with the rest. Each account is walked
+   * through its (account_id, started_at) index, and the run is bounded like the
+   * event prune; the daily retention cadence drains the rest. It runs after the
+   * event prune, so with equal windows most referencing events are already gone;
+   * a newer event that still points at a pruned run keeps its row and loses only
+   * the link, via the indexed ON DELETE SET NULL.
    */
   async runSyncRunPruneJob(): Promise<{ prunedRuns: number }> {
     const result = await this.pool.query(
@@ -1826,7 +1830,7 @@ export class MirrorRepository {
           FROM public.imap_sync_runs r
           WHERE r.account_id = account.id
             AND r.started_at < now() - ($1::int * interval '1 day')
-            AND r.status <> 'running'
+            AND (r.status <> 'running' OR r.started_at < now() - interval '7 days')
           ORDER BY r.started_at
           LIMIT 50000
         ) run

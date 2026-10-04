@@ -438,7 +438,7 @@ describe("repository safety", () => {
     // (account_id, started_at) index; open runs stay for lock reaping.
     expect(source).toContain("runSyncRunPruneJob");
     expect(source).toContain("DELETE FROM public.imap_sync_runs");
-    expect(source).toContain("AND r.status <> 'running'");
+    expect(source).toContain("AND (r.status <> 'running' OR r.started_at < now() - interval '7 days')");
     // Retention re-runs on a daily timer (was boot-only), cleared on shutdown.
     expect(worker).toContain("setInterval");
     expect(worker).toContain("clearInterval(retentionTimer)");
