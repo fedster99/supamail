@@ -77,6 +77,8 @@ describe("mime helpers", () => {
 
   it("converts basic html to normalized text", () => {
     expect(htmlToText("<p>Hello&nbsp;<b>there</b></p><script>x()</script>")).toBe("Hello there");
+    expect(htmlToText("<p>Thanks, <b>Alice</b>. See <a href=\"https://example.test\">my calendar</a>, then <td>x</td><td>y</td></p>"))
+      .toBe("Thanks, Alice. See my calendar, then x y");
   });
 
   it("drops head, comments and invisible preheader padding from html", () => {

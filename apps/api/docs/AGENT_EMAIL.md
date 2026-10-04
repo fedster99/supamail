@@ -46,7 +46,7 @@ listener; remote deployments provide their own transport and authentication.
 | `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each valid distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100) |
 | `read_message` | One message with its full available cleaned body, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false`, optional `body_offset`, optional positive `max_body_chars` |
 | `list_folders` | Folders + unread/flagged/total counts for an account. | `account?` |
-| `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `reply_all=false` |
+| `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `body_format=plain` (or `html`), `reply_all=false` |
 
 ## The ID model
 
