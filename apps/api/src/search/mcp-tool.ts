@@ -178,6 +178,19 @@ export interface SearchInputError {
   error: { code: "invalid_input"; message: string; hint: string };
 }
 
+/** One answer for arguments that fail the search schema, for every search engine. */
+export function searchInputError(error: z.ZodError): SearchInputError {
+  const detail = error.issues.slice(0, 5).map((issue) =>
+    `${issue.path.length > 0 ? issue.path.map(String).join(".") : "arguments"}: ${issue.message}`).join("; ");
+  return {
+    error: {
+      code: "invalid_input",
+      message: `Invalid search arguments. ${detail}`,
+      hint: "Fix the arguments to match the search_email inputSchema, then retry."
+    }
+  };
+}
+
 /**
  * Validate raw tool arguments and run the search. The injected pool keeps this
  * transport-agnostic: the local stdio binding and any remote binding call this
@@ -191,14 +204,6 @@ export async function runSearchTool(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<SearchResponse | SearchInputError> {
   const parsed = searchRequestSchema.safeParse(args);
-  if (!parsed.success) {
-    return {
-      error: {
-        code: "invalid_input",
-        message: parsed.error.message,
-        hint: "Fix the arguments to match the search_email inputSchema, then retry."
-      }
-    };
-  }
+  if (!parsed.success) return searchInputError(parsed.error);
   return searchMessages(pool, parsed.data as SearchRequest, metadataProtection);
 }

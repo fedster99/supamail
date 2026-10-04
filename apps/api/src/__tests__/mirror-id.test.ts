@@ -52,6 +52,6 @@ describe("runSearchTool", () => {
   it("returns invalid_input for arguments that fail the schema, before any query", async () => {
     const result = await runSearchTool(untouchedPool, { q: "x", limit: 500 });
     expect(result).toMatchObject({ error: { code: "invalid_input" } });
-    expect("error" in result && result.error.message).toMatch(/limit/);
+    expect("error" in result && result.error.message).toMatch(/^Invalid search arguments\. limit: /);
   });
 });

@@ -25,8 +25,8 @@ After a provider-acknowledged draft APPEND returns APPENDUID, `createDraft` and
 `updateDraft` write the draft's mirror row through the sync's own
 `upsertMessages`, under the account lock the save already holds, and return
 its id as `messageId`. The lock fences its writes, as sync's does, so a save
-that lost the lock cannot overwrite a row that sync already read. The write has
-a 5-second deadline, so it cannot hold the lock or the caller's request long.
+that lost the lock cannot overwrite a row that sync already read. The upsert has
+a 5-second deadline; the other mirror steps are single indexed queries.
 
 - **Values the save knows.** UID and UIDVALIDITY come from APPENDUID. The
   Message-ID, In-Reply-To, References, subject, sender, To, Cc, size, flags

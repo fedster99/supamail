@@ -200,6 +200,7 @@ async function saveDraft(
     : req;
   const { raw, messageId: rfcMessageId } = await buildRawMime(composeReq, { email: account.email_address });
 
+  // One array: the lock adds its post-confirmation warnings after the callback returns.
   const warnings: string[] = [];
   const result = await withAccountLock(pool, account.lock_id, async (lock) => {
     const savedAt = new Date();
