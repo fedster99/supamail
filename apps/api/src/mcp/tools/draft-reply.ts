@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PgPool } from "../../db.js";
+import { htmlToText } from "../../mime.js";
 import { cleanBody, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
@@ -28,6 +29,7 @@ export const draftReplyRequestSchema = z
   .object({
     source_message_id: z.string(),
     body: z.string(),
+    body_format: z.enum(["plain", "html"]).optional(),
     reply_all: z.boolean().optional()
   })
   .strict();
@@ -75,7 +77,7 @@ export interface DraftReply {
     "X-SupaMail-Draft": "produced-not-sent";
   };
   threadId: string | null;
-  body: { format: "plain"; text: string; html: string };
+  body: { format: "plain" | "html"; text: string; html: string };
   warnings: string[];
 }
 
@@ -108,7 +110,13 @@ export const draftReplyDefinition: ToolDefinition = {
       },
       body: {
         type: "string",
-        description: "The reply text the agent wrote. Quoted original is appended automatically."
+        description: "The reply the agent wrote, as plain text or as HTML when body_format is html. Quoted original is appended automatically."
+      },
+      body_format: {
+        type: "string",
+        enum: ["plain", "html"],
+        default: "plain",
+        description: "html: body is HTML; the plain-text alternative is derived from it."
       },
       reply_all: {
         type: "boolean",
@@ -242,18 +250,23 @@ function quotedTextToHtml(text: string): string {
   return output.join("\n");
 }
 
-/** Build equivalent plain and HTML alternatives from plain, already-normalized source text. */
+/**
+ * Build equivalent plain and HTML alternatives: the authored reply (plain text, or HTML
+ * whose plain alternative is its visible text) above the quoted, normalized source text.
+ */
 export function buildReplyBody(
-  authoredText: string,
+  authored: string,
   sourceText: string | null,
-  attribution: string
+  attribution: string,
+  format: DraftReply["body"]["format"] = "plain"
 ): DraftReply["body"] {
   const fullSource = cleanBody(sourceText, { includeQuoted: true }).text ?? "";
+  const authoredText = format === "html" ? htmlToText(authored) : authored;
   return {
-    format: "plain",
+    format,
     text: `${authoredText}\n\n${attribution}\n${quoteText(fullSource)}`,
     html:
-      `${plainTextToHtml(authoredText)}\n` +
+      `${format === "html" ? authored : plainTextToHtml(authored)}\n` +
       `<div><br></div>\n<div class="gmail_quote gmail_quote_container">\n` +
       `<div>${escapeHtml(attribution)}</div>\n` +
       `${quotedTextToHtml(fullSource)}\n</div>`
@@ -394,7 +407,7 @@ export async function runDraftReply(
   const cc = request.reply_all === true ? buildCc(source) : [];
 
   const original = replySource(source);
-  const body = buildReplyBody(request.body, original.text, original.attribution);
+  const body = buildReplyBody(request.body, original.text, original.attribution, request.body_format);
 
   return {
     draftId: `drf_${source.id}`,

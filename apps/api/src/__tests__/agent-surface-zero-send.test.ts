@@ -114,7 +114,7 @@ describe("agent-email surface is zero-send", () => {
     const draft = TOOLS.find((t) => t.definition.name === "draft_reply");
     expect(draft, "draft_reply must be registered").toBeDefined();
     const draftKeys = Object.keys((draft?.definition.inputSchema as { properties?: Record<string, unknown> }).properties ?? {});
-    const allowed = new Set(["source_message_id", "body", "reply_all"]);
+    const allowed = new Set(["source_message_id", "body", "body_format", "reply_all"]);
     for (const key of draftKeys) {
       expect(allowed.has(key), `draft_reply exposes an unexpected input key "${key}"`).toBe(true);
     }

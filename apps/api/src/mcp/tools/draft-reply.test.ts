@@ -40,4 +40,20 @@ describe("buildReplyBody", () => {
     expect(body.html).not.toContain("> Latest answer.");
     expect(body.html).not.toContain("&gt; Older answer.");
   });
+
+  it("puts an HTML reply above the same quote and derives its plain alternative", () => {
+    const body = buildReplyBody(
+      "<p>Thanks, <b>Alice</b>.</p><p>Best,<br>Bob</p>",
+      "Latest answer.",
+      "On Fri, Alice <alice@example.test> wrote:",
+      "html"
+    );
+
+    expect(body.format).toBe("html");
+    expect(body.html.startsWith("<p>Thanks, <b>Alice</b>.</p><p>Best,<br>Bob</p>\n")).toBe(true);
+    expect(body.html.match(/<blockquote/g)).toHaveLength(1);
+    expect(body.html).toContain("Latest answer.");
+    expect(body.text).toMatch(/^Thanks, Alice ?\.\n\nBest,\nBob\n\nOn Fri, Alice <alice@example.test> wrote:\n> Latest answer\./);
+    expect(body.text).not.toContain("<b>");
+  });
 });
