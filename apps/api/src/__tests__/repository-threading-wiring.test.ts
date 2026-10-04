@@ -2,10 +2,8 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 import type { PgPool } from "../db.js";
-import {
-  MirrorRepository,
-  canonicalJsonForThreadingEvidence
-} from "../repository.js";
+import { canonicalJsonForThreadingEvidence } from "../delivery-evidence.js";
+import { MirrorRepository } from "../repository.js";
 import type { ImapFolder, MessageMetadata } from "../types.js";
 
 const ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
@@ -276,7 +274,7 @@ describe("repository threading evidence wiring", () => {
       namespace: "github_issue",
       evidence_key: "acme/mail#42",
       evidence_key_sha256: createHash("sha256").update("acme/mail#42").digest("hex"),
-      extractor_version: "mime_evidence_v1"
+      extractor_version: "mime_evidence_v2"
     })]);
 
     await repository.storeBodyEvidence({
@@ -298,7 +296,7 @@ describe("repository threading evidence wiring", () => {
       .filter((call) => call.sql.startsWith("INSERT INTO public.imap_message_bodies"))
       .at(-1);
     expect(finalBodyWrite?.params.slice(9, 12)).toEqual([
-      "mime_evidence_v1",
+      "mime_evidence_v2",
       null,
       false
     ]);

@@ -1000,6 +1000,47 @@ liveDb("live DB reliability lane", () => {
     expect(dueBodies.map((message) => message.folder_path)).toEqual(["INBOX"]);
   });
 
+  it("fetches a body again for a stale evidence version, but not for a digest-only upgrade", async () => {
+    const h = await setupIntegration("live-evidence-version-backlog");
+    activeAccountIds.push(h.account.id);
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account) throw new Error("missing account");
+    await h.repository.upsertDiscoveredFolders(account, [{ path: "INBOX", delimiter: "/" }]);
+    await h.pool.query(
+      `UPDATE public.imap_folders SET sync_priority = 1, initial_sync_complete = true
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    await h.pool.query(
+      "UPDATE public.imap_accounts SET body_fetch_policy = 'priority_then_backfill' WHERE id = $1",
+      [h.account.id]
+    );
+    const versions = [null, "mime_evidence_v1", "mime_evidence_v2", "mime_evidence_v0"];
+    for (const [index, version] of versions.entries()) {
+      const message = await h.pool.query<{ id: string }>(
+        `INSERT INTO public.imap_messages
+           (account_id, folder_path, uidvalidity, uid, internal_date,
+            window_status, deleted_in_provider, body_fetched_at)
+         VALUES ($1, 'INBOX', 1, $2, now(), 'IN_WINDOW', false, now())
+         RETURNING id`,
+        [h.account.id, index + 1]
+      );
+      await h.pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_bytes, raw_truncated, headers_json,
+           structured_evidence_extractor_version, structured_evidence_complete,
+           structured_evidence_extracted_at
+         ) VALUES ($1, 0, false, '{}'::jsonb, $2::text, false, CASE WHEN $2::text IS NULL THEN NULL ELSE now() END)`,
+        [message.rows[0].id, version]
+      );
+    }
+
+    const eligible = await h.repository.getAccount(h.account.id);
+    if (!eligible) throw new Error("missing account");
+    const backlog = await h.repository.getBodyBacklog(eligible, 10);
+    expect(backlog.map((message) => Number(message.uid)).sort()).toEqual([1, 4]);
+  });
+
   it("does not let a discovery-missing folder block account health or IDLE during grace", async () => {
     const h = await setupIntegration("live-missing-folder-health");
     activeAccountIds.push(h.account.id);

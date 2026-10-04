@@ -125,7 +125,7 @@ liveDb("threading-header ingestion", () => {
     expect(storedEvidence.rows).toEqual([expect.objectContaining({
       namespace: "github_issue",
       evidence_key: "supamail/supamail#42",
-      extractor_version: "mime_evidence_v1",
+      extractor_version: "mime_evidence_v2",
       complete: true,
       digest: expect.stringMatching(/^[0-9a-f]{64}$/)
     })]);
