@@ -2792,6 +2792,46 @@ liveDb("live DB reliability lane", () => {
     expect(types).not.toContain("PRUNE_TEST_OLD");
   });
 
+  it("retention prunes finished imap_sync_runs older than the retention window, keeping recent and open runs", async () => {
+    const h = await setupIntegration("live-run-prune");
+    activeAccountIds.push(h.account.id);
+    const inserted = await h.pool.query<{ id: string; label: string }>(
+      `
+      INSERT INTO public.imap_sync_runs (account_id, status, started_at, finished_at, metadata)
+      VALUES ($1, 'success', now() - interval '200 days', now() - interval '200 days', '{"prune_test":"old_success"}'),
+             ($1, 'failed', now() - interval '200 days', now() - interval '200 days', '{"prune_test":"old_failed"}'),
+             ($1, 'running', now() - interval '200 days', NULL, '{"prune_test":"old_running"}'),
+             ($1, 'success', now(), now(), '{"prune_test":"recent_success"}')
+      RETURNING id, metadata->>'prune_test' AS label
+      `,
+      [h.account.id]
+    );
+    const oldRunId = inserted.rows.find((row) => row.label === "old_success")?.id;
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_sync_events (account_id, sync_run_id, event_type, occurred_at)
+      VALUES ($1, $2, 'RUN_PRUNE_TEST', now())
+      `,
+      [h.account.id, oldRunId]
+    );
+
+    const retention = await h.repository.runRetentionJobs();
+    expect(retention.prunedRuns).toBeGreaterThanOrEqual(2);
+
+    const remaining = await h.pool.query<{ label: string }>(
+      "SELECT metadata->>'prune_test' AS label FROM public.imap_sync_runs WHERE account_id = $1 AND metadata ? 'prune_test' ORDER BY 1",
+      [h.account.id]
+    );
+    expect(remaining.rows.map((row) => row.label)).toEqual(["old_running", "recent_success"]);
+
+    // A recent event that pointed at a pruned run survives with its link cleared.
+    const event = await h.pool.query<{ sync_run_id: string | null }>(
+      "SELECT sync_run_id FROM public.imap_sync_events WHERE account_id = $1 AND event_type = 'RUN_PRUNE_TEST'",
+      [h.account.id]
+    );
+    expect(event.rows).toEqual([{ sync_run_id: null }]);
+  });
+
   it("degrades on a recent UIDVALIDITY reset, then returns HEALTHY once the reset ages out", async () => {
     const h = await setupIntegration("live-reset-degraded", { RECENT_UIDVALIDITY_RESET_DEGRADED_MS: 60 * 60_000 });
     activeAccountIds.push(h.account.id);

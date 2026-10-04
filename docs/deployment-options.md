@@ -48,6 +48,8 @@ All three sync batch-size settings accept values from `1` through `500`. A metad
 
 `DATABASE_POOL_MAX` (default 10) sets the Postgres connection pool size for the process. Raise it when one worker drives many accounts/folders concurrently and the database can afford the connections; keep it at or below what a connection-capped Postgres (for example a Supavisor session pooler) allows. It does not change advisory-lock semantics — each pooled connection is its own session.
 
+The worker runs retention at startup and then daily. `SYNC_EVENT_RETENTION_DAYS` and `SYNC_RUN_RETENTION_DAYS` (default 90 each) bound the `imap_sync_events` audit trail and finished `imap_sync_runs` rows. Sync runs grow with time rather than mail (one row per sync pass per account), so lower `SYNC_RUN_RETENTION_DAYS` when database size matters more than run history.
+
 Optional API deploy:
 
 ```bash

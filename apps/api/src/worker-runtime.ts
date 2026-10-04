@@ -483,7 +483,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   }));
 
   const logRetention = (
-    r: { expired: number; purged: number; prunedEvents: number },
+    r: { expired: number; purged: number; prunedEvents: number; prunedRuns: number },
     threadRuns: { runsDeleted: number; assignmentsDeleted: number } = { runsDeleted: 0, assignmentsDeleted: 0 }
   ) =>
     console.log(JSON.stringify({
@@ -491,6 +491,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
       expired: r.expired,
       purged: r.purged,
       prunedEvents: r.prunedEvents,
+      prunedRuns: r.prunedRuns,
       threadRunsDeleted: threadRuns.runsDeleted,
       threadAssignmentsDeleted: threadRuns.assignmentsDeleted
     }));

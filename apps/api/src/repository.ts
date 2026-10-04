@@ -1806,11 +1806,44 @@ export class MirrorRepository {
     return { prunedEvents: result.rowCount ?? 0 };
   }
 
-  async runRetentionJobs(): Promise<{ expired: number; purged: number; prunedEvents: number }> {
+  /**
+   * Prune finished imap_sync_runs rows. The engine writes one row per sync pass, so
+   * the table grows with time per account (thousands of rows a week) rather than with
+   * mail. Open runs are kept so lock reaping can still close them. Each account is
+   * walked through its (account_id, started_at) index, and the run is bounded like
+   * the event prune; the daily retention cadence drains the rest. Runs after the
+   * event prune so referencing events are already gone before SET NULL fires.
+   */
+  async runSyncRunPruneJob(): Promise<{ prunedRuns: number }> {
+    const result = await this.pool.query(
+      `
+      DELETE FROM public.imap_sync_runs
+      WHERE id IN (
+        SELECT run.id
+        FROM public.imap_accounts account
+        CROSS JOIN LATERAL (
+          SELECT r.id
+          FROM public.imap_sync_runs r
+          WHERE r.account_id = account.id
+            AND r.started_at < now() - ($1::int * interval '1 day')
+            AND r.status <> 'running'
+          ORDER BY r.started_at
+          LIMIT 50000
+        ) run
+        LIMIT 50000
+      )
+      `,
+      [this.config.SYNC_RUN_RETENTION_DAYS]
+    );
+    return { prunedRuns: result.rowCount ?? 0 };
+  }
+
+  async runRetentionJobs(): Promise<{ expired: number; purged: number; prunedEvents: number; prunedRuns: number }> {
     const { expired } = await this.runExpiryJob();
     const { purged } = await this.runPurgeJob();
     const { prunedEvents } = await this.runSyncEventPruneJob();
-    return { expired, purged, prunedEvents };
+    const { prunedRuns } = await this.runSyncRunPruneJob();
+    return { expired, purged, prunedEvents, prunedRuns };
   }
 
   async upsertDiscoveredFolders(

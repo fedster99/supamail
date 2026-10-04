@@ -108,6 +108,7 @@ const envSchema = z.object({
   OVERALL_RECONCILE_HEALTHY_MAX_AGE_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),
   EXPIRE_AFTER_DAYS: z.coerce.number().int().positive().default(180),
   SYNC_EVENT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  SYNC_RUN_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   RECENT_UIDVALIDITY_RESET_DEGRADED_MS: z.coerce.number().int().positive().default(60 * 60_000),
   BACKFILL_WINDOW_START_HOUR: optionalHourSchema,
   BACKFILL_WINDOW_END_HOUR: optionalHourSchema,
