@@ -72,6 +72,11 @@ const MISSING_MAILBOX_VERIFICATION_NOTE = "missing_mailbox_pending_verification"
 const DEFAULT_METADATA_WRITE_TIMEOUT_MS = 5 * 60_000;
 const LIVE_THREAD_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const PURGE_MESSAGE_BATCH_SIZE = 100;
+// Sync-history retention deletes in statements of at most this many rows, and
+// stops after this many full statements per run so a large first backlog cannot
+// hold up a worker; the daily cadence drains the rest.
+const SYNC_HISTORY_PRUNE_BATCH_SIZE = 50_000;
+const SYNC_HISTORY_PRUNE_MAX_BATCHES = 10;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
 const RECONCILE_MISSING_UID_LIMIT = 5_000;
 const MAX_MESSAGE_EVIDENCE_ROWS = 100;
@@ -1787,37 +1792,34 @@ export class MirrorRepository {
 
   /**
    * Prune the imap_sync_events audit trail, which is INSERT-only (written on every
-   * sync/reset/delete/state event) and otherwise grows without bound. Bounded per run
-   * so the first prune of a large backlog can't run one huge transaction; the daily
-   * retention cadence drains the rest.
+   * sync/reset/delete/state event) and otherwise grows without bound.
    */
   async runSyncEventPruneJob(): Promise<{ prunedEvents: number }> {
-    const result = await this.pool.query(
+    const prunedEvents = await this.pruneSyncHistory(
       `
       DELETE FROM public.imap_sync_events
       WHERE id IN (
         SELECT id FROM public.imap_sync_events
         WHERE occurred_at < now() - ($1::int * interval '1 day')
-        LIMIT 50000
+        LIMIT $2
       )
-      `,
-      [this.config.SYNC_EVENT_RETENTION_DAYS]
+      `
     );
-    return { prunedEvents: result.rowCount ?? 0 };
+    return { prunedEvents };
   }
 
   /**
    * Prune imap_sync_runs rows older than the sync-history window
    * (SYNC_EVENT_RETENTION_DAYS). The engine writes one row per sync pass, so the
-   * table grows with time per account rather than with mail. Status is ignored: a
-   * pass lasts minutes and lock reaping looks back one hour, so any row past the
-   * window (at least one day) is finished or orphaned. Each account is walked
-   * through its (account_id, started_at) index and each pass is bounded like the
-   * event prune. A newer event that still points at a pruned run keeps its row and
-   * loses only the link (indexed ON DELETE SET NULL).
+   * table grows with time per account rather than with mail. A row still marked
+   * running is kept for seven days: the startup lock sweep and the lock holder
+   * normally close it, and one older than that is an orphan. Each account is
+   * walked through its (account_id, started_at) index. A newer event that still
+   * points at a pruned run keeps its row and loses only the link (indexed
+   * ON DELETE SET NULL).
    */
   async runSyncRunPruneJob(): Promise<{ prunedRuns: number }> {
-    const result = await this.pool.query(
+    const prunedRuns = await this.pruneSyncHistory(
       `
       DELETE FROM public.imap_sync_runs
       WHERE id IN (
@@ -1828,15 +1830,33 @@ export class MirrorRepository {
           FROM public.imap_sync_runs r
           WHERE r.account_id = account.id
             AND r.started_at < now() - ($1::int * interval '1 day')
+            AND (r.status <> 'running' OR r.started_at < now() - interval '7 days')
           ORDER BY r.started_at
-          LIMIT 50000
         ) run
-        LIMIT 50000
+        LIMIT $2
       )
-      `,
-      [this.config.SYNC_EVENT_RETENTION_DAYS]
+      `
     );
-    return { prunedRuns: result.rowCount ?? 0 };
+    return { prunedRuns };
+  }
+
+  /**
+   * Run a sync-history DELETE (parameters: retention days, batch size) until a
+   * statement removes less than a full batch, or the per-run batch cap is reached.
+   * Each statement is its own short transaction.
+   */
+  private async pruneSyncHistory(sql: string): Promise<number> {
+    let pruned = 0;
+    for (let batch = 0; batch < SYNC_HISTORY_PRUNE_MAX_BATCHES; batch += 1) {
+      const result = await this.pool.query(sql, [
+        this.config.SYNC_EVENT_RETENTION_DAYS,
+        SYNC_HISTORY_PRUNE_BATCH_SIZE
+      ]);
+      const deleted = result.rowCount ?? 0;
+      pruned += deleted;
+      if (deleted < SYNC_HISTORY_PRUNE_BATCH_SIZE) break;
+    }
+    return pruned;
   }
 
   async runRetentionJobs(): Promise<{ expired: number; purged: number; prunedEvents: number; prunedRuns: number }> {

@@ -2792,7 +2792,29 @@ liveDb("live DB reliability lane", () => {
     expect(types).not.toContain("PRUNE_TEST_OLD");
   });
 
-  it("retention prunes imap_sync_runs older than the sync-history window, keeping recent runs", async () => {
+  it("retention drains a sync-event backlog larger than one prune statement", async () => {
+    const h = await setupIntegration("live-event-prune-backlog");
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      INSERT INTO public.imap_sync_events (account_id, event_type, occurred_at)
+      SELECT $1, 'PRUNE_TEST_BACKLOG', now() - interval '200 days'
+      FROM generate_series(1, 50001)
+      `,
+      [h.account.id]
+    );
+
+    const retention = await h.repository.runRetentionJobs();
+    expect(retention.prunedEvents).toBeGreaterThanOrEqual(50001);
+
+    const remaining = await h.pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM public.imap_sync_events WHERE account_id = $1 AND event_type = 'PRUNE_TEST_BACKLOG'",
+      [h.account.id]
+    );
+    expect(remaining.rows[0].count).toBe("0");
+  });
+
+  it("retention prunes imap_sync_runs older than the sync-history window, keeping recent and recently opened runs", async () => {
     const h = await setupIntegration("live-run-prune");
     activeAccountIds.push(h.account.id);
     const inserted = await h.pool.query<{ id: string; label: string }>(
@@ -2824,7 +2846,7 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
     // Every row past the window goes, including a 200-day-old orphaned "running"
-    // row; a recent open run stays for lock reaping.
+    // row; a run opened two hours ago stays for its lock holder to close.
     expect(remaining.rows.map((row) => row.label)).toEqual(["open_running", "recent_success"]);
 
     // A recent event that pointed at a pruned run survives with its link cleared.
