@@ -87,9 +87,7 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
     },
     attachments: { count: row.attachment_count ?? 0 },
     body: row.body ?? null,
-    ...(row.duplicate_message_ids?.length
-      ? { duplicate_message_ids: [...row.duplicate_message_ids].sort() }
-      : {})
+    ...(row.duplicate_message_ids?.length ? { duplicate_message_ids: row.duplicate_message_ids } : {})
   };
 }
 

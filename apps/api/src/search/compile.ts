@@ -478,7 +478,10 @@ delivery_representatives AS (
   -- ids of every matching stored copy of its delivery.
   SELECT DISTINCT ON (r.account_id, r.delivery_key)
     r.*,
-    array_agg(r.id) OVER (PARTITION BY r.account_id, r.delivery_key) AS delivery_copy_ids
+    array_agg(r.id) OVER (
+      PARTITION BY r.account_id, r.delivery_key
+      ORDER BY r.id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS delivery_copy_ids
   FROM ranked r
   ORDER BY
     r.account_id,

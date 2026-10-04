@@ -95,11 +95,14 @@ function deliveryRepresentativesCte(source: string, key: string): string {
           PARTITION BY m.account_id, ${key}
           ORDER BY (m.body_fetched_at IS NOT NULL) DESC, m.folder_path ASC, m.id ASC
         ) AS position,
-        array_agg(m.id) OVER (PARTITION BY m.account_id, ${key}) AS copy_ids
+        array_agg(m.id) OVER (
+          PARTITION BY m.account_id, ${key}
+          ORDER BY m.id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS delivery_copy_ids
       ${source}
     ),
     delivery_representatives AS (
-      SELECT id, array_remove(copy_ids, id) AS duplicate_message_ids
+      SELECT id, array_remove(delivery_copy_ids, id) AS duplicate_message_ids
       FROM delivery_copies
       WHERE position = 1
     )`;
@@ -677,7 +680,7 @@ async function runReadThreadInternal(
         includeQuoted: includeQuoted || (omitted === 0 && index === 0)
       });
       return row.duplicate_message_ids?.length
-        ? { ...message, duplicate_message_ids: [...row.duplicate_message_ids].sort() }
+        ? { ...message, duplicate_message_ids: row.duplicate_message_ids }
         : message;
     });
     const attachmentsIndex = messages.flatMap((message) =>
