@@ -37,7 +37,7 @@ Mailbox-row identity is `(account_id, folder_path, uidvalidity, uid)`. Conversat
 
 ## Shipping
 
-Ship features live on deploy. Do not add flags, report-only or dry-run modes, enable switches, or activation runbooks; they cost far more than they save. Put safety in code and tests instead. The only exception is an effect a revert cannot undo (deleting data, emailing customers, charging money), and even then check with the maintainer first; prefer a delay or limit built into the feature over a switch. Test in the lab, then check a few real users before everyone.
+Ship features live on deploy, to every user at once. Do not add flags, report-only or dry-run modes, enable switches, staged rollouts, or activation runbooks; they cost far more than they save. Put safety in code and tests instead. The only exception is an effect a revert cannot undo (deleting data, emailing customers, charging money). Check with the maintainer first, and prefer a delay or limit built into the feature over a switch. Only for that exception, test in the lab and on a few real users before everyone.
 
 A merge does not mean done. Work is done only after the production checks pass and any rollout is finished: either fully rolled out, with the flag and its code removed, or reversed, with the feature and its data deleted. Do not archive the workspace or end the task before then.
 
