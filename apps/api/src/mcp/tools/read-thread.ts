@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import type { SyncTrust } from "../../search/index.js";
 import { buildSyncTrust } from "../../search/index.js";
+import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identity.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
 import type { MessageAttachment, MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
 import { loadMessageAttachments, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
@@ -34,54 +35,7 @@ const MAX_MESSAGES_CEILING = 100;
 const MAX_THREAD_BATCH = 10;
 const THREAD_BATCH_CONCURRENCY = 4;
 
-/**
- * Collapse physical mailbox occurrences only when we have delivery-identity
- * evidence. An active threading assignment is authoritative. During the
- * pre-activation compatibility window we can still safely collapse a provider
- * message id, or an RFC Message-ID paired with the exact complete raw-MIME
- * digest. Everything else remains a distinct physical row rather than risking
- * a false merge.
- *
- * The fallback keys are fixed-size hashes so sorting a hostile provider value
- * cannot create an unbounded PostgreSQL sort key.
- */
-const DELIVERY_REPRESENTATIVE_KEY = `coalesce(
-  ta.delivery_key,
-  CASE
-    WHEN nullif(m.provider_message_id_namespace, '') IS NOT NULL
-      AND nullif(m.provider_message_id, '') IS NOT NULL
-      THEN 'provider:' || encode(extensions.digest(
-        m.provider_message_id_namespace || chr(31) || m.provider_message_id,
-        'sha256'
-      ), 'hex')
-    WHEN nullif(m.message_id_normalized, '') IS NOT NULL
-      AND b.raw_mime_sha256 IS NOT NULL
-      THEN 'rfc-body:' || encode(extensions.digest(
-        m.message_id_normalized || chr(31) || b.raw_mime_sha256,
-        'sha256'
-      ), 'hex')
-    ELSE 'physical:' || m.id::text
-  END
-)`;
 
-/**
- * Each message's active assignment, looked up per row. A plain LEFT JOIN to the
- * `imap_thread_active_assignments` view makes the planner build the account's
- * whole active projection (about 20,000 buffer blocks for a 45,000-message
- * mailbox) before matching twenty rows; when those blocks are cold the join
- * takes seconds. The LATERAL form pushes `message_id` into the view, so each
- * row costs a few index reads. `LIMIT 1` keeps the planner from pulling the
- * subquery back up into that same hash join; the view yields at most one row
- * per message (one active run per account), so the alias, columns and NULL
- * semantics are unchanged.
- */
-const ACTIVE_ASSIGNMENT_JOIN = `LEFT JOIN LATERAL (
-        SELECT active.conversation_id, active.delivery_key
-        FROM public.imap_thread_active_assignments active
-        WHERE active.message_id = m.id
-          AND active.account_id = m.account_id
-        LIMIT 1
-      ) ta ON true`;
 
 /**
  * One representative per delivery, plus the ids of its other stored copies.
@@ -441,7 +395,7 @@ async function fetchThreadRows(
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
         WHERE m.provider_thread_id = $1
           AND m.account_id = $2
-          AND m.deleted_in_provider = false`, DELIVERY_REPRESENTATIVE_KEY)}${boundedThreadCtes("$3")}
+          AND m.deleted_in_provider = false`, DELIVERY_KEY_SQL)}${boundedThreadCtes("$3")}
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
@@ -473,7 +427,7 @@ async function fetchThreadRows(
       FROM legacy_candidates candidate
       JOIN public.imap_messages m ON m.id = candidate.id
       ${ACTIVE_ASSIGNMENT_JOIN}
-      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id`, DELIVERY_REPRESENTATIVE_KEY)}${boundedThreadCtes("$5")}
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id`, DELIVERY_KEY_SQL)}${boundedThreadCtes("$5")}
     SELECT ${threadSelect(includeBody)}
     FROM limited_representatives representative
     JOIN public.imap_messages m ON m.id = representative.id

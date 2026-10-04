@@ -1,4 +1,5 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
+import { DELIVERY_KEY_SQL } from "../delivery-identity.js";
 import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
 import { filenameGlob, filetypeMatch, folderMatch, resolveDate } from "./rules.js";
@@ -359,24 +360,7 @@ grouped AS (
     m.subject, m.from_email, m.from_name, m.to_emails, m.flags,
     m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
     ta.conversation_id,
-    coalesce(
-      ta.delivery_key,
-      CASE
-        WHEN nullif(m.provider_message_id_namespace, '') IS NOT NULL
-          AND nullif(m.provider_message_id, '') IS NOT NULL
-          THEN 'provider:' || encode(extensions.digest(
-            m.provider_message_id_namespace || chr(31) || m.provider_message_id,
-            'sha256'
-          ), 'hex')
-        WHEN nullif(m.message_id_normalized, '') IS NOT NULL
-          AND b.raw_mime_sha256 IS NOT NULL
-          THEN 'rfc-body:' || encode(extensions.digest(
-            m.message_id_normalized || chr(31) || b.raw_mime_sha256,
-            'sha256'
-          ), 'hex')
-        ELSE 'physical:' || m.id::text
-      END
-    ) AS delivery_key,
+    ${DELIVERY_KEY_SQL} AS delivery_key,
     CASE
       WHEN ta.conversation_id IS NOT NULL
         THEN 'conversation:' || ta.conversation_id

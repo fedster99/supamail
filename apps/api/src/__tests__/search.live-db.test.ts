@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closePool, getPool } from "../db.js";
+import { deliveryKeys } from "../delivery-identity.js";
 import { searchMessages } from "../search/index.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
@@ -198,6 +199,11 @@ liveDb("search layer live DB", () => {
     const [result] = response.results;
     expect([result.identity.id, ...(result.duplicate_message_ids ?? [])].sort()).toEqual([...ids].sort());
     expect(result.duplicate_message_ids).toHaveLength(1);
+
+    // Hosts with their own index read the same identity.
+    const keys = await deliveryKeys(pool, [...ids, idByUid.get(1)!]);
+    expect(keys.get(ids[0])).toBe(keys.get(ids[1]));
+    expect(keys.get(idByUid.get(1)!)).not.toBe(keys.get(ids[0]));
   });
 
   it("never returns a soft-deleted body even when its term matches", async () => {
