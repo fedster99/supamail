@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildReplyBody, formatReplyDate } from "./draft-reply.js";
+import { buildReplyBody, draftReplyRequestSchema, formatReplyDate } from "./draft-reply.js";
 
 describe("formatReplyDate", () => {
   it("renders a readable Gmail-style UTC date instead of an ISO timestamp", () => {
@@ -53,7 +53,16 @@ describe("buildReplyBody", () => {
     expect(body.html.startsWith("<p>Thanks, <b>Alice</b>.</p><p>Best,<br>Bob</p>\n")).toBe(true);
     expect(body.html.match(/<blockquote/g)).toHaveLength(1);
     expect(body.html).toContain("Latest answer.");
-    expect(body.text).toMatch(/^Thanks, Alice ?\.\n\nBest,\nBob\n\nOn Fri, Alice <alice@example.test> wrote:\n> Latest answer\./);
+    expect(body.text).toMatch(/^Thanks, Alice\.\n\nBest,\nBob\n\nOn Fri, Alice <alice@example.test> wrote:\n> Latest answer\./);
     expect(body.text).not.toContain("<b>");
+  });
+});
+
+describe("draftReplyRequestSchema", () => {
+  it("accepts a plain or HTML body format and rejects any other", () => {
+    const base = { source_message_id: "m1", body: "Thanks" };
+    expect(draftReplyRequestSchema.parse(base).body_format).toBeUndefined();
+    expect(draftReplyRequestSchema.parse({ ...base, body_format: "html" }).body_format).toBe("html");
+    expect(() => draftReplyRequestSchema.parse({ ...base, body_format: "markdown" })).toThrow();
   });
 });

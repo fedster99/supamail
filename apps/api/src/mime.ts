@@ -409,14 +409,21 @@ export function normalizeBodyText(text: string): string {
 const HTML_TOKEN_RE =
   /<(script|style|title)\b[^>]*(?:>[\s\S]*?(?:<\/\1\s*>|$)|$)|<!--[\s\S]*?(?:-->|$)|<\/?([a-z][a-z0-9]*)\b[^>]*(?:>|$)|<[!?][^>]*(?:>|$)/gi;
 const LINE_BREAK_TAGS = new Set(["br", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"]);
+// Inline elements add no space when rendered: "<b>Alice</b>." reads "Alice.".
+const INLINE_TAGS = new Set([
+  "a", "abbr", "b", "bdi", "bdo", "cite", "code", "del", "dfn", "em", "font", "i", "ins", "kbd",
+  "mark", "q", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "u", "var"
+]);
 
 /** Visible text of an HTML body: no script, style, title or comments. */
 export function htmlToText(html: string): string {
   return normalizeBodyText(
     decodeHtmlEntities(
-      html.replace(HTML_TOKEN_RE, (_token, _rawText, tag: string | undefined) =>
-        tag && LINE_BREAK_TAGS.has(tag.toLowerCase()) ? "\n" : " "
-      )
+      html.replace(HTML_TOKEN_RE, (_token, _rawText, tag: string | undefined) => {
+        const name = tag?.toLowerCase();
+        if (!name) return " ";
+        return LINE_BREAK_TAGS.has(name) ? "\n" : INLINE_TAGS.has(name) ? "" : " ";
+      })
     )
   );
 }
