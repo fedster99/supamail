@@ -170,7 +170,7 @@ All account-scoped IMAP work goes through the account advisory lock. `sendMessag
 
 Health is a reliability statement, not a cosmetic status. `HEALTHY` requires completed initial sync, fresh priority folders, acceptable overall lag, and recent clean reconciles. For non-priority folders only, recent provider proof of no change since a clean deletion-complete pass counts as fresh and as recently reconciled; priority folders always need their own sync and exact audit. A folder that fails that proof gets a bounded QRESYNC catch-up in the same pass, so provider flag and delete changes in quiet folders do not wait for the rotation. `DEGRADED` is the correct state for drift, priority lag, missing folders, UIDVALIDITY resync, or incremental timeout. `BROKEN` is for non-retryable auth failure and pathological repeated failures.
 
-Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge is limited to strict trapdoor reasons and must not purge `RECONCILE_MISSING` rows. Operational history is bounded separately: sync events and sync runs older than `SYNC_EVENT_RETENTION_DAYS` / `SYNC_RUN_RETENTION_DAYS` (default 90 days each) are deleted daily in bounded batches; a run still marked running is kept for at least seven days so lock reaping can close it.
+Retention keeps old mirror rows recoverable. Expiry marks rows `EXPIRED`; purge is limited to strict trapdoor reasons and must not purge `RECONCILE_MISSING` rows. Operational history is bounded separately: sync events and sync runs older than `SYNC_EVENT_RETENTION_DAYS` (default 90 days) are deleted daily in bounded batches.
 
 ## Open Reliability Deltas
 

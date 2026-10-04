@@ -434,11 +434,11 @@ describe("repository safety", () => {
     expect(source).toContain("runSyncEventPruneJob");
     expect(source).toContain("DELETE FROM public.imap_sync_events");
     expect(source).toContain("LIMIT 50000");
-    // Finished imap_sync_runs rows are pruned too, per account through the
-    // (account_id, started_at) index; open runs stay for lock reaping.
+    // imap_sync_runs rows past the same window are pruned too, per account
+    // through the (account_id, started_at) index.
     expect(source).toContain("runSyncRunPruneJob");
     expect(source).toContain("DELETE FROM public.imap_sync_runs");
-    expect(source).toContain("AND (r.status <> 'running' OR r.started_at < now() - interval '7 days')");
+    expect(source).toContain("CROSS JOIN LATERAL");
     // Retention re-runs on a daily timer (was boot-only), cleared on shutdown.
     expect(worker).toContain("setInterval");
     expect(worker).toContain("clearInterval(retentionTimer)");

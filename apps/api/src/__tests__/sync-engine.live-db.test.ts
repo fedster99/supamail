@@ -2792,7 +2792,7 @@ liveDb("live DB reliability lane", () => {
     expect(types).not.toContain("PRUNE_TEST_OLD");
   });
 
-  it("retention prunes imap_sync_runs older than the retention window, keeping recent runs and recently opened ones", async () => {
+  it("retention prunes imap_sync_runs older than the sync-history window, keeping recent runs", async () => {
     const h = await setupIntegration("live-run-prune");
     activeAccountIds.push(h.account.id);
     const inserted = await h.pool.query<{ id: string; label: string }>(
@@ -2823,8 +2823,8 @@ liveDb("live DB reliability lane", () => {
       "SELECT metadata->>'prune_test' AS label FROM public.imap_sync_runs WHERE account_id = $1 AND metadata ? 'prune_test' ORDER BY 1",
       [h.account.id]
     );
-    // A 200-day-old "running" row is an orphan and goes with the rest; a recent
-    // open run stays for lock reaping.
+    // Every row past the window goes, including a 200-day-old orphaned "running"
+    // row; a recent open run stays for lock reaping.
     expect(remaining.rows.map((row) => row.label)).toEqual(["open_running", "recent_success"]);
 
     // A recent event that pointed at a pruned run survives with its link cleared.
