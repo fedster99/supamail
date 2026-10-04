@@ -35,6 +35,12 @@ Mailbox-row identity is `(account_id, folder_path, uidvalidity, uid)`. Conversat
 - Update public documentation when behavior, layout, scripts, schema, or verification changes.
 - Leave unrelated user changes untouched.
 
+## Shipping
+
+Ship features live on deploy. Do not add flags, report-only or dry-run modes, enable switches, or activation runbooks; they cost far more than they save. Put safety in code and tests instead. The only exception is an effect a revert cannot undo (deleting data, emailing customers, charging money), and even then check with the maintainer first; prefer a delay or limit built into the feature over a switch. Test in the lab, then check a few real users before everyone.
+
+A merge does not mean done. Work is done only after the production checks pass and any rollout is finished: either fully rolled out, with the flag and its code removed, or reversed, with the feature and its data deleted. Do not archive the workspace or end the task before then.
+
 ## Task-Specific Reading
 
 - Sync engine, repository, locks, migrations, or health: `docs/agent/reliability-invariants.md`.
