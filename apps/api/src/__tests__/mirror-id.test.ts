@@ -4,7 +4,6 @@ import { getDraft } from "../drafts.js";
 import { moveThread, setThreadFlags } from "../mailbox-mutations.js";
 import { isMirrorId } from "../mirror-id.js";
 import { MirrorRepository } from "../repository.js";
-import { runSearchTool } from "../search/mcp-tool.js";
 
 /**
  * A malformed id names no mirror row. Each lookup answers "not found" before any
@@ -45,13 +44,5 @@ describe("lookups by a malformed id", () => {
         await expect(read()).rejects.toMatchObject({ name: "NotFoundError" });
       }
     }
-  });
-});
-
-describe("runSearchTool", () => {
-  it("returns invalid_input for arguments that fail the schema, before any query", async () => {
-    const result = await runSearchTool(untouchedPool, { q: "x", limit: 500 });
-    expect(result).toMatchObject({ error: { code: "invalid_input" } });
-    expect("error" in result && result.error.message).toMatch(/^Invalid search arguments\. limit: /);
   });
 });

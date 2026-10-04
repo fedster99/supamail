@@ -20,7 +20,7 @@ import {
   resolveSmtpCreds,
   type AppendedUid
 } from "./smtp-client.js";
-import type { ImapAccount, MessageMetadata, SendRecipient, SendRequest, SendResult } from "./types.js";
+import type { ImapAccount, ImapMessage, MessageMetadata, SendRecipient, SendRequest, SendResult } from "./types.js";
 import {
   METADATA_PROTECTED_FIELDS,
   plaintextMetadataProtection,
@@ -117,13 +117,12 @@ export interface CreateDraftResult {
   draftsFolderPath: string;
   rfcMessageId: string;
   /** The saved draft's mirror id, ready at once for get, update, send, and delete.
-   * Null when the server returns no APPENDUID, Drafts is not mirrored yet, or the
-   * mirror write failed (see `warnings`); the next Drafts sync then mirrors it. */
+   * Null when the server returns no APPENDUID, Drafts is not mirrored yet, the
+   * mirror write failed (see `warnings`), or an idempotent retry found an earlier
+   * copy that is not mirrored yet; the next Drafts sync then mirrors it. */
   messageId: string | null;
-  /** From UIDPLUS APPENDUID when the server provides one, else null. With
-   * `appendedUidValidity` this is the draft's physical identity. */
+  /** From UIDPLUS APPENDUID when the server provides one, else null. */
   appendedUid: number | null;
-  appendedUidValidity: number | null;
   /** Non-fatal warnings. The draft is saved in the provider regardless; e.g. the
    * old draft of an update could not be EXPUNGEd on a non-UIDPLUS server, which
    * self-heals on sync. */
@@ -213,7 +212,6 @@ async function saveDraft(
       rfcMessageId,
       messageId: null,
       appendedUid: filed.appended?.uid ?? null,
-      appendedUidValidity: filed.appended?.uidValidity ?? null,
       warnings
     };
     if (!filed.appended) return saved;
@@ -449,19 +447,17 @@ function isDraft(draftFolders: string[], row: { folder_path: string; flags: stri
 }
 
 /**
- * The Mailbox Account of a live draft. Any other message is "not found" to a draft
+ * Prove `messageId` names a live draft. Any other message is "not found" to a draft
  * action, so a draft update or delete can never rewrite or remove an ordinary email.
  */
-async function loadDraftAccount(pool: PgPool, repository: MirrorRepository, messageId: string): Promise<ImapAccount> {
+async function loadLiveDraft(pool: PgPool, repository: MirrorRepository, messageId: string): Promise<ImapMessage> {
   const message = await repository.getMessage(messageId);
   if (!message) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (message.deleted_in_provider) throw new NotFoundError(`Draft ${messageId} is already deleted in the provider`);
   if (!isDraft(await draftFolderPaths(pool, message.account_id), message)) {
     throw new NotFoundError(`Draft not found: ${messageId}`);
   }
-  const account = await repository.getAccount(message.account_id);
-  if (!account) throw new Error(`Account not found for draft ${messageId}: ${message.account_id}`);
-  return account;
+  return message;
 }
 
 /**
@@ -591,7 +587,9 @@ export async function updateDraft(
   rejectBcc(input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await loadDraftAccount(pool, repository, messageId);
+  const draft = await loadLiveDraft(pool, repository, messageId);
+  const account = await repository.getAccount(draft.account_id);
+  if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.account_id}`);
 
   const saved = await saveDraft(pool, config, repository, account, { ...input, accountId: account.id }, undefined, options.signal);
 
@@ -831,7 +829,7 @@ export async function deleteDraft(
   options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
   const repository = new MirrorRepository(pool, config, options.metadataProtection ?? plaintextMetadataProtection);
-  await loadDraftAccount(pool, repository, messageId);
+  await loadLiveDraft(pool, repository, messageId);
   const result = await deleteMessage(pool, config, messageId, options);
   return { messageId: result.messageId, fromFolder: result.fromFolder, trashFolder: result.trashFolder };
 }

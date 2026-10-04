@@ -6,7 +6,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 
 - Message identity is scoped by `(account_id, folder_path, uidvalidity, uid)`.
 - This is physical mailbox-row identity. Do not conflate it with a delivered email or a protocol conversation.
-- Mirror row ids (accounts, messages, attachments) are UUIDs. A lookup by any other value answers "not found" before any query (`isMirrorId`), so a malformed caller id is never a Postgres cast error.
+- Mirror row ids (accounts, messages, attachments) are UUIDs. A lookup of one account, message, draft, or attachment by any other value answers "not found" before any query (`isMirrorId`), so a malformed caller id is never a Postgres cast error there.
 - An assignment belongs to an account, physical message, and algorithm run. Readers must use `imap_thread_active_assignments`, never choose an arbitrary assignment row.
 - `delivery_key` is the derived delivery-copy identity; `conversation_id` is the derived transitive reply-component identity. Both are account-scoped.
 - Keep application-specific identity, relationship, and business-domain models outside SupaMail core.

@@ -143,7 +143,7 @@ liveDb("draft folder resolution (live DB)", () => {
       subject: "Saved draft",
       body: { format: "plain", text: "saved body" }
     });
-    expect(saved).toMatchObject({ appendedUid: 50, appendedUidValidity: 100, warnings: [] });
+    expect(saved).toMatchObject({ appendedUid: 50, warnings: [] });
     expect(saved.messageId).not.toBeNull();
 
     const draft = await getDraft(pool, config, saved.messageId!);

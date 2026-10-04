@@ -207,7 +207,6 @@ describe("createDraft", () => {
     expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
-    expect(result.appendedUidValidity).toBe(100);
     // Nothing new reached the provider, so nothing new is marked or written.
     expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
     expect(mocks.upsertMessages).not.toHaveBeenCalled();
@@ -282,7 +281,7 @@ describe("createDraft", () => {
     expect(flags).toContain("\\Draft");
     expect(mocks.logout).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({
-      accountId: "acc-1", draftsFolderPath: "Drafts", messageId: N1, appendedUid: 7, appendedUidValidity: 100, warnings: []
+      accountId: "acc-1", draftsFolderPath: "Drafts", messageId: N1, appendedUid: 7, warnings: []
     });
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     // Create does NOT send or delete — it only files the draft.
