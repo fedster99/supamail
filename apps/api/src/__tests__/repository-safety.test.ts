@@ -429,11 +429,16 @@ describe("repository safety", () => {
     expect(source).not.toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING', 'RECONCILE_MISSING')");
     expect(worker).toContain("runRetentionJobs");
 
-    // The INSERT-only imap_sync_events audit table is pruned as part of retention,
-    // bounded per run (LIMIT) so a large first prune can't run one huge transaction.
+    // The INSERT-only imap_sync_events audit table and imap_sync_runs are pruned as
+    // part of retention, in bounded statements repeated up to a per-run cap, so a
+    // large backlog neither runs one huge transaction nor outgrows the daily prune.
     expect(source).toContain("runSyncEventPruneJob");
     expect(source).toContain("DELETE FROM public.imap_sync_events");
-    expect(source).toContain("LIMIT 50000");
+    expect(source).toContain("runSyncRunPruneJob");
+    expect(source).toContain("DELETE FROM public.imap_sync_runs");
+    expect(source).toContain("CROSS JOIN LATERAL");
+    expect(source).toContain("const SYNC_HISTORY_PRUNE_BATCH_SIZE = 50_000;");
+    expect(source).toContain("if (deleted < SYNC_HISTORY_PRUNE_BATCH_SIZE) break;");
     // Retention re-runs on a daily timer (was boot-only), cleared on shutdown.
     expect(worker).toContain("setInterval");
     expect(worker).toContain("clearInterval(retentionTimer)");

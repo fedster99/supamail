@@ -151,7 +151,7 @@ describe("worker Sent polling cadence", () => {
       } as never,
       engine: { syncDueAccounts, syncDueSentFolders },
       repository: {
-        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0, prunedRuns: 0 }))
       } as never
     });
 
@@ -194,7 +194,7 @@ describe("worker Sent polling cadence", () => {
       pool: { query: vi.fn(async () => ({ rows: [{ count: "0" }] })) } as never,
       engine: { syncDueAccounts, syncDueSentFolders },
       repository: {
-        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0, prunedRuns: 0 }))
       } as never
     });
 
@@ -397,7 +397,7 @@ describe("worker conversation-threading lane", () => {
         syncDueSentFolders: vi.fn(async () => [])
       },
       repository: {
-        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0, prunedRuns: 0 }))
       } as never,
       metadataProtection
     });
@@ -455,7 +455,7 @@ describe("worker conversation-threading lane", () => {
         drainAccount
       },
       repository: {
-        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0, prunedRuns: 0 }))
       } as never
     });
 
@@ -516,7 +516,7 @@ describe("worker conversation-threading lane", () => {
         drainAccount
       },
       repository: {
-        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0, prunedRuns: 0 }))
       } as never
     });
 
@@ -566,7 +566,7 @@ describe("worker conversation-threading lane", () => {
         drainAccount
       },
       repository: {
-        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0 }))
+        runRetentionJobs: vi.fn(async () => ({ expired: 0, purged: 0, prunedEvents: 0, prunedRuns: 0 }))
       } as never
     });
 
