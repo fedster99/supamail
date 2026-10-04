@@ -388,8 +388,13 @@ function codePointToString(value: number): string | null {
   return String.fromCodePoint(value);
 }
 
+// Invisible characters that senders pad preheaders with. A zero-width
+// non-joiner stays between letters, where scripts such as Persian need it.
+const INVISIBLE_PADDING_RE = /[\u034F\u00AD\u200B\u2060\uFEFF]|\u200C(?![\p{L}\p{M}])/gu;
+
 export function normalizeBodyText(text: string): string {
   return text
+    .replace(INVISIBLE_PADDING_RE, "")
     .replace(/\r\n?/g, "\n")
     .replace(/[ \t]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
@@ -398,18 +403,40 @@ export function normalizeBodyText(text: string): string {
     .trim();
 }
 
+// One pass over the HTML. Every alternative ends at its closing token or at the
+// end of input, as browsers parse unclosed elements, so time stays linear even
+// for crafted input such as a megabyte of "<".
+const HTML_TOKEN_RE =
+  /<(script|style|title)\b[^>]*(?:>[\s\S]*?(?:<\/\1\s*>|$)|$)|<!--[\s\S]*?(?:-->|$)|<\/?([a-z][a-z0-9]*)\b[^>]*(?:>|$)|<[!?][^>]*(?:>|$)/gi;
+const LINE_BREAK_TAGS = new Set(["br", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"]);
+
+/** Visible text of an HTML body: no script, style, title or comments. */
 export function htmlToText(html: string): string {
   return normalizeBodyText(
     decodeHtmlEntities(
-      html
-        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-        .replace(/<br\s*\/?>/gi, "\n")
-        .replace(/<\/(p|div|li|h[1-6])\s*>/gi, "\n")
-        .replace(/<(p|div|li|h[1-6])\b[^>]*>/gi, "\n")
-        .replace(/<[^>]+>/g, " ")
+      html.replace(HTML_TOKEN_RE, (_token, _rawText, tag: string | undefined) =>
+        tag && LINE_BREAK_TAGS.has(tag.toLowerCase()) ? "\n" : " "
+      )
     )
   );
+}
+
+// HTML source or CSS rules in a text/plain part. A tag name ends at a space,
+// "/" or ">", so an address such as <head@example.com> is no tag.
+const MARKUP_IN_PLAIN_RE =
+  /<\/?(?:html|head|body|meta|style|title|div|p|span|table|tr|td|font)(?=[\s/>])[^<>]{0,500}>|<[a-z][a-z0-9]*\s[^<>]{0,500}\bstyle\s*=|\{\s*-?[a-z][a-z-]*\s*:[^{}]{1,500}\}/i;
+
+/**
+ * The text that reads and search use. The plain part wins, as in mail clients.
+ * Some senders leave it empty or put their HTML source or CSS in it; then the
+ * HTML part gives the text. Readers can call this again on stored parts, so an
+ * extraction fix also reaches mail that was already synced.
+ */
+export function readableBodyText(bodyPlain: string | null, bodyHtml: string | null): string | null {
+  if (bodyPlain && !MARKUP_IN_PLAIN_RE.test(bodyPlain)) return bodyPlain;
+  if (!bodyHtml) return bodyPlain;
+  // HTML with no visible text keeps a non-empty plain part.
+  return htmlToText(bodyHtml) || (bodyPlain ?? "");
 }
 
 interface StreamedAttachmentEvidence {
@@ -544,7 +571,7 @@ async function parseRawMimeSource(source: MimeSource): Promise<ParsedMimeContent
     parserWarnings.push("html_truncated_for_text_extraction");
     bodyHtml = bodyHtml.slice(0, MAX_HTML_PARSE_BYTES);
   }
-  const bodyText = bodyPlain ?? (bodyHtml ? htmlToText(bodyHtml) : null);
+  const bodyText = readableBodyText(bodyPlain, bodyHtml);
   const evidence: MessageEvidenceInput[] = [];
   const identities = new Set<string>();
   let evidenceTruncated = false;
