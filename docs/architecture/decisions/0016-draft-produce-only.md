@@ -32,7 +32,9 @@ body represents the same escaped history in one compact `<blockquote
 type="cite">`. Its Gmail quote classes are progressive hints, while minimal
 inline border and spacing remain the fallback for other HTML clients. Existing
 plain-text quote depth is flattened visually in HTML so long threads do not
-accumulate indentation.
+accumulate indentation. The agent writes the reply as plain text by default, or
+as HTML with `body_format: "html"`; an HTML reply sits above the same quoted
+history, and its plain alternative is the reply's visible text.
 It does not send, does not IMAP-APPEND a draft, and does not mutate any row.
 
 The boundary is enforced in the schema, not just by convention:

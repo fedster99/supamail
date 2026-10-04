@@ -174,6 +174,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Expiry marks old rows `EXPIRED`; it does not hard-delete them.
 - Purge is a strict safety valve for trapdoor delete reasons only.
 - Do not purge `RECONCILE_MISSING` rows.
+- `imap_sync_events` and `imap_sync_runs` rows are operational history, not mirror data. Daily retention deletes both past `SYNC_EVENT_RETENTION_DAYS` (default 90) in bounded statements, repeated up to a per-run cap. A run still marked `running` is kept for at least seven days so its lock holder or the startup lock sweep can close it.
 
 ## Verification Anchor
 
