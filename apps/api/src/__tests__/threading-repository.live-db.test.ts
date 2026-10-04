@@ -90,6 +90,13 @@ class OpaqueThreadingAdapter implements MetadataProtectionAdapter {
               if (field === "parser_warnings") return [field, []];
               return [field, createHash("sha256").update(JSON.stringify(value)).digest("hex")];
             }))
+        : context.kind === "message_evidence"
+          ? {
+              evidence_key: createHash("sha256").update(String(values.evidence_key)).digest("hex"),
+              evidence_key_sha256: createHash("sha256")
+                .update(String(values.evidence_key_sha256)).digest("hex"),
+              metadata: {}
+            }
         : this.#projectAssignment(values);
     return {
       values: projected,
@@ -2786,6 +2793,185 @@ liveDb("ThreadingRepository live DB", () => {
     );
     expect(evidence.rows.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
     expect(new Set(evidence.rows.map((row) => row.authored_delivery_sha256)).size).toBe(1);
+  });
+
+  // One email delivered twice into one folder, once per recipient address:
+  // the copies differ only in transport headers.
+  async function storeDeliveredCopies(
+    accountId: string,
+    label: string,
+    store: MirrorRepository = mirror
+  ): Promise<string[]> {
+    const rfcMessageId = `<${label}@example.test>`;
+    const messageIds: string[] = [];
+    for (const [index, received] of ["by mx1.example.test", "by mx2.example.test"].entries()) {
+      const messageId = await seedMessage(accountId, {
+        uid: index + 1,
+        subject: "Quarterly update",
+        fromEmail: "sam@acme.example",
+        toEmails: ["team@acme.example"],
+        rfcMessageId
+      });
+      messageIds.push(messageId);
+      const headersJson = {
+        "message-id": rfcMessageId,
+        date: "Thu, 01 Oct 2026 19:42:02 +0000",
+        from: "Sam <sam@acme.example>",
+        to: "team@acme.example",
+        subject: "Quarterly update",
+        "content-type": "multipart/related; boundary=b1",
+        "mime-version": "1.0",
+        received: [received]
+      };
+      const rawMime = Buffer.from(`Received: ${received}\r\n\r\nQuarterly numbers attached.`);
+      await store.storeBody({
+        messageId,
+        rawMime,
+        rawBytes: rawMime.byteLength,
+        rawTruncated: false,
+        bodyText: "Quarterly numbers attached.",
+        bodyHtml: null,
+        bodyPlain: "Quarterly numbers attached.",
+        selectedTextPart: "1",
+        selectedTextFormat: "plain",
+        headersJson,
+        mimeStructure: { type: "multipart/related", childNodes: [{ type: "text/plain" }, { type: "image/png" }] },
+        parserWarnings: [],
+        evidence: [{
+          kind: "attachment_content",
+          namespace: "sha256",
+          key: "c".repeat(64),
+          metadata: { filename: "image001.png", mimeType: "image/png", sizeBytes: 3070 }
+        }]
+      });
+    }
+    return messageIds;
+  }
+
+  async function bodyDigests(messageIds: string[]) {
+    return (await pool.query<{
+      structured_evidence_sha256: string | null;
+      authored_delivery_sha256: string | null;
+      structured_evidence_extractor_version: string | null;
+    }>(
+      `SELECT structured_evidence_sha256, authored_delivery_sha256,
+              structured_evidence_extractor_version
+       FROM public.imap_message_bodies
+       WHERE message_id = ANY($1::uuid[])
+       ORDER BY message_id`,
+      [messageIds]
+    )).rows;
+  }
+
+  // mime_evidence_v1 hashed each row's own id into the evidence digest.
+  async function rewriteAsEvidenceV1(messageIds: string[]): Promise<void> {
+    await pool.query(
+      `UPDATE public.imap_message_bodies
+       SET structured_evidence_extractor_version = 'mime_evidence_v1',
+           structured_evidence_sha256 = encode(extensions.digest(message_id::text, 'sha256'), 'hex'),
+           authored_delivery_sha256 = encode(extensions.digest('authored' || message_id::text, 'sha256'), 'hex')
+       WHERE message_id = ANY($1::uuid[])`,
+      [messageIds]
+    );
+  }
+
+  it("gives stored copies of one email the same evidence digest, so they join one delivery", async () => {
+    const accountId = await createAccount("same-folder-copies");
+    const messageIds = await storeDeliveredCopies(accountId, "same-folder-copies");
+
+    const digests = await bodyDigests(messageIds);
+    expect(digests.every((row) => row.authored_delivery_sha256 !== null)).toBe(true);
+    expect(new Set(digests.map((row) => row.structured_evidence_sha256)).size).toBe(1);
+    expect(new Set(digests.map((row) => row.authored_delivery_sha256)).size).toBe(1);
+    expect(digests.every((row) => row.structured_evidence_extractor_version === "mime_evidence_v2")).toBe(true);
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+    expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
+  });
+
+  it("upgrades v1 evidence digests in place to the values the body write computes", async () => {
+    const accountId = await createAccount("evidence-digest-upgrade");
+    const messageIds = await storeDeliveredCopies(accountId, "evidence-digest-upgrade");
+    const written = await bodyDigests(messageIds);
+    await rewriteAsEvidenceV1(messageIds);
+    expect(new Set((await bodyDigests(messageIds)).map((row) => row.authored_delivery_sha256)).size).toBe(2);
+
+    const ready = await drainUntilReady(accountId, { batchSize: 2 });
+
+    expect(await bodyDigests(messageIds)).toEqual(written);
+    expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
+  });
+
+  it("upgrades protected v1 evidence digests through the metadata adapter", async () => {
+    const accountId = await createAccount("protected-evidence-digest-upgrade");
+    const adapter = new OpaqueThreadingAdapter();
+    await markMetadataProtected(accountId);
+    const protectedMirror = new MirrorRepository(pool, getConfig(), adapter);
+    const messageIds = await storeDeliveredCopies(
+      accountId,
+      "protected-evidence-digest-upgrade",
+      protectedMirror
+    );
+    const revealedDigests = async () => Promise.all(messageIds.map(async (messageId) => {
+      const row = (await pool.query(
+        `SELECT protected_metadata, protected_metadata_version,
+                protected_metadata_key_version, protected_metadata_tokens
+         FROM public.imap_message_bodies WHERE message_id = $1`,
+        [messageId]
+      )).rows[0];
+      const values = await adapter.reveal(
+        { kind: "message_body", accountId, recordId: messageId },
+        {
+          values: {},
+          protectedMetadata: row.protected_metadata,
+          envelopeVersion: row.protected_metadata_version,
+          keyVersion: row.protected_metadata_key_version,
+          tokens: row.protected_metadata_tokens
+        }
+      );
+      return [values.structured_evidence_sha256, values.authored_delivery_sha256];
+    }));
+    const written = await revealedDigests();
+    expect(written[0]).toEqual(written[1]);
+
+    // A v1 envelope holds per-row digests too.
+    for (const messageId of messageIds) {
+      const row = (await pool.query(
+        `SELECT protected_metadata FROM public.imap_message_bodies WHERE message_id = $1`,
+        [messageId]
+      )).rows[0];
+      const envelope = JSON.parse(row.protected_metadata.toString("utf8"));
+      envelope.values.structured_evidence_sha256 = createHash("sha256").update(messageId).digest("hex");
+      envelope.values.authored_delivery_sha256 = createHash("sha256").update(`authored${messageId}`).digest("hex");
+      const projection = await adapter.protect(envelope.context, envelope.values);
+      const columns = protectedMetadataColumns(projection);
+      await pool.query(
+        `UPDATE public.imap_message_bodies
+         SET structured_evidence_extractor_version = 'mime_evidence_v1',
+             structured_evidence_sha256 = $2, authored_delivery_sha256 = $3,
+             protected_metadata = $4, protected_metadata_tokens = $5
+         WHERE message_id = $1`,
+        [
+          messageId,
+          projection.values.structured_evidence_sha256,
+          projection.values.authored_delivery_sha256,
+          columns.protected_metadata,
+          columns.protected_metadata_tokens
+        ]
+      );
+    }
+    expect(new Set((await revealedDigests()).map((pair) => pair[1])).size).toBe(2);
+
+    const ready = await drainUntilReady(
+      accountId,
+      { batchSize: 2 },
+      new ThreadingRepository(pool, { metadataProtection: adapter })
+    );
+
+    expect(await revealedDigests()).toEqual(written);
+    expect((await bodyDigests(messageIds))
+      .every((row) => row.structured_evidence_extractor_version === "mime_evidence_v2")).toBe(true);
+    expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
   });
 
   it("fails closed when protected authored evidence needs legacy repair", async () => {
