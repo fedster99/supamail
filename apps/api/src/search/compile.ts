@@ -474,7 +474,11 @@ ranked AS (
   FROM scored s
 ),
 delivery_representatives AS (
-  SELECT DISTINCT ON (r.account_id, r.delivery_key) r.*
+  -- Window functions run before DISTINCT ON, so each representative keeps the
+  -- ids of every matching stored copy of its delivery.
+  SELECT DISTINCT ON (r.account_id, r.delivery_key)
+    r.*,
+    array_agg(r.id) OVER (PARTITION BY r.account_id, r.delivery_key) AS delivery_copy_ids
   FROM ranked r
   ORDER BY
     r.account_id,
@@ -503,6 +507,7 @@ SELECT
   page.window_status, page.internal_date, page.conversation_id,
   page.provider_thread_id, page.body_fetched_at,
   page.thread_count::int AS thread_count,
+  array_remove(page.delivery_copy_ids, page.id) AS duplicate_message_ids,
   page.text_rel::float8 AS text_rel, page.recency::float8 AS recency,
   page.email_prior::float8 AS email_prior, page.score::float8 AS score,
   (SELECT count(*) FROM public.imap_attachments a

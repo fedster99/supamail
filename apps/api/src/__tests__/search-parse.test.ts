@@ -302,7 +302,8 @@ describe("compileSearch", () => {
     expect(compiled.text).toContain("THEN 'conversation:' || ta.conversation_id");
     expect(compiled.text).toContain("THEN 'provider-thread:' || encode(extensions.digest(");
     expect(compiled.text).toContain("coalesce(m.provider_thread_id_namespace, 'legacy')");
-    expect(compiled.text).toContain("SELECT DISTINCT ON (r.account_id, r.delivery_key) r.*");
+    expect(compiled.text).toContain("SELECT DISTINCT ON (r.account_id, r.delivery_key)");
+    expect(compiled.text).toContain("array_remove(page.delivery_copy_ids, page.id) AS duplicate_message_ids");
     expect(compiled.text).toContain(
       "count(*) OVER (PARTITION BY d.account_id, d.conversation_key)::int AS thread_count"
     );

@@ -83,6 +83,28 @@ const ACTIVE_ASSIGNMENT_JOIN = `LEFT JOIN LATERAL (
         LIMIT 1
       ) ta ON true`;
 
+/**
+ * One representative per delivery, plus the ids of its other stored copies.
+ * `source` is a FROM clause with alias `m`; `key` is the delivery key.
+ */
+function deliveryRepresentativesCte(source: string, key: string): string {
+  return `delivery_copies AS (
+      SELECT
+        m.id,
+        row_number() OVER (
+          PARTITION BY m.account_id, ${key}
+          ORDER BY (m.body_fetched_at IS NOT NULL) DESC, m.folder_path ASC, m.id ASC
+        ) AS position,
+        array_agg(m.id) OVER (PARTITION BY m.account_id, ${key}) AS copy_ids
+      ${source}
+    ),
+    delivery_representatives AS (
+      SELECT id, array_remove(copy_ids, id) AS duplicate_message_ids
+      FROM delivery_copies
+      WHERE position = 1
+    )`;
+}
+
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
  * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
  * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
@@ -110,12 +132,14 @@ function threadSelect(includeBody: boolean): string {
     ? "b.body_text, b.body_plain, b.selected_text_part"
     : "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"},
   stats.total_count AS thread_total_count,
-  stats.participants AS thread_participants
+  stats.participants AS thread_participants,
+  representative.duplicate_message_ids
 `;
 }
 
 type ThreadRow = MessageDetailRow & ProtectedMetadataColumns & {
   conversation_id: string | null;
+  duplicate_message_ids: string[] | null;
   thread_total_count: number | string | null;
   thread_participants: string[] | null;
 };
@@ -202,7 +226,8 @@ export const readThreadDefinition: ToolDefinition = {
     "When no older messages were omitted, the oldest mirrored message keeps quoted content. " +
     "Each message contains its full cleaned body. Recognized quoted reply tails and signatures " +
     "are stripped unless include_quoted=true. Returns the " +
-    "distinct participants, a flat attachments_index, and a sync_trust block. Threading is a " +
+    "distinct participants, a flat attachments_index, and a sync_trust block. Each email appears " +
+    "once; its duplicate_message_ids lists its other stored copies, to move or flag every copy. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
     "provider-threaded siblings only when the seed has no stored assignment. Capped to " +
@@ -354,7 +379,7 @@ function boundedThreadCtes(limitParameter: string): string {
         ), '{}'::text[]) AS participants
     ),
     limited_representatives AS (
-      SELECT representative.id
+      SELECT representative.id, representative.duplicate_message_ids
       FROM delivery_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
       ORDER BY m.internal_date DESC, m.id DESC
@@ -383,22 +408,14 @@ async function fetchThreadRows(
   if (selector.kind === "conversation") {
     const result = await client.query<ThreadRow>(
       `
-      WITH delivery_representatives AS (
-        SELECT DISTINCT ON (assignment.delivery_key)
-          m.id
+      WITH ${deliveryRepresentativesCte(`
         FROM public.imap_thread_active_assignments assignment
         JOIN public.imap_messages m
           ON m.id = assignment.message_id
          AND m.account_id = assignment.account_id
         WHERE assignment.account_id = $1
           AND assignment.conversation_id = $2
-          AND m.deleted_in_provider = false
-        ORDER BY
-          assignment.delivery_key,
-          (m.body_fetched_at IS NOT NULL) DESC,
-          m.folder_path ASC,
-          m.id ASC
-      )${boundedThreadCtes("$3")}
+          AND m.deleted_in_provider = false`, "assignment.delivery_key")}${boundedThreadCtes("$3")}
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
@@ -415,22 +432,13 @@ async function fetchThreadRows(
   if (selector.kind === "provider-thread") {
     const result = await client.query<ThreadRow>(
       `
-      WITH delivery_representatives AS (
-        SELECT DISTINCT ON (m.account_id, ${DELIVERY_REPRESENTATIVE_KEY})
-          m.id
+      WITH ${deliveryRepresentativesCte(`
         FROM public.imap_messages m
         ${ACTIVE_ASSIGNMENT_JOIN}
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
         WHERE m.provider_thread_id = $1
           AND m.account_id = $2
-          AND m.deleted_in_provider = false
-        ORDER BY
-          m.account_id,
-          ${DELIVERY_REPRESENTATIVE_KEY},
-          (m.body_fetched_at IS NOT NULL) DESC,
-          m.folder_path ASC,
-          m.id ASC
-      )${boundedThreadCtes("$3")}
+          AND m.deleted_in_provider = false`, DELIVERY_REPRESENTATIVE_KEY)}${boundedThreadCtes("$3")}
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
@@ -458,20 +466,11 @@ async function fetchThreadRows(
       FROM public.imap_messages m
       WHERE ${threadMembershipClause("m")}
     ),
-    delivery_representatives AS (
-      SELECT DISTINCT ON (m.account_id, ${DELIVERY_REPRESENTATIVE_KEY})
-        m.id
+    ${deliveryRepresentativesCte(`
       FROM legacy_candidates candidate
       JOIN public.imap_messages m ON m.id = candidate.id
       ${ACTIVE_ASSIGNMENT_JOIN}
-      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-      ORDER BY
-        m.account_id,
-        ${DELIVERY_REPRESENTATIVE_KEY},
-        (m.body_fetched_at IS NOT NULL) DESC,
-        m.folder_path ASC,
-        m.id ASC
-    )${boundedThreadCtes("$5")}
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id`, DELIVERY_REPRESENTATIVE_KEY)}${boundedThreadCtes("$5")}
     SELECT ${threadSelect(includeBody)}
     FROM limited_representatives representative
     JOIN public.imap_messages m ON m.id = representative.id
@@ -671,11 +670,16 @@ async function runReadThreadInternal(
     const kept = rows.length > maxMessages ? rows.slice(rows.length - maxMessages) : rows;
     const omitted = Math.max(0, totalCount - kept.length);
 
-    const messages = kept.map((row, index) => mapMessageRow(row, {
-      // Keep quoted content in the oldest mirrored message when it was not
-      // removed by the message cap.
-      includeQuoted: includeQuoted || (omitted === 0 && index === 0)
-    }));
+    const messages = kept.map((row, index) => {
+      const message = mapMessageRow(row, {
+        // Keep quoted content in the oldest mirrored message when it was not
+        // removed by the message cap.
+        includeQuoted: includeQuoted || (omitted === 0 && index === 0)
+      });
+      return row.duplicate_message_ids?.length
+        ? { ...message, duplicate_message_ids: [...row.duplicate_message_ids].sort() }
+        : message;
+    });
     const attachmentsIndex = messages.flatMap((message) =>
       message.attachments.map((att) => ({ message_id: message.message_id, ...att }))
     );

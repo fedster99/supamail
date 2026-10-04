@@ -169,6 +169,37 @@ liveDb("search layer live DB", () => {
     expect(response.read_only).toBe(true);
   });
 
+  it("shows one result per delivery and lists its other stored copies", async () => {
+    const raw = Buffer.from("Message-ID: <zephyr-copy@acme.test>\r\n\r\nZephyr launch notes");
+    const ids: string[] = [];
+    for (const [uid, folder] of [[30, "INBOX"], [31, "Lists"]] as const) {
+      const message = await pool.query<{ id: string }>(
+        `INSERT INTO public.imap_messages (
+           account_id, folder_path, uidvalidity, uid, internal_date, subject, from_email,
+           to_emails, flags, message_id_normalized, deleted_in_provider, window_status,
+           size_bytes, body_fetched_at
+         ) VALUES ($1, $2, $3, $4, now(), 'Zephyr launch', 'sam@acme.example',
+           ARRAY['me@example.test'], ARRAY['\\Seen'], 'zephyr-copy@acme.test', false, 'IN_WINDOW', $5, now())
+         RETURNING id`,
+        [accountId, folder, UIDVALIDITY, uid, raw.byteLength]
+      );
+      ids.push(message.rows[0].id);
+      await pool.query(
+        `INSERT INTO public.imap_message_bodies (
+           message_id, raw_mime, raw_mime_sha256, raw_bytes, raw_truncated, body_text
+         ) VALUES ($1, $2::bytea, encode(extensions.digest($2::bytea, 'sha256'), 'hex'), $3, false, 'Zephyr launch notes')`,
+        [message.rows[0].id, raw, raw.byteLength]
+      );
+    }
+
+    const response = await searchMessages(pool, { q: "zephyr", accounts: [accountId] });
+
+    expect(response.results).toHaveLength(1);
+    const [result] = response.results;
+    expect([result.identity.id, ...(result.duplicate_message_ids ?? [])].sort()).toEqual([...ids].sort());
+    expect(result.duplicate_message_ids).toHaveLength(1);
+  });
+
   it("never returns a soft-deleted body even when its term matches", async () => {
     const response = await searchMessages(pool, { q: "secret", accounts: [accountId], includeBody: true });
     expect(response.results).toHaveLength(0);

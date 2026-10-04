@@ -26,6 +26,7 @@ interface ResultRow {
   conversation_id: string | null;
   provider_thread_id: string | null;
   thread_count: number | null;
+  duplicate_message_ids: string[] | null;
   body_fetched_at: Date | null;
   text_rel: number | string | null;
   recency: number | string | null;
@@ -85,7 +86,10 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
       message_count: row.thread_count ?? 1
     },
     attachments: { count: row.attachment_count ?? 0 },
-    body: row.body ?? null
+    body: row.body ?? null,
+    ...(row.duplicate_message_ids?.length
+      ? { duplicate_message_ids: [...row.duplicate_message_ids].sort() }
+      : {})
   };
 }
 
