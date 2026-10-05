@@ -714,6 +714,19 @@ liveDb("ThreadingRepository live DB", () => {
     await closePool();
   });
 
+  it("keeps the active-assignments view security-invoker with no security barrier", async () => {
+    // The live lane applies every migration twice before this runs, so this is
+    // the catalog state a deploy leaves behind: 0014 creates the view with a
+    // barrier and 0029 resets it. A barrier view never flattens into the
+    // reader's plan, so a plain join would read the whole active projection.
+    const result = await pool.query<{ options: string[] | null }>(
+      "SELECT reloptions AS options FROM pg_class WHERE oid = 'public.imap_thread_active_assignments'::regclass"
+    );
+    const options = result.rows[0]?.options ?? [];
+    expect(options).toContain("security_invoker=true");
+    expect(options.filter((option) => option.startsWith("security_barrier"))).toEqual([]);
+  });
+
   it("builds deterministically in bounded shadow batches and switches every reader atomically", async () => {
     const accountId = await createAccount("shadow-activation");
     await seedMessage(accountId, {

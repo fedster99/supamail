@@ -299,10 +299,14 @@ describe("initial schema", () => {
   it("drops the security barrier from the active-assignments view so joins flatten", async () => {
     const sql = await readFile(activeAssignmentsViewNoBarrierMigrationPath, "utf8");
 
-    // The view stays security-invoker, so table row-level security still
-    // applies; only the barrier goes, and RESET is idempotent.
-    expect(sql).toContain("ALTER VIEW public.imap_thread_active_assignments RESET (security_barrier)");
-    expect(sql).not.toContain("security_invoker = false");
+    // Only the barrier goes, and RESET is idempotent. The view stays
+    // security-invoker (0014 sets it; nothing here touches it), so table
+    // row-level security still applies. The live lane checks the catalog.
+    const statements = sql
+      .split("\n")
+      .filter((line) => line.trim() !== "" && !line.trimStart().startsWith("--"))
+      .join("\n");
+    expect(statements).toBe("ALTER VIEW public.imap_thread_active_assignments RESET (security_barrier);");
   });
 
   it("keeps folder message counts with statement triggers and a one-time backfill", async () => {
@@ -499,7 +503,9 @@ describe("initial schema", () => {
     expect(sql).toContain("USING gin (run_id, participant_edge_hashes)");
 
     // The active projection is one account-scoped pointer swap. It fails closed
-    // on status drift and remains a security-invoker, service-only view.
+    // on status drift and remains a security-invoker, service-only view. 0014
+    // also set security_barrier; 0029 resets it (see its test below), because a
+    // barrier view never flattens into the reader's query plan.
     expect(sql).toContain("account_id uuid PRIMARY KEY");
     expect(sql).toContain("scheduler_cursor integer NOT NULL DEFAULT 0");
     expect(sql).toContain("CHECK (scheduler_cursor BETWEEN 0 AND 4)");
