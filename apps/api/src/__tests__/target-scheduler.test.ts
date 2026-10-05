@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_RUNTIME_TARGET_PER_TARGET_CONCURRENCY,
+  isSchemaVersionReady,
   runRuntimeTargetTasks,
   type RuntimeTargetTask
 } from "../target-scheduler.js";
@@ -231,5 +232,78 @@ describe("runtime target scheduler", () => {
       expect.objectContaining({ targetId: "target-a", status: "fulfilled", value: "a" }),
       expect.objectContaining({ targetId: "target-b", status: "skipped", reason: "scheduler_aborted" })
     ]));
+  });
+
+  it("runs a target whose schema is ahead within its compatibility floor and skips one past it", async () => {
+    const results = await runRuntimeTargetTasks([
+      {
+        targetId: "ahead-compatible",
+        taskId: "ahead-compatible",
+        currentSchemaVersion: "0007_optional_raw_mime",
+        compatibleSinceSchemaVersion: "0005_progress_rollup",
+        async run() {
+          return "ok";
+        }
+      },
+      {
+        targetId: "ahead-floor-moved",
+        taskId: "ahead-floor-moved",
+        currentSchemaVersion: "0007_optional_raw_mime",
+        compatibleSinceSchemaVersion: "0007_optional_raw_mime",
+        async run() {
+          return "ok";
+        }
+      },
+      {
+        targetId: "ahead-exact-only",
+        taskId: "ahead-exact-only",
+        currentSchemaVersion: "0007_optional_raw_mime",
+        async run() {
+          return "ok";
+        }
+      }
+    ], { requiredSchemaVersion });
+
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ targetId: "ahead-compatible", status: "fulfilled", value: "ok" }),
+      expect.objectContaining({ targetId: "ahead-floor-moved", status: "skipped", reason: "stale_migration" }),
+      expect.objectContaining({ targetId: "ahead-exact-only", status: "skipped", reason: "stale_migration" })
+    ]));
+  });
+});
+
+describe("isSchemaVersionReady", () => {
+  const required = "0028_folder_message_counts";
+
+  it("accepts an exact match and, with a floor, a schema that is ahead", () => {
+    expect(isSchemaVersionReady({ currentSchemaVersion: required }, required)).toBe(true);
+    expect(isSchemaVersionReady({
+      currentSchemaVersion: "0029_active_assignments_view_no_barrier",
+      compatibleSinceSchemaVersion: "0028_folder_message_counts"
+    }, required)).toBe(true);
+    expect(isSchemaVersionReady({
+      currentSchemaVersion: "0031_later",
+      compatibleSinceSchemaVersion: "0020_threading_fingerprint_closure"
+    }, required)).toBe(true);
+  });
+
+  it("refuses a schema that is behind, ahead past its floor, or ahead without a floor", () => {
+    expect(isSchemaVersionReady({ currentSchemaVersion: "0027_folder_unchanged_proof" }, required)).toBe(false);
+    expect(isSchemaVersionReady({
+      currentSchemaVersion: "0030_incompatible",
+      compatibleSinceSchemaVersion: "0030_incompatible"
+    }, required)).toBe(false);
+    expect(isSchemaVersionReady({ currentSchemaVersion: "0029_active_assignments_view_no_barrier" }, required)).toBe(false);
+  });
+
+  it("refuses a missing, malformed, or inverted version", () => {
+    expect(isSchemaVersionReady({ currentSchemaVersion: "missing" }, required)).toBe(false);
+    expect(isSchemaVersionReady({ currentSchemaVersion: "" }, required)).toBe(false);
+    expect(isSchemaVersionReady({ currentSchemaVersion: "28_short" }, required)).toBe(false);
+    expect(isSchemaVersionReady({ currentSchemaVersion: required }, "latest")).toBe(false);
+    expect(isSchemaVersionReady({
+      currentSchemaVersion: required,
+      compatibleSinceSchemaVersion: "0029_active_assignments_view_no_barrier"
+    }, required)).toBe(false);
   });
 });

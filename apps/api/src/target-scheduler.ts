@@ -6,11 +6,21 @@ export type RuntimeTargetSkipReason =
   | "stale_migration"
   | "scheduler_aborted";
 
-export interface RuntimeTargetTask<T = unknown> {
+export interface SchemaVersionState {
+  /** The public migration the target's schema is at: a manifest id such as `0029_...`. */
+  currentSchemaVersion: string;
+  /**
+   * The oldest required version this schema still serves. A host reads it from
+   * the schema itself: a migration the running runtime cannot work with sets
+   * it to its own id; a compatible one leaves it. Absent means exact match.
+   */
+  compatibleSinceSchemaVersion?: string;
+}
+
+export interface RuntimeTargetTask<T = unknown> extends SchemaVersionState {
   targetId: string;
   taskId: string;
   status?: RuntimeTargetStatus;
-  currentSchemaVersion: string;
   run(input: { signal?: AbortSignal }): Promise<T>;
 }
 
@@ -184,6 +194,28 @@ export async function runRuntimeTargetTasks<T>(
 function getSkipReason(task: RuntimeTargetTask, requiredSchemaVersion: string): RuntimeTargetSkipReason | null {
   if (task.status === "paused") return "target_paused";
   if (task.status === "needs_attention") return "target_needs_attention";
-  if (task.currentSchemaVersion !== requiredSchemaVersion) return "stale_migration";
+  if (!isSchemaVersionReady(task, requiredSchemaVersion)) return "stale_migration";
   return null;
+}
+
+/**
+ * Whether a runtime that requires `requiredSchemaVersion` can run against this
+ * schema. Public migration ids order by their four-digit prefix. The schema must
+ * be at or after the required version, and the required version must not be
+ * older than the schema's compatibility floor. So a host may apply a
+ * compatible migration before it deploys the runtime that needs it, and the
+ * running runtime keeps serving; a migration the running runtime cannot work
+ * with moves the floor and stops it. A missing or malformed id is not ready.
+ */
+export function isSchemaVersionReady(state: SchemaVersionState, requiredSchemaVersion: string): boolean {
+  const current = migrationSequence(state.currentSchemaVersion);
+  const floor = migrationSequence(state.compatibleSinceSchemaVersion ?? state.currentSchemaVersion);
+  const required = migrationSequence(requiredSchemaVersion);
+  if (current === null || floor === null || required === null) return false;
+  return floor <= required && required <= current;
+}
+
+function migrationSequence(id: string | undefined): number | null {
+  const match = typeof id === "string" ? /^(\d{4})_\S+$/.exec(id) : null;
+  return match ? Number(match[1]) : null;
 }
