@@ -34,6 +34,7 @@ Mailbox-row identity is `(account_id, folder_path, uidvalidity, uid)`. Conversat
 - Keep private or temporary notes in ignored local files, never in tracked handoff diaries.
 - Update public documentation when behavior, layout, scripts, schema, or verification changes.
 - Leave unrelated user changes untouched.
+- Before recommending a merge, review the full diff for quality; the agent that wrote the code may do this. Check that the fix sits in the layer that owns the behavior, there is one deterministic path, inputs are validated at boundaries with typed errors, nothing is duplicated or left dead, and tests would catch a regression. Fix or answer every finding, and record the result in the PR.
 
 ## Shipping
 
