@@ -1,4 +1,5 @@
 import type { SearchFilter } from "./types.js";
+import { normalizeMessageId } from "./rules.js";
 
 /**
  * The single declarative source of truth for the search filter FIELD set.
@@ -122,7 +123,14 @@ export const TEXT_FIELDS: TextFieldRule[] = [
   { structuredKey: "body", kind: "body", operators: ["body"], normalize: identity, rawPrefix: "body" },
   { structuredKey: "folder", kind: "folder", operators: ["in", "folder", "label"], normalize: identity, rawPrefix: "in" },
   { structuredKey: "thread", kind: "thread", operators: ["thread"], normalize: identity, rawPrefix: "thread" },
-  { structuredKey: "msgid", kind: "msgid", operators: ["msgid", "message-id"], normalize: identity, rawPrefix: "msgid" },
+  // A Message-ID copied from a header keeps its brackets and case; the mirror stores neither.
+  {
+    structuredKey: "msgid",
+    kind: "msgid",
+    operators: ["msgid", "message-id", "rfc822msgid"],
+    normalize: (v) => normalizeMessageId(v) ?? "",
+    rawPrefix: "msgid"
+  },
   { structuredKey: "filename", kind: "filename", operators: ["filename", "file"], normalize: lower, rawPrefix: "filename" },
   { structuredKey: "filetype", kind: "filetype", operators: ["filetype", "attachment-type"], normalize: lower, rawPrefix: "filetype" },
   { structuredKey: "mime", kind: "mime", operators: ["mime"], normalize: lower, rawPrefix: "mime" }

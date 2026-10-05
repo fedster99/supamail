@@ -222,10 +222,7 @@ interface BodyStructurePart {
   childNodes?: BodyStructurePart[];
 }
 
-export function normalizeMessageId(value: string | null | undefined): string | null {
-  if (!value) return null;
-  return value.trim().replace(/^<|>$/g, "").toLowerCase() || null;
-}
+export { normalizeMessageId } from "./search/rules.js";
 
 export function parseHeaders(raw: Buffer | string | null | undefined): Record<string, string> {
   if (!raw) return {};

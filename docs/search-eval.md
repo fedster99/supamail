@@ -96,7 +96,7 @@ It immediately exposed two email-specific failures the generic metrics missed:
 - **Thread grouping** (`groupByThread`, default on): the ranker first collapses
   mirrored physical copies by stored `delivery_key`, then collapses each durable,
   account-scoped `conversation_id` to its single best delivery via `DISTINCT ON`.
-  It reports `thread.conversation_id` and a `thread.message_count` of distinct
+  It reports `thread.conversation_id` and a `thread.match_count` of matching
   deliveries. Unassigned legacy rows temporarily fall back to provider thread ID
   and then physical row ID. Set `groupByThread: false` for one result per delivery.
 - **Bulk demotion**: a `list-id` / `list-unsubscribe` (RFC 2369/2919) or bulk-sender

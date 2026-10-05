@@ -2,7 +2,7 @@ import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import { DELIVERY_KEY_SQL } from "../delivery-identity.js";
 import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
-import { filenameGlob, filetypeMatch, folderMatch, resolveDate } from "./rules.js";
+import { filenameGlob, filetypeMatch, resolveDate } from "./rules.js";
 
 /** Accumulates bound parameter values and hands back `$n` placeholders. User
  * input is NEVER interpolated into SQL text — only through these placeholders. */
@@ -127,13 +127,12 @@ function filterPredicate(filter: SearchFilter, pb: Params, now: Date): string {
       return filter.negated ? `(b.search_extract IS NULL OR NOT (${match}))` : match;
     }
     case "folder": {
-      const { kind, path } = folderMatch(filter.value);
-      if (kind === "subtree") {
-        const p = pb.add(`${escapeLike(path.toLowerCase())}/%`);
-        return negate(`lower(m.folder_path) LIKE ${p}`);
-      }
-      const p = pb.add(path.toLowerCase());
-      return negate(`lower(m.folder_path) = ${p}`);
+      // `resolveFolderFilters` named the exact folders; an unresolved value matches nothing.
+      const folders = filter.folders ?? [];
+      return negate(
+        `(m.account_id, m.folder_path) IN (SELECT * FROM unnest(` +
+        `${pb.add(folders.map((folder) => folder.account_id))}::uuid[], ${pb.add(folders.map((folder) => folder.path))}::text[]))`
+      );
     }
     case "thread": {
       const p = pb.add(filter.value);
@@ -499,6 +498,8 @@ SELECT
   page.email_prior::float8 AS email_prior, page.score::float8 AS score,
   (SELECT count(*) FROM public.imap_attachments a
     WHERE a.message_id = page.id AND a.disposition = 'attachment')::int AS attachment_count,
+  (SELECT count(*) FROM public.imap_attachments a
+    WHERE a.message_id = page.id AND a.disposition IS DISTINCT FROM 'attachment')::int AS inline_count,
   ${snippetExpr} AS snippet,
   ${bodyExpr} AS body
 FROM page

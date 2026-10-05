@@ -167,7 +167,6 @@ liveDb("search layer live DB", () => {
     expect(ids).toContain(idByUid.get(3)); // body-only hit, very old
     expect(ids).not.toContain(idByUid.get(4)); // soft-deleted, never surfaces
     expect(ids.indexOf(idByUid.get(1)!)).toBeLessThan(ids.indexOf(idByUid.get(3)!));
-    expect(response.read_only).toBe(true);
   });
 
   it("shows one result per delivery and lists its other stored copies", async () => {

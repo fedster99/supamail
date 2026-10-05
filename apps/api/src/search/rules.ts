@@ -1,3 +1,5 @@
+import type { SearchFilter } from "./types.js";
+
 /**
  * Search filter rules shared by every engine. Postgres compiles them to SQL; a
  * hosted index translates the same data, so the engines cannot drift.
@@ -113,13 +115,107 @@ export function filenameGlob(value: string): string {
   return /[*?]/.test(value) ? value : `*${value}*`;
 }
 
-/** What a `folder:` value matches: the exact path, or with a trailing `/*`, the
- * folders below `path`. The path is literal text. */
-export interface FolderMatch {
-  kind: "exact" | "subtree";
+/** An RFC Message-ID as the mirror stores it: no angle brackets, lowercase. A value
+ * copied from a header (`<ABC@example.com>`) matches the same message. */
+export function normalizeMessageId(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.trim().replace(/^<|>$/g, "").toLowerCase() || null;
+}
+
+/** One mirrored folder, as `in:` resolves against it. */
+export interface FolderRow {
+  account_id: string;
+  path: string;
+  delimiter: string | null;
+  special_use: string | null;
+}
+
+/** The folders a `folder` filter matched, per Mailbox Account. */
+export interface FolderRef {
+  account_id: string;
   path: string;
 }
 
-export function folderMatch(value: string): FolderMatch {
-  return value.endsWith("/*") ? { kind: "subtree", path: value.slice(0, -2) } : { kind: "exact", path: value };
+// A role name selects every folder with its special-use flag or a common provider name,
+// so `in:sent` covers a flagged Sent folder and an unflagged "Sent Messages" alike.
+const FOLDER_ROLES: ReadonlyArray<{ specialUse: string; names: readonly string[] }> = [
+  { specialUse: "\\inbox", names: ["inbox"] },
+  { specialUse: "\\sent", names: ["sent", "sent messages", "sent items", "sent mail"] },
+  { specialUse: "\\drafts", names: ["drafts", "draft"] },
+  { specialUse: "\\trash", names: ["trash", "deleted messages", "deleted items", "bin"] },
+  { specialUse: "\\archive", names: ["archive", "archives"] },
+  { specialUse: "\\junk", names: ["junk", "spam", "junk e-mail", "junk email", "bulk mail"] }
+];
+
+/** A folder path as `/`-separated lowercase segments, whatever the account's delimiter. */
+function folderSegments(path: string, delimiter: string | null): string[] {
+  const parts = delimiter ? path.split(delimiter) : [path];
+  return parts.flatMap((part) => part.split("/")).map((part) => part.toLowerCase());
+}
+
+function editDistance(left: string, right: string): number {
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j += 1) {
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
+    }
+    previous = current;
+  }
+  return previous[right.length];
+}
+
+/** True when `value` names `folder`; see {@link resolveFolder}. */
+function namesFolder(value: string, folder: FolderRow): boolean {
+  const segments = folderSegments(folder.path, folder.delimiter);
+  const subtree = value.endsWith("/*") || (folder.delimiter !== null && value.endsWith(`${folder.delimiter}*`));
+  if (subtree) {
+    const base = folderSegments(value.slice(0, -2), folder.delimiter);
+    return segments.length > base.length && base.every((part, index) => segments[index] === part);
+  }
+  const wanted = folderSegments(value.replace(/^\\/, ""), folder.delimiter);
+  if (segments.join("/") === wanted.join("/")) return true;
+  if (wanted.length > 1) return false;
+  const leaf = segments.at(-1);
+  const role = FOLDER_ROLES.find((candidate) => candidate.names.includes(wanted[0]));
+  return leaf === wanted[0]
+    || (role !== undefined && (folder.special_use?.toLowerCase() === role.specialUse || role.names.includes(leaf!)));
+}
+
+/**
+ * The folders a `folder:`/`in:` value names in each account. The value may be a full
+ * path written with `/` or the account's own delimiter, a folder's last name (`Legal`
+ * for `INBOX.INBOX.Legal`), or a role (`sent`, `\\Sent`, `trash`, `drafts`, `archive`,
+ * `junk`, `inbox`), which covers every folder with that special-use flag or a common
+ * name for it. A trailing `/*` (or the delimiter and `*`) selects the folders below a
+ * full path. Matching ignores case. With no match, the warning names the closest folders.
+ */
+export function resolveFolder(value: string, folders: readonly FolderRow[]): { folders: FolderRef[]; warning: string | null } {
+  const matched = folders.filter((folder) => namesFolder(value, folder));
+  if (matched.length > 0) {
+    return { folders: matched.map(({ account_id, path }) => ({ account_id, path })), warning: null };
+  }
+  const wanted = value.replace(/[/.]?\*$/, "").toLowerCase().split(/[/.]/).filter(Boolean).at(-1) ?? "";
+  const closest = folders
+    .map((folder) => ({ path: folder.path, distance: editDistance(wanted, folderSegments(folder.path, folder.delimiter).at(-1)!) }))
+    .sort((left, right) => left.distance - right.distance || left.path.localeCompare(right.path))
+    .map(({ path }) => path)
+    .filter((path, index, all) => all.indexOf(path) === index)
+    .slice(0, 3);
+  return {
+    folders: [],
+    warning: `folder "${value}" not found; it matches nothing` + (closest.length ? `. Closest folders: ${closest.join(", ")}` : "")
+  };
+}
+
+/** Resolve every folder filter, including OR members, against the searched accounts'
+ * folders. Each engine matches the resolved (account, path) pairs exactly. */
+export function resolveFolderFilters(filters: SearchFilter[], folders: readonly FolderRow[], warnings: string[]): SearchFilter[] {
+  return filters.map(function resolve(filter): SearchFilter {
+    if (filter.kind === "or") return { ...filter, filters: filter.filters.map(resolve) };
+    if (filter.kind !== "folder") return filter;
+    const resolved = resolveFolder(filter.value, folders);
+    if (resolved.warning && !warnings.includes(resolved.warning)) warnings.push(resolved.warning);
+    return { ...filter, folders: resolved.folders };
+  });
 }

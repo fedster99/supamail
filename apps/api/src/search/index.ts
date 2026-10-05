@@ -3,14 +3,17 @@ export { parseQuery, parseTextTerms, filtersFromStructured, tokenize } from "./p
 export {
   filenameGlob,
   filetypeMatch,
-  folderMatch,
+  normalizeMessageId,
+  resolveFolder,
+  resolveFolderFilters,
   isRelativeDate,
   isValidAbsoluteDate,
   parseAbsoluteDate,
   resolveDate,
   resolveRelativeDate,
   type FiletypeMatch,
-  type FolderMatch
+  type FolderRef,
+  type FolderRow
 } from "./rules.js";
 export { compileSearch } from "./compile.js";
 export type { CompileOptions, CompiledQuery } from "./compile.js";

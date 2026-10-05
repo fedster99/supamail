@@ -17,7 +17,7 @@ function result(
     },
     thread: {
       ...thread,
-      message_count: 1
+      match_count: 1
     }
   };
 }

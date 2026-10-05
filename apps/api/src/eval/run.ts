@@ -63,8 +63,6 @@ export interface EvaluateOptions {
   limit?: number;
   /** Account email to seed under; defaults to a process-unique address. */
   accountEmail?: string;
-  /** Request the semantic tier (Tier 2; no-op without embeddings). */
-  semantic?: boolean;
 }
 
 const EVAL_UIDVALIDITY = 99_001;
@@ -321,7 +319,7 @@ async function runArm(
   pool: PgPool,
   accountId: string,
   resolve: ResolveFn,
-  arm: { recall: boolean; limit: number; semantic?: boolean }
+  arm: { recall: boolean; limit: number }
 ): Promise<QueryScore[]> {
   const perQuery: QueryScore[] = [];
   for (const query of queries) {
@@ -329,7 +327,6 @@ async function runArm(
       q: query.q,
       accounts: [accountId],
       limit: arm.limit,
-      semantic: arm.semantic,
       now: EVAL_NOW,
       recall: arm.recall
     });
@@ -417,7 +414,7 @@ export async function evaluateSearch(pool: PgPool, options: EvaluateOptions = {}
   const { accountId, resolve } = await seedCorpus(pool, accountEmail);
 
   try {
-    const perQuery = await runArm(pool, accountId, resolve, { recall: true, limit, semantic: options.semantic });
+    const perQuery = await runArm(pool, accountId, resolve, { recall: true, limit });
     const guardScores = await runGuards(pool, accountId, resolve, limit);
     const overall = meanMetrics(perQuery.map((p) => p.metrics));
 
@@ -473,8 +470,8 @@ export async function compareSearch(pool: PgPool, options: EvaluateOptions = {})
   const { accountId, resolve } = await seedCorpus(pool, accountEmail);
 
   try {
-    const baseline = await runArm(pool, accountId, resolve, { recall: false, limit, semantic: options.semantic });
-    const candidate = await runArm(pool, accountId, resolve, { recall: true, limit, semantic: options.semantic });
+    const baseline = await runArm(pool, accountId, resolve, { recall: false, limit });
+    const candidate = await runArm(pool, accountId, resolve, { recall: true, limit });
 
     const byId = (rows: QueryScore[]): Map<string, QueryScore> => new Map(rows.map((r) => [r.id, r]));
     const baseById = byId(baseline);
