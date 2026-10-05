@@ -3550,6 +3550,11 @@ export class MirrorRepository {
     }
   }
 
+  /**
+   * Tombstone rows whose UIDs the provider proved gone (QRESYNC VANISHED, or an
+   * archive row absent from the folder's complete UID list), in any window lane.
+   * `RECONCILE_MISSING` is recoverable: a later sync that sees the UID revives it.
+   */
   async markVanishedMessages(
     accountId: string,
     folder: ImapFolder,
@@ -3561,7 +3566,7 @@ export class MirrorRepository {
     if (uniqueUids.length === 0) return 0;
     if (uniqueUids.length > MAX_SYNC_BATCH_SIZE
       || uniqueUids.some((uid) => !Number.isSafeInteger(uid) || uid <= 0)) {
-      throw new Error("QRESYNC VANISHED batch is invalid or exceeds the sync batch limit");
+      throw new Error("Vanished UID batch is invalid or exceeds the sync batch limit");
     }
     const query = `
       WITH marked AS (
@@ -3574,7 +3579,6 @@ export class MirrorRepository {
           AND uidvalidity = $3
           AND uid = ANY($4::bigint[])
           AND deleted_in_provider = false
-          AND window_status = 'IN_WINDOW'
         RETURNING id
       )
       SELECT count(*)::text AS count FROM marked
@@ -3588,47 +3592,21 @@ export class MirrorRepository {
     return Number(result.rows[0].count);
   }
 
-  /**
-   * Archive rows (HISTORICAL, EXPIRED) sit outside the live-window reconcile. Given
-   * the folder's complete provider UID list, tombstone every live archive row of the
-   * same UIDVALIDITY whose UID is gone. `RECONCILE_MISSING` keeps the row out of
-   * purge, and a later history walk that sees the UID again revives it.
-   */
-  async markMissingArchiveMessages(
-    accountId: string,
-    folder: ImapFolder,
-    uidValidity: number,
-    providerUids: readonly number[],
-    options: SyncStateWriteOptions = {}
-  ): Promise<number> {
-    const result = await runOptionalDeadlineWrite<{ count: string }>(
-      this.pool,
+  /** UIDs of the folder's live archive (HISTORICAL, EXPIRED) rows at one UIDVALIDITY. */
+  async getLiveArchiveUids(accountId: string, folder: ImapFolder, uidValidity: number): Promise<number[]> {
+    const result = await this.pool.query<{ uid: string }>(
       `
-      WITH provider AS (
-        SELECT DISTINCT uid FROM unnest($5::bigint[]) AS input(uid)
-      ), marked AS (
-        UPDATE public.imap_messages m
-        SET deleted_in_provider = true,
-            provider_deleted_at = now(),
-            deleted_reason = 'RECONCILE_MISSING'
-        WHERE m.account_id = $1
-          AND m.folder_path = $2
-          AND m.uidvalidity = $3
-          AND m.deleted_in_provider = false
-          AND m.window_status <> 'IN_WINDOW'
-          AND EXISTS (
-            SELECT 1 FROM public.imap_folders f
-            WHERE f.id = $4 AND f.account_id = $1 AND f.uidvalidity = $3
-          )
-          AND NOT EXISTS (SELECT 1 FROM provider WHERE provider.uid = m.uid)
-        RETURNING m.id
-      )
-      SELECT count(*)::text AS count FROM marked
+      SELECT uid::text AS uid
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = $2
+        AND uidvalidity = $3
+        AND deleted_in_provider = false
+        AND window_status <> 'IN_WINDOW'
       `,
-      [accountId, folder.path, uidValidity, folder.id, [...providerUids]],
-      options
+      [accountId, folder.path, uidValidity]
     );
-    return Number(result.rows[0].count);
+    return result.rows.map((row) => Number(row.uid));
   }
 
   /**
@@ -3684,7 +3662,7 @@ export class MirrorRepository {
    * Mark a message's body fetch as attempted without storing a body. Used when a UID
    * moved out (MessageMovedError) for a non-IN_WINDOW row: MOVED_OUT is purged, and
    * the next archive snapshot tombstones the row recoverably if the UID is really
-   * gone (markMissingArchiveMessages). This just removes
+   * gone. This just removes
    * the row from getHistoryBacklog (which filters body_fetched_at IS NULL) — a benign,
    * reversible "we tried, the body is gone" watermark, not a soft-delete.
    */

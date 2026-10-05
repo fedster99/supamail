@@ -117,7 +117,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   - Folder discovery runs every 15 minutes.
   - A host may make an authoritative full safety pass force one folder discovery before folder scheduling. Supplemental live, Sent, and body-only passes never use this override. The successful LIST advances the normal discovery schedule, so the host does not add a second discovery job.
   - Newly tracked non-priority folders take the existing bounded round-robin slots before older due non-priority work in that discovery pass. Do not increase the per-cycle folder budget to make discovery immediate.
-  - Archive (`HISTORICAL`/`EXPIRED`) delete/move detection runs at each history snapshot, including the archive refresh: one `UID SEARCH ALL` per folder, tombstoning absent UIDs as recoverable `RECONCILE_MISSING` only when the list size matches SELECT's message count. Match UIDs, never dates.
+  - Archive (`HISTORICAL`/`EXPIRED`) delete/move detection runs at each history snapshot, including the archive refresh: one `UID SEARCH ALL` per folder, tombstoning absent UIDs as recoverable `RECONCILE_MISSING` only when the list size matches SELECT's message count, in `MAX_SYNC_BATCH_SIZE` batches that yield to the lock budget before the snapshot starts. Match UIDs, never dates.
   - Message delete/move detection depends on reconcile, defaulting to about 6 hours per folder. An Inbox `EXPUNGE` wake or a tracked non-Inbox dirty signal may force this reconcile earlier; folders without a dirty signal keep the normal cadence.
   - Folder disappearance gets a 7-day grace period before in-window rows are tombstoned.
   - Each account cycle processes up to 10 priority folders and 5 round-robin folders.

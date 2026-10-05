@@ -904,12 +904,12 @@ export async function searchUidsBefore(
 /**
  * Every UID in the selected mailbox from one UID SEARCH response, without the
  * per-message FETCH lines `iterateAllUids` costs. Fails rather than returning a
- * partial list.
+ * partial list. UIDs may repeat; callers deduplicate.
  */
 export async function listMailboxUids(client: MirrorImapClient): Promise<number[]> {
   const uids = await client.search({ all: true }, { uid: true });
   if (!uids) throw new Error("IMAP UID SEARCH ALL failed");
-  return [...new Set(uids)];
+  return uids;
 }
 
 export async function searchAllUids(client: MirrorImapClient, since?: Date): Promise<number[]> {

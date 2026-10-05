@@ -291,7 +291,7 @@ describe("repository safety", () => {
     expect(worker).toContain("exceeds SYNC_MAX_ACCOUNTS");
   });
 
-  it("limits reconciliation tombstones to the active sync window", async () => {
+  it("limits the live UID-stream reconcile to the active sync window", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("AND window_status = 'IN_WINDOW'");

@@ -5409,15 +5409,76 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       await engine.syncAccount(h.account.id, "manual");
       expect(await rows(h)).toEqual(mirrored);
 
-      // A listing from a folder generation that is no longer current marks nothing.
-      const folder = (
-        await h.pool.query<ImapFolder>(
-          `SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
-          [h.account.id]
-        )
-      ).rows[0];
-      expect(await h.repository.markMissingArchiveMessages(h.account.id, folder, 86_999, [])).toBe(0);
-      expect(await rows(h)).toEqual(mirrored);
+      // A failed search fails the history batch, so the refresh stays due.
+      const refresh = await h.pool.query<{ overdue: boolean }>(
+        `SELECT last_archive_refresh_at < now() - interval '30 days' AS overdue
+         FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      );
+      expect(refresh.rows[0].overdue).toBe(true);
+
+      // A provider VANISHED report is exact per UID, so it tombstones an archive row too.
+      const folder = (await h.pool.query<ImapFolder>(
+        `SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      )).rows[0];
+      expect(await h.repository.markVanishedMessages(h.account.id, folder, 86_101, [2])).toBe(1);
+      expect(await rows(h)).toContain("2:HISTORICAL:RECONCILE_MISSING");
+    });
+
+    it("tombstones a mass archive deletion in bounded batches that resume after the lock budget", async () => {
+      const { h, folders } = await setupArchive("archive-deletion-mass", 86_301, [
+        message(1, oldDate),
+        message(10_000, new Date())
+      ]);
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      // 1,200 archive rows the provider no longer has: more than two write batches.
+      await h.pool.query(
+        `INSERT INTO public.imap_messages (account_id, folder_id, folder_path, uidvalidity, uid, internal_date, window_status)
+         SELECT account_id, folder_id, folder_path, uidvalidity, g, internal_date, 'HISTORICAL'
+         FROM public.imap_messages, generate_series(2, 1201) AS g
+         WHERE account_id = $1 AND uid = 1`,
+        [h.account.id]
+      );
+      const liveArchive = async () => Number((await h.pool.query<{ c: string }>(
+        `SELECT count(*)::text AS c FROM public.imap_messages
+         WHERE account_id = $1 AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+        [h.account.id]
+      )).rows[0].c);
+      expect(await liveArchive()).toBe(1201);
+
+      const internals = engine as unknown as { isLockBudgetExpired(deadline: number): boolean };
+      const budgetCheck = internals.isLockBudgetExpired.bind(engine);
+      let budgetEnded = false;
+      const budget = vi.spyOn(internals, "isLockBudgetExpired")
+        .mockImplementation((deadline) => budgetEnded || budgetCheck(deadline));
+      const markVanished = h.repository.markVanishedMessages.bind(h.repository);
+      const writes: number[] = [];
+      const write = vi.spyOn(h.repository, "markVanishedMessages")
+        .mockImplementation(async (...args: Parameters<typeof markVanished>) => {
+          writes.push(args[3].length);
+          const marked = await markVanished(...args);
+          budgetEnded = true;
+          return marked;
+        });
+
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(writes).toEqual([500]);
+      expect(await liveArchive()).toBe(701);
+
+      budgetEnded = false;
+      budget.mockImplementation((deadline) => budgetCheck(deadline));
+      write.mockImplementation(async (...args: Parameters<typeof markVanished>) => {
+        writes.push(args[3].length);
+        return await markVanished(...args);
+      });
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(writes).toEqual([500, 500, 200]);
+      expect(await liveArchive()).toBe(1);
+      expect(await rows(h)).toContain("1:HISTORICAL:live");
     });
 
     it("leaves a UIDVALIDITY change to the reset path", async () => {
