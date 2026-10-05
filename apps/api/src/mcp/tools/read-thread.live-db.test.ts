@@ -141,7 +141,8 @@ liveDb("read_thread live DB", () => {
       messageIdNormalized: "root@acme.com",
       body: "Let's kick off the project on Monday.\n\nFrom: Prior Author\nSent: Friday\nTo: Alice\nSubject: Forwarded context\n\nOriginal starter details.",
       attachments: [
-        { filename: "agenda.pdf", mimeType: "application/pdf", sizeBytes: 1024, partNumber: "2", disposition: "attachment" }
+        { filename: "agenda.pdf", mimeType: "application/pdf", sizeBytes: 1024, partNumber: "2", disposition: "attachment" },
+        { filename: "logo.png", mimeType: "image/png", sizeBytes: 600, partNumber: "3", disposition: "inline" }
       ]
     });
     await seedMessage({
@@ -259,6 +260,21 @@ liveDb("read_thread live DB", () => {
       rfcMessageId: "<r0@x>",
       messageIdNormalized: "r0@x",
       body: "header-only root message"
+    });
+
+    // A reply whose earlier messages were never mirrored: its References name
+    // two ancestors that exist only as quoted text.
+    await seedMessage({
+      uid: 30,
+      subject: "Re: Before the mirror",
+      fromEmail: "late@example.test",
+      ageDays: 6,
+      providerThreadId: null,
+      rfcMessageId: "<late3@example.test>",
+      messageIdNormalized: "late3@example.test",
+      inReplyTo: "<late2@example.test>",
+      referencesHeader: "<late1@example.test> <late2@example.test>",
+      body: "Following up.\n\nOn Mon, Early wrote:\n> The earlier discussion.\n> More of it."
     });
 
     // Three physical rows in one active durable conversation: uid 22 mirrors
@@ -452,7 +468,7 @@ liveDb("read_thread live DB", () => {
     }
   });
 
-  it("collects distinct participants and a flat attachments_index", async () => {
+  it("collects distinct participants, lists files once, and counts inline parts", async () => {
     const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId });
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
@@ -460,13 +476,40 @@ liveDb("read_thread live DB", () => {
     expect(out.thread.participants).toEqual(
       expect.arrayContaining(["alice@acme.com", "bob@acme.com", "carol@acme.com"])
     );
-    expect(out.attachments_index).toHaveLength(1);
-    expect(out.attachments_index[0]).toMatchObject({
-      message_id: idByUid.get(1),
+    expect(out).not.toHaveProperty("attachments_index");
+    expect(out.messages[0].attachments).toEqual([expect.objectContaining({
       filename: "agenda.pdf",
       mime_type: "application/pdf",
       size_bytes: 1024,
       disposition: "attachment"
+    })]);
+    expect(out.messages[0].inline_count).toBe(1);
+    expect(out.messages.slice(1).every((m) => m.inline_count === undefined && m.attachments.length === 0)).toBe(true);
+  });
+
+  it("reports ancestors named in References that were never mirrored", async () => {
+    const out = await runReadThread(pool, { message_id: idByUid.get(30) });
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+
+    expect(out.messages.map((m) => m.message_id)).toEqual([idByUid.get(30)]);
+    expect(out).toMatchObject({
+      omitted_message_count: 0,
+      missing_ancestor_count: 2,
+      thread_content_status: "partial",
+      thread_omissions: ["ancestors_not_mirrored"]
+    });
+    expect(out.messages[0].body).toContain("The earlier discussion.");
+  });
+
+  it("returns one full result per conversation in a batch", async () => {
+    const out = await runReadThread(pool, { message_ids: [idByUid.get(21)!, idByUid.get(20)!, idByUid.get(2)!] });
+    expect(out).toMatchObject({
+      threads: [
+        { message_id: idByUid.get(21), result: { thread: { conversation_id: ACTIVE_CONVERSATION_ID } } },
+        { message_id: idByUid.get(20), same_thread_as: idByUid.get(21) },
+        { message_id: idByUid.get(2), result: { messages: expect.any(Array) } }
+      ]
     });
   });
 
@@ -495,7 +538,8 @@ liveDb("read_thread live DB", () => {
     expect(ids).toEqual([idByUid.get(6), idByUid.get(7), idByUid.get(8)]);
     expect(ids).not.toContain(idByUid.get(10)); // mirrored Sent copy
     expect(out.thread.message_count).toBe(3);
-    expect(out.thread.provider_thread_id).toBeNull();
+    expect(out.thread).not.toHaveProperty("provider_thread_id");
+    expect(out.thread_content_status).toBe("complete");
   });
 
   it("reads only the atomically active run and collapses its physical delivery copies", async () => {

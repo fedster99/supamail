@@ -14,7 +14,8 @@ describe("MCP agent guidance", () => {
     expect(MCP_INSTRUCTIONS).toContain("account-scoped conversation_id or provider thread_id");
     expect(MCP_INSTRUCTIONS).toContain("Each thread returns at most 20 messages by default and 100 when requested");
     expect(MCP_INSTRUCTIONS).toContain("Duplicate message_ids are collapsed");
-    expect(MCP_INSTRUCTIONS).toContain("each distinct ID has its own result or error entry");
+    expect(MCP_INSTRUCTIONS).toContain("each distinct ID has its own result or error entry, or same_thread_as");
+    expect(MCP_INSTRUCTIONS).toContain("missing_ancestor_count counts earlier replies that were never mirrored");
     expect(MCP_INSTRUCTIONS).toContain("full available cleaned body for each message");
     expect(MCP_INSTRUCTIONS).toContain("specific range without a product character ceiling");
     expect(MCP_INSTRUCTIONS).toContain("body_total_chars and body_next_offset");

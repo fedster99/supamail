@@ -67,8 +67,8 @@ export interface MessageAttachment {
 export interface MessageDetail {
   /** = imap_messages.id; the stable handle passed back as `message_id`. */
   message_id: string;
-  /** = provider_thread_id (the conversation handle), or null. */
-  thread_id: string | null;
+  /** = provider_thread_id (the provider's conversation handle). Omitted when the provider has none. */
+  thread_id?: string;
   account_id: string;
   folder_path: string;
   subject: string | null;
@@ -91,6 +91,8 @@ export interface MessageDetail {
   body_total_chars?: number;
   body_next_offset?: number | null;
   attachments: MessageAttachment[];
+  /** read_thread lists only files; this counts the inline parts it left out. Present only when > 0. */
+  inline_count?: number;
   /** Parsed select headers, only when the tool was asked to include them. */
   headers?: Record<string, string>;
   /** Other stored copies of this email in the thread. Present only when there are any. */
@@ -134,11 +136,16 @@ export interface MessageAttachmentRow extends ProtectedMetadataColumns {
   disposition: string | null;
 }
 
-/** Load and reveal attachment metadata for one or more messages. */
+/**
+ * Load and reveal attachment metadata for one or more messages. `filesOnly`
+ * keeps parts with `disposition = 'attachment'`, the rule search's
+ * `has:attachment` uses; inline parts such as signature images are left out.
+ */
 export async function loadMessageAttachments(
   client: PgClient,
   messageIds: readonly string[],
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  { filesOnly = false }: { filesOnly?: boolean } = {}
 ): Promise<Map<string, MessageAttachmentRow[]>> {
   const byMessage = new Map<string, MessageAttachmentRow[]>();
   for (const messageId of messageIds) byMessage.set(messageId, []);
@@ -154,6 +161,7 @@ export async function loadMessageAttachments(
     FROM public.imap_attachments attachment
     JOIN public.imap_messages message ON message.id = attachment.message_id
     WHERE attachment.message_id = ANY($1::uuid[])
+      ${filesOnly ? "AND attachment.disposition = 'attachment'" : ""}
     ORDER BY attachment.message_id,
              NULLIF(regexp_replace(coalesce(attachment.part_number, ''), '[^0-9]', '', 'g'), '')::bigint NULLS LAST,
              attachment.part_number
@@ -235,7 +243,7 @@ export function mapMessageRow(
     : cleaned.omissions;
   const detail: MessageDetail = {
     message_id: row.id,
-    thread_id: row.provider_thread_id,
+    ...(row.provider_thread_id === null ? {} : { thread_id: row.provider_thread_id }),
     account_id: row.account_id,
     folder_path: row.folder_path,
     subject: row.subject,
@@ -243,7 +251,8 @@ export function mapMessageRow(
     to: row.to_emails ?? [],
     cc: row.cc_emails ?? [],
     date: row.internal_date.toISOString(),
-    flags: row.flags ?? [],
+    // \Recent describes one IMAP session, not the message.
+    flags: (row.flags ?? []).filter((flag) => flag.toLowerCase() !== "\\recent"),
     window_status: row.window_status,
     body: cleaned.text,
     body_content_status: bodyOmissions.length > 0

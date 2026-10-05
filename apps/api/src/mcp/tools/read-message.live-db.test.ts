@@ -140,7 +140,7 @@ liveDb("read_message tool live DB", () => {
         fromName: "Alice Acme",
         toEmails: ["me@example.test", "bob@acme.com"],
         ccEmails: ["carol@acme.com"],
-        flags: ["\\Seen"],
+        flags: ["\\Seen", "\\Recent"],
         ageDays: 1,
         body: [
           "Here is the real reply content the agent should see.",

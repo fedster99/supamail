@@ -286,6 +286,32 @@ describe("mapMessageRow", () => {
       body_next_offset: 4
     });
   });
+  it("drops the session-only \\Recent flag and omits a missing provider thread id", () => {
+    const row = {
+      id: "message-1",
+      account_id: "account-1",
+      folder_path: "INBOX",
+      provider_thread_id: null,
+      subject: "Flags",
+      from_email: "alice@example.test",
+      from_name: "Alice",
+      to_emails: ["me@example.test"],
+      cc_emails: [],
+      flags: ["\\Seen", "\\Recent", "\\recent", "$Label"],
+      window_status: "IN_WINDOW" as const,
+      internal_date: new Date("2026-08-01T00:00:00.000Z"),
+      body_text: "hello",
+      body_plain: null,
+      selected_text_part: null,
+      raw_truncated: false,
+      attachments: []
+    };
+
+    const message = mapMessageRow(row);
+    expect(message.flags).toEqual(["\\Seen", "$Label"]);
+    expect(message).not.toHaveProperty("thread_id");
+    expect(mapMessageRow({ ...row, provider_thread_id: "provider-thread" }).thread_id).toBe("provider-thread");
+  });
 });
 
 describe("quoteText", () => {
