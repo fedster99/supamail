@@ -385,6 +385,8 @@ liveDb("read_thread live DB", () => {
     const ids = out.messages.map((m) => m.message_id);
     expect(ids).toEqual([idByUid.get(1), idByUid.get(2), idByUid.get(3)]);
     expect(ids).not.toContain(idByUid.get(9)); // mirrored Sent copy
+    expect(out.messages[0].duplicate_message_ids).toEqual([idByUid.get(9)]);
+    expect(out.messages.slice(1).every((m) => m.duplicate_message_ids === undefined)).toBe(true);
     expect(ids).not.toContain(idByUid.get(4)); // soft-deleted
     expect(ids).not.toContain(idByUid.get(5)); // different thread
     expect(out.thread.message_count).toBe(3);
@@ -507,6 +509,8 @@ liveDb("read_thread live DB", () => {
       idByUid.get(21)
     ]);
     expect(out.messages.map((message) => message.message_id)).not.toContain(idByUid.get(22));
+    expect(out.messages[0].duplicate_message_ids).toEqual([idByUid.get(22)]);
+    expect(out.messages[1].duplicate_message_ids).toBeUndefined();
     // uid 5 has the same conversation id only in the non-active archived run.
     expect(out.messages.map((message) => message.message_id)).not.toContain(idByUid.get(5));
   });

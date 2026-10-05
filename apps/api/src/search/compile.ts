@@ -1,4 +1,5 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
+import { DELIVERY_KEY_SQL } from "../delivery-identity.js";
 import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
 import { filenameGlob, filetypeMatch, folderMatch, resolveDate } from "./rules.js";
@@ -359,24 +360,7 @@ grouped AS (
     m.subject, m.from_email, m.from_name, m.to_emails, m.flags,
     m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
     ta.conversation_id,
-    coalesce(
-      ta.delivery_key,
-      CASE
-        WHEN nullif(m.provider_message_id_namespace, '') IS NOT NULL
-          AND nullif(m.provider_message_id, '') IS NOT NULL
-          THEN 'provider:' || encode(extensions.digest(
-            m.provider_message_id_namespace || chr(31) || m.provider_message_id,
-            'sha256'
-          ), 'hex')
-        WHEN nullif(m.message_id_normalized, '') IS NOT NULL
-          AND b.raw_mime_sha256 IS NOT NULL
-          THEN 'rfc-body:' || encode(extensions.digest(
-            m.message_id_normalized || chr(31) || b.raw_mime_sha256,
-            'sha256'
-          ), 'hex')
-        ELSE 'physical:' || m.id::text
-      END
-    ) AS delivery_key,
+    ${DELIVERY_KEY_SQL} AS delivery_key,
     CASE
       WHEN ta.conversation_id IS NOT NULL
         THEN 'conversation:' || ta.conversation_id
@@ -474,7 +458,14 @@ ranked AS (
   FROM scored s
 ),
 delivery_representatives AS (
-  SELECT DISTINCT ON (r.account_id, r.delivery_key) r.*
+  -- Window functions run before DISTINCT ON, so each representative keeps the
+  -- ids of every matching stored copy of its delivery.
+  SELECT DISTINCT ON (r.account_id, r.delivery_key)
+    r.*,
+    array_agg(r.id) OVER (
+      PARTITION BY r.account_id, r.delivery_key
+      ORDER BY r.id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS delivery_copy_ids
   FROM ranked r
   ORDER BY
     r.account_id,
@@ -503,6 +494,7 @@ SELECT
   page.window_status, page.internal_date, page.conversation_id,
   page.provider_thread_id, page.body_fetched_at,
   page.thread_count::int AS thread_count,
+  array_remove(page.delivery_copy_ids, page.id) AS duplicate_message_ids,
   page.text_rel::float8 AS text_rel, page.recency::float8 AS recency,
   page.email_prior::float8 AS email_prior, page.score::float8 AS score,
   (SELECT count(*) FROM public.imap_attachments a

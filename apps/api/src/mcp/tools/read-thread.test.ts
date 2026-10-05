@@ -44,7 +44,7 @@ function assignedConversationPool() {
         ]
       };
     }
-    if (sql.includes("WITH delivery_representatives")) {
+    if (sql.includes("WITH delivery_copies")) {
       return {
         rows: [
           {
@@ -152,7 +152,7 @@ function batchConversationPool() {
           }]
         };
       }
-      if (sql.includes("WITH delivery_representatives")) {
+      if (sql.includes("WITH delivery_copies")) {
         const conversationId = String(values?.[1]);
         return {
           rows: [{
@@ -203,7 +203,7 @@ describe("read_thread stored assignments", () => {
     );
 
     expect(isResult(out)).toBe(true);
-    const select = query.mock.calls.find(([sql]) => String(sql).includes("WITH delivery_representatives"))?.[0];
+    const select = query.mock.calls.find(([sql]) => String(sql).includes("WITH delivery_copies"))?.[0];
     expect(select).toContain("b.raw_truncated");
     expect(select).not.toContain("b.body_text");
   });
@@ -408,8 +408,8 @@ describe("read_thread stored assignments", () => {
     expect(out.messages.map((message) => message.message_id)).toEqual(["message-representative"]);
     expect(query).toHaveBeenCalledWith("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 
-    const conversationCall = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"));
-    expect(conversationCall?.[0]).toContain("DISTINCT ON (assignment.delivery_key)");
+    const conversationCall = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"));
+    expect(conversationCall?.[0]).toContain("PARTITION BY m.account_id, assignment.delivery_key");
     expect(conversationCall?.[0]).toContain("public.imap_thread_active_assignments assignment");
     expect(conversationCall?.[0]).toContain("assignment.account_id = $1");
     expect(conversationCall?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20]);
@@ -428,7 +428,7 @@ describe("read_thread stored assignments", () => {
     if (!isResult(out)) return;
     expect(out.thread.conversation_id).toBe("conversation-1");
     expect(query.mock.calls.some(([sql]) => sql.includes("WHERE m.id = $1"))).toBe(false);
-    const select = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"))?.[0];
+    const select = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"))?.[0];
     expect(select).toContain("b.raw_truncated");
     expect(select).not.toContain("b.body_text");
   });
@@ -440,7 +440,7 @@ describe("read_thread stored assignments", () => {
     const { pool, query } = assignedConversationPool();
     const implementation = query.getMockImplementation();
     query.mockImplementation(async (sql: string, values?: unknown[]) => {
-      if (sql.includes("WITH delivery_representatives")) return { rows: [] };
+      if (sql.includes("WITH delivery_copies")) return { rows: [] };
       return implementation!(sql, values);
     });
 
@@ -462,7 +462,7 @@ describe("read_thread stored assignments", () => {
     const conversationQuery = query.getMockImplementation();
     query.mockImplementation(async (sql: string, values?: unknown[]) => {
       const result = await conversationQuery!(sql, values);
-      if (sql.includes("WITH delivery_representatives")) {
+      if (sql.includes("WITH delivery_copies")) {
         return {
           ...result,
           rows: result.rows.map((row: Record<string, unknown>) => ({
@@ -488,7 +488,7 @@ describe("read_thread stored assignments", () => {
     expect(out.omitted_message_count).toBe(2);
     expect(out.thread_content_status).toBe("partial");
     expect(out.thread_omissions).toEqual(["older_messages"]);
-    const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_representatives"));
+    const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"));
     expect(call?.[0]).toContain("LIMIT $3");
     expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 1]);
   });
@@ -504,7 +504,7 @@ describe("read_thread stored assignments", () => {
 
     expect(isResult(out)).toBe(true);
     const providerCall = query.mock.calls.find(([sql]) => sql.includes("WHERE m.provider_thread_id = $1"));
-    expect(providerCall?.[0]).toContain("DISTINCT ON (m.account_id");
+    expect(providerCall?.[0]).toContain("PARTITION BY m.account_id, coalesce(");
     expect(providerCall?.[0]).toContain("ta.delivery_key");
     expect(providerCall?.[0]).toContain("b.raw_mime_sha256");
     expect(providerCall?.[0]).toContain("public.imap_thread_active_assignments active");
@@ -531,7 +531,7 @@ describe("read_thread stored assignments", () => {
     const seedCall = query.mock.calls.find(([sql]) => sql.includes("WHERE m.id = $1"));
     expect(seedCall?.[0]).toContain("public.imap_thread_active_assignments assignment");
     const legacyCall = query.mock.calls.find(([sql]) => sql.includes("WITH legacy_candidates"));
-    expect(legacyCall?.[0]).toContain("DISTINCT ON (m.account_id");
+    expect(legacyCall?.[0]).toContain("PARTITION BY m.account_id, coalesce(");
     expect(legacyCall?.[0]).toContain("public.imap_thread_active_assignments active");
     expect(legacyCall?.[0]).toContain(") ta ON true");
     expect(legacyCall?.[0]).toContain("b.raw_truncated");

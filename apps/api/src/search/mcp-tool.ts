@@ -97,7 +97,9 @@ export const searchEmailToolDefinition = {
     "snippet-highlighted results with full mailbox identity (score is null when the order ranks " +
     "nothing: date, size or sender order, or no free-text words), an optional per-result " +
     "score_breakdown (explain), the echoed parsed query, and a sync_trust block describing " +
-    "how complete the mirror is. READ-ONLY: never sends, deletes, moves, or modifies mail.",
+    "how complete the mirror is. Each email appears once; duplicate_message_ids lists its other " +
+    "stored copies (for example a direct and a list delivery), to move or flag every copy. " +
+    "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,

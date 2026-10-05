@@ -4,6 +4,7 @@ export * from "./content.js";
 export * from "./crypto.js";
 export * from "./db.js";
 export * from "./delivery-evidence.js";
+export * from "./delivery-identity.js";
 export * from "./drafts.js";
 export * from "./imap-client.js";
 export * from "./inbox-idle.js";

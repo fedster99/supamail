@@ -92,6 +92,8 @@ export interface MessageDetail {
   attachments: MessageAttachment[];
   /** Parsed select headers, only when the tool was asked to include them. */
   headers?: Record<string, string>;
+  /** Other stored copies of this email in the thread. Present only when there are any. */
+  duplicate_message_ids?: string[];
 }
 
 /**

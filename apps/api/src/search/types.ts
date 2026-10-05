@@ -203,6 +203,9 @@ export interface SearchResult {
   };
   attachments: { count: number };
   body: string | null;
+  /** Other stored copies of this email that also match, such as a direct and a
+   *  list delivery. Present only when there are any. */
+  duplicate_message_ids?: string[];
 }
 
 export interface SyncTrustAccount {
