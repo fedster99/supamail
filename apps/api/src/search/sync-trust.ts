@@ -42,7 +42,12 @@ export async function buildSyncTrust(
       a.email_address,
       a.sync_state,
       a.sync_state_reason,
-      a.last_sync_finished_at,
+      -- A live-notification sync of one folder does not finish an account sync, but
+      -- it does bring that folder up to date, so the newest folder sync counts too.
+      greatest(
+        a.last_sync_finished_at,
+        (SELECT max(f.last_synced_at) FROM public.imap_folders f WHERE f.account_id = a.id)
+      ) AS last_sync_finished_at,
       a.currently_syncing,
       a.protected_metadata,
       a.protected_metadata_version,
