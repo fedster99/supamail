@@ -40,7 +40,9 @@ Keep the existing `read_thread` tool and add a `message_ids` batch selector:
 - at most four threads execute concurrently;
 - shared `include_quoted` and `max_messages` controls apply to every thread;
 - batch output preserves request order and gives each validated seed its own
-  `{message_id, result}` or `{message_id, error}` entry;
+  `{message_id, result}` or `{message_id, error}` entry; a seed whose
+  conversation an earlier seed already returned gets
+  `{message_id, same_thread_as}` naming that seed instead of a second copy;
 - malformed IDs and other batch-shape failures reject the request before any
   item executes;
 - selector modes cannot be mixed.
@@ -67,8 +69,11 @@ missing section without adding another MCP tool.
 
 Partial content is explicit in returned data. Every message reports
 `body_content_status` and exact `body_omissions`. Every thread reports
-`thread_content_status`, `thread_omissions`, and `omitted_message_count`. A
-caller never has to infer that a requested range, quote policy, signature policy,
+`thread_content_status`, `thread_omissions`, and `omitted_message_count`. When
+no older message was capped away, Message-IDs in the oldest message's
+`References` and `In-Reply-To` that no returned message carries are reported as
+`ancestors_not_mirrored` with `missing_ancestor_count`; that message keeps its
+quoted history. A caller never has to infer that a requested range, quote policy, signature policy,
 or message window removed available text.
 
 The agent still owns query refinement, evidence selection, and synthesis.
@@ -84,7 +89,8 @@ hydrate all successful batch items under one bounded concurrency limit.
   validation, and per-item operational failures.
 - MCP instruction tests pin the neutral capability contract.
 - Existing live-Postgres `read_thread` coverage continues to prove conversation
-  membership, ordering, attachment indexing, message caps, and sync trust.
+  membership, ordering, attached files and inline part counts, missing
+  ancestors, per-conversation batch results, message caps, and sync trust.
 
 ## References
 

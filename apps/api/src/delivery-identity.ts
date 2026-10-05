@@ -43,7 +43,7 @@ export const DELIVERY_KEY_SQL = `coalesce(
  * semantics are unchanged.
  */
 export const ACTIVE_ASSIGNMENT_JOIN = `LEFT JOIN LATERAL (
-        SELECT active.conversation_id, active.delivery_key
+        SELECT active.run_id, active.conversation_id, active.delivery_key
         FROM public.imap_thread_active_assignments active
         WHERE active.message_id = m.id
           AND active.account_id = m.account_id

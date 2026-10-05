@@ -4,8 +4,9 @@ import { formatZodIssues } from "../../errors.js";
 import type { SyncTrust } from "../../search/index.js";
 import { buildSyncTrust } from "../../search/index.js";
 import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identity.js";
+import { extractMessageIdTokens } from "../../threading.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
-import type { MessageAttachment, MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
+import type { MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
 import { loadMessageAttachments, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
 import {
   METADATA_PROTECTED_FIELDS,
@@ -17,8 +18,8 @@ import {
 
 /**
  * `read_thread` — reassemble one or more conversations from the mirror and
- * return each thread's messages oldest first, with cleaned bodies and a flat
- * attachments index.
+ * return each thread's messages oldest first, with cleaned bodies and each
+ * message's attached files.
  *
  * Seed by one `message_id` (any message in the thread), 1 to 10 `message_ids`, a
  * durable `conversation_id`, or the legacy provider `thread_id`. A message with
@@ -64,8 +65,8 @@ function deliveryRepresentativesCte(source: string, key: string): string {
 }
 
 /** The fields each thread message selects: the {@link MessageDetailRow} columns
- * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY.
- * Attachments use the shared {@link ATTACHMENTS_AGG} fragment (alias `m`). */
+ * a tool needs to call {@link mapMessageRow}, plus `internal_date` for ORDER BY,
+ * the reply headers that name missing ancestors, and the inline part count. */
 function threadSelect(includeBody: boolean): string {
   return `
   m.id,
@@ -81,6 +82,11 @@ function threadSelect(includeBody: boolean): string {
   m.flags,
   m.window_status,
   m.internal_date,
+  m.rfc_message_id,
+  m.in_reply_to,
+  m.references_header,
+  (SELECT count(*)::int FROM public.imap_attachments a
+    WHERE a.message_id = m.id AND a.disposition IS DISTINCT FROM 'attachment') AS inline_count,
   m.protected_metadata,
   m.protected_metadata_version,
   m.protected_metadata_key_version,
@@ -97,6 +103,10 @@ function threadSelect(includeBody: boolean): string {
 
 type ThreadRow = MessageDetailRow & ProtectedMetadataColumns & {
   conversation_id: string | null;
+  rfc_message_id: string | null;
+  in_reply_to: string | null;
+  references_header: string | null;
+  inline_count: number;
   duplicate_message_ids: string[] | null;
   thread_total_count: number | string | null;
   thread_participants: string[] | null;
@@ -151,22 +161,25 @@ export const readThreadRequestSchema = z
 export interface ReadThreadResult {
   thread: {
     conversation_id: string | null;
-    provider_thread_id: string | null;
+    /** Omitted when the provider has no thread handle. */
+    provider_thread_id?: string;
     subject: string | null;
     participants: string[];
     message_count: number;
   };
   messages: MessageDetail[];
-  attachments_index: Array<{ message_id: string } & MessageAttachment>;
   omitted_message_count: number;
+  /** Earlier messages the oldest returned message replies to that are not in the mirror. Present only when > 0. */
+  missing_ancestor_count?: number;
   thread_content_status: "complete" | "partial";
-  thread_omissions: Array<"older_messages">;
+  thread_omissions: Array<"older_messages" | "ancestors_not_mirrored">;
   sync_trust: SyncTrust;
 }
 
 export interface ReadThreadBatchResult {
   threads: Array<
     | { message_id: string; result: ReadThreadResult }
+    | { message_id: string; same_thread_as: string }
     | { message_id: string; error: ReturnType<typeof toolError>["error"] }
   >;
 }
@@ -179,18 +192,23 @@ export const readThreadDefinition: ToolDefinition = {
     "message_id (any message in the thread), message_ids (1 to 10 seeds), a durable " +
     "conversation_id, or a legacy provider thread_id. Direct conversation/thread selectors " +
     "require account. Duplicate message_ids are collapsed in first-occurrence order; each " +
-    "distinct seed has its own result or error entry. " +
+    "distinct seed has its own result or error entry, and a seed in a conversation already returned " +
+    "by an earlier seed gets same_thread_as with that seed's message_id. " +
     "Returns the thread's messages oldest-first. Replies contain newly authored plain text by default. " +
     "When no older messages were omitted, the oldest mirrored message keeps quoted content. " +
     "Each message contains its full cleaned body. Recognized quoted reply tails and signatures " +
-    "are stripped unless include_quoted=true. Returns the " +
-    "distinct participants, a flat attachments_index, and a sync_trust block. Each email appears " +
+    "are stripped unless include_quoted=true. Each message's attachments lists attached files; " +
+    "inline_count counts inline parts such as signature images (read_message lists them). " +
+    "window_status: IN_WINDOW is mail in the live sync window; HISTORICAL (backfilled older mail) and " +
+    "EXPIRED (aged out of the window) are archive rows that update less often. Returns the " +
+    "distinct participants and a sync_trust block. Each email appears " +
     "once; its duplicate_message_ids lists its other stored copies, to move or flag every copy. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
     "provider-threaded siblings only when the seed has no stored assignment. Capped to " +
     "max_messages (default 20), keeping the NEWEST when over the cap; thread_content_status, " +
-    "thread_omissions, and omitted_message_count explicitly report missing older messages. " +
+    "thread_omissions, and omitted_message_count explicitly report missing older messages, and " +
+    "ancestors_not_mirrored with missing_ancestor_count reports earlier replies that were never mirrored. " +
     "Each message's body_content_status and body_omissions explicitly report absent source text. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
@@ -296,6 +314,34 @@ function collectParticipants(rows: ThreadRow[]): string[] {
     }
   }
   return out;
+}
+
+/** Message-IDs the oldest message replies to that no returned message carries. */
+function countMissingAncestors(rows: ThreadRow[]): number {
+  const found = new Set(rows.flatMap((row) => extractMessageIdTokens(row.rfc_message_id)));
+  const ancestors = new Set([
+    ...extractMessageIdTokens(rows[0].references_header),
+    ...extractMessageIdTokens(rows[0].in_reply_to)
+  ]);
+  return [...ancestors].filter((id) => !found.has(id)).length;
+}
+
+/**
+ * Keep one full result per conversation in a batch. A later seed from the same
+ * account-scoped conversation names the first seed instead of repeating it.
+ */
+function pointRepeatedConversations(
+  threads: ReadThreadBatchResult["threads"]
+): ReadThreadBatchResult["threads"] {
+  const firstSeed = new Map<string, string>();
+  return threads.map((entry) => {
+    if (!("result" in entry) || !entry.result.thread.conversation_id) return entry;
+    const key = `${entry.result.messages[0]?.account_id}\u0000${entry.result.thread.conversation_id}`;
+    const seed = firstSeed.get(key);
+    if (seed) return { message_id: entry.message_id, same_thread_as: seed };
+    firstSeed.set(key, entry.message_id);
+    return entry;
+  });
 }
 
 /**
@@ -511,7 +557,7 @@ async function runReadThreadInternal(
         }
       }
     ));
-    return { threads };
+    return { threads: pointRepeatedConversations(threads) };
   }
 
   const messageId = typeof input.message_id === "string" ? input.message_id : undefined;
@@ -609,7 +655,8 @@ async function runReadThreadInternal(
     const attachments = await loadMessageAttachments(
       client,
       fetched.rows.map((row) => row.id),
-      metadataProtection
+      metadataProtection,
+      { filesOnly: true }
     );
     const rows = await Promise.all(fetched.rows.map(async (row) => ({
       ...await revealMetadataRecord(
@@ -633,13 +680,16 @@ async function runReadThreadInternal(
         // removed by the message cap.
         includeQuoted: includeQuoted || (omitted === 0 && index === 0)
       });
-      return row.duplicate_message_ids?.length
-        ? { ...message, duplicate_message_ids: row.duplicate_message_ids }
-        : message;
+      if (row.inline_count > 0) message.inline_count = row.inline_count;
+      if (row.duplicate_message_ids?.length) message.duplicate_message_ids = row.duplicate_message_ids;
+      return message;
     });
-    const attachmentsIndex = messages.flatMap((message) =>
-      message.attachments.map((att) => ({ message_id: message.message_id, ...att }))
-    );
+    // With no older message capped away, the oldest message's References and
+    // In-Reply-To name every ancestor the mirror should hold.
+    const missingAncestors = omitted === 0 && kept.length > 0 ? countMissingAncestors(kept) : 0;
+    const threadOmissions: ReadThreadResult["thread_omissions"] = [];
+    if (omitted > 0) threadOmissions.push("older_messages");
+    if (missingAncestors > 0) threadOmissions.push("ancestors_not_mirrored");
 
     // Representative subject + provider handle come from the newest logical delivery.
     // A legacy selector may still discover a unanimous stored conversation id.
@@ -654,16 +704,16 @@ async function runReadThreadInternal(
     return {
       thread: {
         conversation_id: resolvedConversationId,
-        provider_thread_id: providerThreadId,
+        ...(providerThreadId === null ? {} : { provider_thread_id: providerThreadId }),
         subject,
         participants: collectParticipants(rows),
         message_count: totalCount
       },
       messages,
-      attachments_index: attachmentsIndex,
       omitted_message_count: omitted,
-      thread_content_status: omitted > 0 ? "partial" : "complete",
-      thread_omissions: omitted > 0 ? ["older_messages"] : [],
+      ...(missingAncestors > 0 ? { missing_ancestor_count: missingAncestors } : {}),
+      thread_content_status: threadOmissions.length > 0 ? "partial" : "complete",
+      thread_omissions: threadOmissions,
       sync_trust: syncTrust
     };
   });

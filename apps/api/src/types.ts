@@ -249,6 +249,7 @@ export interface MessageEvidenceInput {
 export interface AttachmentMetadata {
   filename: string | null;
   mimeType: string | null;
+  /** Decoded file size; for base64 parts, an upper-bound estimate from the encoded size. */
   sizeBytes: number | null;
   disposition: "attachment" | "inline";
   contentId: string | null;

@@ -76,6 +76,19 @@ describe("mime helpers", () => {
     ]);
   });
 
+  it("records a base64 part's decoded size, not its encoded size", () => {
+    const structure = {
+      type: "multipart/mixed",
+      childNodes: [
+        { part: "1", type: "text/plain" },
+        { part: "2", type: "image/png", size: 848, encoding: "BASE64", id: "<sig@cid>", disposition: "inline" },
+        { part: "3", type: "text/csv", size: 300, encoding: "7bit", disposition: "attachment" }
+      ]
+    };
+
+    expect(extractAttachmentMetadata(structure).map((part) => part.sizeBytes)).toEqual([636, 300]);
+  });
+
   it("converts basic html to normalized text", () => {
     expect(htmlToText("<p>Hello&nbsp;<b>there</b></p><script>x()</script>")).toBe("Hello there");
     expect(htmlToText("<p>Thanks, <b>Alice</b>. See <a href=\"https://example.test\">my calendar</a>, then <td>x</td><td>y</td></p>"))
