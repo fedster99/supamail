@@ -62,20 +62,33 @@ describe("buildSyncStatus", () => {
     expect(status.fully_synced).toBe(true);
   });
 
-  it("describes each mailbox that is not fully synced", async () => {
+  it("describes each mailbox that is not fully synced, from the same reasons as fully_synced", async () => {
     const status = await buildSyncStatus(db([
       statusRow({ account_id: "1", email_address: "a@x.test", sync_state: "INITIAL_SYNC", initial_sync_in_progress: true, live_headers_complete_pct: 40, live_bodies_complete_pct: 10 }),
       statusRow({ account_id: "2", email_address: "b@x.test", sync_state: "BROKEN" }),
       statusRow({ account_id: "3", email_address: "c@x.test", historical_backfill_in_progress: true, historical_bodies_complete_pct: 60 }),
-      statusRow({ account_id: "4", email_address: "d@x.test" })
+      statusRow({ account_id: "4", email_address: "d@x.test", sync_state: "DEGRADED", live_bodies_complete_pct: 98 }),
+      statusRow({ account_id: "5", email_address: "e@x.test", live_headers_complete_pct: 99 }),
+      statusRow({ account_id: "6", email_address: "f@x.test" })
     ]), null);
     expect(status.summary).toBe(
       "a@x.test: first sync, 40% of recent mail and 10% of its bodies stored. " +
       "b@x.test: sync stopped. " +
-      "c@x.test: storing older mail, 60% done."
+      "c@x.test: storing older mail, 60% done. " +
+      "d@x.test: sync delayed, 98% of recent bodies stored. " +
+      "e@x.test: 99% of recent mail stored."
     );
     expect(status.fully_synced).toBe(false);
-    expect(status.degraded_reasons).toEqual(["initial_sync_in_progress", "bodies_incomplete", "account_degraded", "historical_backfill_in_progress"]);
+    expect(status.degraded_reasons).toEqual([
+      "initial_sync_in_progress", "headers_incomplete", "bodies_incomplete", "sync_stopped",
+      "historical_backfill_in_progress", "sync_delayed"
+    ]);
+  });
+
+  it("never calls a set synced when any reason applies", async () => {
+    const status = await buildSyncStatus(db([statusRow({ live_headers_complete_pct: 99 })]), [ID]);
+    expect(status.fully_synced).toBe(false);
+    expect(status.summary).not.toContain("synced");
   });
 
   it("says when no mailbox matched", async () => {

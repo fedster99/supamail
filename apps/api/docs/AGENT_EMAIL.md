@@ -131,10 +131,11 @@ syncing mailbox, or one still storing older mail, gets no notice.
 
 `get_sync_status` returns the full report on request: per account `sync_state`,
 last sync time, whether initial sync or a historical backfill is in progress, and
-live/historical completeness percentages, plus `summary`, `fully_synced`,
-`results_may_be_incomplete`, and `degraded_reasons`. `fully_synced` is true only
-when every account is HEALTHY, not initial-syncing, not backfilling, and at 100%
-live coverage. It reads every recent message's body state, so it is a separate
+live/historical completeness percentages, plus `summary`, `fully_synced`, and
+`degraded_reasons`. `fully_synced` is true only when no account has a reason:
+every account is HEALTHY, past its first sync, done storing older mail, and at
+100% of recent mail and bodies. An `account` that matches no mailbox is
+`not_found`. It reads every recent message's body state, so it is a separate
 call rather than part of each read.
 
 ## Errors

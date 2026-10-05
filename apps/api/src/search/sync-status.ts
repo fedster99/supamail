@@ -89,29 +89,53 @@ export async function buildReadAccounts(
   });
 }
 
-function describeAccount(account: SyncStatusAccount): string | null {
+type StatusReason =
+  | "sync_stopped"
+  | "sync_paused"
+  | "initial_sync_in_progress"
+  | "sync_delayed"
+  | "headers_incomplete"
+  | "bodies_incomplete"
+  | "historical_backfill_in_progress";
+
+/** Every way one mailbox can fall short of fully synced, in summary order. */
+function accountReasons(account: SyncStatusAccount): StatusReason[] {
+  const reasons: StatusReason[] = [];
+  if (account.sync_state === "BROKEN") reasons.push("sync_stopped");
+  if (account.sync_state === "PAUSED") reasons.push("sync_paused");
+  if (account.initial_sync_in_progress) reasons.push("initial_sync_in_progress");
+  if (account.sync_state === "DEGRADED") reasons.push("sync_delayed");
+  if (account.live_headers_complete_pct < 100) reasons.push("headers_incomplete");
+  if (account.live_bodies_complete_pct < 100) reasons.push("bodies_incomplete");
+  if (account.historical_backfill_in_progress) reasons.push("historical_backfill_in_progress");
+  return reasons;
+}
+
+/** One sentence for a mailbox that is not fully synced; the most severe state wins. */
+function describeAccount(account: SyncStatusAccount, reasons: StatusReason[]): string {
   const email = account.account_email;
-  if (account.sync_state === "BROKEN") return `${email}: sync stopped.`;
-  if (account.sync_state === "PAUSED") return `${email}: sync paused.`;
-  if (account.initial_sync_in_progress) {
+  if (reasons.includes("sync_stopped")) return `${email}: sync stopped.`;
+  if (reasons.includes("sync_paused")) return `${email}: sync paused.`;
+  if (reasons.includes("initial_sync_in_progress")) {
     return `${email}: first sync, ${account.live_headers_complete_pct}% of recent mail and ` +
       `${account.live_bodies_complete_pct}% of its bodies stored.`;
   }
-  const notes: string[] = [];
-  if (account.sync_state === "DEGRADED") notes.push("sync delayed");
-  if (account.live_bodies_complete_pct < 100) {
-    notes.push(`${account.live_bodies_complete_pct}% of recent bodies stored`);
-  }
-  if (account.historical_backfill_in_progress) {
-    notes.push(`storing older mail, ${account.historical_bodies_complete_pct}% done`);
-  }
-  return notes.length > 0 ? `${email}: ${notes.join(", ")}.` : null;
+  const notes = reasons.map((reason) => {
+    switch (reason) {
+      case "sync_delayed": return "sync delayed";
+      case "headers_incomplete": return `${account.live_headers_complete_pct}% of recent mail stored`;
+      case "bodies_incomplete": return `${account.live_bodies_complete_pct}% of recent bodies stored`;
+      default: return `storing older mail, ${account.historical_bodies_complete_pct}% done`;
+    }
+  });
+  return `${email}: ${notes.join(", ")}.`;
 }
 
 /**
  * The full sync report for `get_sync_status`: per-account state and progress
- * from `imap_account_progress`, reasons, and a one-line summary. It reads every
- * recent message's body state, so read tools do not call it.
+ * from `imap_account_progress`, the reasons any mailbox is not fully synced,
+ * and a one-line summary, all from one rule set. It reads every recent
+ * message's body state, so read tools do not call it.
  */
 export async function buildSyncStatus(
   db: Queryable,
@@ -160,38 +184,20 @@ export async function buildSyncStatus(
     historical_bodies_complete_pct: row.historical_bodies_complete_pct
   }));
 
-  const reasons = new Set<string>();
-  if (accounts.length === 0) reasons.add("no_accounts_matched");
-  for (const account of accounts) {
-    if (account.initial_sync_in_progress) reasons.add("initial_sync_in_progress");
-    if (account.historical_backfill_in_progress) reasons.add("historical_backfill_in_progress");
-    if (account.live_bodies_complete_pct < 100) reasons.add("bodies_incomplete");
-    if (["DEGRADED", "BROKEN", "PAUSED"].includes(account.sync_state)) reasons.add("account_degraded");
-  }
-
-  const fullySynced =
-    accounts.length > 0 &&
-    accounts.every(
-      (account) =>
-        account.sync_state === "HEALTHY" &&
-        !account.initial_sync_in_progress &&
-        !account.historical_backfill_in_progress &&
-        account.live_headers_complete_pct >= 100 &&
-        account.live_bodies_complete_pct >= 100
-    );
-
-  const details = accounts.map(describeAccount).filter((line): line is string => line !== null);
+  const perAccount = accounts.map((account) => ({ account, reasons: accountReasons(account) }));
+  const behind = perAccount.filter(({ reasons }) => reasons.length > 0);
   const summary = accounts.length === 0
     ? "No mailboxes matched."
-    : details.length === 0
+    : behind.length === 0
       ? `All ${accounts.length === 1 ? "mail is" : `${accounts.length} mailboxes are`} synced.`
-      : details.join(" ");
+      : behind.map(({ account, reasons }) => describeAccount(account, reasons)).join(" ");
 
   return {
     summary,
-    fully_synced: fullySynced,
-    results_may_be_incomplete: !fullySynced,
-    degraded_reasons: [...reasons],
+    fully_synced: accounts.length > 0 && behind.length === 0,
+    degraded_reasons: accounts.length === 0
+      ? ["no_accounts_matched"]
+      : [...new Set(behind.flatMap(({ reasons }) => reasons))],
     accounts
   };
 }

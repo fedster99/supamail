@@ -45,7 +45,8 @@ export const getSyncStatusDefinition: ToolDefinition = {
     properties: {
       account: {
         type: "string",
-        description: "Account UUID to scope to. Omit to report every account in this database."
+        format: "uuid",
+        description: "Account UUID to scope to. Omit to report every account."
       }
     }
   }
@@ -65,9 +66,17 @@ export async function runGetSyncStatus(
     );
   }
   const accountId = parsed.data.account ?? null;
-  return withReadOnlyTx(pool, (client: PgClient) =>
+  const status = await withReadOnlyTx(pool, (client: PgClient) =>
     buildSyncStatus(client, accountId ? [accountId] : null, metadataProtection)
   );
+  if (accountId && status.accounts.length === 0) {
+    return toolError(
+      "not_found",
+      `No mailbox with account id ${accountId}.`,
+      "Call list_folders for valid account ids, or omit account to report every mailbox."
+    );
+  }
+  return status;
 }
 
 /** Registry entry; the server reads `definition` for tools/list and runs `handler` for tools/call. */

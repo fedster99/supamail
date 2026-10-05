@@ -49,6 +49,11 @@ liveDb("get_sync_status tool live DB", () => {
     expect(status.summary).toContain(`${ACCOUNT_EMAIL}: first sync`);
   });
 
+  it("answers not_found for an account id that matches no mailbox", async () => {
+    const out = await runGetSyncStatus(pool, { account: "00000000-0000-4000-8000-000000000000" });
+    expect(out).toMatchObject({ error: { code: "not_found" } });
+  });
+
   it("rejects an account that is not a UUID before querying", async () => {
     const out = await runGetSyncStatus(pool, { account: "not-a-uuid" });
     expect(out).toMatchObject({ error: { code: "invalid_input" } });

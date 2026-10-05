@@ -232,13 +232,13 @@ export interface SyncStatusAccount {
 
 /**
  * The full sync report `get_sync_status` returns. `fully_synced` is true only
- * when every account is HEALTHY, not initial-syncing, not backfilling, and at
- * 100% live body coverage.
+ * when no account has a reason in `degraded_reasons`: every account is HEALTHY,
+ * past its first sync, done storing older mail, and at 100% of recent mail and
+ * bodies.
  */
 export interface SyncStatus {
   summary: string;
   fully_synced: boolean;
-  results_may_be_incomplete: boolean;
   degraded_reasons: string[];
   accounts: SyncStatusAccount[];
 }

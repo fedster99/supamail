@@ -75,7 +75,9 @@ treated as a stable number.
   list of ids, discarding snippets (the agent's answerability surface), parser
   warnings, thread counts, and the zero-result signal. A change that empties every
   snippet moves no metric.
-- **The product's stated honesty differentiator.** `sync_trust` is computed on
+- **The product's stated honesty differentiator.** (Since ADR 0038, read results
+  carry only `accounts` notices and the full report is `get_sync_status`; the
+  sync checks below apply to that tool.) `sync_trust` is computed on
   every search and never asserted. A regression that always returns
   `fully_synced=true` mid-backfill (telling the user "you have no invoice from
   Acme" when bodies are 40% synced) passes every gate.

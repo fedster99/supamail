@@ -98,7 +98,7 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
  * Search the mirror. This is the single read-only entry point that the CLI
  * command and the MCP tool both wrap (ADR 0014). It parses the free-text
  * superset query and/or structured filters, resolves account scoping, then runs
- * the compiled search and the sync-trust query inside one read-only transaction.
+ * the compiled search and the account names inside one read-only transaction.
  *
  * The database connection is injected (no global pool reach-in) so the same
  * logic runs locally or through a remote wrapper. It never sends, mutates, or schedules.

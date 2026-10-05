@@ -217,7 +217,7 @@ pnpm --filter @supamail/api start:mcp
 ```
 
 See [the Agent Email Guide](apps/api/docs/AGENT_EMAIL.md) for tool contracts,
-identity rules, sync-trust semantics, and MCP client guidance.
+identity rules, account notices and sync status, and MCP client guidance.
 
 ## Conversation Threading
 

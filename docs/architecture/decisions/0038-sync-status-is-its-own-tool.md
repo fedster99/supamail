@@ -30,10 +30,12 @@ progress percentages, `fully_synced`, `results_may_be_incomplete`, and
   `first_sync_in_progress` (`INITIAL_SYNC`), `sync_stopped` (`BROKEN`), or
   `sync_paused` (`PAUSED`).
   `DEGRADED`, history backfill, and body progress get no notice.
-- `get_sync_status` (MCP tool and `supamail sync-status`) returns the former
-  report (`buildSyncStatus`) plus a one-line `summary`. It is the only caller of
-  the progress view on the read path. Its description tells agents to call it
-  when the user asks about syncing or results seem to be missing.
+- `get_sync_status` (MCP tool and `supamail sync-status`) returns per-account
+  state and progress (`buildSyncStatus`), `degraded_reasons`, `fully_synced`,
+  and a one-line `summary`, all derived from one list of reasons per mailbox.
+  An explicit account that matches nothing is `not_found`. It is the only agent
+  read tool that queries the progress view. Its description tells agents to
+  call it when the user asks about syncing or results seem to be missing.
 - `sync_trust` and `buildSyncTrust` are removed; `buildReadAccounts` and
   `buildSyncStatus` replace them.
 
@@ -44,8 +46,11 @@ progress percentages, `fully_synced`, `results_may_be_incomplete`, and
 - Agents mention sync only when a mailbox really cannot answer, or when asked.
 - Breaking change: clients that read `sync_trust` from read results must call
   `get_sync_status` instead. Account attribution moves to `accounts`.
-- The summary reports facts per mailbox; a mailbox that is fully synced adds no
-  text, so a synced set reads "All mail is synced."
+- The summary has one sentence per mailbox that has a reason; when none has,
+  it reads "All mail is synced." or "All N mailboxes are synced."
+- A DEGRADED mailbox gets no read notice. It may be failing for up to about a
+  day before stuck-degraded escalation marks it BROKEN; `get_sync_status`
+  reports it as "sync delayed" meanwhile.
 
 ## Verification
 
