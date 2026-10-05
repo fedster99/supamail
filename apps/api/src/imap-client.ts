@@ -167,6 +167,7 @@ export interface MirrorImapClient {
     query: Record<string, unknown>,
     options?: Record<string, unknown>
   ): Promise<FetchMessage | false | null>;
+  search(query: Record<string, unknown>, options: { uid: true }): Promise<number[] | false>;
   download(range: string, part?: string, options?: Record<string, unknown>): Promise<DownloadResult>;
 }
 
@@ -434,6 +435,14 @@ export class ThrottledImapClient implements MirrorImapClient {
     return await this.withCommandTimeout(
       "fetchOne",
       async () => await this.client.fetchOne(range, query as never, options as never) as FetchMessage | false | null
+    );
+  }
+
+  async search(query: Record<string, unknown>, options: { uid: true }): Promise<number[] | false> {
+    await this.throttle.acquire(this.signal);
+    return await this.withCommandTimeout(
+      "search",
+      async () => await this.client.search(query as never, options)
     );
   }
 
@@ -890,6 +899,17 @@ export async function searchUidsBefore(
     uids.push(msg.uid);
   }
   return uids;
+}
+
+/**
+ * Every UID in the selected mailbox from one UID SEARCH response, without the
+ * per-message FETCH lines `iterateAllUids` costs. Fails rather than returning a
+ * partial list.
+ */
+export async function listMailboxUids(client: MirrorImapClient): Promise<number[]> {
+  const uids = await client.search({ all: true }, { uid: true });
+  if (!uids) throw new Error("IMAP UID SEARCH ALL failed");
+  return [...new Set(uids)];
 }
 
 export async function searchAllUids(client: MirrorImapClient, since?: Date): Promise<number[]> {

@@ -15,6 +15,7 @@ import {
   PARSED_BODY_BATCH_MAX_MESSAGES,
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
+  listMailboxUids,
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
@@ -2166,6 +2167,7 @@ export class MirrorEngine {
         || oldestSynced === null;
 
       if (shouldStartSnapshot) {
+        await this.reconcileArchiveRows(account, folder, client, uidValidity, signal);
         const snapshot = await searchUidsBefore(client, windowCutoff);
         const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
 
@@ -2306,6 +2308,42 @@ export class MirrorEngine {
       };
     } finally {
       mailboxLock.release();
+    }
+  }
+
+  /**
+   * The live reconcile covers IN_WINDOW rows only, so each archive snapshot checks
+   * the folder's archive rows against its complete UID list. Matching UIDs rather
+   * than dates means a row that aged out of the window is never mistaken for gone.
+   * A list whose size disagrees with SELECT's message count is not proof of
+   * deletion; the folder waits for its next snapshot instead.
+   */
+  private async reconcileArchiveRows(
+    account: ImapAccount,
+    folder: ImapFolder,
+    client: MirrorImapClient,
+    uidValidity: number,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const providerUids = await listMailboxUids(client);
+    const exists = client.mailbox ? client.mailbox.exists : undefined;
+    const complete = providerUids.length === exists;
+    const marked = complete
+      ? await this.repository.markMissingArchiveMessages(
+          account.id,
+          folder,
+          uidValidity,
+          providerUids,
+          { deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS, signal }
+        )
+      : 0;
+    if (marked > 0 || !complete) {
+      await this.repository.logEvent(account.id, null, null, folder.path, null, "ARCHIVE_RECONCILE", {
+        marked,
+        providerUids: providerUids.length,
+        exists: exists ?? null,
+        skipped: !complete
+      });
     }
   }
 
@@ -2526,9 +2564,9 @@ export class MirrorEngine {
       // transient false-negative recovers. Safe to soft-delete MOVED_OUT.
       await this.repository.markMessageMovedOut(message.id);
     } else {
-      // HISTORICAL/EXPIRED rows are never re-observed (backfill walks strictly
-      // backward) and reconcile is IN_WINDOW-only, so tombstoning would be
-      // unrecoverable. Mark the body fetch attempted instead — non-destructive.
+      // HISTORICAL/EXPIRED rows are re-checked only by the next archive
+      // snapshot, which tombstones a UID that is really gone. Mark the body
+      // fetch attempted instead — non-destructive.
       await this.repository.markBodyFetchAttempted(message.id);
     }
   }

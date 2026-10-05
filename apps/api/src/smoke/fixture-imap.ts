@@ -124,6 +124,12 @@ export class FixtureImapClient implements MirrorImapClient {
     };
   }
 
+  async search(query: Record<string, unknown>, options: { uid: true }): Promise<number[] | false> {
+    void options;
+    if (!this.mailbox) return false;
+    return this.selectedMessages(query).map((message) => message.uid);
+  }
+
   async download(range: string, part?: string, options: Record<string, unknown> = {}): Promise<DownloadResult> {
     void part;
     const uid = Number(range);
