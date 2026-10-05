@@ -43,7 +43,10 @@ interface WorkerThreading {
     options?: Pick<DrainThreadingOptions, "activateInitial">
   ): Promise<string[]>;
   drainAccount(accountId: string, options?: DrainThreadingOptions): Promise<ThreadingRunResult>;
-  retireExpiredStandbyRuns?(options?: { olderThanDays?: number }): Promise<{ runsRetired: number }>;
+  retireExpiredStandbyRuns?(options?: { olderThanDays?: number }): Promise<{
+    runsRetired: number;
+    accountsFailed: number;
+  }>;
   pruneTerminalRuns?(options?: { olderThanDays?: number; batchSize?: number }): Promise<{
     runsDeleted: number;
     assignmentsDeleted: number;
@@ -486,7 +489,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   const logRetention = (
     r: Awaited<ReturnType<MirrorRepository["runRetentionJobs"]>>,
     threadRuns: { runsDeleted: number; assignmentsDeleted: number } = { runsDeleted: 0, assignmentsDeleted: 0 },
-    standbys: { runsRetired: number } = { runsRetired: 0 }
+    standbys: { runsRetired: number; accountsFailed: number } = { runsRetired: 0, accountsFailed: 0 }
   ) =>
     console.log(JSON.stringify({
       event: "worker.retention.completed",
@@ -495,6 +498,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
       prunedEvents: r.prunedEvents,
       prunedRuns: r.prunedRuns,
       threadStandbysRetired: standbys.runsRetired,
+      threadStandbyAccountsFailed: standbys.accountsFailed,
       threadRunsDeleted: threadRuns.runsDeleted,
       threadAssignmentsDeleted: threadRuns.assignmentsDeleted
     }));

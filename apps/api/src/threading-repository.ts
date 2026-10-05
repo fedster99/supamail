@@ -2255,7 +2255,9 @@ export class ThreadingRepository {
    * pruneTerminalRuns deletes it. It keeps its superseded_at. An account whose
    * threading lock is busy is skipped until the next pass.
    */
-  async retireExpiredStandbyRuns(options: { olderThanDays?: number } = {}): Promise<{ runsRetired: number }> {
+  async retireExpiredStandbyRuns(
+    options: { olderThanDays?: number } = {}
+  ): Promise<{ runsRetired: number; accountsFailed: number }> {
     const olderThanDays = runRetentionDays(options.olderThanDays);
     const due = await this.pool.query<{ account_id: string; run_id: string }>(
       `SELECT state.account_id, state.previous_run_id AS run_id
@@ -2267,7 +2269,10 @@ export class ThreadingRepository {
       [olderThanDays]
     );
     let runsRetired = 0;
+    let accountsFailed = 0;
     for (const row of due.rows) {
+      // One account's failure must not stop retirement (or the prune that
+      // follows) for the others; it is retried on the next pass.
       const retired = await this.withAccountLock(row.account_id, async (client) => {
         await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
         try {
@@ -2281,8 +2286,7 @@ export class ThreadingRepository {
               )).rowCount ?? 0
             : 0;
           if (archived > 0) {
-            await client.query("DELETE FROM public.imap_thread_work_queue WHERE run_id = $1", [row.run_id]);
-            await client.query("DELETE FROM public.imap_thread_subject_work WHERE run_id = $1", [row.run_id]);
+            await this.clearRunWork(client, row.run_id);
             await client.query(
               "UPDATE public.imap_thread_state SET previous_run_id = NULL WHERE account_id = $1",
               [row.account_id]
@@ -2294,24 +2298,35 @@ export class ThreadingRepository {
           await client.query("ROLLBACK").catch(() => undefined);
           throw error;
         }
+      }).catch(() => {
+        accountsFailed += 1;
+        return false;
       });
       if (retired) runsRetired += 1;
     }
-    return { runsRetired };
+    return { runsRetired, accountsFailed };
   }
 
   /**
    * Remove old terminal projection runs while retaining immutable operations and
    * comparison certificates for audit. A run's assignments (and, by cascade, its
-   * closure edges) are deleted in statements of THREAD_RUN_PRUNE_ASSIGNMENT_BATCH
-   * rows, so a full-mailbox run never becomes one long transaction. Every
+   * closure edges) are deleted in statements of `assignmentBatchSize` rows
+   * (default 2,000) until one deletes nothing, so a full-mailbox run never becomes
+   * one long transaction, even when another pruner works on the same run. Every
    * statement re-checks that the run is still terminal and unreferenced.
    */
   async pruneTerminalRuns(options: {
     olderThanDays?: number;
     batchSize?: number;
+    assignmentBatchSize?: number;
   } = {}): Promise<{ runsDeleted: number; assignmentsDeleted: number }> {
     const olderThanDays = runRetentionDays(options.olderThanDays);
+    const assignmentBatchSize = Math.max(1, Math.min(
+      Number.isFinite(options.assignmentBatchSize)
+        ? Math.floor(Number(options.assignmentBatchSize))
+        : THREAD_RUN_PRUNE_ASSIGNMENT_BATCH,
+      THREAD_RUN_PRUNE_ASSIGNMENT_BATCH
+    ));
     const batchSize = Math.max(1, Math.min(
       Number.isFinite(options.batchSize) ? Math.floor(Number(options.batchSize)) : 100,
       1_000
@@ -2337,10 +2352,10 @@ export class ThreadingRepository {
              WHERE assignment.run_id = $1 AND ${prunableRunSql("$3")}
              LIMIT $2
            )`,
-          [id, THREAD_RUN_PRUNE_ASSIGNMENT_BATCH, olderThanDays]
+          [id, assignmentBatchSize, olderThanDays]
         );
         assignmentsDeleted += deleted.rowCount ?? 0;
-        if ((deleted.rowCount ?? 0) < THREAD_RUN_PRUNE_ASSIGNMENT_BATCH) break;
+        if ((deleted.rowCount ?? 0) === 0) break;
       }
       const run = await this.pool.query(
         `DELETE FROM public.imap_thread_runs run WHERE run.id = $1 AND ${prunableRunSql("$2")}`,

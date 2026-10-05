@@ -201,9 +201,12 @@ daily retention retires it 30 days after the activation that superseded it
 (status `archived`, pointer cleared, pending work removed); after that, undoing
 the activation means a rebuild. Both rollback paths pause automatic processing
 until an operator completes and activates a clean rebuild. Terminal projection
-runs (archived, failed, rolled back) are pruned 30 days after they end; their
-assignments, and by cascade their closure edges, are deleted in 2,000-row
-statements so a full-mailbox run never becomes one long transaction.
+runs (archived, failed, rolled back) that no account state still points at are
+pruned 30 days after they end. A retired standby counts from its supersede time,
+so the pass that retires it also prunes it; a rolled-back run kept as the
+state's previous pointer stays until a later activation replaces it. Assignments,
+and by cascade closure edges, are deleted in 2,000-row statements repeated until
+one deletes nothing, so a full-mailbox run never becomes one long transaction.
 
 Mirror writes take a shared lock on the small account thread-state row. Build,
 activation, and rollback take it exclusively, so activation cannot certify

@@ -7,7 +7,7 @@ const defaultThreading = vi.hoisted(() => ({
   assertRolloutCompatibility: vi.fn(async () => undefined),
   listAccountsNeedingWork: vi.fn(async () => [] as string[]),
   drainAccount: vi.fn(),
-  retireExpiredStandbyRuns: vi.fn(async () => ({ runsRetired: 0 })),
+  retireExpiredStandbyRuns: vi.fn(async () => ({ runsRetired: 0, accountsFailed: 0 })),
   pruneTerminalRuns: vi.fn(async () => ({ runsDeleted: 0, assignmentsDeleted: 0 }))
 }));
 

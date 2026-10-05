@@ -4780,13 +4780,13 @@ liveDb("ThreadingRepository live DB", () => {
     const activation = await activateReviewed(repository, accountId, candidate.runId as string);
 
     // Inside the window the standby stays a rollback target.
-    expect(await repository.retireExpiredStandbyRuns()).toEqual({ runsRetired: 0 });
+    expect(await repository.retireExpiredStandbyRuns()).toEqual({ runsRetired: 0, accountsFailed: 0 });
 
     await pool.query(
       "UPDATE public.imap_thread_runs SET superseded_at = now() - interval '31 days' WHERE id = $1",
       [baseline.runId]
     );
-    expect(await repository.retireExpiredStandbyRuns()).toEqual({ runsRetired: 1 });
+    expect(await repository.retireExpiredStandbyRuns()).toEqual({ runsRetired: 1, accountsFailed: 0 });
     const retired = await pool.query<{ status: string; previous: string | null }>(
       `SELECT run.status, state.previous_run_id::text AS previous
        FROM public.imap_thread_runs run, public.imap_thread_state state
@@ -4801,7 +4801,10 @@ liveDb("ThreadingRepository live DB", () => {
       "live-test"
     )).rejects.toThrow(/Standby run was retired/);
 
-    expect(await repository.pruneTerminalRuns()).toEqual({ runsDeleted: 1, assignmentsDeleted: 3 });
+    // One-row statements force the multi-statement path: three deletes, then an
+    // empty one, then the run row.
+    expect(await repository.pruneTerminalRuns({ assignmentBatchSize: 1 }))
+      .toEqual({ runsDeleted: 1, assignmentsDeleted: 3 });
     const left = await pool.query<{ assignments: string; edges: string; runs: string }>(
       `SELECT
          (SELECT count(*)::text FROM public.imap_thread_assignments WHERE run_id = $1) AS assignments,
