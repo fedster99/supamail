@@ -215,6 +215,7 @@ interface BodyStructurePart {
   type?: string;
   subtype?: string;
   size?: number;
+  encoding?: string;
   id?: string;
   disposition?: string | { type?: string; params?: { filename?: string } };
   dispositionParameters?: { filename?: string };
@@ -328,6 +329,16 @@ export function selectBodyTextPart(
   return prefer === "html" ? html ?? plain ?? null : plain ?? html ?? null;
 }
 
+/**
+ * A part's file size. BODYSTRUCTURE reports the size in its transfer encoding;
+ * base64 holds 3 bytes in every 4 characters, so 3/4 of that size is an upper
+ * bound within about 3% of the decoded file (line breaks make up the rest).
+ */
+function decodedPartSize(part: BodyStructurePart): number | null {
+  if (typeof part.size !== "number") return null;
+  return part.encoding?.toLowerCase() === "base64" ? Math.floor(part.size * 3 / 4) : part.size;
+}
+
 export function extractAttachmentMetadata(bodyStructure: unknown): AttachmentMetadata[] {
   const attachments: AttachmentMetadata[] = [];
   walkBodyStructure(bodyStructure, (node) => {
@@ -346,7 +357,7 @@ export function extractAttachmentMetadata(bodyStructure: unknown): AttachmentMet
       attachments.push({
         filename,
         mimeType: type || null,
-        sizeBytes: typeof node.size === "number" ? node.size : null,
+        sizeBytes: decodedPartSize(node),
         disposition: isInlineAttachment ? "inline" : "attachment",
         contentId,
         partNumber

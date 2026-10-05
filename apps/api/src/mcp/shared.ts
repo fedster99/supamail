@@ -53,6 +53,7 @@ export interface MessageAttachment {
   attachment_id: string;
   filename: string | null;
   mime_type: string | null;
+  /** Decoded file size; for base64 parts, an upper-bound estimate within about 3%. */
   size_bytes: number | null;
   disposition: string | null;
 }
