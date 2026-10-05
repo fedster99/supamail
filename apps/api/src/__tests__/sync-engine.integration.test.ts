@@ -20,6 +20,7 @@ import {
   backdateMissingSince,
   buildInboxAndSentFolders,
   dueAllFolders,
+  folderCountDrift,
   forceFolderDiscovery,
   setupIntegration,
   teardownIntegration
@@ -110,10 +111,17 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
   afterEach(async () => {
     const pool = getPool();
-    while (activeAccountIds.length > 0) {
-      const id = activeAccountIds.pop()!;
-      await teardownIntegration(pool, id).catch(() => undefined);
+    // Every sync path must leave the trigger-kept folder counts exact.
+    let drift: Awaited<ReturnType<typeof folderCountDrift>> = [];
+    try {
+      drift = await folderCountDrift(pool, activeAccountIds);
+    } finally {
+      while (activeAccountIds.length > 0) {
+        const id = activeAccountIds.pop()!;
+        await teardownIntegration(pool, id).catch(() => undefined);
+      }
     }
+    expect(drift).toEqual([]);
   });
 
   afterAll(async () => {

@@ -18,6 +18,7 @@ import { MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES } from "../sync-limits.js";
 import {
   backdateMissingSince,
   buildInboxAndSentFolders,
+  folderCountDrift,
   setupIntegration,
   teardownIntegration
 } from "./helpers/integration-harness.js";
@@ -151,10 +152,17 @@ liveDb("live DB reliability lane", () => {
 
   afterEach(async () => {
     const pool = getPool();
-    while (activeAccountIds.length > 0) {
-      const accountId = activeAccountIds.pop()!;
-      await teardownIntegration(pool, accountId).catch(() => undefined);
+    // Every reliability path must leave the trigger-kept folder counts exact.
+    let drift: Awaited<ReturnType<typeof folderCountDrift>> = [];
+    try {
+      drift = await folderCountDrift(pool, activeAccountIds);
+    } finally {
+      while (activeAccountIds.length > 0) {
+        const accountId = activeAccountIds.pop()!;
+        await teardownIntegration(pool, accountId).catch(() => undefined);
+      }
     }
+    expect(drift).toEqual([]);
   });
 
   afterAll(async () => {

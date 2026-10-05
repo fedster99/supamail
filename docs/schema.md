@@ -4,6 +4,7 @@ The mirror owns these neutral tables in `public`:
 
 - `imap_accounts`
 - `imap_folders`
+- `imap_folder_message_counts`
 - `imap_messages`
 - `imap_message_bodies`
 - `imap_attachments`
@@ -53,6 +54,16 @@ A scheduled pass sets it when one LIST-STATUS answer proves the folder still
 matches its stored flag and deletion-complete QRESYNC cursors after a clean
 audit. Only non-priority health reads it; sync and audit timestamps and due
 times are unchanged.
+
+`0028_folder_message_counts` adds `imap_folder_message_counts`, keyed by
+`(account_id, folder_path)`: each folder's live (not provider-deleted) messages
+and those without `\Seen`. Statement triggers on `imap_messages` apply each
+insert, update, and delete's net change per folder inside the writer's
+transaction, so the counts are exact for every writer. The counts live apart
+from `imap_folders` so their row locks never meet the folder-row locks sync
+takes before writing messages. The migration backfills once while it blocks
+message writes. `list_folders` reads these rows instead of counting messages;
+unlike `headers_synced_count`, they also fall on deletes and moves.
 
 `0026_threading_closure_edges` normalizes each assignment's conversation,
 delivery, reference, provider-thread, and delivery-fingerprint keys into
