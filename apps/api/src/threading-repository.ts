@@ -1103,6 +1103,11 @@ export class ThreadingRepository {
 
   private async withMetadataProtectionDeadline<T>(operation: () => Promise<T>): Promise<T> {
     if (this.metadataProtectionScope.getStore()) return operation();
+    return this.withOwnMetadataProtectionDeadline(operation);
+  }
+
+  /** Run `operation` under a fresh adapter budget, apart from any enclosing step's. */
+  private async withOwnMetadataProtectionDeadline<T>(operation: () => Promise<T>): Promise<T> {
     const scope: MetadataProtectionScope = {
       remainingMs: this.metadataProtectionTimeoutMs,
       activeOperations: 0,
@@ -1455,8 +1460,12 @@ export class ThreadingRepository {
         // trigger takes the state SHARE lock; taking state FOR UPDATE first and
         // then hashing that same row would invert the lock order and deadlock.
         // The update is bounded, idempotent, and its evidence trigger queues all
-        // live runs before the projection transaction begins.
-        await this.upgradeEvidenceDigestsWithinDeadline(client, accountId);
+        // live runs before the projection transaction begins. It has its own
+        // adapter budget: a full upgrade batch must not leave the projection that
+        // follows in the same pass without one.
+        await this.withOwnMetadataProtectionDeadline(
+          () => this.upgradeEvidenceDigestsWithinDeadline(client, accountId)
+        );
         const bodyEvidenceBatchSize = Math.min(batchSize, this.bodyEvidenceBatchSize);
         const bodyHashesBackfilled = await this.backfillBodyEvidenceBatchWithinDeadline(
           client,

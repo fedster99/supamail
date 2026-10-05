@@ -55,7 +55,9 @@ deployment adapter.
   values. Database equality operations use the adapter's stable projected
   values.
 - One aggregate deadline bounds all adapter work in a threading database step.
-  Database and lock time do not consume that budget. The adapter receives an
+  The one-time evidence-digest upgrade is its own step with its own deadline,
+  so a full upgrade batch cannot use up the budget of the projection that
+  follows it in the same pass. Database and lock time do not consume that budget. The adapter receives an
   abort signal. Timed-out calls keep their concurrency permits until they
   settle.
 - Threading bounds protected envelopes, revealed input evidence, and closure
