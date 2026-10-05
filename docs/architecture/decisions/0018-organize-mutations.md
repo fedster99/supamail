@@ -67,6 +67,8 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   Update (ADR 0034): a confirmed move or delete now also marks its exact source
   row `PROVIDER_DELETED` at once, so the old id is not found. The destination
   row still comes only from sync.
+  Update (ADR 0037): a move the server confirms with COPYUID instead moves the
+  row to the destination key the server reported, so the message keeps its id.
 - **Destructive verbs require server capabilities** so a fallback can never run a
   blanket EXPUNGE. Hard delete (EXPUNGE) requires `UIDPLUS` (UID-scoped EXPUNGE);
   move requires `MOVE` or `UIDPLUS` (native move, or COPY + UID-scoped EXPUNGE). If
