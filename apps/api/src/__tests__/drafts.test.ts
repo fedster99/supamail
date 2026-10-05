@@ -117,12 +117,12 @@ vi.mock("../repository.js", () => ({
 const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 /** A pool whose only query is the Drafts folder lookup used by draft actions. */
 const draftPool = { query: vi.fn(async () => ({ rows: [{ path: "Drafts" }] })) } as never;
-const draftRow = { id: D1, account_id: "acc-1", folder_path: "Drafts", flags: [], deleted_in_provider: false };
+const draftRow = { id: D1, account_id: "11111111-1111-4111-8111-111111111111", folder_path: "Drafts", flags: [], deleted_in_provider: false };
 /** The tracked, mirrored Drafts folder at the APPENDUID's UIDVALIDITY. */
-const draftsFolder = { id: "folder-drafts", account_id: "acc-1", path: "Drafts", uidvalidity: "100" };
+const draftsFolder = { id: "folder-drafts", account_id: "11111111-1111-4111-8111-111111111111", path: "Drafts", uidvalidity: "100" };
 
 const account = {
-  id: "acc-1",
+  id: "11111111-1111-4111-8111-111111111111",
   lock_id: "1234567890",
   email_address: "user@example.test",
   provider_profile: "generic-imap",
@@ -184,7 +184,7 @@ describe("createDraft", () => {
     const { AccountBusyError } = await import("../errors.js");
     await expect(
       createDraft({} as never, config, {
-        accountId: "acc-1",
+        accountId: "11111111-1111-4111-8111-111111111111",
         to: [{ email: "rcpt@example.test" }],
         subject: "My draft",
         body: { format: "plain", text: "Hello" }
@@ -198,7 +198,7 @@ describe("createDraft", () => {
     mocks.searchByMessageId.mockResolvedValueOnce({ uids: [41, 42], uidValidity: 100 });
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "My draft",
       body: { format: "plain", text: "Hello" },
@@ -210,7 +210,7 @@ describe("createDraft", () => {
     // Nothing new reached the provider, so nothing new is marked or written.
     expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
     expect(mocks.upsertMessages).not.toHaveBeenCalled();
-    expect(mocks.getLiveMessageId).toHaveBeenCalledWith({ accountId: "acc-1", folderPath: "Drafts", uidValidity: 100, uid: 42 });
+    expect(mocks.getLiveMessageId).toHaveBeenCalledWith({ accountId: "11111111-1111-4111-8111-111111111111", folderPath: "Drafts", uidValidity: 100, uid: 42 });
   });
 
   it("returns the mirror id of the draft an earlier attempt saved", async () => {
@@ -218,7 +218,7 @@ describe("createDraft", () => {
     mocks.getLiveMessageId.mockResolvedValueOnce(N1);
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }, idempotencyKey: "req-key-1"
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }, idempotencyKey: "req-key-1"
     });
     expect(result).toMatchObject({ messageId: N1, warnings: [] });
   });
@@ -226,7 +226,7 @@ describe("createDraft", () => {
   it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
     const { createDraft } = await import("../drafts.js");
     await createDraft({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "My draft",
       body: { format: "plain", text: "Hello" },
@@ -243,7 +243,7 @@ describe("createDraft", () => {
   it("does NOT search (goes straight to APPEND) when no idempotency key is given", async () => {
     const { createDraft } = await import("../drafts.js");
     await createDraft({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "My draft",
       body: { format: "plain", text: "Hello" }
@@ -256,7 +256,7 @@ describe("createDraft", () => {
     mocks.markFoldersForReconcile.mockRejectedValueOnce(new Error("database unavailable"));
     const { createDraft } = await import("../drafts.js");
     await expect(createDraft({} as never, config, {
-      accountId: "acc-1", to: [{ email: "rcpt@example.test" }], subject: "s", body: { format: "plain", text: "b" }
+      accountId: "11111111-1111-4111-8111-111111111111", to: [{ email: "rcpt@example.test" }], subject: "s", body: { format: "plain", text: "b" }
     })).rejects.toThrow(/database unavailable/);
     expect(mocks.append).not.toHaveBeenCalled();
   });
@@ -264,7 +264,7 @@ describe("createDraft", () => {
   it("APPENDs the composed bytes with \\Draft to the resolved Drafts folder", async () => {
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "My draft",
       body: { format: "plain", text: "Hello" }
@@ -274,14 +274,14 @@ describe("createDraft", () => {
     const [path, raw, flags] = mocks.append.mock.calls[0];
     expect(path).toBe("Drafts");
     // Drafts is durably due before the APPEND, so a host can reconcile it at once.
-    expect(mocks.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["Drafts"]);
+    expect(mocks.markFoldersForReconcile).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111", ["Drafts"]);
     expect(mocks.markFoldersForReconcile.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.append.mock.invocationCallOrder[0]);
     expect(Buffer.isBuffer(raw)).toBe(true);
     expect(flags).toContain("\\Draft");
     expect(mocks.logout).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({
-      accountId: "acc-1", draftsFolderPath: "Drafts", messageId: N1, appendedUid: 7, warnings: []
+      accountId: "11111111-1111-4111-8111-111111111111", draftsFolderPath: "Drafts", messageId: N1, appendedUid: 7, warnings: []
     });
     expect(result.rfcMessageId).toMatch(/^<.+>$/);
     // Create does NOT send or delete — it only files the draft.
@@ -292,7 +292,7 @@ describe("createDraft", () => {
   it("writes the saved draft's mirror row from its APPENDUID and the composed values", async () => {
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       senderName: " Ada ",
       to: [{ email: "rcpt@example.test", name: "Rcpt" }],
       cc: [{ email: "cc@example.test" }],
@@ -301,12 +301,12 @@ describe("createDraft", () => {
       inReplyTo: "<parent@example.test>"
     });
 
-    expect(mocks.getFoldersForWake).toHaveBeenCalledWith("acc-1", ["Drafts"]);
+    expect(mocks.getFoldersForWake).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111", ["Drafts"]);
     expect(mocks.upsertMessages).toHaveBeenCalledTimes(1);
     expect(mocks.upsertMessages.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
     const [accountId, folder, uidValidity, [metadata], windowCutoff, writeOptions] = mocks.upsertMessages.mock.calls[0];
     const [, raw, , savedAt] = mocks.append.mock.calls[0];
-    expect([accountId, folder, uidValidity]).toEqual(["acc-1", draftsFolder, 100]);
+    expect([accountId, folder, uidValidity]).toEqual(["11111111-1111-4111-8111-111111111111", draftsFolder, 100]);
     expect(windowCutoff).toBeInstanceOf(Date);
     // A short deadline: the provider already holds the draft.
     expect(writeOptions.deadlineAt).toBeGreaterThan(Date.now());
@@ -348,7 +348,7 @@ describe("createDraft", () => {
     mocks.append.mockResolvedValueOnce(null);
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
     expect(mocks.upsertMessages).not.toHaveBeenCalled();
     expect(result).toMatchObject({ messageId: null, appendedUid: null, warnings: [] });
@@ -362,7 +362,7 @@ describe("createDraft", () => {
     mocks.getFoldersForWake.mockResolvedValueOnce(folders);
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
     expect(mocks.upsertMessages).not.toHaveBeenCalled();
     expect(result).toMatchObject({ messageId: null, appendedUid: 7, warnings: [] });
@@ -377,7 +377,7 @@ describe("createDraft", () => {
     });
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
     expect(result.messageId).toBe(N1);
     expect(result.warnings).toEqual(["The provider already accepted the change; the lock release failed"]);
@@ -387,7 +387,7 @@ describe("createDraft", () => {
     mocks.upsertMessages.mockRejectedValueOnce(new Error("database unavailable"));
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
-      accountId: "acc-1", to: [], subject: "s", body: { format: "plain", text: "b" }
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
     expect(mocks.append).toHaveBeenCalledTimes(1);
     expect(result.messageId).toBeNull();
@@ -401,7 +401,7 @@ describe("createDraft", () => {
     const { createDraft } = await import("../drafts.js");
     await expect(
       createDraft({} as never, config, {
-        accountId: "missing",
+        accountId: "22222222-2222-4222-8222-222222222222",
         to: [{ email: "x@example.test" }],
         subject: "s",
         body: { format: "plain", text: "b" }
@@ -416,22 +416,67 @@ describe("createDraft", () => {
       // A Bcc on a saved draft is dropped end-to-end (nodemailer's keepBcc default
       // omits it from the APPENDed bytes), so it must be refused, not accepted.
       createDraft({} as never, config, {
-        accountId: "acc-1",
+        accountId: "11111111-1111-4111-8111-111111111111",
         to: [{ email: "rcpt@example.test" }],
         bcc: [{ email: "secret@example.test" }],
         subject: "My draft",
         body: { format: "plain", text: "Hello" }
       } as never)
-    ).rejects.toThrow("Bcc is not supported on saved drafts — set Bcc when you send the draft");
+    ).rejects.toMatchObject({
+      name: "InvalidInputError",
+      message: "bcc: Bcc is not supported on saved drafts — set Bcc when you send the draft"
+    });
     // Refused before any account lookup or IMAP connect.
     expect(mocks.getAccount).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["a bare string recipient list", { to: "rcpt@example.test" }, "to: Expected array, received string"],
+    ["a string body", { body: "text" }, "body: Expected object, received string"],
+    ["an invalid address", { cc: [{ email: "not-an-address" }] }, "cc.0.email: Invalid email"],
+    ["a non-UUID mailbox", { accountId: "acc-1" }, "accountId: Invalid uuid"]
+  ])("rejects %s as InvalidInputError before any APPEND", async (_label, patch, message) => {
+    const { createDraft } = await import("../drafts.js");
+    const error = await createDraft({} as never, config, {
+      accountId: account.id,
+      to: [{ email: "rcpt@example.test" }],
+      subject: "My draft",
+      body: { format: "plain", text: "Hello" },
+      ...patch
+    } as never).catch((value) => value);
+    expect(error).toMatchObject({ name: "InvalidInputError", code: "invalid_input", message });
+    expect(mocks.getAccount).not.toHaveBeenCalled();
+    expect(mocks.withAccountLock).not.toHaveBeenCalled();
+    expect(mocks.append).not.toHaveBeenCalled();
+  });
+
+  it("accepts every optional field a typed host passes, and saves an incomplete draft", async () => {
+    const { createDraft } = await import("../drafts.js");
+    await createDraft({} as never, config, {
+      senderName: "Renée",
+      accountId: account.id,
+      to: [],
+      cc: [{ email: "cc@example.test", name: "Cc" }],
+      subject: "",
+      body: { format: "html", html: "<p>Hi <img src=\"cid:logo\"></p>" },
+      headers: { "X-Trace": "abc" },
+      inReplyTo: "<source@example.test>",
+      references: "<root@example.test> <source@example.test>",
+      messageId: "<stable@example.test>",
+      attachments: [{ filename: "logo.png", contentType: "image/png", content: "cG5n", cid: "logo", inline: true }],
+      idempotencyKey: "req-key-2"
+    });
+    expect(mocks.append).toHaveBeenCalledTimes(1);
+    const raw = (mocks.append.mock.calls[0]?.[1] as Buffer).toString("utf8");
+    expect(raw).toMatch(/Content-ID: <logo>/i);
+    expect(raw).toContain("X-Trace: abc");
+  });
+
   it("composes attachments into the raw MIME APPENDed to Drafts", async () => {
     const { createDraft } = await import("../drafts.js");
     await createDraft({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "My draft",
       body: { format: "plain", text: "Hello" },
@@ -499,6 +544,21 @@ describe("updateDraft", () => {
     expect(mocks.append).not.toHaveBeenCalled();
   });
 
+  it("rejects malformed input and a Bcc as InvalidInputError before any lookup or APPEND", async () => {
+    const { updateDraft } = await import("../drafts.js");
+    for (const [patch, message] of [
+      [{ to: [{ email: "nope" }] }, "to.0.email: Invalid email"],
+      [{ bcc: [{ email: "secret@example.test" }] }, "bcc: Bcc is not supported on saved drafts — set Bcc when you send the draft"]
+    ] as const) {
+      await expect(
+        updateDraft(draftPool, config, D1, { subject: "s", body: { format: "plain", text: "b" }, ...patch } as never)
+      ).rejects.toMatchObject({ name: "InvalidInputError", message });
+    }
+    expect(mocks.getMessage).not.toHaveBeenCalled();
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
   it("throws for an unknown draft without appending or deleting", async () => {
     mocks.getMessage.mockResolvedValue(null);
     const { updateDraft } = await import("../drafts.js");
@@ -562,7 +622,7 @@ describe("sendDraft", () => {
 
   const draftRow = {
     id: D1,
-    account_id: "acc-1",
+    account_id: "11111111-1111-4111-8111-111111111111",
     folder_path: "Drafts",
     uid: "7",
     rfc_message_id: "<draft@example.test>",
@@ -882,7 +942,7 @@ describe("listDrafts / getDraft read the mirror", () => {
         .mockResolvedValueOnce({ rows: [{ path: "Drafts" }] })
         // the list query
         .mockResolvedValueOnce({ rows: [{
-          id: "d1", account_id: "acc-1", folder_path: "Drafts", uid: "7", rfc_message_id: null,
+          id: "d1", account_id: "11111111-1111-4111-8111-111111111111", folder_path: "Drafts", uid: "7", rfc_message_id: null,
           subject: "S", from_email: "user@example.test", to_emails: ["x@example.test"], cc_emails: [],
           flags: ["\\Draft"], in_reply_to: null, references_header: null,
           internal_date: new Date("2026-05-19T00:00:00.000Z"), body_text: null, body_plain: null, selected_text_part: null
@@ -891,7 +951,7 @@ describe("listDrafts / getDraft read the mirror", () => {
     };
     const pool = { connect: vi.fn(async () => client) } as never;
     const { listDrafts } = await import("../drafts.js");
-    const drafts = await listDrafts(pool, config, "acc-1", {});
+    const drafts = await listDrafts(pool, config, "11111111-1111-4111-8111-111111111111", {});
     expect(drafts).toHaveLength(1);
     expect(drafts[0]).toMatchObject({ messageId: "d1", folderPath: "Drafts", subject: "S" });
     // No IMAP — only the injected pool was used.
@@ -903,7 +963,7 @@ describe("listDrafts / getDraft read the mirror", () => {
       query: vi.fn()
         // the draft row in a non-Drafts folder, no \Draft flag
         .mockResolvedValueOnce({ rows: [{
-          id: M1, account_id: "acc-1", folder_path: "INBOX", uid: "9", rfc_message_id: null,
+          id: M1, account_id: "11111111-1111-4111-8111-111111111111", folder_path: "INBOX", uid: "9", rfc_message_id: null,
           subject: "S", from_email: "user@example.test", to_emails: [], cc_emails: [], flags: [],
           in_reply_to: null, references_header: null,
           internal_date: new Date("2026-05-19T00:00:00.000Z"), body_text: "b", body_plain: null, selected_text_part: null

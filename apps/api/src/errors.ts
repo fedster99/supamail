@@ -6,10 +6,35 @@
  * agent surface can import a thrower without pulling in a mutation path.
  *
  * Mapping (api.ts onError):
+ *   InvalidInputError        → 400 invalid_input
  *   NotFoundError            → 404 not_found
  *   NoRecipientsError        → 400 no_recipients
  *   UnfetchableContentError  → 422 content_unfetchable
+ *   MailboxConflictError     → 409 mailbox_conflict
  */
+
+import type { ZodError } from "zod";
+
+/** The caller's input is malformed (wrong shape, invalid address or id, a field
+ * the operation does not accept). A client error the caller must fix, never a
+ * provider or server fault, so it is never retried. Mapped to 400. */
+export class InvalidInputError extends Error {
+  readonly code = "invalid_input";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidInputError";
+  }
+}
+
+/** One readable line per schema issue (`to.0.email: Invalid email`), joined with
+ * "; " and capped at five, so hosts can show it as-is. */
+export function formatZodIssues(error: ZodError): string {
+  return error.issues
+    .slice(0, 5)
+    .map((issue) => `${issue.path.length > 0 ? issue.path.join(".") : "input"}: ${issue.message}`)
+    .join("; ");
+}
 
 /** A requested resource (message, draft, attachment, account) does not exist. */
 export class NotFoundError extends Error {
@@ -25,6 +50,19 @@ export class NoRecipientsError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "NoRecipientsError";
+  }
+}
+
+/**
+ * The live mailbox can no longer be safely addressed by the UID we mirrored:
+ * UIDVALIDITY changed, so the stale UID may now point at a different message.
+ * Thrown by mutations and on-demand content fetches alike. Mapped to 409: the
+ * request was well-formed, the server state moved underneath us.
+ */
+export class MailboxConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MailboxConflictError";
   }
 }
 

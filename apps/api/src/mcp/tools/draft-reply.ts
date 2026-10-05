@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_REFERENCES_LENGTH } from "../../compose-schema.js";
 import type { PgPool } from "../../db.js";
 import { htmlToText } from "../../mime.js";
 import { cleanBody, toolError, withReadOnlyTx } from "../shared.js";
@@ -147,7 +148,9 @@ export function reSubject(subject: string | null): string {
  * Build the References header value (I5): the source's existing References chain
  * plus the source's own rfc_message_id, RAW (angle-bracketed, case preserved).
  * When references_header is null but in_reply_to is present, seed the chain with
- * in_reply_to so the thread stays linked.
+ * in_reply_to so the thread stays linked. A chain longer than a send accepts keeps
+ * its root and newest ids (the RFC 5537 §3.4.4 trim), so a reply to a long thread
+ * still sends.
  */
 export function buildReferences(row: SourceRow): string | undefined {
   const chain: string[] = [];
@@ -166,7 +169,14 @@ export function buildReferences(row: SourceRow): string | undefined {
     push(row.in_reply_to);
   }
   push(row.rfc_message_id);
-  return chain.length === 0 ? undefined : chain.join(" ");
+  if (chain.length === 0) return undefined;
+  const newest: string[] = [];
+  let length = chain[0].length;
+  for (let i = chain.length - 1; i > 0 && length + 1 + chain[i].length <= MAX_REFERENCES_LENGTH; i--) {
+    newest.unshift(chain[i]);
+    length += 1 + chain[i].length;
+  }
+  return [chain[0], ...newest].join(" ");
 }
 
 /**

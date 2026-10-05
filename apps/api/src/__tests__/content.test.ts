@@ -20,7 +20,7 @@ async function drain(stream: AsyncIterable<unknown>): Promise<string> {
   for await (const chunk of stream) out += String(chunk);
   return out;
 }
-import { NotFoundError, UnfetchableContentError } from "../errors.js";
+import { MailboxConflictError, NotFoundError, UnfetchableContentError } from "../errors.js";
 
 // Mirror ids are UUIDs; any other value names no row.
 const M1 = "11111111-1111-4111-8111-111111111111";
@@ -479,7 +479,12 @@ describe("ContentImapClient (UIDVALIDITY guard + verb surface)", () => {
   it("downloadPart fails closed (throws) when the live UIDVALIDITY no longer matches", async () => {
     const stub = imapStub(999); // server moved underneath us
     const client = clientFrom(stub);
-    await expect(client.downloadPart("INBOX", 100, 42, "2", 1000)).rejects.toThrow(/UIDVALIDITY changed/);
+    const error = await client.downloadPart("INBOX", 100, 42, "2", 1000).catch((value) => value);
+    expect(error).toBeInstanceOf(MailboxConflictError);
+    expect(error).toMatchObject({
+      name: "MailboxConflictError",
+      message: "UIDVALIDITY changed for INBOX (mirror 100 != server 999); refusing to fetch by stale UID"
+    });
     // The guard fires BEFORE any download.
     expect(stub.download).not.toHaveBeenCalled();
   });
@@ -487,7 +492,7 @@ describe("ContentImapClient (UIDVALIDITY guard + verb surface)", () => {
   it("fetchOneSource fails closed (throws) on a UIDVALIDITY mismatch", async () => {
     const stub = imapStub(999);
     const client = clientFrom(stub);
-    await expect(client.fetchOneSource("INBOX", 100, 42, 1000)).rejects.toThrow(/UIDVALIDITY changed/);
+    await expect(client.fetchOneSource("INBOX", 100, 42, 1000)).rejects.toBeInstanceOf(MailboxConflictError);
     expect(stub.fetchOne).not.toHaveBeenCalled();
   });
 
@@ -512,7 +517,7 @@ describe("ContentImapClient (UIDVALIDITY guard + verb surface)", () => {
     const release = vi.fn();
     const stub = imapStub(999, { getMailboxLock: vi.fn(async () => ({ release })) });
     const client = clientFrom(stub);
-    await expect(client.downloadPartStream("INBOX", 100, 42, "2", 1000)).rejects.toThrow(/UIDVALIDITY changed/);
+    await expect(client.downloadPartStream("INBOX", 100, 42, "2", 1000)).rejects.toBeInstanceOf(MailboxConflictError);
     expect(stub.download).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledTimes(1);
   });

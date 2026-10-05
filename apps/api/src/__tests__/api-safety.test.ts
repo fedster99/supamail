@@ -1221,6 +1221,25 @@ describe("API safety", () => {
     await expect(res.json()).resolves.toMatchObject({ error: "mailbox_conflict" });
   });
 
+  it("maps an engine InvalidInputError to 400 invalid_input with its readable message", async () => {
+    const { InvalidInputError } = await import("../errors.js");
+    const { app } = buildApp({
+      send: async () => {
+        throw new InvalidInputError('Header "Bcc" cannot be set via custom headers');
+      }
+    });
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ to: [{ email: "rcpt@example.test" }], subject: "Hi", body: { format: "plain", text: "x" } })
+    });
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({
+      error: "invalid_input",
+      message: 'Header "Bcc" cannot be set via custom headers'
+    });
+  });
+
   it("maps a typed NotFoundError from a draft route to 404 (not a 500)", async () => {
     const { app, drafts } = buildApp();
     drafts.send.mockRejectedValueOnce(new NotFoundError("Draft not found: x") as never);

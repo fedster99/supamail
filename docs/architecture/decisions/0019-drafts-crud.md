@@ -69,11 +69,11 @@ introduced:
 - **Bcc is rejected on drafts (send-time only).** Bcc cannot round-trip through the
   APPENDed draft bytes — nodemailer's `keepBcc` default omits Bcc from the composed
   MIME, so a Bcc stored on a draft would be silently lost and never sent. Rather
-  than accept-and-drop, drafts **reject** Bcc: `DRAFT_SCHEMA` errors with `"Bcc is
+  than accept-and-drop, drafts **reject** Bcc: `DRAFT_BODY_SCHEMA` errors with `"Bcc is
   not supported on saved drafts — set Bcc when you send the draft"`, the CLI
   `draft-create`/`draft-update` commands expose no `--bcc`, the `createDraft`/
   `updateDraft` input types omit `bcc`, and the lib re-checks at runtime for an
-  untyped caller. Bcc remains fully supported on the email-001 **send** envelope —
+  untyped caller (ADR 0035: the shared compose schema, as `InvalidInputError`). Bcc remains fully supported on the email-001 **send** envelope —
   set it when the draft is sent.
 - **Delete** reuses email-002 `deleteMessage` directly (trash by default, `\hard`
   EXPUNGE on request), so the blanket-EXPUNGE refusal and UIDVALIDITY guard from
@@ -128,7 +128,7 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   EXPUNGE. Update surfaces that capability error; after confirmed draft delivery,
   send records draft-cleanup failure as a warning instead of throwing.
 - Drafts intentionally do **not** carry Bcc — it is a send-time-only field. A future
-  change must NOT "re-add" `bcc` to `DRAFT_SCHEMA`, the CLI, or the `DraftInput`
+  change must NOT "re-add" `bcc` to `DRAFT_BODY_SCHEMA`, the CLI, or the `DraftInput`
   type as an oversight: Bcc is dropped from the saved bytes by design (nodemailer's
   `keepBcc`), so accepting it on a draft would silently lose recipients. Set Bcc on
   the `send`/`reply` envelope instead.
