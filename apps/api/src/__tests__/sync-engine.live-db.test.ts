@@ -12,7 +12,7 @@ import {
 import { AccountBusyError } from "../errors.js";
 import { MirrorRepository } from "../repository.js";
 import { MirrorEngine } from "../sync-engine.js";
-import type { FetchMessage, MirrorImapClient } from "../imap-client.js";
+import { IncompleteUidListError, type FetchMessage, type MirrorImapClient } from "../imap-client.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type { ImapFolder, MessageMetadata } from "../types.js";
 import { MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES } from "../sync-limits.js";
@@ -2415,7 +2415,7 @@ liveDb("live DB reliability lane", () => {
     }]);
   });
 
-  it("keeps reconciliation fail-closed when both UID streams are empty", async () => {
+  it("keeps reconciliation fail-closed when the UID search is empty for a non-empty mailbox", async () => {
     const h = await setupIntegration("live-reconcile-double-empty", {
       INITIAL_SYNC_BATCH_SIZE: 50
     });
@@ -2425,12 +2425,8 @@ liveDb("live DB reliability lane", () => {
     await engine.syncAccount(h.account.id, "manual");
 
     class EmptyUidStreamClient extends FixtureImapClient {
-      override async *fetch(
-        range: string | number[] | Record<string, unknown>,
-        query: Record<string, unknown>
-      ) {
-        if (typeof range === "object" && !Array.isArray(range)) return;
-        yield* super.fetch(range, query);
+      override async search(): Promise<number[]> {
+        return [];
       }
     }
     const contradictoryEngine = h.buildEngine({
@@ -2449,7 +2445,13 @@ liveDb("live DB reliability lane", () => {
     );
 
     const result = await contradictoryEngine.syncAccount(h.account.id, "manual");
-    expect(result.outcome).toBe("failed");
+    // Unproven, not failed: the folder records an unclean reconcile and retries.
+    expect(result.outcome).toBe("success");
+    const state = await h.pool.query<{ last_reconcile_clean: boolean }>(
+      "SELECT last_reconcile_clean FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    expect(state.rows[0]?.last_reconcile_clean).toBe(false);
 
     const message = await h.pool.query<{
       deleted_in_provider: boolean;
@@ -2481,103 +2483,57 @@ liveDb("live DB reliability lane", () => {
     );
     if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
 
-    async function* providerUids() {
-      for (let uid = 1; uid <= 5_001; uid += 1) yield uid;
-    }
-
-    const result = await h.repository.markMissingMessagesFromLiveUidStream(
+    const providerUids = Array.from({ length: 5_001 }, (_, index) => index + 1);
+    const result = await h.repository.reconcileFolderUids(
       h.account.id,
       folder.rows[0],
       Number(folder.rows[0].uidvalidity),
-      providerUids()
+      providerUids,
+      new Set(providerUids),
+      { expectedCount: 5_001, uidNextAtSelect: 5_002, batchSize: 1_000 }
     );
 
     expect(result.missingInDbUids).toHaveLength(5_000);
     expect(result.missingInDbTruncated).toBe(true);
   });
 
-  it("does not hold a database transaction while it waits for provider UIDs", async () => {
-    const h = await setupIntegration("live-reconcile-short-transaction", {
+  it("changes nothing when the UID list disagrees with SELECT's message count", async () => {
+    const h = await setupIntegration("live-reconcile-incomplete-list", {
       INITIAL_SYNC_BATCH_SIZE: 50
     });
     activeAccountIds.push(h.account.id);
-    await h.buildEngine({ folders: oneFolder("INBOX", 0) }).syncAccount(h.account.id, "manual");
+    await h.buildEngine({ folders: oneFolder("INBOX", 2) }).syncAccount(h.account.id, "manual");
 
     const folder = await h.pool.query<ImapFolder>(
       "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
       [h.account.id]
     );
     if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
-
-    let idleInTransaction = true;
-    async function* providerUids() {
-      yield 1;
-      const activity = await h.pool.query<{ idle_in_transaction: boolean }>(
-        `SELECT EXISTS (
-           SELECT 1
-           FROM pg_stat_activity
-           WHERE pid <> pg_backend_pid()
-             AND state = 'idle in transaction'
-             AND query ILIKE '%INSERT INTO supamail_live_uids%'
-         ) AS idle_in_transaction`
-      );
-      idleInTransaction = activity.rows[0]?.idle_in_transaction ?? true;
-      yield 2;
-    }
-
-    await h.repository.markMissingMessagesFromLiveUidStream(
+    const reconcile = (uids: number[], expectedCount: number | undefined) => h.repository.reconcileFolderUids(
       h.account.id,
-      folder.rows[0],
-      Number(folder.rows[0].uidvalidity),
-      providerUids(),
-      { batchSize: 1 }
+      folder.rows[0]!,
+      Number(folder.rows[0]!.uidvalidity),
+      uids,
+      new Set(uids),
+      { expectedCount, uidNextAtSelect: 3 }
     );
 
-    expect(idleInTransaction).toBe(false);
-  });
+    // A truncated list, an unknown count, an empty list for a non-empty
+    // mailbox, and an invalid UID all prove nothing.
+    await expect(reconcile([1], 2)).rejects.toBeInstanceOf(IncompleteUidListError);
+    await expect(reconcile([1, 2], undefined)).rejects.toBeInstanceOf(IncompleteUidListError);
+    await expect(reconcile([], 2)).rejects.toBeInstanceOf(IncompleteUidListError);
+    await expect(reconcile([1, 0], 2)).rejects.toBeInstanceOf(IncompleteUidListError);
 
-  it("keeps real streamed UID progress when provider iteration fails", async () => {
-    const h = await setupIntegration("live-reconcile-stream-failure-progress", {
-      INITIAL_SYNC_BATCH_SIZE: 50
-    });
-    activeAccountIds.push(h.account.id);
-    await h.buildEngine({ folders: oneFolder("INBOX", 1) }).syncAccount(h.account.id, "manual");
-
-    const folder = await h.pool.query<ImapFolder>(
-      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+    const live = await h.pool.query<{ c: string }>(
+      `SELECT count(*)::text AS c FROM public.imap_messages
+        WHERE account_id = $1 AND deleted_in_provider = false`,
       [h.account.id]
     );
-    if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
-    const progress = { providerUidsSeen: 0 };
+    expect(Number(live.rows[0].c)).toBe(2);
 
-    async function* providerUids() {
-      yield 1;
-      yield 2;
-      throw new Error("provider UID stream failed");
-    }
-
-    await expect(h.repository.markMissingMessagesFromLiveUidStream(
-      h.account.id,
-      folder.rows[0],
-      Number(folder.rows[0].uidvalidity),
-      providerUids(),
-      { batchSize: 1, progress }
-    )).rejects.toThrow(/provider UID stream failed/i);
-    expect(progress.providerUidsSeen).toBe(2);
-
-    const message = await h.pool.query<{
-      deleted_in_provider: boolean;
-      deleted_reason: string | null;
-    }>(
-      `SELECT deleted_in_provider, deleted_reason
-         FROM public.imap_messages
-        WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = 1`,
-      [h.account.id]
-    );
-    expect(message.rows[0]).toEqual({
-      deleted_in_provider: false,
-      deleted_reason: null
-    });
+    // An authoritatively empty mailbox is a complete list.
+    expect((await reconcile([], 0)).markedCount).toBe(2);
   });
 
   it("does not apply a staged reconcile after UIDVALIDITY changes", async () => {
@@ -2593,20 +2549,18 @@ liveDb("live DB reliability lane", () => {
     );
     if (!folder.rows[0]) throw new Error("missing INBOX fixture folder");
     const originalUidValidity = Number(folder.rows[0].uidvalidity);
+    await h.pool.query(
+      "UPDATE public.imap_folders SET uidvalidity = $2 WHERE id = $1",
+      [folder.rows[0].id, originalUidValidity + 1]
+    );
 
-    async function* providerUids() {
-      await h.pool.query(
-        "UPDATE public.imap_folders SET uidvalidity = $2 WHERE id = $1",
-        [folder.rows[0]!.id, originalUidValidity + 1]
-      );
-      if (false) yield 0;
-    }
-
-    await expect(h.repository.markMissingMessagesFromLiveUidStream(
+    await expect(h.repository.reconcileFolderUids(
       h.account.id,
       folder.rows[0],
       originalUidValidity,
-      providerUids()
+      [],
+      new Set(),
+      { expectedCount: 0, uidNextAtSelect: 2 }
     )).rejects.toThrow(/lost folder generation/i);
 
     const message = await h.pool.query<{
@@ -2622,6 +2576,77 @@ liveDb("live DB reliability lane", () => {
       deleted_in_provider: false,
       deleted_reason: null
     });
+  });
+
+  it("bounds tombstones by UIDNEXT and commits them in batches", async () => {
+    const h = await setupIntegration("live-reconcile-bounded-writes", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 6) }).syncAccount(h.account.id, "manual");
+    const folder = (await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    )).rows[0]!;
+
+    // The provider lists only UID 1. UID 6 is at the UIDNEXT seen at SELECT, so a
+    // list taken after it cannot prove UID 6 gone.
+    const result = await h.repository.reconcileFolderUids(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [1],
+      new Set(),
+      { expectedCount: 1, uidNextAtSelect: 6, writeBatchSize: 2 }
+    );
+    expect(result.markedCount).toBe(4);
+    const live = await h.pool.query<{ uid: string }>(
+      `SELECT uid::text FROM public.imap_messages
+        WHERE account_id = $1 AND deleted_in_provider = false ORDER BY uid`,
+      [h.account.id]
+    );
+    expect(live.rows.map((row) => Number(row.uid))).toEqual([1, 6]);
+  });
+
+  it("revives only its own archive tombstones and leaves window rows to repair", async () => {
+    const h = await setupIntegration("live-reconcile-revival", {
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 4) }).syncAccount(h.account.id, "manual");
+    const folder = (await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    )).rows[0]!;
+    // Every UID is still listed. UID 1 is a false archive tombstone, UID 2 a false
+    // tombstone inside the window, and UIDs 3 and 4 were removed by other paths.
+    await h.pool.query(
+      `UPDATE public.imap_messages
+       SET deleted_in_provider = true, provider_deleted_at = now(),
+           deleted_reason = CASE uid WHEN 3 THEN 'PROVIDER_DELETED' WHEN 4 THEN 'MOVED_OUT' ELSE 'RECONCILE_MISSING' END
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+
+    const result = await h.repository.reconcileFolderUids(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [1, 2, 3, 4],
+      new Set([2, 3, 4]),
+      { expectedCount: 4, uidNextAtSelect: 5 }
+    );
+    expect(result.revivedCount).toBe(1);
+    // In the window, repair re-fetches the row so its flags are current.
+    expect(result.missingInDbUids).toEqual([4, 3, 2]);
+    const states = await h.pool.query<{ uid: string; deleted_reason: string | null }>(
+      `SELECT uid::text, deleted_reason FROM public.imap_messages
+        WHERE account_id = $1 ORDER BY uid`,
+      [h.account.id]
+    );
+    expect(states.rows.map((row) => `${row.uid}:${row.deleted_reason}`)).toEqual([
+      "1:null", "2:RECONCILE_MISSING", "3:PROVIDER_DELETED", "4:MOVED_OUT"
+    ]);
   });
 
   it("schedules an early retry when reconcile repair remains incomplete", async () => {

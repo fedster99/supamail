@@ -77,19 +77,19 @@ describe("repository safety", () => {
     expect(method).toContain("sync_state <> 'INITIAL_SYNC'");
   });
 
-  it("streams reconcile UIDs outside the final mutation transaction", async () => {
+  it("stages reconcile UIDs and proves the list complete outside the mutation transaction", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
     const method = source.slice(
-      source.indexOf("async markMissingMessagesFromLiveUidStream("),
-      source.indexOf("async getMessage(")
+      source.indexOf("async reconcileFolderUids("),
+      source.indexOf("async getLiveMessageId(")
     );
 
     expect(method).toContain("ON COMMIT PRESERVE ROWS");
     expect(method).toContain("DROP TABLE IF EXISTS pg_temp.supamail_live_uids");
-    expect(method.indexOf("for await (const uid of liveUids)")).toBeLessThan(
-      method.indexOf('client.query("BEGIN")')
-    );
+    expect(method.indexOf("INSERT INTO supamail_live_uids")).toBeLessThan(method.indexOf("await writeAll("));
+    expect(method.indexOf("throw new IncompleteUidListError(")).toBeLessThan(method.indexOf("await writeAll("));
     expect(method).not.toContain("ON COMMIT DROP");
+    expect(method).not.toContain("window_status");
   });
 
   it("stores NULL raw_mime when BODY_STORAGE_MODE is parsed_only", async () => {
@@ -291,18 +291,12 @@ describe("repository safety", () => {
     expect(worker).toContain("exceeds SYNC_MAX_ACCOUNTS");
   });
 
-  it("limits the live UID-stream reconcile to the active sync window", async () => {
-    const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
-
-    expect(source).toContain("AND window_status = 'IN_WINDOW'");
-  });
-
   it("loads reconcile UIDs through a temporary table", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
     expect(source).toContain("CREATE TEMP TABLE supamail_live_uids");
     expect(source).toContain("ON COMMIT PRESERVE ROWS");
-    expect(source).toContain("SELECT DISTINCT unnest($1::bigint[])");
+    expect(source).toContain("SELECT * FROM unnest($1::bigint[], $2::boolean[])");
   });
 
   it("returns missing-in-DB UIDs from reconcile for backfill (spec §10.7 step 3)", async () => {
@@ -310,7 +304,7 @@ describe("repository safety", () => {
 
     expect(source).toContain("missingInDbUids: number[]");
     expect(source).toContain("FROM supamail_live_uids live");
-    expect(source).toContain("WHERE NOT EXISTS");
+    expect(source).toContain("WHERE live.in_window");
   });
 
   it("treats PARTIAL_SUCCESS as a success for counter rules (spec §12.2)", async () => {

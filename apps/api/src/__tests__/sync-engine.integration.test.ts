@@ -742,7 +742,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       status: {
         path: "Archive",
         uidValidity: 50_004,
-        uidNext: 1,
+        uidNext: 302,
         exists: 0,
         messages: 0,
         highestModseq: undefined
@@ -969,7 +969,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     }
 
     const recoveryClient = new CompleteQresyncWithoutVanishedClient(folders);
-    const fetch = vi.spyOn(recoveryClient, "fetch");
+    const search = vi.spyOn(recoveryClient, "search");
     const engine = h.buildEngine({
       folders,
       overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true }
@@ -986,10 +986,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(result.reconcileFoldersAttempted).toBe(1);
     expect(result.reconcileGapsFound).toBe(1);
-    expect(fetch.mock.calls.some(([range]) => typeof range === "object"
-      && range !== null
-      && "since" in range
-      && !("uid" in range))).toBe(true);
+    expect(search.mock.calls.some(([criteria]) => criteria.all === true)).toBe(true);
     const removed = await h.pool.query<{ deleted_in_provider: boolean; deleted_reason: string | null }>(
       `SELECT deleted_in_provider, deleted_reason
        FROM public.imap_messages
@@ -1689,9 +1686,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const folders = buildInboxAndSentFolders();
     const engine = h.buildEngine({ folders });
     await engine.syncAccount(h.account.id, "manual");
-    vi.spyOn(h.repository, "markMissingMessagesFromLiveUidStream").mockResolvedValue({
+    vi.spyOn(h.repository, "reconcileFolderUids").mockResolvedValue({
       markedCount: 0,
-      liveUidCount: 1,
+      revivedCount: 0,
+      providerUidCount: 1,
       missingInDbUids: [],
       missingInDbTruncated: true
     });
@@ -1734,19 +1732,12 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
        WHERE account_id = $1`,
       [h.account.id]
     );
-    const reconcile = vi.spyOn(h.repository, "markMissingMessagesFromLiveUidStream")
-      .mockImplementation(async (_accountId, _folder, _uidValidity, liveUids, options) => {
-        let consumed = 0;
-        for await (const _uid of liveUids) {
-          consumed += 1;
-          if (options?.progress) options.progress.providerUidsSeen += 1;
-          if (consumed === 2) {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-            throw new Error("staged reconcile failed");
-          }
-        }
-        throw new Error("reconcile fixture did not yield two UIDs");
+    const reconcile = vi.spyOn(h.repository, "reconcileFolderUids")
+      .mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        throw new Error("staged reconcile failed");
       });
+    const providerUids = folders[0].messages.length;
 
     const idleClient = new FixtureImapClient(folders);
     const result = await engine.syncAccount(h.account.id, "scheduled", {
@@ -1757,7 +1748,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("failed");
     expect(result.reconcileFoldersAttempted).toBe(1);
-    expect(result.reconcileProviderUidsSeen).toBe(2);
+    expect(result.reconcileProviderUidsSeen).toBe(providerUids);
     expect(result.reconcileDurationMs).toBeGreaterThan(0);
     expect(reconcile).toHaveBeenCalledTimes(1);
 
@@ -1767,7 +1758,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     expect(run.rows[0]?.metadata).toMatchObject({
       reconcileFoldersAttempted: 1,
-      reconcileProviderUidsSeen: 2,
+      reconcileProviderUidsSeen: providerUids,
       reconcileDurationMs: result.reconcileDurationMs
     });
   });
@@ -5036,17 +5027,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     }];
     const historyRanges: string[] = [];
     class HistoryRangeClient extends FixtureImapClient {
-      override async *fetch(
-        range: string | number[] | Record<string, unknown>,
-        query: Record<string, unknown>
-      ) {
-        if (typeof range === "object"
-          && !Array.isArray(range)
-          && range.before instanceof Date
-          && typeof range.uid === "string") {
-          historyRanges.push(range.uid);
+      override async search(query: Record<string, unknown>, options: { uid: true }) {
+        if (query.before instanceof Date && typeof query.uid === "string") {
+          historyRanges.push(query.uid);
         }
-        yield* super.fetch(range, query);
+        return await super.search(query, options);
       }
     }
 
@@ -5244,7 +5229,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(await liveHistoricalUnder(85_999)).toBe(3);
   });
 
-  describe("archive deletion reconcile", () => {
+  describe("lane-independent reconcile", () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const message = (uid: number, internalDate: Date) => makeTextMessage({
       uid,
@@ -5255,7 +5240,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       internalDate
     });
 
-    async function setupArchive(suite: string, uidValidity: number, messages: FixtureFolder["messages"]) {
+    async function setupFolder(suite: string, uidValidity: number, messages: FixtureFolder["messages"]) {
       const h = await setupIntegration(suite, {
         BODY_BACKFILL_BATCH_SIZE: 50,
         INITIAL_SYNC_BATCH_SIZE: 50,
@@ -5291,34 +5276,48 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       ).rows.map((row) => `${row.uid}:${row.window_status}:${row.deleted_in_provider ? row.deleted_reason : "live"}`);
     }
 
-    async function dueArchiveRefresh(h: Awaited<ReturnType<typeof setupIntegration>>) {
+    async function dueReconcile(h: Awaited<ReturnType<typeof setupIntegration>>) {
       await h.pool.query(
-        `UPDATE public.imap_folders SET last_archive_refresh_at = now() - interval '31 days'
+        `UPDATE public.imap_folders
+         SET next_sync_due_at = now() - interval '1 second',
+             next_reconcile_at = now() - interval '1 second'
          WHERE account_id = $1`,
         [h.account.id]
       );
-      await dueAllFolders(h.pool, h.account.id);
     }
 
-    it("tombstones archive rows whose UID left the folder on the next archive refresh", async () => {
+    // Age a row past the live window without moving its lane, as a host that
+    // never runs the expiry job leaves it; the provider's date search then
+    // no longer returns it.
+    async function age(h: Awaited<ReturnType<typeof setupIntegration>>, folders: FixtureFolder[], uids: number[], lane: string) {
+      for (const m of folders[0].messages) if (uids.includes(m.uid)) m.internalDate = oldDate;
+      await h.pool.query(
+        `UPDATE public.imap_messages SET internal_date = $2, window_status = $3
+         WHERE account_id = $1 AND uid = ANY($4::bigint[])`,
+        [h.account.id, oldDate, lane, uids]
+      );
+    }
+
+    it("tombstones gone rows in every lane and keeps aged rows that are still there", async () => {
       const recent = new Date();
-      const { h, folders } = await setupArchive("archive-deletion-refresh", 86_001, [
+      const { h, folders } = await setupFolder("reconcile-every-lane", 86_001, [
         message(1, oldDate),
         message(2, oldDate),
         message(3, recent),
         message(4, recent),
+        message(5, recent),
         message(13, recent),
         message(14, recent)
       ]);
-      const uidSearches: unknown[] = [];
-      const unfilteredFetches: unknown[] = [];
+      const searches: Record<string, unknown>[] = [];
+      const uidListingFetches: unknown[] = [];
       class RecordingClient extends FixtureImapClient {
         override async search(query: Record<string, unknown>, options: { uid: true }) {
-          uidSearches.push(query);
+          searches.push(query);
           return await super.search(query, options);
         }
         override async *fetch(range: string | number[] | Record<string, unknown>, query: Record<string, unknown>) {
-          if (typeof range === "object" && !Array.isArray(range) && range.all) unfilteredFetches.push(range);
+          if (typeof range === "object" && !Array.isArray(range) && range.all) uidListingFetches.push(range);
           yield* super.fetch(range, query);
         }
       }
@@ -5326,54 +5325,36 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
       await engine.syncAccount(h.account.id, "manual");
       expect(await rows(h)).toEqual([
-        "1:HISTORICAL:live", "2:HISTORICAL:live", "3:IN_WINDOW:live",
-        "4:IN_WINDOW:live", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
+        "1:HISTORICAL:live", "2:HISTORICAL:live", "3:IN_WINDOW:live", "4:IN_WINDOW:live",
+        "5:IN_WINDOW:live", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
       ]);
 
-      // UIDs 3 and 4 age out of the live window. UID 3 stays at the provider, with
-      // an internal date the history snapshot's date search does not return.
-      await h.pool.query(
-        `UPDATE public.imap_messages SET window_status = 'EXPIRED'
-         WHERE account_id = $1 AND uid IN (3, 4)`,
-        [h.account.id]
-      );
-      folders[0].messages = folders[0].messages.filter((m) => ![1, 2, 4].includes(m.uid));
+      await age(h, folders, [3, 4], "IN_WINDOW");
+      await age(h, folders, [5], "EXPIRED");
+      folders[0].messages = folders[0].messages.filter((m) => ![1, 2, 4, 5].includes(m.uid));
 
-      // A routine sync before the refresh is due leaves archive rows alone.
-      await dueAllFolders(h.pool, h.account.id);
-      uidSearches.length = 0;
-      await engine.syncAccount(h.account.id, "manual");
-      expect(uidSearches).toHaveLength(0);
-      expect(await rows(h)).toContain("1:HISTORICAL:live");
-
-      await dueArchiveRefresh(h);
+      await dueReconcile(h);
+      searches.length = 0;
+      uidListingFetches.length = 0;
       await engine.syncAccount(h.account.id, "manual");
       expect(await rows(h)).toEqual([
-        "1:HISTORICAL:RECONCILE_MISSING", "2:HISTORICAL:RECONCILE_MISSING", "3:EXPIRED:live",
-        "4:EXPIRED:RECONCILE_MISSING", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
+        "1:HISTORICAL:RECONCILE_MISSING", "2:HISTORICAL:RECONCILE_MISSING", "3:IN_WINDOW:live",
+        "4:IN_WINDOW:RECONCILE_MISSING", "5:EXPIRED:RECONCILE_MISSING", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
       ]);
-      // One UID SEARCH for the whole folder, never a per-message FETCH of every UID.
-      expect(uidSearches).toEqual([{ all: true }]);
-      expect(unfilteredFetches).toHaveLength(0);
-      const event = await h.pool.query<{ payload: Record<string, unknown> }>(
-        `SELECT payload FROM public.imap_sync_events
-         WHERE account_id = $1 AND event_type = 'ARCHIVE_RECONCILE'`,
-        [h.account.id]
-      );
-      expect(event.rows.map((row) => row.payload)).toEqual([
-        { marked: 3, providerUids: 3, exists: 3, skipped: false }
-      ]);
+      // One UID SEARCH lists the folder, never a FETCH line per message.
+      expect(searches.filter((query) => query.all === true)).toHaveLength(1);
+      expect(uidListingFetches).toHaveLength(0);
 
-      // A UID that comes back is revived by the next refresh's history walk.
+      // A tombstoned UID that is present again is revived by the next reconcile.
       folders[0].messages.unshift(message(2, oldDate));
-      await dueArchiveRefresh(h);
+      await dueReconcile(h);
       await engine.syncAccount(h.account.id, "manual");
       expect(await rows(h)).toContain("2:HISTORICAL:live");
       expect(await rows(h)).toContain("1:HISTORICAL:RECONCILE_MISSING");
     });
 
-    it("never tombstones archive rows from a partial or failed UID listing", async () => {
-      const { h, folders } = await setupArchive("archive-deletion-partial", 86_101, [
+    it("never tombstones from a partial or failed UID listing", async () => {
+      const { h, folders } = await setupFolder("reconcile-partial-listing", 86_101, [
         message(1, oldDate),
         message(2, oldDate),
         message(10, new Date())
@@ -5381,9 +5362,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       let listing: "full" | "partial" | "failed" = "full";
       class FlakyClient extends FixtureImapClient {
         override async search(query: Record<string, unknown>, options: { uid: true }) {
-          if (listing === "failed") return false;
+          if (query.all && listing === "failed") return false;
           const uids = await super.search(query, options);
-          return listing === "partial" && uids ? uids.slice(-1) : uids;
+          return query.all && listing === "partial" && uids ? uids.slice(-1) : uids;
         }
       }
       const engine = h.buildEngine({ folders, clientFactory: async () => new FlakyClient(folders) });
@@ -5391,31 +5372,42 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       const mirrored = await rows(h);
       expect(mirrored).toEqual(["1:HISTORICAL:live", "2:HISTORICAL:live", "10:IN_WINDOW:live"]);
 
-      listing = "partial";
-      await dueArchiveRefresh(h);
-      await engine.syncAccount(h.account.id, "manual");
-      expect(await rows(h)).toEqual(mirrored);
-      const skipped = await h.pool.query<{ payload: Record<string, unknown> }>(
-        `SELECT payload FROM public.imap_sync_events
-         WHERE account_id = $1 AND event_type = 'ARCHIVE_RECONCILE'`,
-        [h.account.id]
-      );
-      expect(skipped.rows.map((row) => row.payload)).toEqual([
-        { marked: 0, providerUids: 1, exists: 3, skipped: true }
-      ]);
-
-      listing = "failed";
-      await dueArchiveRefresh(h);
-      await engine.syncAccount(h.account.id, "manual");
-      expect(await rows(h)).toEqual(mirrored);
-
-      // A failed search fails the history batch, so the refresh stays due.
-      const refresh = await h.pool.query<{ overdue: boolean }>(
-        `SELECT last_archive_refresh_at < now() - interval '30 days' AS overdue
+      // An unproven list changes nothing and fails nothing: the folder keeps its
+      // other progress, records an unclean reconcile, and retries soon.
+      const reconcileState = async () => (await h.pool.query<{ clean: boolean; retry_soon: boolean }>(
+        `SELECT last_reconcile_clean AS clean,
+                next_reconcile_at < now() + interval '1 hour' AS retry_soon
          FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
         [h.account.id]
-      );
-      expect(refresh.rows[0].overdue).toBe(true);
+      )).rows[0];
+      const incompleteEvents = async () => (await h.pool.query<{ reason: string }>(
+        `SELECT payload->>'reason' AS reason FROM public.imap_sync_events
+         WHERE account_id = $1 AND event_type = 'RECONCILE_INCOMPLETE' ORDER BY occurred_at`,
+        [h.account.id]
+      )).rows.map((row) => row.reason);
+
+      listing = "partial";
+      folders[0].messages.push(message(11, new Date()));
+      await dueReconcile(h);
+      const partial = await engine.syncAccount(h.account.id, "manual");
+      expect(partial.outcome).toBe("success");
+      expect(await rows(h)).toEqual([...mirrored, "11:IN_WINDOW:live"]);
+      expect(await reconcileState()).toEqual({ clean: false, retry_soon: true });
+
+      listing = "failed";
+      await dueReconcile(h);
+      const failed = await engine.syncAccount(h.account.id, "manual");
+      expect(failed.outcome).toBe("success");
+      expect(await rows(h)).toEqual([...mirrored, "11:IN_WINDOW:live"]);
+      expect(await incompleteEvents()).toEqual([
+        "Reconcile UID list for INBOX is incomplete: UID SEARCH returned 1 UIDs but SELECT reported 4 messages",
+        "Reconcile UID list for INBOX is incomplete: UID SEARCH failed"
+      ]);
+
+      listing = "full";
+      await dueReconcile(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect((await reconcileState()).clean).toBe(true);
 
       // A provider VANISHED report is exact per UID, so it tombstones an archive row too.
       const folder = (await h.pool.query<ImapFolder>(
@@ -5426,63 +5418,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect(await rows(h)).toContain("2:HISTORICAL:RECONCILE_MISSING");
     });
 
-    it("tombstones a mass archive deletion in bounded batches that resume after the lock budget", async () => {
-      const { h, folders } = await setupArchive("archive-deletion-mass", 86_301, [
-        message(1, oldDate),
-        message(10_000, new Date())
-      ]);
-      const engine = h.buildEngine({ folders });
-      await engine.syncAccount(h.account.id, "manual");
-      // 1,200 archive rows the provider no longer has: more than two write batches.
-      await h.pool.query(
-        `INSERT INTO public.imap_messages (account_id, folder_id, folder_path, uidvalidity, uid, internal_date, window_status)
-         SELECT account_id, folder_id, folder_path, uidvalidity, g, internal_date, 'HISTORICAL'
-         FROM public.imap_messages, generate_series(2, 1201) AS g
-         WHERE account_id = $1 AND uid = 1`,
-        [h.account.id]
-      );
-      const liveArchive = async () => Number((await h.pool.query<{ c: string }>(
-        `SELECT count(*)::text AS c FROM public.imap_messages
-         WHERE account_id = $1 AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
-        [h.account.id]
-      )).rows[0].c);
-      expect(await liveArchive()).toBe(1201);
-
-      const internals = engine as unknown as { isLockBudgetExpired(deadline: number): boolean };
-      const budgetCheck = internals.isLockBudgetExpired.bind(engine);
-      let budgetEnded = false;
-      const budget = vi.spyOn(internals, "isLockBudgetExpired")
-        .mockImplementation((deadline) => budgetEnded || budgetCheck(deadline));
-      const markVanished = h.repository.markVanishedMessages.bind(h.repository);
-      const writes: number[] = [];
-      const write = vi.spyOn(h.repository, "markVanishedMessages")
-        .mockImplementation(async (...args: Parameters<typeof markVanished>) => {
-          writes.push(args[3].length);
-          const marked = await markVanished(...args);
-          budgetEnded = true;
-          return marked;
-        });
-
-      await dueArchiveRefresh(h);
-      await engine.syncAccount(h.account.id, "manual");
-      expect(writes).toEqual([500]);
-      expect(await liveArchive()).toBe(701);
-
-      budgetEnded = false;
-      budget.mockImplementation((deadline) => budgetCheck(deadline));
-      write.mockImplementation(async (...args: Parameters<typeof markVanished>) => {
-        writes.push(args[3].length);
-        return await markVanished(...args);
-      });
-      await dueAllFolders(h.pool, h.account.id);
-      await engine.syncAccount(h.account.id, "manual");
-      expect(writes).toEqual([500, 500, 200]);
-      expect(await liveArchive()).toBe(1);
-      expect(await rows(h)).toContain("1:HISTORICAL:live");
-    });
-
     it("leaves a UIDVALIDITY change to the reset path", async () => {
-      const { h, folders } = await setupArchive("archive-deletion-uidvalidity", 86_201, [
+      const { h, folders } = await setupFolder("reconcile-uidvalidity", 86_201, [
         message(1, oldDate),
         message(10, new Date())
       ]);
@@ -5492,10 +5429,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
       folders[0].uidValidity = 86_202;
       folders[0].messages = [message(10, new Date())];
-      await dueArchiveRefresh(h);
+      await dueReconcile(h);
       await engine.syncAccount(h.account.id, "manual");
-      const reasons = await h.pool.query<{ uidvalidity: string; uid: string; deleted_reason: string | null }>(
-        `SELECT uidvalidity::text, uid::text, deleted_reason FROM public.imap_messages
+      const reasons = await h.pool.query<{ uid: string; deleted_reason: string | null }>(
+        `SELECT uid::text, deleted_reason FROM public.imap_messages
          WHERE account_id = $1 AND uidvalidity = 86201 ORDER BY uid`,
         [h.account.id]
       );

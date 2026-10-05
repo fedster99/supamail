@@ -13,7 +13,7 @@ import {
   MessageMovedError,
   parseMessageMetadata,
   providerObjectIdNamespace,
-  searchAllUids,
+  searchMailboxUids,
   searchUidsBefore,
   searchUidsSince,
   ThrottledImapClient,
@@ -216,7 +216,8 @@ describe("fetchMessageMetadata", () => {
     ]);
     const lock = await client.getMailboxLock("INBOX");
     try {
-      await expect(searchAllUids(client)).resolves.toEqual([1, 7, 42]);
+      await expect(searchMailboxUids(client, { all: true })).resolves.toEqual([1, 7, 42]);
+      await expect(searchMailboxUids(client, { since: new Date("2026-02-01T00:00:00.000Z") })).resolves.toEqual([7, 42]);
       await expect(searchUidsSince(client, new Date("2026-02-01T00:00:00.000Z"))).resolves.toEqual([7, 42]);
       await expect(searchUidsBefore(client, new Date("2026-02-01T00:00:00.000Z"))).resolves.toEqual([1]);
       await expect(searchUidsSince(client, new Date("2026-01-01T00:00:00.000Z"), "2:40")).resolves.toEqual([7]);

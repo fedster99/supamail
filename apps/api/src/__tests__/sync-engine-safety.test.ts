@@ -93,19 +93,16 @@ describe("sync engine safety", () => {
     expect(source).toContain("markAccountSyncPartial");
   });
 
-  it("handles a moved-out body-fetch UID by window instead of bricking the account", async () => {
+  it("handles a moved-out body-fetch UID with a recoverable tombstone instead of bricking the account", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
     // A UID gone from its folder at body-fetch time must be caught as a benign
     // MessageMovedError and taken out of the backlog — NOT re-thrown into the
     // account-level catch, which bricks the account to BROKEN and re-loops every
-    // backfill. Scope the response by window: IN_WINDOW rows self-heal (safe to
-    // tombstone MOVED_OUT); HISTORICAL/EXPIRED rows never re-observe, so tombstoning
-    // would be unrecoverable — mark the fetch attempted instead.
+    // backfill. The tombstone is the same in every lane and recoverable: the
+    // next reconcile revives a UID that is still listed.
     expect(source).toContain("error instanceof MessageMovedError");
-    expect(source).toContain('message.window_status === "IN_WINDOW"');
-    expect(source).toContain("markMessageMovedOut(message.id)");
-    expect(source).toContain("markBodyFetchAttempted(message.id)");
+    expect(source).toContain("markMessageGone(message.id)");
   });
 
   it("commits the search extract and threading evidence before handing off the body payload", async () => {
@@ -127,15 +124,14 @@ describe("sync engine safety", () => {
     expect(batchPayloadWrite).toBeGreaterThan(batchEvidenceWrite);
   });
 
-  it("reconciles only the active sync window", async () => {
+  it("reconciles the complete folder and fetches only the live window", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    expect(source).toContain("iterateAllUids(client, windowCutoff)");
-    expect(source).toContain("markMissingMessagesFromLiveUidStream");
-    expect(source).toContain("Reconcile returned no UIDs for non-empty mailbox");
-    expect(source).toContain("needsAllUidConfirmation");
-    expect(source).toContain("findMissingInDb: !needsAllUidConfirmation");
-    expect(source).not.toContain("searchAllUids(client, windowCutoff)");
+    expect(source).toContain("searchMailboxUids(client, { all: true })");
+    expect(source).toContain("searchMailboxUids(client, { since: windowCutoff })");
+    expect(source).toContain("this.repository.reconcileFolderUids(");
+    expect(source).toContain("expectedCount: client.mailbox ? client.mailbox.exists : undefined");
+    expect(source).toContain("error instanceof IncompleteUidListError");
   });
 
   it("does not accept an empty folder discovery response as authoritative", async () => {
@@ -321,13 +317,13 @@ describe("sync engine safety", () => {
     expect(source).toContain("${timeoutName} exceeded during ${operation}");
   });
 
-  it("puts total deadlines around flag scan and reconcile streams", async () => {
+  it("puts total deadlines around flag scan streams and reconcile searches", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
     expect(source).toContain("FLAG_SCAN_TOTAL_TIMEOUT_MS");
     expect(source).toContain("RECONCILE_TOTAL_TIMEOUT_MS");
     expect(source).toContain("withAsyncIterableDeadline");
-    expect(source).toContain("reconcile UID stream");
+    expect(source).toContain("reconcile UID SEARCH");
   });
 
   it("runs history after the hot and body lanes under the same lock budget", async () => {

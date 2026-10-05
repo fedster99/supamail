@@ -267,6 +267,38 @@ index 0000000000000000000000000000000000000000..3405b0ae2bd05954e614d94b4b3081ad
 +
 +module.exports = notify;
 +module.exports.parseStatus = parseStatus;
+diff --git a/lib/commands/search.js b/lib/commands/search.js
+index fd0c409c24c525cbbb6b841e8d26327eb1b0a635..f0567fa440b4511c223ddcf52404a024bb528cba 100644
+--- a/lib/commands/search.js
++++ b/lib/commands/search.js
+@@ -176,6 +176,9 @@ module.exports = async (connection, query, options) => {
+     // Use a Set to deduplicate sequence numbers/UIDs -- servers may return
+     // duplicates across multiple untagged SEARCH responses.
+     let results = new Set();
++    // An ESEARCH ALL set that cannot be expanded exactly is not a result:
++    // returning the truncated or filtered set would look like a complete list
++    let incompleteAll = false;
+     let response;
+     try {
+         response = await connection.exec(options.uid ? 'UID SEARCH' : 'SEARCH', attributes, {
+@@ -247,6 +250,7 @@ module.exports = async (connection, query, options) => {
+                             }
+                         }
+                         if (truncated || discarded) {
++                            incompleteAll = true;
+                             connection.log.warn({
+                                 msg: 'Invalid entries in the ESEARCH ALL result',
+                                 truncated,
+@@ -259,6 +263,9 @@ module.exports = async (connection, query, options) => {
+             }
+         });
+         response.next();
++        if (incompleteAll) {
++            return false;
++        }
+         // Sort numerically for consistent, predictable output order
+         return Array.from(results).sort((a, b) => a - b);
+     } catch (err) {
 diff --git a/lib/commands/status.js b/lib/commands/status.js
 index 0e15a480d321d746c38f869109f556560737baf0..5f201c8b8084e97ecd41c53af9f529afe3869b61 100644
 --- a/lib/commands/status.js
@@ -357,7 +389,7 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d
      idle(): Promise<boolean>;
  
 diff --git a/lib/imap-flow.js b/lib/imap-flow.js
-index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e4725ca88 100644
+index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecdb061ea36 100644
 --- a/lib/imap-flow.js
 +++ b/lib/imap-flow.js
 @@ -16,6 +16,7 @@ const { LimitedPassthrough } = require('./limited-passthrough');
@@ -416,7 +448,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
              };
  
              if (typeof this.options.expungeHandler === 'function') {
-@@ -1881,7 +1900,9 @@ class ImapFlow extends EventEmitter {
+@@ -1881,7 +1900,16 @@ class ImapFlow extends EventEmitter {
              uids = untagged.attributes[0].value;
          }
  
@@ -424,10 +456,17 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
 +        // Bound the provider-controlled sequence set before emitting per-UID
 +        // events. The caller falls back to exact reconciliation on overflow.
 +        let uidList = expandRange(uids, 10_000);
++
++        // Without EARLIER, VANISHED replaces EXPUNGE once QRESYNC is enabled
++        // (RFC 7162 section 3.2.10): every listed UID left the mailbox, so EXISTS
++        // must drop exactly as it does for EXPUNGE
++        if (!tags.includes('EARLIER')) {
++            mailbox.exists = Math.max(0, (Number(mailbox.exists) || 0) - uidList.length);
++        }
  
          for (let uid of uidList) {
              let payload = {
-@@ -1904,6 +1925,12 @@ class ImapFlow extends EventEmitter {
+@@ -1904,6 +1932,12 @@ class ImapFlow extends EventEmitter {
      }
  
      async untaggedFetch(untagged, mailbox) {
@@ -440,7 +479,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
          mailbox = mailbox || this.mailbox;
          if (!mailbox) {
              // mailbox closed, ignore
-@@ -1914,7 +1941,8 @@ class ImapFlow extends EventEmitter {
+@@ -1914,7 +1948,8 @@ class ImapFlow extends EventEmitter {
          if (message.flags) {
              let updateEvent = {
                  path: mailbox.path,
@@ -450,7 +489,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
              };
  
              if (message.uid) {
-@@ -1935,6 +1963,20 @@ class ImapFlow extends EventEmitter {
+@@ -1935,6 +1970,20 @@ class ImapFlow extends EventEmitter {
          }
      }
  
@@ -471,7 +510,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
      async ensureSelectedMailbox(path) {
          if (!path) {
              return false;
-@@ -2049,6 +2091,7 @@ class ImapFlow extends EventEmitter {
+@@ -2049,6 +2098,7 @@ class ImapFlow extends EventEmitter {
  
          this.untaggedHandlers.CAPABILITY = (...args) => this.untaggedCapability(...args);
          this.sectionHandlers.CAPABILITY = (...args) => this.sectionCapability(...args);
@@ -479,7 +518,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
  
          this.untaggedHandlers.EXISTS = (...args) => this.untaggedExists(...args);
          this.untaggedHandlers.EXPUNGE = (...args) => this.untaggedExpunge(...args);
-@@ -2056,6 +2099,7 @@ class ImapFlow extends EventEmitter {
+@@ -2056,6 +2106,7 @@ class ImapFlow extends EventEmitter {
          // these methods take an optional second argument, so make sure that some random IMAP tag is not used as the second argument
          this.untaggedHandlers.FETCH = untagged => this.untaggedFetch(untagged);
          this.untaggedHandlers.VANISHED = untagged => this.untaggedVanished(untagged);
@@ -487,7 +526,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
  
          let socket = false;
          if (this.options.proxy) {
-@@ -2534,6 +2578,10 @@ class ImapFlow extends EventEmitter {
+@@ -2534,6 +2585,10 @@ class ImapFlow extends EventEmitter {
       * @property {Boolean} [statusQuery.highestModseq] if `true` request last known modseq value
       * @property {Boolean} [statusQuery.size] if `true` request total mailbox size in octets (requires STATUS=SIZE or IMAP4rev2)
       * @property {Boolean} [statusQuery.deleted] if `true` request count of messages with \\Deleted flag (requires IMAP4rev2)
@@ -498,7 +537,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
       * @property {Object} [specialUseHints] set specific paths as special use folders, this would override special use flags provided from the server
       * @property {String} [specialUseHints.sent] Path to "Sent Mail" folder
       * @property {String} [specialUseHints.trash] Path to "Trash" folder
-@@ -2554,8 +2602,11 @@ class ImapFlow extends EventEmitter {
+@@ -2554,8 +2609,11 @@ class ImapFlow extends EventEmitter {
       */
      async list(options) {
          options = options || {};
@@ -512,7 +551,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
          return folders;
      }
  
-@@ -2767,6 +2818,18 @@ class ImapFlow extends EventEmitter {
+@@ -2767,6 +2825,18 @@ class ImapFlow extends EventEmitter {
          return await this.run('STATUS', path, query);
      }
  
@@ -531,7 +570,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..ab516e598a06605edda84ad23c06044e
      /**
       * Starts listening for new or deleted messages from the currently opened mailbox. Only required if {@link ImapFlow#disableAutoIdle} is set to `true`
       * otherwise IDLE is started by default on connection inactivity. NB! If `idle()` is called manually then it does not
-@@ -4182,7 +4245,11 @@ class ImapFlow extends EventEmitter {
+@@ -4182,7 +4252,11 @@ class ImapFlow extends EventEmitter {
                      continue; // Process next lock in queue
                  }
  

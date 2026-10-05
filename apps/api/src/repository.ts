@@ -1,3 +1,4 @@
+import { IncompleteUidListError } from "./imap-client.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { AppConfig } from "./config.js";
@@ -80,6 +81,8 @@ const SYNC_HISTORY_PRUNE_BATCH_SIZE = 50_000;
 const SYNC_HISTORY_PRUNE_MAX_BATCHES = 10;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
 const RECONCILE_MISSING_UID_LIMIT = 5_000;
+/** Rows one reconcile transaction tombstones or revives before it commits. */
+const RECONCILE_WRITE_BATCH_SIZE = 5_000;
 const MAX_MESSAGE_EVIDENCE_ROWS = 100;
 const THREADING_BODY_HEADER_KEYS = [
   "message-id",
@@ -3551,9 +3554,8 @@ export class MirrorRepository {
   }
 
   /**
-   * Tombstone rows whose UIDs the provider proved gone (QRESYNC VANISHED, or an
-   * archive row absent from the folder's complete UID list), in any window lane.
-   * `RECONCILE_MISSING` is recoverable: a later sync that sees the UID revives it.
+   * Tombstone rows whose UIDs QRESYNC VANISHED proved gone, in any window lane.
+   * `RECONCILE_MISSING` is recoverable: a reconcile that sees the UID revives it.
    */
   async markVanishedMessages(
     accountId: string,
@@ -3592,36 +3594,19 @@ export class MirrorRepository {
     return Number(result.rows[0].count);
   }
 
-  /** UIDs of the folder's live archive (HISTORICAL, EXPIRED) rows at one UIDVALIDITY. */
-  async getLiveArchiveUids(accountId: string, folder: ImapFolder, uidValidity: number): Promise<number[]> {
-    const result = await this.pool.query<{ uid: string }>(
-      `
-      SELECT uid::text AS uid
-      FROM public.imap_messages
-      WHERE account_id = $1
-        AND folder_path = $2
-        AND uidvalidity = $3
-        AND deleted_in_provider = false
-        AND window_status <> 'IN_WINDOW'
-      `,
-      [accountId, folder.path, uidValidity]
-    );
-    return result.rows.map((row) => Number(row.uid));
-  }
-
   /**
    * A single message whose UID vanished from its folder between metadata sync and
-   * body fetch (see MessageMovedError). Soft-delete it as MOVED_OUT so it drops out
-   * of getBodyBacklog instead of being re-fetched — and re-thrown — every backfill.
-   * MOVED_OUT is the deleted_reason reserved for exactly this case.
+   * body fetch (see MessageMovedError), in any window lane. Tombstone it
+   * `RECONCILE_MISSING` so it leaves the body backlog; the next reconcile revives
+   * it if the UID is still listed, so a transient miss loses nothing.
    */
-  async markMessageMovedOut(messageId: string): Promise<void> {
+  async markMessageGone(messageId: string): Promise<void> {
     await this.pool.query(
       `
       UPDATE public.imap_messages
       SET deleted_in_provider = true,
           provider_deleted_at = now(),
-          deleted_reason = 'MOVED_OUT'
+          deleted_reason = 'RECONCILE_MISSING'
       WHERE id = $1
         AND deleted_in_provider = false
       `,
@@ -3714,102 +3699,50 @@ export class MirrorRepository {
   }
 
   /**
-   * Mark a message's body fetch as attempted without storing a body. Used when a UID
-   * moved out (MessageMovedError) for a non-IN_WINDOW row: MOVED_OUT is purged, and
-   * the next archive snapshot tombstones the row recoverably if the UID is really
-   * gone. This just removes
-   * the row from getHistoryBacklog (which filters body_fetched_at IS NULL) — a benign,
-   * reversible "we tried, the body is gone" watermark, not a soft-delete.
+   * Exact reconcile of one folder generation against its complete provider UID
+   * list, in every window lane: the provider's folder membership has no window.
+   * - Rows below `uidNextAtSelect` whose UID is gone are tombstoned
+   *   `RECONCILE_MISSING`. A row at or above it may have arrived after the list.
+   * - `RECONCILE_MISSING` rows outside `windowUids` whose UID is listed again are
+   *   revived. Inside the window, missing-in-DB repair re-fetches them with
+   *   fresh flags instead.
+   * - Missing-in-DB repair returns only `windowUids`, the UIDs the live window
+   *   fetches, so reconcile never backfills archive mail.
+   * The list must hold exactly `expectedCount` distinct UIDs (SELECT's message
+   * count), or nothing changes. UIDs are staged in a temp table first; writes
+   * then commit in bounded batches, each re-checking the folder generation.
    */
-  async markBodyFetchAttempted(messageId: string): Promise<void> {
-    await this.pool.query(
-      `
-      UPDATE public.imap_messages
-      SET body_fetched_at = now()
-      WHERE id = $1
-        AND body_fetched_at IS NULL
-      `,
-      [messageId]
-    );
-  }
-
-  async hasActiveWindowMessages(accountId: string, folder: ImapFolder, uidValidity: number): Promise<boolean> {
-    const result = await this.pool.query<{ exists: boolean }>(
-      `
-      SELECT EXISTS (
-        SELECT 1
-        FROM public.imap_messages
-        WHERE account_id = $1
-          AND folder_path = $2
-          AND uidvalidity = $3
-          AND deleted_in_provider = false
-          AND window_status = 'IN_WINDOW'
-      ) AS exists
-      `,
-      [accountId, folder.path, uidValidity]
-    );
-    return result.rows[0]?.exists ?? false;
-  }
-
-  // Reconcile via a streamed temp table rather than a `bigint[]` parameter:
-  // heavy mailboxes routinely surface 100k+ UIDs. Provider iteration and
-  // staging are intentionally outside the final mutation transaction so a slow
-  // IMAP stream cannot leave Postgres idle in transaction.
-  async markMissingMessagesFromLiveUidStream(
+  async reconcileFolderUids(
     accountId: string,
     folder: ImapFolder,
     uidValidity: number,
-    liveUids: AsyncIterable<number>,
+    folderUids: readonly number[],
+    windowUids: ReadonlySet<number>,
     options: {
-      failIfEmpty?: boolean;
-      emptyError?: string;
+      expectedCount: number | undefined;
+      uidNextAtSelect: number | undefined;
       batchSize?: number;
-      findMissingInDb?: boolean;
-      progress?: { providerUidsSeen: number };
-    } = {}
+      writeBatchSize?: number;
+    }
   ): Promise<{
     markedCount: number;
-    liveUidCount: number;
+    revivedCount: number;
+    providerUidCount: number;
     missingInDbUids: number[];
     missingInDbTruncated: boolean;
   }> {
+    if (folderUids.some((uid) => !Number.isSafeInteger(uid) || uid <= 0)) {
+      throw new IncompleteUidListError(folder.path, "the provider returned an invalid UID");
+    }
     const batchSize = options.batchSize ?? 10_000;
+    const writeBatchSize = options.writeBatchSize ?? RECONCILE_WRITE_BATCH_SIZE;
+    const uidBound = options.uidNextAtSelect ?? Number.MAX_SAFE_INTEGER;
     const client = await this.pool.connect();
-    const batch: number[] = [];
-    let liveUidCount = 0;
     let inTransaction = false;
     let discardClient = false;
 
-    const flush = async () => {
-      if (batch.length === 0) return;
-      await client.query(
-        `
-        INSERT INTO supamail_live_uids (uid)
-        SELECT DISTINCT unnest($1::bigint[])
-        ON CONFLICT DO NOTHING
-        `,
-        [batch.splice(0, batch.length)]
-      );
-    };
-
-    try {
-      await client.query("DROP TABLE IF EXISTS pg_temp.supamail_live_uids");
-      await client.query(
-        "CREATE TEMP TABLE supamail_live_uids (uid bigint PRIMARY KEY) ON COMMIT PRESERVE ROWS"
-      );
-
-      for await (const uid of liveUids) {
-        liveUidCount += 1;
-        if (options.progress) options.progress.providerUidsSeen += 1;
-        batch.push(uid);
-        if (batch.length >= batchSize) await flush();
-      }
-      await flush();
-
-      if (liveUidCount === 0 && options.failIfEmpty) {
-        throw new Error(options.emptyError ?? `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`);
-      }
-
+    // One bounded write per transaction, under the folder generation it proves.
+    const writeBatch = async (sql: string, values: unknown[]): Promise<number> => {
       await client.query("BEGIN");
       inTransaction = true;
       const generation = await client.query<{ uidvalidity: string | null }>(
@@ -3822,64 +3755,122 @@ export class MirrorRepository {
       if (Number(generation.rows[0]?.uidvalidity) !== uidValidity) {
         throw new Error(`Reconcile lost folder generation ${folder.id}`);
       }
+      const result = await client.query<{ count: string }>(sql, values);
+      await client.query("COMMIT");
+      inTransaction = false;
+      return Number(result.rows[0].count);
+    };
+    const writeAll = async (sql: string, values: unknown[]): Promise<number> => {
+      let total = 0;
+      for (;;) {
+        const written = await writeBatch(sql, values);
+        total += written;
+        if (written < writeBatchSize) return total;
+      }
+    };
 
-      const markedResult = await client.query<{ count: string }>(
-        `
+    try {
+      await client.query("DROP TABLE IF EXISTS pg_temp.supamail_live_uids");
+      await client.query(
+        `CREATE TEMP TABLE supamail_live_uids (
+           uid bigint PRIMARY KEY,
+           in_window boolean NOT NULL
+         ) ON COMMIT PRESERVE ROWS`
+      );
+      for (let i = 0; i < folderUids.length; i += batchSize) {
+        const batch = folderUids.slice(i, i + batchSize);
+        await client.query(
+          `INSERT INTO supamail_live_uids (uid, in_window)
+           SELECT * FROM unnest($1::bigint[], $2::boolean[])
+           ON CONFLICT DO NOTHING`,
+          [batch, batch.map((uid) => windowUids.has(uid))]
+        );
+      }
+      const staged = await client.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM supamail_live_uids"
+      );
+      const providerUidCount = Number(staged.rows[0].count);
+      if (providerUidCount !== options.expectedCount) {
+        throw new IncompleteUidListError(
+          folder.path,
+          `UID SEARCH returned ${providerUidCount} UIDs but SELECT reported ${options.expectedCount ?? "an unknown number of"} messages`
+        );
+      }
+
+      const markedCount = await writeAll(`
         WITH marked AS (
           UPDATE public.imap_messages m
           SET deleted_in_provider = true,
               provider_deleted_at = now(),
               deleted_reason = 'RECONCILE_MISSING'
-          WHERE m.account_id = $1
-            AND m.folder_path = $2
-            AND m.uidvalidity = $3
-            AND m.deleted_in_provider = false
-            AND m.window_status = 'IN_WINDOW'
-            AND NOT EXISTS (
-              SELECT 1
-              FROM supamail_live_uids live
-              WHERE live.uid = m.uid
-            )
+          WHERE m.id IN (
+            SELECT row.id
+            FROM public.imap_messages row
+            WHERE row.account_id = $1
+              AND row.folder_path = $2
+              AND row.uidvalidity = $3
+              AND row.uid < $4
+              AND row.deleted_in_provider = false
+              AND NOT EXISTS (
+                SELECT 1 FROM supamail_live_uids live WHERE live.uid = row.uid
+              )
+            LIMIT $5
+          )
           RETURNING m.id
         )
         SELECT count(*)::text AS count FROM marked
-        `,
-        [accountId, folder.path, uidValidity]
-      );
+      `, [accountId, folder.path, uidValidity, uidBound, writeBatchSize]);
 
-      // Spec §10.7 step 3: server has UIDs we don't have a live row for.
+      // UIDs are never reused within one UIDVALIDITY, so a listed UID proves the
+      // message is still in the folder. Revive only reconcile's own tombstones.
+      const revivedCount = await writeAll(`
+        WITH revived AS (
+          UPDATE public.imap_messages m
+          SET deleted_in_provider = false,
+              provider_deleted_at = NULL,
+              deleted_reason = NULL
+          WHERE m.id IN (
+            SELECT row.id
+            FROM public.imap_messages row
+            JOIN supamail_live_uids live ON live.uid = row.uid AND NOT live.in_window
+            WHERE row.account_id = $1
+              AND row.folder_path = $2
+              AND row.uidvalidity = $3
+              AND row.deleted_in_provider = true
+              AND row.deleted_reason = 'RECONCILE_MISSING'
+            LIMIT $4
+          )
+          RETURNING m.id
+        )
+        SELECT count(*)::text AS count FROM revived
+      `, [accountId, folder.path, uidValidity, writeBatchSize]);
+
+      // Spec §10.7 step 3: live-window UIDs without a live row.
       // Caller fetches metadata for these and upserts (closes the gap).
       const missingResult = await client.query<{ uid: string }>(
         `
         SELECT live.uid::text AS uid
         FROM supamail_live_uids live
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM public.imap_messages m
-          WHERE m.account_id = $1
-            AND m.folder_path = $2
-            AND m.uidvalidity = $3
-            AND m.uid = live.uid
-            AND m.deleted_in_provider = false
-        )
-          AND $5::boolean
+        WHERE live.in_window
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.imap_messages m
+            WHERE m.account_id = $1
+              AND m.folder_path = $2
+              AND m.uidvalidity = $3
+              AND m.uid = live.uid
+              AND m.deleted_in_provider = false
+          )
         ORDER BY live.uid DESC
         LIMIT $4
         `,
-        [
-          accountId,
-          folder.path,
-          uidValidity,
-          RECONCILE_MISSING_UID_LIMIT + 1,
-          options.findMissingInDb !== false
-        ]
+        [accountId, folder.path, uidValidity, RECONCILE_MISSING_UID_LIMIT + 1]
       );
 
-      await client.query("COMMIT");
-      inTransaction = false;
       return {
-        markedCount: Number(markedResult.rows[0].count),
-        liveUidCount,
+        markedCount,
+        revivedCount,
+        providerUidCount,
         missingInDbUids: missingResult.rows
           .slice(0, RECONCILE_MISSING_UID_LIMIT)
           .map((row) => Number(row.uid)),
