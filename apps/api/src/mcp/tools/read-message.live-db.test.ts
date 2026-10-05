@@ -262,6 +262,45 @@ liveDb("read_message tool live DB", () => {
     expect(res.body_next_offset).toBeNull();
   });
 
+  it("lists the live stored copies that share the message's active delivery key", async () => {
+    await seedMessage({ uid: 4, subject: "Project kickoff", fromEmail: "alice@acme.com", ageDays: 1 });
+    await seedMessage({ uid: 5, subject: "Project kickoff", fromEmail: "alice@acme.com", ageDays: 1 });
+    await pool.query("UPDATE public.imap_messages SET deleted_in_provider = true WHERE id = $1", [idByUid.get(5)]);
+    const run = await pool.query<{ id: string }>(
+      `
+      INSERT INTO public.imap_thread_runs (
+        account_id, algorithm_version, mode, status, stage, completed_at, activated_at, requested_by
+      )
+      VALUES ($1, 1, 'initial', 'active', 'ready', now(), now(), 'read-message-live-test')
+      RETURNING id
+      `,
+      [accountId]
+    );
+    for (const [uid, deliveryKey] of [[1, "1"], [4, "1"], [5, "1"], [2, "2"]] as const) {
+      await pool.query(
+        `
+        INSERT INTO public.imap_thread_assignments (
+          run_id, message_id, account_id, delivery_key, conversation_id,
+          assignment_method, confidence, algorithm_version, input_hash, generation, evidence
+        )
+        VALUES ($1, $2, $3, $4, $5, 'standalone', 'high', 1, $6, 1, '{}'::jsonb)
+        `,
+        [run.rows[0].id, idByUid.get(uid), accountId, deliveryKey.repeat(64), `thread_${"b".repeat(32)}`, String(uid).repeat(64)]
+      );
+    }
+    await pool.query(
+      `INSERT INTO public.imap_thread_state (account_id, active_run_id) VALUES ($1, $2)
+       ON CONFLICT (account_id) DO UPDATE SET active_run_id = EXCLUDED.active_run_id`,
+      [accountId, run.rows[0].id]
+    );
+
+    const copied = await runReadMessage(pool, { message_id: idByUid.get(1)! });
+    const single = await runReadMessage(pool, { message_id: idByUid.get(2)! });
+    if ("error" in copied || "error" in single) throw new Error("unexpected error envelope");
+    expect(copied.duplicate_message_ids).toEqual([idByUid.get(4)]);
+    expect(single).not.toHaveProperty("duplicate_message_ids");
+  });
+
   it("returns the full available cleaned body", async () => {
     const messageId = idByUid.get(2)!;
     const body = "x".repeat(40_000) + "END MARKER";
