@@ -595,7 +595,8 @@ program
 // Organize mutations (email-002, ADR 0018). Non-destructive verbs (mark/star/
 // move) need no --confirm; destructive verbs (delete/hard-delete, folder delete)
 // refuse without --confirm. All emit JSON, addressing the message by mirror id and
-// acting on IMAP by UID; the next sync reconciles the mirror.
+// acting on IMAP by UID; flag changes and removed source rows are written through
+// to the mirror at once, and the next sync mirrors the rest.
 program
   .command("flag <messageId>")
   .description("Add/remove IMAP flags on a message (e.g. seen, flagged) — non-destructive")

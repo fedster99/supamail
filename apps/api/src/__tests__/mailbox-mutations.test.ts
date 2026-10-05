@@ -14,7 +14,8 @@ const M_INBOX = "1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b";
  * runs under a per-folder lock with a UIDVALIDITY guard, (2) the flag short-names
  * map to IMAP system flags, (3) move/trash/expunge act by UID, (4) thread fan-out
  * resolves every live member and applies the verb to each, (5) folder CRUD is
- * account-scoped. We never guess a mirror write — the next sync reconciles.
+ * account-scoped, (6) a confirmed move/delete tombstones exactly its source row
+ * (ADR 0034). We never guess a destination row — the next sync mirrors it.
  */
 
 describe("toImapFlag", () => {
@@ -58,7 +59,8 @@ const repo = vi.hoisted(() => ({
   getMessage: vi.fn(),
   getAccount: vi.fn(),
   applyMessageFlags: vi.fn(async () => ["\\Seen"] as string[]),
-  markFoldersForReconcile: vi.fn(async () => undefined)
+  markFoldersForReconcile: vi.fn(async () => undefined),
+  markMessageRemovedByProvider: vi.fn(async (_target: unknown) => undefined)
 }));
 
 // MailboxMutator.connect is intercepted via vi.spyOn (the real lib functions call
@@ -73,6 +75,7 @@ vi.mock("../repository.js", () => ({
     getAccount = repo.getAccount;
     applyMessageFlags = repo.applyMessageFlags;
     markFoldersForReconcile = repo.markFoldersForReconcile;
+    markMessageRemovedByProvider = repo.markMessageRemovedByProvider;
   }
 }));
 
@@ -108,6 +111,9 @@ beforeEach(() => {
   repo.getAccount.mockResolvedValue(account);
   repo.applyMessageFlags.mockResolvedValue(["\\Seen"]);
 });
+
+/** The exact physical identity of the mocked source row. */
+const SOURCE_ROW = { messageId: M1, accountId: "acc-1", folderPath: "INBOX", uidValidity: 100, uid: 42 };
 
 describe("setMessageFlags", () => {
   it("STOREs +Seen by UID for mark-read and logs out", async () => {
@@ -191,6 +197,35 @@ describe("moveMessage", () => {
     expect(result).toMatchObject({ fromFolder: "INBOX", toFolder: "Archive", newUid: 99 });
   });
 
+  it("tombstones the source row after the provider confirms the move", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    const { moveMessage } = await import("../mailbox-mutations.js");
+    await moveMessage({} as never, config, M1, "Archive");
+    expect(repo.markMessageRemovedByProvider).toHaveBeenCalledExactlyOnceWith(SOURCE_ROW);
+    expect(mutator.move.mock.invocationCallOrder[0]).toBeLessThan(
+      repo.markMessageRemovedByProvider.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("is a no-op when the message already lives in the destination", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    const { moveMessage } = await import("../mailbox-mutations.js");
+    const result = await moveMessage({} as never, config, M1, "INBOX");
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", toFolder: "INBOX", newUid: 42 });
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(mutator.move).not.toHaveBeenCalled();
+    expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
+    expect(repo.markMessageRemovedByProvider).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing to the mirror when the provider move fails", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    mutator.move.mockRejectedValueOnce(new Error("MOVE failed"));
+    const { moveMessage } = await import("../mailbox-mutations.js");
+    await expect(moveMessage({} as never, config, M1, "Archive")).rejects.toThrow(/MOVE failed/);
+    expect(repo.markMessageRemovedByProvider).not.toHaveBeenCalled();
+  });
+
   it("rejects an empty destination", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { moveMessage } = await import("../mailbox-mutations.js");
@@ -205,10 +240,15 @@ describe("deleteMessage", () => {
     const result = await deleteMessage({} as never, config, M1, {});
     expect(mutator.move).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), "Trash");
     expect(mutator.expunge).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ mode: "trash", trashFolder: "Trash" });
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", mode: "trash", trashFolder: "Trash" });
     expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX", "Trash"]);
     expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
       mutator.move.mock.invocationCallOrder[0]
+    );
+    // The confirmed move tombstones exactly the source row.
+    expect(repo.markMessageRemovedByProvider).toHaveBeenCalledExactlyOnceWith(SOURCE_ROW);
+    expect(mutator.move.mock.invocationCallOrder[0]).toBeLessThan(
+      repo.markMessageRemovedByProvider.mock.invocationCallOrder[0]
     );
   });
 
@@ -218,6 +258,7 @@ describe("deleteMessage", () => {
     const result = await deleteMessage({} as never, config, M1, {});
     expect(mutator.move).not.toHaveBeenCalled();
     expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
+    expect(repo.markMessageRemovedByProvider).not.toHaveBeenCalled();
     expect(result).toMatchObject({ mode: "trash", trashFolder: "Trash" });
   });
 
@@ -227,11 +268,41 @@ describe("deleteMessage", () => {
     const result = await deleteMessage({} as never, config, M1, { hard: true });
     expect(mutator.expunge).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }));
     expect(mutator.move).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ mode: "expunge", trashFolder: null });
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", mode: "expunge", trashFolder: null });
     expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX"]);
     expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
       mutator.expunge.mock.invocationCallOrder[0]
     );
+    // The confirmed EXPUNGE tombstones exactly the source row.
+    expect(repo.markMessageRemovedByProvider).toHaveBeenCalledExactlyOnceWith(SOURCE_ROW);
+    expect(mutator.expunge.mock.invocationCallOrder[0]).toBeLessThan(
+      repo.markMessageRemovedByProvider.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("writes nothing to the mirror when the provider EXPUNGE fails", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    mutator.expunge.mockRejectedValueOnce(new Error("EXPUNGE failed"));
+    const { deleteMessage } = await import("../mailbox-mutations.js");
+    await expect(deleteMessage({} as never, config, M1, { hard: true })).rejects.toThrow(/EXPUNGE failed/);
+    expect(repo.markMessageRemovedByProvider).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["hard", { hard: true }, { mode: "expunge", trashFolder: null }],
+    ["trash", {}, { mode: "trash", trashFolder: "Trash" }]
+  ])("still succeeds after a confirmed %s delete when the mirror write fails", async (_name, opts, expected) => {
+    repo.getMessage.mockResolvedValue(message());
+    repo.markMessageRemovedByProvider.mockRejectedValueOnce(new Error("db down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { deleteMessage } = await import("../mailbox-mutations.js");
+    const result = await deleteMessage({} as never, config, M1, opts);
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", ...expected });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("removal_write_through_failed"));
+    // The folders were already due, so reconcile remains the fallback.
+    expect(repo.markFoldersForReconcile).toHaveBeenCalled();
+    expect(mutator.logout).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });
 
@@ -404,6 +475,22 @@ describe("setThreadFlags / moveThread fan-out", () => {
     expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
       mutator.move.mock.invocationCallOrder[0]
     );
+    expect(repo.markMessageRemovedByProvider).toHaveBeenCalledTimes(100);
+  });
+
+  it("moveThread tombstones each moved member as it goes and skips members already there", async () => {
+    const rows = members(3);
+    rows[1] = { ...rows[1], folder_path: "Archive" };
+    const pool = poolReturningMembers(rows);
+    // The 3rd member's MOVE fails: the 1st member's tombstone is already written.
+    mutator.move
+      .mockResolvedValueOnce({ uidMap: new Map() })
+      .mockRejectedValueOnce(new Error("MOVE failed"));
+    const { moveThread } = await import("../mailbox-mutations.js");
+    await expect(moveThread(pool, config, M1, "Archive")).rejects.toThrow(/MOVE failed/);
+    expect(repo.markMessageRemovedByProvider).toHaveBeenCalledExactlyOnceWith({
+      messageId: "msg-1", accountId: "acc-1", folderPath: "INBOX", uidValidity: 100, uid: 1
+    });
   });
 });
 

@@ -71,6 +71,8 @@ Sent APPENDs (ADR 0017) are unchanged and still insert no row.
 - The new draft shows in `listDrafts` at once. Deletes stay
   provider-authoritative (ADR 0018), so after an update the replaced draft can
   also show until reconcile, as it did before this change.
+  *Superseded by ADR 0034:* the confirmed delete tombstones the replaced draft's
+  row at once, so its id is not found after the update.
 - `headers_synced_count` counts the row once. Sync's later re-read finds the
   existing row and does not count it again.
 

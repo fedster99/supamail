@@ -64,6 +64,9 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   that are currently tracked; an intentionally untracked destination such as
   Trash is not a live-lane failure. Other moves and deletes converge when the
   next UID reconcile runs.
+  Update (ADR 0034): a confirmed move or delete now also marks its exact source
+  row `PROVIDER_DELETED` at once, so the old id is not found. The destination
+  row still comes only from sync.
 - **Destructive verbs require server capabilities** so a fallback can never run a
   blanket EXPUNGE. Hard delete (EXPUNGE) requires `UIDPLUS` (UID-scoped EXPUNGE);
   move requires `MOVE` or `UIDPLUS` (native move, or COPY + UID-scoped EXPUNGE). If

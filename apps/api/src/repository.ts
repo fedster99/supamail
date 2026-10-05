@@ -3632,6 +3632,35 @@ export class MirrorRepository {
   }
 
   /**
+   * Tombstone the one row whose UID the provider just confirmed removing from its
+   * folder: our own UID EXPUNGE, or a MOVE that took it to another folder (ADR 0034).
+   * Within one UIDVALIDITY a UID is never reused, so the write is final at any
+   * window status; PROVIDER_DELETED keeps it out of purge, as RECONCILE_MISSING
+   * would.
+   */
+  async markMessageRemovedByProvider(target: {
+    accountId: string;
+    folderPath: string;
+    uidValidity: number;
+    uid: number;
+  }): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE public.imap_messages
+      SET deleted_in_provider = true,
+          provider_deleted_at = now(),
+          deleted_reason = 'PROVIDER_DELETED'
+      WHERE account_id = $1
+        AND folder_path = $2
+        AND uidvalidity = $3
+        AND uid = $4
+        AND deleted_in_provider = false
+      `,
+      [target.accountId, target.folderPath, target.uidValidity, target.uid]
+    );
+  }
+
+  /**
    * Mark a message's body fetch as attempted without storing a body. Used when a UID
    * moved out (MessageMovedError) for a non-IN_WINDOW row: unlike IN_WINDOW rows,
    * HISTORICAL/EXPIRED rows are never re-observed and reconcile is IN_WINDOW-only, so
