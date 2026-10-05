@@ -89,7 +89,8 @@ touch bodies, so a denormalized flag would leak soft-deleted bodies into search.
 - **Tier 0 / Tier 1 (this migration, mandatory, 100% pure Postgres):** weighted FTS,
   `pg_trgm` substring/identifier matching, `btree_gin` account-scoped GIN, structured
   b-tree predicates, two-factor relevance ranking (lexical × recency × email-signal
-  prior), `ts_headline` snippets, and an honest `sync_trust` block. Dependencies:
+  prior), `ts_headline` snippets, and an honest `sync_trust` block (since ADR 0038, read results carry
+  `accounts` and the full report is `get_sync_status`). Dependencies:
   `unaccent`, `pg_trgm`, `btree_gin` only. Deterministic, zero external services.
 - **Tier 2 (opt-in, self-gated):** a separate `imap_message_embeddings` table + HNSW
   index, created **only if** the `vector` extension is already installed. The pure

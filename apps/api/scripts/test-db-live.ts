@@ -116,6 +116,7 @@ async function main(): Promise<void> {
       "src/mcp/tools/read-message.live-db.test.ts",
       "src/mcp/tools/read-thread.live-db.test.ts",
       "src/mcp/tools/list-folders.live-db.test.ts",
+      "src/mcp/tools/get-sync-status.live-db.test.ts",
       "src/mcp/tools/draft-reply.live-db.test.ts"
     ], env);
 

@@ -559,11 +559,11 @@ liveDb("read_thread live DB", () => {
     expect(out.messages.map((message) => message.message_id)).not.toContain(idByUid.get(5));
   });
 
-  it("returns a sync_trust block", async () => {
+  it("names the account read", async () => {
     const out = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId });
     expect(isResult(out)).toBe(true);
     if (!isResult(out)) return;
-    expect(out.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);
+    expect(out.accounts.map((a) => a.account_id)).toEqual([accountId]);
   });
 
   it("returns a not_found error for an unknown message_id", async () => {

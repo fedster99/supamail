@@ -204,7 +204,19 @@ export interface SearchResult {
   duplicate_message_ids?: string[];
 }
 
-export interface SyncTrustAccount {
+/** Why a mailbox cannot give a complete answer: its first sync is still
+ *  running, or sync is stopped (connection broken) or paused. */
+export type ReadAccountNotice = "first_sync_in_progress" | "sync_stopped" | "sync_paused";
+
+/** A Mailbox Account a read result came from. `notice` appears only when the
+ *  mailbox cannot give a complete answer. */
+export interface ReadAccount {
+  account_id: string;
+  account_email: string;
+  notice?: ReadAccountNotice;
+}
+
+export interface SyncStatusAccount {
   account_id: string;
   account_email: string;
   sync_state: string;
@@ -219,15 +231,16 @@ export interface SyncTrustAccount {
 }
 
 /**
- * Honest completeness signal. `fully_synced` is true only when every searched
- * account is HEALTHY, not initial-syncing, not backfilling, and at 100% live
- * body coverage — so an agent never silently trusts a partial mirror.
+ * The full sync report `get_sync_status` returns. `fully_synced` is true only
+ * when every account is HEALTHY, not initial-syncing, not backfilling, and at
+ * 100% live body coverage.
  */
-export interface SyncTrust {
+export interface SyncStatus {
+  summary: string;
   fully_synced: boolean;
   results_may_be_incomplete: boolean;
   degraded_reasons: string[];
-  accounts: SyncTrustAccount[];
+  accounts: SyncStatusAccount[];
 }
 
 export interface SearchResponse {
@@ -238,7 +251,7 @@ export interface SearchResponse {
     returned: number;
     has_more: boolean;
   };
-  sync_trust: SyncTrust;
+  accounts: ReadAccount[];
   parsed_query: {
     free_text: string;
     filters: SearchFilter[];

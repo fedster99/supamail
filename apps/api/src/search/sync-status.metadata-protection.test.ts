@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import type { MetadataProtectionAdapter } from "../metadata-protection.js";
-import { buildSyncTrust } from "./sync-trust.js";
+import { buildReadAccounts, buildSyncStatus } from "./sync-status.js";
 
-test("sync trust reveals the Mailbox Account email through the injected adapter", async () => {
+test("account names reveal the Mailbox Account email through the injected adapter", async () => {
   const accountId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const envelope = Buffer.from("ciphertext");
   const adapter: MetadataProtectionAdapter = {
@@ -43,10 +43,16 @@ test("sync trust reveals the Mailbox Account email through the injected adapter"
     })
   };
 
-  const trust = await buildSyncTrust(
-    db as unknown as Parameters<typeof buildSyncTrust>[0],
+  const status = await buildSyncStatus(
+    db as unknown as Parameters<typeof buildSyncStatus>[0],
     [accountId],
     adapter
   );
-  assert.equal(trust.accounts[0]?.account_email, "owner@example.test");
+  assert.equal(status.accounts[0]?.account_email, "owner@example.test");
+  const accounts = await buildReadAccounts(
+    db as unknown as Parameters<typeof buildReadAccounts>[0],
+    [accountId],
+    adapter
+  );
+  assert.deepEqual(accounts, [{ account_id: accountId, account_email: "owner@example.test" }]);
 });

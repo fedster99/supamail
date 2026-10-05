@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closePool, getPool } from "../db.js";
 import { deliveryKeys } from "../delivery-identity.js";
-import { searchMessages } from "../search/index.js";
+import { buildSyncStatus, searchMessages } from "../search/index.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
 const liveDb = LIVE_DB_AVAILABLE ? describe : describe.skip;
@@ -245,8 +245,8 @@ liveDb("search layer live DB", () => {
        VALUES ($1, 'Live', '/', '2099-01-01T00:00:00Z')`,
       [accountId]
     );
-    const response = await searchMessages(pool, { q: "invoice", accounts: [accountId] });
-    expect(response.sync_trust.accounts[0].last_sync_at).toBe("2099-01-01T00:00:00.000Z");
+    const status = await buildSyncStatus(pool, [accountId]);
+    expect(status.accounts[0].last_sync_at).toBe("2099-01-01T00:00:00.000Z");
   });
 
   it("never returns a soft-deleted body even when its term matches", async () => {
@@ -319,9 +319,9 @@ liveDb("search layer live DB", () => {
     expect(excluded.results.every((r) => r.score === null)).toBe(true);
   });
 
-  it("reports a sync-trust block for the searched account", async () => {
+  it("names the searched account without sync detail", async () => {
     const response = await searchMessages(pool, { q: "report", accounts: [accountId] });
-    expect(response.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);
-    expect(typeof response.sync_trust.results_may_be_incomplete).toBe("boolean");
+    expect(response.accounts.map((a) => a.account_id)).toEqual([accountId]);
+    expect(response).not.toHaveProperty("sync_trust");
   });
 });

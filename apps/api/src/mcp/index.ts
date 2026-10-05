@@ -3,6 +3,7 @@ import type { ToolDefinition, ToolEntry } from "./shared.js";
 import { readMessageEntry, runReadMessage } from "./tools/read-message.js";
 import { readThreadEntry, runReadThread } from "./tools/read-thread.js";
 import { listFoldersEntry, runListFolders } from "./tools/list-folders.js";
+import { getSyncStatusEntry, runGetSyncStatus } from "./tools/get-sync-status.js";
 import { draftReplyEntry, runDraftReply } from "./tools/draft-reply.js";
 
 export * from "./shared.js";
@@ -11,7 +12,7 @@ export { MCP_INSTRUCTIONS } from "./instructions.js";
 // Re-export each tool's run-function so the CLI and any remote transport can wire
 // to the same handlers the registry runs (one source of truth). Tool definitions
 // are reachable via TOOLS[i].definition, so they are not re-exported here.
-export { runReadMessage, runReadThread, runListFolders, runDraftReply };
+export { runReadMessage, runReadThread, runListFolders, runGetSyncStatus, runDraftReply };
 
 /**
  * The single tool registry (ADR 0014: one read-tool contract). The stdio server
@@ -20,7 +21,7 @@ export { runReadMessage, runReadThread, runListFolders, runDraftReply };
  *
  * search_email is the canonical ranked search, kept untouched — we wrap the
  * existing `searchEmailToolDefinition` + `runSearchTool` rather than reimplement.
- * The other four tools (read_message, read_thread, list_folders, draft_reply)
+ * The other tools (read_message, read_thread, list_folders, get_sync_status, draft_reply)
  * plug in from `./tools/*`, each contributing a ready-made `ToolEntry`.
  */
 export const TOOLS: ToolEntry[] = [
@@ -31,5 +32,6 @@ export const TOOLS: ToolEntry[] = [
   readMessageEntry,
   readThreadEntry,
   listFoldersEntry,
+  getSyncStatusEntry,
   draftReplyEntry
 ];

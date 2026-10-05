@@ -7,7 +7,7 @@ describe("MCP agent guidance", () => {
   it("describes the public tool surface without prescribing a workflow", () => {
     const messageId = "00000000-0000-4000-8000-000000000001";
     expect(MCP_INSTRUCTIONS).toContain("read-only access to synced email");
-    expect(MCP_INSTRUCTIONS).toContain("search_email, read_message, read_thread, list_folders, and draft_reply");
+    expect(MCP_INSTRUCTIONS).toContain("search_email, read_message, read_thread, list_folders, get_sync_status, and draft_reply");
     expect(MCP_INSTRUCTIONS).toContain("grouped by conversation by default");
     expect(MCP_INSTRUCTIONS).toContain("1 to 10 message_ids");
     expect(MCP_INSTRUCTIONS).toContain("25 results by default and at most 100");
@@ -25,7 +25,9 @@ describe("MCP agent guidance", () => {
     expect(MCP_INSTRUCTIONS).toContain("oldest mirrored message keeps quoted content");
     expect(MCP_INSTRUCTIONS).toContain("batch thread errors use the same fields in the affected thread entry");
     expect(MCP_INSTRUCTIONS).toContain("cannot send, save drafts, move, delete, flag, or otherwise change mail");
-    expect(MCP_INSTRUCTIONS).toContain("Read results include sync_trust");
+    expect(MCP_INSTRUCTIONS).toContain("Read results name their accounts");
+    expect(MCP_INSTRUCTIONS).toContain("get_sync_status reports each mailbox's sync state");
+    expect(MCP_INSTRUCTIONS).not.toContain("sync_trust");
     expect(MCP_INSTRUCTIONS).not.toContain("Use the fewest");
     expect(MCP_INSTRUCTIONS).not.toContain("Start with");
     expect(MCP_INSTRUCTIONS).not.toContain("Do not read every");

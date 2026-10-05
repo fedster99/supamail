@@ -3,7 +3,7 @@ import type { WindowStatus } from "../types.js";
 import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
-import { buildSyncTrust } from "./sync-trust.js";
+import { buildReadAccounts } from "./sync-status.js";
 import { hasFolderFilter, resolveFolderFilters, type FolderRow } from "./rules.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
 import {
@@ -189,7 +189,7 @@ export async function searchMessages(
       rows = result.rows;
     }
 
-    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
+    const accounts = await buildReadAccounts(client, accountIds, metadataProtection);
     await client.query("COMMIT");
 
     const hasMore = rows.length > limit;
@@ -200,7 +200,7 @@ export async function searchMessages(
     return {
       results,
       page: { limit, offset, returned: results.length, has_more: hasMore },
-      sync_trust: syncTrust,
+      accounts,
       parsed_query: { free_text: freeText, filters: resolvedFilters, sort, warnings },
       timing_ms: { total: Date.now() - startedAt }
     };

@@ -5,7 +5,7 @@ import { formatZodIssues } from "../../errors.js";
 import {
   loadMessageAttachments,
   mapMessageRow,
-  syncTrustFor,
+  readAccountsFor,
   toolError,
   withReadOnlyTx,
   type MessageDetail,
@@ -13,7 +13,7 @@ import {
   type ToolDefinition,
   type ToolEntry
 } from "../shared.js";
-import type { SyncTrust } from "../../search/index.js";
+import type { ReadAccount } from "../../search/index.js";
 import {
   METADATA_PROTECTED_FIELDS,
   plaintextMetadataProtection,
@@ -96,7 +96,8 @@ export const readMessageDefinition: ToolDefinition = {
     "are archive rows that update less often. duplicate_message_ids lists other stored copies of " +
     "this email, to move or flag every copy. include_quoted=true retains the quoted reply tail and " +
     "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
-    "mirrored (metadata only). Always attaches a sync_trust block describing mirror completeness. " +
+    "mirrored (metadata only). Names its account; a notice appears only when that mailbox cannot " +
+    "give a complete answer. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
@@ -156,7 +157,7 @@ export async function runReadMessage(
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: ReadMessageOptions = {}
-): Promise<(MessageDetail & { sync_trust: SyncTrust }) | ReturnType<typeof toolError>> {
+): Promise<(MessageDetail & { accounts: ReadAccount[] }) | ReturnType<typeof toolError>> {
   const parsed = readMessageRequestSchema.safeParse(args);
   if (!parsed.success) {
     return toolError(
@@ -247,9 +248,9 @@ export async function runReadMessage(
     includeBodyRange: true
   });
   if (row.duplicate_message_ids?.length) detail.duplicate_message_ids = row.duplicate_message_ids;
-  const sync_trust = await syncTrustFor(pool, [row.account_id], metadataProtection);
+  const accounts = await readAccountsFor(pool, [row.account_id], metadataProtection);
 
-  return { ...detail, sync_trust };
+  return { ...detail, accounts };
 }
 
 /** The registry entry the server and safety test both read. */

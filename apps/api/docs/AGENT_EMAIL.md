@@ -38,7 +38,7 @@ repository and database placeholders:
 The process communicates only over stdin/stdout. It does not open a remote
 listener; remote deployments provide their own transport and authentication.
 
-## The five tools
+## The six tools
 
 | Tool | Purpose | Key params |
 | --- | --- | --- |
@@ -46,6 +46,7 @@ listener; remote deployments provide their own transport and authentication.
 | `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each valid distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100) |
 | `read_message` | One message with its full available cleaned body, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false`, optional `body_offset`, optional positive `max_body_chars` |
 | `list_folders` | Synced folders, including empty ones, with total/unread counts and their sums. | `account?` |
+| `get_sync_status` | Each mailbox's sync state, last sync, progress, and a one-line summary. | `account?` |
 | `draft_reply` | Produce (never send) a ready-to-send reply. | `source_message_id`, `body`, `body_format=plain` (or `html`), `reply_all=false` |
 
 ## The ID model
@@ -119,21 +120,22 @@ These capabilities are not exposed in v1:
   (filename, mime type, size, disposition) is mirrored; the bytes are not.
 - **No mutations.** No labels, flags, moves, deletes, marking read, or scheduling.
 
-## What `sync_trust` means
+## Accounts and sync status
 
-Every successful read result attaches a `sync_trust` block describing how
-complete the mirror is for the accounts you touched. In a batch thread response,
-each successful entry carries its own block inside `result`; error entries do not.
-The mirror fills incrementally (initial sync, then history backfill, then bodies),
-so a result set can be a partial view.
+Every successful read result names the Mailbox Accounts it came from in
+`accounts` (`account_id`, `account_email`). In a batch thread response, each
+successful entry carries its own `accounts` inside `result`. An account carries a
+`notice` only when it cannot give a complete answer: `first_sync_in_progress`,
+`sync_stopped` (the connection is broken), or `sync_paused`. A delayed but
+syncing mailbox, or one still storing older mail, gets no notice.
 
-`sync_trust` reports, per account: `sync_state`, whether initial sync or a
-historical backfill is in progress, and live/historical completeness percentages.
-The top-level `fully_synced` is true only when every searched account is HEALTHY,
-not initial-syncing, not backfilling, and at 100% live coverage;
-`results_may_be_incomplete` and `degraded_reasons` spell out why when it is not.
-
-`results_may_be_incomplete=true` means the returned mirror view may be partial.
+`get_sync_status` returns the full report on request: per account `sync_state`,
+last sync time, whether initial sync or a historical backfill is in progress, and
+live/historical completeness percentages, plus `summary`, `fully_synced`,
+`results_may_be_incomplete`, and `degraded_reasons`. `fully_synced` is true only
+when every account is HEALTHY, not initial-syncing, not backfilling, and at 100%
+live coverage. It reads every recent message's body state, so it is a separate
+call rather than part of each read.
 
 ## Errors
 

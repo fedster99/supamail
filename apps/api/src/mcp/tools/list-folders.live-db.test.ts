@@ -23,7 +23,7 @@ interface SeedMessage {
 interface ListFoldersOk {
   folders: Array<{ account_id: string; path: string; special_use: string | null; status: string | null; total: number; unread: number }>;
   totals: { total: number; unread: number };
-  sync_trust: { accounts: Array<{ account_id: string }>; results_may_be_incomplete: boolean };
+  accounts: Array<{ account_id: string; account_email: string; notice?: string }>;
 }
 
 liveDb("list_folders tool live DB", () => {
@@ -301,10 +301,10 @@ liveDb("list_folders tool live DB", () => {
     expect(rerun.folders).toEqual(before.folders);
   });
 
-  it("attaches a sync_trust block for the scoped account", async () => {
+  it("names the scoped account without sync detail", async () => {
     const res = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
-    expect(res.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);
-    expect(typeof res.sync_trust.results_may_be_incomplete).toBe("boolean");
+    expect(res.accounts).toEqual([{ account_id: accountId, account_email: ACCOUNT_EMAIL, notice: "first_sync_in_progress" }]);
+    expect(res).not.toHaveProperty("sync_trust");
   });
 
   it("aggregates across all accounts when account is omitted (folder rows keep account_id)", async () => {

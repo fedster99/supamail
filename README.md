@@ -196,10 +196,11 @@ pnpm --filter @supamail/api exec tsx src/cli.ts search "from:alice@example.com i
 pnpm --filter @supamail/api exec tsx src/cli.ts message <message-id>
 pnpm --filter @supamail/api exec tsx src/cli.ts thread <message-id>
 pnpm --filter @supamail/api exec tsx src/cli.ts folders --account <account-id>
+pnpm --filter @supamail/api exec tsx src/cli.ts sync-status
 ```
 
-The MCP server exposes five agent tools: `search_email`, `read_message`,
-`read_thread`, `list_folders`, and `draft_reply`. It uses local stdio transport,
+The MCP server exposes six agent tools: `search_email`, `read_message`,
+`read_thread`, `list_folders`, `get_sync_status`, and `draft_reply`. It uses local stdio transport,
 reads the same `DATABASE_URL`, and has no remote listener or send capability.
 
 `read_thread` accepts one message seed or a batch of up to ten `message_ids`,

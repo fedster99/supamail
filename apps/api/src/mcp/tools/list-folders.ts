@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { formatZodIssues } from "../../errors.js";
-import { syncTrustFor, toolError, withReadOnlyTx } from "../shared.js";
+import { readAccountsFor, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
@@ -11,7 +11,7 @@ import {
 /**
  * `list_folders` — the agent's "orient" tool. Reads every tracked folder row
  * with its stored live message and unread counts, sums the listed folders into
- * totals, and attaches the same honest `sync_trust` signal as search.
+ * totals, and names the accounts listed, like every read tool.
  * READ-ONLY: a single SELECT over folder rows, nothing else.
  *
  * Counts (spec I1/I4) are kept exact in `imap_folder_message_counts` by
@@ -41,7 +41,7 @@ interface FolderRow {
 interface ListFoldersResponse {
   folders: FolderRow[];
   totals: { total: number; unread: number };
-  sync_trust: Awaited<ReturnType<typeof syncTrustFor>>;
+  accounts: Awaited<ReturnType<typeof readAccountsFor>>;
 }
 
 /** The MCP tool definition (literal JSON Schema), mirroring `search_email`'s shape. */
@@ -55,7 +55,8 @@ export const listFoldersDefinition: ToolDefinition = {
     "A folder excluded from sync is listed only while it still holds mirrored mail. Each folder carries its IMAP " +
     "special_use (e.g. \\Inbox, \\Sent, \\Trash) and sync status. Scope to one account UUID via " +
     "`account`, or omit to aggregate across all accounts (each folder row keeps its account_id). " +
-    "Includes a sync_trust block describing how complete the mirror is. READ-ONLY: never sends, " +
+    "Names the accounts listed; a notice appears only when a mailbox cannot give a complete " +
+    "answer. READ-ONLY: never sends, " +
     "deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
@@ -76,9 +77,8 @@ export const listFoldersDefinition: ToolDefinition = {
 };
 
 /**
- * Read tracked folder rows with their stored counts in one read-only
- * transaction; sync_trust runs in its own (matching the search layer's
- * pattern). Empty result is not an error.
+ * Read folder rows with their stored counts in one read-only transaction;
+ * the account names come from their own. Empty result is not an error.
  */
 export async function runListFolders(
   pool: PgPool,
@@ -122,13 +122,13 @@ export async function runListFolders(
     unread: folders.reduce((sum, folder) => sum + folder.unread, 0)
   };
 
-  const sync_trust = await syncTrustFor(
+  const accounts = await readAccountsFor(
     pool,
     accountId ? [accountId] : null,
     metadataProtection
   );
 
-  return { folders, totals, sync_trust };
+  return { folders, totals, accounts };
 }
 
 /** Registry entry; the server reads `definition` for tools/list and runs `handler` for tools/call. */
