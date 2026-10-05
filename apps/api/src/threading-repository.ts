@@ -60,6 +60,29 @@ const LIVE_RUN_STATUSES = ["building", "ready", "active", "standby"] as const;
 const DEFAULT_COMPARISON_STATEMENT_TIMEOUT_MS = 30_000;
 const ALERTABLE_THREADING_RETRY_ATTEMPTS = 10;
 const RUN_FAIRNESS_SCHEDULE = ["active", "active", "standby", "active", "building"] as const;
+// Superseded standbys and terminal runs are kept this many days by default.
+const THREAD_RUN_RETENTION_DAYS = 30;
+const THREAD_RUN_PRUNE_ASSIGNMENT_BATCH = 2_000;
+
+function runRetentionDays(value: number | undefined): number {
+  return Math.max(1, Math.min(
+    Number.isFinite(value) ? Math.floor(Number(value)) : THREAD_RUN_RETENTION_DAYS,
+    3_650
+  ));
+}
+
+/** A run that is terminal, older than the window, and not referenced by any state pointer. */
+function prunableRunSql(ageParam: string): string {
+  return `run.status IN ('archived', 'failed', 'rolled_back')
+    AND coalesce(run.superseded_at, run.completed_at, run.updated_at)
+          < now() - (${ageParam}::integer * interval '1 day')
+    AND NOT EXISTS (
+      SELECT 1 FROM public.imap_thread_state state
+      WHERE state.active_run_id = run.id
+         OR state.previous_run_id = run.id
+         OR state.building_run_id = run.id
+    )`;
+}
 const DELIVERY_EVIDENCE_BRIDGE_REASON = "delivery_evidence_bridge";
 
 type RunStatus = "building" | "ready" | "active" | "standby" | "archived" | "failed" | "rolled_back";
@@ -2013,6 +2036,9 @@ export class ThreadingRepository {
           if (previousRunId) {
             const previous = await this.loadRun(client, previousRunId);
             if (!previous || previous.account_id !== accountId) throw new Error("Previous threading run is unavailable");
+            if (previous.status !== "standby") {
+              throw new Error("Standby run was retired after its retention window; rebuild instead of rolling back");
+            }
             this.requireExecutor(previous, "standby");
             const clock = await client.query<{ revision: string }>(
               `SELECT coalesce((
@@ -2221,66 +2247,123 @@ export class ThreadingRepository {
   }
 
   /**
-   * Remove old projection state in bounded batches while retaining immutable
-   * operations and comparison certificates for audit.
+   * Retire rollback standbys superseded more than `olderThanDays` ago (default
+   * 30, the same window as terminal-run pruning). A standby is a full, caught-up
+   * copy of the previous projection, kept only so the latest activation can be
+   * rolled back. After the window it becomes an archived run: its pending work is
+   * removed and the state pointer cleared, so rollback is refused and
+   * pruneTerminalRuns deletes it. It keeps its superseded_at. An account whose
+   * threading lock is busy is skipped until the next pass.
+   */
+  async retireExpiredStandbyRuns(
+    options: { olderThanDays?: number } = {}
+  ): Promise<{ runsRetired: number; accountsFailed: number }> {
+    const olderThanDays = runRetentionDays(options.olderThanDays);
+    const due = await this.pool.query<{ account_id: string; run_id: string }>(
+      `SELECT state.account_id, state.previous_run_id AS run_id
+       FROM public.imap_thread_state state
+       JOIN public.imap_thread_runs run ON run.id = state.previous_run_id
+       WHERE run.status = 'standby'
+         AND run.superseded_at < now() - ($1::integer * interval '1 day')
+       ORDER BY run.superseded_at, run.id`,
+      [olderThanDays]
+    );
+    let runsRetired = 0;
+    let accountsFailed = 0;
+    for (const row of due.rows) {
+      // One account's failure must not stop retirement (or the prune that
+      // follows) for the others; it is retried on the next pass.
+      const retired = await this.withAccountLock(row.account_id, async (client) => {
+        await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+        try {
+          const state = await this.lockState(client, row.account_id);
+          const archived = state.previous_run_id === row.run_id
+            ? (await client.query(
+                `UPDATE public.imap_thread_runs SET status = 'archived'
+                 WHERE id = $1 AND status = 'standby'
+                   AND superseded_at < now() - ($2::integer * interval '1 day')`,
+                [row.run_id, olderThanDays]
+              )).rowCount ?? 0
+            : 0;
+          if (archived > 0) {
+            await this.clearRunWork(client, row.run_id);
+            await client.query(
+              "UPDATE public.imap_thread_state SET previous_run_id = NULL WHERE account_id = $1",
+              [row.account_id]
+            );
+          }
+          await client.query("COMMIT");
+          return archived > 0;
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        }
+      }).catch(() => {
+        accountsFailed += 1;
+        return false;
+      });
+      if (retired) runsRetired += 1;
+    }
+    return { runsRetired, accountsFailed };
+  }
+
+  /**
+   * Remove old terminal projection runs while retaining immutable operations and
+   * comparison certificates for audit. A run's assignments (and, by cascade, its
+   * closure edges) are deleted in statements of `assignmentBatchSize` rows
+   * (default 2,000) until one deletes nothing, so a full-mailbox run never becomes
+   * one long transaction, even when another pruner works on the same run. Every
+   * statement re-checks that the run is still terminal and unreferenced.
    */
   async pruneTerminalRuns(options: {
     olderThanDays?: number;
     batchSize?: number;
+    assignmentBatchSize?: number;
   } = {}): Promise<{ runsDeleted: number; assignmentsDeleted: number }> {
-    const olderThanDays = Math.max(1, Math.min(
-      Number.isFinite(options.olderThanDays) ? Math.floor(Number(options.olderThanDays)) : 30,
-      3_650
+    const olderThanDays = runRetentionDays(options.olderThanDays);
+    const assignmentBatchSize = Math.max(1, Math.min(
+      Number.isFinite(options.assignmentBatchSize)
+        ? Math.floor(Number(options.assignmentBatchSize))
+        : THREAD_RUN_PRUNE_ASSIGNMENT_BATCH,
+      THREAD_RUN_PRUNE_ASSIGNMENT_BATCH
     ));
     const batchSize = Math.max(1, Math.min(
       Number.isFinite(options.batchSize) ? Math.floor(Number(options.batchSize)) : 100,
       1_000
     ));
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const candidates = await client.query<{ id: string }>(
-        `SELECT run.id
-         FROM public.imap_thread_runs run
-         WHERE run.status IN ('archived', 'failed', 'rolled_back')
-           AND coalesce(run.superseded_at, run.completed_at, run.updated_at)
-                 < now() - ($1::integer * interval '1 day')
-           AND NOT EXISTS (
-             SELECT 1 FROM public.imap_thread_state state
-             WHERE state.active_run_id = run.id
-                OR state.previous_run_id = run.id
-                OR state.building_run_id = run.id
-           )
-         ORDER BY coalesce(run.superseded_at, run.completed_at, run.updated_at), run.id
-         LIMIT $2
-         FOR UPDATE SKIP LOCKED`,
-        [olderThanDays, batchSize]
-      );
-      const runIds = candidates.rows.map((row) => row.id);
-      if (runIds.length === 0) {
-        await client.query("COMMIT");
-        return { runsDeleted: 0, assignmentsDeleted: 0 };
+    const candidates = await this.pool.query<{ id: string }>(
+      `SELECT run.id
+       FROM public.imap_thread_runs run
+       WHERE ${prunableRunSql("$1")}
+       ORDER BY coalesce(run.superseded_at, run.completed_at, run.updated_at), run.id
+       LIMIT $2`,
+      [olderThanDays, batchSize]
+    );
+    let runsDeleted = 0;
+    let assignmentsDeleted = 0;
+    for (const { id } of candidates.rows) {
+      for (;;) {
+        const deleted = await this.pool.query(
+          `DELETE FROM public.imap_thread_assignments
+           WHERE run_id = $1 AND message_id IN (
+             SELECT assignment.message_id
+             FROM public.imap_thread_assignments assignment
+             JOIN public.imap_thread_runs run ON run.id = assignment.run_id
+             WHERE assignment.run_id = $1 AND ${prunableRunSql("$3")}
+             LIMIT $2
+           )`,
+          [id, assignmentBatchSize, olderThanDays]
+        );
+        assignmentsDeleted += deleted.rowCount ?? 0;
+        if ((deleted.rowCount ?? 0) === 0) break;
       }
-      const assignmentCount = await client.query<{ count: string }>(
-        `SELECT count(*)::text AS count
-         FROM public.imap_thread_assignments WHERE run_id = ANY($1::uuid[])`,
-        [runIds]
+      const run = await this.pool.query(
+        `DELETE FROM public.imap_thread_runs run WHERE run.id = $1 AND ${prunableRunSql("$2")}`,
+        [id, olderThanDays]
       );
-      const deleted = await client.query(
-        "DELETE FROM public.imap_thread_runs WHERE id = ANY($1::uuid[])",
-        [runIds]
-      );
-      await client.query("COMMIT");
-      return {
-        runsDeleted: deleted.rowCount ?? 0,
-        assignmentsDeleted: Number(assignmentCount.rows[0]?.count ?? 0)
-      };
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
+      runsDeleted += run.rowCount ?? 0;
     }
+    return { runsDeleted, assignmentsDeleted };
   }
 
   /** Durable disagreement certificate for quality-gating a shadow run before activation. */

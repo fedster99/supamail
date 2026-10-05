@@ -7,6 +7,7 @@ const defaultThreading = vi.hoisted(() => ({
   assertRolloutCompatibility: vi.fn(async () => undefined),
   listAccountsNeedingWork: vi.fn(async () => [] as string[]),
   drainAccount: vi.fn(),
+  retireExpiredStandbyRuns: vi.fn(async () => ({ runsRetired: 0, accountsFailed: 0 })),
   pruneTerminalRuns: vi.fn(async () => ({ runsDeleted: 0, assignmentsDeleted: 0 }))
 }));
 
@@ -33,6 +34,7 @@ vi.mock("../threading-repository.js", () => ({
     listAccountsNeedingWork = defaultThreading.listAccountsNeedingWork;
     assertRolloutCompatibility = defaultThreading.assertRolloutCompatibility;
     drainAccount = defaultThreading.drainAccount;
+    retireExpiredStandbyRuns = defaultThreading.retireExpiredStandbyRuns;
     pruneTerminalRuns = defaultThreading.pruneTerminalRuns;
   }
 }));
@@ -158,6 +160,11 @@ describe("worker Sent polling cadence", () => {
     try {
       await vi.advanceTimersByTimeAsync(0);
       expect(syncDueAccounts).toHaveBeenCalledTimes(1);
+      // Startup retention retires expired rollback standbys before pruning,
+      // so one pass removes a standby that just aged out.
+      expect(defaultThreading.retireExpiredStandbyRuns).toHaveBeenCalled();
+      expect(defaultThreading.retireExpiredStandbyRuns.mock.invocationCallOrder[0])
+        .toBeLessThan(defaultThreading.pruneTerminalRuns.mock.invocationCallOrder[0]);
 
       await vi.advanceTimersByTimeAsync(30_000);
       expect(syncDueSentFolders).toHaveBeenCalledTimes(1);
