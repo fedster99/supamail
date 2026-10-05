@@ -1,6 +1,6 @@
 # ADR 0034: A Confirmed Move Or Delete Tombstones Its Source Row
 
-Status: Accepted
+Status: Accepted; amended by ADR 0037 for moves the server confirms with COPYUID
 
 Date: 2026-10-05
 

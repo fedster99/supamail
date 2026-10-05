@@ -191,6 +191,7 @@ export async function runReadMessage(
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
+        AND m.deleted_in_provider = false
       `,
       [request.message_id]
     );
@@ -201,7 +202,11 @@ export async function runReadMessage(
   });
 
   if (!row) {
-    return toolError("not_found", `No mirrored message with id ${request.message_id}.`, "call search_email to locate the message id");
+    return toolError(
+      "not_found",
+      `No mirrored message with id ${request.message_id}. It may have been moved or deleted.`,
+      "call search_email to locate the message id"
+    );
   }
 
   const revealed = await revealMetadataRecord(

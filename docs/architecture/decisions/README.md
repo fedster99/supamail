@@ -41,6 +41,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0034-confirmed-removal-tombstones-source-row.md`: A provider-confirmed move or delete marks exactly its source row `PROVIDER_DELETED` at once, so the old id is not found; a failed mirror write never fails the action, and the destination row still comes from sync.
 - `0035-typed-invalid-input-errors.md`: Send and draft entry points parse their input with one shared compose schema and throw a readable `InvalidInputError` (HTTP 400) before provider work, never a fake delivery failure; the content fetch's UIDVALIDITY change is `MailboxConflictError` (409).
 - `0036-trigger-maintained-folder-counts.md`: Statement triggers on `imap_messages` keep each folder's live message and unread counts exact in their own table, in the writer's transaction, so `list_folders` reads one row per folder instead of counting messages.
+- `0037-confirmed-move-keeps-message-id.md`: A move the server confirms with COPYUID moves the mirror row with the message, so it keeps its id and everything keyed by it; deletes still tombstone; by-id reads never serve a tombstoned row.
 
 ## Status Values
 
