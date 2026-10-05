@@ -4,8 +4,8 @@ import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
-import { resolveFolderFilters, type FolderRow } from "./rules.js";
-import type { SearchFilter, SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
+import { hasFolderFilter, resolveFolderFilters, type FolderRow } from "./rules.js";
+import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
 import {
   plaintextMetadataProtection,
   type MetadataProtectionAdapter
@@ -53,10 +53,6 @@ function intersectAccounts(a: string[] | null, b: string[] | null): string[] | n
   if (b === null) return a;
   const set = new Set(b);
   return a.filter((id) => set.has(id));
-}
-
-function hasFolderFilter(filter: SearchFilter): boolean {
-  return filter.kind === "folder" || (filter.kind === "or" && filter.filters.some(hasFolderFilter));
 }
 
 function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult {

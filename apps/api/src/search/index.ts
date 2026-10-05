@@ -3,6 +3,7 @@ export { parseQuery, parseTextTerms, filtersFromStructured, tokenize } from "./p
 export {
   filenameGlob,
   filetypeMatch,
+  hasFolderFilter,
   normalizeMessageId,
   resolveFolder,
   resolveFolderFilters,

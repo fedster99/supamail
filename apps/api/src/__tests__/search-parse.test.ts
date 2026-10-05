@@ -506,7 +506,8 @@ describe("shared search rules", () => {
     const folders = [
       dot("INBOX", "\\Inbox"), dot("INBOX.Sent"), dot("INBOX.Sent Messages"), dot("INBOX.INBOX.Sent", "\\Sent"),
       dot("INBOX.INBOX.Legal"), dot("INBOX.INBOX.Legal.2025"), dot("INBOX.Archive", "\\Archive"),
-      slash("INBOX", "\\Inbox"), slash("Sent Messages", "\\Sent"), slash("Projects/Acme"), slash("[Gmail]/Sent Mail")
+      slash("INBOX", "\\Inbox"), slash("Sent Messages", "\\Sent"), slash("Projects/Acme"), slash("[Gmail]/Sent Mail"),
+      slash("Projects/Inbox"), slash("Acme"), slash("Clients/Acme")
     ];
     const paths = (value: string): string[] => resolveFolder(value, folders).folders.map((folder) => `${folder.account_id}:${folder.path}`);
 
@@ -523,13 +524,20 @@ describe("shared search rules", () => {
       expect(paths("inbox/inbox/legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
       expect(paths("Legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
       expect(paths("[Gmail]/Sent Mail")).toEqual(["a-slash:[Gmail]/Sent Mail"]);
-      expect(paths("Acme")).toEqual(["a-slash:Projects/Acme"]);
+      // Where a folder has the full path, a last name elsewhere does not count.
+      expect(paths("Acme")).toEqual(["a-slash:Acme"]);
+      expect(paths("Legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
+    });
+
+    it("never takes a subfolder named Inbox for the Inbox", () => {
+      expect(paths("INBOX")).toEqual(["a-dot:INBOX", "a-slash:INBOX"]);
+      expect(paths("Projects/Inbox")).toEqual(["a-slash:Projects/Inbox"]);
     });
 
     it("reads a trailing /* or delimiter and * as the folders below a full path", () => {
       expect(paths("INBOX.INBOX.*")).toEqual(["a-dot:INBOX.INBOX.Sent", "a-dot:INBOX.INBOX.Legal", "a-dot:INBOX.INBOX.Legal.2025"]);
       expect(paths("INBOX/INBOX/*")).toEqual(paths("INBOX.INBOX.*"));
-      expect(paths("Projects/*")).toEqual(["a-slash:Projects/Acme"]);
+      expect(paths("Projects/*")).toEqual(["a-slash:Projects/Acme", "a-slash:Projects/Inbox"]);
       // An inner * is part of the path.
       expect(paths("Projects/*/Notes")).toEqual([]);
     });
