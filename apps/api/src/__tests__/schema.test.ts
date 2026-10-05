@@ -68,6 +68,10 @@ const folderMessageCountsMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0028_folder_message_counts.sql"
 );
+const activeAssignmentsViewNoBarrierMigrationPath = resolve(
+  process.cwd(),
+  "supabase/migrations/public/0029_active_assignments_view_no_barrier.sql"
+);
 const threadingClosureEdgesMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0026_threading_closure_edges.sql"
@@ -202,9 +206,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0028_folder_message_counts");
+    expect(version).toBe("0029_active_assignments_view_no_barrier");
     expect(manifest).toEqual({
-      schemaVersion: "0028_folder_message_counts",
+      schemaVersion: "0029_active_assignments_view_no_barrier",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -233,7 +237,8 @@ describe("initial schema", () => {
         { id: "0025_qresync_cursor", file: "0025_qresync_cursor.sql" },
         { id: "0026_threading_closure_edges", file: "0026_threading_closure_edges.sql" },
         { id: "0027_folder_unchanged_proof", file: "0027_folder_unchanged_proof.sql" },
-        { id: "0028_folder_message_counts", file: "0028_folder_message_counts.sql" }
+        { id: "0028_folder_message_counts", file: "0028_folder_message_counts.sql" },
+        { id: "0029_active_assignments_view_no_barrier", file: "0029_active_assignments_view_no_barrier.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -289,6 +294,15 @@ describe("initial schema", () => {
 
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS last_verified_unchanged_at timestamptz");
     expect(sql).not.toMatch(/last_synced_at\s*=|last_full_reconcile_at\s*=/);
+  });
+
+  it("drops the security barrier from the active-assignments view so joins flatten", async () => {
+    const sql = await readFile(activeAssignmentsViewNoBarrierMigrationPath, "utf8");
+
+    // The view stays security-invoker, so table row-level security still
+    // applies; only the barrier goes, and RESET is idempotent.
+    expect(sql).toContain("ALTER VIEW public.imap_thread_active_assignments RESET (security_barrier)");
+    expect(sql).not.toContain("security_invoker = false");
   });
 
   it("keeps folder message counts with statement triggers and a one-time backfill", async () => {

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0028_folder_message_counts",
+  "schemaVersion": "0029_active_assignments_view_no_barrier",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -112,6 +112,10 @@
     {
       "id": "0028_folder_message_counts",
       "file": "0028_folder_message_counts.sql"
+    },
+    {
+      "id": "0029_active_assignments_view_no_barrier",
+      "file": "0029_active_assignments_view_no_barrier.sql"
     }
   ]
 }
