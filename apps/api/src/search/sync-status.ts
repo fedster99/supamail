@@ -17,6 +17,7 @@ interface AccountRow extends ProtectedMetadataColumns {
 }
 
 interface StatusRow extends AccountRow {
+  historical_backfill_mode: string;
   sync_state_reason: string | null;
   last_sync_finished_at: Date | null;
   currently_syncing: boolean;
@@ -96,10 +97,15 @@ type StatusReason =
   | "sync_delayed"
   | "headers_incomplete"
   | "bodies_incomplete"
-  | "historical_backfill_in_progress";
+  | "historical_backfill_in_progress"
+  | "historical_bodies_incomplete";
 
-/** Every way one mailbox can fall short of fully synced, in summary order. */
-function accountReasons(account: SyncStatusAccount): StatusReason[] {
+/**
+ * Every way one mailbox can fall short of fully synced, in summary order. Older
+ * bodies are fetched after the header backfill ends, so they are their own
+ * reason, and only when the mailbox stores older bodies at all.
+ */
+function accountReasons(account: SyncStatusAccount, storesOlderBodies: boolean): StatusReason[] {
   const reasons: StatusReason[] = [];
   if (account.sync_state === "BROKEN") reasons.push("sync_stopped");
   if (account.sync_state === "PAUSED") reasons.push("sync_paused");
@@ -108,6 +114,9 @@ function accountReasons(account: SyncStatusAccount): StatusReason[] {
   if (account.live_headers_complete_pct < 100) reasons.push("headers_incomplete");
   if (account.live_bodies_complete_pct < 100) reasons.push("bodies_incomplete");
   if (account.historical_backfill_in_progress) reasons.push("historical_backfill_in_progress");
+  if (storesOlderBodies && account.historical_bodies_complete_pct < 100) {
+    reasons.push("historical_bodies_incomplete");
+  }
   return reasons;
 }
 
@@ -125,7 +134,8 @@ function describeAccount(account: SyncStatusAccount, reasons: StatusReason[]): s
       case "sync_delayed": return "sync delayed";
       case "headers_incomplete": return `${account.live_headers_complete_pct}% of recent mail stored`;
       case "bodies_incomplete": return `${account.live_bodies_complete_pct}% of recent bodies stored`;
-      default: return `storing older mail, ${account.historical_bodies_complete_pct}% done`;
+      case "historical_backfill_in_progress": return "storing older mail";
+      default: return `${account.historical_bodies_complete_pct}% of older bodies stored`;
     }
   });
   return `${email}: ${notes.join(", ")}.`;
@@ -145,6 +155,7 @@ export async function buildSyncStatus(
   const result = await db.query<StatusRow>(
     `
     SELECT ${ACCOUNT_COLUMNS},
+      a.historical_backfill_mode,
       a.sync_state_reason,
       -- A live-notification sync of one folder does not finish an account sync, but
       -- it does bring that folder up to date, so the newest folder sync counts too.
@@ -184,7 +195,10 @@ export async function buildSyncStatus(
     historical_bodies_complete_pct: row.historical_bodies_complete_pct
   }));
 
-  const perAccount = accounts.map((account) => ({ account, reasons: accountReasons(account) }));
+  const perAccount = accounts.map((account, index) => ({
+    account,
+    reasons: accountReasons(account, rows[index].historical_backfill_mode === "metadata_and_bodies")
+  }));
   const behind = perAccount.filter(({ reasons }) => reasons.length > 0);
   const summary = accounts.length === 0
     ? "No mailboxes matched."

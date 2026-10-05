@@ -73,7 +73,7 @@ export async function runGetSyncStatus(
     return toolError(
       "not_found",
       `No mailbox with account id ${accountId}.`,
-      "Call list_folders for valid account ids, or omit account to report every mailbox."
+      "Use an account_id from a read result, or omit account to report every mailbox."
     );
   }
   return status;
