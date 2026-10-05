@@ -2,8 +2,6 @@ import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { MailboxConflictError, NotFoundError, throwIfAborted } from "./errors.js";
-
-export { MailboxConflictError };
 import {
   closeImap,
   connectAbortableImap,
@@ -24,6 +22,9 @@ import {
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
 import { isMirrorId } from "./mirror-id.js";
+
+// Moved to errors.ts so content fetches can throw it too; still exported here.
+export { MailboxConflictError };
 
 /**
  * Mechanical IMAP write verbs — mark read/unread, star/unstar, move, trash,

@@ -1,7 +1,7 @@
 import { SEND_REQUEST_SCHEMA, parseInput } from "./compose-schema.js";
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
-import { AccountBusyError, throwIfAborted } from "./errors.js";
+import { AccountBusyError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
 import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
@@ -71,7 +71,7 @@ export async function sendMessage(
     if (error instanceof SmtpDeliveryError) throw error;
     if (
       !deliveryConfirmed &&
-      ["AbortError", "AccountBusyError", "HostValidationError", "InvalidInputError"].includes(
+      ["AbortError", "AccountBusyError", "HostValidationError", "InvalidInputError", "NotFoundError"].includes(
         error instanceof Error ? error.name : ""
       )
     ) {
@@ -97,7 +97,7 @@ async function sendMessageAttempt(
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(req.accountId);
   if (!account) {
-    throw new Error(`Account not found: ${req.accountId}`);
+    throw new NotFoundError(`Account not found: ${req.accountId}`);
   }
 
   const creds = await resolveSmtpCreds(pool, config, account);

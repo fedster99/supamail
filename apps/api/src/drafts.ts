@@ -361,7 +361,7 @@ export async function createDraft(
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(request.accountId);
-  if (!account) throw new Error(`Account not found: ${request.accountId}`);
+  if (!account) throw new NotFoundError(`Account not found: ${request.accountId}`);
 
   const saved = await saveDraft(pool, config, repository, account, request, request.idempotencyKey, options.signal);
   return { accountId: account.id, ...saved };

@@ -34,6 +34,9 @@ dump as the `invalid_input` message.
   sender name, checked in `buildRawMime`, use the same error. The HTTP API maps
   it to 400 `{ error: "invalid_input", message }`. The package root exports it with
   the other typed errors.
+- **An unknown mailbox is `NotFoundError`.** `sendMessage` and `createDraft`
+  throw it for an `accountId` with no account, and `sendMessage` passes it
+  through, so it is a 404 rather than a `not_delivered` delivery outcome.
 - **Addresses are checked loosely**: one `@`, no whitespace, at most 255
   characters. Replies reuse mirrored addresses such as `list+tag=x@…` or
   internationalized mailboxes that a strict validator rejects; the provider keeps

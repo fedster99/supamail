@@ -568,8 +568,9 @@ describe("sendMessage orchestration", () => {
         subject: "Hi",
         body: { format: "plain", text: "Body" }
       }).catch((value) => value);
-    expect(error).toBeInstanceOf(SmtpDeliveryError);
-    expect(error.outcome).toBe("not_delivered");
+    // An unknown mailbox is the caller's mistake, not a delivery outcome.
+    expect(error).not.toBeInstanceOf(SmtpDeliveryError);
+    expect(error.name).toBe("NotFoundError");
     expect(error.message).toMatch(/Account not found/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
   });

@@ -406,7 +406,7 @@ describe("createDraft", () => {
         subject: "s",
         body: { format: "plain", text: "b" }
       })
-    ).rejects.toThrow(/Account not found/);
+    ).rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/Account not found/) });
     expect(mocks.append).not.toHaveBeenCalled();
   });
 
