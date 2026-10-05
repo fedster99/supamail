@@ -205,6 +205,42 @@ class LargeThreadAssignmentEnvelopeAdapter extends OpaqueThreadingAdapter {
   }
 }
 
+/** Waits `ms`, or rejects with the operation's abort reason. */
+function adapterDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Slow evidence reads (the digest upgrade only) and slow assignment writes (the projection). */
+class SlowUpgradeAndProjectionAdapter extends OpaqueThreadingAdapter {
+  override async reveal(
+    context: MetadataProtectionContext,
+    stored: MetadataProtectionProjection,
+    options?: MetadataProtectionOperationOptions
+  ): Promise<MetadataValues> {
+    if (context.kind === "message_evidence") await adapterDelay(70, options?.signal);
+    return super.reveal(context, stored);
+  }
+
+  override async protect(
+    context: MetadataProtectionContext,
+    values: MetadataValues,
+    options?: MetadataProtectionOperationOptions
+  ): Promise<MetadataProtectionProjection> {
+    if (context.kind === "thread_assignment") await adapterDelay(30, options?.signal);
+    return super.protect(context, values);
+  }
+}
+
 class SlowThreadAssignmentAdapter extends OpaqueThreadingAdapter {
   active = 0;
   maxActive = 0;
@@ -2902,16 +2938,17 @@ liveDb("ThreadingRepository live DB", () => {
     expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
   });
 
-  it("upgrades protected v1 evidence digests through the metadata adapter", async () => {
-    const accountId = await createAccount("protected-evidence-digest-upgrade");
-    const adapter = new OpaqueThreadingAdapter();
+  // Delivered copies on a protected account whose envelopes hold mime_evidence_v1 digests.
+  async function storeProtectedV1Copies(
+    accountId: string,
+    label: string,
+    adapter: OpaqueThreadingAdapter,
+    beforeV1: () => Promise<unknown> = async () => undefined
+  ) {
     await markMetadataProtected(accountId);
     const protectedMirror = new MirrorRepository(pool, getConfig(), adapter);
-    const messageIds = await storeDeliveredCopies(
-      accountId,
-      "protected-evidence-digest-upgrade",
-      protectedMirror
-    );
+    const messageIds = await storeDeliveredCopies(accountId, label, protectedMirror);
+    await beforeV1();
     const revealedDigests = async () => Promise.all(messageIds.map(async (messageId) => {
       const row = (await pool.query(
         `SELECT protected_metadata, protected_metadata_version,
@@ -2961,6 +2998,17 @@ liveDb("ThreadingRepository live DB", () => {
       );
     }
     expect(new Set((await revealedDigests()).map((pair) => pair[1])).size).toBe(2);
+    return { messageIds, written, revealedDigests };
+  }
+
+  it("upgrades protected v1 evidence digests through the metadata adapter", async () => {
+    const accountId = await createAccount("protected-evidence-digest-upgrade");
+    const adapter = new OpaqueThreadingAdapter();
+    const { messageIds, written, revealedDigests } = await storeProtectedV1Copies(
+      accountId,
+      "protected-evidence-digest-upgrade",
+      adapter
+    );
 
     const ready = await drainUntilReady(
       accountId,
@@ -2969,6 +3017,34 @@ liveDb("ThreadingRepository live DB", () => {
     );
 
     expect(await revealedDigests()).toEqual(written);
+    expect((await bodyDigests(messageIds))
+      .every((row) => row.structured_evidence_extractor_version === "mime_evidence_v2")).toBe(true);
+    expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
+  });
+
+  it("gives the digest upgrade its own adapter budget, so the projection after it still runs", async () => {
+    const accountId = await createAccount("upgrade-own-budget");
+    const adapter = new SlowUpgradeAndProjectionAdapter();
+    // As in production: a ready run exists, then the v1 digests queue its rework.
+    const { messageIds, written, revealedDigests } = await storeProtectedV1Copies(
+      accountId,
+      "upgrade-own-budget",
+      adapter,
+      () => drainUntilReady(accountId, { batchSize: 2 }, new ThreadingRepository(pool, {
+        metadataProtection: new OpaqueThreadingAdapter()
+      }))
+    );
+    // Each step fits the budget alone (about 70 ms for the upgrade's evidence reads,
+    // 2 x 30 ms for the projection's assignment writes); together they do not.
+    const slowRepository = new ThreadingRepository(pool, {
+      metadataProtection: adapter,
+      metadataProtectionTimeoutMs: 100
+    });
+
+    // One pass upgrades the digests and then projects without a timeout.
+    await slowRepository.drainAccount(accountId, { batchSize: 2, requestedBy: "live-test" });
+    expect(await revealedDigests()).toEqual(written);
+    const ready = await drainUntilReady(accountId, { batchSize: 2 }, slowRepository);
     expect((await bodyDigests(messageIds))
       .every((row) => row.structured_evidence_extractor_version === "mime_evidence_v2")).toBe(true);
     expect(new Set((await projection(ready.runId as string)).map((row) => row.delivery_key)).size).toBe(1);
