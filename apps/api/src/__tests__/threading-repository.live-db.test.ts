@@ -236,7 +236,7 @@ class SlowUpgradeAndProjectionAdapter extends OpaqueThreadingAdapter {
     values: MetadataValues,
     options?: MetadataProtectionOperationOptions
   ): Promise<MetadataProtectionProjection> {
-    if (context.kind === "thread_assignment") await adapterDelay(40, options?.signal);
+    if (context.kind === "thread_assignment") await adapterDelay(30, options?.signal);
     return super.protect(context, values);
   }
 }
@@ -3035,7 +3035,7 @@ liveDb("ThreadingRepository live DB", () => {
       }))
     );
     // Each step fits the budget alone (about 70 ms for the upgrade's evidence reads,
-    // 2 x 40 ms for the projection's assignment writes); together they do not.
+    // 2 x 30 ms for the projection's assignment writes); together they do not.
     const slowRepository = new ThreadingRepository(pool, {
       metadataProtection: adapter,
       metadataProtectionTimeoutMs: 100
