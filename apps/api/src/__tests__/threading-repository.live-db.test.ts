@@ -4765,6 +4765,56 @@ liveDb("ThreadingRepository live DB", () => {
     });
   });
 
+  it("retires a standby after its retention window, refuses its rollback, then prunes it", async () => {
+    const accountId = await createAccount("standby-retention");
+    for (const uid of [1, 2, 3]) {
+      await seedMessage(accountId, {
+        uid,
+        subject: `Standby retention ${uid}`,
+        rfcMessageId: `<standby-retention-${uid}@example.test>`
+      });
+    }
+    const baseline = await drainUntilReady(accountId, { batchSize: 1 });
+    await activateReviewed(repository, accountId, baseline.runId as string);
+    const candidate = await repository.rebuildAccount(accountId, { batchSize: 1, requestedBy: "live-test" });
+    const activation = await activateReviewed(repository, accountId, candidate.runId as string);
+
+    // Inside the window the standby stays a rollback target.
+    expect(await repository.retireExpiredStandbyRuns()).toEqual({ runsRetired: 0 });
+
+    await pool.query(
+      "UPDATE public.imap_thread_runs SET superseded_at = now() - interval '31 days' WHERE id = $1",
+      [baseline.runId]
+    );
+    expect(await repository.retireExpiredStandbyRuns()).toEqual({ runsRetired: 1 });
+    const retired = await pool.query<{ status: string; previous: string | null }>(
+      `SELECT run.status, state.previous_run_id::text AS previous
+       FROM public.imap_thread_runs run, public.imap_thread_state state
+       WHERE run.id = $1 AND state.account_id = $2`,
+      [baseline.runId, accountId]
+    );
+    expect(retired.rows[0]).toEqual({ status: "archived", previous: null });
+
+    await expect(repository.rollbackOperation(
+      accountId,
+      activation.operationId as string,
+      "live-test"
+    )).rejects.toThrow(/Standby run was retired/);
+
+    expect(await repository.pruneTerminalRuns()).toEqual({ runsDeleted: 1, assignmentsDeleted: 3 });
+    const left = await pool.query<{ assignments: string; edges: string; runs: string }>(
+      `SELECT
+         (SELECT count(*)::text FROM public.imap_thread_assignments WHERE run_id = $1) AS assignments,
+         (SELECT count(*)::text FROM public.imap_thread_closure_edges WHERE run_id = $1) AS edges,
+         (SELECT count(*)::text FROM public.imap_thread_runs WHERE id = $1) AS runs`,
+      [baseline.runId]
+    );
+    expect(left.rows[0]).toEqual({ assignments: "0", edges: "0", runs: "0" });
+    const active = await activeProjection(accountId);
+    expect(active).toHaveLength(3);
+    expect(active.every((row) => row.run_id === candidate.runId)).toBe(true);
+  });
+
   it("acknowledges the evidence revision when the only subjectless message is deleted", async () => {
     const accountId = await createAccount("subjectless-delete-clock");
     const messageId = await seedMessage(accountId, {

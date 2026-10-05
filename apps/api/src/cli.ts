@@ -160,7 +160,7 @@ program
   .command("threads-prune")
   .description("Delete old terminal threading projections while retaining audit records")
   .option("--older-than-days <n>", "Minimum terminal age", "30")
-  .option("--batch-size <n>", "Maximum runs deleted in one transaction", "100")
+  .option("--batch-size <n>", "Maximum runs deleted per invocation", "100")
   .option("--confirm", "Required confirmation for projection retention")
   .action(async (options) => {
     if (!options.confirm) {

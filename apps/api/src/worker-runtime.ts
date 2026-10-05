@@ -43,6 +43,7 @@ interface WorkerThreading {
     options?: Pick<DrainThreadingOptions, "activateInitial">
   ): Promise<string[]>;
   drainAccount(accountId: string, options?: DrainThreadingOptions): Promise<ThreadingRunResult>;
+  retireExpiredStandbyRuns?(options?: { olderThanDays?: number }): Promise<{ runsRetired: number }>;
   pruneTerminalRuns?(options?: { olderThanDays?: number; batchSize?: number }): Promise<{
     runsDeleted: number;
     assignmentsDeleted: number;
@@ -484,7 +485,8 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
 
   const logRetention = (
     r: Awaited<ReturnType<MirrorRepository["runRetentionJobs"]>>,
-    threadRuns: { runsDeleted: number; assignmentsDeleted: number } = { runsDeleted: 0, assignmentsDeleted: 0 }
+    threadRuns: { runsDeleted: number; assignmentsDeleted: number } = { runsDeleted: 0, assignmentsDeleted: 0 },
+    standbys: { runsRetired: number } = { runsRetired: 0 }
   ) =>
     console.log(JSON.stringify({
       event: "worker.retention.completed",
@@ -492,14 +494,17 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
       purged: r.purged,
       prunedEvents: r.prunedEvents,
       prunedRuns: r.prunedRuns,
+      threadStandbysRetired: standbys.runsRetired,
       threadRunsDeleted: threadRuns.runsDeleted,
       threadAssignmentsDeleted: threadRuns.assignmentsDeleted
     }));
 
   const runRetention = async () => {
     const retained = await repository.runRetentionJobs();
+    // Retire expired rollback standbys first so the same pass can prune them.
+    const standbys = await threading?.retireExpiredStandbyRuns?.();
     const threadRuns = await threading?.pruneTerminalRuns?.();
-    logRetention(retained, threadRuns);
+    logRetention(retained, threadRuns, standbys);
   };
 
   await runRetention();
