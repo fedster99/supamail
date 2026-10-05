@@ -42,8 +42,11 @@ import { isMirrorId } from "./mirror-id.js";
  * required because the flag-scan sync only re-reads flags within
  * FLAG_DIFF_WINDOW_DAYS, so a change to older mail would otherwise never reconcile.
  * Moves and deletes mark their known source and destination folders due before the
- * provider command. The host can reconcile them immediately after acknowledgement;
- * the periodic sync remains the crash-safe fallback.
+ * provider command. Once the provider confirms the MOVE or EXPUNGE, the source row
+ * is tombstoned at once (ADR 0034): its UID is gone, so the old id can never again
+ * pass as live. The destination copy is never guessed; the host can reconcile the
+ * folders immediately after acknowledgement, and the periodic sync remains the
+ * crash-safe fallback.
  *
  * Destructive verbs require server capabilities so a fallback can never run a
  * blanket EXPUNGE: hard delete requires UIDPLUS (UID-scoped EXPUNGE); move
@@ -329,7 +332,7 @@ export class MailboxMutator {
 }
 
 // ---------------------------------------------------------------------------
-// Library functions: resolve from the repository, act on IMAP, rely on sync.
+// Library functions: resolve from the repository, act on IMAP, write known rows through.
 // ---------------------------------------------------------------------------
 
 export interface FlagChange {
@@ -385,6 +388,24 @@ async function writeFlagsThrough(
 }
 
 /**
+ * Tombstone the source row of a provider-confirmed MOVE or EXPUNGE (ADR 0034). The
+ * provider action already happened, so a mirror failure only logs: the folders are
+ * already due, and the next reconcile tombstones the row instead.
+ */
+async function writeRemovalThrough(repository: MirrorRepository, target: ResolvedMessageTarget): Promise<void> {
+  try {
+    await repository.markMessageRemovedByProvider(target);
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "organize.removal_write_through_failed",
+      messageId: target.messageId,
+      accountId: target.accountId,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+}
+
+/**
  * Apply a flag change to one mirrored message by UID. `add`/`remove` accept the
  * SupaMail short names (`seen`/`flagged`/…), bare keywords, or `\`-prefixed
  * system flags. After a successful STORE the new flags are written through to the
@@ -432,7 +453,8 @@ export interface MoveResult {
 
 /** Move one mirrored message to `destination` by UID. The source and destination
  * are durably due before the provider command so a host can reconcile them after
- * acknowledgement without depending on a prompt IDLE/NOTIFY event. */
+ * acknowledgement without depending on a prompt IDLE/NOTIFY event. The confirmed
+ * move tombstones the source row; the destination row arrives with its sync. */
 export async function moveMessage(
   pool: PgPool,
   config: AppConfig,
@@ -452,13 +474,15 @@ export async function moveMessage(
   await repository.markFoldersForReconcile(account.id, [target.folderPath, destination]);
 
   const mutator = await MailboxMutator.connect(pool, config, account, options);
+  let newUid: number | null;
   try {
     const { uidMap } = await mutator.move(target, destination);
-    const newUid = uidMap?.get(target.uid) ?? null;
-    return { messageId, fromFolder: target.folderPath, toFolder: destination, newUid };
+    newUid = uidMap?.get(target.uid) ?? null;
   } finally {
     await closeImap(mutator);
   }
+  await writeRemovalThrough(repository, target);
+  return { messageId, fromFolder: target.folderPath, toFolder: destination, newUid };
 }
 
 export interface DeleteResult {
@@ -473,8 +497,8 @@ export interface DeleteResult {
 /**
  * Delete one mirrored message. Default ("trash") moves it to the resolved Trash
  * folder (reversible, the safe default). `hard: true` STOREs `\Deleted` and
- * EXPUNGEs the single UID (irreversible). Either way the next sync reconciles the
- * source row as deleted-in-provider.
+ * EXPUNGEs the single UID (irreversible). Either way the confirmed action tombstones
+ * the source row at once, so the id is not found afterwards.
  */
 export async function deleteMessage(
   pool: PgPool,
@@ -492,28 +516,31 @@ export async function deleteMessage(
   const target = toTarget(message);
 
   const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
+  let trashFolder: string | null = null;
   try {
     // The changed folders are durably due before the provider command, as for a move.
     if (options.hard) {
       await repository.markFoldersForReconcile(account.id, [target.folderPath]);
       await mutator.expunge(target);
-      return { messageId, fromFolder: target.folderPath, mode: "expunge", trashFolder: null };
+    } else {
+      const profile = getProviderProfile(account.provider_profile);
+      const mailboxes = await mutator.list();
+      // Resolve Trash via the shared role-keyed resolver: the "trash" role uses its
+      // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
+      trashFolder = resolveSpecialUseFolder(mailboxes, "trash", profile);
+      // Already in Trash → a non-hard delete is a no-op move onto itself; the
+      // message stays where it is, live.
+      if (trashFolder === target.folderPath) {
+        return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
+      }
+      await repository.markFoldersForReconcile(account.id, [target.folderPath, trashFolder]);
+      await mutator.move(target, trashFolder);
     }
-    const profile = getProviderProfile(account.provider_profile);
-    const mailboxes = await mutator.list();
-    // Resolve Trash via the shared role-keyed resolver: the "trash" role uses its
-    // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
-    const trashFolder = resolveSpecialUseFolder(mailboxes, "trash", profile);
-    // Already in Trash → a non-hard delete is a no-op move onto itself; treat as done.
-    if (trashFolder === target.folderPath) {
-      return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
-    }
-    await repository.markFoldersForReconcile(account.id, [target.folderPath, trashFolder]);
-    await mutator.move(target, trashFolder);
-    return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
   } finally {
     await closeImap(mutator);
   }
+  await writeRemovalThrough(repository, target);
+  return { messageId, fromFolder: target.folderPath, mode: options.hard ? "expunge" : "trash", trashFolder };
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +774,8 @@ export async function moveThread(
     for (const target of targets) {
       if (target.folderPath === destination) continue;
       await mutator.move(target, destination);
+      // Per member, so a later member's failure keeps every earlier tombstone.
+      await writeRemovalThrough(repository, target);
       moved.push(target.messageId);
     }
   } finally {

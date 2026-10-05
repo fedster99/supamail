@@ -1,11 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getWindowCutoff, type AppConfig } from "../config.js";
 import { closePool, getPool } from "../db.js";
-import { createDraft, getDraft, listDrafts } from "../drafts.js";
+import { createDraft, deleteDraft, getDraft, listDrafts, updateDraft } from "../drafts.js";
+import { MailboxMutator } from "../mailbox-mutations.js";
 import { MirrorRepository } from "../repository.js";
 import type { ImapFolder } from "../types.js";
 
-// The provider side of a draft save: Drafts answers APPEND with APPENDUID 100/50.
+// The provider side of a draft save: Drafts answers each APPEND with APPENDUID
+// 100/<next UID>, starting at 50.
+const provider = vi.hoisted(() => ({ nextUid: 50, appends: 0 }));
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
   return {
@@ -13,7 +16,10 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
     SentFolderAppender: {
       connect: async () => ({
         list: async () => [{ path: "Drafts", specialUse: "\\Drafts" }],
-        append: async () => ({ uidValidity: 100, uid: 50 }),
+        append: async () => {
+          provider.appends += 1;
+          return { uidValidity: 100, uid: provider.nextUid++ };
+        },
         searchByMessageId: async () => ({ uids: [], uidValidity: 100 }),
         logout: async () => undefined,
         close: () => undefined
@@ -97,7 +103,27 @@ liveDb("draft folder resolution (live DB)", () => {
     await seedMessage({ subject: "Plain inbox", folderPath: "INBOX", uid: 3, body: "inbox body" });
   });
 
+  // The provider side of a draft delete: it confirms every UID EXPUNGE and MOVE.
+  function confirmEveryRemoval(): void {
+    vi.spyOn(MailboxMutator, "connect").mockResolvedValue({
+      list: async () => [{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Trash", specialUse: "\\Trash" }],
+      expunge: async () => true,
+      move: async () => ({ uidMap: null }),
+      logout: async () => undefined,
+      close: () => undefined
+    } as unknown as MailboxMutator);
+  }
+
+  async function removedState(id: string): Promise<{ deleted_in_provider: boolean; deleted_reason: string | null }> {
+    const result = await pool.query<{ deleted_in_provider: boolean; deleted_reason: string | null }>(
+      "SELECT deleted_in_provider, deleted_reason FROM public.imap_messages WHERE id = $1",
+      [id]
+    );
+    return result.rows[0];
+  }
+
   afterAll(async () => {
+    vi.restoreAllMocks();
     if (accountId) await pool.query("DELETE FROM public.imap_accounts WHERE id = $1", [accountId]);
     await closePool();
   });
@@ -202,5 +228,51 @@ liveDb("draft folder resolution (live DB)", () => {
   it("getDraft returns null for a plain (non-draft) inbox message", async () => {
     const id = idBySubject.get("Plain inbox")!;
     expect(await getDraft(pool, config, id)).toBeNull();
+  });
+
+  it("a confirmed hard or Trash draft delete hides the draft at once (ADR 0034)", async () => {
+    confirmEveryRemoval();
+    await seedMessage({ subject: "Hard-deleted draft", folderPath: "Drafts", uid: 70 });
+    await seedMessage({ subject: "Trashed draft", folderPath: "Drafts", uid: 71 });
+    const hardId = idBySubject.get("Hard-deleted draft")!;
+    const trashId = idBySubject.get("Trashed draft")!;
+
+    await deleteDraft(pool, config, hardId, { hard: true });
+    await expect(deleteDraft(pool, config, trashId)).resolves.toMatchObject({ trashFolder: "Trash" });
+
+    for (const id of [hardId, trashId]) {
+      expect(await removedState(id)).toEqual({ deleted_in_provider: true, deleted_reason: "PROVIDER_DELETED" });
+      expect(await getDraft(pool, config, id)).toBeNull();
+    }
+    const listed = (await listDrafts(pool, config, accountId, {})).map((draft) => draft.messageId);
+    expect(listed).not.toContain(hardId);
+    expect(listed).not.toContain(trashId);
+    expect(listed).toContain(idBySubject.get("Folder draft"));
+  });
+
+  it("after an update the replaced id is not found, and reusing it files nothing (ADR 0034)", async () => {
+    confirmEveryRemoval();
+    const input = { to: [{ email: "rcpt@example.test" }], subject: "Revised draft", body: { format: "plain" as const, text: "v2" } };
+    const created = await createDraft(pool, config, { ...input, accountId, subject: "Original draft" });
+    const replacedId = created.messageId!;
+    const updated = await updateDraft(pool, config, replacedId, input);
+    expect(updated).toMatchObject({ replacedMessageId: replacedId, replacedDraftDeleted: true, warnings: [] });
+    expect(updated.messageId).not.toBeNull();
+    expect(updated.messageId).not.toBe(replacedId);
+
+    expect(await removedState(replacedId)).toEqual({ deleted_in_provider: true, deleted_reason: "PROVIDER_DELETED" });
+    expect(await getDraft(pool, config, replacedId)).toBeNull();
+    expect(await getDraft(pool, config, updated.messageId!)).toMatchObject({ subject: "Revised draft" });
+    const listed = (await listDrafts(pool, config, accountId, {})).map((draft) => draft.messageId);
+    expect(listed).toContain(updated.messageId);
+    expect(listed).not.toContain(replacedId);
+
+    const appends = provider.appends;
+    await expect(updateDraft(pool, config, replacedId, input)).rejects.toMatchObject({
+      name: "NotFoundError",
+      message: expect.stringMatching(/already deleted/)
+    });
+    await expect(deleteDraft(pool, config, replacedId)).rejects.toMatchObject({ name: "NotFoundError" });
+    expect(provider.appends).toBe(appends);
   });
 });

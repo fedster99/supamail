@@ -38,6 +38,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0031-host-owned-inbox-idle-wake.md`: Hosts may use one read-only Inbox IDLE session per active Mailbox Account as a low-latency wake hint while polling, reconciliation, and account locking remain authoritative.
 - `0032-shared-idle-all-folder-status-feed.md`: The shared Inbox IDLE session uses bounded STATUS rotations, with an optional strict LIST-STATUS command-reduction layer, to wake authoritative sync for changes in every tracked folder. CONDSTORE deltas and the periodic loop remain safety layers.
 - `0033-saved-draft-mirror-row.md`: A provider-acknowledged draft save writes its mirror row from APPENDUID under the account lock and returns its id at once; sync re-reads the UID and stays authoritative for every server-derived field.
+- `0034-confirmed-removal-tombstones-source-row.md`: A provider-confirmed move or delete marks exactly its source row `PROVIDER_DELETED` at once, so the old id is not found; a failed mirror write never fails the action, and the destination row still comes from sync.
 
 ## Status Values
 
