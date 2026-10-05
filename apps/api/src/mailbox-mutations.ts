@@ -447,7 +447,8 @@ export interface MoveResult {
   messageId: string;
   fromFolder: string;
   toFolder: string;
-  /** Destination UID from UIDPLUS COPYUID when the server provides it, else null. */
+  /** Destination UID from UIDPLUS COPYUID when the server provides it, else null.
+   * A move to the message's own folder is a no-op and returns its current UID. */
   newUid: number | null;
 }
 
@@ -470,6 +471,11 @@ export async function moveMessage(
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId, { requireLive: true });
   const target = toTarget(message);
+  // Already there: a no-op, as in moveThread. Calling the provider anyway could
+  // leave the UID in place, and the write-through would then hide a live row.
+  if (destination === target.folderPath) {
+    return { messageId, fromFolder: target.folderPath, toFolder: destination, newUid: target.uid };
+  }
 
   await repository.markFoldersForReconcile(account.id, [target.folderPath, destination]);
 

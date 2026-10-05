@@ -41,7 +41,8 @@ After the provider confirms the action, `deleteMessage` (hard and Trash),
   destination folder's sync, as before. Until then the message is absent from
   reads rather than shown in the folder it left. This is the state reconcile
   would reach anyway when the destination, such as Trash, is not tracked.
-- A Trash delete of a message already in Trash does nothing, so it writes nothing.
+- A Trash delete of a message already in Trash, or a move to the folder a
+  message is already in, does nothing: no provider command and no write.
 
 ## Consequences
 
@@ -58,7 +59,7 @@ After the provider confirms the action, `deleteMessage` (hard and Trash),
 
 - `mailbox-mutations.test.ts`: hard delete, Trash delete, move, and thread move
   tombstone the exact source row after the provider confirms; a failed provider
-  action or a no-op Trash delete writes nothing; a failed mirror write still
+  action, a no-op Trash delete, or a same-folder move writes nothing; a failed mirror write still
   returns success.
 - `drafts.live-db.test.ts`: against real Postgres, with only IMAP faked, a hard
   and a Trash draft delete tombstone the row with `PROVIDER_DELETED` and drop it

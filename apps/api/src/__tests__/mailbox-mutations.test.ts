@@ -207,6 +207,17 @@ describe("moveMessage", () => {
     );
   });
 
+  it("is a no-op when the message already lives in the destination", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    const { moveMessage } = await import("../mailbox-mutations.js");
+    const result = await moveMessage({} as never, config, M1, "INBOX");
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", toFolder: "INBOX", newUid: 42 });
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(mutator.move).not.toHaveBeenCalled();
+    expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
+    expect(repo.markMessageRemovedByProvider).not.toHaveBeenCalled();
+  });
+
   it("writes nothing to the mirror when the provider move fails", async () => {
     repo.getMessage.mockResolvedValue(message());
     mutator.move.mockRejectedValueOnce(new Error("MOVE failed"));
