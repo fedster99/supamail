@@ -3630,6 +3630,61 @@ export class MirrorRepository {
   }
 
   /**
+   * Move a mirrored row to where the provider just confirmed moving its message: the
+   * destination folder, UIDVALIDITY, and UID from the server's COPYUID (ADR 0037).
+   * The row keeps its id, so everything keyed by it (body, attachments, threading,
+   * host state) stays attached; the destination's next sync then upserts the same
+   * key and updates this row. Only a tracked destination at that UIDVALIDITY
+   * qualifies, and only while no row holds the destination key yet. Returns false,
+   * writing nothing, when it does not qualify; the caller then tombstones the source.
+   */
+  async relocateMovedMessage(
+    source: { messageId: string; accountId: string; folderPath: string; uidValidity: number; uid: number },
+    destination: { folderPath: string; uidValidity: number; uid: number }
+  ): Promise<boolean> {
+    try {
+      const result = await this.pool.query(
+        `
+        UPDATE public.imap_messages message
+        SET folder_id = folder.id,
+            folder_path = folder.path,
+            uidvalidity = $6,
+            uid = $7,
+            deleted_in_provider = false,
+            provider_deleted_at = NULL,
+            deleted_reason = NULL
+        FROM public.imap_folders folder
+        WHERE message.id = $1
+          AND message.account_id = $2
+          AND message.folder_path = $3
+          AND message.uidvalidity = $4
+          AND message.uid = $5
+          AND folder.account_id = message.account_id
+          AND folder.path = $8
+          AND folder.tracked = true
+          AND folder.uidvalidity = $6
+          AND NOT EXISTS (
+            SELECT 1 FROM public.imap_messages taken
+            WHERE taken.account_id = message.account_id
+              AND taken.folder_path = folder.path
+              AND taken.uidvalidity = $6
+              AND taken.uid = $7
+          )
+        `,
+        [
+          source.messageId, source.accountId, source.folderPath, source.uidValidity, source.uid,
+          destination.uidValidity, destination.uid, destination.folderPath
+        ]
+      );
+      return (result.rowCount ?? 0) > 0;
+    } catch (error) {
+      // A sync that mirrored the destination copy between our check and the update.
+      if ((error as { code?: string }).code === "23505") return false;
+      throw error;
+    }
+  }
+
+  /**
    * Tombstone the one row whose UID the provider just confirmed removing from its
    * folder: our own UID EXPUNGE, or a MOVE that took it to another folder (ADR 0034).
    * Within one UIDVALIDITY a UID is never reused, so the write is final at any

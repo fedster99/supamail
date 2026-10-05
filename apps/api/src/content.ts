@@ -321,6 +321,7 @@ export async function listAttachments(
       FROM public.imap_attachments attachment
       JOIN public.imap_messages message ON message.id = attachment.message_id
       WHERE attachment.message_id = $1
+        AND message.deleted_in_provider = false
       ORDER BY NULLIF(regexp_replace(coalesce(attachment.part_number, ''), '[^0-9]', '', 'g'), '')::bigint NULLS LAST,
                attachment.part_number
       `,
@@ -359,6 +360,7 @@ export async function getAttachmentMetadata(
       FROM public.imap_attachments attachment
       JOIN public.imap_messages message ON message.id = attachment.message_id
       WHERE attachment.id = $1
+        AND message.deleted_in_provider = false
       `,
       [attachmentId]
     );
@@ -488,13 +490,16 @@ export async function getRawMime(
   throwIfAborted(options.signal);
   if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
   const stored = await pool.connect();
-  let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean } | undefined;
+  let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean | null } | undefined;
   try {
-    const result = await stored.query<{ raw_mime: Buffer | null; raw_truncated: boolean }>(
+    // Only a live message: a removed row's bytes no longer belong to the mailbox.
+    const result = await stored.query<{ raw_mime: Buffer | null; raw_truncated: boolean | null }>(
       `
-      SELECT raw_mime, raw_truncated
-      FROM public.imap_message_bodies
-      WHERE message_id = $1
+      SELECT b.raw_mime, b.raw_truncated
+      FROM public.imap_messages m
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+      WHERE m.id = $1
+        AND m.deleted_in_provider = false
       `,
       [messageId]
     );
@@ -503,8 +508,9 @@ export async function getRawMime(
     stored.release();
   }
 
-  if (mirrored && mirrored.raw_mime !== null) {
-    return { messageId, raw: mirrored.raw_mime, source: "mirror", truncated: mirrored.raw_truncated };
+  if (!mirrored) throw new NotFoundError(`Message ${messageId} was not found, or was moved or deleted in the mailbox`);
+  if (mirrored.raw_mime !== null) {
+    return { messageId, raw: mirrored.raw_mime, source: "mirror", truncated: mirrored.raw_truncated === true };
   }
 
   // raw_mime not stored (parsed_only) or no body row yet → on-demand FETCH.
@@ -580,6 +586,7 @@ export async function getMessageHeaders(
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.id = $1
+        AND m.deleted_in_provider = false
       `,
       [messageId]
     );
