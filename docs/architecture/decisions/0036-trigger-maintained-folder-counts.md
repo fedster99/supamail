@@ -37,9 +37,10 @@ cannot serve as a live count.
 - Migration `0028` creates the table and backfills it once, under `LOCK TABLE
   imap_messages IN SHARE MODE`, in the same transaction that creates the
   triggers, so no write lands between the count and the first counted change.
-- `list_folders` reads tracked folder rows joined to their counts on
-  `(account_id, path = folder_path)` and sums them for account totals. Empty
-  tracked folders are listed; untracked and missing folders are not. The
+- `list_folders` reads folder rows joined to their counts on
+  `(account_id, path = folder_path)` and sums the listed folders for totals.
+  Every tracked folder is listed, including empty ones; an untracked (excluded
+  or missing) folder is listed while it still holds live mail. The
   `flagged` total is removed: no caller used it, and keeping it would add a
   third counter.
 
@@ -64,7 +65,11 @@ cannot serve as a live count.
   writer's rights and upserts on that key. A write that changes no count does
   not touch the table.
 - Triggers do not fire under `session_replication_role = replica` or for
-  `TRUNCATE`. A restore that bypasses triggers must recompute the counts.
+  `TRUNCATE`, and a data-only restore with triggers on counts restored rows
+  again. After such a restore, recompute in one transaction:
+  `LOCK TABLE imap_messages IN SHARE MODE`, delete every counts row, then insert
+  the migration's backfill query. Hosts that add columns to the counts table
+  fill them in the same insert.
 
 ## Verification
 
@@ -72,8 +77,9 @@ cannot serve as a live count.
   flags, tombstones and restores, a multi-folder move in one statement, and a
   hard delete equal a fresh count for every folder; a count-changing write
   finishes while another transaction holds the folder row locked; an account
-  delete removes its counts; empty tracked folders are listed and untracked
-  ones are not.
+  delete removes its counts; a write that changes no count does not wait on an
+  open count change; empty tracked folders are listed, and untracked ones only
+  while they hold mail.
 - `schema.test.ts`: the migration creates the table, backfills under the lock,
   and creates three statement triggers without touching `imap_folders`.
 - `list-folders.live-db.test.ts` also drops the table, migrates over existing

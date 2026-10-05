@@ -59,7 +59,8 @@ BEGIN
     ) delta;
   END IF;
 
-  -- A statement that changes no count writes nothing.
+  -- A statement that changes no count writes nothing, so it neither waits on a
+  -- counts row nor needs rights on the counts table.
   IF delta_account_ids IS NULL THEN
     RETURN NULL;
   END IF;

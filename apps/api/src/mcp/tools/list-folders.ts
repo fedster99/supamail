@@ -17,8 +17,9 @@ import {
  * Counts (spec I1/I4) are kept exact in `imap_folder_message_counts` by
  * statement triggers on `imap_messages` (migration 0028): soft-deleted rows
  * (`deleted_in_provider = true`) never count, and `unread` excludes the IMAP
- * `\Seen` flag. The join is `(account_id, path = folder_path)`. Excluded and
- * missing folders are untracked and not mirrored, so they are not listed.
+ * `\Seen` flag. The join is `(account_id, path = folder_path)`. Every synced
+ * folder is listed, and an untracked (excluded or missing) folder is listed
+ * while it still holds live mirrored mail.
  */
 
 /** Validated input. `account` scopes to one account UUID; omit for every account. */
@@ -51,7 +52,7 @@ export const listFoldersDefinition: ToolDefinition = {
     "Orient in the mirror: list every synced folder, including empty ones, with its live message " +
     "total and unread count, plus totals (total, unread) summed over the listed folders. Counts " +
     "are over the non-deleted live mirror in Postgres; unread excludes the IMAP \\Seen flag. " +
-    "Folders excluded from sync are not listed. Each folder carries its IMAP " +
+    "A folder excluded from sync is listed only while it still holds mirrored mail. Each folder carries its IMAP " +
     "special_use (e.g. \\Inbox, \\Sent, \\Trash) and sync status. Scope to one account UUID via " +
     "`account`, or omit to aggregate across all accounts (each folder row keeps its account_id). " +
     "Includes a sync_trust block describing how complete the mirror is. READ-ONLY: never sends, " +
@@ -107,7 +108,7 @@ export async function runListFolders(
       LEFT JOIN public.imap_folder_message_counts c
         ON c.account_id = f.account_id
        AND c.folder_path = f.path
-      WHERE f.tracked = true
+      WHERE (f.tracked = true OR c.message_count > 0)
         AND ($1::uuid IS NULL OR f.account_id = $1::uuid)
       ORDER BY f.account_id, f.path
       `,

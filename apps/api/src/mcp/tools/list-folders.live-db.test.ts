@@ -107,6 +107,7 @@ liveDb("list_folders tool live DB", () => {
     await seedFolder("Archive", null, "ACTIVE");
     await seedFolder("Empty", null, "PENDING");
     await seedFolder("[Gmail]/All Mail", "\\All", "ACTIVE", false);
+    await seedFolder("Old Project", null, "ACTIVE", false);
 
     // INBOX: 3 live (2 unread, 1 of those flagged) + 1 soft-deleted unread that must not count.
     await seedMessage({ uid: 1, folder: "INBOX", subject: "Welcome", fromEmail: "a@x.test", flags: ["\\Seen"], ageDays: 1, body: "hi" });
@@ -117,6 +118,9 @@ liveDb("list_folders tool live DB", () => {
     // Sent: 2 live, both read (Sent typically carries \Seen).
     await seedMessage({ uid: 5, folder: "Sent", subject: "Re: hi", fromEmail: ACCOUNT_EMAIL, flags: ["\\Seen"], ageDays: 1, body: "reply" });
     await seedMessage({ uid: 6, folder: "Sent", subject: "Re: hello", fromEmail: ACCOUNT_EMAIL, flags: ["\\Seen", "\\Answered"], ageDays: 2, body: "reply2" });
+
+    // Old Project: excluded after it was synced; its 1 read message is still live.
+    await seedMessage({ uid: 8, folder: "Old Project", subject: "Kickoff", fromEmail: "f@x.test", flags: ["\\Seen"], ageDays: 200 });
 
     // Archive: 1 live unread.
     await seedMessage({ uid: 7, folder: "Archive", subject: "Old thing", fromEmail: "e@x.test", flags: [], ageDays: 100, body: "archived" });
@@ -146,17 +150,18 @@ liveDb("list_folders tool live DB", () => {
     expect(sent?.special_use).toBe("\\Sent");
   });
 
-  it("lists empty tracked folders and never untracked ones", async () => {
+  it("lists empty tracked folders, and untracked ones only while they hold mail", async () => {
     const res = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
     const empty = res.folders.find((f) => f.path === "Empty");
     expect(empty).toMatchObject({ total: 0, unread: 0, special_use: null, status: "PENDING" });
+    expect(res.folders.find((f) => f.path === "Old Project")).toMatchObject({ total: 1, unread: 0 });
     expect(res.folders.some((f) => f.path === "[Gmail]/All Mail")).toBe(false);
   });
 
   it("sums the listed folders into totals (total/unread) over the non-deleted live mirror", async () => {
     const res = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
-    // Live across INBOX(3) + Sent(2) + Archive(1) = 6; unread INBOX uid2, uid3 + Archive uid7.
-    expect(res.totals).toEqual({ total: 6, unread: 3 });
+    // Live across INBOX(3) + Sent(2) + Archive(1) + Old Project(1) = 7; unread INBOX uid2, uid3 + Archive uid7.
+    expect(res.totals).toEqual({ total: 7, unread: 3 });
   });
 
   it("keeps counts exact through flag changes, tombstones, moves, and deletes", async () => {
@@ -242,6 +247,37 @@ liveDb("list_folders tool live DB", () => {
     expect(await countsFor("INBOX")).toEqual({ total: 2, unread: 2 });
   });
 
+  it("leaves the counts row alone for a write that changes no count", async () => {
+    // A body or evidence update must not queue behind an open count change in
+    // the same folder.
+    const live = await pool.query<{ id: string }>(
+      `
+      SELECT id FROM public.imap_messages
+      WHERE account_id = $1 AND folder_path = 'INBOX' AND deleted_in_provider = false
+      ORDER BY uid
+      `,
+      [accountId]
+    );
+    expect(live.rows.length).toBeGreaterThanOrEqual(2);
+    const [counted, untouched] = live.rows.map((row) => row.id);
+    const counting = await pool.connect();
+    const other = await pool.connect();
+    try {
+      await counting.query("BEGIN");
+      await counting.query(
+        "UPDATE public.imap_messages SET flags = CASE WHEN flags @> $2::text[] THEN '{}' ELSE $2::text[] END WHERE id = $1",
+        [counted, ["\\Seen"]]
+      );
+      await other.query("SET lock_timeout = '2s'");
+      await other.query("UPDATE public.imap_messages SET body_fetched_at = now() WHERE id = $1", [untouched]);
+    } finally {
+      await counting.query("ROLLBACK");
+      await other.query("RESET lock_timeout");
+      counting.release();
+      other.release();
+    }
+  });
+
   it("drops an account's counts with the account", async () => {
     const other = await pool.query<{ id: string }>(
       `
@@ -287,7 +323,7 @@ liveDb("list_folders tool live DB", () => {
   it("aggregates across all accounts when account is omitted (folder rows keep account_id)", async () => {
     const res = (await runListFolders(pool, {})) as ListFoldersOk;
     const mine = res.folders.filter((f) => f.account_id === accountId);
-    expect(mine.length).toBeGreaterThanOrEqual(4); // INBOX, Sent, Archive, Empty
+    expect(mine.length).toBeGreaterThanOrEqual(5); // INBOX, Sent, Archive, Empty, Old Project
     expect(mine.every((f) => f.account_id === accountId)).toBe(true);
   });
 });
