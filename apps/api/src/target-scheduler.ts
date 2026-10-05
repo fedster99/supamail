@@ -10,11 +10,32 @@ export interface SchemaVersionState {
   /** The public migration the target's schema is at: a manifest id such as `0029_...`. */
   currentSchemaVersion: string;
   /**
-   * The oldest required version this schema still serves. A host reads it from
-   * the schema itself: a migration the running runtime cannot work with sets
-   * it to its own id; a compatible one leaves it. Absent means exact match.
+   * The oldest required version this schema still serves. A host records it
+   * in its own schema marker when it applies migrations, from the manifest's
+   * `breaksOlderRuntimes` entries: such a migration sets the floor to its own
+   * id, any other leaves it. Absent or empty means exact match.
    */
   compatibleSinceSchemaVersion?: string;
+}
+
+/** Public migration ids are a four-digit sequence, an underscore, and a name. */
+const PUBLIC_MIGRATION_ID = /^(\d{4})_\S+$/;
+
+/** A migration id's position in manifest order, or null when it is not an id. */
+export function publicMigrationSequence(id: string): number | null {
+  const match = PUBLIC_MIGRATION_ID.exec(id);
+  return match ? Number(match[1]) : null;
+}
+
+/** The runtime's own required version is not a public migration id. */
+export class InvalidSchemaVersionError extends TypeError {
+  readonly version: string;
+
+  constructor(version: string) {
+    super(`required schema version is not a public migration id: ${JSON.stringify(version)}`);
+    this.name = "InvalidSchemaVersionError";
+    this.version = version;
+  }
 }
 
 export interface RuntimeTargetTask<T = unknown> extends SchemaVersionState {
@@ -70,6 +91,9 @@ export async function runRuntimeTargetTasks<T>(
   }
   if (!Number.isInteger(perTargetConcurrency) || perTargetConcurrency < 1) {
     throw new Error("perTargetConcurrency must be a positive integer");
+  }
+  if (publicMigrationSequence(options.requiredSchemaVersion) === null) {
+    throw new InvalidSchemaVersionError(options.requiredSchemaVersion);
   }
 
   const results: Array<RuntimeTargetTaskResult<T>> = [];
@@ -200,22 +224,23 @@ function getSkipReason(task: RuntimeTargetTask, requiredSchemaVersion: string): 
 
 /**
  * Whether a runtime that requires `requiredSchemaVersion` can run against this
- * schema. Public migration ids order by their four-digit prefix. The schema must
- * be at or after the required version, and the required version must not be
- * older than the schema's compatibility floor. So a host may apply a
- * compatible migration before it deploys the runtime that needs it, and the
- * running runtime keeps serving; a migration the running runtime cannot work
- * with moves the floor and stops it. A missing or malformed id is not ready.
+ * schema. Ids order by their four-digit prefix. The schema must be at or after
+ * the required version, and the required version must not be older than the
+ * schema's compatibility floor. So a host may apply a compatible migration
+ * before it deploys the runtime that needs it, and the running runtime keeps
+ * serving; a migration the running runtime cannot work with moves the floor
+ * and stops it. Two ids with one sequence number must be the same id. A
+ * missing or malformed schema version is not ready; a malformed required
+ * version is the runtime's own error and throws.
  */
 export function isSchemaVersionReady(state: SchemaVersionState, requiredSchemaVersion: string): boolean {
-  const current = migrationSequence(state.currentSchemaVersion);
-  const floor = migrationSequence(state.compatibleSinceSchemaVersion ?? state.currentSchemaVersion);
-  const required = migrationSequence(requiredSchemaVersion);
-  if (current === null || floor === null || required === null) return false;
+  const required = publicMigrationSequence(requiredSchemaVersion);
+  if (required === null) throw new InvalidSchemaVersionError(requiredSchemaVersion);
+  const floorId = state.compatibleSinceSchemaVersion || state.currentSchemaVersion;
+  const current = publicMigrationSequence(state.currentSchemaVersion);
+  const floor = publicMigrationSequence(floorId);
+  if (current === null || floor === null) return false;
+  if (current === required && state.currentSchemaVersion !== requiredSchemaVersion) return false;
+  if (floor === required && floorId !== requiredSchemaVersion) return false;
   return floor <= required && required <= current;
-}
-
-function migrationSequence(id: string | undefined): number | null {
-  const match = typeof id === "string" ? /^(\d{4})_\S+$/.exec(id) : null;
-  return match ? Number(match[1]) : null;
 }

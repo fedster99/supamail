@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_RUNTIME_TARGET_PER_TARGET_CONCURRENCY,
+  InvalidSchemaVersionError,
   isSchemaVersionReady,
   runRuntimeTargetTasks,
   type RuntimeTargetTask
@@ -296,14 +297,24 @@ describe("isSchemaVersionReady", () => {
     expect(isSchemaVersionReady({ currentSchemaVersion: "0029_active_assignments_view_no_barrier" }, required)).toBe(false);
   });
 
-  it("refuses a missing, malformed, or inverted version", () => {
+  it("refuses a missing, malformed, inverted, or same-number-different-name version", () => {
     expect(isSchemaVersionReady({ currentSchemaVersion: "missing" }, required)).toBe(false);
     expect(isSchemaVersionReady({ currentSchemaVersion: "" }, required)).toBe(false);
     expect(isSchemaVersionReady({ currentSchemaVersion: "28_short" }, required)).toBe(false);
-    expect(isSchemaVersionReady({ currentSchemaVersion: required }, "latest")).toBe(false);
+    expect(isSchemaVersionReady({ currentSchemaVersion: "0028_fork_of_folder_counts" }, required)).toBe(false);
+    expect(isSchemaVersionReady({
+      currentSchemaVersion: "0029_active_assignments_view_no_barrier",
+      compatibleSinceSchemaVersion: "0028_fork_of_folder_counts"
+    }, required)).toBe(false);
     expect(isSchemaVersionReady({
       currentSchemaVersion: required,
       compatibleSinceSchemaVersion: "0029_active_assignments_view_no_barrier"
     }, required)).toBe(false);
+  });
+
+  it("treats an empty floor as absent and throws on a malformed required version", () => {
+    expect(isSchemaVersionReady({ currentSchemaVersion: required, compatibleSinceSchemaVersion: "" }, required)).toBe(true);
+    expect(() => isSchemaVersionReady({ currentSchemaVersion: required }, "latest")).toThrow(InvalidSchemaVersionError);
+    expect(() => runRuntimeTargetTasks([], { requiredSchemaVersion: "latest" })).rejects.toThrow(InvalidSchemaVersionError);
   });
 });

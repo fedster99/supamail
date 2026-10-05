@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
+import { publicMigrationSequence } from "./target-scheduler.js";
 
 const { Pool } = pg;
 
@@ -15,6 +16,13 @@ export interface PublicMigrationManifest {
   migrations: Array<{
     id: string;
     file: string;
+    /**
+     * A runtime older than this migration cannot run on a schema that
+     * includes it. A host moves its compatibility floor to this id when it
+     * applies the migration, so the running runtime stops until the new one
+     * is up. Absent: older runtimes keep serving through the deploy window.
+     */
+    breaksOlderRuntimes?: boolean;
   }>;
 }
 
@@ -118,24 +126,56 @@ export async function readPublicMigrationManifest(): Promise<PublicMigrationMani
   const here = dirname(fileURLToPath(import.meta.url));
   const manifestPath = resolve(here, "../supabase/migrations/public/manifest.json");
   const raw = await readFile(manifestPath, "utf8");
-  const parsed = JSON.parse(raw) as PublicMigrationManifest;
+  return assertPublicMigrationManifest(JSON.parse(raw));
+}
 
-  if (!parsed.schemaVersion || !Array.isArray(parsed.migrations) || parsed.migrations.length === 0) {
+/**
+ * The manifest contract the schema gate relies on: every id is a public
+ * migration id, ids strictly ascend, and the schema version is the last id.
+ */
+export function assertPublicMigrationManifest(parsed: unknown): PublicMigrationManifest {
+  const manifest = parsed as PublicMigrationManifest;
+  if (!manifest?.schemaVersion || !Array.isArray(manifest.migrations) || manifest.migrations.length === 0) {
     throw new Error("Invalid public migration manifest");
   }
-
-  for (const migration of parsed.migrations) {
-    if (!migration.id || !migration.file || migration.file.includes("/") || migration.file.includes("\\")) {
+  let previous = -1;
+  for (const migration of manifest.migrations) {
+    const sequence = typeof migration?.id === "string" ? publicMigrationSequence(migration.id) : null;
+    if (
+      sequence === null
+      || !migration.file
+      || migration.file.includes("/")
+      || migration.file.includes("\\")
+      || (migration.breaksOlderRuntimes !== undefined && typeof migration.breaksOlderRuntimes !== "boolean")
+    ) {
       throw new Error(`Invalid public migration manifest entry: ${JSON.stringify(migration)}`);
     }
+    if (sequence <= previous) {
+      throw new Error(`Public migration manifest is out of order at ${migration.id}`);
+    }
+    previous = sequence;
   }
-
-  return parsed;
+  const last = manifest.migrations[manifest.migrations.length - 1]!.id;
+  if (manifest.schemaVersion !== last) {
+    throw new Error(`Public migration manifest version ${manifest.schemaVersion} is not its last migration ${last}`);
+  }
+  return manifest;
 }
 
 export async function getRequiredPublicSchemaVersion(): Promise<string> {
   const manifest = await readPublicMigrationManifest();
   return manifest.schemaVersion;
+}
+
+/**
+ * The oldest required version a schema at this manifest's version still
+ * serves: the last migration that breaks older runtimes, else the first
+ * migration. A host records this as its schema's compatibility floor.
+ */
+export async function getPublicSchemaCompatibilityFloor(): Promise<string> {
+  const manifest = await readPublicMigrationManifest();
+  const breaking = manifest.migrations.filter((migration) => migration.breaksOlderRuntimes === true);
+  return (breaking.length > 0 ? breaking[breaking.length - 1] : manifest.migrations[0])!.id;
 }
 
 export async function readPublicMigrations(): Promise<string> {
