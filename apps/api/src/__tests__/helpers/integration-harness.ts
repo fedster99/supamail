@@ -74,6 +74,36 @@ export async function teardownIntegration(pool: PgPool, accountId: string): Prom
   await pool.query("DELETE FROM public.imap_accounts WHERE id = $1", [accountId]);
 }
 
+/** Folders whose trigger-kept counts (migration 0028) differ from a fresh count. */
+export async function folderCountDrift(
+  pool: PgPool,
+  accountIds: string[]
+): Promise<Array<{ account_id: string; folder_path: string }>> {
+  const result = await pool.query<{ account_id: string; folder_path: string }>(
+    `
+    WITH live AS (
+      SELECT account_id, folder_path, count(*)::int AS messages,
+             count(*) FILTER (
+               WHERE NOT (coalesce(flags, '{}'::text[]) @> ARRAY['\\Seen']::text[])
+             )::int AS unread
+      FROM public.imap_messages
+      WHERE account_id = ANY($1::uuid[]) AND deleted_in_provider = false
+      GROUP BY account_id, folder_path
+    ), stored AS (
+      SELECT account_id, folder_path, message_count AS messages, unread_count AS unread
+      FROM public.imap_folder_message_counts
+      WHERE account_id = ANY($1::uuid[])
+    )
+    SELECT account_id, folder_path
+    FROM live FULL JOIN stored USING (account_id, folder_path)
+    WHERE (coalesce(live.messages, 0), coalesce(live.unread, 0))
+      IS DISTINCT FROM (coalesce(stored.messages, 0), coalesce(stored.unread, 0))
+    `,
+    [accountIds]
+  );
+  return result.rows;
+}
+
 export async function dueAllFolders(pool: PgPool, accountId: string): Promise<void> {
   await pool.query(
     `UPDATE public.imap_folders SET next_sync_due_at = now() - interval '1 second' WHERE account_id = $1`,

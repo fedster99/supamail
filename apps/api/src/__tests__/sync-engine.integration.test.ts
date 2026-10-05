@@ -20,6 +20,7 @@ import {
   backdateMissingSince,
   buildInboxAndSentFolders,
   dueAllFolders,
+  folderCountDrift,
   forceFolderDiscovery,
   setupIntegration,
   teardownIntegration
@@ -110,35 +111,17 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
   afterEach(async () => {
     const pool = getPool();
-    // Every sync path must leave the trigger-kept folder counts equal to a
-    // fresh count of the live mirror (migration 0028).
-    const drift = await pool.query<{ account_id: string; folder_path: string }>(
-      `
-      WITH live AS (
-        SELECT account_id, folder_path, count(*)::int AS messages,
-               count(*) FILTER (
-                 WHERE NOT (coalesce(flags, '{}'::text[]) @> ARRAY['\\Seen']::text[])
-               )::int AS unread
-        FROM public.imap_messages
-        WHERE account_id = ANY($1::uuid[]) AND deleted_in_provider = false
-        GROUP BY account_id, folder_path
-      ), stored AS (
-        SELECT account_id, folder_path, message_count AS messages, unread_count AS unread
-        FROM public.imap_folder_message_counts
-        WHERE account_id = ANY($1::uuid[])
-      )
-      SELECT account_id, folder_path
-      FROM live FULL JOIN stored USING (account_id, folder_path)
-      WHERE (coalesce(live.messages, 0), coalesce(live.unread, 0))
-        IS DISTINCT FROM (coalesce(stored.messages, 0), coalesce(stored.unread, 0))
-      `,
-      [activeAccountIds]
-    );
-    while (activeAccountIds.length > 0) {
-      const id = activeAccountIds.pop()!;
-      await teardownIntegration(pool, id).catch(() => undefined);
+    // Every sync path must leave the trigger-kept folder counts exact.
+    let drift: Awaited<ReturnType<typeof folderCountDrift>> = [];
+    try {
+      drift = await folderCountDrift(pool, activeAccountIds);
+    } finally {
+      while (activeAccountIds.length > 0) {
+        const id = activeAccountIds.pop()!;
+        await teardownIntegration(pool, id).catch(() => undefined);
+      }
     }
-    expect(drift.rows).toEqual([]);
+    expect(drift).toEqual([]);
   });
 
   afterAll(async () => {

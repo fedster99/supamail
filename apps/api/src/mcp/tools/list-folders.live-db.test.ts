@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { applyPublicMigrations, closePool, getPool } from "../../db.js";
+import { folderCountDrift } from "../../__tests__/helpers/integration-harness.js";
 import { runListFolders } from "./list-folders.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
@@ -198,25 +199,7 @@ liveDb("list_folders tool live DB", () => {
     expect(await countsFor("Archive")).toEqual({ total: 2, unread: 1 });
 
     // The stored counts equal a fresh count for every folder of the account.
-    const drift = await pool.query(
-      `
-      SELECT f.path
-      FROM public.imap_folders f
-      LEFT JOIN public.imap_folder_message_counts c
-        ON c.account_id = f.account_id
-       AND c.folder_path = f.path
-      LEFT JOIN public.imap_messages m
-        ON m.account_id = f.account_id
-       AND m.folder_path = f.path
-       AND m.deleted_in_provider = false
-      WHERE f.account_id = $1
-      GROUP BY f.id, c.message_count, c.unread_count
-      HAVING coalesce(c.message_count, 0) <> count(m.id)
-          OR coalesce(c.unread_count, 0) <> count(m.id) FILTER (WHERE NOT (coalesce(m.flags, '{}'::text[]) @> $2::text[]))
-      `,
-      [accountId, ["\\Seen"]]
-    );
-    expect(drift.rows).toEqual([]);
+    expect(await folderCountDrift(pool, [accountId])).toEqual([]);
   });
 
   it("counts without waiting on a folder row that sync holds locked", async () => {
@@ -305,8 +288,12 @@ liveDb("list_folders tool live DB", () => {
 
   it("backfills counts from existing mail once, and a second migrate keeps them", async () => {
     const before = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
-    await pool.query("DROP TABLE public.imap_folder_message_counts");
-    await applyPublicMigrations(pool);
+    try {
+      await pool.query("DROP TABLE public.imap_folder_message_counts");
+    } finally {
+      // Later test files share this database; never leave it without the table.
+      await applyPublicMigrations(pool);
+    }
     const backfilled = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
     await applyPublicMigrations(pool);
     const rerun = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
