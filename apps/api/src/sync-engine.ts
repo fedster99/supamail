@@ -15,6 +15,7 @@ import {
   PARSED_BODY_BATCH_MAX_MESSAGES,
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
+  listMailboxUids,
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
@@ -1522,8 +1523,8 @@ export class MirrorEngine {
         options.reconcileTelemetry.startedAt = reconcileStartedAt;
         const reconcileDeadline = Date.now() + this.config.RECONCILE_TOTAL_TIMEOUT_MS;
         // Spec §10.7: only reconcile once initial sync is complete and only
-        // inside the active sync window. HISTORICAL/EXPIRED rows are static
-        // archive, not part of the hot mirror safety loop.
+        // inside the active sync window. HISTORICAL/EXPIRED rows are checked by
+        // the history lane's archive snapshot, not this hot safety loop.
         this.assertDeadlineAvailable(
           client,
           reconcileDeadline,
@@ -2166,6 +2167,9 @@ export class MirrorEngine {
         || oldestSynced === null;
 
       if (shouldStartSnapshot) {
+        if (await this.reconcileArchiveRows(account, folder, client, uidValidity, lockDeadline, signal)) {
+          return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
+        }
         const snapshot = await searchUidsBefore(client, windowCutoff);
         const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
 
@@ -2307,6 +2311,56 @@ export class MirrorEngine {
     } finally {
       mailboxLock.release();
     }
+  }
+
+  /**
+   * The live reconcile covers IN_WINDOW rows only, so each archive snapshot checks
+   * the folder's archive rows against its complete UID list. Matching UIDs rather
+   * than dates means a row that aged out of the window is never mistaken for gone.
+   * A list whose size disagrees with SELECT's message count is not proof of
+   * deletion; the folder waits for its next snapshot instead. Tombstones commit in
+   * bounded batches, so a mass deletion resumes on the next cycle when the lock
+   * budget ends; returns true then, before the snapshot starts.
+   */
+  private async reconcileArchiveRows(
+    account: ImapAccount,
+    folder: ImapFolder,
+    client: MirrorImapClient,
+    uidValidity: number,
+    lockDeadline: number,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    const providerUids = new Set(await listMailboxUids(client));
+    const exists = client.mailbox ? client.mailbox.exists : undefined;
+    const complete = providerUids.size === exists;
+    let marked = 0;
+    let hitLockBudget = false;
+    if (complete) {
+      const gone = (await this.repository.getLiveArchiveUids(account.id, folder, uidValidity))
+        .filter((uid) => !providerUids.has(uid));
+      for (let i = 0; i < gone.length; i += MAX_SYNC_BATCH_SIZE) {
+        if (this.isLockBudgetExpired(lockDeadline)) {
+          hitLockBudget = true;
+          break;
+        }
+        marked += await this.repository.markVanishedMessages(
+          account.id,
+          folder,
+          uidValidity,
+          gone.slice(i, i + MAX_SYNC_BATCH_SIZE),
+          { deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS, signal }
+        );
+      }
+    }
+    if (marked > 0 || !complete) {
+      await this.repository.logEvent(account.id, null, null, folder.path, null, "ARCHIVE_RECONCILE", {
+        marked,
+        providerUids: providerUids.size,
+        exists: exists ?? null,
+        skipped: !complete
+      });
+    }
+    return hitLockBudget;
   }
 
   private async fetchHistoricalBodyBatch(
@@ -2526,9 +2580,9 @@ export class MirrorEngine {
       // transient false-negative recovers. Safe to soft-delete MOVED_OUT.
       await this.repository.markMessageMovedOut(message.id);
     } else {
-      // HISTORICAL/EXPIRED rows are never re-observed (backfill walks strictly
-      // backward) and reconcile is IN_WINDOW-only, so tombstoning would be
-      // unrecoverable. Mark the body fetch attempted instead — non-destructive.
+      // HISTORICAL/EXPIRED rows are re-checked only by the next archive
+      // snapshot, which tombstones a UID that is really gone. Mark the body
+      // fetch attempted instead — non-destructive.
       await this.repository.markBodyFetchAttempted(message.id);
     }
   }

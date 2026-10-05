@@ -3550,29 +3550,11 @@ export class MirrorRepository {
     }
   }
 
-  async markMissingMessages(accountId: string, folder: ImapFolder, uidValidity: number, liveUids: number[]): Promise<number> {
-    const result = await this.pool.query<{ count: string }>(
-      `
-      WITH marked AS (
-        UPDATE public.imap_messages
-        SET deleted_in_provider = true,
-            provider_deleted_at = now(),
-            deleted_reason = 'RECONCILE_MISSING'
-        WHERE account_id = $1
-          AND folder_path = $2
-          AND uidvalidity = $3
-          AND deleted_in_provider = false
-          AND window_status = 'IN_WINDOW'
-          AND NOT (uid = ANY($4::bigint[]))
-        RETURNING id
-      )
-      SELECT count(*)::text AS count FROM marked
-      `,
-      [accountId, folder.path, uidValidity, liveUids]
-    );
-    return Number(result.rows[0].count);
-  }
-
+  /**
+   * Tombstone rows whose UIDs the provider proved gone (QRESYNC VANISHED, or an
+   * archive row absent from the folder's complete UID list), in any window lane.
+   * `RECONCILE_MISSING` is recoverable: a later sync that sees the UID revives it.
+   */
   async markVanishedMessages(
     accountId: string,
     folder: ImapFolder,
@@ -3584,7 +3566,7 @@ export class MirrorRepository {
     if (uniqueUids.length === 0) return 0;
     if (uniqueUids.length > MAX_SYNC_BATCH_SIZE
       || uniqueUids.some((uid) => !Number.isSafeInteger(uid) || uid <= 0)) {
-      throw new Error("QRESYNC VANISHED batch is invalid or exceeds the sync batch limit");
+      throw new Error("Vanished UID batch is invalid or exceeds the sync batch limit");
     }
     const query = `
       WITH marked AS (
@@ -3597,7 +3579,6 @@ export class MirrorRepository {
           AND uidvalidity = $3
           AND uid = ANY($4::bigint[])
           AND deleted_in_provider = false
-          AND window_status = 'IN_WINDOW'
         RETURNING id
       )
       SELECT count(*)::text AS count FROM marked
@@ -3609,6 +3590,23 @@ export class MirrorRepository {
           this.pool, query, values, options.deadlineAt, options.signal
         );
     return Number(result.rows[0].count);
+  }
+
+  /** UIDs of the folder's live archive (HISTORICAL, EXPIRED) rows at one UIDVALIDITY. */
+  async getLiveArchiveUids(accountId: string, folder: ImapFolder, uidValidity: number): Promise<number[]> {
+    const result = await this.pool.query<{ uid: string }>(
+      `
+      SELECT uid::text AS uid
+      FROM public.imap_messages
+      WHERE account_id = $1
+        AND folder_path = $2
+        AND uidvalidity = $3
+        AND deleted_in_provider = false
+        AND window_status <> 'IN_WINDOW'
+      `,
+      [accountId, folder.path, uidValidity]
+    );
+    return result.rows.map((row) => Number(row.uid));
   }
 
   /**
@@ -3662,9 +3660,9 @@ export class MirrorRepository {
 
   /**
    * Mark a message's body fetch as attempted without storing a body. Used when a UID
-   * moved out (MessageMovedError) for a non-IN_WINDOW row: unlike IN_WINDOW rows,
-   * HISTORICAL/EXPIRED rows are never re-observed and reconcile is IN_WINDOW-only, so
-   * tombstoning them (markMessageMovedOut) would be unrecoverable. This just removes
+   * moved out (MessageMovedError) for a non-IN_WINDOW row: MOVED_OUT is purged, and
+   * the next archive snapshot tombstones the row recoverably if the UID is really
+   * gone. This just removes
    * the row from getHistoryBacklog (which filters body_fetched_at IS NULL) — a benign,
    * reversible "we tried, the body is gone" watermark, not a soft-delete.
    */

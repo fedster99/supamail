@@ -12,6 +12,7 @@ import type {
 import { resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
+import type { ImapFolder } from "../types.js";
 import {
   plaintextMetadataProtection,
   type MetadataProtectionAdapter
@@ -5241,6 +5242,267 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       if ((await liveHistoricalUnder(85_999)) === 3) break;
     }
     expect(await liveHistoricalUnder(85_999)).toBe(3);
+  });
+
+  describe("archive deletion reconcile", () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const message = (uid: number, internalDate: Date) => makeTextMessage({
+      uid,
+      subject: `m-${uid}`,
+      from: "a@x.test",
+      to: "u@x.test",
+      body: `m-${uid}`,
+      internalDate
+    });
+
+    async function setupArchive(suite: string, uidValidity: number, messages: FixtureFolder["messages"]) {
+      const h = await setupIntegration(suite, {
+        BODY_BACKFILL_BATCH_SIZE: 50,
+        INITIAL_SYNC_BATCH_SIZE: 50,
+        MAX_RR_FOLDERS_PER_CYCLE: 5
+      });
+      activeAccountIds.push(h.account.id);
+      await h.pool.query(
+        `UPDATE public.imap_accounts
+         SET body_fetch_policy = 'lazy',
+             historical_backfill_mode = 'metadata_only',
+             archive_refresh_interval = 'monthly',
+             max_backfill_rate = 'aggressive'
+         WHERE id = $1`,
+        [h.account.id]
+      );
+      const folders: FixtureFolder[] = [{
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity,
+        messages
+      }];
+      return { h, folders };
+    }
+
+    async function rows(h: Awaited<ReturnType<typeof setupIntegration>>) {
+      return (
+        await h.pool.query<{ uid: string; window_status: string; deleted_in_provider: boolean; deleted_reason: string | null }>(
+          `SELECT uid::text, window_status, deleted_in_provider, deleted_reason
+           FROM public.imap_messages m WHERE account_id = $1 ORDER BY m.uidvalidity, m.uid`,
+          [h.account.id]
+        )
+      ).rows.map((row) => `${row.uid}:${row.window_status}:${row.deleted_in_provider ? row.deleted_reason : "live"}`);
+    }
+
+    async function dueArchiveRefresh(h: Awaited<ReturnType<typeof setupIntegration>>) {
+      await h.pool.query(
+        `UPDATE public.imap_folders SET last_archive_refresh_at = now() - interval '31 days'
+         WHERE account_id = $1`,
+        [h.account.id]
+      );
+      await dueAllFolders(h.pool, h.account.id);
+    }
+
+    it("tombstones archive rows whose UID left the folder on the next archive refresh", async () => {
+      const recent = new Date();
+      const { h, folders } = await setupArchive("archive-deletion-refresh", 86_001, [
+        message(1, oldDate),
+        message(2, oldDate),
+        message(3, recent),
+        message(4, recent),
+        message(13, recent),
+        message(14, recent)
+      ]);
+      const uidSearches: unknown[] = [];
+      const unfilteredFetches: unknown[] = [];
+      class RecordingClient extends FixtureImapClient {
+        override async search(query: Record<string, unknown>, options: { uid: true }) {
+          uidSearches.push(query);
+          return await super.search(query, options);
+        }
+        override async *fetch(range: string | number[] | Record<string, unknown>, query: Record<string, unknown>) {
+          if (typeof range === "object" && !Array.isArray(range) && range.all) unfilteredFetches.push(range);
+          yield* super.fetch(range, query);
+        }
+      }
+      const engine = h.buildEngine({ folders, clientFactory: async () => new RecordingClient(folders) });
+
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await rows(h)).toEqual([
+        "1:HISTORICAL:live", "2:HISTORICAL:live", "3:IN_WINDOW:live",
+        "4:IN_WINDOW:live", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
+      ]);
+
+      // UIDs 3 and 4 age out of the live window. UID 3 stays at the provider, with
+      // an internal date the history snapshot's date search does not return.
+      await h.pool.query(
+        `UPDATE public.imap_messages SET window_status = 'EXPIRED'
+         WHERE account_id = $1 AND uid IN (3, 4)`,
+        [h.account.id]
+      );
+      folders[0].messages = folders[0].messages.filter((m) => ![1, 2, 4].includes(m.uid));
+
+      // A routine sync before the refresh is due leaves archive rows alone.
+      await dueAllFolders(h.pool, h.account.id);
+      uidSearches.length = 0;
+      await engine.syncAccount(h.account.id, "manual");
+      expect(uidSearches).toHaveLength(0);
+      expect(await rows(h)).toContain("1:HISTORICAL:live");
+
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await rows(h)).toEqual([
+        "1:HISTORICAL:RECONCILE_MISSING", "2:HISTORICAL:RECONCILE_MISSING", "3:EXPIRED:live",
+        "4:EXPIRED:RECONCILE_MISSING", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
+      ]);
+      // One UID SEARCH for the whole folder, never a per-message FETCH of every UID.
+      expect(uidSearches).toEqual([{ all: true }]);
+      expect(unfilteredFetches).toHaveLength(0);
+      const event = await h.pool.query<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM public.imap_sync_events
+         WHERE account_id = $1 AND event_type = 'ARCHIVE_RECONCILE'`,
+        [h.account.id]
+      );
+      expect(event.rows.map((row) => row.payload)).toEqual([
+        { marked: 3, providerUids: 3, exists: 3, skipped: false }
+      ]);
+
+      // A UID that comes back is revived by the next refresh's history walk.
+      folders[0].messages.unshift(message(2, oldDate));
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await rows(h)).toContain("2:HISTORICAL:live");
+      expect(await rows(h)).toContain("1:HISTORICAL:RECONCILE_MISSING");
+    });
+
+    it("never tombstones archive rows from a partial or failed UID listing", async () => {
+      const { h, folders } = await setupArchive("archive-deletion-partial", 86_101, [
+        message(1, oldDate),
+        message(2, oldDate),
+        message(10, new Date())
+      ]);
+      let listing: "full" | "partial" | "failed" = "full";
+      class FlakyClient extends FixtureImapClient {
+        override async search(query: Record<string, unknown>, options: { uid: true }) {
+          if (listing === "failed") return false;
+          const uids = await super.search(query, options);
+          return listing === "partial" && uids ? uids.slice(-1) : uids;
+        }
+      }
+      const engine = h.buildEngine({ folders, clientFactory: async () => new FlakyClient(folders) });
+      await engine.syncAccount(h.account.id, "manual");
+      const mirrored = await rows(h);
+      expect(mirrored).toEqual(["1:HISTORICAL:live", "2:HISTORICAL:live", "10:IN_WINDOW:live"]);
+
+      listing = "partial";
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await rows(h)).toEqual(mirrored);
+      const skipped = await h.pool.query<{ payload: Record<string, unknown> }>(
+        `SELECT payload FROM public.imap_sync_events
+         WHERE account_id = $1 AND event_type = 'ARCHIVE_RECONCILE'`,
+        [h.account.id]
+      );
+      expect(skipped.rows.map((row) => row.payload)).toEqual([
+        { marked: 0, providerUids: 1, exists: 3, skipped: true }
+      ]);
+
+      listing = "failed";
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await rows(h)).toEqual(mirrored);
+
+      // A failed search fails the history batch, so the refresh stays due.
+      const refresh = await h.pool.query<{ overdue: boolean }>(
+        `SELECT last_archive_refresh_at < now() - interval '30 days' AS overdue
+         FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      );
+      expect(refresh.rows[0].overdue).toBe(true);
+
+      // A provider VANISHED report is exact per UID, so it tombstones an archive row too.
+      const folder = (await h.pool.query<ImapFolder>(
+        `SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      )).rows[0];
+      expect(await h.repository.markVanishedMessages(h.account.id, folder, 86_101, [2])).toBe(1);
+      expect(await rows(h)).toContain("2:HISTORICAL:RECONCILE_MISSING");
+    });
+
+    it("tombstones a mass archive deletion in bounded batches that resume after the lock budget", async () => {
+      const { h, folders } = await setupArchive("archive-deletion-mass", 86_301, [
+        message(1, oldDate),
+        message(10_000, new Date())
+      ]);
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      // 1,200 archive rows the provider no longer has: more than two write batches.
+      await h.pool.query(
+        `INSERT INTO public.imap_messages (account_id, folder_id, folder_path, uidvalidity, uid, internal_date, window_status)
+         SELECT account_id, folder_id, folder_path, uidvalidity, g, internal_date, 'HISTORICAL'
+         FROM public.imap_messages, generate_series(2, 1201) AS g
+         WHERE account_id = $1 AND uid = 1`,
+        [h.account.id]
+      );
+      const liveArchive = async () => Number((await h.pool.query<{ c: string }>(
+        `SELECT count(*)::text AS c FROM public.imap_messages
+         WHERE account_id = $1 AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+        [h.account.id]
+      )).rows[0].c);
+      expect(await liveArchive()).toBe(1201);
+
+      const internals = engine as unknown as { isLockBudgetExpired(deadline: number): boolean };
+      const budgetCheck = internals.isLockBudgetExpired.bind(engine);
+      let budgetEnded = false;
+      const budget = vi.spyOn(internals, "isLockBudgetExpired")
+        .mockImplementation((deadline) => budgetEnded || budgetCheck(deadline));
+      const markVanished = h.repository.markVanishedMessages.bind(h.repository);
+      const writes: number[] = [];
+      const write = vi.spyOn(h.repository, "markVanishedMessages")
+        .mockImplementation(async (...args: Parameters<typeof markVanished>) => {
+          writes.push(args[3].length);
+          const marked = await markVanished(...args);
+          budgetEnded = true;
+          return marked;
+        });
+
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(writes).toEqual([500]);
+      expect(await liveArchive()).toBe(701);
+
+      budgetEnded = false;
+      budget.mockImplementation((deadline) => budgetCheck(deadline));
+      write.mockImplementation(async (...args: Parameters<typeof markVanished>) => {
+        writes.push(args[3].length);
+        return await markVanished(...args);
+      });
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(writes).toEqual([500, 500, 200]);
+      expect(await liveArchive()).toBe(1);
+      expect(await rows(h)).toContain("1:HISTORICAL:live");
+    });
+
+    it("leaves a UIDVALIDITY change to the reset path", async () => {
+      const { h, folders } = await setupArchive("archive-deletion-uidvalidity", 86_201, [
+        message(1, oldDate),
+        message(10, new Date())
+      ]);
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await rows(h)).toEqual(["1:HISTORICAL:live", "10:IN_WINDOW:live"]);
+
+      folders[0].uidValidity = 86_202;
+      folders[0].messages = [message(10, new Date())];
+      await dueArchiveRefresh(h);
+      await engine.syncAccount(h.account.id, "manual");
+      const reasons = await h.pool.query<{ uidvalidity: string; uid: string; deleted_reason: string | null }>(
+        `SELECT uidvalidity::text, uid::text, deleted_reason FROM public.imap_messages
+         WHERE account_id = $1 AND uidvalidity = 86201 ORDER BY uid`,
+        [h.account.id]
+      );
+      expect(reasons.rows.map((row) => `${row.uid}:${row.deleted_reason}`)).toEqual([
+        "1:UIDVALIDITY_RESET", "10:UIDVALIDITY_RESET"
+      ]);
+    });
   });
 
   it("Scenario Q — a new account backfills history on default settings (no manual config)", async () => {
