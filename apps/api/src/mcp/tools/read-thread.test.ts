@@ -328,14 +328,14 @@ describe("read_thread stored assignments", () => {
   });
 
   it.each([
-    { message_id: "not-a-uuid" },
-    { message_ids: ["not-a-uuid"] }
-  ])("rejects invalid message ids before opening a database connection", async (args) => {
+    [{ message_id: "not-a-uuid" }, "message_id: Invalid uuid"],
+    [{ message_ids: ["not-a-uuid"] }, "message_ids.0: Invalid uuid"]
+  ])("rejects invalid message ids before opening a database connection", async (args, message) => {
     const connect = vi.fn();
 
     const out = await runReadThread({ connect } as never, args);
 
-    expect(out).toMatchObject({ error: { code: "invalid_input" } });
+    expect(out).toMatchObject({ error: { code: "invalid_input", message } });
     expect(connect).not.toHaveBeenCalled();
   });
 

@@ -28,7 +28,7 @@ const FROM = { email: "sender@example.test", name: "Sender" };
 
 describe("buildRawMime", () => {
   const base: SendRequest = {
-    accountId: "acc-1",
+    accountId: "11111111-1111-4111-8111-111111111111",
     to: [{ email: "rcpt@example.test", name: "Recipient" }],
     subject: "Hello",
     body: { format: "plain", text: "Body text" }
@@ -182,7 +182,7 @@ describe("buildRawMime", () => {
 describe("buildSendEnvelope", () => {
   it("includes every recipient (To + Cc + Bcc) so Bcc is delivered despite not being in the bytes", () => {
     const req: SendRequest = {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "to@example.test" }],
       cc: [{ email: "cc@example.test" }],
       bcc: [{ email: "bcc@example.test" }],
@@ -268,7 +268,7 @@ vi.mock("../host-validation.js", () => ({
 }));
 
 const account = {
-  id: "acc-1",
+  id: "11111111-1111-4111-8111-111111111111",
   lock_id: "1234567890",
   email_address: "sender@example.test",
   provider_profile: "generic-imap",
@@ -301,7 +301,7 @@ describe("sendMessage orchestration", () => {
     const { sendMessage } = await import("../send.js");
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
     const result = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -357,7 +357,7 @@ describe("sendMessage orchestration", () => {
     const { sendMessage } = await import("../send.js");
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
     await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -374,7 +374,7 @@ describe("sendMessage orchestration", () => {
 
     await expect(
       sendMessage({} as never, config, {
-        accountId: "acc-1",
+        accountId: "11111111-1111-4111-8111-111111111111",
         to: [{ email: "rcpt@example.test" }],
         subject: "Hi",
         body: { format: "plain", text: "Body" }
@@ -392,7 +392,7 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const error = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -409,7 +409,7 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const error = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -430,7 +430,7 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const error = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -452,7 +452,7 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const result = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -472,7 +472,7 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const result = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -490,7 +490,7 @@ describe("sendMessage orchestration", () => {
 
     await expect(
       sendMessage({} as never, config, {
-        accountId: "acc-1",
+        accountId: "11111111-1111-4111-8111-111111111111",
         to: [{ email: "rcpt@example.test" }],
         subject: "Hi",
         body: { format: "plain", text: "Body" }
@@ -510,7 +510,7 @@ describe("sendMessage orchestration", () => {
     } as never;
 
     await expect(sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -530,7 +530,7 @@ describe("sendMessage orchestration", () => {
     } as never;
 
     const error = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -546,7 +546,7 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const result = await sendMessage({} as never, config, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -563,15 +563,90 @@ describe("sendMessage orchestration", () => {
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const error = await sendMessage({} as never, config, {
-        accountId: "missing",
+        accountId: "22222222-2222-4222-8222-222222222222",
         to: [{ email: "rcpt@example.test" }],
         subject: "Hi",
         body: { format: "plain", text: "Body" }
       }).catch((value) => value);
-    expect(error).toBeInstanceOf(SmtpDeliveryError);
-    expect(error.outcome).toBe("not_delivered");
+    // An unknown mailbox is the caller's mistake, not a delivery outcome.
+    expect(error).not.toBeInstanceOf(SmtpDeliveryError);
+    expect(error.name).toBe("NotFoundError");
     expect(error.message).toMatch(/Account not found/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a bare string recipient list", { to: "rcpt@example.test" }, "to: Expected array, received string"],
+    ["a string body", { body: "text" }, "body: Expected object, received string"],
+    ["an invalid address", { to: [{ email: "not-an-address" }] }, "to.0.email: Invalid email"],
+    ["a non-UUID mailbox", { accountId: "acc-1" }, "accountId: Invalid uuid"],
+    ["a forged custom header", { headers: { Bcc: "hidden@example.test" } }, 'Header "Bcc" cannot be set'],
+    ["an overlong sender name", { senderName: "x".repeat(121) }, "Sender name must be a single line"]
+  ])("rejects %s as InvalidInputError before any provider work", async (_label, patch, message) => {
+    const { InvalidInputError } = await import("../errors.js");
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+
+    const error = await sendMessage({} as never, config, {
+      accountId: account.id,
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" },
+      ...patch
+    } as never).catch((value) => value);
+
+    expect(error).toBeInstanceOf(InvalidInputError);
+    expect(error.name).toBe("InvalidInputError");
+    expect(error.code).toBe("invalid_input");
+    expect(error.message).toContain(message);
+    expect(error.message).not.toContain("[{");
+    expect(mocks.withAccountLock).not.toHaveBeenCalled();
+    expect(mocks.deliverSmtp).not.toHaveBeenCalled();
+    expect(mocks.appenderAppend).not.toHaveBeenCalled();
+  });
+
+  it("joins several input problems into one readable message", async () => {
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+    const error = await sendMessage({} as never, config, {
+      accountId: account.id,
+      to: [{ email: "bad" }],
+      cc: [{ email: "also bad@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    }).catch((value) => value);
+    expect(error.message).toBe("to.0.email: Invalid email; cc.0.email: Invalid email");
+    expect(mocks.getAccount).not.toHaveBeenCalled();
+  });
+
+  it("accepts every optional field a typed host passes", async () => {
+    const { sendMessage } = await import("../send.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+    const request: SendRequest = {
+      senderName: "Renée Sender",
+      accountId: account.id,
+      to: [{ email: "list+tag=x@lists.example.test", name: "List" }],
+      cc: [{ email: "cc@example.test" }],
+      bcc: [{ email: "bcc@example.test", name: "Hidden" }],
+      subject: "Re: Hi",
+      body: { format: "html", text: "Body", html: "<p>Body <img src=\"cid:logo\"></p>" },
+      headers: { "X-Trace": "abc" },
+      inReplyTo: "<source@example.test>",
+      references: "<root@example.test> <source@example.test>",
+      messageId: "<stable@example.test>",
+      attachments: [
+        { filename: "a.txt", contentType: "text/plain", content: Buffer.from("a").toString("base64") },
+        { filename: "logo.png", content: Buffer.from("png").toString("base64"), cid: "logo", inline: true }
+      ]
+    };
+
+    const result = await sendMessage({} as never, config, request);
+    expect(result.delivered).toBe(true);
+    expect(result.rfcMessageId).toBe("<stable@example.test>");
+    expect(mocks.deliverSmtp.mock.calls[0][2]).toEqual({
+      from: account.email_address,
+      to: ["list+tag=x@lists.example.test", "cc@example.test", "bcc@example.test"]
+    });
   });
 
   // ── The appender socket-cleanup fallback: closeImap() tries a graceful LOGOUT
@@ -595,7 +670,7 @@ describe("sendMessage orchestration", () => {
     const cfg = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const result = await sendMessage({} as never, cfg, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }
@@ -616,7 +691,7 @@ describe("sendMessage orchestration", () => {
     const cfg = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
 
     const result = await sendMessage({} as never, cfg, {
-      accountId: "acc-1",
+      accountId: "11111111-1111-4111-8111-111111111111",
       to: [{ email: "rcpt@example.test" }],
       subject: "Hi",
       body: { format: "plain", text: "Body" }

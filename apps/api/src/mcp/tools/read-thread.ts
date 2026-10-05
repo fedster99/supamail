@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
+import { formatZodIssues } from "../../errors.js";
 import type { SyncTrust } from "../../search/index.js";
 import { buildSyncTrust } from "../../search/index.js";
 import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identity.js";
@@ -447,16 +448,15 @@ async function runReadThreadInternal(
   metadataProtection: MetadataProtectionAdapter,
   options: ReadThreadOptions
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
-  let input: ReadThreadArgs;
-  try {
-    input = readThreadRequestSchema.parse(args ?? {});
-  } catch (error) {
+  const parsed = readThreadRequestSchema.safeParse(args ?? {});
+  if (!parsed.success) {
     return toolError(
       "invalid_input",
-      error instanceof Error ? error.message : "Invalid arguments.",
+      formatZodIssues(parsed.error),
       "Pass message_id, message_ids, or conversation_id/thread_id together with the account UUID."
     );
   }
+  const input: ReadThreadArgs = parsed.data;
 
   const selectorCount = [
     input.message_id,

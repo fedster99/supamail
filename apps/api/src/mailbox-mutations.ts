@@ -1,7 +1,7 @@
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
-import { NotFoundError, throwIfAborted } from "./errors.js";
+import { MailboxConflictError, NotFoundError, throwIfAborted } from "./errors.js";
 import {
   closeImap,
   connectAbortableImap,
@@ -22,6 +22,9 @@ import {
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "./thread-walk.js";
 import type { ImapAccount, ImapMessage } from "./types.js";
 import { isMirrorId } from "./mirror-id.js";
+
+// Moved to errors.ts so content fetches can throw it too; still exported here.
+export { MailboxConflictError };
 
 /**
  * Mechanical IMAP write verbs — mark read/unread, star/unstar, move, trash,
@@ -74,19 +77,6 @@ export const SYSTEM_FLAGS = {
 } as const;
 
 export type SystemFlagName = keyof typeof SYSTEM_FLAGS;
-
-/**
- * Thrown when the live mailbox can no longer be safely addressed by the UID we
- * mirrored — UIDVALIDITY changed, so the stale UID may now point at a different
- * message. Callers (api.ts) map this to HTTP 409 Conflict rather than 500: the
- * request was well-formed, the server state simply moved underneath us.
- */
-export class MailboxConflictError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "MailboxConflictError";
-  }
-}
 
 /**
  * Thrown when the IMAP server does not advertise the capability a verb needs to

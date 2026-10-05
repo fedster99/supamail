@@ -4,6 +4,7 @@ import nodemailer from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
+import { InvalidInputError } from "./errors.js";
 import type { PgPool } from "./db.js";
 import { connectAbortableImap, type ImapAbortBinding } from "./imap-connect.js";
 import { getProviderProfile } from "./provider-profiles.js";
@@ -148,12 +149,12 @@ function assertSafeCustomHeaders(headers: Record<string, string>): void {
   for (const name of Object.keys(headers)) {
     const lower = name.toLowerCase();
     if (FORBIDDEN_CUSTOM_HEADERS.has(lower)) {
-      throw new Error(
+      throw new InvalidInputError(
         `Header "${name}" cannot be set via custom headers — set it through the structured send fields instead`
       );
     }
     if (lower.startsWith("x-") || ALLOWED_NON_X.has(lower)) continue;
-    throw new Error(
+    throw new InvalidInputError(
       `Custom header "${name}" is not allowed — only X-* custom headers (and In-Reply-To/References/Message-ID) may be set`
     );
   }
@@ -176,7 +177,7 @@ export const SENDER_NAME_SUPPORTED = true;
 
 export async function buildRawMime(req: SendRequest, from: SendRecipient): Promise<BuiltMime> {
   if (req.senderName !== undefined && (typeof req.senderName !== "string" || req.senderName.length > 120 || /[\x00-\x1f\x7f]/.test(req.senderName))) {
-    throw new Error("Sender name must be a single line of at most 120 characters");
+    throw new InvalidInputError("Sender name must be a single line of at most 120 characters");
   }
   const messageId = req.messageId ?? `<${randomUUID()}@${domainOf(from.email)}>`;
 

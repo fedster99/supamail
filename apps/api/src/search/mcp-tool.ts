@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PgPool } from "../db.js";
+import { formatZodIssues } from "../errors.js";
 import { searchMessages } from "./search.js";
 import type { SearchRequest, SearchResponse } from "./types.js";
 import {
@@ -182,12 +183,10 @@ export interface SearchInputError {
 
 /** One answer for arguments that fail the search schema, for every search engine. */
 export function searchInputError(error: z.ZodError): SearchInputError {
-  const detail = error.issues.slice(0, 5).map((issue) =>
-    `${issue.path.length > 0 ? issue.path.map(String).join(".") : "arguments"}: ${issue.message}`).join("; ");
   return {
     error: {
       code: "invalid_input",
-      message: `Invalid search arguments. ${detail}`,
+      message: `Invalid search arguments. ${formatZodIssues(error)}`,
       hint: "Fix the arguments to match the search_email inputSchema, then retry."
     }
   };

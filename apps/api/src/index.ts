@@ -6,6 +6,14 @@ export * from "./db.js";
 export * from "./delivery-evidence.js";
 export * from "./delivery-identity.js";
 export * from "./drafts.js";
+export {
+  AbortError,
+  AccountBusyError,
+  InvalidInputError,
+  NoRecipientsError,
+  NotFoundError,
+  UnfetchableContentError
+} from "./errors.js";
 export * from "./imap-client.js";
 export * from "./inbox-idle.js";
 export * from "./locks.js";

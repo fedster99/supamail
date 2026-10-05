@@ -9,7 +9,14 @@ import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { getConfig, type AppConfig } from "./config.js";
 import { applyPublicMigrations, getPool, type PgPool } from "./db.js";
-import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "./errors.js";
+import { DRAFT_BODY_SCHEMA, SEND_BODY_SCHEMA } from "./compose-schema.js";
+import {
+  AccountBusyError,
+  InvalidInputError,
+  NoRecipientsError,
+  NotFoundError,
+  UnfetchableContentError
+} from "./errors.js";
 import { HostValidationError } from "./host-validation.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { FolderTrackingRejectedError, MirrorRepository } from "./repository.js";
@@ -174,91 +181,13 @@ const UPDATE_ACCOUNT_CREDENTIALS_SCHEMA = z.object({
   password: z.string().min(1).max(1024)
 }).strict();
 
-const SEND_RECIPIENT_SCHEMA = z.object({
-  email: z.string().email().max(255),
-  name: z.string().max(255).optional()
-});
-
-// A header-safe string: no CR/LF, so a value can never break out of its header
-// line and inject extra headers when it reaches the MIME composer. nodemailer 9
-// strips newlines today, but we reject at the edge so the wire-byte safety is
-// not solely external (defense in depth; see the review CRLF finding).
-const NO_CRLF = (v: string) => !/[\r\n]/.test(v);
-const CRLF_MSG = "must not contain CR or LF characters";
-const headerSafe = (max: number) => z.string().max(max).refine(NO_CRLF, CRLF_MSG);
-// A record whose values are all header-safe (custom headers).
-const HEADER_RECORD = z.record(z.string().refine(NO_CRLF, CRLF_MSG));
-
-// Cap a single base64 attachment payload at ~25MB of decoded bytes (the same
-// BODY_RAW_MAX_BYTES ceiling reads use); base64 inflates ~4/3, so ~34MB encoded.
-const MAX_ATTACHMENT_BASE64_LEN = 34 * 1024 * 1024;
-
 // Whole-request ceiling for BOTH send transports (JSON base64 + multipart). This
 // is enforced by a Hono bodyLimit BEFORE the body is buffered by parseBody/json(),
 // so an oversized request is rejected with 413 without first materializing
 // hundreds of MB on the single shared Node process (the OOM the review flagged).
-// One attachment under MAX_ATTACHMENT_BASE64_LEN (~34MB) plus envelope fits; this
+// One attachment under the per-attachment cap (~34MB base64) plus envelope fits; this
 // bounds the aggregate, not each part. JSON (the default) is the worst case.
 const MAX_SEND_BODY_BYTES = 35 * 1024 * 1024;
-
-// One outbound attachment (email-004). `content` is base64 of the raw bytes; `cid`
-// makes it an inline image referenced from the HTML body as `cid:<value>`.
-const ATTACHMENT_SCHEMA = z.object({
-  filename: z.string().min(1).max(255),
-  contentType: z.string().max(255).optional(),
-  content: z.string().max(MAX_ATTACHMENT_BASE64_LEN),
-  cid: z.string().max(255).optional(),
-  inline: z.boolean().optional()
-});
-
-// Send body minus accountId (taken from the path). Mirrors SendRequest.
-const SEND_SCHEMA = z.object({
-  to: z.array(SEND_RECIPIENT_SCHEMA).min(1),
-  cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
-  bcc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
-  subject: z.string().max(2000),
-  body: z.object({
-    format: z.enum(["plain", "html"]),
-    text: z.string().optional(),
-    html: z.string().optional()
-  }),
-  headers: HEADER_RECORD.optional(),
-  inReplyTo: headerSafe(2000).optional(),
-  references: headerSafe(8000).optional(),
-  messageId: headerSafe(2000).optional(),
-  attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
-});
-
-// Draft body (email-003). Unlike SEND_SCHEMA, `to` may be empty/absent — a draft
-// can be saved while still incomplete; the recipient requirement is enforced only
-// when the draft is sent. accountId comes from the path on create.
-//
-// Bcc is intentionally NOT a draft field: it cannot round-trip through the APPENDed
-// draft bytes (nodemailer's keepBcc default omits Bcc from the composed MIME), so a
-// Bcc set on a saved draft would be silently dropped and never sent. We REJECT it
-// here with a clear message rather than accept-and-drop. Bcc is a send-time-only
-// field — set it on the /accounts/:id/send envelope (see ADR 0019).
-//
-// Attachments use the same bounded base64 transport and MIME composer as direct
-// sends. sendDraft later resends the saved raw MIME, preserving every part.
-const DRAFT_SCHEMA = z.object({
-  to: z.array(SEND_RECIPIENT_SCHEMA).optional(),
-  cc: z.array(SEND_RECIPIENT_SCHEMA).optional(),
-  bcc: z.any().optional().refine((v) => v === undefined, {
-    message: "Bcc is not supported on saved drafts — set Bcc when you send the draft"
-  }),
-  subject: z.string().max(2000).optional(),
-  body: z.object({
-    format: z.enum(["plain", "html"]),
-    text: z.string().optional(),
-    html: z.string().optional()
-  }),
-  headers: HEADER_RECORD.optional(),
-  inReplyTo: headerSafe(2000).optional(),
-  references: headerSafe(8000).optional(),
-  messageId: headerSafe(2000).optional(),
-  attachments: z.array(ATTACHMENT_SCHEMA).max(32).optional()
-});
 
 const TRACK_FOLDER_SCHEMA = z.object({
   path: z.string().min(1).max(1024)
@@ -381,7 +310,7 @@ const MAX_MULTIPART_FILE_BYTES = 25 * 1024 * 1024;
  * JSON send envelope (to/subject/body/…); every File field is decoded to base64
  * and appended as an attachment (filename + contentType from the part, marked
  * inline when the field name is `inline`). Returns the merged object for
- * SEND_SCHEMA. A file over the size cap is rejected with 413.
+ * SEND_BODY_SCHEMA. A file over the size cap is rejected with 413.
  */
 async function parseMultipartSend(c: Context): Promise<unknown> {
   let body: Record<string, unknown>;
@@ -478,6 +407,9 @@ export function createApiApp(options: ApiAppOptions): Hono {
   app.onError((err, c) => {
     if (err instanceof HTTPException) return err.getResponse();
     if (err instanceof HostValidationError) {
+      return c.json({ error: err.code, message: err.message }, 400);
+    }
+    if (err instanceof InvalidInputError) {
       return c.json({ error: err.code, message: err.message }, 400);
     }
     if (err instanceof NotFoundError) {
@@ -783,7 +715,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const raw = contentType.includes("multipart/form-data")
       ? await parseMultipartSend(c)
       : await parseJsonBody(c);
-    const input = SEND_SCHEMA.parse(raw);
+    const input = SEND_BODY_SCHEMA.parse(raw);
     const result = await options.send({ accountId: id, ...input });
     return c.json({ result });
   });
@@ -795,20 +727,14 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
-    const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
+    const input = DRAFT_BODY_SCHEMA.parse(await parseJsonBody(c));
     // Optional idempotent create: a retry carrying the same Idempotency-Key returns the
     // existing draft instead of filing a duplicate (search-before-APPEND in createDraft).
     // Normalize blank/whitespace to "no key" so "" and "   " behave identically
     // (both fall back to a non-idempotent APPEND) instead of "" silently duping while
     // "   " derives a useless Message-ID.
     const idempotencyKey = c.req.header("Idempotency-Key")?.trim() || undefined;
-    const result = await options.drafts.create({
-      accountId: id,
-      ...input,
-      to: input.to ?? [],
-      subject: input.subject ?? "",
-      idempotencyKey
-    });
+    const result = await options.drafts.create({ accountId: id, ...input, idempotencyKey });
     return c.json({ result }, 201);
   });
 
@@ -830,8 +756,8 @@ export function createApiApp(options: ApiAppOptions): Hono {
 
   app.patch("/drafts/:id", sendBodyLimit, async (c) => {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
-    const input = DRAFT_SCHEMA.parse(await parseJsonBody(c));
-    const result = await options.drafts.update(id, { ...input, to: input.to ?? [], subject: input.subject ?? "" });
+    const input = DRAFT_BODY_SCHEMA.parse(await parseJsonBody(c));
+    const result = await options.drafts.update(id, input);
     return c.json({ result });
   });
 

@@ -200,10 +200,9 @@ export async function closeImap(client: ClosableImapClient): Promise<void> {
  * comparison + message live here once.
  *
  * Returns `true` when the live mailbox UIDVALIDITY still matches what we mirrored
- * (or no mailbox is selected); returns `false` on a mismatch. Each caller keeps its
- * OWN thrown error type (mutations throw `MailboxConflictError` → HTTP 409; content
- * throws a plain `Error`), so this shared check changes no existing error contract —
- * the call site decides how to fail. `verb` tunes the message ("mutate" / "fetch").
+ * (or no mailbox is selected); returns `false` on a mismatch. Both the mutate and
+ * fetch call sites throw `MailboxConflictError` (→ HTTP 409). `verb` tunes the
+ * message ("mutate" / "fetch").
  */
 export function uidValidityMatches(
   mailbox: { uidValidity?: bigint | number } | false | null | undefined,

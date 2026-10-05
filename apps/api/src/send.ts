@@ -1,6 +1,7 @@
+import { SEND_REQUEST_SCHEMA, parseInput } from "./compose-schema.js";
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
-import { AccountBusyError, throwIfAborted } from "./errors.js";
+import { AccountBusyError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
 import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
@@ -44,6 +45,10 @@ import {
  * `unknown`. A durable caller may retry only `not_delivered`; it must reconcile
  * `unknown` and never submit it again. Remote wrappers own that durable ledger.
  *
+ * INPUT: the request is parsed first. Malformed input throws `InvalidInputError`
+ * before any provider work, never `SmtpDeliveryError`, so a caller fixes it
+ * instead of retrying it.
+ *
  * ABORT: an optional AbortSignal stops the send before SMTP with `AbortError`
  * (proven not delivered). SMTP submission itself is never interrupted, so abort
  * cannot turn a delivery into `unknown`. After delivery, abort only skips or
@@ -56,16 +61,17 @@ export async function sendMessage(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: { signal?: AbortSignal } = {}
 ): Promise<SendResult> {
+  const request = parseInput(SEND_REQUEST_SCHEMA, req);
   let deliveryConfirmed = false;
   try {
-    return await sendMessageAttempt(pool, config, req, metadataProtection, options.signal, () => {
+    return await sendMessageAttempt(pool, config, request, metadataProtection, options.signal, () => {
       deliveryConfirmed = true;
     });
   } catch (error) {
     if (error instanceof SmtpDeliveryError) throw error;
     if (
       !deliveryConfirmed &&
-      ["AbortError", "AccountBusyError", "HostValidationError"].includes(
+      ["AbortError", "AccountBusyError", "HostValidationError", "InvalidInputError", "NotFoundError"].includes(
         error instanceof Error ? error.name : ""
       )
     ) {
@@ -91,7 +97,7 @@ async function sendMessageAttempt(
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const account = await repository.getAccount(req.accountId);
   if (!account) {
-    throw new Error(`Account not found: ${req.accountId}`);
+    throw new NotFoundError(`Account not found: ${req.accountId}`);
   }
 
   const creds = await resolveSmtpCreds(pool, config, account);

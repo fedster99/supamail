@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { DRAFT_INPUT_SCHEMA, DRAFT_UPDATE_SCHEMA, parseInput } from "./compose-schema.js";
 import { getWindowCutoff, type AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
@@ -75,14 +76,6 @@ export type DraftInput = Omit<SendRequest, "bcc"> & {
    * keys are treated as no key. */
   idempotencyKey?: string;
 };
-
-/** Reject a Bcc smuggled past the type system (e.g. an untyped HTTP/JSON caller).
- * Bcc on a draft is dropped end-to-end, so refuse it loudly instead. */
-function rejectBcc(input: unknown): void {
-  if (input && typeof input === "object" && (input as { bcc?: unknown }).bcc !== undefined) {
-    throw new Error("Bcc is not supported on saved drafts — set Bcc when you send the draft");
-  }
-}
 
 /** One draft summary read from the mirror (list view). */
 export interface DraftSummary {
@@ -364,13 +357,13 @@ export async function createDraft(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: MailboxActionOptions = {}
 ): Promise<CreateDraftResult> {
-  rejectBcc(input);
+  const request = parseInput(DRAFT_INPUT_SCHEMA, input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await repository.getAccount(input.accountId);
-  if (!account) throw new Error(`Account not found: ${input.accountId}`);
+  const account = await repository.getAccount(request.accountId);
+  if (!account) throw new NotFoundError(`Account not found: ${request.accountId}`);
 
-  const saved = await saveDraft(pool, config, repository, account, input, input.idempotencyKey, options.signal);
+  const saved = await saveDraft(pool, config, repository, account, request, request.idempotencyKey, options.signal);
   return { accountId: account.id, ...saved };
 }
 
@@ -584,14 +577,14 @@ export async function updateDraft(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: MailboxActionOptions = {}
 ): Promise<UpdateDraftResult> {
-  rejectBcc(input);
+  const request = parseInput(DRAFT_UPDATE_SCHEMA, input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const draft = await loadLiveDraft(pool, repository, messageId);
   const account = await repository.getAccount(draft.account_id);
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.account_id}`);
 
-  const saved = await saveDraft(pool, config, repository, account, { ...input, accountId: account.id }, undefined, options.signal);
+  const saved = await saveDraft(pool, config, repository, account, { ...request, accountId: account.id }, undefined, options.signal);
 
   // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
   // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped

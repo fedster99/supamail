@@ -49,6 +49,7 @@ reset must never act on / fetch the wrong message" — so the comparison + messa
 once. Each call site **keeps its own thrown error type** (mutations throw
 `MailboxConflictError` → HTTP 409; content throws a plain `Error`): only the
 comparison + message string are shared, so no existing error contract changes.
+Update (ADR 0035): the content fetch now also throws `MailboxConflictError` (409).
 
 This is a behavior-preserving refactor. It does not reopen ADR 0017/0018/0020 — those
 already *described* this prelude as a "reused pattern"; this is the faithful

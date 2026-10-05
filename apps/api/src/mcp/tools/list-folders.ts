@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
+import { formatZodIssues } from "../../errors.js";
 import { syncTrustFor, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
@@ -100,16 +101,15 @@ export async function runListFolders(
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<ListFoldersResponse | ReturnType<typeof toolError>> {
-  let request: z.infer<typeof listFoldersRequestSchema>;
-  try {
-    request = listFoldersRequestSchema.parse(args);
-  } catch (error) {
+  const parsed = listFoldersRequestSchema.safeParse(args);
+  if (!parsed.success) {
     return toolError(
       "invalid_input",
-      error instanceof Error ? error.message : "Invalid arguments.",
+      formatZodIssues(parsed.error),
       "Pass an optional { account } UUID string, or no arguments to list folders for every account."
     );
   }
+  const request = parsed.data;
 
   const accountId = request.account ?? null;
 

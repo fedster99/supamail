@@ -125,7 +125,8 @@ that surface, exactly as 0014 required any write capability to be a new decision
   partial positive reply, a lost final reply, or an unqualified connection loss
   has outcome `unknown`. A proven failure before submission, such as DNS,
   authentication, TLS, connection setup, compose, or account lookup, has outcome
-  `not_delivered`.
+  `not_delivered`. Malformed caller input is not a delivery outcome: it throws
+  `InvalidInputError` before any provider work (ADR 0035).
 - SMTP connection and greeting setup keep the short `CONNECT_TIMEOUT_MS`.
   Waiting for the final DATA response uses `SMTP_COMMAND_TIMEOUT_MS`, which
   defaults to 10 minutes as required by RFC 5321. It does not reuse the

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
+import { formatZodIssues } from "../../errors.js";
 import {
   loadMessageAttachments,
   mapMessageRow,
@@ -150,16 +151,15 @@ export async function runReadMessage(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: ReadMessageOptions = {}
 ): Promise<(MessageDetail & { sync_trust: SyncTrust }) | ReturnType<typeof toolError>> {
-  let request: z.infer<typeof readMessageRequestSchema>;
-  try {
-    request = readMessageRequestSchema.parse(args);
-  } catch (error) {
+  const parsed = readMessageRequestSchema.safeParse(args);
+  if (!parsed.success) {
     return toolError(
       "invalid_input",
-      error instanceof Error ? error.message : "Invalid arguments.",
+      formatZodIssues(parsed.error),
       "Pass one valid message_id and optional body range or header settings."
     );
   }
+  const request = parsed.data;
   const includeHeaders = request.include_headers ?? false;
   const includeQuoted = request.include_quoted ?? false;
 

@@ -2,7 +2,7 @@ import type { Readable } from "node:stream";
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
-import { NotFoundError, UnfetchableContentError, throwIfAborted } from "./errors.js";
+import { MailboxConflictError, NotFoundError, UnfetchableContentError, throwIfAborted } from "./errors.js";
 import {
   closeImap,
   connectAbortableImap,
@@ -267,10 +267,10 @@ export class ContentImapClient {
 
   private assertUidValidity(folderPath: string, uidValidity: number): void {
     const mailbox = this.client.mailbox as { uidValidity?: bigint | number } | false | null;
-    // Shared fail-closed UIDVALIDITY check (imap-connect.ts) — same property as
-    // MailboxMutator's mutate guard, but the fetch path keeps its own plain Error.
+    // Shared fail-closed UIDVALIDITY check (imap-connect.ts) — same property and
+    // the same typed error as MailboxMutator's mutate guard.
     if (!uidValidityMatches(mailbox, uidValidity)) {
-      throw new Error(
+      throw new MailboxConflictError(
         uidValidityMismatchMessage(
           folderPath,
           uidValidity,

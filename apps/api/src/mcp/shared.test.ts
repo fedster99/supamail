@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { cleanBody, mapMessageRow, withReadOnlyTx } from "./shared.js";
 import { buildCc, buildReferences, quoteText, reSubject } from "./tools/draft-reply.js";
+import { MAX_REFERENCES_LENGTH } from "../compose-schema.js";
 
 /**
  * No-DB unit suite for the pure MCP helpers (ADR 0014/0016). These run in the
@@ -340,6 +341,18 @@ describe("buildReferences", () => {
       sourceRow({ references_header: null, in_reply_to: null, rfc_message_id: null })
     );
     expect(out).toBeUndefined();
+  });
+
+  it("keeps the root and the newest ids when a long thread exceeds the send limit", () => {
+    const ids = Array.from({ length: 400 }, (_, i) => `<message-${String(i).padStart(4, "0")}@lists.example.test>`);
+    const out = buildReferences(
+      sourceRow({ references_header: ids.join(" "), in_reply_to: ids[399], rfc_message_id: "<src@x>" })
+    )!;
+    const kept = out.split(" ");
+    expect(out.length).toBeLessThanOrEqual(MAX_REFERENCES_LENGTH);
+    expect(kept[0]).toBe(ids[0]);
+    expect(kept.slice(-2)).toEqual([ids[399], "<src@x>"]);
+    expect(ids.slice(400 - (kept.length - 2))).toEqual(kept.slice(1, -1));
   });
 });
 
