@@ -204,8 +204,10 @@ export async function runReadMessage(
   if (!row) {
     return toolError(
       "not_found",
-      `No mirrored message with id ${request.message_id}. It may have been moved or deleted.`,
-      "call search_email to locate the message id"
+      `No message with id ${request.message_id} in this mirror.`,
+      "Message ids belong to this mirror: an id from another email tool or mirror never matches. " +
+        "Find the message with search_email and use its identity.id. A message deleted in the mailbox, " +
+        "or moved without keeping its id, also has no live id here."
     );
   }
 

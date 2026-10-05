@@ -1271,6 +1271,17 @@ describe("API safety", () => {
     await expect(res.json()).resolves.toMatchObject({ error: "account_busy" });
   });
 
+  it("maps a body refetch during a sync to 503 account_busy + Retry-After (not a 500)", async () => {
+    const { app, engine } = buildApp();
+    engine.fetchBody.mockRejectedValueOnce(
+      new AccountBusyError("Account is busy syncing; retry the body fetch shortly") as never
+    );
+    const res = await app.request(`/messages/${messageId}/refetch-body`, { method: "POST", headers: auth() });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("5");
+    await expect(res.json()).resolves.toMatchObject({ error: "account_busy" });
+  });
+
   it("maps an unfetchable attachment (no BODYSTRUCTURE part) to 422 (not a 500)", async () => {
     const { app, content } = buildApp();
     const attachmentId = "00000000-0000-4000-8000-0000000000b2";
