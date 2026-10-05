@@ -220,7 +220,7 @@ liveDb("search layer live DB", () => {
            account_id, folder_path, uidvalidity, uid, internal_date, subject, from_email,
            to_emails, flags, deleted_in_provider, window_status, size_bytes
          ) VALUES ($1, $2, $3, $4, now(), 'Folder probe', 'me@example.test',
-           ARRAY['you@example.test'], ARRAY['\\Seen'], false, 'IN_WINDOW', 10)`,
+           ARRAY['you@example.test'], ARRAY['\\Recent', '\\Seen'], false, 'IN_WINDOW', 10)`,
         [accountId, folder, UIDVALIDITY, uid]
       );
     }
@@ -228,6 +228,8 @@ liveDb("search layer live DB", () => {
       .results.map((result) => result.identity.folder_path).sort();
 
     expect(await folders("in:Legal")).toEqual(["INBOX.INBOX.Legal"]);
+    const legal = await searchMessages(pool, { q: "in:Legal", accounts: [accountId] });
+    expect(legal.results[0].flags).toEqual(["\\Seen"]);
     expect(await folders("in:sent")).toEqual(["INBOX.INBOX.Sent", "INBOX.Sent Messages"]);
     expect(await folders("in:INBOX.INBOX.* folder probe")).toEqual(["INBOX.INBOX.Legal", "INBOX.INBOX.Sent"]);
     expect(await folders("-in:sent folder probe")).toEqual(["INBOX.INBOX.Legal"]);

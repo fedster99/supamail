@@ -73,7 +73,8 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
     from: { email: row.from_email, name: row.from_name },
     to: row.to_emails ?? [],
     date: row.internal_date.toISOString(),
-    flags: row.flags ?? [],
+    // \Recent describes one IMAP session, not the message.
+    flags: (row.flags ?? []).filter((flag) => flag.toLowerCase() !== "\\recent"),
     window_status: row.window_status,
     body_fetched_at: row.body_fetched_at ? row.body_fetched_at.toISOString() : null,
     snippet: row.snippet ?? null,
