@@ -396,9 +396,11 @@ export function normalizeBodyText(text: string): string {
   return text
     .replace(INVISIBLE_PADDING_RE, "")
     .replace(/\r\n?/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n[ \t]+/g, "\n")
+    // Every run of horizontal space, including no-break and other Unicode
+    // spaces that senders use to pad previews, becomes one space.
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ \n/g, "\n")
+    .replace(/\n /g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }

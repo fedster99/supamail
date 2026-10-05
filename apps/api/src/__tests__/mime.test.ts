@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   extractAttachmentMetadata,
   htmlToText,
+  normalizeBodyText,
   normalizeMessageId,
   parseHeaders,
   parseRawMime,
@@ -89,6 +90,15 @@ describe("mime helpers", () => {
       "<p>\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645</p></body></html>"
     ].join("");
     expect(htmlToText(html)).toBe("Preview\n\nPaid\n\n\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645");
+  });
+
+  it("collapses runs of Unicode space, such as no-break preview padding", () => {
+    expect(normalizeBodyText("Weekly digest\u00a0\u00a0\u2007 \u00a0\n\u00a0 Top deals \t\r\nEnd")).toBe(
+      "Weekly digest\nTop deals\nEnd"
+    );
+    expect(htmlToText("<p>Weekly digest</p>" + "&nbsp;\u00a0".repeat(120) + "<p>Top deals</p>")).toBe(
+      "Weekly digest\n\nTop deals"
+    );
   });
 
   it("converts crafted html in linear time", () => {
