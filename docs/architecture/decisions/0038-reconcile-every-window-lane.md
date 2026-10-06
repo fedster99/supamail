@@ -50,8 +50,9 @@ row of that UIDVALIDITY, whatever its lane.**
 - The list is proof only when its distinct size equals SELECT's message count,
   read after both searches. Otherwise, or when a search fails, reconcile raises
   `IncompleteUidListError`, changes nothing, records a `RECONCILE_INCOMPLETE`
-  event and an unclean reconcile, and the folder retries on the next sync
-  cadence. The rest of the folder's sync still commits.
+  event and an unclean reconcile. The folder retries once on the next sync
+  cadence, then on the normal reconcile cadence, so a provider that keeps
+  disagreeing cannot take the reconcile slot every pass. The rest of the folder's sync still commits.
 - Two client gaps would break that count, and both are fixed in the pinned
   ImapFlow patch. A QRESYNC `VANISHED` response now lowers EXISTS the way
   `EXPUNGE` does. An ESEARCH `ALL` set that cannot be expanded exactly (more
@@ -78,5 +79,5 @@ row of that UIDVALIDITY, whatever its lane.**
   and reports `RECONCILE_INCOMPLETE` on every reconcile, rather than guessing.
 - Reconcile tombstones and revivals do not call `onMessageUpsert`, as tombstones
   never did; hosts follow `deleted_in_provider` in the database.
-- Folder-missing tombstones are unchanged and still cover `IN_WINDOW` rows only;
-  extending them changes which rows the 30-day purge removes.
+- Folder-missing tombstones cover every row since ADR 0039: purgeable
+  `FOLDER_MISSING` inside the window, recoverable `RECONCILE_MISSING` outside it.

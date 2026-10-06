@@ -200,7 +200,6 @@ const TRACK_FOLDER_SCHEMA = z.object({
 const BOOL_PARAM = z
   .enum(["true", "false", "1", "0"])
   .transform((v) => v === "true" || v === "1");
-const WINDOW_ENUM = z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"]);
 const SEARCH_QUERY_SCHEMA = z.object({
   q: z.string().max(4096).optional(),
   from: z.string().max(255).optional(),
@@ -218,7 +217,8 @@ const SEARCH_QUERY_SCHEMA = z.object({
   received_after: z.string().max(64).optional(),
   received_before: z.string().max(64).optional(),
   account: z.string().uuid().optional(),
-  window: WINDOW_ENUM.optional(),
+  // Retired lane filter (ADR 0039): reject it rather than silently widen results.
+  window: z.never({ message: "window is no longer supported; use received_after or received_before" }).optional(),
   sort: z.enum(["smart", "relevance", "recent", "oldest", "size", "sender"]).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
   // Cap offset: deep OFFSET in the no-candidate-cap structured path scans/scores/
@@ -263,16 +263,12 @@ const RENAME_FOLDER_SCHEMA = z.object({
 const MUTABLE_ACCOUNT_SETTING_KEYS = [
   "bodyFetchPolicy",
   "historicalBackfillMode",
-  "archiveRefreshInterval",
-  "archiveFlagSync",
   "maxBackfillRate"
 ] as const;
 
 const ACCOUNT_SETTINGS_SCHEMA = z.object({
   bodyFetchPolicy: z.enum(["immediate", "lazy", "priority_then_backfill"]).optional(),
   historicalBackfillMode: z.enum(["off", "metadata_only", "metadata_and_bodies"]).optional(),
-  archiveRefreshInterval: z.enum(["never", "monthly", "weekly"]).optional(),
-  archiveFlagSync: z.boolean().optional(),
   maxBackfillRate: z.enum(["small", "normal", "aggressive"]).optional(),
   liveWindowDays: z.unknown().optional(),
   live_window_days: z.unknown().optional()
@@ -562,8 +558,6 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const input: UpdateAccountSettingsInput = {
       bodyFetchPolicy: parsed.bodyFetchPolicy,
       historicalBackfillMode: parsed.historicalBackfillMode,
-      archiveRefreshInterval: parsed.archiveRefreshInterval,
-      archiveFlagSync: parsed.archiveFlagSync,
       maxBackfillRate: parsed.maxBackfillRate
     };
     const updated = await options.repository.updateAccountSettings(id, input);
@@ -603,7 +597,6 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (p.has_attachment !== undefined) filters.hasAttachment = p.has_attachment;
     if (p.received_after !== undefined) filters.after = p.received_after;
     if (p.received_before !== undefined) filters.before = p.received_before;
-    if (p.window !== undefined) filters.window = p.window;
 
     const request: SearchRequest = {
       // Treat an empty/whitespace `?q=` as absent so it doesn't slip past the

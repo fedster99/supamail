@@ -268,7 +268,6 @@ describe("mapMessageRow", () => {
       to_emails: ["me@example.test"],
       cc_emails: [],
       flags: [],
-      window_status: "IN_WINDOW",
       internal_date: new Date("2026-08-01T00:00:00.000Z"),
       body_text: "0123456789",
       body_plain: null,

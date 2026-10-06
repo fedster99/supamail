@@ -38,7 +38,7 @@ import {
   setMessageFlags,
   setThreadFlags
 } from "./mailbox-mutations.js";
-import type { SendAttachment, SendRecipient, SendRequest, WindowStatus } from "./types.js";
+import type { SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
 const program = new Command();
 const config = getConfig();
@@ -264,7 +264,6 @@ program
   .option("--before <when>", "Received before (ISO or relative)")
   .option("--larger <size>", "Larger than (e.g. 2mb, 500kb)")
   .option("--smaller <size>", "Smaller than")
-  .option("--window <lane>", "Lane IN_WINDOW|EXPIRED|HISTORICAL (repeatable)", collect, [])
   .option("--include-deleted", "Include soft-deleted messages")
   .option("--sort <mode>", "smart|relevance|recent|oldest|size|sender")
   .option("--limit <n>", "Maximum results (1-100)", "25")
@@ -302,11 +301,9 @@ program
     if (options.withoutAttachment) qParts.push("-has:attachment");
 
     const accounts = options.account as string[];
-    const windows = options.window as string[];
     const request: SearchRequest = {
       q: qParts.length > 0 ? qParts.join(" ") : undefined,
       accounts: accounts.length > 0 ? accounts : undefined,
-      windowStatus: windows.length > 0 ? (windows as WindowStatus[]) : undefined,
       includeDeleted: Boolean(options.includeDeleted),
       sort: options.sort as SearchSort | undefined,
       limit: Number(options.limit),

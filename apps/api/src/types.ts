@@ -2,11 +2,9 @@ export type BodyFetchPolicy = "immediate" | "lazy" | "priority_then_backfill";
 export type BodyStorageMode = "raw_mime" | "parsed_only";
 export type LiveWindowDays = 30 | 90 | 180;
 export type HistoricalBackfillMode = "off" | "metadata_only" | "metadata_and_bodies";
-export type ArchiveRefreshInterval = "never" | "monthly" | "weekly";
 export type MaxBackfillRate = "small" | "normal" | "aggressive";
 export type SyncState = "INITIAL_SYNC" | "HEALTHY" | "DEGRADED" | "BROKEN" | "PAUSED";
 export type FolderStatus = "PENDING" | "SYNCING" | "ACTIVE" | "NEEDS_FULL_RESYNC" | "MISSING" | "PENDING_VERIFICATION";
-export type WindowStatus = "IN_WINDOW" | "EXPIRED" | "HISTORICAL";
 export type SyncRunStatus = "running" | "success" | "partial_success" | "failed";
 export type SyncTriggerType = "scheduled" | "manual" | "api" | "backfill";
 
@@ -27,8 +25,6 @@ export interface ImapAccount {
   body_fetch_policy: BodyFetchPolicy;
   live_window_days: LiveWindowDays;
   historical_backfill_mode: HistoricalBackfillMode;
-  archive_refresh_interval: ArchiveRefreshInterval;
-  archive_flag_sync: boolean;
   max_backfill_rate: MaxBackfillRate;
   sync_state: SyncState;
   sync_state_reason: string | null;
@@ -60,8 +56,6 @@ export interface AccountSummary {
   body_fetch_policy: BodyFetchPolicy;
   live_window_days: LiveWindowDays;
   historical_backfill_mode: HistoricalBackfillMode;
-  archive_refresh_interval: ArchiveRefreshInterval;
-  archive_flag_sync: boolean;
   max_backfill_rate: MaxBackfillRate;
   sync_state: SyncState;
   sync_state_reason: string | null;
@@ -163,12 +157,11 @@ export interface ImapFolder {
   backfill_target_max_uid: string | null;
   backfill_oldest_uid_synced: string | null;
   backfill_since_date: Date | null;
-  last_archive_refresh_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
 
-export type HistoryBacklogReason = "snapshot" | "metadata" | "body" | "refresh";
+export type HistoryBacklogReason = "snapshot" | "metadata" | "body";
 
 export type HistoryBacklogFolder = ImapFolder & {
   history_backlog_reason: HistoryBacklogReason;
@@ -206,7 +199,6 @@ export interface ImapMessage {
   deleted_in_provider: boolean;
   provider_deleted_at: Date | null;
   deleted_reason: string | null;
-  window_status: WindowStatus;
   created_at: Date;
   updated_at: Date;
 }
@@ -405,8 +397,6 @@ export interface SendResult {
 export interface UpdateAccountSettingsInput {
   bodyFetchPolicy?: BodyFetchPolicy;
   historicalBackfillMode?: HistoricalBackfillMode;
-  archiveRefreshInterval?: ArchiveRefreshInterval;
-  archiveFlagSync?: boolean;
   maxBackfillRate?: MaxBackfillRate;
 }
 

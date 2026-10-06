@@ -1,6 +1,5 @@
 import type { SearchFilter, SearchSort, TextTerm, TextTerms } from "./types.js";
 import { DELIVERY_KEY_SQL } from "../delivery-identity.js";
-import type { WindowStatus } from "../types.js";
 import { parseTextTerms } from "./parse.js";
 import { filenameGlob, filetypeMatch, resolveDate } from "./rules.js";
 
@@ -16,7 +15,6 @@ class Params {
 
 export interface CompileOptions {
   accountIds: string[] | null;
-  windowStatus: WindowStatus[] | null;
   includeDeleted: boolean;
   sort: SearchSort;
   limit: number;
@@ -183,10 +181,6 @@ function filterPredicate(filter: SearchFilter, pb: Params, now: Date): string {
       const op = filter.op === "larger" ? ">" : "<";
       return negate(`m.size_bytes ${op} ${pb.add(filter.value)}`);
     }
-    case "window": {
-      const p = pb.add(filter.value);
-      return negate(`m.window_status = ${p}`);
-    }
     case "or":
       return negate(`(${filter.filters.map((member) => filterPredicate(member, pb, now)).join(" OR ")})`);
     default: {
@@ -303,9 +297,6 @@ export function compileSearch(
   if (opts.accountIds && opts.accountIds.length > 0) {
     scope.push(`m.account_id = ANY(${pb.add(opts.accountIds)}::uuid[])`);
   }
-  if (opts.windowStatus && opts.windowStatus.length > 0) {
-    scope.push(`m.window_status = ANY(${pb.add(opts.windowStatus)}::text[])`);
-  }
   const scopeSql = scope.join("\n      AND ");
   // Structured operator predicates (from:/folder:/has:/date:…) — applied once over
   // the bounded candidate set (they reference m, the joined body b, or self-contained
@@ -357,7 +348,7 @@ grouped AS (
   const candProjection = `SELECT
     m.id, m.account_id, m.folder_path, m.uidvalidity, m.uid,
     m.subject, m.from_email, m.from_name, m.to_emails, m.flags,
-    m.window_status, m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
+    m.internal_date, m.provider_thread_id, m.body_fetched_at, m.size_bytes,
     ta.conversation_id,
     ${DELIVERY_KEY_SQL} AS delivery_key,
     CASE
@@ -490,7 +481,7 @@ page AS (
 SELECT
   page.id, page.account_id, page.folder_path, page.uidvalidity, page.uid,
   page.subject, page.from_email, page.from_name, page.to_emails, page.flags,
-  page.window_status, page.internal_date, page.conversation_id,
+  page.internal_date, page.conversation_id,
   page.provider_thread_id, page.body_fetched_at,
   page.thread_count::int AS thread_count,
   array_remove(page.delivery_copy_ids, page.id) AS duplicate_message_ids,

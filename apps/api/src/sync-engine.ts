@@ -15,9 +15,7 @@ import {
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   IncompleteUidListError,
-  searchMailboxUids,
-  searchUidsBefore,
-  searchUidsSince
+  searchMailboxUids
 } from "./imap-client.js";
 import type {
   MailboxChange,
@@ -58,6 +56,8 @@ const HISTORY_METADATA_COMMIT_GRACE_MS = 30_000;
 const SYNC_STATE_WRITE_GRACE_MS = 30_000;
 const UNCHANGED_PROOF_QUERY = { uidValidity: true, uidNext: true, highestModseq: true } as const;
 const SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS = 1_000;
+/** Incremental batches one folder pass takes before it saves progress and yields. */
+const MAX_INCREMENTAL_BATCHES_PER_PASS = 20;
 /** How long a provider that did not activate QRESYNC is left alone before the next try. */
 const QRESYNC_UNAVAILABLE_RETRY_MS = 6 * 60 * 60_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
@@ -66,6 +66,16 @@ const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
 const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
 const FOLDER_ALIAS_SAMPLE_SIZE = 5;
 const FOLDER_ALIAS_SAMPLE_UID_WINDOW = 100;
+
+/**
+ * The UIDNEXT a pass may store after mirroring every UID up to `lastUid`. A
+ * stored UIDNEXT promises that nothing below it is still unfetched new mail, so
+ * a pass that stopped early stores the next UID it would have fetched instead.
+ */
+function reachedUidNext(uidNext: number | undefined, lastUid: number): number | undefined {
+  if (uidNext === undefined) return undefined;
+  return lastUid >= uidNext - 1 ? uidNext : lastUid + 1;
+}
 
 type DiscoveredFolder = {
   path: string;
@@ -1219,7 +1229,7 @@ export class MirrorEngine {
         };
       }
 
-      const windowCutoff = getWindowCutoff(this.config);
+      const windowCutoff = getWindowCutoff(account);
       let messagesUpserted = 0;
       let flagsUpdated = 0;
       let reconcileGapsFound = 0;
@@ -1260,7 +1270,7 @@ export class MirrorEngine {
         };
       }
 
-      // Spec §10.5: incremental sync — only UIDs > last_uid, in window.
+      // Spec §10.5: incremental sync — every UID > last_uid, whatever its date.
       const incrementalDeadline = Date.now() + this.config.INCREMENTAL_TOTAL_TIMEOUT_MS;
       const lastUid = folder.last_uid ? Number(folder.last_uid) : 0;
       const uidFloor = lastUid + 1;
@@ -1271,15 +1281,20 @@ export class MirrorEngine {
             client,
             incrementalDeadline,
             "incremental SEARCH",
-            () => searchUidsSince(client, windowCutoff, `${uidFloor}:${uidCeiling}`)
+            // A new UID is new mail whatever its date, e.g. old mail moved here.
+            () => searchMailboxUids(client, { uid: `${uidFloor}:${uidCeiling}` })
           )).filter((uid) => uid > lastUid)
         )
       ].sort((a, b) => a - b);
 
       const incrementalBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+      // New mail has no date limit, so a large move of old mail can arrive at
+      // once. One pass takes a bounded number of batches and saves its progress;
+      // the rest follows on the next passes, oldest UID first.
+      const passUids = incomingUids.slice(0, incrementalBatchSize * MAX_INCREMENTAL_BATCHES_PER_PASS);
       let lastProcessedUid: number | undefined;
-      for (let i = 0; i < incomingUids.length; i += incrementalBatchSize) {
-        const batchUids = incomingUids.slice(i, i + incrementalBatchSize);
+      for (let i = 0; i < passUids.length; i += incrementalBatchSize) {
+        const batchUids = passUids.slice(i, i + incrementalBatchSize);
         const metadata = await this.withIncrementalDeadline(
           client,
           incrementalDeadline,
@@ -1292,7 +1307,6 @@ export class MirrorEngine {
           folder,
           uidValidity,
           metadata,
-          windowCutoff,
           { deadlineAt: incrementalDeadline, signal: options.signal }
         );
         messagesUpserted += messages.length;
@@ -1449,7 +1463,7 @@ export class MirrorEngine {
               flagScanDeadline,
               "FLAG_SCAN_TOTAL_TIMEOUT_MS",
               "flag scan SEARCH",
-              () => searchUidsSince(client, flagCutoff)
+              () => searchMailboxUids(client, { since: flagCutoff })
             ))
           ].sort((a, b) => a - b);
           for (let i = 0; i < flagUids.length; i += incrementalBatchSize) {
@@ -1484,6 +1498,7 @@ export class MirrorEngine {
 
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
+      let reconcileListIncomplete = false;
       const reconcileDue = qresyncFallbackRequired
         || options.forceAuthoritativeReconcile
         || (!qresyncApplied && options.forceReconcile)
@@ -1533,7 +1548,8 @@ export class MirrorEngine {
               // Read after both searches: imapflow applies the EXISTS, EXPUNGE
               // and VANISHED responses they carried.
               expectedCount: client.mailbox ? client.mailbox.exists : undefined,
-              uidNextAtSelect: uidNext
+              uidNextAtSelect: uidNext,
+              deadlineAt: reconcileDeadline
             }
           );
         } catch (error) {
@@ -1546,6 +1562,7 @@ export class MirrorEngine {
         }
         if (!reconcile) {
           reconcileClean = false;
+          reconcileListIncomplete = true;
         } else {
           reconcileProviderUidsSeen += reconcile.providerUidCount;
 
@@ -1573,7 +1590,6 @@ export class MirrorEngine {
                 folder,
                 uidValidity,
                 metadata,
-                windowCutoff,
                 { deadlineAt: reconcileDeadline, signal: options.signal }
               );
               backfilled += messages.length;
@@ -1603,15 +1619,19 @@ export class MirrorEngine {
           // Keep health degraded only when the bounded repair was interrupted or
           // the missing-UID result overflowed this pass.
           reconcileClean = !hitLockBudget
+            && reconcile.complete
             && !reconcile.missingInDbTruncated
             && backfilled === reconcile.missingInDbUids.length;
         }
         reconcileDurationMs += Math.max(0, Date.now() - reconcileStartedAt);
       }
 
+      // Store only the UIDNEXT this pass reached, so the unchanged-folder proof
+      // and the 0030 head repair never pass over pending new mail.
+      const newMailComplete = lastProcessedUid === incomingUids[incomingUids.length - 1];
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
-        uidNext,
+        uidNext: newMailComplete ? uidNext : reachedUidNext(uidNext, lastProcessedUid ?? lastUid),
         highestModseq: flagScanAttempted ? highestModseq : undefined,
         qresyncHighestModseq: qresyncApplied
           || (flagScanAttempted && reconcileAttempted && reconcileClean === true)
@@ -1620,6 +1640,7 @@ export class MirrorEngine {
         lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,
+        reconcileListIncomplete,
         flagScanCompleted: flagScanAttempted ? true : undefined
       }, {
         deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
@@ -1762,7 +1783,6 @@ export class MirrorEngine {
     folder: ImapFolder,
     uidValidity: number,
     metadata: MessageMetadata[],
-    windowCutoff: Date,
     options: MetadataWriteOptions = {}
   ): Promise<ImapMessage[]> {
     const startedAt = performance.now();
@@ -1773,7 +1793,6 @@ export class MirrorEngine {
         folder,
         uidValidity,
         metadata,
-        windowCutoff,
         options
       );
       stats.rowsCommitted += rows.length;
@@ -1808,13 +1827,17 @@ export class MirrorEngine {
       : null;
     let liveHeadUid = folder.last_uid ? Number(folder.last_uid) : 0;
 
-    // First pass for this folder: take the snapshot.
+    // First pass for this folder: take the snapshot. Every UID below UIDNEXT is
+    // then either in the window snapshot or archive for the history lane, so the
+    // live head starts at UIDNEXT and takes new mail whatever its date. Without
+    // UIDNEXT the head stays at the snapshot maximum, as before.
+    const snapshotHighWater = uidNext ? uidNext - 1 : 0;
     if (targetMaxUid === null || oldestSynced === null) {
       const snapshot = await this.withInitialSyncDeadline(
         client,
         initialSyncDeadline,
         "initial sync snapshot SEARCH",
-        () => searchUidsSince(client, windowCutoff)
+        () => searchMailboxUids(client, { since: windowCutoff })
       );
       const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
 
@@ -1826,12 +1849,13 @@ export class MirrorEngine {
           0,
           0,
           uidValidity,
+          snapshotHighWater,
           { deadlineAt: initialSyncDeadline, signal }
         );
         await this.repository.markFolderSynced(folder.id, {
           uidValidity,
           uidNext,
-          lastUid: 0,
+          lastUid: snapshotHighWater,
           initialComplete: true
         }, { deadlineAt: initialSyncDeadline, signal });
         return { messagesUpserted: 0, initialSyncComplete: true };
@@ -1845,8 +1869,10 @@ export class MirrorEngine {
         oldestSynced,
         sortedTargets.length,
         uidValidity,
+        snapshotHighWater,
         { deadlineAt: initialSyncDeadline, signal }
       );
+      liveHeadUid = Math.max(liveHeadUid, snapshotHighWater);
     }
 
     // Re-search and bound by the snapshot. Any UIDs the provider has expunged
@@ -1855,13 +1881,23 @@ export class MirrorEngine {
       client,
       initialSyncDeadline,
       "initial sync SEARCH",
-      () => searchUidsSince(client, windowCutoff)
+      () => searchMailboxUids(client, { since: windowCutoff })
     );
     const sortedCandidates = [...new Set(candidates)].sort((a, b) => a - b);
     let messagesUpserted = 0;
 
-    const liveBatch = sortedCandidates
-      .filter((uid) => uid > targetMaxUid! && uid > liveHeadUid)
+    const liveFloor = Math.max(targetMaxUid, liveHeadUid) + 1;
+    const liveCandidates = uidNext && uidNext > liveFloor
+      ? await this.withInitialSyncDeadline(
+          client,
+          initialSyncDeadline,
+          "initial sync live-head SEARCH",
+          () => searchMailboxUids(client, { uid: `${liveFloor}:${uidNext - 1}` })
+        )
+      : [];
+    const liveBatch = [...new Set(liveCandidates)]
+      .filter((uid) => uid >= liveFloor)
+      .sort((a, b) => a - b)
       .slice(0, this.config.INCREMENTAL_SYNC_BATCH_SIZE);
     if (liveBatch.length > 0) {
       const liveMetadata = await this.withInitialSyncDeadline(
@@ -1886,7 +1922,6 @@ export class MirrorEngine {
         folder,
         uidValidity,
         liveMetadata,
-        windowCutoff,
         { deadlineAt: initialSyncDeadline, signal }
       );
       messagesUpserted += liveMessages.length;
@@ -1918,7 +1953,7 @@ export class MirrorEngine {
       // Everything in the original snapshot has gone away — done.
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
-        uidNext,
+        uidNext: reachedUidNext(uidNext, completionLastUid),
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
@@ -1940,7 +1975,7 @@ export class MirrorEngine {
       // Watermark already at or below the minimum — initial sync is complete.
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
-        uidNext,
+        uidNext: reachedUidNext(uidNext, completionLastUid),
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
@@ -1966,7 +2001,6 @@ export class MirrorEngine {
       folder,
       uidValidity,
       metadata,
-      windowCutoff,
       { deadlineAt: initialSyncDeadline, signal }
     );
     messagesUpserted += messages.length;
@@ -1994,7 +2028,7 @@ export class MirrorEngine {
     if (!stillRemaining) {
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
-        uidNext,
+        uidNext: reachedUidNext(uidNext, completionLastUid),
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
@@ -2131,7 +2165,7 @@ export class MirrorEngine {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
       }
 
-      const windowCutoff = getWindowCutoff(this.config);
+      const windowCutoff = getWindowCutoff(account);
       let targetMaxUid: number | null = folder.backfill_target_max_uid
         ? Number(folder.backfill_target_max_uid)
         : null;
@@ -2139,12 +2173,11 @@ export class MirrorEngine {
         ? Number(folder.backfill_oldest_uid_synced)
         : null;
       const shouldStartSnapshot = folder.history_backlog_reason === "snapshot"
-        || folder.history_backlog_reason === "refresh"
         || targetMaxUid === null
         || oldestSynced === null;
 
       if (shouldStartSnapshot) {
-        const snapshot = await searchUidsBefore(client, windowCutoff);
+        const snapshot = await searchMailboxUids(client, { before: windowCutoff });
         const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
 
         if (sortedTargets.length === 0) {
@@ -2192,14 +2225,20 @@ export class MirrorEngine {
       // refresh quadratic in mailbox size. Advancing across an empty range is safe:
       // this exact date-and-UID query proved that no snapshot candidate exists there.
       const scanLowerUid = Math.max(1, scanUpperUid - batchSize + 1);
-      const candidates = await searchUidsBefore(
-        client,
-        windowCutoff,
-        `${scanLowerUid}:${scanUpperUid}`
-      );
-      const batch = [...new Set(candidates)]
+      const candidates = await searchMailboxUids(client, {
+        before: windowCutoff,
+        uid: `${scanLowerUid}:${scanUpperUid}`
+      });
+      const listed = [...new Set(candidates)]
         .filter((uid) => uid >= scanLowerUid && uid <= scanUpperUid)
         .sort((a, b) => a - b);
+      if (listed.length > batchSize) {
+        throw new Error(`Historical UID scan exceeded bounded batch size for ${folder.path}`);
+      }
+      // History adds what is missing; rows already live are kept current by new
+      // mail, reconcile, and the flag delta, so the walk never re-fetches them.
+      const live = new Set(await this.repository.getLiveMessageUids(account.id, folder, uidValidity, listed));
+      const batch = listed.filter((uid) => !live.has(uid));
       const stillRemaining = scanLowerUid > 1;
 
       if (batch.length === 0) {
@@ -2222,10 +2261,6 @@ export class MirrorEngine {
         };
       }
 
-      if (batch.length > batchSize) {
-        throw new Error(`Historical UID scan exceeded bounded batch size for ${folder.path}`);
-      }
-
       if (this.isLockBudgetExpired(lockDeadline)) {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
       }
@@ -2241,12 +2276,7 @@ export class MirrorEngine {
         folder,
         uidValidity,
         metadata,
-        windowCutoff,
-        {
-          preserveExistingFlags: !account.archive_flag_sync,
-          deadlineAt: historyWriteDeadline,
-          signal
-        }
+        { deadlineAt: historyWriteDeadline, signal }
       );
       for (const message of messages) {
         await this.hooks.onMessageUpsert?.(message);
@@ -2295,7 +2325,7 @@ export class MirrorEngine {
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
     const backlog = await this.repository.getHistoricalBodyBacklog(
-      account.id,
+      account,
       folder,
       this.config.BODY_BACKFILL_BATCH_SIZE
     );

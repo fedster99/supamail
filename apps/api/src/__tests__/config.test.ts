@@ -29,6 +29,16 @@ describe("config BODY_STORAGE_MODE", () => {
   });
 });
 
+describe("config retired WINDOW_DAYS", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it("rejects the retired setting instead of silently running another window", () => {
+    expect(() => getConfig({ ...baseEnv, WINDOW_DAYS: "30" })).toThrow(/live_window_days/);
+  });
+});
+
 describe("config sent-folder polling", () => {
   beforeEach(() => {
     resetConfigForTests();

@@ -1,5 +1,4 @@
 import type { PgPool } from "../db.js";
-import type { WindowStatus } from "../types.js";
 import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
@@ -22,7 +21,6 @@ interface ResultRow {
   from_name: string | null;
   to_emails: string[] | null;
   flags: string[] | null;
-  window_status: WindowStatus;
   internal_date: Date;
   conversation_id: string | null;
   provider_thread_id: string | null;
@@ -71,7 +69,6 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
     date: row.internal_date.toISOString(),
     // \Recent describes one IMAP session, not the message.
     flags: (row.flags ?? []).filter((flag) => flag.toLowerCase() !== "\\recent"),
-    window_status: row.window_status,
     body_fetched_at: row.body_fetched_at ? row.body_fetched_at.toISOString() : null,
     snippet: row.snippet ?? null,
     score: ranked ? score : null,
@@ -173,7 +170,6 @@ export async function searchMessages(
     if (!(accountIds !== null && accountIds.length === 0)) {
       const compiled = compileSearch(parsed.text, resolvedFilters, {
         accountIds,
-        windowStatus: request.windowStatus ?? null,
         includeDeleted: request.includeDeleted ?? false,
         sort,
         limit,

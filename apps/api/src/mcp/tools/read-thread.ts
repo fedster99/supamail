@@ -80,7 +80,6 @@ function threadSelect(includeBody: boolean): string {
   m.to_emails,
   m.cc_emails,
   m.flags,
-  m.window_status,
   m.internal_date,
   m.rfc_message_id,
   m.in_reply_to,
@@ -199,8 +198,7 @@ export const readThreadDefinition: ToolDefinition = {
     "Each message contains its full cleaned body. Recognized quoted reply tails and signatures " +
     "are stripped unless include_quoted=true. Each message's attachments lists attached files; " +
     "inline_count counts inline parts such as signature images (read_message lists them). " +
-    "window_status: IN_WINDOW is mail in the live sync window; HISTORICAL (backfilled older mail) and " +
-    "EXPIRED (aged out of the window) are archive rows that update less often. Returns the " +
+    "Returns the " +
     "distinct participants and the accounts read. Each email appears " +
     "once; its duplicate_message_ids lists its other stored copies, to move or flag every copy. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +

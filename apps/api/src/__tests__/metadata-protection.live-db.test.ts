@@ -160,8 +160,7 @@ liveDb("metadata-protection repository seam", () => {
       accountId,
       folder,
       1,
-      [metadata],
-      new Date("2025-01-01T00:00:00.000Z")
+      [metadata]
     );
     const readableStoredMessage = await pool.query<{
       rfc_message_id: string | null;
@@ -184,8 +183,7 @@ liveDb("metadata-protection repository seam", () => {
       accountId,
       folder,
       1,
-      [metadata],
-      new Date("2025-01-01T00:00:00.000Z")
+      [metadata]
     );
     expect(message.id).toBe(readableMessage.id);
 
@@ -346,8 +344,7 @@ liveDb("metadata-protection repository seam", () => {
       accountId,
       folder,
       1,
-      [metadata],
-      new Date("2025-01-01T00:00:00.000Z")
+      [metadata]
     );
     await expect(repository.getMessage(message.id)).resolves.toMatchObject({
       rfc_message_id: metadata.rfcMessageId,

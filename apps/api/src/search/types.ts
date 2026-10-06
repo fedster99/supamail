@@ -1,4 +1,3 @@
-import type { WindowStatus } from "../types.js";
 import type { FolderRef } from "./rules.js";
 
 /**
@@ -37,7 +36,6 @@ export type SearchFilter =
   | { kind: "mime"; value: string; negated: boolean; raw: string }
   | { kind: "date"; op: "after" | "before"; value: string; negated: boolean; raw: string }
   | { kind: "size"; op: "larger" | "smaller"; value: number; negated: boolean; raw: string }
-  | { kind: "window"; value: WindowStatus; negated: boolean; raw: string }
   /** `from:a OR from:b`: matches when any member matches. Members are never `or`. */
   | { kind: "or"; filters: SearchFilter[]; negated: boolean; raw: string };
 
@@ -121,7 +119,6 @@ export interface StructuredFilters {
   before?: string;
   largerThan?: number;
   smallerThan?: number;
-  window?: WindowStatus;
 }
 
 /**
@@ -133,7 +130,6 @@ export interface SearchRequest {
   filters?: StructuredFilters;
   /** Account UUIDs to scope to, or "all"/undefined for every account in this DB. */
   accounts?: string[] | "all";
-  windowStatus?: WindowStatus[];
   includeDeleted?: boolean;
   sort?: SearchSort;
   limit?: number;
@@ -183,7 +179,6 @@ export interface SearchResult {
   to: string[];
   date: string;
   flags: string[];
-  window_status: WindowStatus;
   body_fetched_at: string | null;
   snippet: string | null;
   /** Ranking score; null when the order ranks nothing (date, size or sender order, or no text). */

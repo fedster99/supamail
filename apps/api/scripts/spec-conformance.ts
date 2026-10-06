@@ -6,7 +6,7 @@
  * Usage: DATABASE_URL=… IMAP_ENCRYPTION_KEY=… IMAP_ALLOW_PRIVATE_HOSTS=true \
  *        pnpm tsx scripts/spec-conformance.ts
  */
-import { getConfig, type AppConfig } from "../src/config.js";
+import { getConfig, getWindowCutoff, type AppConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { MirrorRepository } from "../src/repository.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../src/smoke/fixture-imap.js";
@@ -1434,7 +1434,6 @@ async function scenarioThreeLaneHistory() {
       UPDATE public.imap_accounts
       SET body_fetch_policy = 'immediate',
           historical_backfill_mode = 'metadata_and_bodies',
-          archive_refresh_interval = 'monthly',
           max_backfill_rate = 'small'
       WHERE id = $1
       `,
@@ -1483,6 +1482,8 @@ async function scenarioThreeLaneHistory() {
       }
     ];
     const events: string[] = [];
+    const lane = (message: { internal_date: Date | string }) =>
+      new Date(message.internal_date) < getWindowCutoff(account) ? "HISTORICAL" : "IN_WINDOW";
     const engine = new MirrorEngine({
       pool,
       config,
@@ -1490,10 +1491,10 @@ async function scenarioThreeLaneHistory() {
       clientFactory: async () => new FixtureImapClient(folders),
       hooks: {
         onMessageUpsert(message) {
-          events.push(`${message.window_status === "HISTORICAL" ? "history" : "hot"}:${message.folder_path}:${message.uid}`);
+          events.push(`${lane(message) === "HISTORICAL" ? "history" : "hot"}:${message.folder_path}:${message.uid}`);
         },
         onBodyFetched(message) {
-          events.push(`body:${message.window_status}:${message.folder_path}:${message.uid}`);
+          events.push(`body:${lane(message)}:${message.folder_path}:${message.uid}`);
         }
       }
     });
@@ -1516,15 +1517,13 @@ async function scenarioThreeLaneHistory() {
         headers_synced_count: number;
         bodies_fetched_count: number;
         backfill_in_progress: boolean;
-        last_archive_refresh_at: Date | null;
       }>(
         `
         SELECT
           historical_target_count,
           headers_synced_count,
           bodies_fetched_count,
-          backfill_in_progress,
-          last_archive_refresh_at
+          backfill_in_progress
         FROM public.imap_folders
         WHERE account_id = $1
           AND path = 'INBOX'
@@ -1536,9 +1535,8 @@ async function scenarioThreeLaneHistory() {
       archive.historical_target_count === 1
         && archive.headers_synced_count === 2
         && archive.bodies_fetched_count === 2
-        && archive.backfill_in_progress === false
-        && archive.last_archive_refresh_at !== null,
-      "history lane records target, progress, and refresh completion",
+        && archive.backfill_in_progress === false,
+      "history lane records target, progress, and completion",
       `archive=${JSON.stringify(archive)}`
     );
   } finally {
@@ -1633,7 +1631,7 @@ async function scenarioThreeLaneHistory() {
             FROM public.imap_messages m
             WHERE m.account_id = f.account_id
               AND m.folder_path = f.path
-              AND m.window_status = 'HISTORICAL'
+              AND m.internal_date < now() - interval '90 days'
               AND m.deleted_in_provider = false
           ) AS historical_message_count
         FROM public.imap_folders f

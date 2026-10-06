@@ -242,8 +242,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      messages,
-      new Date("2026-01-01T00:00:00.000Z")
+      messages
     );
 
     expect(rows.map((row) => Number(row.uid))).toEqual(messages.map((message) => message.uid));
@@ -262,8 +261,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      [metadata(1), metadata(2)],
-      new Date("2026-01-01T00:00:00.000Z")
+      [metadata(1), metadata(2)]
     );
 
     expect(stub.calls.some((call) => call.sql.includes("UPDATE public.imap_folders"))).toBe(false);
@@ -276,8 +274,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_000,
-      [metadata(1)],
-      new Date("2026-01-01T00:00:00.000Z")
+      [metadata(1)]
     )).rejects.toThrow(/no longer matches folder/);
 
     expect(stub.calls.some((call) => call.sql.includes("INSERT INTO public.imap_messages"))).toBe(false);
@@ -290,8 +287,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      [metadata(1)],
-      new Date("2026-01-01T00:00:00.000Z")
+      [metadata(1)]
     )).resolves.toHaveLength(1);
 
     const initializeIndex = stub.calls.findIndex((call) =>
@@ -314,8 +310,7 @@ describe("repository metadata batching", () => {
         "00000000-0000-4000-8000-000000000001",
         folder,
         42_001,
-        [metadata(1), metadata(1)],
-        new Date("2026-01-01T00:00:00.000Z")
+        [metadata(1), metadata(1)]
       )
     ).rejects.toThrow(/duplicate UIDs/);
     expect(stub.connectCalls()).toBe(0);
@@ -328,8 +323,7 @@ describe("repository metadata batching", () => {
         "00000000-0000-4000-8000-000000000001",
         folder,
         42_001,
-        [{ ...metadata(1), sizeBytes: Number.NaN }],
-        new Date("2026-01-01T00:00:00.000Z")
+        [{ ...metadata(1), sizeBytes: Number.NaN }]
       )
     ).rejects.toThrow(/invalid size/);
 
@@ -348,8 +342,7 @@ describe("repository metadata batching", () => {
             contentId: null,
             partNumber: "1"
           }]
-        }],
-        new Date("2026-01-01T00:00:00.000Z")
+        }]
       )
     ).rejects.toThrow(/invalid attachment size/);
     expect(stub.connectCalls()).toBe(0);
@@ -367,8 +360,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      messages,
-      new Date("2026-01-01T00:00:00.000Z")
+      messages
     )).rejects.toThrow(/exceeds maximum/);
     expect(stub.connectCalls()).toBe(0);
   });
@@ -426,8 +418,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      messages,
-      new Date("2026-01-01T00:00:00.000Z")
+      messages
     )).resolves.toHaveLength(2);
     expect(stub.calls.filter((call) => call.sql === "BEGIN")).toHaveLength(1);
     expect(stub.calls.filter((call) => call.sql === "COMMIT")).toHaveLength(1);
@@ -442,8 +433,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      [{ ...metadata(1), subject: "x".repeat(MAX_SYNC_METADATA_BATCH_BYTES) }],
-      new Date("2026-01-01T00:00:00.000Z")
+      [{ ...metadata(1), subject: "x".repeat(MAX_SYNC_METADATA_BATCH_BYTES) }]
     )).rejects.toThrow(/byte write limit/);
 
     const attachment = {
@@ -464,8 +454,7 @@ describe("repository metadata batching", () => {
           { length: MAX_SYNC_ATTACHMENTS_PER_BATCH + 1 },
           (_, index) => ({ ...attachment, partNumber: String(index + 1) })
         )
-      }],
-      new Date("2026-01-01T00:00:00.000Z")
+      }]
     )).rejects.toThrow(/attachment write limit/);
     expect(stub.connectCalls()).toBe(0);
   });
@@ -482,8 +471,7 @@ describe("repository metadata batching", () => {
       "00000000-0000-4000-8000-000000000001",
       folder,
       42_001,
-      messages,
-      new Date("2026-01-01T00:00:00.000Z")
+      messages
     )).rejects.toThrow(/aggregate logical write limit/);
     expect(stub.connectCalls()).toBe(0);
   });
@@ -505,7 +493,6 @@ describe("repository metadata batching", () => {
         folder,
         42_001,
         [metadata(1)],
-        new Date("2026-01-01T00:00:00.000Z"),
         { deadlineAt: Date.now() + 10 }
       );
       const rejection = expect(write).rejects.toThrow(/metadata write deadline exceeded/);
@@ -537,7 +524,6 @@ describe("repository metadata batching", () => {
       folder,
       42_001,
       [metadata(1)],
-      new Date("2026-01-01T00:00:00.000Z"),
       { deadlineAt: Date.now() + 10_000, signal: abort.signal }
     );
 
@@ -563,7 +549,6 @@ describe("repository metadata batching", () => {
         folder,
         42_001,
         [metadata(1)],
-        new Date("2026-01-01T00:00:00.000Z"),
         { deadlineAt: 2_000 }
       )).resolves.toHaveLength(1);
     } finally {
@@ -662,35 +647,6 @@ describe("repository flag scan deadline", () => {
     })))).toThrow(/aggregate logical write limit/);
   });
 
-  it("rejects pathological stored flags before sorting or writing", async () => {
-    const storedFlags = Array.from(
-      { length: MAX_SYNC_FLAGS_PER_BATCH + 1 },
-      (_, index) => `legacy-${index}`
-    );
-    const pool = {
-      query: vi.fn(async () => ({
-        rows: [{
-          id: "00000000-0000-4000-8000-000000000010",
-          uid: "1",
-          flags: storedFlags
-        }]
-      }))
-    } as unknown as PgPool;
-    const repository = new MirrorRepository(pool, {} as AppConfig);
-    const upsert = vi.spyOn(repository, "upsertMessages");
-    const logEvent = vi.spyOn(repository, "logEvent");
-
-    await expect(repository.applyFlagScan(
-      "00000000-0000-4000-8000-000000000001",
-      folder,
-      42_001,
-      [metadata(1)],
-      new Date("2026-01-01T00:00:00.000Z")
-    )).rejects.toThrow(/stored flags.*event limit/i);
-    expect(upsert).not.toHaveBeenCalled();
-    expect(logEvent).not.toHaveBeenCalled();
-  });
-
   it("rejects duplicate and oversized projected batches before opening a connection", async () => {
     const connect = vi.fn();
     const repository = new MirrorRepository(
@@ -714,76 +670,6 @@ describe("repository flag scan deadline", () => {
       }))
     )).rejects.toThrow(/exceeds maximum/);
     expect(connect).not.toHaveBeenCalled();
-  });
-
-  it("preserves the legacy full-metadata Date contract", async () => {
-    const row = {
-      id: "00000000-0000-4000-8000-000000000010",
-      uid: "1",
-      flags: []
-    } as unknown as ImapMessage;
-    const pool = {
-      query: vi.fn(async () => ({ rows: [row] }))
-    } as unknown as PgPool;
-    const repository = new MirrorRepository(pool, {} as AppConfig);
-    const upsert = vi.spyOn(repository, "upsertMessages").mockResolvedValue([{ ...row, flags: ["\\Seen"] }]);
-    const logEvent = vi.spyOn(repository, "logEvent").mockResolvedValue();
-    const windowCutoff = new Date("2026-01-01T00:00:00.000Z");
-
-    const result = await repository.applyFlagScan(
-      "00000000-0000-4000-8000-000000000001",
-      folder,
-      42_001,
-      [metadata(1)],
-      windowCutoff
-    );
-
-    expect(result).toMatchObject({ flagsChanged: 1 });
-    expect(upsert).toHaveBeenCalledWith(
-      "00000000-0000-4000-8000-000000000001",
-      folder,
-      42_001,
-      [metadata(1)],
-      windowCutoff
-    );
-    expect(logEvent).toHaveBeenCalledOnce();
-  });
-
-  it("rejects aggregate legacy stored flags without returning arrays to Node", async () => {
-    const pool = {
-      query: vi.fn(async () => ({
-        rows: [{
-          id: null,
-          uid: null,
-          flags: null,
-          stored_bytes: String(MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES + 1),
-          stored_flags: "1"
-        }]
-      }))
-    } as unknown as PgPool;
-    const repository = new MirrorRepository(pool, {} as AppConfig);
-    const upsert = vi.spyOn(repository, "upsertMessages");
-    const logEvent = vi.spyOn(repository, "logEvent");
-
-    await expect(repository.applyFlagScan(
-      "00000000-0000-4000-8000-000000000001",
-      folder,
-      42_001,
-      [metadata(1)],
-      new Date("2026-01-01T00:00:00.000Z")
-    )).rejects.toThrow(/stored flags exceed the aggregate logical event limit/i);
-
-    expect(upsert).not.toHaveBeenCalled();
-    expect(logEvent).not.toHaveBeenCalled();
-    expect((pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "LEFT JOIN candidates"
-    );
-    expect((pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
-      "octet_length(to_json(flags)::text)"
-    );
-    expect((pool.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toContain(
-      "pg_column_size(flags)"
-    );
   });
 
   it("bounds pool acquisition and releases a connection that arrives after the deadline", async () => {

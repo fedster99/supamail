@@ -50,8 +50,7 @@ export const searchFiltersSchema = z
     after: z.string().optional(),
     before: z.string().optional(),
     largerThan: z.number().int().nonnegative().optional(),
-    smallerThan: z.number().int().nonnegative().optional(),
-    window: z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"]).optional()
+    smallerThan: z.number().int().nonnegative().optional()
   })
   .strict();
 
@@ -60,7 +59,6 @@ export const searchRequestSchema = z
     q: z.string().max(4096).optional(),
     filters: searchFiltersSchema.optional(),
     accounts: z.union([z.array(z.string()), z.literal("all")]).optional(),
-    windowStatus: z.array(z.enum(["IN_WINDOW", "EXPIRED", "HISTORICAL"])).optional(),
     includeDeleted: z.boolean().optional(),
     sort: z.enum(["smart", "relevance", "recent", "oldest", "size", "sender"]).optional(),
     limit: z.number().int().min(1).max(100).optional(),
@@ -153,8 +151,7 @@ export const searchEmailToolDefinition = {
           after: { type: "string", description: "Received on/after (ISO date or relative like 7d)." },
           before: { type: "string", description: "Received before (ISO date or relative)." },
           largerThan: { type: "integer", minimum: 0, description: "Size larger than, in bytes." },
-          smallerThan: { type: "integer", minimum: 0, description: "Size smaller than, in bytes." },
-          window: { enum: ["IN_WINDOW", "EXPIRED", "HISTORICAL"], description: "Restrict to one retention lane." }
+          smallerThan: { type: "integer", minimum: 0, description: "Size smaller than, in bytes." }
         }
       },
       accounts: {
@@ -163,11 +160,6 @@ export const searchEmailToolDefinition = {
           { type: "array", items: { type: "string" } },
           { const: "all" }
         ]
-      },
-      windowStatus: {
-        type: "array",
-        items: { enum: ["IN_WINDOW", "EXPIRED", "HISTORICAL"] },
-        description: "Restrict to retention lanes (default: all lanes)."
       },
       includeDeleted: { type: "boolean", default: false },
       sort: { enum: ["smart", "relevance", "recent", "oldest", "size", "sender"], default: "smart" },

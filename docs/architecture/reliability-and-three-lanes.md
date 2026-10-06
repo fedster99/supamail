@@ -69,7 +69,7 @@ completeness.
 
 ADR 0027 refines the live and priority body fields. The
 `imap_account_progress` Postgres **VIEW** derives their targets from current
-`imap_messages` rows that are `IN_WINDOW`, not deleted at the provider, and in
+`imap_messages` rows dated inside the live window, not deleted at the provider, and in
 tracked folders whose `missing_since` is NULL and whose status is neither
 `MISSING` nor `PENDING_VERIFICATION`. It counts a fetched body only when
 `body_fetched_at` marks a successful body store, the matching
@@ -156,6 +156,8 @@ Type-safe columns, not JSONB. SQL `CHECK` constraints document and enforce allow
 - `aggressive` = unbounded within the lock budget (uses all remaining time after hot + body)
 
 No daily token-bucket counter. The natural rate limit is the IMAP throttle + lock budget + tick interval; provider-side throttling handles the rest. `aggressive` is honest about what it actually means.
+
+ADR 0039 later removed `archive_refresh_interval`, `archive_flag_sync`, the periodic archive refresh, and the stored `window_status` lane; `live_window_days` is now the one source of the live window.
 
 `live_window_days` is **immutable after account creation in v0.1**. The API rejects PATCH to this field. A future migration may add change support; for now, just lock it in.
 
@@ -304,7 +306,7 @@ priority body counts come from active live message/body rows. Folder counters
 continue to supply header and historical fields. Truncated body rows count as
 incomplete and do not cause automatic retry loops. The migration adds
 `imap_messages_live_body_progress_idx` on `(account_id, folder_path, id)` for
-active `IN_WINDOW` rows. Large existing mirrors must prebuild this exact index
+active in-window rows (dropped by migration 0030). Large existing mirrors must prebuild this exact index
 concurrently before the transactional migration runs.
 
 ## Code Changes Summary
@@ -380,7 +382,7 @@ PRs 6–8 are the historical backfill feature build. They land in order after th
 
 Things this plan does NOT solve. Each becomes a candidate for a follow-on issue.
 
-- **`live_window_days` change after onboarding.** Locked to creation-time in v0.1. A migration story (re-classifying `window_status` for newly in-window or newly out-of-window messages, handling the historical lane's relationship to the moving boundary) is deferred to v0.2.
+- **`live_window_days` change after onboarding.** Locked to creation-time in v0.1. A migration story (since ADR 0039 the window is computed from the date, so no rows need re-classifying; handling the historical lane's relationship to the moving boundary) is deferred to v0.2.
 - **`estimated_full_sync_at` accuracy.** Best-effort. Documented as approximate. We do not commit to a tight bound. May move backward when the provider rate-limits.
 - **Counter drift correction.** D4's incremental counters can drift if a bug causes them to skip an update or double-count. Current live and priority body coverage is no longer exposed to that drift because it reads current message/body rows. Header and historical telemetry still uses the counters. Source-of-truth recovery for those fields is an account/folder row recount, which is accurate but O(messages). v0.1 ships without an automatic drift detector. Each counter update is inside the same transaction as the underlying insert/update, so the common bug modes (mid-transaction crash and partial batch) preserve consistency.
 

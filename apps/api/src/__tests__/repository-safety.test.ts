@@ -175,10 +175,8 @@ describe("repository safety", () => {
 
     expect(source).toContain("updateAccountSettings");
     expect(source).toContain("historical_backfill_mode = COALESCE($2::text, historical_backfill_mode)");
-    expect(source).toContain("archive_refresh_interval = COALESCE($3::text, archive_refresh_interval)");
-    expect(source).toContain("archive_flag_sync = COALESCE($4::boolean, archive_flag_sync)");
-    expect(source).toContain("max_backfill_rate = COALESCE($5::text, max_backfill_rate)");
-    expect(source).toContain("body_fetch_policy = COALESCE($6::text, body_fetch_policy)");
+    expect(source).toContain("max_backfill_rate = COALESCE($3::text, max_backfill_rate)");
+    expect(source).toContain("body_fetch_policy = COALESCE($4::text, body_fetch_policy)");
     expect(source).not.toContain("live_window_days =");
   });
 
@@ -198,8 +196,8 @@ describe("repository safety", () => {
     })).resolves.toBe(updated);
 
     expect(query).toHaveBeenCalledWith(
-      expect.stringContaining("body_fetch_policy = COALESCE($6::text, body_fetch_policy)"),
-      [updated.id, null, null, null, null, "immediate"]
+      expect.stringContaining("body_fetch_policy = COALESCE($4::text, body_fetch_policy)"),
+      [updated.id, null, null, "immediate"]
     );
   });
 
@@ -241,11 +239,11 @@ describe("repository safety", () => {
     expect(repository).toContain("advanceHistoryBackfillWatermark");
     expect(repository).toContain("markHistoryBackfillComplete");
     expect(repository).toContain("getHistoricalBodyBacklog");
-    expect(repository).toContain("last_archive_refresh_at");
-    expect(repository).toContain("preserveExistingFlags");
+    // History is a one-time backfill: no periodic archive refresh re-walks it.
+    expect(repository).not.toContain("last_archive_refresh_at");
     expect(engine).toContain("runHistoryLane");
     expect(engine).toContain("historyBatchLimit");
-    expect(engine).toContain("searchUidsBefore");
+    expect(engine).toContain("searchMailboxUids(client, { before: windowCutoff })");
     expect(engine).toContain("historical_backfill_mode === \"off\"");
   });
 
@@ -263,7 +261,7 @@ describe("repository safety", () => {
   it("tombstones folder messages after the missing grace expires", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    expect(source).toContain("deleted_reason = 'FOLDER_MISSING'");
+    expect(source).toContain("WHEN internal_date >= $3 THEN 'FOLDER_MISSING'");
     expect(source).toContain("\"FOLDER_MISSING\"");
     expect(source).toContain("FOLDER_MISSING_GRACE_EXCEEDED");
   });
@@ -411,12 +409,12 @@ describe("repository safety", () => {
     expect(source).toContain("AND f.tracked = true");
   });
 
-  it("runs retention as expiry first, purge second", async () => {
+  it("runs retention as purge and prune, with no stored-lane expiry", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
     const worker = await readFile(resolve(process.cwd(), "src/worker-runtime.ts"), "utf8");
 
-    expect(source).toContain("runExpiryJob");
-    expect(source).toContain("window_status = 'EXPIRED'");
+    expect(source).not.toContain("runExpiryJob");
+    expect(source).not.toContain("window_status");
     expect(source).toContain("runPurgeJob");
     expect(source).toContain("provider_deleted_at < now() - interval '30 days'");
     expect(source).toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')");

@@ -267,8 +267,8 @@ IMAP headers arrive much faster than full MIME bodies. SupaMail exposes progress
 percentages so downstream search, agent, or UI consumers can decide how much
 body completeness they need before trusting deep search results.
 
-Live and priority body percentages describe current active `IN_WINDOW`
-messages. The target includes messages in tracked, non-missing folders that are
+Live and priority body percentages describe current active messages dated
+inside the live window. The target includes messages in tracked, non-missing folders that are
 not deleted at the provider. A body is complete only when its
 `imap_message_bodies` row exists and `raw_truncated` is false. A complete
 `parsed_only` row counts even though `raw_mime` is NULL.
@@ -286,17 +286,6 @@ folder. Each folder row adds `live_bodies_fetched_count` and
 Folder rows still report untracked, missing, and pending folders, so their
 targets do not always sum to the active account target. The older
 `bodies_fetched_count` remains cumulative telemetry.
-
-Migration `0021_row_accurate_body_progress` adds the partial
-`imap_messages_live_body_progress_idx`. On a large existing mirror, create this
-exact index concurrently before you apply the transactional migration:
-
-```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_live_body_progress_idx
-  ON public.imap_messages (account_id, folder_path, id)
-  WHERE deleted_in_provider = false
-    AND window_status = 'IN_WINDOW';
-```
 
 SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.
 

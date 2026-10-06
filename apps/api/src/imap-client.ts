@@ -871,22 +871,6 @@ export async function fetchChangedMessageFlags(
   return [...returned.values()];
 }
 
-export async function searchUidsSince(
-  client: MirrorImapClient,
-  since: Date,
-  uidRange?: string
-): Promise<number[]> {
-  return await searchMailboxUids(client, uidRange ? { since, uid: uidRange } : { since });
-}
-
-export async function searchUidsBefore(
-  client: MirrorImapClient,
-  before: Date,
-  uidRange?: string
-): Promise<number[]> {
-  return await searchMailboxUids(client, uidRange ? { before, uid: uidRange } : { before });
-}
-
 /**
  * UIDs in the selected mailbox matching `criteria`, from one UID SEARCH response
  * rather than a FETCH line per message. Fails rather than returning a partial
@@ -898,6 +882,10 @@ export async function searchMailboxUids(
 ): Promise<number[]> {
   const uids = await client.search(criteria, { uid: true });
   if (!uids) {
+    // imapflow answers false for a rejected command and for a dropped socket.
+    if (client.usable === false) {
+      throw Object.assign(new Error("IMAP connection lost during UID SEARCH"), { code: "NoConnection" });
+    }
     throw new IncompleteUidListError(client.mailbox ? client.mailbox.path : "?", "UID SEARCH failed");
   }
   return uids;
@@ -910,7 +898,7 @@ export async function searchMailboxUids(
  */
 export class IncompleteUidListError extends Error {
   constructor(readonly folderPath: string, detail: string) {
-    super(`Reconcile UID list for ${folderPath} is incomplete: ${detail}`);
+    super(`UID list for ${folderPath} is incomplete: ${detail}`);
     this.name = "IncompleteUidListError";
   }
 }

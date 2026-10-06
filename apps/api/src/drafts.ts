@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DRAFT_INPUT_SCHEMA, DRAFT_UPDATE_SCHEMA, parseInput } from "./compose-schema.js";
-import { getWindowCutoff, type AppConfig } from "./config.js";
+import type { AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
@@ -211,7 +211,7 @@ async function saveDraft(
     try {
       saved.messageId = filed.retried
         ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...filed.appended })
-        : await mirrorSavedDraft(repository, config, account.id, filed.draftsFolderPath, filed.appended.uidValidity,
+        : await mirrorSavedDraft(repository, account.id, filed.draftsFolderPath, filed.appended.uidValidity,
           savedDraftMetadata(composeReq, account, { raw, rfcMessageId, uid: filed.appended.uid, savedAt }));
     } catch (error) {
       warnings.push(
@@ -281,7 +281,6 @@ async function fileDraft(
  */
 async function mirrorSavedDraft(
   repository: MirrorRepository,
-  config: AppConfig,
   accountId: string,
   folderPath: string,
   uidValidity: number,
@@ -289,7 +288,7 @@ async function mirrorSavedDraft(
 ): Promise<string | null> {
   const [folder] = await repository.getFoldersForWake(accountId, [folderPath]);
   if (!folder || folder.uidvalidity === null || Number(folder.uidvalidity) !== uidValidity) return null;
-  const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], getWindowCutoff(config), {
+  const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], {
     deadlineAt: Date.now() + DRAFT_MIRROR_WRITE_TIMEOUT_MS
   });
   return row.id;

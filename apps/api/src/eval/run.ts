@@ -147,11 +147,11 @@ export async function seedCorpus(pool: PgPool, accountEmail: string): Promise<Se
          subject, from_email, from_name, to_emails, flags,
          provider_thread_id, rfc_message_id, message_id_normalized,
          in_reply_to, references_header, headers_json,
-         deleted_in_provider, window_status, size_bytes
+         deleted_in_provider, size_bytes
         )
         VALUES ($18, $1, $2, $3, $4, '${EVAL_NOW}'::timestamptz - ($5 * interval '1 day'),
           $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-          false, 'IN_WINDOW', $17)`,
+          false, $17)`,
       [
         accountId,
         message.folder,

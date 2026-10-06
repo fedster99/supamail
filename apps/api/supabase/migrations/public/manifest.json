@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0029_active_assignments_view_no_barrier",
+  "schemaVersion": "0030_window_from_message_date",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -116,6 +116,10 @@
     {
       "id": "0029_active_assignments_view_no_barrier",
       "file": "0029_active_assignments_view_no_barrier.sql"
+    },
+    {
+      "id": "0030_window_from_message_date",
+      "file": "0030_window_from_message_date.sql"
     }
   ]
 }

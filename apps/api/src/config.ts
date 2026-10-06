@@ -20,6 +20,8 @@ function isValidTimeZone(value: string): boolean {
 }
 
 const envSchema = z.object({
+  // Only so the refinement below can see and reject the retired setting.
+  WINDOW_DAYS: z.unknown().optional(),
   DATABASE_URL: z.string().min(1),
   // Max connections in the pg pool. Defaults to 10 (the prior hardcoded value). Raise
   // it when one process drives many accounts/folders concurrently against a Postgres
@@ -35,7 +37,6 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   SENT_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
-  WINDOW_DAYS: z.coerce.number().int().positive().default(90),
   BODY_FETCH_POLICY: z
     .enum(["immediate", "lazy", "priority_then_backfill"])
     .default("priority_then_backfill"),
@@ -115,6 +116,15 @@ const envSchema = z.object({
     message: "BACKFILL_WINDOW_TIMEZONE must be a valid IANA time zone"
   })
 }).superRefine((env, ctx) => {
+  // Retired (ADR 0039): the window is each Mailbox Account's live_window_days.
+  // Fail loudly rather than silently run a different window than configured.
+  if ((env as Record<string, unknown>).WINDOW_DAYS !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["WINDOW_DAYS"],
+      message: "WINDOW_DAYS is retired; set live_window_days on the Mailbox Account instead"
+    });
+  }
   if (env.IMAP_IDLE_SOCKET_TIMEOUT_MS <= env.IMAP_IDLE_MAX_TIME_MS) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -170,10 +180,15 @@ export function resetConfigForTests(): void {
   cachedConfig = null;
 }
 
-export function getWindowCutoff(config: Pick<AppConfig, "WINDOW_DAYS">): Date {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - config.WINDOW_DAYS);
-  return cutoff;
+/**
+ * The start of a Mailbox Account's live window. The window is a cost limit on
+ * the expensive sync work, computed from the message date; no row stores it.
+ */
+export function getWindowCutoff(account: { live_window_days: number }, now = Date.now()): Date {
+  if (!Number.isSafeInteger(account.live_window_days) || account.live_window_days <= 0) {
+    throw new TypeError(`live_window_days must be a positive integer, got ${String(account.live_window_days)}`);
+  }
+  return new Date(now - account.live_window_days * 24 * 60 * 60_000);
 }
 
 export function isWithinBackfillWindow(
