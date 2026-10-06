@@ -217,6 +217,8 @@ const SEARCH_QUERY_SCHEMA = z.object({
   received_after: z.string().max(64).optional(),
   received_before: z.string().max(64).optional(),
   account: z.string().uuid().optional(),
+  // Retired lane filter (ADR 0039): reject it rather than silently widen results.
+  window: z.never({ message: "window is no longer supported; use received_after or received_before" }).optional(),
   sort: z.enum(["smart", "relevance", "recent", "oldest", "size", "sender"]).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
   // Cap offset: deep OFFSET in the no-candidate-cap structured path scans/scores/

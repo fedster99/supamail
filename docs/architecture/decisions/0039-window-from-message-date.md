@@ -50,14 +50,28 @@ came from that copy:
 - The expiry job and the `EXPIRED` lane are removed.
 - The search `window`/`lane` filter and the `window_status` field in search and
   read results are removed. Callers use the message date and `after:`/`before:`.
-- Migration `0030` recomputes `imap_account_progress` by date and drops the
-  lane-predicated body indexes, which no backlog query could use. It also
-  repairs state the old code left, once:
-  - completed folders whose live head sat below old UIDs start it at UIDNEXT,
-    so that archive is not fetched again as new mail;
-  - completed history snapshots run once more where history is on, recovering
-    old mail moved into a folder after its snapshot, which only the removed
-    refresh found. The obsolete refresh stamp marks the folders still to re-run.
+- Migration `0030` recomputes `imap_account_progress` by date. Every migrate
+  re-applies every file, so each statement is idempotent. It repairs state the
+  old code left:
+  - completed folders whose live head sat below old UIDs start it at UIDNEXT, so
+    that archive is not fetched again as new mail. Current code stores only the
+    UIDNEXT a pass reached, so re-applying this changes nothing;
+  - completed history snapshots are re-taken once where history is on,
+    recovering old mail moved into a folder after its snapshot, which only the
+    removed refresh found. The walk fetches only UIDs without a live row, and
+    the folder keeps its history progress meanwhile. The obsolete refresh stamp
+    marks the folders to re-run and is then cleared everywhere;
+  - body-lane `MOVED_OUT` tombstones become the recoverable `RECONCILE_MISSING`.
+- A history walk never re-fetches a UID that already has a live row.
+- A folder gone past its grace period tombstones every row: `FOLDER_MISSING`
+  inside the window, as before, and the recoverable `RECONCILE_MISSING` outside
+  it, so the 30-day purge removes nothing it did not remove before.
+- `WINDOW_DAYS` in the environment fails configuration with a typed error, and
+  the REST search `window` parameter returns 400, so neither silently changes
+  behaviour.
+- The two lane-predicated indexes from `0001` and `0021` stay until the later
+  migration that drops `window_status`: those files are re-applied on every
+  migrate and would rebuild any index dropped here.
 - `window_status`, `last_archive_refresh_at`, `archive_refresh_interval`, and
   `archive_flag_sync` are no longer read or written; a later migration drops
   them once every host has stopped reading them, so a running old version never
@@ -68,13 +82,11 @@ came from that copy:
 - Nothing in the window can go stale, and no job maintains it.
 - The monthly re-walk of every old message's metadata is gone.
 - An old message moved into a folder appears on the next sync. A large move of
-  old mail arrives through the existing bounded incremental batches.
-- The one-time history re-run costs what one monthly refresh cost.
+  old mail arrives over several bounded passes.
+- The one-time history re-run lists every folder's old UIDs once and fetches
+  only the missing ones.
 - With history off, old mail moved into a folder before this change stays
   unmirrored, as the setting asks.
-- Folder-missing tombstones still cover only rows inside the window; extending
-  them to every row changes which rows the 30-day purge deletes, a maintainer
-  decision.
 - On servers without CONDSTORE, flag changes to mail older than the window are
   no longer refreshed monthly; they were never refreshed unless
   `archive_flag_sync` was on.

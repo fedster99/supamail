@@ -2597,6 +2597,25 @@ liveDb("live DB reliability lane", () => {
     expect(live.rows.map((row) => Number(row.uid))).toEqual([1, 6]);
   });
 
+  it("stops reconcile writes at the deadline and reports the pass incomplete", async () => {
+    const h = await setupIntegration("live-reconcile-deadline", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    await h.buildEngine({ folders: oneFolder("INBOX", 3) }).syncAccount(h.account.id, "manual");
+    const folder = (await h.pool.query<ImapFolder>(
+      "SELECT * FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    )).rows[0]!;
+    const result = await h.repository.reconcileFolderUids(
+      h.account.id,
+      folder,
+      Number(folder.uidvalidity),
+      [],
+      new Set(),
+      { expectedCount: 0, uidNextAtSelect: 4, deadlineAt: Date.now() - 1 }
+    );
+    expect(result).toMatchObject({ markedCount: 0, complete: false });
+  });
+
   it("revives only its own archive tombstones and leaves window rows to repair", async () => {
     const h = await setupIntegration("live-reconcile-revival", {
       INITIAL_SYNC_BATCH_SIZE: 50

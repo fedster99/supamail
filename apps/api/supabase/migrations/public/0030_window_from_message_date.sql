@@ -5,19 +5,18 @@
 -- stored lane goes stale as time passes unless a job rewrites it, and stale lanes
 -- hid mail that was still in the provider. imap_messages.window_status,
 -- imap_folders.last_archive_refresh_at, and imap_accounts.archive_refresh_interval
--- and archive_flag_sync are no longer read or written; a later migration drops
--- them once every host stops reading them. This file is re-applied on every
--- migrate, so each statement is idempotent.
-
--- The lane-predicated body indexes are only as correct as the lane.
-DROP INDEX IF EXISTS public.imap_messages_body_backlog_idx;
-DROP INDEX IF EXISTS public.imap_messages_live_body_progress_idx;
+-- and archive_flag_sync are no longer read or written. A later migration drops
+-- them together with the two lane-predicated indexes from 0001 and 0021: those
+-- files are re-applied on every migrate, so dropping the indexes here would make
+-- each migrate rebuild them. This file is re-applied on every migrate too, so each
+-- statement is idempotent.
 
 -- New mail is every UID above the live head, whatever its date. Under the old
 -- date-filtered incremental, a completed folder's head could sit far below
 -- UIDNEXT over archive mail the history lane owns; start it at UIDNEXT so that
 -- archive is never fetched again as new mail. A live-window UID the old code had
--- left unfetched is still repaired by reconcile.
+-- left unfetched is still repaired by reconcile. Current code stores only the
+-- UIDNEXT a pass reached, so re-applying this changes nothing.
 UPDATE public.imap_folders
 SET last_uid = uid_next - 1
 WHERE initial_sync_complete = true
@@ -25,20 +24,33 @@ WHERE initial_sync_complete = true
   AND COALESCE(last_uid, 0) < uid_next - 1;
 
 -- The old date-filtered incremental also skipped old mail moved into a folder
--- after its history snapshot; only the removed archive refresh found it. Re-run
--- each completed history snapshot once to recover it. The obsolete refresh stamp
--- marks folders not yet re-run: it is cleared here and never written again.
+-- after its history snapshot; only the removed archive refresh found it. Re-take
+-- each completed history snapshot once to recover it: the walk fetches only UIDs
+-- without a live row, and the folder keeps its history progress meanwhile. The
+-- obsolete refresh stamp marks folders not yet re-run; it is then cleared on
+-- every folder and never written again.
 UPDATE public.imap_folders f
-SET historical_target_count = NULL,
+SET backfill_in_progress = true,
     backfill_target_max_uid = NULL,
-    backfill_oldest_uid_synced = NULL,
-    backfill_in_progress = false,
-    last_archive_refresh_at = NULL
+    backfill_oldest_uid_synced = NULL
 FROM public.imap_accounts a
 WHERE a.id = f.account_id
   AND a.historical_backfill_mode <> 'off'
   AND f.last_archive_refresh_at IS NOT NULL
+  AND f.historical_target_count IS NOT NULL
   AND f.backfill_in_progress = false;
+
+UPDATE public.imap_folders
+SET last_archive_refresh_at = NULL
+WHERE last_archive_refresh_at IS NOT NULL;
+
+-- A body fetch that finds its UID gone now writes the recoverable
+-- RECONCILE_MISSING, which reconcile revives while the UID is still listed. Give
+-- earlier body-lane tombstones the same recovery instead of the 30-day purge.
+-- Nothing writes MOVED_OUT any more.
+UPDATE public.imap_messages
+SET deleted_reason = 'RECONCILE_MISSING'
+WHERE deleted_reason = 'MOVED_OUT';
 
 -- Current live body coverage counts rows inside the account's window by date.
 -- The per-account LATERAL lets the cutoff bound the date index scan.
@@ -152,5 +164,5 @@ LEFT JOIN LATERAL (
       AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
       AND m.deleted_in_provider = false
       AND m.account_id = a.id
-      AND m.internal_date >= now() - a.live_window_days * interval '1 day'
+      AND m.internal_date >= now() - make_interval(hours => 24 * a.live_window_days)
 ) b ON true;

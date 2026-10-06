@@ -1953,11 +1953,17 @@ export class MirrorRepository {
         UPDATE public.imap_messages
         SET deleted_in_provider = true,
             provider_deleted_at = now(),
-            deleted_reason = 'FOLDER_MISSING'
+            -- Every row of a gone folder leaves reads and search. Rows inside the
+            -- window take the purgeable FOLDER_MISSING as before; older rows
+            -- take the recoverable RECONCILE_MISSING, which reconcile revives if
+            -- the folder returns, so the purge removes nothing new.
+            deleted_reason = CASE
+              WHEN internal_date >= $3 THEN 'FOLDER_MISSING'
+              ELSE 'RECONCILE_MISSING'
+            END
         WHERE account_id = $1
           AND folder_path = $2
           AND deleted_in_provider = false
-          AND internal_date >= $3
         `,
         [account.id, row.path, getWindowCutoff(account)]
       );
@@ -2462,6 +2468,8 @@ export class MirrorRepository {
     lastUid?: number;
     initialComplete?: boolean;
     reconcileClean?: boolean;
+    /** The reconcile could not prove the folder's UID list (IncompleteUidListError). */
+    reconcileListIncomplete?: boolean;
     flagScanCompleted?: boolean;
   }, options: { deadlineAt?: number; signal?: AbortSignal } = {}): Promise<void> {
     const query = `
@@ -2491,6 +2499,11 @@ export class MirrorRepository {
           -- A completed clean reconcile returns to the normal six-hour
           -- cadence. An incomplete bounded repair must retry on the next full
           -- sync cadence instead of pinning degraded health for six hours.
+          -- An unproven UID list retries once soon; a provider that keeps
+          -- disagreeing returns to the normal cadence instead of taking the
+          -- reconcile slot every pass.
+          WHEN $6::boolean = false AND $16::boolean AND last_reconcile_clean = false
+            THEN now() + ($10::bigint * interval '1 millisecond')
           WHEN $6::boolean = false
             THEN now() + ($13::bigint * interval '1 millisecond')
           WHEN $6::boolean = true
@@ -2520,7 +2533,8 @@ export class MirrorRepository {
       this.config.SENT_SYNC_INTERVAL_MS,
       this.config.SYNC_INTERVAL_MS,
       patch.highestModseq ?? null,
-      patch.qresyncHighestModseq ?? null
+      patch.qresyncHighestModseq ?? null,
+      patch.reconcileListIncomplete === true
     ];
     const result = options.deadlineAt === undefined
       ? await this.pool.query<{ id: string }>(query, values)
@@ -3572,7 +3586,8 @@ export class MirrorRepository {
    *   fetches, so reconcile never backfills archive mail.
    * The list must hold exactly `expectedCount` distinct UIDs (SELECT's message
    * count), or nothing changes. UIDs are staged in a temp table first; writes
-   * then commit in bounded batches, each re-checking the folder generation.
+   * then commit in bounded UID-ordered batches, each re-checking the folder
+   * generation, and stop at `deadlineAt` with `complete: false`.
    */
   async reconcileFolderUids(
     accountId: string,
@@ -3583,6 +3598,8 @@ export class MirrorRepository {
     options: {
       expectedCount: number | undefined;
       uidNextAtSelect: number | undefined;
+      /** Stop at the next batch boundary after this time; the rest waits for the next reconcile. */
+      deadlineAt?: number;
       batchSize?: number;
       writeBatchSize?: number;
     }
@@ -3592,6 +3609,8 @@ export class MirrorRepository {
     providerUidCount: number;
     missingInDbUids: number[];
     missingInDbTruncated: boolean;
+    /** False when the deadline stopped the writes early. */
+    complete: boolean;
   }> {
     if (folderUids.some((uid) => !Number.isSafeInteger(uid) || uid <= 0)) {
       throw new IncompleteUidListError(folder.path, "the provider returned an invalid UID");
@@ -3602,9 +3621,11 @@ export class MirrorRepository {
     const client = await this.pool.connect();
     let inTransaction = false;
     let discardClient = false;
+    let complete = true;
 
     // One bounded write per transaction, under the folder generation it proves.
-    const writeBatch = async (sql: string, values: unknown[]): Promise<number> => {
+    // Each batch returns its count and highest UID; the next starts after it.
+    const writeBatch = async (sql: string, values: unknown[]): Promise<{ count: number; lastUid: number }> => {
       await client.query("BEGIN");
       inTransaction = true;
       const generation = await client.query<{ uidvalidity: string | null }>(
@@ -3617,17 +3638,23 @@ export class MirrorRepository {
       if (Number(generation.rows[0]?.uidvalidity) !== uidValidity) {
         throw new Error(`Reconcile lost folder generation ${folder.id}`);
       }
-      const result = await client.query<{ count: string }>(sql, values);
+      const result = await client.query<{ count: string; last_uid: string | null }>(sql, values);
       await client.query("COMMIT");
       inTransaction = false;
-      return Number(result.rows[0].count);
+      return { count: Number(result.rows[0].count), lastUid: Number(result.rows[0].last_uid ?? 0) };
     };
     const writeAll = async (sql: string, values: unknown[]): Promise<number> => {
       let total = 0;
+      let afterUid = 0;
       for (;;) {
-        const written = await writeBatch(sql, values);
-        total += written;
-        if (written < writeBatchSize) return total;
+        if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) {
+          complete = false;
+          return total;
+        }
+        const batch = await writeBatch(sql, [...values, afterUid]);
+        total += batch.count;
+        if (batch.count < writeBatchSize) return total;
+        afterUid = batch.lastUid;
       }
     };
 
@@ -3652,6 +3679,7 @@ export class MirrorRepository {
         "SELECT count(*)::text AS count FROM supamail_live_uids"
       );
       const providerUidCount = Number(staged.rows[0].count);
+      await client.query("ANALYZE pg_temp.supamail_live_uids");
       if (providerUidCount !== options.expectedCount) {
         throw new IncompleteUidListError(
           folder.path,
@@ -3672,15 +3700,17 @@ export class MirrorRepository {
               AND row.folder_path = $2
               AND row.uidvalidity = $3
               AND row.uid < $4
+              AND row.uid > $6
               AND row.deleted_in_provider = false
               AND NOT EXISTS (
                 SELECT 1 FROM supamail_live_uids live WHERE live.uid = row.uid
               )
+            ORDER BY row.uid
             LIMIT $5
           )
-          RETURNING m.id
+          RETURNING m.uid
         )
-        SELECT count(*)::text AS count FROM marked
+        SELECT count(*)::text AS count, max(uid)::text AS last_uid FROM marked
       `, [accountId, folder.path, uidValidity, uidBound, writeBatchSize]);
 
       // UIDs are never reused within one UIDVALIDITY, so a listed UID proves the
@@ -3700,11 +3730,13 @@ export class MirrorRepository {
               AND row.uidvalidity = $3
               AND row.deleted_in_provider = true
               AND row.deleted_reason = 'RECONCILE_MISSING'
+              AND row.uid > $5
+            ORDER BY row.uid
             LIMIT $4
           )
-          RETURNING m.id
+          RETURNING m.uid
         )
-        SELECT count(*)::text AS count FROM revived
+        SELECT count(*)::text AS count, max(uid)::text AS last_uid FROM revived
       `, [accountId, folder.path, uidValidity, writeBatchSize]);
 
       // Spec §10.7 step 3: live-window UIDs without a live row.
@@ -3736,7 +3768,8 @@ export class MirrorRepository {
         missingInDbUids: missingResult.rows
           .slice(0, RECONCILE_MISSING_UID_LIMIT)
           .map((row) => Number(row.uid)),
-        missingInDbTruncated: missingResult.rows.length > RECONCILE_MISSING_UID_LIMIT
+        missingInDbTruncated: missingResult.rows.length > RECONCILE_MISSING_UID_LIMIT,
+        complete
       };
     } catch (error) {
       if (inTransaction) {
@@ -3754,6 +3787,26 @@ export class MirrorRepository {
       }
       client.release(discardClient);
     }
+  }
+
+  /** The UIDs among `uids` (at most one sync batch) that have a live row in this folder generation. */
+  async getLiveMessageUids(
+    accountId: string,
+    folder: ImapFolder,
+    uidValidity: number,
+    uids: readonly number[]
+  ): Promise<number[]> {
+    if (uids.length === 0) return [];
+    if (uids.length > MAX_SYNC_BATCH_SIZE) {
+      throw new Error("Live UID lookup exceeds the sync batch limit");
+    }
+    const result = await this.pool.query<{ uid: string }>(
+      `SELECT uid::text AS uid FROM public.imap_messages
+        WHERE account_id = $1 AND folder_path = $2 AND uidvalidity = $3
+          AND uid = ANY($4::bigint[]) AND deleted_in_provider = false`,
+      [accountId, folder.path, uidValidity, [...uids]]
+    );
+    return result.rows.map((row) => Number(row.uid));
   }
 
   /**

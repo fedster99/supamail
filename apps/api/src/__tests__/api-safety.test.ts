@@ -1085,6 +1085,13 @@ describe("API safety", () => {
     expect(search).not.toHaveBeenCalled();
   });
 
+  it("rejects the retired window search parameter with a 400", async () => {
+    const { app, search } = buildApp();
+    const res = await app.request("/search?q=invoice&window=HISTORICAL", { headers: auth() });
+    expect(res.status).toBe(400);
+    expect(search).not.toHaveBeenCalled();
+  });
+
   it("composes the free-text q with structured field/state/date/folder filters", async () => {
     const { app, search } = buildApp();
     const res = await app.request(

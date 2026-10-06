@@ -243,7 +243,7 @@ describe("repository safety", () => {
     expect(repository).not.toContain("last_archive_refresh_at");
     expect(engine).toContain("runHistoryLane");
     expect(engine).toContain("historyBatchLimit");
-    expect(engine).toContain("searchUidsBefore");
+    expect(engine).toContain("searchMailboxUids(client, { before: windowCutoff })");
     expect(engine).toContain("historical_backfill_mode === \"off\"");
   });
 
@@ -261,7 +261,7 @@ describe("repository safety", () => {
   it("tombstones folder messages after the missing grace expires", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    expect(source).toContain("deleted_reason = 'FOLDER_MISSING'");
+    expect(source).toContain("WHEN internal_date >= $3 THEN 'FOLDER_MISSING'");
     expect(source).toContain("\"FOLDER_MISSING\"");
     expect(source).toContain("FOLDER_MISSING_GRACE_EXCEEDED");
   });
