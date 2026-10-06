@@ -27,6 +27,7 @@ import type {
   MailboxStatus,
   MirrorImapClient
 } from "./imap-client.js";
+import { AccountBusyError } from "./errors.js";
 import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -932,7 +933,8 @@ export class MirrorEngine {
       }
     });
 
-    if (fetched === null) throw new Error("Account lock busy");
+    // A sync holds the lock, often right after new mail arrives: a short retry works.
+    if (fetched === null) throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the body fetch shortly`);
     return fetched;
   }
 

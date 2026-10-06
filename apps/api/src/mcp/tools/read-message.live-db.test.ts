@@ -195,6 +195,9 @@ liveDb("read_message tool live DB", () => {
     if ("error" in res) {
       expect(res.error.code).toBe("not_found");
       expect(res.error.hint).toContain("search_email");
+      // An id from another email tool is not data loss: say whose ids these are.
+      expect(res.error.hint).toContain("another email tool");
+      expect(res.error.message).not.toMatch(/deleted/);
     }
   });
 
