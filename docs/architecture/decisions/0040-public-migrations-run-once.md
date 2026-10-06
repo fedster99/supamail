@@ -28,7 +28,13 @@ file once.
   schema is outside the API-exposed schemas and grants nothing to `PUBLIC`.
 - Under the existing advisory lock, the runner applies each manifest id that is
   not recorded, in manifest order, and records it in the same transaction. A
-  failed migration records nothing and stops the run.
+  failed migration records nothing, stops the run, and raises
+  `PublicMigrationError` with its id. A migration listed before one that already
+  ran is refused the same way, because it would run out of order.
+- The migrator role owns `supamail_meta`; the runner creates the schema only when
+  it is missing. No runtime, reader, or API role needs access to it.
+- A schema test pins the hash of every released file: a released migration never
+  changes, because a database that already ran it would never see the edit.
 - A database migrated before the record existed has no ids recorded, so it
   applies every file once more and records them all. Every existing file is
   idempotent, so this is the same work as before, done for the last time.
@@ -39,5 +45,10 @@ file once.
   files create.
 - Public migrations stay idempotent: a database without the record still applies
   every file once.
-- Other runners that apply the public files (for example a host's provisioning
-  of customer databases) must use the same record, or keep applying every file.
+- Every runner that applies the public files (for example a host's provisioning
+  of customer databases) must use the same record. Once a migration drops an
+  object, re-running earlier files can fail, so only a database from before this
+  record may apply every file again.
+- A migration that drops an object is its own reviewed release, made after every
+  host stopped using the object; an older image that re-applies every file would
+  recreate it, so such a release does not roll back.

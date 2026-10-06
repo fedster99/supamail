@@ -87,27 +87,55 @@ describe("createPool server-side TCP liveness", () => {
 });
 
 describe("applyPublicMigrations", () => {
-  it("commits each migration with its record and stops at the first failure", async () => {
+  async function run(failOn: (text: string) => Error | null) {
     const { applyPublicMigrations, readPublicMigrationFiles } = await import("../db.js");
     const migrations = await readPublicMigrationFiles();
     const ran: Array<{ text: string; values?: unknown[] }> = [];
+    let released = false;
     const client = {
+      on: () => undefined,
+      off: () => undefined,
       query: async (text: string, values?: unknown[]) => {
         ran.push({ text, values });
-        if (text.startsWith("SELECT id FROM supamail_meta.public_migrations")) return { rows: [] };
-        if (text === migrations[1].sql) throw new Error("second migration failed");
+        const error = failOn(text);
+        if (error) throw error;
         return { rows: [] };
       },
-      release: () => undefined
+      release: () => { released = true; }
     };
     const pool = { connect: async () => client } as unknown as Parameters<typeof applyPublicMigrations>[0];
+    const outcome = await applyPublicMigrations(pool).then(() => null, (error: unknown) => error);
+    return { migrations, ran, released: () => released, outcome };
+  }
 
-    await expect(applyPublicMigrations(pool)).rejects.toThrow(/second migration failed/);
+  it("commits each migration with its record and stops at the first failure", async () => {
+    const { migrations } = await run(() => null);
+    const failing = migrations[1].sql;
+    const { ran, released, outcome } = await run((text) => text === failing ? new Error("second migration failed") : null);
+    const { PublicMigrationError } = await import("../db.js");
+    expect(outcome).toBeInstanceOf(PublicMigrationError);
+    expect((outcome as InstanceType<typeof PublicMigrationError>).migrationId).toBe(migrations[1].id);
     const recorded = ran
       .filter((entry) => entry.text.startsWith("INSERT INTO supamail_meta.public_migrations"))
       .map((entry) => entry.values?.[0]);
     expect(recorded).toEqual([migrations[0].id]);
-    expect(ran.map((entry) => entry.text)).toContain("ROLLBACK");
-    expect(ran.map((entry) => entry.text)).not.toContain(migrations[2].sql);
+    const texts = ran.map((entry) => entry.text);
+    expect(texts.slice(texts.indexOf(failing))).toEqual([
+      failing,
+      "ROLLBACK",
+      "SELECT pg_advisory_unlock(hashtext('supamail.public_migrations'))"
+    ]);
+    expect(released()).toBe(true);
+  });
+
+  it("reports the migration's own error when ROLLBACK also fails", async () => {
+    const { migrations } = await run(() => null);
+    const failing = migrations[0].sql;
+    const { outcome } = await run((text) => {
+      if (text === failing) return new Error("first migration failed");
+      if (text === "ROLLBACK") return new Error("connection lost");
+      return null;
+    });
+    expect(String(outcome)).toMatch(/first migration failed/);
   });
 });

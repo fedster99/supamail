@@ -1,12 +1,12 @@
 -- 0031_active_assignments_view_columns.sql
 --
 -- imap_thread_active_assignments selects assignment.*, and Postgres fixes that
--- column list when the view is created. 0023 later added the protected metadata
--- columns to imap_thread_assignments, so a database that applied 0014 once never
--- exposed them through the view. Re-applying every migration on each migrate hid
--- this until migrations began to run once (ADR 0040). Recreate the view so it
--- exposes every current assignment column, without the security barrier that
--- 0029 removed.
+-- column list when the view is created. 0020 and 0023 later added columns to
+-- imap_thread_assignments, so a database that applied 0014 once had a narrower
+-- view than one that re-applied it. Re-applying every migration on each migrate
+-- hid the difference until migrations began to run once (ADR 0040). Recreate the
+-- view so it has the same shape on every host, without the security barrier that
+-- 0029 removed. A schema test keeps its columns equal to the table's.
 CREATE OR REPLACE VIEW public.imap_thread_active_assignments
 WITH (security_invoker = true)
 AS

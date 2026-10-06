@@ -29,7 +29,7 @@ Mailbox-row identity is `(account_id, folder_path, uidvalidity, uid)`. Conversat
 - Work on one focused task at a time.
 - Prefer small, verified changes over broad refactors.
 - Do not weaken reliability or security semantics to make tests pass.
-- Keep public migrations under `apps/api/supabase/migrations/public/` additive and idempotent.
+- Keep public migrations under `apps/api/supabase/migrations/public/` idempotent, and never edit a released one. Each runs once (ADR 0040); a migration may drop an object only as its own reviewed release, after every host stopped using it.
 - Never commit real mailbox content, credentials, tokens, customer data, private infrastructure details, or machine-specific paths.
 - Keep private or temporary notes in ignored local files, never in tracked handoff diaries.
 - Update public documentation when behavior, layout, scripts, schema, or verification changes.

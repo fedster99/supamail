@@ -15,11 +15,9 @@ The constraints are fixed by the rest of the product:
 
 - **Public core, per-account Supabase/Postgres.** The search schema ships as a public
   migration that runs unchanged on every self-hoster and customer database. It must
-  be additive, idempotent, and safe to re-run (the whole public set is concatenated
-  and executed as one implicit transaction by `applyPublicMigrations` (since ADR 0040
-  each migration runs once, recorded with it), re-applied on
-  every boot — see `db.ts`). No `CREATE INDEX CONCURRENTLY` (illegal in a
-  transaction).
+  be additive, idempotent, and safe to re-run. `applyPublicMigrations` runs each
+  file in a transaction (since ADR 0040 once, recorded with it — see `db.ts`), so
+  no `CREATE INDEX CONCURRENTLY` (illegal in a transaction).
 - **Core scope is email sync only, no AI by default** (AGENTS.md, ADR 0001). A
   semantic/embedding search needs an external embedding model, which the pure core
   must not require to function.
