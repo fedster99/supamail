@@ -126,11 +126,12 @@ A whole-stack review hardened the thread-level verbs:
 
 ## Follow-up 2026-10-06: a failed flag write-through is an error
 
-The write-through is the only path that updates flags on mail older than
-`FLAG_DIFF_WINDOW_DAYS` when the server lacks CONDSTORE: the flag scan reads only
-that window, and reconcile compares UIDs, not flags. A database fault in the
-write-through was logged and the call still succeeded, so such a row could keep the
-old flags with nothing left to repair it. `setMessageFlags` now throws
+Without CONDSTORE, no sync is guaranteed to re-read flags on mail older than
+`FLAG_DIFF_WINDOW_DAYS`: the routine flag scan reads only that window, reconcile
+compares UIDs, not flags, and a full-window scan runs only when a provider event
+forces it. The write-through is the one guaranteed path. A database fault in it was
+logged and the call still succeeded, so such a row could keep the old flags with
+nothing guaranteed to repair it. `setMessageFlags` now throws
 `MirrorWriteError` (`mirror_write_failed`, HTTP 503 with `Retry-After`) after the
 STORE. Retrying the same change is safe: the STORE is idempotent and the retry
 writes the row. A row that is gone meanwhile (moved or deleted) still succeeds,

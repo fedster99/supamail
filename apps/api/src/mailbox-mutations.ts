@@ -347,9 +347,9 @@ export interface FlagResult {
 }
 
 /**
- * Write a successful flag change through to the mirror row. This is the only path
- * that updates flags on mail older than FLAG_DIFF_WINDOW_DAYS when the server has
- * no CONDSTORE, so a database failure is not left to a later sync: it throws
+ * Write a successful flag change through to the mirror row. Without CONDSTORE no
+ * sync is guaranteed to re-read flags on mail older than FLAG_DIFF_WINDOW_DAYS, so
+ * a database failure is not left to a later sync: it throws
  * {@link MirrorWriteError}, and retrying the same change repairs the row. Returns
  * false when the row is gone (moved or deleted meanwhile), which leaves nothing
  * to update.
@@ -716,8 +716,8 @@ export interface ThreadFlagResult {
   messageIds: string[];
   /** Members whose mirror row was not updated after the IMAP STORE succeeded (a
    * database fault or a row gone meanwhile). 0 = mirror fully in sync. Retrying the
-   * same change repairs a faulted row; without CONDSTORE no sync re-reads flags on
-   * mail older than FLAG_DIFF_WINDOW_DAYS. */
+   * same change repairs a faulted row; without CONDSTORE no sync is guaranteed to
+   * re-read flags on mail older than FLAG_DIFF_WINDOW_DAYS. */
   mirrorWriteThroughStale: number;
   /** True when the thread exceeded MAX_THREAD_FANOUT and only the oldest N members
    * were acted on. */
