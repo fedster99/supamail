@@ -1,3 +1,5 @@
+import { assertRequiredSchemaVersion, isSchemaVersionReady } from "./migration-id.js";
+
 export type RuntimeTargetStatus = "active" | "paused" | "needs_attention";
 
 export type RuntimeTargetSkipReason =
@@ -10,6 +12,7 @@ export interface RuntimeTargetTask<T = unknown> {
   targetId: string;
   taskId: string;
   status?: RuntimeTargetStatus;
+  /** The public migration the target's schema is at: a manifest id such as `0029_...`. */
   currentSchemaVersion: string;
   run(input: { signal?: AbortSignal }): Promise<T>;
 }
@@ -61,6 +64,7 @@ export async function runRuntimeTargetTasks<T>(
   if (!Number.isInteger(perTargetConcurrency) || perTargetConcurrency < 1) {
     throw new Error("perTargetConcurrency must be a positive integer");
   }
+  assertRequiredSchemaVersion(options.requiredSchemaVersion);
 
   const results: Array<RuntimeTargetTaskResult<T>> = [];
   const pending: Array<RunnableTask<T>> = [];
@@ -184,6 +188,6 @@ export async function runRuntimeTargetTasks<T>(
 function getSkipReason(task: RuntimeTargetTask, requiredSchemaVersion: string): RuntimeTargetSkipReason | null {
   if (task.status === "paused") return "target_paused";
   if (task.status === "needs_attention") return "target_needs_attention";
-  if (task.currentSchemaVersion !== requiredSchemaVersion) return "stale_migration";
+  if (!isSchemaVersionReady(task.currentSchemaVersion, requiredSchemaVersion)) return "stale_migration";
   return null;
 }
