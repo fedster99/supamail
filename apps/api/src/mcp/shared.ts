@@ -6,14 +6,14 @@ import {
   type MetadataProtectionAdapter,
   type ProtectedMetadataColumns
 } from "../metadata-protection.js";
-import { buildSyncTrust } from "../search/index.js";
-import type { SyncTrust } from "../search/types.js";
+import { buildReadAccounts } from "../search/index.js";
+import type { ReadAccount } from "../search/types.js";
 import type { WindowStatus } from "../types.js";
 
 /**
  * The shared MCP foundation (ADR 0014/0016). Every agent-email tool and the
  * stdio server plug into the contracts here, so the four tool files
- * (`read_thread`, `read_message`, `list_folders`, `draft_reply`) and the server
+ * (`read_thread`, `read_message`, `list_folders`, `get_sync_status`, `draft_reply`) and the server
  * depend on these signatures verbatim. Keep them STABLE.
  *
  * Read-only by construction: nothing here sends, mutates, or schedules — it only
@@ -548,17 +548,17 @@ export function toolError(
 }
 
 /**
- * Build the sync-trust block for the given accounts, wrapping the search layer's
- * `buildSyncTrust` so tools attach the same honest mirror-completeness signal as
- * search. `null` means "every account in this database". Runs read-only.
+ * Name the accounts a read came from, with a notice only when a mailbox cannot
+ * give a complete answer. `null` means "every account in this database". Runs
+ * read-only.
  */
-export async function syncTrustFor(
+export async function readAccountsFor(
   pool: PgPool,
   accountIds: string[] | null,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
-): Promise<SyncTrust> {
+): Promise<ReadAccount[]> {
   return withReadOnlyTx(
     pool,
-    (client) => buildSyncTrust(client, accountIds, metadataProtection)
+    (client) => buildReadAccounts(client, accountIds, metadataProtection)
   );
 }

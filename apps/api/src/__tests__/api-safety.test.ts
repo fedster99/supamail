@@ -253,7 +253,7 @@ function buildApp(options: {
   const search = vi.fn(async (_req: unknown) => ({
     results: [],
     page: { limit: 25, offset: 0, returned: 0, has_more: false },
-    sync_trust: { fully_synced: true, results_may_be_incomplete: false, degraded_reasons: [], accounts: [] },
+    accounts: [],
     parsed_query: { free_text: "", filters: [], sort: "smart" as const, warnings: [] },
     timing_ms: { total: 0 }
   }));

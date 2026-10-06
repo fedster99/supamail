@@ -54,8 +54,8 @@ const FORBIDDEN_CALLS = [
   "transport.send"
 ];
 
-const READ_TOOLS = new Set(["search_email", "read_message", "read_thread", "list_folders"]);
-const EXPECTED_TOOL_NAMES = ["search_email", "read_message", "read_thread", "list_folders", "draft_reply"];
+const READ_TOOLS = new Set(["search_email", "read_message", "read_thread", "list_folders", "get_sync_status"]);
+const EXPECTED_TOOL_NAMES = ["search_email", "read_message", "read_thread", "list_folders", "get_sync_status", "draft_reply"];
 
 // A tool name must never advertise a send/mutate capability.
 const FORBIDDEN_NAME = /send|submit|^reply_send|move|delete|flag|append|trash|archive_to_server/i;

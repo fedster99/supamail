@@ -201,7 +201,7 @@ liveDb("read_message tool live DB", () => {
     }
   });
 
-  it("reads a full message: envelope, cleaned body, attachments, sync_trust", async () => {
+  it("reads a full message: envelope, cleaned body, attachments, accounts", async () => {
     const res = await runReadMessage(pool, { message_id: idByUid.get(1)! });
     expect(res).not.toHaveProperty("error");
     if ("error" in res) throw new Error("unexpected error envelope");
@@ -230,7 +230,7 @@ liveDb("read_message tool live DB", () => {
     // Headers omitted unless asked.
     expect(res.headers).toBeUndefined();
 
-    expect(res.sync_trust.accounts.some((a) => a.account_id === accountId)).toBe(true);
+    expect(res.accounts.map((a) => a.account_id)).toEqual([accountId]);
   });
 
   it("keeps the quoted tail when include_quoted=true and parses headers when asked", async () => {

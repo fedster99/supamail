@@ -1,8 +1,8 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { formatZodIssues } from "../../errors.js";
-import type { SyncTrust } from "../../search/index.js";
-import { buildSyncTrust } from "../../search/index.js";
+import type { ReadAccount } from "../../search/index.js";
+import { buildReadAccounts } from "../../search/index.js";
 import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identity.js";
 import { extractMessageIdTokens } from "../../threading.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
@@ -173,7 +173,7 @@ export interface ReadThreadResult {
   missing_ancestor_count?: number;
   thread_content_status: "complete" | "partial";
   thread_omissions: Array<"older_messages" | "ancestors_not_mirrored">;
-  sync_trust: SyncTrust;
+  accounts: ReadAccount[];
 }
 
 export interface ReadThreadBatchResult {
@@ -201,7 +201,7 @@ export const readThreadDefinition: ToolDefinition = {
     "inline_count counts inline parts such as signature images (read_message lists them). " +
     "window_status: IN_WINDOW is mail in the live sync window; HISTORICAL (backfilled older mail) and " +
     "EXPIRED (aged out of the window) are archive rows that update less often. Returns the " +
-    "distinct participants and a sync_trust block. Each email appears " +
+    "distinct participants and the accounts read. Each email appears " +
     "once; its duplicate_message_ids lists its other stored copies, to move or flag every copy. Threading is a " +
     "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
     "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
@@ -522,7 +522,7 @@ async function runReadThreadInternal(
     const messageIds = [...new Set(input.message_ids)];
     const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
     let nextIndex = 0;
-    // Each item owns one snapshot, including sync_trust. Sharing trust across
+    // Each item owns one snapshot, including its accounts. Sharing them across
     // items could describe a different mirror state than the returned thread.
     await Promise.all(Array.from(
       { length: Math.min(THREAD_BATCH_CONCURRENCY, messageIds.length) },
@@ -651,7 +651,7 @@ async function runReadThreadInternal(
       );
     }
 
-    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
+    const accounts = await buildReadAccounts(client, accountIds, metadataProtection);
 
     const attachments = await loadMessageAttachments(
       client,
@@ -715,7 +715,7 @@ async function runReadThreadInternal(
       ...(missingAncestors > 0 ? { missing_ancestor_count: missingAncestors } : {}),
       thread_content_status: threadOmissions.length > 0 ? "partial" : "complete",
       thread_omissions: threadOmissions,
-      sync_trust: syncTrust
+      accounts
     };
   });
 }

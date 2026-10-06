@@ -18,7 +18,7 @@ import { MirrorEngine } from "./sync-engine.js";
 import { ThreadingRepository } from "./threading-repository.js";
 import { searchMessages } from "./search/index.js";
 import type { SearchRequest, SearchSort } from "./search/index.js";
-import { runDraftReply, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
+import { runDraftReply, runGetSyncStatus, runListFolders, runReadMessage, runReadThread } from "./mcp/index.js";
 import { sendMessage } from "./send.js";
 import {
   createDraft,
@@ -365,6 +365,15 @@ program
   .option("--account <id>", "Scope to one account UUID")
   .action(async (options) => {
     const result = await runListFolders(pool, { account: options.account });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command("sync-status")
+  .description("Report how up to date the mirror is per mailbox (read-only, JSON output)")
+  .option("--account <id>", "Scope to one account UUID")
+  .action(async (options) => {
+    const result = await runGetSyncStatus(pool, { account: options.account });
     console.log(JSON.stringify(result, null, 2));
   });
 

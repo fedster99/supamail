@@ -97,8 +97,8 @@ export const searchEmailToolDefinition = {
     "FULL mirror history (no 90-day window). Returns ranked, " +
     "snippet-highlighted results with full mailbox identity (score is null when the order ranks " +
     "nothing: date, size or sender order, or no free-text words), an optional per-result " +
-    "score_breakdown (explain), the echoed parsed query, and a sync_trust block describing " +
-    "how complete the mirror is. Each email appears once; duplicate_message_ids lists its other " +
+    "score_breakdown (explain), the echoed parsed query, and the accounts searched (a notice " +
+    "appears only when a mailbox cannot give a complete answer). Each email appears once; duplicate_message_ids lists its other " +
     "stored copies (for example a direct and a list delivery), to move or flag every copy. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {

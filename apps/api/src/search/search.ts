@@ -3,7 +3,7 @@ import type { WindowStatus } from "../types.js";
 import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
-import { buildSyncTrust } from "./sync-trust.js";
+import { buildReadAccounts } from "./sync-status.js";
 import { hasFolderFilter, resolveFolderFilters, type FolderRow } from "./rules.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
 import {
@@ -98,7 +98,7 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
  * Search the mirror. This is the single read-only entry point that the CLI
  * command and the MCP tool both wrap (ADR 0014). It parses the free-text
  * superset query and/or structured filters, resolves account scoping, then runs
- * the compiled search and the sync-trust query inside one read-only transaction.
+ * the compiled search and the account names inside one read-only transaction.
  *
  * The database connection is injected (no global pool reach-in) so the same
  * logic runs locally or through a remote wrapper. It never sends, mutates, or schedules.
@@ -189,7 +189,7 @@ export async function searchMessages(
       rows = result.rows;
     }
 
-    const syncTrust = await buildSyncTrust(client, accountIds, metadataProtection);
+    const accounts = await buildReadAccounts(client, accountIds, metadataProtection);
     await client.query("COMMIT");
 
     const hasMore = rows.length > limit;
@@ -200,7 +200,7 @@ export async function searchMessages(
     return {
       results,
       page: { limit, offset, returned: results.length, has_more: hasMore },
-      sync_trust: syncTrust,
+      accounts,
       parsed_query: { free_text: freeText, filters: resolvedFilters, sort, warnings },
       timing_ms: { total: Date.now() - startedAt }
     };
