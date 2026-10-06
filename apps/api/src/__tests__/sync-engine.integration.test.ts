@@ -1469,6 +1469,60 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(acknowledge).toHaveBeenCalledWith([change]);
   });
 
+  it("scans the full active window on each exact reconcile when the server has no modseq", async () => {
+    const h = await setupIntegration("reconcile-old-flag-no-modseq", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      FLAG_DIFF_WINDOW_DAYS: 7
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_010,
+      messages: [makeTextMessage({
+        uid: 401,
+        subject: "old archive flag",
+        from: "a@x.test",
+        to: "u@x.test",
+        body: "old",
+        internalDate: new Date(Date.now() - 30 * 24 * 60 * 60_000)
+      })]
+    });
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50 } });
+    await engine.syncAccount(h.account.id, "manual");
+    // Another client marks the 30-day-old message read; no event reaches the engine.
+    folders[2].messages[0].flags = ["\\Seen"];
+
+    const schedule = (reconcile: string, flagScan: string) => h.pool.query(
+      `UPDATE public.imap_folders
+       SET next_sync_due_at = now(),
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + ${reconcile},
+           next_flag_scan_at = now() + ${flagScan}
+       WHERE account_id = $1 AND path = 'Archive'`,
+      [h.account.id]
+    );
+
+    // A routine flag scan reads only FLAG_DIFF_WINDOW_DAYS, so the old change waits.
+    await schedule("interval '6 hours'", "interval '0'");
+    const routine = await engine.syncAccount(h.account.id, "scheduled");
+    expect(routine.outcome).toBe("success");
+    expect(routine.flagsUpdated).toBe(0);
+
+    // The exact reconcile pass scans the whole window even when no routine flag
+    // scan is due, and picks it up.
+    await schedule("interval '0'", "interval '6 hours'");
+    const reconcile = await engine.syncAccount(h.account.id, "scheduled");
+    expect(reconcile.outcome).toBe("success");
+    expect(reconcile.flagsUpdated).toBe(1);
+    const row = await h.pool.query<{ flags: string[] }>(
+      "SELECT flags FROM public.imap_messages WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 401",
+      [h.account.id]
+    );
+    expect(row.rows[0]?.flags).toEqual(["\\Seen"]);
+  });
+
   it("does not let a pending non-Inbox hint shadow a concurrent Inbox wake", async () => {
     const h = await setupIntegration("idle-inbox-with-archive", {
       INITIAL_SYNC_BATCH_SIZE: 50,

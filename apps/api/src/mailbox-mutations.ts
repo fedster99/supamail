@@ -42,8 +42,9 @@ export { MailboxConflictError };
  * Flag mutations (mark read/unread, star/unstar) write the new flag set THROUGH
  * to the mirror row immediately after a successful STORE: that is a deterministic
  * update of a KNOWN row to a KNOWN value (not fabricating identity), and it is
- * required because the flag-scan sync only re-reads flags within
- * FLAG_DIFF_WINDOW_DAYS, so a change to older mail would otherwise never reconcile.
+ * required because the routine flag scan re-reads only FLAG_DIFF_WINDOW_DAYS; on a
+ * server without a modseq, older mail would otherwise wait for the next exact
+ * reconcile pass.
  * Moves and deletes mark their known source and destination folders due before the
  * provider command. A MOVE the server confirms with COPYUID moves the row with the
  * message, so it keeps its id (ADR 0037); without COPYUID, and for every delete, the

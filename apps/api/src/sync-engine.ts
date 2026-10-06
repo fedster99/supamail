@@ -1402,8 +1402,21 @@ export class MirrorEngine {
         );
       }
 
+      const scheduledReconcileDue = !folder.last_full_reconcile_at
+        || !folder.next_reconcile_at
+        || new Date(folder.next_reconcile_at).getTime() <= Date.now();
+      const reconcileDue = qresyncFallbackRequired
+        || options.forceAuthoritativeReconcile
+        || (!qresyncApplied && options.forceReconcile)
+        || scheduledReconcileDue;
+      // Without a modseq nothing else re-reads flags on mail older than
+      // FLAG_DIFF_WINDOW_DAYS, so each scheduled exact reconcile also scans flags
+      // over the whole window: RECONCILE_INTERVAL_MS bounds flag staleness there.
+      // A forced reconcile after a known move stays narrow.
+      const fullFlagScanDue = highestModseq === undefined && scheduledReconcileDue;
       const flagScanDue = qresyncFallbackRequired
         || options.forceFlagScan
+        || fullFlagScanDue
         || !folder.next_flag_scan_at
         || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
@@ -1452,7 +1465,9 @@ export class MirrorEngine {
           // could be skipped forever when the cursor advances.
           const establishingCondstoreCursor = folder.highest_modseq === null
             && highestModseq !== undefined;
-          const scanEntireWindow = establishingCondstoreCursor || options.forceFlagScan === true;
+          const scanEntireWindow = establishingCondstoreCursor
+            || options.forceFlagScan === true
+            || fullFlagScanDue;
           const flagCutoff = scanEntireWindow ? windowCutoff : new Date();
           if (!scanEntireWindow) {
             flagCutoff.setDate(flagCutoff.getDate() - this.config.FLAG_DIFF_WINDOW_DAYS);
@@ -1499,12 +1514,6 @@ export class MirrorEngine {
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
       let reconcileListIncomplete = false;
-      const reconcileDue = qresyncFallbackRequired
-        || options.forceAuthoritativeReconcile
-        || (!qresyncApplied && options.forceReconcile)
-        || !folder.last_full_reconcile_at
-        || !folder.next_reconcile_at
-        || new Date(folder.next_reconcile_at).getTime() <= Date.now();
       let backfilled = 0;
       if (!hitLockBudget && options.allowReconcile && reconcileDue) {
         reconcileAttempted = true;

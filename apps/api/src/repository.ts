@@ -3841,9 +3841,10 @@ export class MirrorRepository {
   /**
    * Write a flag change through to a KNOWN message row (organize mutations,
    * email-002/ADR 0018). After a successful IMAP STORE we update the mirrored
-   * `flags` array so mark-read/star reflect immediately — the flag-scan sync only
-   * re-reads flags within FLAG_DIFF_WINDOW_DAYS, so older mail would otherwise
-   * never reconcile. This is a deterministic update of a known row to a known
+   * `flags` array so mark-read/star reflect immediately — the routine flag scan
+   * re-reads only FLAG_DIFF_WINDOW_DAYS, so on a server without a modseq older
+   * mail would otherwise wait for the next exact reconcile pass. This is a
+   * deterministic update of a known row to a known
    * value, account-scoped and parameterized; it does NOT fabricate identity.
    *
    * `add`/`remove` are raw IMAP flag tokens (e.g. "\\Seen"). Matching is
