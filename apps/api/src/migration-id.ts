@@ -1,5 +1,5 @@
 /** Public migration ids are a four-digit sequence, an underscore, and a name. */
-const PUBLIC_MIGRATION_ID = /^(\d{4})_\S+$/;
+export const PUBLIC_MIGRATION_ID = /^(\d{4})_\S+$/;
 
 /**
  * Migrations after this one are held additive by the schema test, so an older
@@ -23,16 +23,11 @@ export class InvalidSchemaVersionError extends TypeError {
   }
 }
 
-/** The runtime's required version, parsed once; throws when it is not an id. */
-export interface RequiredSchemaVersion {
-  id: string;
-  sequence: number;
-}
-
-export function parseRequiredSchemaVersion(requiredSchemaVersion: string): RequiredSchemaVersion {
-  const sequence = publicMigrationSequence(requiredSchemaVersion);
-  if (sequence === null) throw new InvalidSchemaVersionError(requiredSchemaVersion);
-  return { id: requiredSchemaVersion, sequence };
+/** Throws when the runtime's required version is not a public migration id. */
+export function assertRequiredSchemaVersion(requiredSchemaVersion: string): void {
+  if (publicMigrationSequence(requiredSchemaVersion) === null) {
+    throw new InvalidSchemaVersionError(requiredSchemaVersion);
+  }
 }
 
 /**
@@ -49,12 +44,39 @@ export function parseRequiredSchemaVersion(requiredSchemaVersion: string): Requi
  * runtime's own error and throws.
  */
 export function isSchemaVersionReady(currentSchemaVersion: string, requiredSchemaVersion: string): boolean {
-  return schemaServes(currentSchemaVersion, parseRequiredSchemaVersion(requiredSchemaVersion));
-}
-
-export function schemaServes(currentSchemaVersion: string, required: RequiredSchemaVersion): boolean {
+  assertRequiredSchemaVersion(requiredSchemaVersion);
+  const required = publicMigrationSequence(requiredSchemaVersion)!;
   const current = publicMigrationSequence(currentSchemaVersion);
   if (current === null) return false;
-  if (current === required.sequence) return currentSchemaVersion === required.id;
-  return current > required.sequence && required.sequence >= ADDITIVE_SINCE_SEQUENCE;
+  if (current === required) return currentSchemaVersion === requiredSchemaVersion;
+  return current > required && required >= ADDITIVE_SINCE_SEQUENCE;
+}
+
+const SQL_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\//g;
+const IDENTIFIER = String.raw`(?:"[^"]*"|\S+)`;
+
+/**
+ * Statements that take something away from a running older runtime, or make
+ * one of its writes fail. The list is what a scan can see; a replaced function
+ * or view body is for review to judge. Returns the first offending statement
+ * fragment, or null.
+ */
+export function findNonAdditiveStatement(sql: string): string | null {
+  const text = sql.replace(SQL_COMMENT, " ");
+  const patterns = [
+    /\bdrop\s+(?:table|index|policy|trigger|type)\b/i,
+    // ALTER TABLE ... DROP [COLUMN] name and ... DROP DEFAULT take something
+    // away; DROP CONSTRAINT and DROP NOT NULL only loosen.
+    new RegExp(String.raw`\balter\s+table\b[^;]*\bdrop\s+(?!constraint\b|not\s+null\b)(?:if\s+exists\s+)?${IDENTIFIER}`, "i"),
+    /\brename\b/i,
+    new RegExp(String.raw`\balter\s+(?:column\s+)?${IDENTIFIER}\s+(?:(?:set\s+data\s+)?type|set\s+not\s+null)\b`, "i"),
+    new RegExp(String.raw`\badd\s+(?:constraint\s+${IDENTIFIER}\s+)?(?:check|unique|primary\s+key|foreign\s+key|exclude)\b`, "i"),
+    /\bcreate\s+unique\s+index\b/i,
+    /\badd\s+column\s+[^,;]*\bnot\s+null\b(?![^,;]*\bdefault\b)/i
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (match) return match[0];
+  }
+  return null;
 }

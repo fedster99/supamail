@@ -31,6 +31,7 @@ export * from "./sync-engine.js";
 export * from "./target-scheduler.js";
 export {
   ADDITIVE_SINCE_SEQUENCE,
+  findNonAdditiveStatement,
   InvalidSchemaVersionError,
   isSchemaVersionReady,
   publicMigrationSequence

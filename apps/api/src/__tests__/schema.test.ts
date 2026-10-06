@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ADDITIVE_SINCE_SEQUENCE, publicMigrationSequence } from "../migration-id.js";
+import { ADDITIVE_SINCE_SEQUENCE, findNonAdditiveStatement, publicMigrationSequence } from "../migration-id.js";
 import {
   applyPublicMigrations,
   assertPublicMigrationManifest,
@@ -204,7 +204,7 @@ describe("initial schema", () => {
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), entry("0002_b")] }))
       .not.toThrow();
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0002-b", migrations: [entry("0001_a"), entry("0002-b")] }))
-      .toThrow(/Invalid public migration manifest entry/);
+      .toThrow(/not a public migration id/);
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_a", migrations: [entry("0002_b"), entry("0001_a")] }))
       .toThrow(/out of order/);
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_a", migrations: [entry("0001_a"), entry("0002_b")] }))
@@ -212,25 +212,59 @@ describe("initial schema", () => {
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_b", migrations: [entry("0001_a"), entry("0001_b")] }))
       .toThrow(/out of order/);
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), { id: "0002_b", file: 2 }] }))
-      .toThrow(/Invalid public migration manifest entry/);
+      .toThrow(/Invalid public migration manifest/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: 2, migrations: [entry("0001_a")] }))
+      .toThrow(/Invalid public migration manifest/);
   });
 
   it("keeps every migration after 0029 additive, which is what lets an older runtime run on a newer schema", async () => {
     // The scheduler accepts a schema ahead of the runtime from 0029 on
     // (ADDITIVE_SINCE_SEQUENCE) because a later migration never takes away
-    // what the running code uses. This scan catches the structural breaks a
-    // regex can see; it cannot judge a replaced function or view body, which
-    // the PR review must. Comments are not stripped, so do not name these
-    // statements in comments either.
+    // what the running code uses. findNonAdditiveStatement names the breaks a
+    // scan can see; a replaced function or view body is for review to judge.
     const manifest = await readPublicMigrationManifest();
     const here = resolve(process.cwd(), "supabase/migrations/public");
     const later = manifest.migrations.filter((entry) => publicMigrationSequence(entry.id)! > ADDITIVE_SINCE_SEQUENCE);
     for (const migration of later) {
       const sql = await readFile(resolve(here, migration.file), "utf8");
-      expect(sql, migration.id).not.toMatch(
-        /\b(drop\s+(column|table|index|policy|trigger)|rename\s+(column|to)|alter\s+column\s+\S+\s+((set\s+data\s+)?type|set\s+not\s+null)|add\s+constraint\s+\S+\s+check)\b/i
-      );
+      expect(findNonAdditiveStatement(sql), migration.id).toBeNull();
     }
+  });
+
+  it("names the statements that take something away from an older runtime", () => {
+    const breaks = [
+      "alter table public.t drop column old_col;",
+      "alter table public.t drop old_col;",
+      "alter table public.t alter column old_col drop default;",
+      "drop table public.t;",
+      "drop index if exists public.t_idx;",
+      "alter table public.t rename column a to b;",
+      "alter table public.t rename to u;",
+      'alter table public.t alter column "display name" type text;',
+      "alter table public.t alter column a set data type bigint;",
+      "alter table public.t alter column a set not null;",
+      "alter table public.t add constraint t_check check (a > 0);",
+      "alter table public.t add unique (a);",
+      "alter table public.t add constraint t_fk foreign key (a) references public.u (id);",
+      "create unique index if not exists t_a_idx on public.t (a);",
+      "alter table public.t add column kind text not null;"
+    ];
+    for (const sql of breaks) expect(findNonAdditiveStatement(sql), sql).not.toBeNull();
+
+    const additive = [
+      "alter table public.t add column if not exists kind text;",
+      "alter table public.t add column kind text not null default 'x';",
+      "create index if not exists t_a_idx on public.t (a);",
+      "alter table public.t drop constraint if exists t_check;",
+      "alter table public.t alter column a drop not null;",
+      "drop view if exists public.v; create view public.v as select 1;",
+      "drop function if exists public.f(); create function public.f() returns int language sql as $$ select 1 $$;",
+      "create or replace function public.f() returns int language sql as $$ select 2 $$;",
+      "alter view public.v reset (security_barrier);",
+      "-- we do not drop column legacy here\nselect 1;",
+      "/* rename nothing */ select 1;"
+    ];
+    for (const sql of additive) expect(findNonAdditiveStatement(sql), sql).toBeNull();
   });
 
   it("serializes programmatic public migration calls with an advisory lock", async () => {

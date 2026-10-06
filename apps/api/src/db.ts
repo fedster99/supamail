@@ -4,21 +4,45 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
-import { publicMigrationSequence } from "./migration-id.js";
+import { z } from "zod";
+import { PUBLIC_MIGRATION_ID, publicMigrationSequence } from "./migration-id.js";
 
 const { Pool } = pg;
 
 export type PgPool = pg.Pool;
 export type PgClient = pg.PoolClient;
 
-export interface PublicMigrationManifest {
-  /** The last migration's id. Hosts read it as the required version, so it stays a field. */
-  schemaVersion: string;
-  migrations: Array<{
-    id: string;
-    file: string;
-  }>;
-}
+/**
+ * The manifest contract the schema gate relies on: every id is a public
+ * migration id, ids strictly ascend, files are names, and `schemaVersion` is
+ * the last id. Hosts read `schemaVersion` as the required version, so it
+ * stays a field.
+ */
+export const publicMigrationManifestSchema = z.object({
+  schemaVersion: z.string().min(1),
+  migrations: z.array(z.object({
+    id: z.string().regex(PUBLIC_MIGRATION_ID, "not a public migration id"),
+    file: z.string().min(1).refine((file) => !file.includes("/") && !file.includes("\\"), "file must be a name")
+  })).min(1)
+}).superRefine((manifest, context) => {
+  let previous = -1;
+  for (const migration of manifest.migrations) {
+    const sequence = publicMigrationSequence(migration.id)!;
+    if (sequence <= previous) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: `out of order at ${migration.id}` });
+    }
+    previous = sequence;
+  }
+  const last = manifest.migrations[manifest.migrations.length - 1]!.id;
+  if (manifest.schemaVersion !== last) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `schemaVersion ${manifest.schemaVersion} is not its last migration ${last}`
+    });
+  }
+});
+
+export type PublicMigrationManifest = z.infer<typeof publicMigrationManifestSchema>;
 
 let cachedPool: PgPool | null = null;
 
@@ -123,37 +147,12 @@ export async function readPublicMigrationManifest(): Promise<PublicMigrationMani
   return assertPublicMigrationManifest(JSON.parse(raw));
 }
 
-/**
- * The manifest contract the schema gate relies on: every id is a public
- * migration id, ids strictly ascend, and the schema version is the last id.
- */
 export function assertPublicMigrationManifest(parsed: unknown): PublicMigrationManifest {
-  const manifest = parsed as PublicMigrationManifest;
-  if (!manifest?.schemaVersion || !Array.isArray(manifest.migrations) || manifest.migrations.length === 0) {
-    throw new Error("Invalid public migration manifest");
+  const result = publicMigrationManifestSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(`Invalid public migration manifest: ${result.error.issues.map((issue) => issue.message).join("; ")}`);
   }
-  let previous = -1;
-  for (const migration of manifest.migrations) {
-    const sequence = typeof migration?.id === "string" ? publicMigrationSequence(migration.id) : null;
-    if (
-      sequence === null
-      || typeof migration.file !== "string"
-      || migration.file === ""
-      || migration.file.includes("/")
-      || migration.file.includes("\\")
-    ) {
-      throw new Error(`Invalid public migration manifest entry: ${JSON.stringify(migration)}`);
-    }
-    if (sequence <= previous) {
-      throw new Error(`Public migration manifest is out of order at ${migration.id}`);
-    }
-    previous = sequence;
-  }
-  const last = manifest.migrations[manifest.migrations.length - 1]!.id;
-  if (manifest.schemaVersion !== last) {
-    throw new Error(`Public migration manifest version ${manifest.schemaVersion} is not its last migration ${last}`);
-  }
-  return manifest;
+  return result.data;
 }
 
 export async function getRequiredPublicSchemaVersion(): Promise<string> {
