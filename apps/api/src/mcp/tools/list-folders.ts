@@ -51,7 +51,7 @@ export const listFoldersDefinition: ToolDefinition = {
   description:
     "Orient in the mirror: list every synced folder, including empty ones, with its live message " +
     "total and unread count, plus totals (total, unread) summed over the listed folders. Counts " +
-    "are over the non-deleted live mirror in Postgres; unread excludes the IMAP \\Seen flag. " +
+    "are over the non-deleted live mirror; unread excludes the IMAP \\Seen flag. " +
     "A folder excluded from sync is listed only while it still holds mirrored mail. Each folder carries its IMAP " +
     "special_use (e.g. \\Inbox, \\Sent, \\Trash) and sync status. Scope to one account UUID via " +
     "`account`, or omit to aggregate across all accounts (each folder row keeps its account_id). " +
