@@ -52,9 +52,10 @@ new write-only `MailboxMutator` IMAP client (mirroring email-001's
   remain provider-authoritative. A flag change (mark read/unread, star/unstar)
   updates the KNOWN message row's `flags` to a KNOWN value right after a successful
   STORE — a deterministic write of existing identity, not fabricating identity, so
-  it stays within the email-001 rule. This is required because the flag-scan sync
-  only re-reads flags within `FLAG_DIFF_WINDOW_DAYS` (~7 days), so a flag change on
-  older mail would otherwise never reconcile. Before a move, the engine marks
+  it stays within the email-001 rule. This is required because the routine flag
+  scan only re-reads flags within `FLAG_DIFF_WINDOW_DAYS` (~7 days); on a server
+  without a modseq, a flag change on older mail would otherwise wait for the next
+  exact reconcile pass (see the 2026-10-06 follow-up). Before a move, the engine marks
   the tracked source and destination folders due for sync and exact reconcile.
   This durable hint is written before the provider command, so a process exit
   after provider acknowledgement cannot strand the change. A host that receives
@@ -123,3 +124,14 @@ A whole-stack review hardened the thread-level verbs:
   the scan's FETCH) touches the HOT sync `upsertMessages` ON-CONFLICT path
   (high blast radius), so it is deliberately deferred — the eventual-convergence
   guarantee already bounds the staleness to one scan interval.
+
+## Follow-up 2026-10-06: old-mail flags on servers without a modseq
+
+On a server that reports no modseq (Microsoft 365 is the confirmed case), the
+routine flag scan reads only `FLAG_DIFF_WINDOW_DAYS`, reconcile compares UIDs, not
+flags, and no provider event forces a wider scan. A flag changed in another client
+on older mail therefore never reached the mirror. Each exact reconcile pass on such
+a folder now scans flags over the whole mirrored window, using the existing
+full-window scan path, deadline and batch budgets. `RECONCILE_INTERVAL_MS` (6 hours
+by default) bounds flag staleness on those servers. Servers with a modseq are
+unchanged: CONDSTORE deltas already cover every change. No new state or schedule.
