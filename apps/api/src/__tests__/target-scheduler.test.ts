@@ -235,30 +235,20 @@ describe("runtime target scheduler", () => {
     ]));
   });
 
-  it("runs a target whose schema is ahead within its compatibility floor and skips one past it", async () => {
+  it("runs a target whose schema is ahead of the runtime and skips one behind it", async () => {
     const results = await runRuntimeTargetTasks([
       {
-        targetId: "ahead-compatible",
-        taskId: "ahead-compatible",
+        targetId: "ahead",
+        taskId: "ahead",
         currentSchemaVersion: "0007_optional_raw_mime",
-        compatibleSinceSchemaVersion: "0005_progress_rollup",
         async run() {
           return "ok";
         }
       },
       {
-        targetId: "ahead-floor-moved",
-        taskId: "ahead-floor-moved",
-        currentSchemaVersion: "0007_optional_raw_mime",
-        compatibleSinceSchemaVersion: "0007_optional_raw_mime",
-        async run() {
-          return "ok";
-        }
-      },
-      {
-        targetId: "ahead-exact-only",
-        taskId: "ahead-exact-only",
-        currentSchemaVersion: "0007_optional_raw_mime",
+        targetId: "behind",
+        taskId: "behind",
+        currentSchemaVersion: "0005_progress_rollup",
         async run() {
           return "ok";
         }
@@ -266,9 +256,8 @@ describe("runtime target scheduler", () => {
     ], { requiredSchemaVersion });
 
     expect(results).toEqual(expect.arrayContaining([
-      expect.objectContaining({ targetId: "ahead-compatible", status: "fulfilled", value: "ok" }),
-      expect.objectContaining({ targetId: "ahead-floor-moved", status: "skipped", reason: "stale_migration" }),
-      expect.objectContaining({ targetId: "ahead-exact-only", status: "skipped", reason: "stale_migration" })
+      expect.objectContaining({ targetId: "ahead", status: "fulfilled", value: "ok" }),
+      expect.objectContaining({ targetId: "behind", status: "skipped", reason: "stale_migration" })
     ]));
   });
 });
@@ -276,45 +265,22 @@ describe("runtime target scheduler", () => {
 describe("isSchemaVersionReady", () => {
   const required = "0028_folder_message_counts";
 
-  it("accepts an exact match and, with a floor, a schema that is ahead", () => {
-    expect(isSchemaVersionReady({ currentSchemaVersion: required }, required)).toBe(true);
-    expect(isSchemaVersionReady({
-      currentSchemaVersion: "0029_active_assignments_view_no_barrier",
-      compatibleSinceSchemaVersion: "0028_folder_message_counts"
-    }, required)).toBe(true);
-    expect(isSchemaVersionReady({
-      currentSchemaVersion: "0031_later",
-      compatibleSinceSchemaVersion: "0020_threading_fingerprint_closure"
-    }, required)).toBe(true);
+  it("accepts an exact match and a schema that is ahead", () => {
+    expect(isSchemaVersionReady(required, required)).toBe(true);
+    expect(isSchemaVersionReady("0029_active_assignments_view_no_barrier", required)).toBe(true);
+    expect(isSchemaVersionReady("0131_far_ahead", required)).toBe(true);
   });
 
-  it("refuses a schema that is behind, ahead past its floor, or ahead without a floor", () => {
-    expect(isSchemaVersionReady({ currentSchemaVersion: "0027_folder_unchanged_proof" }, required)).toBe(false);
-    expect(isSchemaVersionReady({
-      currentSchemaVersion: "0030_incompatible",
-      compatibleSinceSchemaVersion: "0030_incompatible"
-    }, required)).toBe(false);
-    expect(isSchemaVersionReady({ currentSchemaVersion: "0029_active_assignments_view_no_barrier" }, required)).toBe(false);
+  it("refuses a schema that is behind, missing, malformed, or a different id with the same number", () => {
+    expect(isSchemaVersionReady("0027_folder_unchanged_proof", required)).toBe(false);
+    expect(isSchemaVersionReady("missing", required)).toBe(false);
+    expect(isSchemaVersionReady("", required)).toBe(false);
+    expect(isSchemaVersionReady("28_short", required)).toBe(false);
+    expect(isSchemaVersionReady("0028_fork_of_folder_counts", required)).toBe(false);
   });
 
-  it("refuses a missing, malformed, inverted, or same-number-different-name version", () => {
-    expect(isSchemaVersionReady({ currentSchemaVersion: "missing" }, required)).toBe(false);
-    expect(isSchemaVersionReady({ currentSchemaVersion: "" }, required)).toBe(false);
-    expect(isSchemaVersionReady({ currentSchemaVersion: "28_short" }, required)).toBe(false);
-    expect(isSchemaVersionReady({ currentSchemaVersion: "0028_fork_of_folder_counts" }, required)).toBe(false);
-    expect(isSchemaVersionReady({
-      currentSchemaVersion: "0029_active_assignments_view_no_barrier",
-      compatibleSinceSchemaVersion: "0028_fork_of_folder_counts"
-    }, required)).toBe(false);
-    expect(isSchemaVersionReady({
-      currentSchemaVersion: required,
-      compatibleSinceSchemaVersion: "0029_active_assignments_view_no_barrier"
-    }, required)).toBe(false);
-  });
-
-  it("treats an empty floor as absent and throws on a malformed required version", () => {
-    expect(isSchemaVersionReady({ currentSchemaVersion: required, compatibleSinceSchemaVersion: "" }, required)).toBe(true);
-    expect(() => isSchemaVersionReady({ currentSchemaVersion: required }, "latest")).toThrow(InvalidSchemaVersionError);
-    expect(() => runRuntimeTargetTasks([], { requiredSchemaVersion: "latest" })).rejects.toThrow(InvalidSchemaVersionError);
+  it("throws on a malformed required version at the boundary", async () => {
+    expect(() => isSchemaVersionReady(required, "latest")).toThrow(InvalidSchemaVersionError);
+    await expect(runRuntimeTargetTasks([], { requiredSchemaVersion: "latest" })).rejects.toThrow(InvalidSchemaVersionError);
   });
 });

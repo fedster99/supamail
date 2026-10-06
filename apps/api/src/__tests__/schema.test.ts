@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import {
   applyPublicMigrations,
   assertPublicMigrationManifest,
-  getPublicSchemaCompatibilityFloor,
   getRequiredPublicSchemaVersion,
   readPublicMigrationManifest,
   readPublicMigrations
@@ -200,7 +199,7 @@ describe("initial schema", () => {
   });
 
   it("rejects a manifest whose ids are malformed, out of order, or whose version is not the last id", () => {
-    const entry = (id: string, extra: Record<string, unknown> = {}) => ({ id, file: `${id}.sql`, ...extra });
+    const entry = (id: string) => ({ id, file: `${id}.sql` });
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), entry("0002_b")] }))
       .not.toThrow();
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0002-b", migrations: [entry("0001_a"), entry("0002-b")] }))
@@ -209,12 +208,6 @@ describe("initial schema", () => {
       .toThrow(/out of order/);
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_a", migrations: [entry("0001_a"), entry("0002_b")] }))
       .toThrow(/is not its last migration/);
-    expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), entry("0002_b", { breaksOlderRuntimes: "yes" })] }))
-      .toThrow(/Invalid public migration manifest entry/);
-  });
-
-  it("keeps the compatibility floor at the first migration until one breaks older runtimes", async () => {
-    expect(await getPublicSchemaCompatibilityFloor()).toBe("0001_imap_mirror");
   });
 
   it("serializes programmatic public migration calls with an advisory lock", async () => {

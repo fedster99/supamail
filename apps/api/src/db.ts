@@ -16,13 +16,6 @@ export interface PublicMigrationManifest {
   migrations: Array<{
     id: string;
     file: string;
-    /**
-     * A runtime older than this migration cannot run on a schema that
-     * includes it. A host moves its compatibility floor to this id when it
-     * applies the migration, so the running runtime stops until the new one
-     * is up. Absent: older runtimes keep serving through the deploy window.
-     */
-    breaksOlderRuntimes?: boolean;
   }>;
 }
 
@@ -146,7 +139,6 @@ export function assertPublicMigrationManifest(parsed: unknown): PublicMigrationM
       || !migration.file
       || migration.file.includes("/")
       || migration.file.includes("\\")
-      || (migration.breaksOlderRuntimes !== undefined && typeof migration.breaksOlderRuntimes !== "boolean")
     ) {
       throw new Error(`Invalid public migration manifest entry: ${JSON.stringify(migration)}`);
     }
@@ -165,17 +157,6 @@ export function assertPublicMigrationManifest(parsed: unknown): PublicMigrationM
 export async function getRequiredPublicSchemaVersion(): Promise<string> {
   const manifest = await readPublicMigrationManifest();
   return manifest.schemaVersion;
-}
-
-/**
- * The oldest required version a schema at this manifest's version still
- * serves: the last migration that breaks older runtimes, else the first
- * migration. A host records this as its schema's compatibility floor.
- */
-export async function getPublicSchemaCompatibilityFloor(): Promise<string> {
-  const manifest = await readPublicMigrationManifest();
-  const breaking = manifest.migrations.filter((migration) => migration.breaksOlderRuntimes === true);
-  return (breaking.length > 0 ? breaking[breaking.length - 1] : manifest.migrations[0])!.id;
 }
 
 export async function readPublicMigrations(): Promise<string> {

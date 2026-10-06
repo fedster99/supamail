@@ -6,16 +6,13 @@ export type RuntimeTargetSkipReason =
   | "stale_migration"
   | "scheduler_aborted";
 
-export interface SchemaVersionState {
+export interface RuntimeTargetTask<T = unknown> {
+  targetId: string;
+  taskId: string;
+  status?: RuntimeTargetStatus;
   /** The public migration the target's schema is at: a manifest id such as `0029_...`. */
   currentSchemaVersion: string;
-  /**
-   * The oldest required version this schema still serves. A host records it
-   * in its own schema marker when it applies migrations, from the manifest's
-   * `breaksOlderRuntimes` entries: such a migration sets the floor to its own
-   * id, any other leaves it. Absent or empty means exact match.
-   */
-  compatibleSinceSchemaVersion?: string;
+  run(input: { signal?: AbortSignal }): Promise<T>;
 }
 
 /** Public migration ids are a four-digit sequence, an underscore, and a name. */
@@ -36,13 +33,6 @@ export class InvalidSchemaVersionError extends TypeError {
     this.name = "InvalidSchemaVersionError";
     this.version = version;
   }
-}
-
-export interface RuntimeTargetTask<T = unknown> extends SchemaVersionState {
-  targetId: string;
-  taskId: string;
-  status?: RuntimeTargetStatus;
-  run(input: { signal?: AbortSignal }): Promise<T>;
 }
 
 export interface RuntimeTargetSchedulerOptions {
@@ -218,29 +208,26 @@ export async function runRuntimeTargetTasks<T>(
 function getSkipReason(task: RuntimeTargetTask, requiredSchemaVersion: string): RuntimeTargetSkipReason | null {
   if (task.status === "paused") return "target_paused";
   if (task.status === "needs_attention") return "target_needs_attention";
-  if (!isSchemaVersionReady(task, requiredSchemaVersion)) return "stale_migration";
+  if (!isSchemaVersionReady(task.currentSchemaVersion, requiredSchemaVersion)) return "stale_migration";
   return null;
 }
 
 /**
- * Whether a runtime that requires `requiredSchemaVersion` can run against this
- * schema. Ids order by their four-digit prefix. The schema must be at or after
- * the required version, and the required version must not be older than the
- * schema's compatibility floor. So a host may apply a compatible migration
- * before it deploys the runtime that needs it, and the running runtime keeps
- * serving; a migration the running runtime cannot work with moves the floor
- * and stops it. Two ids with one sequence number must be the same id. A
- * missing or malformed schema version is not ready; a malformed required
- * version is the runtime's own error and throws.
+ * Whether a runtime that requires `requiredSchemaVersion` can run against a
+ * schema at `currentSchemaVersion`. Ids order by their four-digit prefix. A
+ * schema behind the runtime is not ready: the code would miss what a later
+ * migration adds. A schema ahead of the runtime is ready: public migrations
+ * are additive and idempotent, so an older runtime keeps working, and a host
+ * applies a migration before it deploys the runtime that needs it. Two ids
+ * with one sequence number must be the same id. A missing or malformed
+ * schema version is not ready; a malformed required version is the runtime's
+ * own error and throws.
  */
-export function isSchemaVersionReady(state: SchemaVersionState, requiredSchemaVersion: string): boolean {
+export function isSchemaVersionReady(currentSchemaVersion: string, requiredSchemaVersion: string): boolean {
   const required = publicMigrationSequence(requiredSchemaVersion);
   if (required === null) throw new InvalidSchemaVersionError(requiredSchemaVersion);
-  const floorId = state.compatibleSinceSchemaVersion || state.currentSchemaVersion;
-  const current = publicMigrationSequence(state.currentSchemaVersion);
-  const floor = publicMigrationSequence(floorId);
-  if (current === null || floor === null) return false;
-  if (current === required && state.currentSchemaVersion !== requiredSchemaVersion) return false;
-  if (floor === required && floorId !== requiredSchemaVersion) return false;
-  return floor <= required && required <= current;
+  const current = publicMigrationSequence(currentSchemaVersion);
+  if (current === null) return false;
+  if (current === required) return currentSchemaVersion === requiredSchemaVersion;
+  return current > required;
 }
