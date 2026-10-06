@@ -61,10 +61,33 @@ liveDb("public migrations run once", () => {
   });
 
   it("applies every file once more on a database migrated before the record existed", async () => {
-    await getPool().query("DROP SCHEMA supamail_meta CASCADE");
-    await applyPublicMigrations(getPool());
+    // The old runner re-applied every file, so such a database ends at 0031: the
+    // last migration before one dropped what earlier files create.
     const migrations = await readPublicMigrationFiles();
-    expect(await recorded()).toEqual(migrations.map((migration) => migration.id).sort());
+    const legacyCount = migrations.findIndex((migration) => migration.id === "0031_active_assignments_view_columns") + 1;
+    const database = `supamail_legacy_${process.pid}`;
+    await getPool().query(`DROP DATABASE IF EXISTS ${database}`);
+    await getPool().query(`CREATE DATABASE ${database}`);
+    const url = new URL(getConfig().DATABASE_URL);
+    url.pathname = `/${database}`;
+    const legacy = createPool({ DATABASE_URL: url.toString() });
+    try {
+      for (let run = 0; run < 2; run += 1) {
+        await legacy.query(migrations.slice(0, legacyCount).map((migration) => migration.sql).join("\n\n"));
+      }
+      await applyPublicMigrations(legacy);
+      const ids = (await legacy.query<{ id: string }>(
+        "SELECT id FROM supamail_meta.public_migrations ORDER BY id"
+      )).rows.map((row) => row.id);
+      expect(ids).toEqual(migrations.map((migration) => migration.id).sort());
+      const column = await legacy.query(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = 'imap_messages' AND column_name = 'window_status'"
+      );
+      expect(column.rows).toEqual([]);
+    } finally {
+      await legacy.end();
+      await getPool().query(`DROP DATABASE IF EXISTS ${database}`);
+    }
   });
 
   it("applies only migrations missing from the record, in manifest order", async () => {

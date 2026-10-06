@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ADDITIVE_SINCE_SEQUENCE, findNonAdditiveStatement, publicMigrationSequence } from "../migration-id.js";
+import { ADDITIVE_SINCE_SEQUENCE, COMPATIBILITY_FLOORS, findNonAdditiveStatement, publicMigrationSequence } from "../migration-id.js";
 import {
   applyPublicMigrations,
   assertPublicMigrationManifest,
@@ -111,7 +111,8 @@ const RELEASED_MIGRATION_SHA256: Record<string, string> = {
   "0028_folder_message_counts.sql": "6c79f6b28bcc82f4f856b58e30da2488b1b7a5b0f3eff0230b2fa0b45e055de8",
   "0029_active_assignments_view_no_barrier.sql": "3d44fe55233bc035477c62a8c62c1e58fbda168f5743f43b54b2f2009fb6cc82",
   "0030_window_from_message_date.sql": "ef838f7cdc055fe834792e2245e2bab7d8decb55c7cbcc47022ae57b69a197c3",
-  "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf"
+  "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf",
+  "0032_drop_retired_window_columns.sql": "85e2ab13092313ff864f77d21816c2cc1e94d3be45d3ad46bebea4da29ddb9fe"
 };
 
 describe("initial schema", () => {
@@ -260,8 +261,14 @@ describe("initial schema", () => {
     const manifest = await readPublicMigrationManifest();
     const here = resolve(process.cwd(), "supabase/migrations/public");
     const later = manifest.migrations.filter((entry) => publicMigrationSequence(entry.id)! > ADDITIVE_SINCE_SEQUENCE);
+    // A removal is allowed only as a reviewed release with a compatibility floor.
+    const floors = new Set(COMPATIBILITY_FLOORS.map((floor) => floor.sequence));
     for (const migration of later) {
       const sql = await readFile(resolve(here, migration.file), "utf8");
+      if (floors.has(publicMigrationSequence(migration.id)!)) {
+        expect(findNonAdditiveStatement(sql), migration.id).not.toBeNull();
+        continue;
+      }
       expect(findNonAdditiveStatement(sql), migration.id).toBeNull();
     }
   });
@@ -330,9 +337,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = (await readPublicMigrationFiles()).map((migration) => migration.sql).join("\n\n");
 
-    expect(version).toBe("0031_active_assignments_view_columns");
+    expect(version).toBe("0032_drop_retired_window_columns");
     expect(manifest).toEqual({
-      schemaVersion: "0031_active_assignments_view_columns",
+      schemaVersion: "0032_drop_retired_window_columns",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -364,7 +371,8 @@ describe("initial schema", () => {
         { id: "0028_folder_message_counts", file: "0028_folder_message_counts.sql" },
         { id: "0029_active_assignments_view_no_barrier", file: "0029_active_assignments_view_no_barrier.sql" },
         { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" },
-        { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" }
+        { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" },
+        { id: "0032_drop_retired_window_columns", file: "0032_drop_retired_window_columns.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");

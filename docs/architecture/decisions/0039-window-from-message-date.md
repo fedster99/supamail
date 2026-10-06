@@ -71,7 +71,10 @@ came from that copy:
   behaviour.
 - The two lane-predicated indexes from `0001` and `0021` stay until the later
   migration that drops `window_status`: those files are re-applied on every
-  migrate and would rebuild any index dropped here.
+  migrate and would rebuild any index dropped here. (Done: once migrations ran
+  once (ADR 0040), migration `0032` dropped the indexes and columns below and the
+  `MOVED_OUT` reason, with a compatibility floor that keeps runtimes before 0030
+  off that schema.)
 - `window_status`, `last_archive_refresh_at`, `archive_refresh_interval`, and
   `archive_flag_sync` are no longer read or written; a later migration drops
   them once every host has stopped reading them, so a running old version never

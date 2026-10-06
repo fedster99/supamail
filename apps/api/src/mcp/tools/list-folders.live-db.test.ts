@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { applyPublicMigrations, closePool, getPool } from "../../db.js";
-import { forgetPublicMigrationsFrom } from "../../__tests__/helpers/public-migrations.js";
+import { applyPublicMigrations, closePool, getPool, readPublicMigrationFiles } from "../../db.js";
 import { folderCountDrift } from "../../__tests__/helpers/integration-harness.js";
 import { runListFolders } from "./list-folders.js";
 
@@ -53,12 +52,12 @@ liveDb("list_folders tool live DB", () => {
       INSERT INTO public.imap_messages (
         account_id, folder_path, uidvalidity, uid, internal_date,
         subject, from_email, to_emails, flags,
-        deleted_in_provider, window_status, size_bytes
+        deleted_in_provider, size_bytes
       )
       VALUES (
         $1, $2, $3, $4, now() - ($5 * interval '1 day'),
         $6, $7, $8, $9,
-        $10, 'IN_WINDOW', $11
+        $10, $11
       )
       RETURNING id
       `,
@@ -289,13 +288,15 @@ liveDb("list_folders tool live DB", () => {
 
   it("backfills counts from existing mail once, and a second migrate keeps them", async () => {
     const before = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
+    // A database from before 0028: no counts table. Run 0028 itself, as its
+    // first apply did; later migrations dropped objects earlier files create, so
+    // the whole set no longer re-runs (ADR 0040).
+    const counts = (await readPublicMigrationFiles()).find((migration) => migration.id === "0028_folder_message_counts")!;
     try {
-      // A database migrated before 0028: no counts table and no record of 0028.
       await pool.query("DROP TABLE public.imap_folder_message_counts");
-      await forgetPublicMigrationsFrom(pool, "0028_folder_message_counts");
     } finally {
       // Later test files share this database; never leave it without the table.
-      await applyPublicMigrations(pool);
+      await pool.query(counts.sql);
     }
     const backfilled = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
     await applyPublicMigrations(pool);

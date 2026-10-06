@@ -297,7 +297,6 @@ describe("mapMessageRow", () => {
       to_emails: ["me@example.test"],
       cc_emails: [],
       flags: ["\\Seen", "\\Recent", "\\recent", "$Label"],
-      window_status: "IN_WINDOW" as const,
       internal_date: new Date("2026-08-01T00:00:00.000Z"),
       body_text: "hello",
       body_plain: null,
