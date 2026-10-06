@@ -4591,26 +4591,33 @@ export class MirrorRepository {
         SELECT
           f.*,
           CASE
-            WHEN f.backfill_in_progress = true THEN 'metadata'
-            WHEN f.historical_target_count IS NULL THEN 'snapshot'
-            WHEN $2::text = 'metadata_and_bodies'
-              AND EXISTS (
-                SELECT 1
-                FROM public.imap_messages m
-                LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-                WHERE m.account_id = f.account_id
-                  AND m.folder_path = f.path
-                  AND m.deleted_in_provider = false
-                  AND m.internal_date < $5
-                  AND (
-                    m.body_fetched_at IS NULL
-                    OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
-                  )
-              )
-            THEN 'body'
+            -- A stored message without a body comes before finding more history:
+            -- reconcile can revive archive mail whose body is gone, and a walk
+            -- over a large folder takes many passes. An evidence upgrade of a
+            -- stored body waits for the walk.
+            WHEN body_backlog.missing_body THEN 0
+            WHEN f.backfill_in_progress = true THEN 1
+            WHEN f.historical_target_count IS NULL THEN 2
+            WHEN body_backlog.missing_body IS NOT NULL THEN 3
             ELSE NULL
-          END AS history_backlog_reason
+          END AS history_backlog_rank
         FROM public.imap_folders f
+        -- One scan per folder: NULL when no archive body is due, true when a
+        -- body is missing, false when only an evidence upgrade is due.
+        CROSS JOIN LATERAL (
+          SELECT bool_or(m.body_fetched_at IS NULL) AS missing_body
+          FROM public.imap_messages m
+          LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+          WHERE $2::text = 'metadata_and_bodies'
+            AND m.account_id = f.account_id
+            AND m.folder_path = f.path
+            AND m.deleted_in_provider = false
+            AND m.internal_date < $5
+            AND (
+              m.body_fetched_at IS NULL
+              OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
+            )
+        ) body_backlog
         WHERE f.account_id = $1
           AND f.tracked = true
           -- A deleted folder discovery has flagged (missing_since) must not be
@@ -4619,17 +4626,16 @@ export class MirrorRepository {
           AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
           AND f.initial_sync_complete = true
       )
-      SELECT *
+      SELECT
+        candidates.*,
+        CASE history_backlog_rank
+          WHEN 1 THEN 'metadata'
+          WHEN 2 THEN 'snapshot'
+          ELSE 'body'
+        END AS history_backlog_reason
       FROM candidates
-      WHERE history_backlog_reason IS NOT NULL
-      ORDER BY
-        CASE history_backlog_reason
-          WHEN 'metadata' THEN 0
-          WHEN 'snapshot' THEN 1
-          ELSE 2
-        END,
-        sync_priority,
-        path
+      WHERE history_backlog_rank IS NOT NULL
+      ORDER BY history_backlog_rank, sync_priority, path
       LIMIT $3
       `,
       [
@@ -4661,7 +4667,7 @@ export class MirrorRepository {
           m.body_fetched_at IS NULL
           OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
         )
-      ORDER BY m.internal_date DESC, m.uid DESC
+      ORDER BY (m.body_fetched_at IS NULL) DESC, m.internal_date DESC, m.uid DESC
       LIMIT $3
       `,
       [account.id, folder.path, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, getWindowCutoff(account)]

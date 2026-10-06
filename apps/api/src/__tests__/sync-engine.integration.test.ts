@@ -4787,6 +4787,108 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(historyBodies.rows[0].count)).toBe(2);
   });
 
+  it("fetches a stored archive message's missing body before walking more history", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const h = await setupIntegration("history-missing-body-first", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const old = (uid: number) => makeTextMessage({
+      uid,
+      subject: `old-${uid}`,
+      from: "a@x.test",
+      to: "u@x.test",
+      body: `old-${uid}`,
+      internalDate: oldDate
+    });
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_004,
+      messages: [
+        old(1),
+        old(2),
+        old(3),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: new Date()
+        })
+      ]
+    }];
+    const sync = async () => {
+      const result = await h.buildEngine({
+        folders,
+        clientFactory: async () => new FixtureImapClient(folders)
+      }).syncAccount(h.account.id, "manual");
+      expect(result.outcome).toBe("success");
+    };
+    const state = async () => {
+      const messages = await h.pool.query<{ uid: string; has_body: boolean }>(
+        `SELECT m.uid::text AS uid, m.body_fetched_at IS NOT NULL AS has_body
+           FROM public.imap_messages m
+          WHERE m.account_id = $1 AND m.deleted_in_provider = false
+          ORDER BY m.uid`,
+        [h.account.id]
+      );
+      const folder = await h.pool.query<{ backfill_in_progress: boolean; oldest: string | null }>(
+        `SELECT backfill_in_progress, backfill_oldest_uid_synced::text AS oldest
+           FROM public.imap_folders
+          WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      );
+      return { messages: messages.rows, folder: folder.rows[0] };
+    };
+
+    // One history batch per pass: the walk stores UID 3 with its body and stops.
+    await sync();
+    expect(await state()).toEqual({
+      messages: [{ uid: "3", has_body: true }, { uid: "10", has_body: true }],
+      folder: { backfill_in_progress: true, oldest: "3" }
+    });
+
+    // Reconcile revived UID 3 after its stored body was removed.
+    await h.pool.query(
+      `DELETE FROM public.imap_message_bodies
+        WHERE message_id IN (SELECT id FROM public.imap_messages WHERE account_id = $1 AND uid = 3)`,
+      [h.account.id]
+    );
+    await h.pool.query(
+      "UPDATE public.imap_messages SET body_fetched_at = NULL WHERE account_id = $1 AND uid = 3",
+      [h.account.id]
+    );
+
+    // The next pass fetches that body first; the walk waits and is not marked complete.
+    await sync();
+    expect(await state()).toEqual({
+      messages: [{ uid: "3", has_body: true }, { uid: "10", has_body: true }],
+      folder: { backfill_in_progress: true, oldest: "3" }
+    });
+
+    // Then the walk resumes and finishes with every body stored.
+    for (let pass = 0; pass < 3; pass += 1) await sync();
+    expect(await state()).toEqual({
+      messages: ["1", "2", "3", "10"].map((uid) => ({ uid, has_body: true })),
+      folder: { backfill_in_progress: false, oldest: "1" }
+    });
+  });
+
   it("finishes an in-flight history batch at the safe boundary after the lock budget expires", async () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const recentDate = new Date();
