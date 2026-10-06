@@ -1,4 +1,4 @@
-import { isSchemaAtOrAfter, requiredMigrationSequence } from "./migration-id.js";
+import { parseRequiredSchemaVersion, schemaServes, type RequiredSchemaVersion } from "./migration-id.js";
 
 export type RuntimeTargetStatus = "active" | "paused" | "needs_attention";
 
@@ -64,13 +64,13 @@ export async function runRuntimeTargetTasks<T>(
   if (!Number.isInteger(perTargetConcurrency) || perTargetConcurrency < 1) {
     throw new Error("perTargetConcurrency must be a positive integer");
   }
-  const requiredSequence = requiredMigrationSequence(options.requiredSchemaVersion);
+  const required = parseRequiredSchemaVersion(options.requiredSchemaVersion);
 
   const results: Array<RuntimeTargetTaskResult<T>> = [];
   const pending: Array<RunnableTask<T>> = [];
 
   for (const task of tasks) {
-    const skipReason = getSkipReason(task, requiredSequence);
+    const skipReason = getSkipReason(task, required);
     if (skipReason) {
       results.push({
         targetId: task.targetId,
@@ -185,9 +185,9 @@ export async function runRuntimeTargetTasks<T>(
   });
 }
 
-function getSkipReason(task: RuntimeTargetTask, requiredSequence: number): RuntimeTargetSkipReason | null {
+function getSkipReason(task: RuntimeTargetTask, required: RequiredSchemaVersion): RuntimeTargetSkipReason | null {
   if (task.status === "paused") return "target_paused";
   if (task.status === "needs_attention") return "target_needs_attention";
-  if (!isSchemaAtOrAfter(task.currentSchemaVersion, requiredSequence)) return "stale_migration";
+  if (!schemaServes(task.currentSchemaVersion, required)) return "stale_migration";
   return null;
 }

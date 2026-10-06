@@ -1,6 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { ADDITIVE_SINCE_SEQUENCE, publicMigrationSequence } from "../migration-id.js";
 import {
   applyPublicMigrations,
   assertPublicMigrationManifest,
@@ -215,15 +216,20 @@ describe("initial schema", () => {
   });
 
   it("keeps every migration after 0029 additive, which is what lets an older runtime run on a newer schema", async () => {
-    // The scheduler accepts a schema ahead of the runtime (isSchemaVersionReady)
-    // because a migration never takes away what the running code uses. Older
-    // migrations predate the rule; the gate relies on it from here on.
+    // The scheduler accepts a schema ahead of the runtime from 0029 on
+    // (ADDITIVE_SINCE_SEQUENCE) because a later migration never takes away
+    // what the running code uses. This scan catches the structural breaks a
+    // regex can see; it cannot judge a replaced function or view body, which
+    // the PR review must. Comments are not stripped, so do not name these
+    // statements in comments either.
     const manifest = await readPublicMigrationManifest();
     const here = resolve(process.cwd(), "supabase/migrations/public");
-    for (const migration of manifest.migrations.filter((entry) => Number(entry.id.slice(0, 4)) > 29)) {
-      const sql = (await readFile(resolve(here, migration.file), "utf8"))
-        .replace(/--[^\n]*/g, "");
-      expect(sql, migration.id).not.toMatch(/\b(drop\s+(column|table|view|function)|rename\s+(column|to)|alter\s+column\s+\S+\s+(set\s+data\s+)?type)\b/i);
+    const later = manifest.migrations.filter((entry) => publicMigrationSequence(entry.id)! > ADDITIVE_SINCE_SEQUENCE);
+    for (const migration of later) {
+      const sql = await readFile(resolve(here, migration.file), "utf8");
+      expect(sql, migration.id).not.toMatch(
+        /\b(drop\s+(column|table|index|policy|trigger)|rename\s+(column|to)|alter\s+column\s+\S+\s+((set\s+data\s+)?type|set\s+not\s+null)|add\s+constraint\s+\S+\s+check)\b/i
+      );
     }
   });
 
