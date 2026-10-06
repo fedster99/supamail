@@ -58,10 +58,13 @@ export async function buildSyncTrust(
       coalesce(p.historical_bodies_complete_pct, 0) AS historical_bodies_complete_pct
     FROM public.imap_accounts a
     LEFT JOIN public.imap_account_progress p ON p.account_id = a.id
+      -- The outer ANY filter need not reach the view's grouped body scans.
+      -- Make a singleton scope explicit without changing multi-account reads.
+      AND ($2::uuid IS NULL OR p.account_id = $2::uuid)
     WHERE ($1::uuid[] IS NULL OR a.id = ANY($1::uuid[]))
     ORDER BY a.id
     `,
-    [accountIds]
+    [accountIds, accountIds?.length === 1 ? accountIds[0] : null]
   );
 
   const revealedRows = await Promise.all(result.rows.map((row) => revealMetadataRecord(
