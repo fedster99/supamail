@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { InvalidSchemaVersionError, isSchemaVersionReady } from "../migration-id.js";
 import {
   DEFAULT_RUNTIME_TARGET_PER_TARGET_CONCURRENCY,
-  InvalidSchemaVersionError,
-  isSchemaVersionReady,
   runRuntimeTargetTasks,
   type RuntimeTargetTask
 } from "../target-scheduler.js";
@@ -271,12 +270,12 @@ describe("isSchemaVersionReady", () => {
     expect(isSchemaVersionReady("0131_far_ahead", required)).toBe(true);
   });
 
-  it("refuses a schema that is behind, missing, malformed, or a different id with the same number", () => {
+  it("refuses a schema that is behind, missing, or malformed", () => {
     expect(isSchemaVersionReady("0027_folder_unchanged_proof", required)).toBe(false);
     expect(isSchemaVersionReady("missing", required)).toBe(false);
     expect(isSchemaVersionReady("", required)).toBe(false);
     expect(isSchemaVersionReady("28_short", required)).toBe(false);
-    expect(isSchemaVersionReady("0028_fork_of_folder_counts", required)).toBe(false);
+    expect(isSchemaVersionReady("0028-folder-message-counts", required)).toBe(false);
   });
 
   it("throws on a malformed required version at the boundary", async () => {

@@ -1,3 +1,5 @@
+import { isSchemaAtOrAfter, requiredMigrationSequence } from "./migration-id.js";
+
 export type RuntimeTargetStatus = "active" | "paused" | "needs_attention";
 
 export type RuntimeTargetSkipReason =
@@ -13,26 +15,6 @@ export interface RuntimeTargetTask<T = unknown> {
   /** The public migration the target's schema is at: a manifest id such as `0029_...`. */
   currentSchemaVersion: string;
   run(input: { signal?: AbortSignal }): Promise<T>;
-}
-
-/** Public migration ids are a four-digit sequence, an underscore, and a name. */
-const PUBLIC_MIGRATION_ID = /^(\d{4})_\S+$/;
-
-/** A migration id's position in manifest order, or null when it is not an id. */
-export function publicMigrationSequence(id: string): number | null {
-  const match = PUBLIC_MIGRATION_ID.exec(id);
-  return match ? Number(match[1]) : null;
-}
-
-/** The runtime's own required version is not a public migration id. */
-export class InvalidSchemaVersionError extends TypeError {
-  readonly version: string;
-
-  constructor(version: string) {
-    super(`required schema version is not a public migration id: ${JSON.stringify(version)}`);
-    this.name = "InvalidSchemaVersionError";
-    this.version = version;
-  }
 }
 
 export interface RuntimeTargetSchedulerOptions {
@@ -82,15 +64,13 @@ export async function runRuntimeTargetTasks<T>(
   if (!Number.isInteger(perTargetConcurrency) || perTargetConcurrency < 1) {
     throw new Error("perTargetConcurrency must be a positive integer");
   }
-  if (publicMigrationSequence(options.requiredSchemaVersion) === null) {
-    throw new InvalidSchemaVersionError(options.requiredSchemaVersion);
-  }
+  const requiredSequence = requiredMigrationSequence(options.requiredSchemaVersion);
 
   const results: Array<RuntimeTargetTaskResult<T>> = [];
   const pending: Array<RunnableTask<T>> = [];
 
   for (const task of tasks) {
-    const skipReason = getSkipReason(task, options.requiredSchemaVersion);
+    const skipReason = getSkipReason(task, requiredSequence);
     if (skipReason) {
       results.push({
         targetId: task.targetId,
@@ -205,29 +185,9 @@ export async function runRuntimeTargetTasks<T>(
   });
 }
 
-function getSkipReason(task: RuntimeTargetTask, requiredSchemaVersion: string): RuntimeTargetSkipReason | null {
+function getSkipReason(task: RuntimeTargetTask, requiredSequence: number): RuntimeTargetSkipReason | null {
   if (task.status === "paused") return "target_paused";
   if (task.status === "needs_attention") return "target_needs_attention";
-  if (!isSchemaVersionReady(task.currentSchemaVersion, requiredSchemaVersion)) return "stale_migration";
+  if (!isSchemaAtOrAfter(task.currentSchemaVersion, requiredSequence)) return "stale_migration";
   return null;
-}
-
-/**
- * Whether a runtime that requires `requiredSchemaVersion` can run against a
- * schema at `currentSchemaVersion`. Ids order by their four-digit prefix. A
- * schema behind the runtime is not ready: the code would miss what a later
- * migration adds. A schema ahead of the runtime is ready: public migrations
- * are additive and idempotent, so an older runtime keeps working, and a host
- * applies a migration before it deploys the runtime that needs it. Two ids
- * with one sequence number must be the same id. A missing or malformed
- * schema version is not ready; a malformed required version is the runtime's
- * own error and throws.
- */
-export function isSchemaVersionReady(currentSchemaVersion: string, requiredSchemaVersion: string): boolean {
-  const required = publicMigrationSequence(requiredSchemaVersion);
-  if (required === null) throw new InvalidSchemaVersionError(requiredSchemaVersion);
-  const current = publicMigrationSequence(currentSchemaVersion);
-  if (current === null) return false;
-  if (current === required) return currentSchemaVersion === requiredSchemaVersion;
-  return current > required;
 }

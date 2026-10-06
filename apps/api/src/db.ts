@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { AppConfig } from "./config.js";
 import { getConfig } from "./config.js";
-import { publicMigrationSequence } from "./target-scheduler.js";
+import { publicMigrationSequence } from "./migration-id.js";
 
 const { Pool } = pg;
 
@@ -12,6 +12,7 @@ export type PgPool = pg.Pool;
 export type PgClient = pg.PoolClient;
 
 export interface PublicMigrationManifest {
+  /** The last migration's id. Hosts read it as the required version, so it stays a field. */
   schemaVersion: string;
   migrations: Array<{
     id: string;
@@ -136,7 +137,8 @@ export function assertPublicMigrationManifest(parsed: unknown): PublicMigrationM
     const sequence = typeof migration?.id === "string" ? publicMigrationSequence(migration.id) : null;
     if (
       sequence === null
-      || !migration.file
+      || typeof migration.file !== "string"
+      || migration.file === ""
       || migration.file.includes("/")
       || migration.file.includes("\\")
     ) {

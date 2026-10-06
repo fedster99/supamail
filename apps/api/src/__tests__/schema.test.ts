@@ -208,6 +208,23 @@ describe("initial schema", () => {
       .toThrow(/out of order/);
     expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_a", migrations: [entry("0001_a"), entry("0002_b")] }))
       .toThrow(/is not its last migration/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_b", migrations: [entry("0001_a"), entry("0001_b")] }))
+      .toThrow(/out of order/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), { id: "0002_b", file: 2 }] }))
+      .toThrow(/Invalid public migration manifest entry/);
+  });
+
+  it("keeps every migration after 0029 additive, which is what lets an older runtime run on a newer schema", async () => {
+    // The scheduler accepts a schema ahead of the runtime (isSchemaVersionReady)
+    // because a migration never takes away what the running code uses. Older
+    // migrations predate the rule; the gate relies on it from here on.
+    const manifest = await readPublicMigrationManifest();
+    const here = resolve(process.cwd(), "supabase/migrations/public");
+    for (const migration of manifest.migrations.filter((entry) => Number(entry.id.slice(0, 4)) > 29)) {
+      const sql = (await readFile(resolve(here, migration.file), "utf8"))
+        .replace(/--[^\n]*/g, "");
+      expect(sql, migration.id).not.toMatch(/\b(drop\s+(column|table|view|function)|rename\s+(column|to)|alter\s+column\s+\S+\s+(set\s+data\s+)?type)\b/i);
+    }
   });
 
   it("serializes programmatic public migration calls with an advisory lock", async () => {
