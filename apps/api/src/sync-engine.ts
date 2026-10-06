@@ -2338,7 +2338,8 @@ export class MirrorEngine {
       folder,
       this.config.BODY_BACKFILL_BATCH_SIZE
     );
-    if (backlog.length === 0) {
+    // A body batch can run during a walk; only a finished walk is marked complete.
+    if (backlog.length === 0 && !folder.backfill_in_progress) {
       const expectedUidValidity = Number(folder.uidvalidity);
       if (!Number.isSafeInteger(expectedUidValidity) || expectedUidValidity <= 0) {
         throw new Error(`History completion missing UIDVALIDITY for ${folder.path}`);
