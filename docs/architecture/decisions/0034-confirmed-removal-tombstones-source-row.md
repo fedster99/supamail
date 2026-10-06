@@ -32,8 +32,8 @@ After the provider confirms the action, `deleteMessage` (hard and Trash),
   purge set, so the row keeps the same retention as the `RECONCILE_MISSING` row
   reconcile would have written. No migration.
 - **Any window status.** The write does not depend on `IN_WINDOW`. Reconcile
-  covers only in-window rows, so before this change a removed historical message
-  could stay live in the mirror.
+  covered only in-window rows when this was written (ADR 0038 later extended it
+  to every lane), so a removed historical message could stay live in the mirror.
 - **Never fails a confirmed action.** The provider action has already happened.
   If the mirror write fails, the call still succeeds and logs a warning; the
   folders are already due, and reconcile tombstones the row instead.

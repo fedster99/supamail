@@ -10,12 +10,12 @@ import {
   fetchMessageFlags,
   fetchMessageMetadata,
   iterateChangedMessageFlagBatches,
-  iterateAllUids,
   MessageMovedError,
   PARSED_BODY_BATCH_MAX_MESSAGES,
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
-  listMailboxUids,
+  IncompleteUidListError,
+  searchMailboxUids,
   searchUidsBefore,
   searchUidsSince
 } from "./imap-client.js";
@@ -66,33 +66,6 @@ const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
 const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
 const FOLDER_ALIAS_SAMPLE_SIZE = 5;
 const FOLDER_ALIAS_SAMPLE_UID_WINDOW = 100;
-
-async function peekAsyncIterable<T>(values: AsyncIterable<T>): Promise<{
-  empty: boolean;
-  values: AsyncIterable<T>;
-}> {
-  const iterator = values[Symbol.asyncIterator]();
-  const first = await iterator.next();
-  if (first.done) {
-    return { empty: true, values: (async function* empty() {})() };
-  }
-
-  return {
-    empty: false,
-    values: (async function* replay() {
-      try {
-        yield first.value;
-        while (true) {
-          const next = await iterator.next();
-          if (next.done) break;
-          yield next.value;
-        }
-      } finally {
-        await iterator.return?.();
-      }
-    })()
-  };
-}
 
 type DiscoveredFolder = {
   path: string;
@@ -1524,113 +1497,115 @@ export class MirrorEngine {
         options.reconcileTelemetry.attempted = true;
         options.reconcileTelemetry.startedAt = reconcileStartedAt;
         const reconcileDeadline = Date.now() + this.config.RECONCILE_TOTAL_TIMEOUT_MS;
-        // Spec §10.7: only reconcile once initial sync is complete and only
-        // inside the active sync window. HISTORICAL/EXPIRED rows are checked by
-        // the history lane's archive snapshot, not this hot safety loop.
+        // Spec §10.7: reconcile once initial sync is complete. Folder membership
+        // has no window, so the complete UID list tombstones gone rows in every
+        // lane; the window only limits which provider-only UIDs are fetched.
         this.assertDeadlineAvailable(
           client,
           reconcileDeadline,
           "RECONCILE_TOTAL_TIMEOUT_MS",
-          "reconcile UID stream"
+          "reconcile UID SEARCH"
         );
-        const shouldFailOnEmptyReconcile = await this.repository.hasActiveWindowMessages(
-          account.id,
-          folder,
-          uidValidity
-        );
-        const selectedMailboxIsAuthoritativelyEmpty = mailbox.exists === 0;
-        const windowUidStream = await peekAsyncIterable(this.withAsyncIterableDeadline(
-          client,
-          reconcileDeadline,
-          "RECONCILE_TOTAL_TIMEOUT_MS",
-          "reconcile UID stream",
-          iterateAllUids(client, windowCutoff)
-        ));
-        const needsAllUidConfirmation = shouldFailOnEmptyReconcile && windowUidStream.empty;
-        const reconcile = await this.repository.markMissingMessagesFromLiveUidStream(
-          account.id,
-          folder,
-          uidValidity,
-          needsAllUidConfirmation
-            ? this.withAsyncIterableDeadline(
+        let reconcile: Awaited<ReturnType<MirrorRepository["reconcileFolderUids"]>> | null = null;
+        try {
+          const folderUids = await this.withOperationDeadline(
+            client,
+            reconcileDeadline,
+            "RECONCILE_TOTAL_TIMEOUT_MS",
+            "reconcile UID SEARCH",
+            () => searchMailboxUids(client, { all: true })
+          );
+          options.reconcileTelemetry.providerUidsSeen += folderUids.length;
+          const windowUids = await this.withOperationDeadline(
+            client,
+            reconcileDeadline,
+            "RECONCILE_TOTAL_TIMEOUT_MS",
+            "reconcile window UID SEARCH",
+            () => searchMailboxUids(client, { since: windowCutoff })
+          );
+          reconcile = await this.repository.reconcileFolderUids(
+            account.id,
+            folder,
+            uidValidity,
+            folderUids,
+            new Set(windowUids),
+            {
+              // Read after both searches: imapflow applies the EXISTS, EXPUNGE
+              // and VANISHED responses they carried.
+              expectedCount: client.mailbox ? client.mailbox.exists : undefined,
+              uidNextAtSelect: uidNext
+            }
+          );
+        } catch (error) {
+          if (!(error instanceof IncompleteUidListError)) throw error;
+          // Unproven: change nothing, keep the folder's other progress, and let
+          // the unclean result schedule an early retry.
+          await this.repository.logEvent(account.id, null, null, folder.path, null, "RECONCILE_INCOMPLETE", {
+            reason: error.message
+          });
+        }
+        if (!reconcile) {
+          reconcileClean = false;
+        } else {
+          reconcileProviderUidsSeen += reconcile.providerUidCount;
+
+          // Spec §10.7 step 3: missingInDb → fetch + upsert (closes the gap).
+          if (reconcile.missingInDbUids.length > 0) {
+            const backfillBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+            for (let i = 0; i < reconcile.missingInDbUids.length; i += backfillBatchSize) {
+              const batchUids = reconcile.missingInDbUids.slice(i, i + backfillBatchSize);
+              const metadata = await this.withOperationDeadline(
                 client,
                 reconcileDeadline,
                 "RECONCILE_TOTAL_TIMEOUT_MS",
-                "reconcile all-UID confirmation stream",
-                iterateAllUids(client)
-              )
-            : windowUidStream.values,
-          {
-            // Two empty UID streams are valid when SELECT also reports zero
-            // messages. Keep failing closed for every contradictory or unknown
-            // mailbox count so a transient empty SEARCH cannot mass-tombstone.
-            failIfEmpty: shouldFailOnEmptyReconcile && !selectedMailboxIsAuthoritativelyEmpty,
-            emptyError: `Reconcile returned no UIDs for non-empty mailbox ${folder.path}`,
-            // The unfiltered fallback confirms provider deletions only. Feeding its
-            // archive UIDs into missing-in-DB repair would violate the live-window
-            // boundary and turn a rare safety probe into unbounded history backfill.
-            findMissingInDb: !needsAllUidConfirmation,
-            progress: options.reconcileTelemetry
-          }
-        );
-        reconcileProviderUidsSeen += reconcile.liveUidCount;
-
-        // Spec §10.7 step 3: missingInDb → fetch + upsert (closes the gap).
-        if (reconcile.missingInDbUids.length > 0) {
-          const backfillBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
-          for (let i = 0; i < reconcile.missingInDbUids.length; i += backfillBatchSize) {
-            const batchUids = reconcile.missingInDbUids.slice(i, i + backfillBatchSize);
-            const metadata = await this.withOperationDeadline(
-              client,
-              reconcileDeadline,
-              "RECONCILE_TOTAL_TIMEOUT_MS",
-              "reconcile backfill FETCH",
-              () => fetchMessageMetadata(client, batchUids, backfillBatchSize)
-            );
-            this.assertDeadlineAvailable(
-              client,
-              reconcileDeadline,
-              "RECONCILE_TOTAL_TIMEOUT_MS",
-              "reconcile backfill write"
-            );
-            const messages = await this.upsertMetadataBatch(
-              options.metadataWriteStats,
+                "reconcile backfill FETCH",
+                () => fetchMessageMetadata(client, batchUids, backfillBatchSize)
+              );
+              this.assertDeadlineAvailable(
+                client,
+                reconcileDeadline,
+                "RECONCILE_TOTAL_TIMEOUT_MS",
+                "reconcile backfill write"
+              );
+              const messages = await this.upsertMetadataBatch(
+                options.metadataWriteStats,
+                account.id,
+                folder,
+                uidValidity,
+                metadata,
+                windowCutoff,
+                { deadlineAt: reconcileDeadline, signal: options.signal }
+              );
+              backfilled += messages.length;
+              for (const message of messages) {
+                await this.hooks.onMessageUpsert?.(message);
+              }
+              if (this.folderHitLockBudget(options)) {
+                hitLockBudget = true;
+                break;
+              }
+            }
+            await this.repository.logEvent(
               account.id,
-              folder,
-              uidValidity,
-              metadata,
-              windowCutoff,
-              { deadlineAt: reconcileDeadline, signal: options.signal }
+              null,
+              null,
+              folder.path,
+              null,
+              "RECONCILE_BACKFILL",
+              { backfilled, attempted: reconcile.missingInDbUids.length }
             );
-            backfilled += messages.length;
-            for (const message of messages) {
-              await this.hooks.onMessageUpsert?.(message);
-            }
-            if (this.folderHitLockBudget(options)) {
-              hitLockBudget = true;
-              break;
-            }
           }
-          await this.repository.logEvent(
-            account.id,
-            null,
-            null,
-            folder.path,
-            null,
-            "RECONCILE_BACKFILL",
-            { backfilled, attempted: reconcile.missingInDbUids.length }
-          );
+          reconcileGapsFound += reconcile.markedCount + reconcile.revivedCount + reconcile.missingInDbUids.length;
+          // Gap count is evidence that the mirror drifted before this pass, not
+          // evidence that it is still dirty afterward. Provider-missing rows are
+          // tombstoned inside reconcileFolderUids, and every
+          // returned missing-in-DB UID has been fetched and upserted by this point.
+          // Keep health degraded only when the bounded repair was interrupted or
+          // the missing-UID result overflowed this pass.
+          reconcileClean = !hitLockBudget
+            && !reconcile.missingInDbTruncated
+            && backfilled === reconcile.missingInDbUids.length;
         }
-        reconcileGapsFound += reconcile.markedCount + reconcile.missingInDbUids.length;
-        // Gap count is evidence that the mirror drifted before this pass, not
-        // evidence that it is still dirty afterward. Provider-missing rows are
-        // tombstoned inside markMissingMessagesFromLiveUidStream, and every
-        // returned missing-in-DB UID has been fetched and upserted by this point.
-        // Keep health degraded only when the bounded repair was interrupted or
-        // the missing-UID result overflowed this pass.
-        reconcileClean = !hitLockBudget
-          && !reconcile.missingInDbTruncated
-          && backfilled === reconcile.missingInDbUids.length;
         reconcileDurationMs += Math.max(0, Date.now() - reconcileStartedAt);
       }
 
@@ -2169,9 +2144,6 @@ export class MirrorEngine {
         || oldestSynced === null;
 
       if (shouldStartSnapshot) {
-        if (await this.reconcileArchiveRows(account, folder, client, uidValidity, lockDeadline, signal)) {
-          return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
-        }
         const snapshot = await searchUidsBefore(client, windowCutoff);
         const sortedTargets = [...new Set(snapshot)].sort((a, b) => a - b);
 
@@ -2315,56 +2287,6 @@ export class MirrorEngine {
     }
   }
 
-  /**
-   * The live reconcile covers IN_WINDOW rows only, so each archive snapshot checks
-   * the folder's archive rows against its complete UID list. Matching UIDs rather
-   * than dates means a row that aged out of the window is never mistaken for gone.
-   * A list whose size disagrees with SELECT's message count is not proof of
-   * deletion; the folder waits for its next snapshot instead. Tombstones commit in
-   * bounded batches, so a mass deletion resumes on the next cycle when the lock
-   * budget ends; returns true then, before the snapshot starts.
-   */
-  private async reconcileArchiveRows(
-    account: ImapAccount,
-    folder: ImapFolder,
-    client: MirrorImapClient,
-    uidValidity: number,
-    lockDeadline: number,
-    signal?: AbortSignal
-  ): Promise<boolean> {
-    const providerUids = new Set(await listMailboxUids(client));
-    const exists = client.mailbox ? client.mailbox.exists : undefined;
-    const complete = providerUids.size === exists;
-    let marked = 0;
-    let hitLockBudget = false;
-    if (complete) {
-      const gone = (await this.repository.getLiveArchiveUids(account.id, folder, uidValidity))
-        .filter((uid) => !providerUids.has(uid));
-      for (let i = 0; i < gone.length; i += MAX_SYNC_BATCH_SIZE) {
-        if (this.isLockBudgetExpired(lockDeadline)) {
-          hitLockBudget = true;
-          break;
-        }
-        marked += await this.repository.markVanishedMessages(
-          account.id,
-          folder,
-          uidValidity,
-          gone.slice(i, i + MAX_SYNC_BATCH_SIZE),
-          { deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS, signal }
-        );
-      }
-    }
-    if (marked > 0 || !complete) {
-      await this.repository.logEvent(account.id, null, null, folder.path, null, "ARCHIVE_RECONCILE", {
-        marked,
-        providerUids: providerUids.size,
-        exists: exists ?? null,
-        skipped: !complete
-      });
-    }
-    return hitLockBudget;
-  }
-
   private async fetchHistoricalBodyBatch(
     account: ImapAccount,
     folder: ImapFolder,
@@ -2500,7 +2422,7 @@ export class MirrorEngine {
     for (const message of result.missingMessages) {
       // A successful set FETCH can still omit a response or its source. That
       // is not enough evidence to tombstone the row. Retry the exact UID
-      // through the individual path, which marks MOVED_OUT only when the
+      // through the individual path, which tombstones the row only when the
       // dedicated download confirms that the message is gone.
       await this.fetchAndStoreBody(client, message, skipMailboxLock);
       processed += 1;
@@ -2575,18 +2497,9 @@ export class MirrorEngine {
   private async recordMovedBody(message: ImapMessage): Promise<void> {
     // The UID vanished between metadata sync and body fetch. Get it out of the
     // backlog without re-throwing into the account-level catch (which bricks the
-    // account to BROKEN and re-loops every backfill) — but scope the tombstone by
-    // window, because only IN_WINDOW rows self-heal.
-    if (message.window_status === "IN_WINDOW") {
-      // A later metadata sync's ON CONFLICT resets deleted_in_provider, so a rare
-      // transient false-negative recovers. Safe to soft-delete MOVED_OUT.
-      await this.repository.markMessageMovedOut(message.id);
-    } else {
-      // HISTORICAL/EXPIRED rows are re-checked only by the next archive
-      // snapshot, which tombstones a UID that is really gone. Mark the body
-      // fetch attempted instead — non-destructive.
-      await this.repository.markBodyFetchAttempted(message.id);
-    }
+    // account to BROKEN and re-loops every backfill). The tombstone is
+    // recoverable in every lane: the next reconcile revives a UID still listed.
+    await this.repository.markMessageGone(message.id);
   }
 
   private async commitBody(

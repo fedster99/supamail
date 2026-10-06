@@ -14,13 +14,13 @@ Stream provider UIDs into a transaction-scoped Postgres temp table with `ON COMM
 
 ## Consequences
 
-- Reconcile can handle large folders without building one giant array in application memory.
+- Reconcile can handle large folders without building one giant array in application memory. ADR 0038 supersedes this point: one UID SEARCH response is held in memory (about 8 bytes per UID) and staged into the temp table in bounded inserts.
 - Cleanup is transaction-scoped.
 - Reconcile code depends on live Postgres behavior and must be covered by the live DB lane.
 
 ## Verification
 
-- `MirrorRepository.markMissingMessagesFromLiveUidStream` creates and uses the temp table.
+- `MirrorRepository.reconcileFolderUids` creates and uses the temp table (formerly `markMissingMessagesFromLiveUidStream`).
 - `pnpm test:db:live` covers reconcile backfill and provider-missing behavior.
 - `pnpm spec-conformance` runs as part of the live DB lane.
 

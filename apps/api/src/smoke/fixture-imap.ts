@@ -29,6 +29,18 @@ export interface FixtureFolder {
   messages: FixtureMessage[];
 }
 
+// UIDNEXT never decreases within one UIDVALIDITY, even after the highest UID is
+// deleted. Tests reuse folder objects across clients, so track it per folder.
+const uidNextHighWater = new WeakMap<FixtureFolder, { uidValidity: number; uidNext: number }>();
+
+function fixtureUidNext(folder: FixtureFolder): number {
+  const current = Math.max(0, ...folder.messages.map((message) => message.uid)) + 1;
+  const seen = uidNextHighWater.get(folder);
+  const uidNext = seen && seen.uidValidity === folder.uidValidity ? Math.max(seen.uidNext, current) : current;
+  uidNextHighWater.set(folder, { uidValidity: folder.uidValidity, uidNext });
+  return uidNext;
+}
+
 export class FixtureImapClient implements MirrorImapClient {
   mailbox: MailboxStatus | false | null = null;
   peekMailboxChanges?: (limit?: number) => readonly MailboxChange[];
@@ -61,7 +73,7 @@ export class FixtureImapClient implements MirrorImapClient {
     this.mailbox = {
       path,
       uidValidity: folder.uidValidity,
-      uidNext: Math.max(0, ...folder.messages.map((message) => message.uid)) + 1,
+      uidNext: fixtureUidNext(folder),
       exists: folder.messages.length,
       highestModseq: folder.highestModseq
     };

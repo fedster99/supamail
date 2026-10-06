@@ -876,14 +876,7 @@ export async function searchUidsSince(
   since: Date,
   uidRange?: string
 ): Promise<number[]> {
-  const query: Record<string, unknown> = { since };
-  if (uidRange) query.uid = uidRange;
-
-  const uids: number[] = [];
-  for await (const msg of client.fetch(query, { uid: true }, { uid: true })) {
-    uids.push(msg.uid);
-  }
-  return uids;
+  return await searchMailboxUids(client, uidRange ? { since, uid: uidRange } : { since });
 }
 
 export async function searchUidsBefore(
@@ -891,39 +884,34 @@ export async function searchUidsBefore(
   before: Date,
   uidRange?: string
 ): Promise<number[]> {
-  const query: Record<string, unknown> = { before };
-  if (uidRange) query.uid = uidRange;
+  return await searchMailboxUids(client, uidRange ? { before, uid: uidRange } : { before });
+}
 
-  const uids: number[] = [];
-  for await (const msg of client.fetch(query, { uid: true }, { uid: true })) {
-    uids.push(msg.uid);
+/**
+ * UIDs in the selected mailbox matching `criteria`, from one UID SEARCH response
+ * rather than a FETCH line per message. Fails rather than returning a partial
+ * list. UIDs may repeat; callers deduplicate.
+ */
+export async function searchMailboxUids(
+  client: MirrorImapClient,
+  criteria: Record<string, unknown>
+): Promise<number[]> {
+  const uids = await client.search(criteria, { uid: true });
+  if (!uids) {
+    throw new IncompleteUidListError(client.mailbox ? client.mailbox.path : "?", "UID SEARCH failed");
   }
   return uids;
 }
 
 /**
- * Every UID in the selected mailbox from one UID SEARCH response, without the
- * per-message FETCH lines `iterateAllUids` costs. Fails rather than returning a
- * partial list. UIDs may repeat; callers deduplicate.
+ * A provider UID list that cannot prove which messages a folder holds: the
+ * search failed, its size disagrees with SELECT's message count, or it holds an
+ * invalid UID. Reconcile changes nothing and the folder retries soon.
  */
-export async function listMailboxUids(client: MirrorImapClient): Promise<number[]> {
-  const uids = await client.search({ all: true }, { uid: true });
-  if (!uids) throw new Error("IMAP UID SEARCH ALL failed");
-  return uids;
-}
-
-export async function searchAllUids(client: MirrorImapClient, since?: Date): Promise<number[]> {
-  const uids: number[] = [];
-  for await (const uid of iterateAllUids(client, since)) {
-    uids.push(uid);
-  }
-  return uids;
-}
-
-export async function* iterateAllUids(client: MirrorImapClient, since?: Date): AsyncIterable<number> {
-  const query: Record<string, unknown> = since ? { since } : { all: true };
-  for await (const msg of client.fetch(query, { uid: true }, { uid: true })) {
-    yield msg.uid;
+export class IncompleteUidListError extends Error {
+  constructor(readonly folderPath: string, detail: string) {
+    super(`Reconcile UID list for ${folderPath} is incomplete: ${detail}`);
+    this.name = "IncompleteUidListError";
   }
 }
 
@@ -943,7 +931,7 @@ const FULL_MESSAGE_DOWNLOAD_CHUNK_BYTES = 1024 * 1024;
 /**
  * A message UID present at metadata-sync time is no longer in its folder at
  * body-fetch time — moved by a provider filter, or deleted. Terminal and benign:
- * the body lane catches this and soft-deletes the row (`MOVED_OUT`) instead of
+ * the body lane catches this and tombstones the row (`RECONCILE_MISSING`) instead of
  * erroring the account. Without it a gone UID makes `fetchOne` return false, the
  * download fallback fetches `false.content` (undefined) and crashes `streamToBuffer`,
  * and because the body lane is the one un-try/caught reader that throw bricks the
