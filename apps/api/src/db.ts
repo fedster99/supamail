@@ -140,7 +140,22 @@ export async function closePool(): Promise<void> {
   }
 }
 
-export async function readPublicMigrationManifest(): Promise<PublicMigrationManifest> {
+let manifestPromise: Promise<PublicMigrationManifest> | null = null;
+
+/**
+ * The manifest ships inside the image and does not change while the process
+ * runs, so it is read and validated once. A failed read is not kept: the next
+ * call reads again.
+ */
+export function readPublicMigrationManifest(): Promise<PublicMigrationManifest> {
+  manifestPromise ??= loadPublicMigrationManifest().catch((error: unknown) => {
+    manifestPromise = null;
+    throw error;
+  });
+  return manifestPromise;
+}
+
+async function loadPublicMigrationManifest(): Promise<PublicMigrationManifest> {
   const here = dirname(fileURLToPath(import.meta.url));
   const manifestPath = resolve(here, "../supabase/migrations/public/manifest.json");
   const raw = await readFile(manifestPath, "utf8");

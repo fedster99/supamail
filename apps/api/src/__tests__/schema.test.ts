@@ -271,6 +271,12 @@ describe("initial schema", () => {
     expect(applyPublicMigrations.toString()).toContain("pg_advisory_lock(hashtext('supamail.public_migrations'))");
   });
 
+  it("reads and validates the manifest once per process", async () => {
+    const first = await readPublicMigrationManifest();
+    const second = await readPublicMigrationManifest();
+    expect(second).toBe(first);
+  });
+
   it("exposes an ordered public migration manifest for deployment gates", async () => {
     const manifest = await readPublicMigrationManifest();
     const version = await getRequiredPublicSchemaVersion();
