@@ -14,7 +14,7 @@ The repository publishes Node 24 container images, ordered public mirror migrati
 
 Public migrations live only under `apps/api/supabase/migrations/public/`. The manifest records their order and the required public schema version. Deployment-specific schemas and account lifecycle data must not enter this migration path.
 
-Consumers must pin immutable image digests or SHA tags and apply the required public migrations before starting a newer core image. Scheduler tasks use bounded global/per-target concurrency, skip paused or stale-schema targets, and isolate target failures.
+Consumers must pin immutable image digests or SHA tags and apply the required public migrations before starting a newer core image. Scheduler tasks use bounded global/per-target concurrency, skip paused or stale-schema targets, and isolate target failures. A target is stale when its schema is behind the required version (`isSchemaVersionReady`). A schema ahead of the runtime is ready from `0029` on, because later public migrations are held additive by a schema test: a host applies a migration before it deploys the runtime that needs it, and the running runtime keeps serving through the window.
 
 ## Consequences
 

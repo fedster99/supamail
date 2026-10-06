@@ -29,6 +29,13 @@ export * from "./send.js";
 export * from "./smtp-client.js";
 export * from "./sync-engine.js";
 export * from "./target-scheduler.js";
+export {
+  ADDITIVE_SINCE_SEQUENCE,
+  findNonAdditiveStatement,
+  InvalidSchemaVersionError,
+  isSchemaVersionReady,
+  publicMigrationSequence
+} from "./migration-id.js";
 export * from "./threading.js";
 export * from "./threading-repository.js";
 export * from "./types.js";
