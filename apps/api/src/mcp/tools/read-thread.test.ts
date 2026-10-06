@@ -659,8 +659,8 @@ describe("read_thread stored assignments", () => {
     expect(providerCall?.[0]).toContain("PARTITION BY m.account_id, coalesce(");
     expect(providerCall?.[0]).toContain("ta.delivery_key");
     expect(providerCall?.[0]).toContain("b.raw_mime_sha256");
-    expect(providerCall?.[0]).toContain("public.imap_thread_active_assignments active");
-    expect(providerCall?.[0]).toContain(") ta ON true");
+    expect(providerCall?.[0]).toContain("LEFT JOIN public.imap_thread_active_assignments ta");
+    expect(providerCall?.[0]).toContain("ON ta.message_id = m.id");
     expect(providerCall?.[0]).toContain("b.raw_truncated");
     expect(providerCall?.[0]).not.toContain("b.body_text");
     expect(providerCall?.[1]).toEqual(["provider-thread", ACCOUNT_ID, 20]);
@@ -684,8 +684,8 @@ describe("read_thread stored assignments", () => {
     expect(seedCall?.[0]).toContain("public.imap_thread_active_assignments assignment");
     const legacyCall = query.mock.calls.find(([sql]) => sql.includes("WITH legacy_candidates"));
     expect(legacyCall?.[0]).toContain("PARTITION BY m.account_id, coalesce(");
-    expect(legacyCall?.[0]).toContain("public.imap_thread_active_assignments active");
-    expect(legacyCall?.[0]).toContain(") ta ON true");
+    expect(legacyCall?.[0]).toContain("LEFT JOIN public.imap_thread_active_assignments ta");
+    expect(legacyCall?.[0]).toContain("ON ta.message_id = m.id");
     expect(legacyCall?.[0]).toContain("b.raw_truncated");
     expect(legacyCall?.[0]).not.toContain("b.body_text");
   });

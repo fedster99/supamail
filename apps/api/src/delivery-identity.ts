@@ -32,23 +32,14 @@ export const DELIVERY_KEY_SQL = `coalesce(
 )`;
 
 /**
- * Each message's active assignment, looked up per row. A plain LEFT JOIN to the
- * `imap_thread_active_assignments` view makes the planner build the account's
- * whole active projection (about 20,000 buffer blocks for a 45,000-message
- * mailbox) before matching twenty rows; when those blocks are cold the join
- * takes seconds. The LATERAL form pushes `message_id` into the view, so each
- * row costs a few index reads. `LIMIT 1` keeps the planner from pulling the
- * subquery back up into that same hash join; the view yields at most one row
- * per message (one active run per account), so the alias, columns and NULL
- * semantics are unchanged.
+ * Each message's active assignment, alias `ta`: at most one row per message,
+ * because an account has one active run. The view carries no security barrier
+ * (migration 0029), so the planner flattens it and this join takes the
+ * message index instead of building the account's whole active projection.
  */
-export const ACTIVE_ASSIGNMENT_JOIN = `LEFT JOIN LATERAL (
-        SELECT active.run_id, active.conversation_id, active.delivery_key
-        FROM public.imap_thread_active_assignments active
-        WHERE active.message_id = m.id
-          AND active.account_id = m.account_id
-        LIMIT 1
-      ) ta ON true`;
+export const ACTIVE_ASSIGNMENT_JOIN = `LEFT JOIN public.imap_thread_active_assignments ta
+        ON ta.message_id = m.id
+       AND ta.account_id = m.account_id`;
 
 /**
  * The delivery key of each given message: stored copies of one email share

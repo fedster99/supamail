@@ -1,0 +1,14 @@
+-- 0029_active_assignments_view_no_barrier.sql
+--
+-- Drop security_barrier from imap_thread_active_assignments. The planner never
+-- flattens a barrier view into the query that reads it, so a plain join to the
+-- view cannot take a per-row index path: it builds the account's whole active
+-- projection (71,000 rows and 65,000 buffers, 9 s on a 43,000-message mailbox)
+-- before it matches the rows the reader asked for. Without the barrier the same
+-- join is one index probe per row (64 buffers and 70 ms for the same batch).
+--
+-- The barrier guarded nothing. The view is security_invoker, so row-level
+-- security on the underlying tables applies to every reader. The only rows the
+-- view hides are the same account's assignments from runs that are not active,
+-- and that is not a security boundary.
+ALTER VIEW public.imap_thread_active_assignments RESET (security_barrier);
