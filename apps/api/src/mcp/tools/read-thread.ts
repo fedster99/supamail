@@ -624,7 +624,8 @@ async function runReadThreadInternal(
         return toolError(
           "not_found",
           `No message found for id ${messageId}.`,
-          "Check the message_id (a UUID from search_email) or scope account. The message may be deleted in the provider."
+          "Use a message_id from search_email in this mirror; an id from another email tool never matches. " +
+            "Check the account scope. The message may be deleted in the provider."
         );
       }
       if (seed.conversation_id) {

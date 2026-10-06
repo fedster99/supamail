@@ -377,7 +377,7 @@ describe("read_thread stored assignments", () => {
     expect(out).toMatchObject({
       threads: [
         { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } },
-        { message_id: MISSING_MESSAGE, error: { code: "not_found" } },
+        { message_id: MISSING_MESSAGE, error: { code: "not_found", hint: expect.stringContaining("another email tool") } },
         { message_id: MESSAGE_TWO, result: { thread: { conversation_id: conversationFor(MESSAGE_TWO) } } }
       ]
     });

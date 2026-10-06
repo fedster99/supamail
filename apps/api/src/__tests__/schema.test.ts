@@ -1,8 +1,10 @@
 import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { ADDITIVE_SINCE_SEQUENCE, findNonAdditiveStatement, publicMigrationSequence } from "../migration-id.js";
 import {
   applyPublicMigrations,
+  assertPublicMigrationManifest,
   getRequiredPublicSchemaVersion,
   readPublicMigrationManifest,
   readPublicMigrations
@@ -195,6 +197,74 @@ describe("initial schema", () => {
 
     expect(sql).toContain("UNIQUE (message_id, part_number)");
     expect(sql).not.toContain("UNIQUE (message_id, part_number, content_id, filename)");
+  });
+
+  it("rejects a manifest whose ids are malformed, out of order, or whose version is not the last id", () => {
+    const entry = (id: string) => ({ id, file: `${id}.sql` });
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), entry("0002_b")] }))
+      .not.toThrow();
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0002-b", migrations: [entry("0001_a"), entry("0002-b")] }))
+      .toThrow(/not a public migration id/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_a", migrations: [entry("0002_b"), entry("0001_a")] }))
+      .toThrow(/out of order/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_a", migrations: [entry("0001_a"), entry("0002_b")] }))
+      .toThrow(/is not its last migration/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0001_b", migrations: [entry("0001_a"), entry("0001_b")] }))
+      .toThrow(/out of order/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: "0002_b", migrations: [entry("0001_a"), { id: "0002_b", file: 2 }] }))
+      .toThrow(/Invalid public migration manifest/);
+    expect(() => assertPublicMigrationManifest({ schemaVersion: 2, migrations: [entry("0001_a")] }))
+      .toThrow(/Invalid public migration manifest/);
+  });
+
+  it("keeps every migration after 0029 additive, which is what lets an older runtime run on a newer schema", async () => {
+    // The scheduler accepts a schema ahead of the runtime from 0029 on
+    // (ADDITIVE_SINCE_SEQUENCE) because a later migration never takes away
+    // what the running code uses. findNonAdditiveStatement names the breaks a
+    // scan can see; a replaced function or view body is for review to judge.
+    const manifest = await readPublicMigrationManifest();
+    const here = resolve(process.cwd(), "supabase/migrations/public");
+    const later = manifest.migrations.filter((entry) => publicMigrationSequence(entry.id)! > ADDITIVE_SINCE_SEQUENCE);
+    for (const migration of later) {
+      const sql = await readFile(resolve(here, migration.file), "utf8");
+      expect(findNonAdditiveStatement(sql), migration.id).toBeNull();
+    }
+  });
+
+  it("names the statements that take something away from an older runtime", () => {
+    const breaks = [
+      "alter table public.t drop column old_col;",
+      "alter table public.t drop old_col;",
+      "alter table public.t alter column old_col drop default;",
+      "drop table public.t;",
+      "drop index if exists public.t_idx;",
+      "alter table public.t rename column a to b;",
+      "alter table public.t rename to u;",
+      'alter table public.t alter column "display name" type text;',
+      "alter table public.t alter column a set data type bigint;",
+      "alter table public.t alter column a set not null;",
+      "alter table public.t add constraint t_check check (a > 0);",
+      "alter table public.t add unique (a);",
+      "alter table public.t add constraint t_fk foreign key (a) references public.u (id);",
+      "create unique index if not exists t_a_idx on public.t (a);",
+      "alter table public.t add column kind text not null;"
+    ];
+    for (const sql of breaks) expect(findNonAdditiveStatement(sql), sql).not.toBeNull();
+
+    const additive = [
+      "alter table public.t add column if not exists kind text;",
+      "alter table public.t add column kind text not null default 'x';",
+      "create index if not exists t_a_idx on public.t (a);",
+      "alter table public.t drop constraint if exists t_check;",
+      "alter table public.t alter column a drop not null;",
+      "drop view if exists public.v; create view public.v as select 1;",
+      "drop function if exists public.f(); create function public.f() returns int language sql as $$ select 1 $$;",
+      "create or replace function public.f() returns int language sql as $$ select 2 $$;",
+      "alter view public.v reset (security_barrier);",
+      "-- we do not drop column legacy here\nselect 1;",
+      "/* rename nothing */ select 1;"
+    ];
+    for (const sql of additive) expect(findNonAdditiveStatement(sql), sql).toBeNull();
   });
 
   it("serializes programmatic public migration calls with an advisory lock", async () => {

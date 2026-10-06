@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { InvalidSchemaVersionError, isSchemaVersionReady } from "../migration-id.js";
 import {
   DEFAULT_RUNTIME_TARGET_PER_TARGET_CONCURRENCY,
   runRuntimeTargetTasks,
@@ -231,5 +232,61 @@ describe("runtime target scheduler", () => {
       expect.objectContaining({ targetId: "target-a", status: "fulfilled", value: "a" }),
       expect.objectContaining({ targetId: "target-b", status: "skipped", reason: "scheduler_aborted" })
     ]));
+  });
+
+  it("runs a target whose schema is ahead of the runtime and skips one behind it", async () => {
+    const results = await runRuntimeTargetTasks([
+      {
+        targetId: "ahead",
+        taskId: "ahead",
+        currentSchemaVersion: "0031_later",
+        async run() {
+          return "ok";
+        }
+      },
+      {
+        targetId: "behind",
+        taskId: "behind",
+        currentSchemaVersion: "0028_folder_message_counts",
+        async run() {
+          return "ok";
+        }
+      }
+    ], { requiredSchemaVersion: "0029_active_assignments_view_no_barrier" });
+
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ targetId: "ahead", status: "fulfilled", value: "ok" }),
+      expect.objectContaining({ targetId: "behind", status: "skipped", reason: "stale_migration" })
+    ]));
+  });
+});
+
+describe("isSchemaVersionReady", () => {
+  const required = "0029_active_assignments_view_no_barrier";
+
+  it("accepts an exact match and, from 0029 on, a schema that is ahead", () => {
+    expect(isSchemaVersionReady(required, required)).toBe(true);
+    expect(isSchemaVersionReady("0030_next", required)).toBe(true);
+    expect(isSchemaVersionReady("0131_far_ahead", required)).toBe(true);
+    expect(isSchemaVersionReady("0028_folder_message_counts", "0028_folder_message_counts")).toBe(true);
+  });
+
+  it("refuses a schema that is behind, missing, malformed, or another id with the required number", () => {
+    expect(isSchemaVersionReady("0028_folder_message_counts", required)).toBe(false);
+    expect(isSchemaVersionReady("missing", required)).toBe(false);
+    expect(isSchemaVersionReady("", required)).toBe(false);
+    expect(isSchemaVersionReady("29_short", required)).toBe(false);
+    expect(isSchemaVersionReady("0029-active-assignments-view-no-barrier", required)).toBe(false);
+    expect(isSchemaVersionReady("0029_fork", required)).toBe(false);
+  });
+
+  it("refuses a schema ahead of a runtime from before the additive rule", () => {
+    expect(isSchemaVersionReady("0029_active_assignments_view_no_barrier", "0028_folder_message_counts")).toBe(false);
+    expect(isSchemaVersionReady("0005_progress_rollup", "0004_account_lane_settings")).toBe(false);
+  });
+
+  it("throws on a malformed required version at the boundary", async () => {
+    expect(() => isSchemaVersionReady(required, "latest")).toThrow(InvalidSchemaVersionError);
+    await expect(runRuntimeTargetTasks([], { requiredSchemaVersion: "latest" })).rejects.toThrow(InvalidSchemaVersionError);
   });
 });

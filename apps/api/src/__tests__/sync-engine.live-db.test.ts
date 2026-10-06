@@ -9,6 +9,7 @@ import {
   lockedSessionPool,
   withAccountLock
 } from "../locks.js";
+import { AccountBusyError } from "../errors.js";
 import { MirrorRepository } from "../repository.js";
 import { MirrorEngine } from "../sync-engine.js";
 import type { FetchMessage, MirrorImapClient } from "../imap-client.js";
@@ -289,6 +290,28 @@ liveDb("live DB reliability lane", () => {
     releaseList();
     const firstResult = await timeout(first, "first sync completion");
     expect(firstResult.outcome).toBe("success");
+  });
+
+  it("reports a body fetch during a sync as busy, so the caller retries", async () => {
+    const h = await setupIntegration("live-body-fetch-busy", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const engine = h.buildEngine({ folders: oneFolder() });
+    expect((await engine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+    const message = await h.pool.query<{ id: string }>(
+      "SELECT id FROM public.imap_messages WHERE account_id = $1 LIMIT 1",
+      [h.account.id]
+    );
+    const account = await h.repository.getAccount(h.account.id);
+    if (!account || !message.rows[0]) throw new Error("missing seeded message");
+    const locker = await h.pool.connect();
+    await locker.query("SELECT pg_advisory_lock($1::bigint)", [account.lock_id]);
+    try {
+      await expect(engine.fetchBody(message.rows[0].id, true)).rejects.toBeInstanceOf(AccountBusyError);
+    } finally {
+      await locker.query("SELECT pg_advisory_unlock_all()");
+      locker.release();
+    }
+    await expect(engine.fetchBody(message.rows[0].id, true)).resolves.toBe(true);
   });
 
   it("lets a Sent pass yield neutrally whenever the account lock is busy", async () => {
