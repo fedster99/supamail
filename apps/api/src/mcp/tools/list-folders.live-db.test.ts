@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { applyPublicMigrations, closePool, getPool, readPublicMigrationFiles } from "../../db.js";
+import { closePool, getPool, readPublicMigrationFiles } from "../../db.js";
 import { folderCountDrift } from "../../__tests__/helpers/integration-harness.js";
 import { runListFolders } from "./list-folders.js";
 
@@ -286,7 +286,7 @@ liveDb("list_folders tool live DB", () => {
     expect(left.rows).toEqual([]);
   });
 
-  it("backfills counts from existing mail once, and a second migrate keeps them", async () => {
+  it("backfills counts from existing mail once, and running 0028 again keeps them", async () => {
     const before = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
     // A database from before 0028: no counts table. Run 0028 itself, as its
     // first apply did; later migrations dropped objects earlier files create, so
@@ -299,7 +299,8 @@ liveDb("list_folders tool live DB", () => {
       await pool.query(counts.sql);
     }
     const backfilled = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
-    await applyPublicMigrations(pool);
+    // 0028 is idempotent: running it again keeps the counts.
+    await pool.query(counts.sql);
     const rerun = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
     expect(backfilled.folders).toEqual(before.folders);
     expect(rerun.folders).toEqual(before.folders);

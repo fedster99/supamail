@@ -49,6 +49,9 @@ file once.
   of customer databases) must use the same record. Once a migration drops an
   object, re-running earlier files can fail, so only a database from before this
   record may apply every file again.
-- A migration that drops an object is its own reviewed release, made after every
-  host stopped using the object; an older image that re-applies every file would
-  recreate it, so such a release does not roll back.
+- A migration that drops an object is its own reviewed release, listed in the
+  schema test, made after every host runs a core that stopped using the object.
+  An older runtime's readiness check would accept the newer schema, so that
+  precondition is the host's release step, not code. Such a release does not roll
+  back: an image whose runner predates the record re-applies every file and fails
+  on the removed objects.

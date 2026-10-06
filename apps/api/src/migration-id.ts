@@ -9,19 +9,6 @@ export const PUBLIC_MIGRATION_ID = /^(\d{4})_\S+$/;
  */
 export const ADDITIVE_SINCE_SEQUENCE = 29;
 
-/**
- * A later migration that removes something only runtimes from a known version
- * on have stopped using. A runtime that requires an earlier version must not run
- * on a schema that includes the removal. Each entry is its own reviewed release.
- */
-export const COMPATIBILITY_FLOORS: ReadonlyArray<{ sequence: number; minimumRequired: number; reason: string }> = [
-  {
-    sequence: 32,
-    minimumRequired: 30,
-    reason: "0032 drops window_status and the archive-refresh columns; runtimes before 0030 still write them"
-  }
-];
-
 /** A migration id's position in manifest order, or null when it is not an id. */
 export function publicMigrationSequence(id: string): number | null {
   const match = PUBLIC_MIGRATION_ID.exec(id);
@@ -50,8 +37,7 @@ export function assertRequiredSchemaVersion(requiredSchemaVersion: string): void
  * migration adds. A schema at the required sequence must be the required id;
  * two branches can each add a migration with one number. A schema ahead of
  * the runtime is ready from {@link ADDITIVE_SINCE_SEQUENCE} on: later
- * migrations are additive, or remove only what the runtime has stopped using
- * ({@link COMPATIBILITY_FLOORS}), so an older runtime keeps working, and a host
+ * migrations are additive, so an older runtime keeps working, and a host
  * applies a migration before it deploys the runtime that needs it. What is
  * ahead cannot be checked by name; the host's marker is trusted. A missing or
  * malformed schema version is not ready; a malformed required version is the
@@ -63,10 +49,7 @@ export function isSchemaVersionReady(currentSchemaVersion: string, requiredSchem
   const current = publicMigrationSequence(currentSchemaVersion);
   if (current === null) return false;
   if (current === required) return currentSchemaVersion === requiredSchemaVersion;
-  if (current < required || required < ADDITIVE_SINCE_SEQUENCE) return false;
-  return COMPATIBILITY_FLOORS.every((floor) =>
-    floor.sequence <= required || floor.sequence > current || required >= floor.minimumRequired
-  );
+  return current > required && required >= ADDITIVE_SINCE_SEQUENCE;
 }
 
 const SQL_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\//g;

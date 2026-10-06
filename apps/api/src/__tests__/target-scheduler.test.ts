@@ -267,8 +267,7 @@ describe("isSchemaVersionReady", () => {
   it("accepts an exact match and, from 0029 on, a schema that is ahead", () => {
     expect(isSchemaVersionReady(required, required)).toBe(true);
     expect(isSchemaVersionReady("0030_next", required)).toBe(true);
-    expect(isSchemaVersionReady("0031_next", required)).toBe(true);
-    expect(isSchemaVersionReady("0131_far_ahead", "0030_window_from_message_date")).toBe(true);
+    expect(isSchemaVersionReady("0131_far_ahead", required)).toBe(true);
     expect(isSchemaVersionReady("0028_folder_message_counts", "0028_folder_message_counts")).toBe(true);
   });
 
@@ -284,14 +283,6 @@ describe("isSchemaVersionReady", () => {
   it("refuses a schema ahead of a runtime from before the additive rule", () => {
     expect(isSchemaVersionReady("0029_active_assignments_view_no_barrier", "0028_folder_message_counts")).toBe(false);
     expect(isSchemaVersionReady("0005_progress_rollup", "0004_account_lane_settings")).toBe(false);
-  });
-
-  it("refuses a schema past a removal the runtime still depends on", () => {
-    // 0032 drops columns that only runtimes from 0030 on stopped writing.
-    expect(isSchemaVersionReady("0032_drop_retired_window_columns", required)).toBe(false);
-    expect(isSchemaVersionReady("0131_far_ahead", required)).toBe(false);
-    expect(isSchemaVersionReady("0032_drop_retired_window_columns", "0030_window_from_message_date")).toBe(true);
-    expect(isSchemaVersionReady("0032_drop_retired_window_columns", "0031_active_assignments_view_columns")).toBe(true);
   });
 
   it("throws on a malformed required version at the boundary", async () => {
