@@ -85,3 +85,29 @@ describe("createPool server-side TCP liveness", () => {
     }
   });
 });
+
+describe("applyPublicMigrations", () => {
+  it("commits each migration with its record and stops at the first failure", async () => {
+    const { applyPublicMigrations, readPublicMigrationFiles } = await import("../db.js");
+    const migrations = await readPublicMigrationFiles();
+    const ran: Array<{ text: string; values?: unknown[] }> = [];
+    const client = {
+      query: async (text: string, values?: unknown[]) => {
+        ran.push({ text, values });
+        if (text.startsWith("SELECT id FROM supamail_meta.public_migrations")) return { rows: [] };
+        if (text === migrations[1].sql) throw new Error("second migration failed");
+        return { rows: [] };
+      },
+      release: () => undefined
+    };
+    const pool = { connect: async () => client } as unknown as Parameters<typeof applyPublicMigrations>[0];
+
+    await expect(applyPublicMigrations(pool)).rejects.toThrow(/second migration failed/);
+    const recorded = ran
+      .filter((entry) => entry.text.startsWith("INSERT INTO supamail_meta.public_migrations"))
+      .map((entry) => entry.values?.[0]);
+    expect(recorded).toEqual([migrations[0].id]);
+    expect(ran.map((entry) => entry.text)).toContain("ROLLBACK");
+    expect(ran.map((entry) => entry.text)).not.toContain(migrations[2].sql);
+  });
+});

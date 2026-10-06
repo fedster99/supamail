@@ -282,9 +282,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = await readPublicMigrations();
 
-    expect(version).toBe("0030_window_from_message_date");
+    expect(version).toBe("0031_active_assignments_view_columns");
     expect(manifest).toEqual({
-      schemaVersion: "0030_window_from_message_date",
+      schemaVersion: "0031_active_assignments_view_columns",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -315,7 +315,8 @@ describe("initial schema", () => {
         { id: "0027_folder_unchanged_proof", file: "0027_folder_unchanged_proof.sql" },
         { id: "0028_folder_message_counts", file: "0028_folder_message_counts.sql" },
         { id: "0029_active_assignments_view_no_barrier", file: "0029_active_assignments_view_no_barrier.sql" },
-        { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" }
+        { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" },
+        { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");

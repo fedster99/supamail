@@ -16,7 +16,8 @@ The constraints are fixed by the rest of the product:
 - **Public core, per-account Supabase/Postgres.** The search schema ships as a public
   migration that runs unchanged on every self-hoster and customer database. It must
   be additive, idempotent, and safe to re-run (the whole public set is concatenated
-  and executed as one implicit transaction by `applyPublicMigrations`, re-applied on
+  and executed as one implicit transaction by `applyPublicMigrations` (since ADR 0040
+  each migration runs once, recorded with it), re-applied on
   every boot — see `db.ts`). No `CREATE INDEX CONCURRENTLY` (illegal in a
   transaction).
 - **Core scope is email sync only, no AI by default** (AGENTS.md, ADR 0001). A
