@@ -246,7 +246,8 @@ export class MailboxMutator {
   }
 
   /**
-   * MOVE the message by UID into `destination`. Requires either the MOVE extension
+   * MOVE messages of one folder by UID into `destination` with one UID MOVE. Every
+   * target must share the folder and UIDVALIDITY. Requires either the MOVE extension
    * (a native, atomic, safe move) or UIDPLUS (imapflow falls back to COPY + a
    * UID-scoped EXPUNGE, which is safe). If the server advertises neither, imapflow
    * would fall back to COPY + a blanket EXPUNGE that purges ALL \Deleted messages
@@ -254,17 +255,23 @@ export class MailboxMutator {
    * destination UIDVALIDITY and the source → destination UID map, both null when
    * the server does not report them.
    */
-  async move(target: ResolvedMessageTarget, destination: string): Promise<MovedLocation> {
+  async move(targets: readonly ResolvedMessageTarget[], destination: string): Promise<MovedLocation> {
+    const [first] = targets;
+    if (!first || targets.some((target) =>
+      target.folderPath !== first.folderPath || target.uidValidity !== first.uidValidity)) {
+      throw new Error("move requires one or more targets from one folder at one UIDVALIDITY");
+    }
     if (!this.hasCapability("MOVE") && !this.hasCapability("UIDPLUS")) {
       throw new MailboxCapabilityError(
         `Move needs the MOVE or UIDPLUS extension to avoid a collateral EXPUNGE; ${this.host} advertises neither`
       );
     }
-    return this.withUidScope(target, async () => {
-      const result = await this.client.messageMove(String(target.uid), destination, { uid: true });
+    const uids = targets.map((target) => target.uid).join(",");
+    return this.withUidScope(first, async () => {
+      const result = await this.client.messageMove(uids, destination, { uid: true });
       if (!result) {
         throw new MailboxMutationError(
-          `MOVE failed for UID ${target.uid} from ${target.folderPath} to ${destination} on ${this.host}`
+          `MOVE failed for UID ${uids} from ${first.folderPath} to ${destination} on ${this.host}`
         );
       }
       if (typeof result !== "object") return { uidMap: null, uidValidity: null };
@@ -491,10 +498,12 @@ export interface MoveResult {
   idKept: boolean;
 }
 
-/** Move one mirrored message to `destination` by UID. The source and destination
- * are durably due before the provider command so a host can reconcile them after
- * acknowledgement without depending on a prompt IDLE/NOTIFY event. A move the
- * server confirms with COPYUID keeps the message id (ADR 0037). */
+/** The result of one message in a {@link moveMessages} call: its move, or why it failed. */
+export type MoveOutcome =
+  | { messageId: string; result: MoveResult }
+  | { messageId: string; error: unknown };
+
+/** Move one mirrored message to `destination` by UID: {@link moveMessages} with one id. */
 export async function moveMessage(
   pool: PgPool,
   config: AppConfig,
@@ -503,31 +512,105 @@ export async function moveMessage(
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: MailboxActionOptions = {}
 ): Promise<MoveResult> {
+  const [outcome] = await moveMessages(pool, config, [messageId], destination, metadataProtection, options);
+  if ("error" in outcome) throw outcome.error;
+  return outcome.result;
+}
+
+/**
+ * Move mirrored messages to `destination` with one connection per mailbox and one
+ * UID MOVE per source folder, so the provider cost does not grow with the number of
+ * messages. Every source folder and the destination are durably due before the
+ * provider commands, so a host can reconcile them after acknowledgement without a
+ * prompt IDLE/NOTIFY event. A move the server confirms with COPYUID keeps the
+ * message id (ADR 0037). Outcomes follow the input order; one folder's failure never
+ * hides another message's result. A message already in `destination` is a no-op.
+ */
+export async function moveMessages(
+  pool: PgPool,
+  config: AppConfig,
+  messageIds: readonly string[],
+  destination: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: MailboxActionOptions = {}
+): Promise<MoveOutcome[]> {
   if (!destination || destination.trim().length === 0) {
-    throw new Error("moveMessage requires a non-empty destination folder");
+    throw new Error("moveMessages requires a non-empty destination folder");
   }
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
-  const target = toTarget(message);
-  // Already there: a no-op, as in moveThread. Calling the provider anyway could
-  // leave the UID in place, and the write-through would then hide a live row.
-  if (destination === target.folderPath) {
-    return { messageId, fromFolder: target.folderPath, toFolder: destination, newUid: target.uid, idKept: true };
+  const outcomes = new Map<string, MoveOutcome>();
+  const mailboxes = new Map<string, { account: ImapAccount; targets: ResolvedMessageTarget[] }>();
+  for (const messageId of new Set(messageIds)) {
+    try {
+      const { message, account } = await loadMessageAndAccount(repository, messageId);
+      const target = toTarget(message);
+      // Already there: calling the provider anyway could leave the UID in place, and
+      // the write-through would then hide a live row.
+      if (destination === target.folderPath) {
+        outcomes.set(messageId, { messageId, result: moveResult(target, destination, target.uid, true) });
+        continue;
+      }
+      const mailbox = mailboxes.get(account.id) ?? { account, targets: [] };
+      mailbox.targets.push(target);
+      mailboxes.set(account.id, mailbox);
+    } catch (error) {
+      outcomes.set(messageId, { messageId, error });
+    }
   }
+  for (const { account, targets } of mailboxes.values()) {
+    await moveMailboxTargets(pool, config, repository, account, targets, destination, options, outcomes);
+  }
+  return messageIds.map((messageId) => outcomes.get(messageId)!);
+}
 
-  await repository.markFoldersForReconcile(account.id, [target.folderPath, destination]);
+function moveResult(target: ResolvedMessageTarget, destination: string, newUid: number | null, idKept: boolean): MoveResult {
+  return { messageId: target.messageId, fromFolder: target.folderPath, toFolder: destination, newUid, idKept };
+}
 
-  const mutator = await MailboxMutator.connect(pool, config, account, options);
-  let moved: MovedLocation;
+/** Move one mailbox's targets over one connection, one UID MOVE per folder and
+ * UIDVALIDITY, writing each confirmed message through before the next folder. */
+async function moveMailboxTargets(
+  pool: PgPool,
+  config: AppConfig,
+  repository: MirrorRepository,
+  account: ImapAccount,
+  targets: ResolvedMessageTarget[],
+  destination: string,
+  options: MailboxActionOptions,
+  outcomes: Map<string, MoveOutcome>
+): Promise<void> {
+  const folders = new Map<string, ResolvedMessageTarget[]>();
+  for (const target of targets) {
+    const key = `${target.uidValidity}:${target.folderPath}`;
+    folders.set(key, [...(folders.get(key) ?? []), target]);
+  }
   try {
-    moved = await mutator.move(target, destination);
-  } finally {
-    await closeImap(mutator);
+    await repository.markFoldersForReconcile(account.id, [...new Set(targets.map((target) => target.folderPath)), destination]);
+    const mutator = await MailboxMutator.connect(pool, config, account, options);
+    try {
+      for (const folder of folders.values()) {
+        let moved: MovedLocation;
+        try {
+          moved = await mutator.move(folder, destination);
+        } catch (error) {
+          for (const target of folder) outcomes.set(target.messageId, { messageId: target.messageId, error });
+          continue;
+        }
+        for (const target of folder) {
+          const idKept = await writeMoveThrough(repository, target, destination, moved);
+          const newUid = moved.uidMap?.get(target.uid) ?? null;
+          outcomes.set(target.messageId, { messageId: target.messageId, result: moveResult(target, destination, newUid, idKept) });
+        }
+      }
+    } finally {
+      await closeImap(mutator);
+    }
+  } catch (error) {
+    for (const target of targets) {
+      if (!outcomes.has(target.messageId)) outcomes.set(target.messageId, { messageId: target.messageId, error });
+    }
   }
-  const idKept = await writeMoveThrough(repository, target, destination, moved);
-  const newUid = moved.uidMap?.get(target.uid) ?? null;
-  return { messageId, fromFolder: target.folderPath, toFolder: destination, newUid, idKept };
 }
 
 export interface DeleteResult {
@@ -579,7 +662,7 @@ export async function deleteMessage(
         return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
       }
       await repository.markFoldersForReconcile(account.id, [target.folderPath, trashFolder]);
-      await mutator.move(target, trashFolder);
+      await mutator.move([target], trashFolder);
     }
   } finally {
     await closeImap(mutator);
@@ -822,7 +905,7 @@ export async function moveThread(
   try {
     for (const target of targets) {
       if (target.folderPath === destination) continue;
-      const location = await mutator.move(target, destination);
+      const location = await mutator.move([target], destination);
       // Per member, so a later member's failure keeps every earlier write.
       if (!await writeMoveThrough(repository, target, destination, location)) idsNotKept.push(target.messageId);
       moved.push(target.messageId);

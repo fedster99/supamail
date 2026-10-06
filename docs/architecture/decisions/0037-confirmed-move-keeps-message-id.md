@@ -28,12 +28,15 @@ guess.
 ## Decision
 
 **A move the server confirms with COPYUID moves the row with the message.**
-`moveMessage` and each member of `moveThread` update the source row's
+`moveMessages` (and `moveMessage`, which is one id of it) and each member of
+`moveThread` update the source row's
 `folder_id`, `folder_path`, `uidvalidity`, and `uid` to the destination
 (`MirrorRepository.relocateMovedMessage`). The row keeps its id, so everything
 keyed by it stays attached: body, attachments, thread assignments, and host
 state such as hosted Tags. The destination's next sync upserts the same
 `(account_id, folder_path, uidvalidity, uid)` key and updates this row.
+`moveMessages` opens one connection per mailbox and sends one UID MOVE per source
+folder; the one COPYUID answer maps each moved UID to its row.
 
 Relocation applies only when all of these hold; otherwise the source row is
 tombstoned as in ADR 0034, and the next sync mirrors the copy under a new id:

@@ -9,6 +9,7 @@ import { ImapFlow } from "imapflow";
 import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { openInboxIdleSession } from "../src/inbox-idle.js";
+import { MailboxMutator, moveMessages } from "../src/mailbox-mutations.js";
 import { MirrorRepository } from "../src/repository.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 
@@ -477,6 +478,43 @@ async function main(): Promise<void> {
       [account.id]
     );
     const archiveQresync = qresyncEvent.rows[0]?.payload;
+
+    // A batch move uses one connection and one UID MOVE, and every row keeps its id.
+    const inboxRows = await pool.query<{ id: string }>(
+      `SELECT id FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND deleted_in_provider = false
+       ORDER BY uid`,
+      [account.id]
+    );
+    const movedIds = inboxRows.rows.map((row) => row.id);
+    const moveCheck = new ImapFlow({
+      host: "127.0.0.1",
+      port: imapPort,
+      secure: false,
+      auth: { user: mailbox, pass: password },
+      logger: false
+    });
+    await moveCheck.connect();
+    const inboxBeforeMove = await moveCheck.status("INBOX", { messages: true });
+    const connect = MailboxMutator.connect;
+    let moveConnections = 0;
+    MailboxMutator.connect = (...args) => {
+      moveConnections += 1;
+      return connect.apply(MailboxMutator, args);
+    };
+    let moveOutcomes: Awaited<ReturnType<typeof moveMessages>>;
+    try {
+      moveOutcomes = await moveMessages(pool, config, movedIds, "Archive");
+    } finally {
+      MailboxMutator.connect = connect;
+    }
+    const movedRows = await pool.query<{ id: string; uid: string }>(
+      `SELECT id, uid FROM public.imap_messages
+       WHERE id = ANY($1::uuid[]) AND folder_path = 'Archive' AND deleted_in_provider = false`,
+      [movedIds]
+    );
+    const inboxAfterMove = await moveCheck.status("INBOX", { messages: true });
+    await moveCheck.logout();
     const assertions: Array<[string, boolean]> = [
       ["sync succeeded", result.outcome === "success"],
       ["discovered Dovecot folders", counts.folders >= 4],
@@ -497,7 +535,15 @@ async function main(): Promise<void> {
       ["Archive replay used complete QRESYNC", archiveQresync?.accepted === true
         && archiveQresync.complete === true
         && archiveQresync.fallbackRequired === false
-        && (archiveQresync.vanishedUidCount ?? 0) >= 1]
+        && (archiveQresync.vanishedUidCount ?? 0) >= 1],
+      ["batch move covered several INBOX messages", movedIds.length >= 2],
+      ["batch move used one connection", moveConnections === 1],
+      ["batch move kept every id", moveOutcomes.every((outcome) => "result" in outcome && outcome.result.idKept)],
+      ["batch move relocated every row to its Archive UID", movedRows.rows.length === movedIds.length
+        && movedRows.rows.every((row) => moveOutcomes.some((outcome) =>
+          "result" in outcome && outcome.messageId === row.id && outcome.result.newUid === Number(row.uid)))],
+      ["batch move took exactly the moved messages out of INBOX on the server",
+        inboxAfterMove.messages === (inboxBeforeMove.messages ?? 0) - movedIds.length]
     ];
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
@@ -517,7 +563,13 @@ async function main(): Promise<void> {
       reconnectResult,
       archiveWakeLatencyMs,
       archiveLiveResult,
-      archiveQresync
+      archiveQresync,
+      batchMove: {
+        messages: movedIds.length,
+        connections: moveConnections,
+        inboxBefore: inboxBeforeMove.messages,
+        inboxAfter: inboxAfterMove.messages
+      }
     }, null, 2));
   } finally {
     const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";
