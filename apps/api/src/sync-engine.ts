@@ -1219,7 +1219,7 @@ export class MirrorEngine {
         };
       }
 
-      const windowCutoff = getWindowCutoff(this.config);
+      const windowCutoff = getWindowCutoff(account);
       let messagesUpserted = 0;
       let flagsUpdated = 0;
       let reconcileGapsFound = 0;
@@ -1271,7 +1271,8 @@ export class MirrorEngine {
             client,
             incrementalDeadline,
             "incremental SEARCH",
-            () => searchUidsSince(client, windowCutoff, `${uidFloor}:${uidCeiling}`)
+            // A new UID is new mail whatever its date, e.g. old mail moved here.
+            () => searchMailboxUids(client, { uid: `${uidFloor}:${uidCeiling}` })
           )).filter((uid) => uid > lastUid)
         )
       ].sort((a, b) => a - b);
@@ -1292,7 +1293,6 @@ export class MirrorEngine {
           folder,
           uidValidity,
           metadata,
-          windowCutoff,
           { deadlineAt: incrementalDeadline, signal: options.signal }
         );
         messagesUpserted += messages.length;
@@ -1573,7 +1573,6 @@ export class MirrorEngine {
                 folder,
                 uidValidity,
                 metadata,
-                windowCutoff,
                 { deadlineAt: reconcileDeadline, signal: options.signal }
               );
               backfilled += messages.length;
@@ -1762,7 +1761,6 @@ export class MirrorEngine {
     folder: ImapFolder,
     uidValidity: number,
     metadata: MessageMetadata[],
-    windowCutoff: Date,
     options: MetadataWriteOptions = {}
   ): Promise<ImapMessage[]> {
     const startedAt = performance.now();
@@ -1773,7 +1771,6 @@ export class MirrorEngine {
         folder,
         uidValidity,
         metadata,
-        windowCutoff,
         options
       );
       stats.rowsCommitted += rows.length;
@@ -1808,7 +1805,10 @@ export class MirrorEngine {
       : null;
     let liveHeadUid = folder.last_uid ? Number(folder.last_uid) : 0;
 
-    // First pass for this folder: take the snapshot.
+    // First pass for this folder: take the snapshot. Every UID below UIDNEXT is
+    // then either in the window snapshot or archive for the history lane, so the
+    // live head starts at UIDNEXT and takes new mail whatever its date.
+    const snapshotHighWater = uidNext ? uidNext - 1 : 0;
     if (targetMaxUid === null || oldestSynced === null) {
       const snapshot = await this.withInitialSyncDeadline(
         client,
@@ -1831,7 +1831,7 @@ export class MirrorEngine {
         await this.repository.markFolderSynced(folder.id, {
           uidValidity,
           uidNext,
-          lastUid: 0,
+          lastUid: snapshotHighWater,
           initialComplete: true
         }, { deadlineAt: initialSyncDeadline, signal });
         return { messagesUpserted: 0, initialSyncComplete: true };
@@ -1847,6 +1847,15 @@ export class MirrorEngine {
         uidValidity,
         { deadlineAt: initialSyncDeadline, signal }
       );
+      if (snapshotHighWater > Math.max(targetMaxUid, liveHeadUid)) {
+        liveHeadUid = snapshotHighWater;
+        await this.repository.advanceInitialSyncLiveHead(
+          folder.id,
+          liveHeadUid,
+          uidValidity,
+          { deadlineAt: initialSyncDeadline, signal }
+        );
+      }
     }
 
     // Re-search and bound by the snapshot. Any UIDs the provider has expunged
@@ -1860,8 +1869,18 @@ export class MirrorEngine {
     const sortedCandidates = [...new Set(candidates)].sort((a, b) => a - b);
     let messagesUpserted = 0;
 
-    const liveBatch = sortedCandidates
-      .filter((uid) => uid > targetMaxUid! && uid > liveHeadUid)
+    const liveFloor = Math.max(targetMaxUid, liveHeadUid) + 1;
+    const liveCandidates = uidNext && uidNext > liveFloor
+      ? await this.withInitialSyncDeadline(
+          client,
+          initialSyncDeadline,
+          "initial sync live-head SEARCH",
+          () => searchMailboxUids(client, { uid: `${liveFloor}:${uidNext - 1}` })
+        )
+      : [];
+    const liveBatch = [...new Set(liveCandidates)]
+      .filter((uid) => uid >= liveFloor)
+      .sort((a, b) => a - b)
       .slice(0, this.config.INCREMENTAL_SYNC_BATCH_SIZE);
     if (liveBatch.length > 0) {
       const liveMetadata = await this.withInitialSyncDeadline(
@@ -1886,7 +1905,6 @@ export class MirrorEngine {
         folder,
         uidValidity,
         liveMetadata,
-        windowCutoff,
         { deadlineAt: initialSyncDeadline, signal }
       );
       messagesUpserted += liveMessages.length;
@@ -1966,7 +1984,6 @@ export class MirrorEngine {
       folder,
       uidValidity,
       metadata,
-      windowCutoff,
       { deadlineAt: initialSyncDeadline, signal }
     );
     messagesUpserted += messages.length;
@@ -2131,7 +2148,7 @@ export class MirrorEngine {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
       }
 
-      const windowCutoff = getWindowCutoff(this.config);
+      const windowCutoff = getWindowCutoff(account);
       let targetMaxUid: number | null = folder.backfill_target_max_uid
         ? Number(folder.backfill_target_max_uid)
         : null;
@@ -2139,7 +2156,6 @@ export class MirrorEngine {
         ? Number(folder.backfill_oldest_uid_synced)
         : null;
       const shouldStartSnapshot = folder.history_backlog_reason === "snapshot"
-        || folder.history_backlog_reason === "refresh"
         || targetMaxUid === null
         || oldestSynced === null;
 
@@ -2241,12 +2257,7 @@ export class MirrorEngine {
         folder,
         uidValidity,
         metadata,
-        windowCutoff,
-        {
-          preserveExistingFlags: !account.archive_flag_sync,
-          deadlineAt: historyWriteDeadline,
-          signal
-        }
+        { deadlineAt: historyWriteDeadline, signal }
       );
       for (const message of messages) {
         await this.hooks.onMessageUpsert?.(message);
@@ -2295,7 +2306,7 @@ export class MirrorEngine {
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
     const backlog = await this.repository.getHistoricalBodyBacklog(
-      account.id,
+      account,
       folder,
       this.config.BODY_BACKFILL_BATCH_SIZE
     );

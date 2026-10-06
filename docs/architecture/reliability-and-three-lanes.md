@@ -157,6 +157,8 @@ Type-safe columns, not JSONB. SQL `CHECK` constraints document and enforce allow
 
 No daily token-bucket counter. The natural rate limit is the IMAP throttle + lock budget + tick interval; provider-side throttling handles the rest. `aggressive` is honest about what it actually means.
 
+ADR 0039 later removed `archive_refresh_interval`, `archive_flag_sync`, the periodic archive refresh, and the stored `window_status` lane; `live_window_days` is now the one source of the live window.
+
 `live_window_days` is **immutable after account creation in v0.1**. The API rejects PATCH to this field. A future migration may add change support; for now, just lock it in.
 
 `body_fetch_policy` predates these five history-lane columns, but ADR 0027 makes

@@ -80,7 +80,6 @@ function threadSelect(includeBody: boolean): string {
   m.to_emails,
   m.cc_emails,
   m.flags,
-  m.window_status,
   m.internal_date,
   m.rfc_message_id,
   m.in_reply_to,

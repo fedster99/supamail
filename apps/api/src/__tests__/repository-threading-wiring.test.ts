@@ -107,8 +107,7 @@ describe("repository threading evidence wiring", () => {
       ACCOUNT_ID,
       folder,
       7,
-      [metadata],
-      new Date("2025-01-01T00:00:00.000Z")
+      [metadata]
     );
 
     const stateLockIndex = calls.findIndex((call) => call.sql.includes("FOR SHARE"));

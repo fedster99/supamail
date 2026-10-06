@@ -215,7 +215,7 @@ liveDb("draft folder resolution (live DB)", () => {
       headersJson: { "message-id": saved.rfcMessageId },
       mimeStructure: { part: "1", type: "text/plain" },
       attachments: []
-    }], getWindowCutoff(config));
+    }]);
     expect(synced).toMatchObject({ id: saved.messageId, provider_message_id: "server-object-id", size_bytes: "321" });
     expect(synced.mime_structure).toEqual({ part: "1", type: "text/plain" });
     const counted = await pool.query<{ headers_synced_count: number }>(

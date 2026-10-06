@@ -1,13 +1,11 @@
 import type { IgnoredOr, ParsedQuery, SearchFilter, SearchSort, StructuredFilters, TextTerm, TextTerms } from "./types.js";
 import { SEARCH_SORTS } from "./types.js";
-import type { WindowStatus } from "../types.js";
 import {
   DATE_FIELDS,
   FLAG_FIELDS,
   SIZE_FIELDS,
   TEXT_FIELDS,
-  TEXT_FIELD_BY_OPERATOR,
-  WINDOW_STRUCTURED_KEY
+  TEXT_FIELD_BY_OPERATOR
 } from "./filter-fields.js";
 import { isRelativeDate, isValidAbsoluteDate } from "./rules.js";
 
@@ -21,7 +19,7 @@ const SPECIAL_OPERATORS = [
   "after", "since", "newer_than", "newer",
   "before", "until", "older_than", "older",
   "larger", "bigger", "smaller",
-  "account", "window", "lane",
+  "account",
   "sort", "limit"
 ];
 const KNOWN_OPERATORS = new Set<string>([
@@ -29,7 +27,6 @@ const KNOWN_OPERATORS = new Set<string>([
   ...SPECIAL_OPERATORS
 ]);
 
-const WINDOW_VALUES: WindowStatus[] = ["IN_WINDOW", "EXPIRED", "HISTORICAL"];
 const SIZE_RE = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i;
 
 /** Quote-aware tokenizer: whitespace separates tokens, but a double-quoted span
@@ -364,13 +361,6 @@ export function parseQuery(input: string): ParsedQuery {
       case "account":
         accounts.push(rawValue);
         return null;
-      case "window":
-      case "lane": {
-        const upper = rawValue.toUpperCase() as WindowStatus;
-        if (WINDOW_VALUES.includes(upper)) return { kind: "window", value: upper, negated, raw };
-        warnings.push(`unknown window/lane "${rawValue}"; ignored`);
-        return null;
-      }
       case "sort": {
         const candidate = rawValue.toLowerCase();
         const aliased = candidate === "date" ? "recent" : candidate;
@@ -442,10 +432,6 @@ export function filtersFromStructured(structured: StructuredFilters, warnings: s
     if (value !== undefined) {
       push({ kind: "size", op: field.op, value: value as number, negated: false, raw: `${field.op}:${value}` });
     }
-  }
-
-  if (structured[WINDOW_STRUCTURED_KEY]) {
-    push({ kind: "window", value: structured.window as WindowStatus, negated: false, raw: `window:${structured.window}` });
   }
   return out;
 }

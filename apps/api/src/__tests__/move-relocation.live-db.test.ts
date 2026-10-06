@@ -129,7 +129,7 @@ liveDb("a confirmed move keeps the message id (live DB)", () => {
       subject: "Move me", fromEmail: "a@example.test", fromName: null, toEmails: [], toNames: [], ccEmails: [],
       ccNames: [], bccEmails: [], headersJson: {}, mimeStructure: null, attachments: []
     };
-    const [upserted] = await repository.upsertMessages(accountId, archive, 200, [synced], getWindowCutoff(config));
+    const [upserted] = await repository.upsertMessages(accountId, archive, 200, [synced]);
 
     expect(upserted.id).toBe(id);
     const count = await pool.query("SELECT 1 FROM public.imap_messages WHERE account_id = $1 AND folder_path = 'Archive' AND uid = 502", [accountId]);

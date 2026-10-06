@@ -35,7 +35,6 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   SENT_SYNC_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
-  WINDOW_DAYS: z.coerce.number().int().positive().default(90),
   BODY_FETCH_POLICY: z
     .enum(["immediate", "lazy", "priority_then_backfill"])
     .default("priority_then_backfill"),
@@ -170,10 +169,12 @@ export function resetConfigForTests(): void {
   cachedConfig = null;
 }
 
-export function getWindowCutoff(config: Pick<AppConfig, "WINDOW_DAYS">): Date {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - config.WINDOW_DAYS);
-  return cutoff;
+/**
+ * The start of a Mailbox Account's live window. The window is a cost limit on
+ * the expensive sync work, computed from the message date; no row stores it.
+ */
+export function getWindowCutoff(account: { live_window_days: number }, now = Date.now()): Date {
+  return new Date(now - account.live_window_days * 24 * 60 * 60_000);
 }
 
 export function isWithinBackfillWindow(

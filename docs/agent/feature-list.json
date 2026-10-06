@@ -19,7 +19,7 @@
       "priority": 1,
       "area": "sync-engine",
       "title": "Add automatic historical backfill",
-      "user_visible_behavior": "A new account can eventually mirror older messages beyond WINDOW_DAYS without manual intervention while fresh mail stays current.",
+      "user_visible_behavior": "A new account can eventually mirror older messages beyond the live window without manual intervention while fresh mail stays current.",
       "status": "passing",
       "dependencies": [
         "reliability-hardening-pr-1-lock-budget",

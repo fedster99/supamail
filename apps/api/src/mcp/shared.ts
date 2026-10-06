@@ -8,7 +8,6 @@ import {
 } from "../metadata-protection.js";
 import { buildReadAccounts } from "../search/index.js";
 import type { ReadAccount } from "../search/types.js";
-import type { WindowStatus } from "../types.js";
 
 /**
  * The shared MCP foundation (ADR 0014/0016). Every agent-email tool and the
@@ -78,7 +77,6 @@ export interface MessageDetail {
   /** ISO timestamp of internal_date. */
   date: string;
   flags: string[];
-  window_status: WindowStatus;
   /** Cleaned body (coalesce(body_text, body_plain, selected_text_part)). */
   body: string | null;
   /** Whether `body` contains all available source text after the requested options. */
@@ -116,7 +114,6 @@ export interface MessageDetailRow {
   to_emails: string[] | null;
   cc_emails: string[] | null;
   flags: string[] | null;
-  window_status: WindowStatus;
   internal_date: Date;
   body_text: string | null;
   body_plain: string | null;
@@ -253,7 +250,6 @@ export function mapMessageRow(
     date: row.internal_date.toISOString(),
     // \Recent describes one IMAP session, not the message.
     flags: (row.flags ?? []).filter((flag) => flag.toLowerCase() !== "\\recent"),
-    window_status: row.window_status,
     body: cleaned.text,
     body_content_status: bodyOmissions.length > 0
       ? "partial"

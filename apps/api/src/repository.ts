@@ -1,7 +1,7 @@
 import { IncompleteUidListError } from "./imap-client.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
-import type { AppConfig } from "./config.js";
+import { getWindowCutoff, type AppConfig } from "./config.js";
 import { buildSearchExtract } from "./body-store.js";
 import {
   EVIDENCE_VERSIONS_WITHOUT_REFETCH,
@@ -320,7 +320,6 @@ async function runMetadataWriteWithDeadline<T extends QueryResultRow>(
 }
 
 export interface MetadataWriteOptions {
-  preserveExistingFlags?: boolean;
   deadlineAt?: number;
   signal?: AbortSignal;
 }
@@ -555,8 +554,6 @@ const ACCOUNT_SUMMARY_COLUMNS = `
   body_fetch_policy,
   live_window_days,
   historical_backfill_mode,
-  archive_refresh_interval,
-  archive_flag_sync,
   max_backfill_rate,
   sync_state,
   sync_state_reason,
@@ -587,8 +584,6 @@ const ACCOUNT_DETAILS_COLUMNS = `
   a.body_fetch_policy,
   a.live_window_days,
   a.historical_backfill_mode,
-  a.archive_refresh_interval,
-  a.archive_flag_sync,
   a.max_backfill_rate,
   a.sync_state,
   a.sync_state_reason,
@@ -880,7 +875,7 @@ export class MirrorRepository {
           ON b.message_id = m.id
         WHERE m.account_id = $1
           AND m.deleted_in_provider = false
-          AND m.window_status = 'IN_WINDOW'
+          AND m.internal_date >= $2
         GROUP BY m.folder_path
       )
       SELECT
@@ -925,7 +920,7 @@ export class MirrorRepository {
       WHERE f.account_id = $1
       ORDER BY f.sync_priority, f.path
       `,
-      [id]
+      [id, getWindowCutoff(storedAccount)]
     );
 
     return {
@@ -938,8 +933,6 @@ export class MirrorRepository {
     if (
       input.bodyFetchPolicy === undefined
       && input.historicalBackfillMode === undefined
-      && input.archiveRefreshInterval === undefined
-      && input.archiveFlagSync === undefined
       && input.maxBackfillRate === undefined
     ) {
       const existing = await this.pool.query<AccountSummary & ProtectedMetadataColumns>(
@@ -954,18 +947,14 @@ export class MirrorRepository {
       UPDATE public.imap_accounts
       SET
         historical_backfill_mode = COALESCE($2::text, historical_backfill_mode),
-        archive_refresh_interval = COALESCE($3::text, archive_refresh_interval),
-        archive_flag_sync = COALESCE($4::boolean, archive_flag_sync),
-        max_backfill_rate = COALESCE($5::text, max_backfill_rate),
-        body_fetch_policy = COALESCE($6::text, body_fetch_policy)
+        max_backfill_rate = COALESCE($3::text, max_backfill_rate),
+        body_fetch_policy = COALESCE($4::text, body_fetch_policy)
       WHERE id = $1
       RETURNING ${ACCOUNT_SUMMARY_COLUMNS}
       `,
       [
         accountId,
         input.historicalBackfillMode ?? null,
-        input.archiveRefreshInterval ?? null,
-        input.archiveFlagSync ?? null,
         input.maxBackfillRate ?? null,
         input.bodyFetchPolicy ?? null
       ]
@@ -1629,19 +1618,6 @@ export class MirrorRepository {
     );
   }
 
-  async runExpiryJob(): Promise<{ expired: number }> {
-    const result = await this.pool.query(
-      `
-      UPDATE public.imap_messages
-      SET window_status = 'EXPIRED'
-      WHERE window_status = 'IN_WINDOW'
-        AND internal_date < now() - ($1::int * interval '1 day')
-      `,
-      [this.config.WINDOW_DAYS]
-    );
-    return { expired: result.rowCount ?? 0 };
-  }
-
   async runPurgeJob(): Promise<{ purged: number }> {
     const client = await this.pool.connect();
     try {
@@ -1864,12 +1840,11 @@ export class MirrorRepository {
     return pruned;
   }
 
-  async runRetentionJobs(): Promise<{ expired: number; purged: number; prunedEvents: number; prunedRuns: number }> {
-    const { expired } = await this.runExpiryJob();
+  async runRetentionJobs(): Promise<{ purged: number; prunedEvents: number; prunedRuns: number }> {
     const { purged } = await this.runPurgeJob();
     const { prunedEvents } = await this.runSyncEventPruneJob();
     const { prunedRuns } = await this.runSyncRunPruneJob();
-    return { expired, purged, prunedEvents, prunedRuns };
+    return { purged, prunedEvents, prunedRuns };
   }
 
   async upsertDiscoveredFolders(
@@ -1982,9 +1957,9 @@ export class MirrorRepository {
         WHERE account_id = $1
           AND folder_path = $2
           AND deleted_in_provider = false
-          AND window_status = 'IN_WINDOW'
+          AND internal_date >= $3
         `,
-        [account.id, row.path]
+        [account.id, row.path, getWindowCutoff(account)]
       );
       await this.logEvent(account.id, null, null, row.path, null, "FOLDER_MISSING", {
         reason: "FOLDER_MISSING_GRACE_EXCEEDED"
@@ -2615,7 +2590,6 @@ export class MirrorRepository {
             backfill_target_max_uid = NULL,
             backfill_oldest_uid_synced = NULL,
             backfill_since_date = NULL,
-            last_archive_refresh_at = NULL,
             status = 'NEEDS_FULL_RESYNC',
             uidvalidity_reset_count = CASE
               WHEN last_uidvalidity_reset_at IS NULL
@@ -2677,7 +2651,6 @@ export class MirrorRepository {
     folder: ImapFolder,
     uidValidity: number,
     messages: MessageMetadata[],
-    windowCutoff: Date,
     options: MetadataWriteOptions = {}
   ): Promise<ImapMessage[]> {
     if (messages.length === 0) return [];
@@ -2847,7 +2820,6 @@ export class MirrorRepository {
             internal_date: message.internalDate.toISOString(),
             size_bytes: message.sizeBytes,
             flags: message.flags,
-            window_status: message.internalDate < windowCutoff ? "HISTORICAL" : "IN_WINDOW",
             protected_metadata_base64:
               protectedMessage.columns.protected_metadata?.toString("base64") ?? null,
             protected_metadata_version:
@@ -2889,7 +2861,6 @@ export class MirrorRepository {
             flags text[],
             headers_json jsonb,
             mime_structure jsonb,
-            window_status text,
             protected_metadata_base64 text,
             protected_metadata_version smallint,
             protected_metadata_key_version integer,
@@ -2924,7 +2895,6 @@ export class MirrorRepository {
           flags,
           headers_json,
           mime_structure,
-          window_status,
           protected_metadata,
           protected_metadata_version,
           protected_metadata_key_version,
@@ -2958,7 +2928,6 @@ export class MirrorRepository {
           input.flags,
           input.headers_json,
           input.mime_structure,
-          input.window_status,
           CASE
             WHEN input.protected_metadata_base64 IS NULL THEN NULL
             ELSE decode(input.protected_metadata_base64, 'base64')
@@ -2989,7 +2958,7 @@ export class MirrorRepository {
           cc_emails = EXCLUDED.cc_emails,
           cc_names = EXCLUDED.cc_names,
           bcc_emails = EXCLUDED.bcc_emails,
-          flags = CASE WHEN $6::boolean THEN public.imap_messages.flags ELSE EXCLUDED.flags END,
+          flags = EXCLUDED.flags,
           headers_json = EXCLUDED.headers_json,
           mime_structure = EXCLUDED.mime_structure,
           protected_metadata = EXCLUDED.protected_metadata,
@@ -3006,8 +2975,7 @@ export class MirrorRepository {
             accountId,
             folder.id,
             folder.path,
-            uidValidity,
-            options.preserveExistingFlags === true
+            uidValidity
           ],
           deadlineAt,
           metadataWriteDeadline.remainingMs
@@ -3214,22 +3182,8 @@ export class MirrorRepository {
     accountId: string,
     folder: ImapFolder,
     uidValidity: number,
-    messages: MessageMetadata[],
-    windowCutoff: Date
-  ): Promise<{ messages: ImapMessage[]; flagsChanged: number }>;
-  async applyFlagScan(
-    accountId: string,
-    folder: ImapFolder,
-    uidValidity: number,
     messages: MessageFlagSnapshot[],
-    options?: { deadlineAt?: number; signal?: AbortSignal }
-  ): Promise<{ messages: ImapMessage[]; flagsChanged: number }>;
-  async applyFlagScan(
-    accountId: string,
-    folder: ImapFolder,
-    uidValidity: number,
-    messages: MessageFlagSnapshot[] | MessageMetadata[],
-    options: Date | { deadlineAt?: number; signal?: AbortSignal } = {}
+    options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<{ messages: ImapMessage[]; flagsChanged: number }> {
     if (messages.length === 0) return { messages: [], flagsChanged: 0 };
     if (messages.length > MAX_SYNC_BATCH_SIZE) {
@@ -3241,102 +3195,6 @@ export class MirrorRepository {
     const uniqueUids = new Set(messages.map((message) => message.uid));
     if (uniqueUids.size !== messages.length) {
       throw new Error("Flag scan batch contains duplicate UIDs");
-    }
-
-    if (options instanceof Date) {
-      // Preserve the exported pre-projection API: Date callers supplied complete
-      // metadata and expected headers, MIME, and attachments to refresh too.
-      const metadata = messages as MessageMetadata[];
-      const uids = metadata.map((message) => message.uid);
-      const boundedExisting = await this.pool.query<Pick<ImapMessage, "id" | "uid" | "flags"> & {
-        stored_bytes: string;
-        stored_flags: string;
-      }>(
-        `
-        WITH candidates AS MATERIALIZED (
-          SELECT id,
-                 uid,
-                 flags,
-                 octet_length(to_json(flags)::text)::bigint AS flag_bytes,
-                 cardinality(flags)::bigint AS flag_count
-          FROM public.imap_messages
-          WHERE account_id = $1
-            AND folder_path = $2
-            AND uidvalidity = $3
-            AND uid = ANY($4::bigint[])
-            AND deleted_in_provider = false
-        ), totals AS (
-          SELECT COALESCE(sum(flag_bytes), 0)::bigint AS stored_bytes,
-                 COALESCE(sum(flag_count), 0)::bigint AS stored_flags
-          FROM candidates
-        )
-        SELECT candidate.id,
-               candidate.uid,
-               candidate.flags,
-               totals.stored_bytes::text,
-               totals.stored_flags::text
-        FROM totals
-        LEFT JOIN candidates AS candidate
-          ON totals.stored_bytes <= $5::bigint
-         AND totals.stored_flags <= $6::bigint
-        `,
-        [
-          accountId,
-          folder.path,
-          uidValidity,
-          uids,
-          MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
-          MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH
-        ]
-      );
-      const storedBytes = Number(boundedExisting.rows[0]?.stored_bytes ?? 0);
-      const storedFlags = Number(boundedExisting.rows[0]?.stored_flags ?? 0);
-      if (storedBytes > MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES
-        || storedFlags > MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH) {
-        throw new Error("Stored flags exceed the aggregate logical event limit");
-      }
-      const existing = boundedExisting.rows.filter(
-        (row): row is typeof row & { id: string } => typeof row.id === "string"
-      );
-      const existingByUid = new Map(existing.map((row) => [Number(row.uid), row]));
-      const knownMessages = metadata.filter((message) => existingByUid.has(message.uid));
-      const changed = metadata
-        .map((message) => {
-          const row = existingByUid.get(message.uid);
-          if (!row) return null;
-          assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
-          if (flagsEqual(row.flags, message.flags)) return null;
-          return {
-            row,
-            message,
-            previousFlags: normalizeFlags(row.flags),
-            nextFlags: normalizeFlags(message.flags)
-          };
-        })
-        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-
-      const rows = await this.upsertMessages(
-        accountId,
-        folder,
-        uidValidity,
-        knownMessages,
-        options
-      );
-      for (const change of changed) {
-        await this.logEvent(
-          accountId,
-          null,
-          change.row.id,
-          folder.path,
-          change.message.uid,
-          "FLAGS_CHANGED",
-          {
-            previousFlags: change.previousFlags,
-            nextFlags: change.nextFlags
-          }
-        );
-      }
-      return { messages: rows, flagsChanged: changed.length };
     }
 
     const uids = messages.map((message) => message.uid);
@@ -4685,25 +4543,13 @@ export class MirrorRepository {
                 WHERE m.account_id = f.account_id
                   AND m.folder_path = f.path
                   AND m.deleted_in_provider = false
-                  AND m.window_status = 'HISTORICAL'
+                  AND m.internal_date < $5
                   AND (
                     m.body_fetched_at IS NULL
-                    OR NOT coalesce(b.structured_evidence_extractor_version = ANY($5::text[]), false)
+                    OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
                   )
               )
             THEN 'body'
-            WHEN $3::text = 'weekly'
-              AND (
-                f.last_archive_refresh_at IS NULL
-                OR f.last_archive_refresh_at <= now() - interval '7 days'
-              )
-            THEN 'refresh'
-            WHEN $3::text = 'monthly'
-              AND (
-                f.last_archive_refresh_at IS NULL
-                OR f.last_archive_refresh_at <= now() - interval '30 days'
-              )
-            THEN 'refresh'
             ELSE NULL
           END AS history_backlog_reason
         FROM public.imap_folders f
@@ -4722,27 +4568,25 @@ export class MirrorRepository {
         CASE history_backlog_reason
           WHEN 'metadata' THEN 0
           WHEN 'snapshot' THEN 1
-          WHEN 'body' THEN 2
-          WHEN 'refresh' THEN 3
-          ELSE 4
+          ELSE 2
         END,
         sync_priority,
         path
-      LIMIT $4
+      LIMIT $3
       `,
       [
         account.id,
         account.historical_backfill_mode,
-        account.archive_refresh_interval,
         limit,
-        EVIDENCE_VERSIONS_WITHOUT_REFETCH
+        EVIDENCE_VERSIONS_WITHOUT_REFETCH,
+        getWindowCutoff(account)
       ]
     );
     return result.rows;
   }
 
   async getHistoricalBodyBacklog(
-    accountId: string,
+    account: ImapAccount,
     folder: ImapFolder,
     limit: number
   ): Promise<ImapMessage[]> {
@@ -4754,15 +4598,15 @@ export class MirrorRepository {
       WHERE m.account_id = $1
         AND m.folder_path = $2
         AND m.deleted_in_provider = false
-        AND m.window_status = 'HISTORICAL'
+        AND m.internal_date < $5
         AND (
           m.body_fetched_at IS NULL
           OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
         )
-      ORDER BY m.uid DESC
+      ORDER BY m.internal_date DESC, m.uid DESC
       LIMIT $3
       `,
-      [accountId, folder.path, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH]
+      [account.id, folder.path, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, getWindowCutoff(account)]
     );
     return await Promise.all(result.rows.map((row) => this.revealMessage(row)));
   }
@@ -4785,7 +4629,6 @@ export class MirrorRepository {
           backfill_oldest_uid_synced = $3,
           backfill_since_date = $5,
           historical_target_count = $4,
-          last_archive_refresh_at = CASE WHEN $4::int = 0 THEN now() ELSE last_archive_refresh_at END,
           last_progress_at = now(),
           last_progress_note = 'history_backfill_snapshot'
       WHERE id = $1
@@ -4811,7 +4654,6 @@ export class MirrorRepository {
       UPDATE public.imap_folders
       SET backfill_oldest_uid_synced = $2,
           backfill_in_progress = CASE WHEN $4::boolean THEN false ELSE backfill_in_progress END,
-          last_archive_refresh_at = CASE WHEN $4::boolean THEN now() ELSE last_archive_refresh_at END,
           last_progress_at = now(),
           last_progress_uid = $3,
           last_progress_note = CASE
@@ -4853,7 +4695,6 @@ export class MirrorRepository {
       `
       UPDATE public.imap_folders
       SET backfill_in_progress = false,
-          last_archive_refresh_at = now(),
           last_progress_at = now(),
           last_progress_note = 'history_backfill_complete'
       WHERE id = $1
@@ -4872,8 +4713,8 @@ export class MirrorRepository {
     const policy = account.body_fetch_policy || (this.config.BODY_FETCH_POLICY as BodyFetchPolicy);
     if (policy === "lazy") return [];
 
-    const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $4" : "";
-    const params: unknown[] = [account.id, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH];
+    const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $5" : "";
+    const params: unknown[] = [account.id, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, getWindowCutoff(account)];
     if (policy === "priority_then_backfill") params.push(this.config.PRIORITY_CUTOFF);
 
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
@@ -4892,7 +4733,7 @@ export class MirrorRepository {
         AND f.missing_since IS NULL
         AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND m.deleted_in_provider = false
-        AND m.window_status = 'IN_WINDOW'
+        AND m.internal_date >= $4
         AND (
           m.body_fetched_at IS NULL
           OR NOT coalesce(b.structured_evidence_extractor_version = ANY($3::text[]), false)

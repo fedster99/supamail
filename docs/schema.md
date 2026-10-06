@@ -116,26 +116,28 @@ Messages are soft-deleted when reconciliation, folder disappearance, UIDVALIDITY
 
 `POST /accounts/:id/folders/track` lets operators opt an existing non-provider-excluded folder back into sync past the folder-count cap. The opt-in is persisted on the folder so the next discovery pass does not reapply `folder_count_cap_exceeded` to that path.
 
-`imap_accounts` stores `body_fetch_policy` plus the account-level lane settings consumed by the history lane: `live_window_days`, `historical_backfill_mode`, `archive_refresh_interval`, `archive_flag_sync`, and `max_backfill_rate`. The columns are type-safe Postgres fields with CHECK constraints and defaults. `PATCH /accounts/:id/settings` can update `bodyFetchPolicy` with `immediate`, `lazy`, or `priority_then_backfill`, together with the mutable historical/archive/backfill-rate settings. In v0.1, `live_window_days` remains immutable after account creation.
+`imap_accounts` stores `body_fetch_policy` plus the account-level lane settings: `live_window_days` (the live window, default 90), `historical_backfill_mode`, and `max_backfill_rate`. The columns are type-safe Postgres fields with CHECK constraints and defaults. `PATCH /accounts/:id/settings` can update `bodyFetchPolicy` with `immediate`, `lazy`, or `priority_then_backfill`, together with `historicalBackfillMode` and `maxBackfillRate`. In v0.1, `live_window_days` remains immutable after account creation. The `archive_refresh_interval` and `archive_flag_sync` columns are no longer read (ADR 0039) and are removed by a later migration.
 
 `imap_folders` stores incremental progress counters: `headers_synced_count`, `bodies_fetched_count`, `live_window_target_count`, and `historical_target_count`. Header counters advance when new mailbox rows are inserted, body counters advance only on the first stored body for a message, and UIDVALIDITY resets clear the live and historical progress for that folder. These cumulative counters remain telemetry; they are not current live or priority body coverage.
 
-Historical backfill uses the folder-level `backfill_in_progress`, `backfill_target_max_uid`, `backfill_oldest_uid_synced`, `backfill_since_date`, and `last_archive_refresh_at` fields. The history lane snapshots UIDs older than the live window, walks them newest-first in resumable batches, stores metadata as `window_status = 'HISTORICAL'`, and fetches historical bodies when `historical_backfill_mode = 'metadata_and_bodies'`. Deletions are not the history lane's job: exact reconcile compares every live row, in any `window_status`, with the folder's complete UID list (ADR 0038). A QRESYNC `VANISHED` UID also tombstones its row in any lane.
+Historical backfill uses the folder-level `backfill_in_progress`, `backfill_target_max_uid`, `backfill_oldest_uid_synced`, and `backfill_since_date` fields. The history lane snapshots UIDs older than the live window once, walks them newest-first in resumable batches, and fetches historical bodies when `historical_backfill_mode = 'metadata_and_bodies'`. It is never re-walked: exact reconcile compares every live row, whatever its age, with the folder's complete UID list (ADR 0038), and new mail takes every new UID whatever its date (ADR 0039).
 
-`0021_row_accurate_body_progress` replaces `imap_account_progress`. Live and priority body targets now come from active `IN_WINDOW` `imap_messages` joined to tracked `imap_folders` whose `missing_since` is NULL and whose status is neither `MISSING` nor `PENDING_VERIFICATION`; provider-deleted rows are excluded. Migration `0022` tightens completion for the two-stage store: a fetched body counts only when `body_fetched_at` is set, an `imap_message_bodies` row exists, and `raw_truncated = false`. Priority coverage applies the existing `sync_priority <= 10` cutoff. Live-header and historical percentages continue to use the cumulative folder counters.
+The live window is computed, never stored: a row is in the window when `internal_date >= now() - live_window_days` for its Mailbox Account. `imap_messages.window_status` and `imap_folders.last_archive_refresh_at` are no longer read or written and are removed by a later migration.
+
+`0021_row_accurate_body_progress` replaces `imap_account_progress`. Live and priority body targets now come from active `imap_messages` dated inside the account window (since `0030`) joined to tracked `imap_folders` whose `missing_since` is NULL and whose status is neither `MISSING` nor `PENDING_VERIFICATION`; provider-deleted rows are excluded. Migration `0022` tightens completion for the two-stage store: a fetched body counts only when `body_fetched_at` is set, an `imap_message_bodies` row exists, and `raw_truncated = false`. Priority coverage applies the existing `sync_priority <= 10` cutoff. Live-header and historical percentages continue to use the cumulative folder counters.
 
 `GET /accounts/:id` exposes the account percentages plus a nullable `estimated_full_sync_at`; the estimate remains null until a durable rate model exists. Each folder row also exposes row-current `live_bodies_fetched_count` and `live_bodies_target_count`. Its `bodies_pct` uses those fields instead of the cumulative `bodies_fetched_count`. Folder rows cover every returned folder, including untracked, missing, and pending folders. The account roll-up includes only active eligible folders, so folder targets do not always sum to the account target.
 
-The same migration adds the partial `imap_messages_live_body_progress_idx` on
-`(account_id, folder_path, id)` for active `IN_WINDOW` rows. Large existing
-mirrors should create this exact index concurrently before applying the
-transactional migration:
+Migration `0030_window_from_message_date` replaces the lane-predicated body
+indexes with `imap_messages_unfetched_body_idx`, which serves the live and the
+history body backlogs. Large existing mirrors should create this exact index
+concurrently before applying the transactional migration:
 
 ```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_live_body_progress_idx
-  ON public.imap_messages (account_id, folder_path, id)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_unfetched_body_idx
+  ON public.imap_messages (account_id, folder_path, internal_date, uid)
   WHERE deleted_in_provider = false
-    AND window_status = 'IN_WINDOW';
+    AND body_fetched_at IS NULL;
 ```
 
 `imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a missing-mailbox verification pass. Missing-mailbox errors stamp `missing_since`, force `imap_accounts.next_folder_discovery_at = now()`, and move the folder into `PENDING_VERIFICATION`. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.

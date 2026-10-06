@@ -28,7 +28,6 @@ const noText = parseTextTerms("");
 
 const baseCompileOptions: CompileOptions = {
   accountIds: null,
-  windowStatus: null,
   includeDeleted: false,
   sort: "smart",
   limit: 25,
@@ -311,7 +310,7 @@ describe("compileSearch", () => {
       "count(*) OVER (PARTITION BY d.account_id, d.conversation_key)::int AS thread_count"
     );
     expect(compiled.text).toContain("SELECT DISTINCT ON (c.account_id, c.conversation_key) c.*");
-    expect(compiled.text).toContain("page.window_status, page.internal_date, page.conversation_id");
+    expect(compiled.text).toContain("page.internal_date, page.conversation_id");
   });
 
   it("resolves a thread: selector only through the active assignment view and keeps the value bound", () => {

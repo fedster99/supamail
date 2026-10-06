@@ -493,7 +493,6 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
   ) =>
     console.log(JSON.stringify({
       event: "worker.retention.completed",
-      expired: r.expired,
       purged: r.purged,
       prunedEvents: r.prunedEvents,
       prunedRuns: r.prunedRuns,

@@ -304,10 +304,9 @@ describe("createDraft", () => {
     expect(mocks.getFoldersForWake).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111", ["Drafts"]);
     expect(mocks.upsertMessages).toHaveBeenCalledTimes(1);
     expect(mocks.upsertMessages.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
-    const [accountId, folder, uidValidity, [metadata], windowCutoff, writeOptions] = mocks.upsertMessages.mock.calls[0];
+    const [accountId, folder, uidValidity, [metadata], writeOptions] = mocks.upsertMessages.mock.calls[0];
     const [, raw, , savedAt] = mocks.append.mock.calls[0];
     expect([accountId, folder, uidValidity]).toEqual(["11111111-1111-4111-8111-111111111111", draftsFolder, 100]);
-    expect(windowCutoff).toBeInstanceOf(Date);
     // A short deadline: the provider already holds the draft.
     expect(writeOptions.deadlineAt).toBeGreaterThan(Date.now());
     expect(writeOptions.deadlineAt).toBeLessThanOrEqual(Date.now() + 5_000);

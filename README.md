@@ -287,15 +287,15 @@ Folder rows still report untracked, missing, and pending folders, so their
 targets do not always sum to the active account target. The older
 `bodies_fetched_count` remains cumulative telemetry.
 
-Migration `0021_row_accurate_body_progress` adds the partial
-`imap_messages_live_body_progress_idx`. On a large existing mirror, create this
+Migration `0030_window_from_message_date` adds the partial
+`imap_messages_unfetched_body_idx`. On a large existing mirror, create this
 exact index concurrently before you apply the transactional migration:
 
 ```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_live_body_progress_idx
-  ON public.imap_messages (account_id, folder_path, id)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_unfetched_body_idx
+  ON public.imap_messages (account_id, folder_path, internal_date, uid)
   WHERE deleted_in_provider = false
-    AND window_status = 'IN_WINDOW';
+    AND body_fetched_at IS NULL;
 ```
 
 SupaMail stores raw RFC822/MIME bytes plus parsed text, HTML, headers, MIME structure, selected text part, and parser warnings.

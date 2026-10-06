@@ -27,8 +27,6 @@ function makeAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
     body_fetch_policy: "lazy",
     live_window_days: 90,
     historical_backfill_mode: "metadata_and_bodies",
-    archive_refresh_interval: "monthly",
-    archive_flag_sync: false,
     max_backfill_rate: "normal",
     sync_state: "HEALTHY",
     sync_state_reason: null,
@@ -129,7 +127,6 @@ function makeFolder(overrides: Partial<ImapFolder> = {}): ImapFolder {
     backfill_target_max_uid: null,
     backfill_oldest_uid_synced: null,
     backfill_since_date: null,
-    last_archive_refresh_at: null,
     created_at: now,
     updated_at: now,
     ...overrides
@@ -173,8 +170,6 @@ function buildApp(options: {
     updateAccountSettings: vi.fn(options.updateAccountSettings ?? (async (_accountId, input) => makeAccount({
       body_fetch_policy: input.bodyFetchPolicy ?? "lazy",
       historical_backfill_mode: input.historicalBackfillMode ?? "metadata_and_bodies",
-      archive_refresh_interval: input.archiveRefreshInterval ?? "monthly",
-      archive_flag_sync: input.archiveFlagSync ?? false,
       max_backfill_rate: input.maxBackfillRate ?? "normal"
     }))),
     trackFolder: vi.fn(options.trackFolder ?? (async (_accountId: string, path: string) => makeFolder({ path }))),
@@ -508,8 +503,6 @@ describe("API safety", () => {
       headers: { ...auth(), "content-type": "application/json" },
       body: JSON.stringify({
         historicalBackfillMode: "metadata_only",
-        archiveRefreshInterval: "weekly",
-        archiveFlagSync: true,
         maxBackfillRate: "aggressive"
       })
     });
@@ -517,16 +510,12 @@ describe("API safety", () => {
     await expect(valid.json()).resolves.toMatchObject({
       account: {
         historical_backfill_mode: "metadata_only",
-        archive_refresh_interval: "weekly",
-        archive_flag_sync: true,
         max_backfill_rate: "aggressive",
         live_window_days: 90
       }
     });
     expect(repository.updateAccountSettings).toHaveBeenCalledWith(accountId, {
       historicalBackfillMode: "metadata_only",
-      archiveRefreshInterval: "weekly",
-      archiveFlagSync: true,
       maxBackfillRate: "aggressive"
     });
   });
@@ -552,8 +541,6 @@ describe("API safety", () => {
       expect(repository.updateAccountSettings).toHaveBeenCalledWith(accountId, {
         bodyFetchPolicy,
         historicalBackfillMode: undefined,
-        archiveRefreshInterval: undefined,
-        archiveFlagSync: undefined,
         maxBackfillRate: undefined
       });
     }

@@ -53,7 +53,6 @@ describe("expandConcepts", () => {
 
 const baseOptions: CompileOptions = {
   accountIds: null,
-  windowStatus: null,
   includeDeleted: false,
   sort: "smart",
   limit: 25,

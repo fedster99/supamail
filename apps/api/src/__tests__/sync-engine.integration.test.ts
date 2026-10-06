@@ -9,7 +9,7 @@ import type {
   MirrorImapClient,
   QresyncRequest
 } from "../imap-client.js";
-import { resetConfigForTests } from "../config.js";
+import { getWindowCutoff, resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
 import type { ImapFolder } from "../types.js";
@@ -1425,8 +1425,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
   it("scans the full active window for a forced flag wake without CONDSTORE", async () => {
     const h = await setupIntegration("status-old-flag-no-condstore", {
       INITIAL_SYNC_BATCH_SIZE: 50,
-      FLAG_DIFF_WINDOW_DAYS: 7,
-      WINDOW_DAYS: 90
+      FLAG_DIFF_WINDOW_DAYS: 7
     });
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
@@ -4440,7 +4439,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       UPDATE public.imap_accounts
       SET body_fetch_policy = 'immediate',
           historical_backfill_mode = 'metadata_and_bodies',
-          archive_refresh_interval = 'monthly',
           max_backfill_rate = 'small'
       WHERE id = $1
       `,
@@ -4490,6 +4488,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ];
 
     const events: string[] = [];
+    const lane = (message: { internal_date: Date | string }) =>
+      new Date(message.internal_date) < getWindowCutoff({ live_window_days: 90 }) ? "HISTORICAL" : "IN_WINDOW";
     const engine = new MirrorEngine({
       pool: h.pool,
       config: h.config,
@@ -4497,10 +4497,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       clientFactory: async () => new FixtureImapClient(folders),
       hooks: {
         onMessageUpsert(message) {
-          events.push(`${message.window_status === "HISTORICAL" ? "history" : "hot"}:${message.folder_path}:${message.uid}`);
+          events.push(`${lane(message) === "HISTORICAL" ? "history" : "hot"}:${message.folder_path}:${message.uid}`);
         },
         onBodyFetched(message) {
-          events.push(`body:${message.window_status}:${message.folder_path}:${message.uid}`);
+          events.push(`body:${lane(message)}:${message.folder_path}:${message.uid}`);
         }
       }
     });
@@ -4519,15 +4519,13 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         headers_synced_count: number;
         bodies_fetched_count: number;
         backfill_in_progress: boolean;
-        last_archive_refresh_at: Date | null;
       }>(
         `
         SELECT
           historical_target_count,
           headers_synced_count,
           bodies_fetched_count,
-          backfill_in_progress,
-          last_archive_refresh_at
+          backfill_in_progress
         FROM public.imap_folders
         WHERE account_id = $1
           AND path = 'INBOX'
@@ -4541,7 +4539,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       bodies_fetched_count: 2,
       backfill_in_progress: false
     });
-    expect(archive.last_archive_refresh_at).not.toBeNull();
 
     const progress = (
       await h.pool.query<{
@@ -4608,7 +4605,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
             FROM public.imap_messages m
             WHERE m.account_id = f.account_id
               AND m.folder_path = f.path
-              AND m.window_status = 'HISTORICAL'
+              AND m.internal_date < now() - interval '90 days'
               AND m.deleted_in_provider = false
           ) AS historical_message_count
         FROM public.imap_folders f
@@ -4637,7 +4634,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       UPDATE public.imap_accounts
       SET body_fetch_policy = 'immediate',
           historical_backfill_mode = 'metadata_and_bodies',
-          archive_refresh_interval = 'monthly',
           max_backfill_rate = 'small'
       WHERE id = $1
       `,
@@ -4711,7 +4707,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       SELECT count(*)::text AS count
       FROM public.imap_messages
       WHERE account_id = $1
-        AND window_status = 'HISTORICAL'
+        AND internal_date < now() - interval '90 days'
         AND body_fetched_at IS NOT NULL
       `,
       [h.account.id]
@@ -4905,7 +4901,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       UPDATE public.imap_accounts
       SET body_fetch_policy = 'immediate',
           historical_backfill_mode = 'metadata_and_bodies',
-          archive_refresh_interval = 'monthly',
           max_backfill_rate = 'small'
       WHERE id = $1
       `,
@@ -4950,7 +4945,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
           await h.pool.query<{ c: string }>(
             `SELECT count(*)::text AS c FROM public.imap_messages
              WHERE account_id = $1 AND folder_path = 'INBOX'
-               AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+               AND internal_date < now() - interval '90 days' AND deleted_in_provider = false`,
             [h.account.id]
           )
         ).rows[0].c
@@ -5061,7 +5056,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       UPDATE public.imap_accounts
       SET body_fetch_policy = 'immediate',
           historical_backfill_mode = 'metadata_and_bodies',
-          archive_refresh_interval = 'monthly',
           max_backfill_rate = 'aggressive'
       WHERE id = $1
       `,
@@ -5088,7 +5082,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
           await h.pool.query<{ c: string }>(
             `SELECT count(*)::text AS c FROM public.imap_messages
              WHERE account_id = $1 AND folder_path = 'INBOX'
-               AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+               AND internal_date < now() - interval '90 days' AND deleted_in_provider = false`,
             [h.account.id]
           )
         ).rows[0].c
@@ -5148,7 +5142,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       UPDATE public.imap_accounts
       SET body_fetch_policy = 'immediate',
           historical_backfill_mode = 'metadata_and_bodies',
-          archive_refresh_interval = 'monthly',
           max_backfill_rate = 'small'
       WHERE id = $1
       `,
@@ -5176,7 +5169,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
           await h.pool.query<{ c: string }>(
             `SELECT count(*)::text AS c FROM public.imap_messages
              WHERE account_id = $1 AND folder_path = 'INBOX'
-               AND window_status = 'HISTORICAL' AND deleted_in_provider = false
+               AND internal_date < now() - interval '90 days' AND deleted_in_provider = false
                AND uidvalidity = $2`,
             [h.account.id, uidvalidity]
           )
@@ -5229,6 +5222,104 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(await liveHistoricalUnder(85_999)).toBe(3);
   });
 
+  describe("window from the message date", () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const message = (uid: number, internalDate: Date) => makeTextMessage({
+      uid,
+      subject: `m-${uid}`,
+      from: "a@x.test",
+      to: "u@x.test",
+      body: `m-${uid}`,
+      internalDate
+    });
+
+    async function setup(suite: string, historicalBackfillMode: string, messages: FixtureFolder["messages"]) {
+      const h = await setupIntegration(suite, {
+        BODY_BACKFILL_BATCH_SIZE: 50,
+        INITIAL_SYNC_BATCH_SIZE: 50,
+        MAX_RR_FOLDERS_PER_CYCLE: 5
+      });
+      activeAccountIds.push(h.account.id);
+      await h.pool.query(
+        `UPDATE public.imap_accounts
+         SET body_fetch_policy = 'lazy', historical_backfill_mode = $2, max_backfill_rate = 'aggressive'
+         WHERE id = $1`,
+        [h.account.id, historicalBackfillMode]
+      );
+      const folders: FixtureFolder[] = [{
+        path: "INBOX", delimiter: "/", specialUse: "\\Inbox", uidValidity: 87_001, messages
+      }];
+      const uids = async () => (await h.pool.query<{ uid: string }>(
+        `SELECT uid::text FROM public.imap_messages m
+         WHERE account_id = $1 AND deleted_in_provider = false ORDER BY m.uid`,
+        [h.account.id]
+      )).rows.map((row) => Number(row.uid));
+      return { h, folders, uids };
+    }
+
+    it("mirrors new mail at once whatever its date, without importing the archive as new mail", async () => {
+      // History off: only the window and new mail are mirrored.
+      const { h, folders, uids } = await setup("window-new-old-mail", "off", [
+        message(1, oldDate),
+        message(2, oldDate),
+        message(3, new Date())
+      ]);
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await uids()).toEqual([3]);
+
+      // An old email moved into the folder gets a new UID: it is new mail.
+      folders[0].messages.push(message(4, oldDate));
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await uids()).toEqual([3, 4]);
+    });
+
+    it("starts new mail at UIDNEXT when the window is empty at the first sync", async () => {
+      const { h, folders, uids } = await setup("window-empty-archive", "off", [
+        message(1, oldDate),
+        message(2, oldDate)
+      ]);
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      folders[0].messages.push(message(3, new Date()));
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      // The archive stays the history lane's job; only the new UID arrives.
+      expect(await uids()).toEqual([3]);
+    });
+
+    it("backfills history once and never re-walks it", async () => {
+      const { h, folders, uids } = await setup("window-history-once", "metadata_only", [
+        message(1, oldDate),
+        message(2, oldDate),
+        message(3, new Date())
+      ]);
+      const beforeSearches: string[] = [];
+      class RecordingClient extends FixtureImapClient {
+        override async search(query: Record<string, unknown>, options: { uid: true }) {
+          if (query.before instanceof Date) beforeSearches.push(String(query.uid ?? "snapshot"));
+          return await super.search(query, options);
+        }
+      }
+      const engine = h.buildEngine({ folders, clientFactory: async () => new RecordingClient(folders) });
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await uids()).toEqual([1, 2, 3]);
+      expect(beforeSearches.length).toBeGreaterThan(0);
+
+      // Months later the archive is not walked again; reconcile owns deletions.
+      beforeSearches.length = 0;
+      // The refresh timestamp the old monthly re-walk used is long past.
+      await h.pool.query(
+        `UPDATE public.imap_folders SET last_archive_refresh_at = now() - interval '400 days' WHERE account_id = $1`,
+        [h.account.id]
+      );
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(beforeSearches).toEqual([]);
+    });
+  });
+
   describe("lane-independent reconcile", () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const message = (uid: number, internalDate: Date) => makeTextMessage({
@@ -5251,7 +5342,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         `UPDATE public.imap_accounts
          SET body_fetch_policy = 'lazy',
              historical_backfill_mode = 'metadata_only',
-             archive_refresh_interval = 'monthly',
              max_backfill_rate = 'aggressive'
          WHERE id = $1`,
         [h.account.id]
@@ -5269,7 +5359,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     async function rows(h: Awaited<ReturnType<typeof setupIntegration>>) {
       return (
         await h.pool.query<{ uid: string; window_status: string; deleted_in_provider: boolean; deleted_reason: string | null }>(
-          `SELECT uid::text, window_status, deleted_in_provider, deleted_reason
+          `SELECT uid::text,
+                  CASE WHEN internal_date >= now() - interval '90 days' THEN 'IN_WINDOW' ELSE 'HISTORICAL' END AS window_status,
+                  deleted_in_provider, deleted_reason
            FROM public.imap_messages m WHERE account_id = $1 ORDER BY m.uidvalidity, m.uid`,
           [h.account.id]
         )
@@ -5286,19 +5378,18 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       );
     }
 
-    // Age a row past the live window without moving its lane, as a host that
-    // never runs the expiry job leaves it; the provider's date search then
-    // no longer returns it.
-    async function age(h: Awaited<ReturnType<typeof setupIntegration>>, folders: FixtureFolder[], uids: number[], lane: string) {
+    // Age rows past the live window, as time does; the provider's date search
+    // then no longer returns them.
+    async function age(h: Awaited<ReturnType<typeof setupIntegration>>, folders: FixtureFolder[], uids: number[]) {
       for (const m of folders[0].messages) if (uids.includes(m.uid)) m.internalDate = oldDate;
       await h.pool.query(
-        `UPDATE public.imap_messages SET internal_date = $2, window_status = $3
-         WHERE account_id = $1 AND uid = ANY($4::bigint[])`,
-        [h.account.id, oldDate, lane, uids]
+        `UPDATE public.imap_messages SET internal_date = $2
+         WHERE account_id = $1 AND uid = ANY($3::bigint[])`,
+        [h.account.id, oldDate, uids]
       );
     }
 
-    it("tombstones gone rows in every lane and keeps aged rows that are still there", async () => {
+    it("tombstones gone rows of any age and keeps aged rows that are still there", async () => {
       const recent = new Date();
       const { h, folders } = await setupFolder("reconcile-every-lane", 86_001, [
         message(1, oldDate),
@@ -5329,8 +5420,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         "5:IN_WINDOW:live", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
       ]);
 
-      await age(h, folders, [3, 4], "IN_WINDOW");
-      await age(h, folders, [5], "EXPIRED");
+      await age(h, folders, [3, 4, 5]);
       folders[0].messages = folders[0].messages.filter((m) => ![1, 2, 4, 5].includes(m.uid));
 
       await dueReconcile(h);
@@ -5338,8 +5428,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       uidListingFetches.length = 0;
       await engine.syncAccount(h.account.id, "manual");
       expect(await rows(h)).toEqual([
-        "1:HISTORICAL:RECONCILE_MISSING", "2:HISTORICAL:RECONCILE_MISSING", "3:IN_WINDOW:live",
-        "4:IN_WINDOW:RECONCILE_MISSING", "5:EXPIRED:RECONCILE_MISSING", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
+        "1:HISTORICAL:RECONCILE_MISSING", "2:HISTORICAL:RECONCILE_MISSING", "3:HISTORICAL:live",
+        "4:HISTORICAL:RECONCILE_MISSING", "5:HISTORICAL:RECONCILE_MISSING", "13:IN_WINDOW:live", "14:IN_WINDOW:live"
       ]);
       // One UID SEARCH lists the folder, never a FETCH line per message.
       expect(searches.filter((query) => query.all === true)).toHaveLength(1);
@@ -5493,7 +5583,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         await h.pool.query<{ c: string }>(
           `SELECT count(*)::text AS c FROM public.imap_messages
            WHERE account_id = $1 AND folder_path = 'INBOX'
-             AND window_status = 'HISTORICAL' AND deleted_in_provider = false`,
+             AND internal_date < now() - interval '90 days' AND deleted_in_provider = false`,
           [h.account.id]
         )
       ).rows[0].c
@@ -5751,16 +5841,16 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       `
       INSERT INTO public.imap_messages (
         account_id, folder_path, uidvalidity, uid, internal_date,
-        subject, body_fetched_at, deleted_in_provider, window_status
+        subject, body_fetched_at, deleted_in_provider
       )
       VALUES
-        ($1, 'INBOX', 72001, 3, now(), 'parsed-only complete', now(), false, 'IN_WINDOW'),
-        ($1, 'INBOX', 72001, 4, now(), 'marker without body', now(), false, 'IN_WINDOW'),
-        ($1, 'INBOX', 72001, 5, now(), 'provider deleted', NULL, true, 'IN_WINDOW'),
-        ($1, 'INBOX', 72001, 6, now(), 'historical', NULL, false, 'HISTORICAL'),
-        ($1, 'Untracked', 72002, 1, now(), 'untracked', NULL, false, 'IN_WINDOW'),
-        ($1, 'MissingSince', 72003, 1, now(), 'missing since', NULL, false, 'IN_WINDOW'),
-        ($1, 'Pending', 72004, 1, now(), 'pending verification', NULL, false, 'IN_WINDOW')
+        ($1, 'INBOX', 72001, 3, now(), 'parsed-only complete', now(), false),
+        ($1, 'INBOX', 72001, 4, now(), 'marker without body', now(), false),
+        ($1, 'INBOX', 72001, 5, now(), 'provider deleted', NULL, true),
+        ($1, 'INBOX', 72001, 6, now() - interval '200 days', 'historical', NULL, false),
+        ($1, 'Untracked', 72002, 1, now(), 'untracked', NULL, false),
+        ($1, 'MissingSince', 72003, 1, now(), 'missing since', NULL, false),
+        ($1, 'Pending', 72004, 1, now(), 'pending verification', NULL, false)
       `,
       [h.account.id]
     );

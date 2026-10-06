@@ -21,7 +21,7 @@ import { normalizeMessageId } from "./rules.js";
  * each is multi-valued, validated, or not a single-field filter): the `is:` /
  * `has:` multi-value flag operators, the validated `after:`/`before:` date and
  * `larger:`/`smaller:` size operators, and the non-filter operators `account:`,
- * `window:`/`lane:`, `sort:`, `limit:`. Their STRUCTURED twins still live in the
+ * `sort:`, `limit:`. Their STRUCTURED twins still live in the
  * table (so the schema key set stays single-sourced); only their q-operator
  * parsing is special-cased.
  */
@@ -201,9 +201,6 @@ export const SIZE_FIELDS: SizeFieldRule[] = [
   { structuredKey: "smallerThan", op: "smaller" }
 ];
 
-/** The structured `window` field (the only enum-valued structured field). */
-export const WINDOW_STRUCTURED_KEY = "window" as const;
-
 /**
  * The full set of structured-object keys, derived from the table. This is the
  * single source the Zod `searchFiltersSchema` and the JSON-Schema
@@ -241,7 +238,6 @@ interface StructuredKeySet {
   before: unknown;
   largerThan: unknown;
   smallerThan: unknown;
-  window: unknown;
 }
 
 /** Every structured filter field key, in the historical structured-emission order. */
@@ -249,8 +245,7 @@ export const STRUCTURED_FILTER_KEYS: (keyof StructuredKeySet)[] = [
   ...TEXT_FIELDS.filter((f): f is TextFieldRule & { structuredKey: keyof StructuredKeySet } => f.structuredKey !== undefined).map((f) => f.structuredKey),
   ...FLAG_FIELDS.map((f) => f.structuredKey),
   ...DATE_FIELDS.map((f) => f.structuredKey),
-  ...SIZE_FIELDS.map((f) => f.structuredKey),
-  WINDOW_STRUCTURED_KEY
+  ...SIZE_FIELDS.map((f) => f.structuredKey)
 ];
 
 /** Operator-alias → text field lookup, built once from {@link TEXT_FIELDS}. */

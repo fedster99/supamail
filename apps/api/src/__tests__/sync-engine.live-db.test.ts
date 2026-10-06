@@ -1391,8 +1391,7 @@ liveDb("live DB reliability lane", () => {
         h.account.id,
         folder,
         Number(folder.uidvalidity),
-        [first, second],
-        new Date("2026-01-01T00:00:00.000Z")
+        [first, second]
       )
     ).rejects.toThrow();
 
@@ -1446,8 +1445,7 @@ liveDb("live DB reliability lane", () => {
       h.account.id,
       folder,
       Number(folder.uidvalidity),
-      [first, second],
-      new Date("2026-01-01T00:00:00.000Z")
+      [first, second]
     )).rejects.toThrow();
 
     const persisted = await h.pool.query<{ messages: string; attachments: string }>(
@@ -1485,15 +1483,13 @@ liveDb("live DB reliability lane", () => {
         h.account.id,
         folder,
         Number(folder.uidvalidity),
-        [messageMetadata(100), messageMetadata(101)],
-        new Date("2026-01-01T00:00:00.000Z")
+        [messageMetadata(100), messageMetadata(101)]
       ),
       h.repository.upsertMessages(
         h.account.id,
         folder,
         Number(folder.uidvalidity),
-        [messageMetadata(101), messageMetadata(102)],
-        new Date("2026-01-01T00:00:00.000Z")
+        [messageMetadata(101), messageMetadata(102)]
       )
     ]);
 
@@ -1534,8 +1530,7 @@ liveDb("live DB reliability lane", () => {
       h.account.id,
       folder,
       oldUidValidity,
-      [messageMetadata(99)],
-      new Date("2026-01-01T00:00:00.000Z")
+      [messageMetadata(99)]
     );
     const initialized = await h.pool.query<{ uidvalidity: string; headers_synced_count: number }>(
       "SELECT uidvalidity::text, headers_synced_count FROM public.imap_folders WHERE id = $1",
@@ -1565,8 +1560,7 @@ liveDb("live DB reliability lane", () => {
         h.account.id,
         folder,
         oldUidValidity,
-        [messageMetadata(100)],
-        new Date("2026-01-01T00:00:00.000Z")
+        [messageMetadata(100)]
       );
       void staleWritePromise.catch(() => undefined);
       await waitForBlockedQuery(blocker, blockerPid, "SELECT id, uidvalidity::text");
@@ -1584,8 +1578,7 @@ liveDb("live DB reliability lane", () => {
       h.account.id,
       folder,
       oldUidValidity,
-      [messageMetadata(101)],
-      new Date("2026-01-01T00:00:00.000Z")
+      [messageMetadata(101)]
     )).rejects.toThrow(/no longer matches folder/);
     await expect(h.repository.markFolderSynced(folder.id, {
       uidValidity: oldUidValidity,
@@ -1667,7 +1660,6 @@ liveDb("live DB reliability lane", () => {
         folder,
         Number(folder.uidvalidity),
         [messageMetadata(100)],
-        new Date("2026-01-01T00:00:00.000Z"),
         { deadlineAt: Date.now() + 75 }
       )).rejects.toThrow();
     } finally {
@@ -2133,9 +2125,7 @@ liveDb("live DB reliability lane", () => {
       h.account.id,
       folder,
       Number(folder.uidvalidity),
-      [newMessage, existingUpdate],
-      new Date("2026-01-01T00:00:00.000Z"),
-      { preserveExistingFlags: true }
+      [newMessage, existingUpdate]
     );
     expect(firstWrite.map((row) => Number(row.uid))).toEqual([100, 1]);
 
@@ -2156,7 +2146,7 @@ liveDb("live DB reliability lane", () => {
     );
     expect(afterFirstWrite.rows[0]).toMatchObject({
       uid: "1",
-      flags: ["\\Seen"],
+      flags: ["\\Flagged"],
       headers_json: { "x-bulk-refresh": "yes" },
       mime_structure: { refreshed: true },
       deleted_in_provider: false
@@ -2188,8 +2178,7 @@ liveDb("live DB reliability lane", () => {
       h.account.id,
       folder,
       Number(folder.uidvalidity),
-      [newMessage, existingUpdate],
-      new Date("2026-01-01T00:00:00.000Z")
+      [newMessage, existingUpdate]
     );
     const afterRetry = await h.pool.query<{ uid: string; flags: string[] }>(
       `
@@ -2739,7 +2728,7 @@ liveDb("live DB reliability lane", () => {
     expect(folder.rows[0]?.last_reconcile_clean).toBe(true);
   });
 
-  it("retention expires old in-window rows and purges only trapdoor delete reasons", async () => {
+  it("retention keeps old rows and purges only trapdoor delete reasons", async () => {
     const h = await setupIntegration("live-retention", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);
     const folders = oneFolder("INBOX", 5);
@@ -2749,8 +2738,7 @@ liveDb("live DB reliability lane", () => {
     await h.pool.query(
       `
       UPDATE public.imap_messages
-      SET internal_date = now() - interval '200 days',
-          window_status = 'IN_WINDOW'
+      SET internal_date = now() - interval '200 days'
       WHERE account_id = $1 AND uid = 1
       `,
       [h.account.id]
@@ -2772,12 +2760,11 @@ liveDb("live DB reliability lane", () => {
     );
 
     const retention = await h.repository.runRetentionJobs();
-    expect(retention.expired).toBeGreaterThanOrEqual(1);
     expect(retention.purged).toBe(3);
 
-    const rows = await h.pool.query<{ uid: string; window_status: string; deleted_reason: string | null }>(
+    const rows = await h.pool.query<{ uid: string; deleted_in_provider: boolean; deleted_reason: string | null }>(
       `
-      SELECT uid::text AS uid, window_status, deleted_reason
+      SELECT uid::text AS uid, deleted_in_provider, deleted_reason
       FROM public.imap_messages
       WHERE account_id = $1
       ORDER BY uid
@@ -2785,7 +2772,7 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
     expect(rows.rows.map((row) => Number(row.uid))).toEqual([1, 5]);
-    expect(rows.rows.find((row) => Number(row.uid) === 1)?.window_status).toBe("EXPIRED");
+    expect(rows.rows.find((row) => Number(row.uid) === 1)?.deleted_in_provider).toBe(false);
     expect(rows.rows.find((row) => Number(row.uid) === 5)?.deleted_reason).toBe("RECONCILE_MISSING");
   });
 

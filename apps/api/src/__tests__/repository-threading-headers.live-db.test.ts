@@ -73,8 +73,7 @@ liveDb("threading-header ingestion", () => {
       accountId,
       folder,
       1,
-      [metadata],
-      new Date("2025-01-01T00:00:00.000Z")
+      [metadata]
     );
 
     const rawMime = Buffer.from(
@@ -135,8 +134,7 @@ liveDb("threading-header ingestion", () => {
       accountId,
       folder,
       1,
-      [metadata],
-      new Date("2025-01-01T00:00:00.000Z")
+      [metadata]
     );
 
     const draft = await runDraftReply(pool, {
