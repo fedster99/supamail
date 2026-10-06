@@ -10,6 +10,7 @@ export {
   AbortError,
   AccountBusyError,
   InvalidInputError,
+  MirrorWriteError,
   NoRecipientsError,
   NotFoundError,
   UnfetchableContentError

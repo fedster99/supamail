@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
-import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
+import { AccountBusyError, MirrorWriteError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
 import { MailboxCapabilityError, MailboxMutationError } from "../mailbox-mutations.js";
 import { SmtpDeliveryError } from "../smtp-client.js";
 import type {
@@ -919,6 +919,19 @@ describe("API safety", () => {
     expect(ok.status).toBe(200);
     await expect(ok.json()).resolves.toMatchObject({ result: { added: ["seen"], removed: ["flagged"] } });
     expect(mutations.setMessageFlags).toHaveBeenCalledWith(messageId, { add: ["seen"], remove: ["flagged"] });
+  });
+
+  it("maps a flag change the mirror did not record to 503 mirror_write_failed + Retry-After", async () => {
+    const { app, mutations } = buildApp();
+    mutations.setMessageFlags.mockRejectedValueOnce(new MirrorWriteError("not recorded") as never);
+    const res = await app.request(`/messages/${messageId}/flags`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ add: ["seen"] })
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("5");
+    await expect(res.json()).resolves.toMatchObject({ error: "mirror_write_failed" });
   });
 
   it("returns 404 from /messages/:id/flags when the message is unknown", async () => {

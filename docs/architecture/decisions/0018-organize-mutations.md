@@ -112,8 +112,8 @@ A whole-stack review hardened the thread-level verbs:
   mirror row through immediately AFTER that member's STORE (inside the per-member loop),
   instead of STORE-all-then-write-all. A mid-thread STORE failure therefore preserves
   every earlier member's write-through instead of aborting before ANY mirror write. The
-  result surfaces a `mirrorWriteThroughStale` count so callers see mirror lag; the lag
-  self-heals on the next flag-scan sync.
+  result surfaces a `mirrorWriteThroughStale` count so callers see mirror lag. Retrying
+  the change repairs it; see the 2026-10-06 follow-up below.
 - **Known race, documented not gated (decision 6).** Flag write-through races the
   pre-existing sync flag-scan: `upsertMessages` ON CONFLICT sets `flags =
   EXCLUDED.flags` unconditionally, so a scan that FETCHed pre-STORE flags and commits
@@ -123,3 +123,16 @@ A whole-stack review hardened the thread-level verbs:
   the scan's FETCH) touches the HOT sync `upsertMessages` ON-CONFLICT path
   (high blast radius), so it is deliberately deferred — the eventual-convergence
   guarantee already bounds the staleness to one scan interval.
+
+## Follow-up 2026-10-06: a failed flag write-through is an error
+
+The write-through is the only path that updates flags on mail older than
+`FLAG_DIFF_WINDOW_DAYS` when the server lacks CONDSTORE: the flag scan reads only
+that window, and reconcile compares UIDs, not flags. A database fault in the
+write-through was logged and the call still succeeded, so such a row could keep the
+old flags with nothing left to repair it. `setMessageFlags` now throws
+`MirrorWriteError` (`mirror_write_failed`, HTTP 503 with `Retry-After`) after the
+STORE. Retrying the same change is safe: the STORE is idempotent and the retry
+writes the row. A row that is gone meanwhile (moved or deleted) still succeeds,
+since there is nothing to update. `setThreadFlags` keeps acting on every member and
+counts a faulted row in `mirrorWriteThroughStale`.

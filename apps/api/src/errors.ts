@@ -36,6 +36,18 @@ export function formatZodIssues(error: ZodError): string {
     .join("; ");
 }
 
+/** The mailbox accepted a change, but the mirror row could not be updated (a
+ * database fault). Retrying the same change is safe: the provider already has it,
+ * and the retry writes the row. Mapped to 503 with Retry-After. */
+export class MirrorWriteError extends Error {
+  readonly code = "mirror_write_failed";
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "MirrorWriteError";
+  }
+}
+
 /** A requested resource (message, draft, attachment, account) does not exist. */
 export class NotFoundError extends Error {
   constructor(message: string) {

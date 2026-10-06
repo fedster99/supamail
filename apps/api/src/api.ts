@@ -13,6 +13,7 @@ import { DRAFT_BODY_SCHEMA, SEND_BODY_SCHEMA } from "./compose-schema.js";
 import {
   AccountBusyError,
   InvalidInputError,
+  MirrorWriteError,
   NoRecipientsError,
   NotFoundError,
   UnfetchableContentError
@@ -424,6 +425,12 @@ export function createApiApp(options: ApiAppOptions): Hono {
       // Content known in metadata but not fetchable (e.g. an attachment row with
       // no BODYSTRUCTURE part number). A permanent condition: 422, not 500.
       return c.json({ error: "content_unfetchable", message: err.message }, 422);
+    }
+    if (err instanceof MirrorWriteError) {
+      // The mailbox has the change; the mirror row does not. Retrying the same
+      // change is safe and writes the row.
+      c.header("Retry-After", "5");
+      return c.json({ error: err.code, message: err.message }, 503);
     }
     if (err instanceof AccountBusyError) {
       // The per-account advisory lock is held (the sync worker is mid-cycle). The

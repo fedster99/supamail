@@ -58,7 +58,7 @@ const mutator = vi.hoisted(() => ({
 const repo = vi.hoisted(() => ({
   getMessage: vi.fn(),
   getAccount: vi.fn(),
-  applyMessageFlags: vi.fn(async () => ["\\Seen"] as string[]),
+  applyMessageFlags: vi.fn(async (): Promise<string[] | null> => ["\\Seen"]),
   markFoldersForReconcile: vi.fn(async () => undefined),
   markMessageRemovedByProvider: vi.fn(async (_target: unknown) => undefined),
   relocateMovedMessage: vi.fn(async (_source: unknown, _destination: unknown) => true)
@@ -152,14 +152,28 @@ describe("setMessageFlags", () => {
     });
   });
 
-  it("surfaces a warning but still succeeds if the mirror write-through fails (M1)", async () => {
+  it("throws a retryable MirrorWriteError when the mirror write-through fails after the STORE (M1)", async () => {
     repo.getMessage.mockResolvedValue(message());
     repo.applyMessageFlags.mockRejectedValueOnce(new Error("db down"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { setMessageFlags } = await import("../mailbox-mutations.js");
+    await expect(setMessageFlags({} as never, config, M1, { add: ["seen"] }))
+      .rejects.toMatchObject({ name: "MirrorWriteError", code: "mirror_write_failed" });
+    expect(mutator.addFlags).toHaveBeenCalledTimes(1);
+    expect(mutator.logout).toHaveBeenCalledTimes(1);
+
+    // The retry re-STOREs the same flags and writes the row.
     const result = await setMessageFlags({} as never, config, M1, { add: ["seen"] });
     expect(result).toMatchObject({ messageId: M1, added: ["\\Seen"] });
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_failed"));
+    expect(repo.applyMessageFlags).toHaveBeenCalledTimes(2);
+  });
+
+  it("succeeds without a row update when the row is gone meanwhile", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    repo.applyMessageFlags.mockResolvedValueOnce(null);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { setMessageFlags } = await import("../mailbox-mutations.js");
+    await expect(setMessageFlags({} as never, config, M1, { add: ["seen"] })).resolves.toMatchObject({ messageId: M1 });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_missing_row"));
     warn.mockRestore();
   });
 
@@ -494,6 +508,22 @@ describe("setThreadFlags / moveThread fan-out", () => {
     const result = await setThreadFlags(pool, config, M1, { add: ["seen"] });
     expect(result.messageCount).toBe(2);
     expect(result.mirrorWriteThroughStale).toBe(1);
+    warn.mockRestore();
+  });
+
+  it("keeps STOREing the rest of a thread when one member's mirror write faults, and counts it", async () => {
+    const pool = poolReturningMembers(members(3));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    repo.applyMessageFlags
+      .mockResolvedValueOnce(["\\Seen"])
+      .mockRejectedValueOnce(new Error("db down"))
+      .mockResolvedValueOnce(["\\Seen"]);
+    const { setThreadFlags } = await import("../mailbox-mutations.js");
+    const result = await setThreadFlags(pool, config, M1, { add: ["seen"] });
+    expect(mutator.addFlags).toHaveBeenCalledTimes(3);
+    expect(result.messageCount).toBe(3);
+    expect(result.mirrorWriteThroughStale).toBe(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_failed"));
     warn.mockRestore();
   });
 

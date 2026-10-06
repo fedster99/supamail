@@ -1,7 +1,7 @@
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
-import { MailboxConflictError, NotFoundError, throwIfAborted } from "./errors.js";
+import { MailboxConflictError, MirrorWriteError, NotFoundError, throwIfAborted } from "./errors.js";
 import {
   closeImap,
   connectAbortableImap,
@@ -347,12 +347,12 @@ export interface FlagResult {
 }
 
 /**
- * Write a successful flag change through to the mirror row, best-effort but
- * surfaced: a failure here logs a warning (and never masks the STORE that already
- * succeeded on IMAP). This keeps mark-read/star visible in the mirror immediately,
- * even for mail older than the flag-scan window. Returns true when the mirror row
- * was updated, false on a missing row or a DB error (so thread callers can surface
- * a stale count) — the lag self-heals on the next flag-scan sync.
+ * Write a successful flag change through to the mirror row. This is the only path
+ * that updates flags on mail older than FLAG_DIFF_WINDOW_DAYS when the server has
+ * no CONDSTORE, so a database failure is not left to a later sync: it throws
+ * {@link MirrorWriteError}, and retrying the same change repairs the row. Returns
+ * false when the row is gone (moved or deleted meanwhile), which leaves nothing
+ * to update.
  */
 async function writeFlagsThrough(
   repository: MirrorRepository,
@@ -361,26 +361,21 @@ async function writeFlagsThrough(
   add: string[],
   remove: string[]
 ): Promise<boolean> {
+  let updated: string[] | null;
   try {
-    const updated = await repository.applyMessageFlags(messageId, accountId, { add, remove });
-    if (updated === null) {
-      console.warn(JSON.stringify({
-        event: "organize.flag_write_through_missing_row",
-        messageId,
-        accountId
-      }));
-      return false;
-    }
-    return true;
+    updated = await repository.applyMessageFlags(messageId, accountId, { add, remove });
   } catch (error) {
+    throw new MirrorWriteError(`Flags changed in the mailbox but not in the mirror for message ${messageId}`, { cause: error });
+  }
+  if (updated === null) {
     console.warn(JSON.stringify({
-      event: "organize.flag_write_through_failed",
+      event: "organize.flag_write_through_missing_row",
       messageId,
-      accountId,
-      error: error instanceof Error ? error.message : String(error)
+      accountId
     }));
     return false;
   }
+  return true;
 }
 
 /** Where the provider put a moved message, as its COPYUID reported it. */
@@ -719,9 +714,10 @@ export interface ThreadFlagResult {
   added: string[];
   removed: string[];
   messageIds: string[];
-  /** Members whose mirror write-through lagged (the IMAP STORE succeeded but the
-   * mirror row update failed/was missing). 0 = mirror fully in sync. The lag
-   * self-heals on the next flag-scan sync. */
+  /** Members whose mirror row was not updated after the IMAP STORE succeeded (a
+   * database fault or a row gone meanwhile). 0 = mirror fully in sync. Retrying the
+   * same change repairs a faulted row; without CONDSTORE no sync re-reads flags on
+   * mail older than FLAG_DIFF_WINDOW_DAYS. */
   mirrorWriteThroughStale: number;
   /** True when the thread exceeded MAX_THREAD_FANOUT and only the oldest N members
    * were acted on. */
@@ -762,7 +758,13 @@ export async function setThreadFlags(
     for (const target of targets) {
       if (add.length > 0) await mutator.addFlags(target, add);
       if (remove.length > 0) await mutator.removeFlags(target, remove);
-      const wrote = await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
+      // One member's row fault must not stop the STOREs of the rest; it is counted.
+      const wrote = await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove)
+        .catch((error: unknown) => {
+          if (!(error instanceof MirrorWriteError)) throw error;
+          warnWriteThroughFailed("organize.flag_write_through_failed", target, error.cause);
+          return false;
+        });
       if (!wrote) mirrorWriteThroughStale += 1;
       appliedIds.push(target.messageId);
     }
