@@ -346,7 +346,7 @@ liveDb("ThreadingRepository live DB", () => {
          in_reply_to, references_header,
          provider_message_id, provider_message_id_namespace,
          provider_thread_id, provider_thread_id_namespace,
-         window_status, size_bytes, headers_json
+         size_bytes, headers_json
        ) VALUES (
          $1, $2, $3, $4, $5,
          $6, $7, $8, $9,
@@ -354,7 +354,7 @@ liveDb("ThreadingRepository live DB", () => {
          $12, $13,
          $14, $15,
          $16, $17,
-         'IN_WINDOW', $18, $19::jsonb
+         $18, $19::jsonb
        ) RETURNING id`,
       [
         accountId,
@@ -2337,7 +2337,7 @@ liveDb("ThreadingRepository live DB", () => {
     await pool.query(
       `UPDATE public.imap_messages
        SET deleted_in_provider = true,
-           deleted_reason = 'MOVED_OUT',
+           deleted_reason = 'FOLDER_MISSING',
            provider_deleted_at = now() - interval '31 days'
        WHERE id = $1`,
       [root]
@@ -2534,7 +2534,7 @@ liveDb("ThreadingRepository live DB", () => {
          INSERT INTO public.imap_messages (
            account_id, folder_path, uidvalidity, uid, internal_date,
            subject, from_email, to_emails, rfc_message_id,
-           message_id_normalized, window_status, size_bytes, headers_json
+           message_id_normalized, size_bytes, headers_json
          )
          SELECT $1, 'INBOX', 101, value,
                 timestamptz '2026-01-01 00:00:00+00' + value * interval '1 second',
@@ -2542,7 +2542,7 @@ liveDb("ThreadingRepository live DB", () => {
                 ARRAY['recipient@example.test'],
                 '<criteria-' || value || '@example.test>',
                 'criteria-' || value || '@example.test',
-                'IN_WINDOW', 1024, '{}'::jsonb
+                1024, '{}'::jsonb
          FROM generate_series(1, 501) AS value
          RETURNING id, uid
        )
@@ -3932,7 +3932,7 @@ liveDb("ThreadingRepository live DB", () => {
          subject, from_email, to_emails,
          rfc_message_id, message_id_normalized,
          provider_thread_id, provider_thread_id_namespace,
-         window_status, size_bytes, headers_json
+         size_bytes, headers_json
        )
        SELECT $1, 'INBOX', 101, sequence, '2026-08-15T00:00:00.000Z',
               format('Synthetic component %s message %s', component, position),
@@ -3940,7 +3940,7 @@ liveDb("ThreadingRepository live DB", () => {
               format('<timeout-%s-%s@example.test>', component, position),
               format('timeout-%s-%s@example.test', component, position),
               format('timeout-component-%s', component), 'fixture',
-              'IN_WINDOW', 1024, '{}'::jsonb
+              1024, '{}'::jsonb
        FROM generated`,
       [accountId]
     );
@@ -4883,11 +4883,11 @@ liveDb("ThreadingRepository live DB", () => {
         `INSERT INTO public.imap_messages (
            account_id, folder_path, uidvalidity, uid, internal_date,
            subject, rfc_message_id, message_id_normalized,
-           window_status, size_bytes, headers_json
+           size_bytes, headers_json
          ) VALUES (
            $1, 'INBOX', 101, 2, '2026-05-02T12:00:00Z',
            'Re: Barrier', '<barrier-reply@example.test>', 'barrier-reply@example.test',
-           'IN_WINDOW', 0, '{}'::jsonb
+           0, '{}'::jsonb
          )`,
         [accountId]
       );

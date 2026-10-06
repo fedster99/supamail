@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { applyPublicMigrations, closePool, getPool } from "../db.js";
+import { closePool, getPool } from "../db.js";
 import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type {
@@ -26,7 +26,6 @@ import {
   setupIntegration,
   teardownIntegration
 } from "./helpers/integration-harness.js";
-import { forgetPublicMigrationsFrom } from "./helpers/public-migrations.js";
 
 const DB_AVAILABLE = Boolean(process.env.DATABASE_URL);
 
@@ -5427,66 +5426,33 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect(progress.rows[0]?.live_bodies_target_count).toBe(1);
     });
 
-    it("repairs folders left by the date-filtered code once, on migrate", async () => {
-      const { h, folders, uids } = await setup("window-upgrade-repair", "metadata_only", [
+    it("re-takes a history snapshot fetching only UIDs without a live row", async () => {
+      const { h, folders, uids } = await setup("window-history-retake", "metadata_only", [
         message(1, oldDate),
-        message(2, new Date())
+        message(2, oldDate),
+        message(3, new Date())
       ]);
       await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
-      // State the old code could leave: a live head far below UIDNEXT, a completed
-      // history snapshot with its refresh stamp, an old email moved in after that
-      // snapshot that nothing fetched, and a body-lane MOVED_OUT tombstone.
-      folders[0].messages.push(message(3, oldDate));
+      // An old email the mirror lost, then a history re-take.
+      await h.pool.query("DELETE FROM public.imap_messages WHERE account_id = $1 AND uid = 1", [h.account.id]);
       await h.pool.query(
         `UPDATE public.imap_folders
-         SET last_uid = 0, uid_next = 4, last_archive_refresh_at = now(),
-             next_reconcile_at = now() - interval '1 second'
+         SET backfill_in_progress = true, backfill_target_max_uid = NULL, backfill_oldest_uid_synced = NULL
          WHERE account_id = $1`,
         [h.account.id]
       );
-      await h.pool.query(
-        `UPDATE public.imap_messages SET deleted_in_provider = true, deleted_reason = 'MOVED_OUT'
-         WHERE account_id = $1 AND uid = 1`,
-        [h.account.id]
-      );
-      // The database comes from before 0030: its repairs have not run yet.
-      await forgetPublicMigrationsFrom(h.pool, "0030_window_from_message_date");
-      await applyPublicMigrations(h.pool);
-      await applyPublicMigrations(h.pool);
-      const folder = async () => (await h.pool.query<{
-        last_uid: string; historical_target_count: number | null; backfill_in_progress: boolean;
-        last_archive_refresh_at: Date | null;
-      }>(
-        `SELECT last_uid::text, historical_target_count, backfill_in_progress, last_archive_refresh_at
-         FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
-        [h.account.id]
-      )).rows[0];
-      // The head moves to UIDNEXT; history keeps its progress and re-runs once.
-      expect(await folder()).toEqual({
-        last_uid: "3", historical_target_count: 1, backfill_in_progress: true, last_archive_refresh_at: null
-      });
-      const reason = await h.pool.query<{ deleted_reason: string }>(
-        "SELECT deleted_reason FROM public.imap_messages WHERE account_id = $1 AND uid = 1",
-        [h.account.id]
-      );
-      expect(reason.rows[0].deleted_reason).toBe("RECONCILE_MISSING");
-
-      // The re-run fetches only the missing old email, then later migrates leave
-      // the folder alone.
-      const fetched: number[][] = [];
+      const fetched: number[] = [];
       class RecordingClient extends FixtureImapClient {
         override async *fetch(range: string | number[] | Record<string, unknown>, query: Record<string, unknown>) {
-          if (Array.isArray(range) && query.envelope) fetched.push([...range]);
+          if (Array.isArray(range) && query.envelope) fetched.push(...range);
           yield* super.fetch(range, query);
         }
       }
       await dueAllFolders(h.pool, h.account.id);
       await h.buildEngine({ folders, clientFactory: async () => new RecordingClient(folders) })
         .syncAccount(h.account.id, "manual");
+      expect(fetched).toEqual([1]);
       expect(await uids()).toEqual([1, 2, 3]);
-      expect(fetched.flat()).not.toContain(2);
-      await applyPublicMigrations(h.pool);
-      expect((await folder()).backfill_in_progress).toBe(false);
     });
 
     it("finishes initial sync without promising new mail it has not fetched", async () => {
@@ -5522,9 +5488,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       // The stored UIDNEXT never runs ahead of the live head.
       expect(Number(done.uid_next)).toBe(Number(done.last_uid) + 1);
 
-      // Re-applying migration 0030 then cannot skip the pending UIDs.
-      await forgetPublicMigrationsFrom(h.pool, "0030_window_from_message_date");
-      await applyPublicMigrations(h.pool);
       for (let i = 0; i < 3; i += 1) {
         await dueAllFolders(h.pool, h.account.id);
         await engine.syncAccount(h.account.id, "manual");
@@ -5559,11 +5522,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
       // Months later the archive is not walked again; reconcile owns deletions.
       beforeSearches.length = 0;
-      // The refresh timestamp the old monthly re-walk used is long past.
-      await h.pool.query(
-        `UPDATE public.imap_folders SET last_archive_refresh_at = now() - interval '400 days' WHERE account_id = $1`,
-        [h.account.id]
-      );
       await dueAllFolders(h.pool, h.account.id);
       await engine.syncAccount(h.account.id, "manual");
       expect(beforeSearches).toEqual([]);

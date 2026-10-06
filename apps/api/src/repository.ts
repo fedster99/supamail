@@ -1625,7 +1625,7 @@ export class MirrorRepository {
       const discovered = await client.query<PurgeCandidate>(
         `SELECT id, account_id FROM public.imap_messages
          WHERE deleted_in_provider = true
-           AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+           AND deleted_reason IN ('UIDVALIDITY_RESET', 'FOLDER_MISSING')
            AND provider_deleted_at < now() - interval '30 days'
          ORDER BY id LIMIT $1`,
         [PURGE_MESSAGE_BATCH_SIZE]
@@ -1653,7 +1653,7 @@ export class MirrorRepository {
         `SELECT id, account_id FROM public.imap_messages
          WHERE id = ANY($1::uuid[])
            AND deleted_in_provider = true
-           AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+           AND deleted_reason IN ('UIDVALIDITY_RESET', 'FOLDER_MISSING')
            AND provider_deleted_at < now() - interval '30 days'
          ORDER BY id FOR UPDATE SKIP LOCKED`,
         [discovered.rows.map((row) => row.id)]
@@ -1757,7 +1757,7 @@ export class MirrorRepository {
       const result = await client.query(
         `DELETE FROM public.imap_messages
          WHERE id = ANY($1::uuid[]) AND deleted_in_provider = true
-           AND deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')
+           AND deleted_reason IN ('UIDVALIDITY_RESET', 'FOLDER_MISSING')
            AND provider_deleted_at < now() - interval '30 days'`,
         [acceptedVictims]
       );

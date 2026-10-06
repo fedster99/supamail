@@ -32,12 +32,12 @@ liveDb("search layer live DB", () => {
       INSERT INTO public.imap_messages (
         account_id, folder_path, uidvalidity, uid, internal_date,
         subject, from_email, from_name, to_emails, flags,
-        deleted_in_provider, window_status, size_bytes
+        deleted_in_provider, size_bytes
       )
       VALUES (
         $1, 'INBOX', $2, $3, now() - ($4 * interval '1 day'),
         $5, $6, $7, $8, $9,
-        $10, 'IN_WINDOW', $11
+        $10, $11
       )
       RETURNING id
       `,
@@ -176,10 +176,10 @@ liveDb("search layer live DB", () => {
       const message = await pool.query<{ id: string }>(
         `INSERT INTO public.imap_messages (
            account_id, folder_path, uidvalidity, uid, internal_date, subject, from_email,
-           to_emails, flags, message_id_normalized, deleted_in_provider, window_status,
+           to_emails, flags, message_id_normalized, deleted_in_provider,
            size_bytes, body_fetched_at
          ) VALUES ($1, $2, $3, $4, now(), 'Zephyr launch', 'sam@acme.example',
-           ARRAY['me@example.test'], ARRAY['\\Seen'], 'zephyr-copy@acme.test', false, 'IN_WINDOW', $5, now())
+           ARRAY['me@example.test'], ARRAY['\\Seen'], 'zephyr-copy@acme.test', false, $5, now())
          RETURNING id`,
         [accountId, folder, UIDVALIDITY, uid, raw.byteLength]
       );
@@ -218,9 +218,9 @@ liveDb("search layer live DB", () => {
       await pool.query(
         `INSERT INTO public.imap_messages (
            account_id, folder_path, uidvalidity, uid, internal_date, subject, from_email,
-           to_emails, flags, deleted_in_provider, window_status, size_bytes
+           to_emails, flags, deleted_in_provider, size_bytes
          ) VALUES ($1, $2, $3, $4, now(), 'Folder probe', 'me@example.test',
-           ARRAY['you@example.test'], ARRAY['\\Recent', '\\Seen'], false, 'IN_WINDOW', 10)`,
+           ARRAY['you@example.test'], ARRAY['\\Recent', '\\Seen'], false, 10)`,
         [accountId, folder, UIDVALIDITY, uid]
       );
     }

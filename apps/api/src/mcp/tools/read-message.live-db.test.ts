@@ -48,14 +48,14 @@ liveDb("read_message tool live DB", () => {
         subject, from_email, from_name, to_emails, cc_emails, flags,
         provider_thread_id, rfc_message_id, in_reply_to, references_header,
         message_id_normalized, headers_json,
-        deleted_in_provider, window_status, size_bytes
+        deleted_in_provider, size_bytes
       )
       VALUES (
         $1, 'INBOX', $2, $3, now() - ($4 * interval '1 day'),
         $5, $6, $7, $8, $9, $10,
         $11, $12, $13, $14,
         $15, $16,
-        false, 'IN_WINDOW', $17
+        false, $17
       )
       RETURNING id
       `,

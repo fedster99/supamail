@@ -43,13 +43,13 @@ liveDb("draft_reply live DB", () => {
         account_id, folder_path, uidvalidity, uid, internal_date,
         subject, from_email, from_name, to_emails, to_names,
         cc_emails, cc_names, rfc_message_id, references_header, in_reply_to,
-        provider_thread_id, window_status, size_bytes
+        provider_thread_id, size_bytes
       )
       VALUES (
         $1, 'INBOX', $2, $3, now() - interval '1 hour',
         $4, $5, $6, $7, $8,
         $9, $10, $11, $12, $13,
-        $14, 'IN_WINDOW', $15
+        $14, $15
       )
       RETURNING id
       `,
