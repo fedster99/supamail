@@ -45,7 +45,7 @@ pnpm --filter @supamail/web build
 
 ## Heavy Reliability Gate
 
-`pnpm test:db:live` starts disposable Docker Postgres, applies the migration twice, runs DB-backed integration tests, runs spec conformance, and tears down the container.
+`pnpm test:db:live` starts disposable Docker Postgres, applies the migrations twice (`public-migrations.live-db.test.ts` proves the second run applies nothing), runs DB-backed integration tests, runs spec conformance, and tears down the container.
 
 Use it for any change that could alter:
 

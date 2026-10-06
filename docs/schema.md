@@ -130,7 +130,12 @@ The live window is computed, never stored: a row is in the window when `internal
 
 The body backlogs and coverage use the account and folder date indexes. The two
 lane-predicated indexes from `0001` and `0021` stay until the migration that drops
-`window_status`, because every migrate re-applies those files and would rebuild them.
+`window_status`.
+
+Each public migration runs once: `applyPublicMigrations` records its id in
+`supamail_meta.public_migrations` in the same transaction (ADR 0040). A database
+migrated before that record existed applies every file once more, so public
+migrations stay idempotent.
 
 `imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a missing-mailbox verification pass. Missing-mailbox errors stamp `missing_since`, force `imap_accounts.next_folder_discovery_at = now()`, and move the folder into `PENDING_VERIFICATION`. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
 

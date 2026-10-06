@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { applyPublicMigrations, closePool, getPool } from "../../db.js";
+import { forgetPublicMigrationsFrom } from "../../__tests__/helpers/public-migrations.js";
 import { folderCountDrift } from "../../__tests__/helpers/integration-harness.js";
 import { runListFolders } from "./list-folders.js";
 
@@ -289,7 +290,9 @@ liveDb("list_folders tool live DB", () => {
   it("backfills counts from existing mail once, and a second migrate keeps them", async () => {
     const before = (await runListFolders(pool, { account: accountId })) as ListFoldersOk;
     try {
+      // A database migrated before 0028: no counts table and no record of 0028.
       await pool.query("DROP TABLE public.imap_folder_message_counts");
+      await forgetPublicMigrationsFrom(pool, "0028_folder_message_counts");
     } finally {
       // Later test files share this database; never leave it without the table.
       await applyPublicMigrations(pool);

@@ -26,6 +26,7 @@ import {
   setupIntegration,
   teardownIntegration
 } from "./helpers/integration-harness.js";
+import { forgetPublicMigrationsFrom } from "./helpers/public-migrations.js";
 
 const DB_AVAILABLE = Boolean(process.env.DATABASE_URL);
 
@@ -5448,6 +5449,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
          WHERE account_id = $1 AND uid = 1`,
         [h.account.id]
       );
+      // The database comes from before 0030: its repairs have not run yet.
+      await forgetPublicMigrationsFrom(h.pool, "0030_window_from_message_date");
       await applyPublicMigrations(h.pool);
       await applyPublicMigrations(h.pool);
       const folder = async () => (await h.pool.query<{
@@ -5520,6 +5523,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect(Number(done.uid_next)).toBe(Number(done.last_uid) + 1);
 
       // Re-applying migration 0030 then cannot skip the pending UIDs.
+      await forgetPublicMigrationsFrom(h.pool, "0030_window_from_message_date");
       await applyPublicMigrations(h.pool);
       for (let i = 0; i < 3; i += 1) {
         await dueAllFolders(h.pool, h.account.id);

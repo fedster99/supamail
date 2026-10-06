@@ -175,33 +175,83 @@ export async function getRequiredPublicSchemaVersion(): Promise<string> {
   return manifest.schemaVersion;
 }
 
-export async function readPublicMigrations(): Promise<string> {
+/** Every public migration in manifest order, with its id. */
+export async function readPublicMigrationFiles(): Promise<Array<{ id: string; sql: string }>> {
   const here = dirname(fileURLToPath(import.meta.url));
   const publicMigrationDir = resolve(here, "../supabase/migrations/public");
   const manifest = await readPublicMigrationManifest();
-  const sql = await Promise.all(
-    manifest.migrations.map(async (migration) => readFile(resolve(publicMigrationDir, migration.file), "utf8"))
-  );
-  return sql.join("\n\n");
+  return await Promise.all(manifest.migrations.map(async (migration) => ({
+    id: migration.id,
+    sql: await readFile(resolve(publicMigrationDir, migration.file), "utf8")
+  })));
 }
 
-export async function readInitialMigration(): Promise<string> {
-  return readPublicMigrations();
-}
-
-export async function applyPublicMigrations(pool: PgPool = getPool()): Promise<void> {
-  const sql = await readPublicMigrations();
-  const client = await pool.connect();
-
-  try {
-    await client.query("SELECT pg_advisory_lock(hashtext('supamail.public_migrations'))");
-    await client.query(sql);
-  } finally {
-    await client.query("SELECT pg_advisory_unlock(hashtext('supamail.public_migrations'))").catch(() => undefined);
-    client.release();
+/** A public migration failed; nothing of it, and nothing after it, was applied. */
+export class PublicMigrationError extends Error {
+  constructor(readonly migrationId: string, options: { cause?: unknown } = {}) {
+    const detail = options.cause instanceof Error ? `: ${options.cause.message}` : "";
+    super(`Public migration ${migrationId} failed${detail}`, options);
+    this.name = "PublicMigrationError";
   }
 }
 
-export async function applyInitialMigration(pool: PgPool = getPool()): Promise<void> {
-  return applyPublicMigrations(pool);
+/**
+ * Records each applied public migration, outside the API-exposed schemas, so a
+ * migration runs once (ADR 0040). Every host runner must use this record: once a
+ * migration drops an object, re-running earlier files is no longer safe. The
+ * migrator role owns the schema; it creates it only when missing.
+ */
+const PUBLIC_MIGRATION_RECORD_SQL = `
+  DO $$
+  BEGIN
+    IF to_regnamespace('supamail_meta') IS NULL THEN
+      CREATE SCHEMA supamail_meta;
+      REVOKE ALL ON SCHEMA supamail_meta FROM PUBLIC;
+    END IF;
+  END
+  $$;
+  CREATE TABLE IF NOT EXISTS supamail_meta.public_migrations (
+    id text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+  );
+`;
+
+export async function applyPublicMigrations(pool: PgPool = getPool()): Promise<void> {
+  const migrations = await readPublicMigrationFiles();
+  const client = await pool.connect();
+  // A dropped connection surfaces through the failing query; without a listener
+  // the client's own error event would crash the process.
+  const onClientError = () => undefined;
+  client.on("error", onClientError);
+
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext('supamail.public_migrations'))");
+    await client.query(PUBLIC_MIGRATION_RECORD_SQL);
+    const applied = new Set((await client.query<{ id: string }>(
+      "SELECT id FROM supamail_meta.public_migrations"
+    )).rows.map((row) => row.id));
+    // A migration added below one already applied would run after it here.
+    const lastApplied = migrations.reduce((last, migration, index) => applied.has(migration.id) ? index : last, -1);
+    const late = migrations.slice(0, Math.max(0, lastApplied)).find((migration) => !applied.has(migration.id));
+    if (late) {
+      throw new PublicMigrationError(late.id, { cause: new Error("listed before a migration that already ran") });
+    }
+    for (const migration of migrations) {
+      if (applied.has(migration.id)) continue;
+      // The migration and its record commit together or not at all.
+      await client.query("BEGIN");
+      try {
+        await client.query(migration.sql);
+        await client.query("INSERT INTO supamail_meta.public_migrations (id) VALUES ($1)", [migration.id]);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw new PublicMigrationError(migration.id, { cause: error });
+      }
+    }
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext('supamail.public_migrations'))").catch(() => undefined);
+    client.off("error", onClientError);
+    client.release();
+  }
 }

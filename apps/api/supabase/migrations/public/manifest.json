@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0030_window_from_message_date",
+  "schemaVersion": "0031_active_assignments_view_columns",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -120,6 +120,10 @@
     {
       "id": "0030_window_from_message_date",
       "file": "0030_window_from_message_date.sql"
+    },
+    {
+      "id": "0031_active_assignments_view_columns",
+      "file": "0031_active_assignments_view_columns.sql"
     }
   ]
 }

@@ -78,14 +78,9 @@ Deploy the worker from the repository root with
 `apps/api/fly.worker.toml.example`, then add a mailbox below. The API is
 optional; run it separately only when you need remote control endpoints.
 
-If you need to run SQL manually, apply the public migration files in manifest
-order:
-
-```bash
-for file in apps/api/supabase/migrations/public/*.sql; do
-  psql "$DATABASE_URL" -f "$file"
-done
-```
+Apply migrations with `pnpm migrate`. Each public migration runs once and is
+recorded in `supamail_meta.public_migrations` (ADR 0040); a runner that skips the
+record can break once a migration drops an object an earlier file creates.
 
 See [docs/fly-supabase.md](docs/fly-supabase.md) for the full Fly.io + Supabase setup.
 

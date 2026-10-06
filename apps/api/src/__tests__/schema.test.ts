@@ -6,9 +6,10 @@ import {
   applyPublicMigrations,
   assertPublicMigrationManifest,
   getRequiredPublicSchemaVersion,
-  readPublicMigrationManifest,
-  readPublicMigrations
+  readPublicMigrationFiles,
+  readPublicMigrationManifest
 } from "../db.js";
+import { createHash } from "node:crypto";
 
 const publicMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0001_imap_mirror.sql");
 const stuckDegradedMigrationPath = resolve(process.cwd(), "supabase/migrations/public/0002_stuck_degraded_escalation.sql");
@@ -78,6 +79,40 @@ const threadingClosureEdgesMigrationPath = resolve(
   process.cwd(),
   "supabase/migrations/public/0026_threading_closure_edges.sql"
 );
+
+const RELEASED_MIGRATION_SHA256: Record<string, string> = {
+  "0001_imap_mirror.sql": "8029ad5b73aca109e86acc663cbeb4fbf139c71d752e604473568776767cd6fa",
+  "0002_stuck_degraded_escalation.sql": "5fe1d5827f9e09eff52796eade157f376532acb8cd26202e0ecc41264ebe7715",
+  "0003_folder_count_cap_pending_verification.sql": "72e950ae932cffc22d81306006bfddf0288aed37e090104e79f79efd3a58d612",
+  "0004_account_lane_settings.sql": "d825d73c9ab83d8fb6aec42a3dc7d408c1a9e1553a1ec964d3c6d7ed03b55b0a",
+  "0005_progress_rollup.sql": "aeba15a7c749606cfb6c087d367d9ad8b6ac7f9658f0e5371e6b763047edc08a",
+  "0006_history_lane_state.sql": "b025e579543b6e4033c5874362e5978584032b6949b81b7c9ea2aba3997a7ca8",
+  "0007_optional_raw_mime.sql": "b6b3dba95c1a6d8550ec01a70c68e9be49dfef5f2e2dadf31d5bc45d79c86fa3",
+  "0008_search_layer.sql": "86c61aaab3c4e72450930e05c708372303a49069f805ba43cc7ef319c74d3aa8",
+  "0009_smtp_send.sql": "af84a93bf4f090ad335b17c6fca732e45c6f3b0fae074f5b2692f621f9f02522",
+  "0010_search_recipient_indexes.sql": "08fabc130c9dcc7e9072f754ccfdbbf89530d039da0a400b8bb01b122d0c5ef2",
+  "0011_webhook_emit_indexes.sql": "d36d1a8aa61a2aa4ff9b37b3e470e32076257f18d43830dd1ecde9c480103924",
+  "0012_sync_events_retention_index.sql": "87efa979957189045087c5eef6d25f1c1fbb39d2a8f9f5327cd3aa8f294f3051",
+  "0013_body_head_trigram_index.sql": "2b2c7a20ca1ab6af4485072f78bfac7ca8c521ad1425334a8b577f3b93a21cad",
+  "0014_conversation_threading.sql": "f05496988bfdc81b2c5a869a72a56953cd1e65ac742e80f8ef4a2ca1f88c67fc",
+  "0015_threading_production_hardening.sql": "fa27d5935865491b96d9fedd0000edbcd898c46a1d404a207bb4f630434518f3",
+  "0016_message_evidence.sql": "6ca434cba7406feefe910ff16a86e9b17bc6e2985aba6f2eac91e2fd632389b6",
+  "0017_threading_body_backfill_index.sql": "fa5bc3fbf810f7d51492bfbbf18deec3809918c668dc0ee9874a4d29d2fcd732",
+  "0018_threading_body_fallback_index.sql": "8b0a74e08a683794d16c03adf854ea26072194bd8118ce2635069c0a22179e3e",
+  "0019_authored_delivery_evidence.sql": "3fb80ad1e687a8e04a1438d34984d90c8eb005f814e8e00930b16a4e44c4c354",
+  "0020_threading_fingerprint_closure.sql": "4818c3f89bbc74ab3bc576a764dce71900aea6ec0b2e29816fa13c381f27456a",
+  "0021_row_accurate_body_progress.sql": "684518e0a8151f066a2c23aba5d82dd53926683a47a28fa66dfece3f78d36424",
+  "0022_content_extract_body_store.sql": "f0822d30ea9b75f886ebddf09fc5f96db0f356688b550b6d37dc06359b47b9b1",
+  "0023_metadata_protection_seam.sql": "36f46fa860407461672603f503e5e5dd0ff7107a832ac69963a9331ac819e563",
+  "0024_metadata_protection_mode.sql": "4287739d576389d196db07f1a0724d72cee709ad22d13bb8c6a5d0c973426be4",
+  "0025_qresync_cursor.sql": "b380e0a95f10f6cdff9b21eea25248ebe55045e9fb2663520fc4fcdc013f2b41",
+  "0026_threading_closure_edges.sql": "603f379c65aa993f994732a9c54832cdc1d959696f977b3d0ada33295aea7b1a",
+  "0027_folder_unchanged_proof.sql": "59f834afbf00d35022e7ac1e4d4d7ddc8a4a1453096f4db68eb8b39672828ff5",
+  "0028_folder_message_counts.sql": "6c79f6b28bcc82f4f856b58e30da2488b1b7a5b0f3eff0230b2fa0b45e055de8",
+  "0029_active_assignments_view_no_barrier.sql": "3d44fe55233bc035477c62a8c62c1e58fbda168f5743f43b54b2f2009fb6cc82",
+  "0030_window_from_message_date.sql": "ef838f7cdc055fe834792e2245e2bab7d8decb55c7cbcc47022ae57b69a197c3",
+  "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf"
+};
 
 describe("initial schema", () => {
   it("adds a bounded search extract without moving full body payloads into metadata", async () => {
@@ -277,14 +312,27 @@ describe("initial schema", () => {
     expect(second).toBe(first);
   });
 
+  it("never changes a released public migration", async () => {
+    // Each migration runs once (ADR 0040): an edit to a released file would never
+    // reach a database that already ran it. Ship a new migration instead, and add
+    // its hash here when it is released.
+    const files = await readPublicMigrationFiles();
+    const manifest = await readPublicMigrationManifest();
+    const actual = Object.fromEntries(manifest.migrations.map((migration, index) => [
+      migration.file,
+      createHash("sha256").update(files[index].sql).digest("hex")
+    ]));
+    expect(actual).toEqual(RELEASED_MIGRATION_SHA256);
+  });
+
   it("exposes an ordered public migration manifest for deployment gates", async () => {
     const manifest = await readPublicMigrationManifest();
     const version = await getRequiredPublicSchemaVersion();
-    const sql = await readPublicMigrations();
+    const sql = (await readPublicMigrationFiles()).map((migration) => migration.sql).join("\n\n");
 
-    expect(version).toBe("0030_window_from_message_date");
+    expect(version).toBe("0031_active_assignments_view_columns");
     expect(manifest).toEqual({
-      schemaVersion: "0030_window_from_message_date",
+      schemaVersion: "0031_active_assignments_view_columns",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -315,7 +363,8 @@ describe("initial schema", () => {
         { id: "0027_folder_unchanged_proof", file: "0027_folder_unchanged_proof.sql" },
         { id: "0028_folder_message_counts", file: "0028_folder_message_counts.sql" },
         { id: "0029_active_assignments_view_no_barrier", file: "0029_active_assignments_view_no_barrier.sql" },
-        { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" }
+        { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" },
+        { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
