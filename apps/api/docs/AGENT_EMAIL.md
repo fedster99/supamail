@@ -43,7 +43,7 @@ listener; remote deployments provide their own transport and authentication.
 | Tool | Purpose | Key params |
 | --- | --- | --- |
 | `search_email` | Canonical ranked search over the mirror. | `q` (free-text + operators), `filters`, `accounts`, `sort`, `limit` |
-| `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each valid distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100) |
+| `read_thread` | One durable conversation or a batch of up to ten. Exact duplicate seeds are collapsed; each valid distinct seed has its own result or error entry. | `message_id` (seed) \| `message_ids` (1–10 seeds) \| `conversation_id` + `account` \| legacy `thread_id` + `account`; `include_quoted=false`, `max_messages=20` per thread (max 100), `cursor` to continue into older messages |
 | `read_message` | One message with its full available cleaned body, cc, and attachments. | `message_id`, `include_headers=false`, `include_quoted=false`, optional `body_offset`, optional positive `max_body_chars` |
 | `list_folders` | Synced folders, including empty ones, with total/unread counts and their sums. | `account?` |
 | `get_sync_status` | Each mailbox's sync state, last sync, progress, and a one-line summary. | `account?` |
@@ -88,7 +88,11 @@ response range; it does not hide source truncation.
 
 Every thread returns `thread_content_status`, `thread_omissions`, and
 `omitted_message_count`. A `partial` status explicitly identifies older messages
-removed by `max_messages`.
+removed by `max_messages`. When older messages remain, the response also carries
+`next_cursor`; the same selector with `cursor` returns the messages before it.
+The boundary is a message's position in the conversation, so a new reply never
+shifts an older page. The last page has no `next_cursor`, and its oldest
+message keeps quoted content. `cursor` is not accepted with `message_ids`.
 
 Search groups by durable conversation by default and first deduplicates physical
 copies of one delivery. A hit's `thread.conversation_id` is therefore the right

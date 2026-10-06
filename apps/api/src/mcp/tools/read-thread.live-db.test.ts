@@ -526,6 +526,76 @@ liveDb("read_thread live DB", () => {
     expect(out.messages[0].body).not.toContain("Alice wrote:");
   });
 
+  it("continues into older messages from next_cursor without repeating one", async () => {
+    const first = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId, max_messages: 2 });
+    expect(isResult(first)).toBe(true);
+    if (!isResult(first)) return;
+    expect(first.messages.map((m) => m.message_id)).toEqual([idByUid.get(2), idByUid.get(3)]);
+    expect(first.next_cursor).toBe(idByUid.get(2));
+
+    const second = await runReadThread(pool, {
+      thread_id: THREAD_ID,
+      account: accountId,
+      max_messages: 2,
+      cursor: first.next_cursor
+    });
+    expect(isResult(second)).toBe(true);
+    if (!isResult(second)) return;
+    expect(second.messages.map((m) => m.message_id)).toEqual([idByUid.get(1)]);
+    expect(second.thread.message_count).toBe(3);
+    expect(second).not.toHaveProperty("next_cursor");
+    expect(second).toMatchObject({
+      omitted_message_count: 0,
+      thread_content_status: "complete",
+      thread_omissions: []
+    });
+    // The oldest message of the conversation keeps its quoted content on the last page.
+    expect(second.messages[0].body).toContain("Original starter details.");
+    expect(second.messages[0].duplicate_message_ids).toEqual([idByUid.get(9)]);
+  });
+
+  it("keeps an older page stable when a new reply arrives", async () => {
+    const first = await runReadThread(pool, { message_id: idByUid.get(3), max_messages: 2 });
+    expect(isResult(first)).toBe(true);
+    if (!isResult(first)) return;
+
+    await seedMessage({
+      uid: 40,
+      subject: "Re: Project kickoff",
+      fromEmail: "dave@acme.com",
+      ageDays: 0,
+      providerThreadId: THREAD_ID,
+      rfcMessageId: "<reply3@acme.com>",
+      messageIdNormalized: "reply3@acme.com",
+      inReplyTo: "<reply2@acme.com>",
+      referencesHeader: "<root@acme.com> <reply1@acme.com> <reply2@acme.com>",
+      body: "Late to the party."
+    });
+    try {
+      const second = await runReadThread(pool, { message_id: idByUid.get(3), max_messages: 2, cursor: first.next_cursor });
+      expect(isResult(second)).toBe(true);
+      if (!isResult(second)) return;
+      expect(second.messages.map((m) => m.message_id)).toEqual([idByUid.get(1)]);
+      expect(second.thread.message_count).toBe(4);
+      expect(second.omitted_message_count).toBe(0);
+    } finally {
+      await pool.query("DELETE FROM public.imap_messages WHERE id = $1", [idByUid.get(40)]);
+      idByUid.delete(40);
+    }
+  });
+
+  it("returns not_found when nothing precedes the cursor", async () => {
+    const atStart = await runReadThread(pool, { thread_id: THREAD_ID, account: accountId, cursor: idByUid.get(1) });
+    expect(atStart).toMatchObject({ error: { code: "not_found", message: "No messages before cursor." } });
+
+    const unknown = await runReadThread(pool, {
+      thread_id: THREAD_ID,
+      account: accountId,
+      cursor: "00000000-0000-0000-0000-000000000000"
+    });
+    expect(unknown).toMatchObject({ error: { code: "not_found", message: "No messages before cursor." } });
+  });
+
   it("reconstructs a header-only (no provider_thread_id) thread from the middle seed", async () => {
     const out = await runReadThread(pool, { message_id: idByUid.get(7) });
     expect(isResult(out)).toBe(true);

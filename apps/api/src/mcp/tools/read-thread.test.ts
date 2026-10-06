@@ -77,7 +77,10 @@ function assignedConversationPool() {
 }
 
 function unassignedSeedPool() {
-  const query = vi.fn(async (sql: string): Promise<{ rows: Array<Record<string, unknown>> }> => {
+  const query = vi.fn(async (
+    sql: string,
+    _values?: unknown[]
+  ): Promise<{ rows: Array<Record<string, unknown>> }> => {
     if (sql.includes("WHERE m.id = $1")) {
       return {
         rows: [
@@ -190,7 +193,10 @@ function batchConversationPool(conversationOf: (messageId: string) => string = c
 
 /** One assigned seed whose conversation holds the given rows; attachments come from `files`. */
 function threadRowsPool(rows: Array<Record<string, unknown>>, files: Array<Record<string, unknown>> = []) {
-  const query = vi.fn(async (sql: string): Promise<{ rows: Array<Record<string, unknown>> }> => {
+  const query = vi.fn(async (
+    sql: string,
+    _values?: unknown[]
+  ): Promise<{ rows: Array<Record<string, unknown>> }> => {
     if (sql.includes("WHERE m.id = $1")) {
       return {
         rows: [{
@@ -320,6 +326,96 @@ describe("read_thread response shape", () => {
     if (!isResult(out)) return;
     expect(out).toMatchObject({ thread_content_status: "complete", thread_omissions: [] });
     expect(out).not.toHaveProperty("missing_ancestor_count");
+  });
+});
+
+describe("read_thread continuation", () => {
+  const CURSOR = "00000000-0000-4000-8000-000000000999";
+
+  it("reads the page before the cursor and points at the next one", async () => {
+    const { pool, query } = threadRowsPool([
+      threadRow("older", {
+        body_text: "Older.\n\nOn Mon, Bob wrote:\n> Quoted history.",
+        thread_total_count: 6,
+        thread_remaining_count: 4
+      }),
+      threadRow("newer", { thread_total_count: 6, thread_remaining_count: 4 })
+    ]);
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED, cursor: CURSOR });
+
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+    expect(out.thread.message_count).toBe(6);
+    expect(out.messages.map((message) => message.message_id)).toEqual(["older", "newer"]);
+    expect(out).toMatchObject({
+      omitted_message_count: 2,
+      next_cursor: "older",
+      thread_content_status: "partial",
+      thread_omissions: ["older_messages"]
+    });
+    expect(out.messages[0].body).not.toContain("Quoted history.");
+    const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"));
+    expect(call?.[0]).toContain("(m.internal_date, m.id) < (");
+    expect(call?.[0]).toContain("WHERE cursor_message.id = $4");
+    expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20, CURSOR]);
+  });
+
+  it("ends without next_cursor and keeps the oldest message's quoted content", async () => {
+    const { pool } = threadRowsPool([
+      threadRow("root", {
+        body_text: "Root.\n\nFrom: Earlier\nSent: Friday\nSubject: Forwarded\n\nForwarded context.",
+        thread_total_count: 3,
+        thread_remaining_count: 1
+      })
+    ]);
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED, cursor: CURSOR });
+
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+    expect(out).not.toHaveProperty("next_cursor");
+    expect(out).toMatchObject({ omitted_message_count: 0, thread_content_status: "complete", thread_omissions: [] });
+    expect(out.messages[0].body).toContain("Forwarded context.");
+  });
+
+  it("passes the cursor to the legacy walk and the provider selector", async () => {
+    const legacy = unassignedSeedPool();
+    await runReadThread(legacy.pool as never, { message_id: LEGACY_SEED, cursor: CURSOR });
+    const legacyCall = legacy.query.mock.calls.find(([sql]) => sql.includes("WITH legacy_candidates"));
+    expect(legacyCall?.[0]).toContain("WHERE cursor_message.id = $6");
+    expect(legacyCall?.[1]?.slice(4)).toEqual([20, CURSOR]);
+
+    const provider = assignedConversationPool();
+    await runReadThread(provider.pool as never, { thread_id: "provider-thread", account: ACCOUNT_ID, cursor: CURSOR });
+    const providerCall = provider.query.mock.calls.find(([sql]) => sql.includes("WHERE m.provider_thread_id = $1"));
+    expect(providerCall?.[1]).toEqual(["provider-thread", ACCOUNT_ID, 20, CURSOR]);
+  });
+
+  it("returns not_found when nothing precedes the cursor", async () => {
+    const { pool } = threadRowsPool([]);
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED, cursor: CURSOR });
+
+    expect(out).toMatchObject({ error: { code: "not_found", message: "No messages before cursor." } });
+  });
+
+  it("rejects a cursor with a message_ids batch before opening a database connection", async () => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, { message_ids: [MESSAGE_ONE], cursor: CURSOR });
+
+    expect(out).toMatchObject({ error: { code: "invalid_input", message: expect.stringContaining("message_ids batch") } });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cursor that is not a message id before opening a database connection", async () => {
+    const connect = vi.fn();
+
+    const out = await runReadThread({ connect } as never, { message_id: MESSAGE_ONE, cursor: "page-2" });
+
+    expect(out).toMatchObject({ error: { code: "invalid_input", message: "cursor: Invalid uuid" } });
+    expect(connect).not.toHaveBeenCalled();
   });
 });
 
@@ -560,7 +656,7 @@ describe("read_thread stored assignments", () => {
     expect(conversationCall?.[0]).toContain("PARTITION BY m.account_id, assignment.delivery_key");
     expect(conversationCall?.[0]).toContain("public.imap_thread_active_assignments assignment");
     expect(conversationCall?.[0]).toContain("assignment.account_id = $1");
-    expect(conversationCall?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20]);
+    expect(conversationCall?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20, null]);
   });
 
   it("accepts a direct account-scoped conversation selector", async () => {
@@ -638,7 +734,8 @@ describe("read_thread stored assignments", () => {
     expect(out.thread_omissions).toEqual(["older_messages"]);
     const call = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"));
     expect(call?.[0]).toContain("LIMIT $3");
-    expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 1]);
+    expect(call?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 1, null]);
+    expect(out.next_cursor).toBe("message-representative");
   });
 
   it("deduplicates a provider selector by active delivery identity with conservative pre-activation fallbacks", async () => {
@@ -659,7 +756,7 @@ describe("read_thread stored assignments", () => {
     expect(providerCall?.[0]).toContain("ON ta.message_id = m.id");
     expect(providerCall?.[0]).toContain("b.raw_truncated");
     expect(providerCall?.[0]).not.toContain("b.body_text");
-    expect(providerCall?.[1]).toEqual(["provider-thread", ACCOUNT_ID, 20]);
+    expect(providerCall?.[1]).toEqual(["provider-thread", ACCOUNT_ID, 20, null]);
   });
 
   it("falls back to the legacy one-hop walk when the active run has no assignment", async () => {

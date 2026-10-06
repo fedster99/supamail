@@ -16,6 +16,7 @@ describe("MCP agent guidance", () => {
     expect(MCP_INSTRUCTIONS).toContain("Duplicate message_ids are collapsed");
     expect(MCP_INSTRUCTIONS).toContain("each distinct ID has its own result or error entry, or same_thread_as");
     expect(MCP_INSTRUCTIONS).toContain("missing_ancestor_count counts earlier replies that were never mirrored");
+    expect(MCP_INSTRUCTIONS).toContain("next_cursor continues into them: call read_thread again with the same selector and cursor");
     expect(MCP_INSTRUCTIONS).toContain("full available cleaned body for each message");
     expect(MCP_INSTRUCTIONS).toContain("specific range without a product character ceiling");
     expect(MCP_INSTRUCTIONS).toContain("body_total_chars and body_next_offset");
@@ -35,6 +36,9 @@ describe("MCP agent guidance", () => {
     expect(readThreadDefinition.description).not.toContain("broader investigation");
     expect(readThreadDefinition.description).not.toContain("instead of issuing separate");
     expect(readThreadDefinition.description).toContain("full cleaned body");
+    expect(readThreadDefinition.description).toContain("exists only on read_message");
+    expect(readThreadDefinition.description).toContain("next_cursor continues into them");
+    expect(readThreadDefinition.description).not.toContain("ONE-HOP");
     const properties = readThreadDefinition.inputSchema.properties as Record<string, unknown>;
     expect(properties.message_ids).toMatchObject({
       minItems: 1,
@@ -47,9 +51,12 @@ describe("MCP agent guidance", () => {
       minLength: 36,
       maxLength: 36
     });
+    expect(properties.cursor).toMatchObject({ type: "string", format: "uuid", minLength: 36, maxLength: 36 });
     const selectors = readThreadDefinition.inputSchema.oneOf as Array<Record<string, unknown>>;
     expect(selectors).toHaveLength(4);
     expect(selectors.every((selector) => Object.hasOwn(selector, "not"))).toBe(true);
+    const batch = selectors.find((selector) => (selector.required as string[]).includes("message_ids"));
+    expect(batch?.not).toEqual({ anyOf: expect.arrayContaining([{ required: ["cursor"] }]) });
 
     const readMessageProperties = readMessageDefinition.inputSchema.properties as Record<string, unknown>;
     expect(readMessageProperties.message_id).toMatchObject({
