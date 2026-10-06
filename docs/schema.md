@@ -65,6 +65,14 @@ takes before writing messages. The migration backfills once while it blocks
 message writes. `list_folders` reads these rows instead of counting messages;
 unlike `headers_synced_count`, they also fall on deletes and moves.
 
+`0029_active_assignments_view_no_barrier` drops `security_barrier` from
+`imap_thread_active_assignments`. A barrier view is never flattened into the
+query that reads it, so a plain join could not take a per-row index path and
+read the account's whole active projection; without the barrier a join on
+`message_id` takes the message index. The view stays `security_invoker`, so
+table row-level security still applies; the rows it hides are only the same
+account's assignments from non-active runs.
+
 `0026_threading_closure_edges` normalizes each assignment's conversation,
 delivery, reference, provider-thread, and delivery-fingerprint keys into
 `imap_thread_closure_edges`. A run-scoped composite index lets closure expansion
@@ -156,7 +164,7 @@ Threading algorithm v3 adds two deliberately narrow corrections while retaining 
 
 `0020_threading_fingerprint_closure` persists the bounded, namespaced hashes of each physical row's raw, parsed, authored, and exact-metadata delivery tokens. The bounded worker iterates an account-run-scoped GIN overlap lookup to close transitive evidence without copying an entire delivery's token set onto every assignment. This pulls an already-processed physical copy into a later closure even when the copies cannot otherwise be rediscovered from the current page. Existing projection rows receive an empty array; the next deterministic shadow rebuild populates the evidence and repairs page-boundary false splits before reader activation. Messages and bodies remain authoritative, and the projection remains fully replaceable.
 
-`imap_thread_runs` is an isolated algorithm snapshot for one account. Its mode is initial, upgrade, or explicit rebuild; its bounded stages are body evidence, strong protocol graph, weak subject buckets, catch-up, and ready. `0015` moves shadow pagination to the immutable `cursor_message_id`; runs created by 0014 safely restart their current scan once after upgrade. Catch-up repairs missing assignment coverage in bounded batches before `ready`. Each run records the mirror evidence revision it has fully consumed. `imap_thread_state` points to at most one active reader run, one rollback standby, and one building/ready shadow; its `scheduler_cursor` persists the three-active/one-standby/one-building weighted schedule across workers and deploys. `imap_thread_evidence_clock` is a monotonic account clock advanced by database triggers for relevant message/body writes. `imap_thread_active_assignments` is the security-invoker/status-checked view used by readers, so cutover is one atomic pointer update rather than an in-place table rewrite.
+`imap_thread_runs` is an isolated algorithm snapshot for one account. Its mode is initial, upgrade, or explicit rebuild; its bounded stages are body evidence, strong protocol graph, weak subject buckets, catch-up, and ready. `0015` moves shadow pagination to the immutable `cursor_message_id`; runs created by 0014 safely restart their current scan once after upgrade. Catch-up repairs missing assignment coverage in bounded batches before `ready`. Each run records the mirror evidence revision it has fully consumed. `imap_thread_state` points to at most one active reader run, one rollback standby, and one building/ready shadow; its `scheduler_cursor` persists the three-active/one-standby/one-building weighted schedule across workers and deploys. `imap_thread_evidence_clock` is a monotonic account clock advanced by database triggers for relevant message/body writes. `imap_thread_active_assignments` is the security-invoker/status-checked view used by readers, so cutover is one atomic pointer update rather than an in-place table rewrite. `0029` removes its security barrier (see the migration list above).
 
 There is one `imap_thread_assignments` row per physical message row per run. It records the strict Message-ID, fixed-size delivery/conversation evidence keys, hashed delivery-fingerprint evidence, raw root/parent/reference evidence, provider hint, normalized subject, assignment method, coarse confidence tier, provisional flag, evidence, input hash, generation, and algorithm version. Raw evidence is inspectable but unindexed; indexed adversarial header/provider/fingerprint values are SHA-256 digests. The RFC/provider inputs in `imap_messages` and `imap_message_bodies` remain authoritative.
 
