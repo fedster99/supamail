@@ -125,7 +125,17 @@ structured filter **narrows** the existing semantic + fuzzy free-text query over
   beyond parsing: strict calendar-date validation, relative dates (`h`/`d`/`w`/
   `m`/`y`, at most about 100 years back, months clamped to the month's end), the
   `filetype:` MIME table, the `filename:` glob (a value without `*` or `?`
-  matches as a substring), and the `folder:` subtree (a trailing `/*`).
+  matches as a substring), Message-ID normalization (`msgid:` drops angle
+  brackets and case, as the mirror stores it), and folder resolution.
+  `resolveFolderFilters` turns each `in:`/`folder:` value into the exact
+  `(account_id, folder_path)` pairs it names in the searched accounts: a full
+  path in `/` or the account's delimiter, a folder's last name, or a role
+  (`sent`, `trash`, `drafts`, `archive`, `junk`, `inbox`) covering every folder
+  with that special-use flag or a common name for it. A trailing `/*` or
+  delimiter-and-`*` selects the folders below a path. `parsed_query` echoes the
+  resolved folders; a value that names no folder matches nothing and warns with
+  the closest folders. An operator-shaped token that is not an operator stays
+  free text with a warning.
   `resolveDate` turns every valid date value, relative
   or absolute (UTC when it has no zone), into one instant; Postgres binds that
   instant as a timestamp, so every engine reads a date filter the same way. A

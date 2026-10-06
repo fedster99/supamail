@@ -1,3 +1,5 @@
+import type { SearchFilter } from "./types.js";
+
 /**
  * Search filter rules shared by every engine. Postgres compiles them to SQL; a
  * hosted index translates the same data, so the engines cannot drift.
@@ -113,13 +115,119 @@ export function filenameGlob(value: string): string {
   return /[*?]/.test(value) ? value : `*${value}*`;
 }
 
-/** What a `folder:` value matches: the exact path, or with a trailing `/*`, the
- * folders below `path`. The path is literal text. */
-export interface FolderMatch {
-  kind: "exact" | "subtree";
+/** An RFC Message-ID as the mirror stores it: no angle brackets, lowercase. A value
+ * copied from a header (`<ABC@example.com>`) matches the same message. */
+export function normalizeMessageId(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value.trim().replace(/^<|>$/g, "").toLowerCase() || null;
+}
+
+/** One mirrored folder, as `in:` resolves against it. */
+export interface FolderRow {
+  account_id: string;
+  path: string;
+  delimiter: string | null;
+  special_use: string | null;
+}
+
+/** The folders a `folder` filter matched, per Mailbox Account. */
+export interface FolderRef {
+  account_id: string;
   path: string;
 }
 
-export function folderMatch(value: string): FolderMatch {
-  return value.endsWith("/*") ? { kind: "subtree", path: value.slice(0, -2) } : { kind: "exact", path: value };
+// A role name selects every folder with its special-use flag or a common provider name,
+// so `in:sent` covers a flagged Sent folder and an unflagged "Sent Messages" alike. The
+// Inbox is only the flagged folder or the INBOX path itself, never a subfolder named Inbox.
+const FOLDER_ROLES: ReadonlyArray<{ role: string; specialUse: string; names: readonly string[] }> = [
+  { role: "inbox", specialUse: "\\inbox", names: [] },
+  { role: "sent", specialUse: "\\sent", names: ["sent", "sent messages", "sent items", "sent mail"] },
+  { role: "drafts", specialUse: "\\drafts", names: ["drafts", "draft"] },
+  { role: "trash", specialUse: "\\trash", names: ["trash", "deleted messages", "deleted items", "bin"] },
+  { role: "archive", specialUse: "\\archive", names: ["archive", "archives"] },
+  { role: "junk", specialUse: "\\junk", names: ["junk", "spam", "junk e-mail", "junk email", "bulk mail"] }
+];
+
+/** A folder path as `/`-separated lowercase segments, whatever the account's delimiter. */
+function folderSegments(path: string, delimiter: string | null): string[] {
+  const parts = delimiter ? path.split(delimiter) : [path];
+  return parts.flatMap((part) => part.split("/")).map((part) => part.toLowerCase());
+}
+
+function editDistance(left: string, right: string): number {
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j += 1) {
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
+    }
+    previous = current;
+  }
+  return previous[right.length];
+}
+
+/** How `value` names `folder`: by full path (or a subtree below one), by role, or by
+ * last name; null when it does not. */
+function folderMatchKind(value: string, folder: FolderRow): "path" | "role" | "leaf" | null {
+  const segments = folderSegments(folder.path, folder.delimiter);
+  const subtree = value.endsWith("/*") || (folder.delimiter !== null && value.endsWith(`${folder.delimiter}*`));
+  if (subtree) {
+    const base = folderSegments(value.slice(0, -2), folder.delimiter);
+    return segments.length > base.length && base.every((part, index) => segments[index] === part) ? "path" : null;
+  }
+  const wanted = folderSegments(value.replace(/^\\/, ""), folder.delimiter);
+  if (segments.join("/") === wanted.join("/")) return "path";
+  if (wanted.length > 1) return null;
+  const leaf = segments.at(-1)!;
+  const role = FOLDER_ROLES.find((candidate) => candidate.role === wanted[0] || candidate.names.includes(wanted[0]));
+  if (role) return folder.special_use?.toLowerCase() === role.specialUse || role.names.includes(leaf) ? "role" : null;
+  return leaf === wanted[0] ? "leaf" : null;
+}
+
+/**
+ * The folders a `folder:`/`in:` value names in each account. The value may be a full
+ * path written with `/` or the account's own delimiter, a folder's last name (`Legal`
+ * for `INBOX.INBOX.Legal`, used only where no folder has that full path), or a role (`sent`, `\\Sent`, `trash`, `drafts`, `archive`,
+ * `junk`, `inbox`), which covers every folder with that special-use flag or a common
+ * name for it. A trailing `/*` (or the delimiter and `*`) selects the folders below a
+ * full path. Matching ignores case. With no match, the warning names the closest folders.
+ */
+export function resolveFolder(value: string, folders: readonly FolderRow[]): { folders: FolderRef[]; warning: string | null } {
+  const kinds = folders.map((folder) => ({ folder, kind: folderMatchKind(value, folder) }));
+  // A last name counts only in an account where no folder has that full path.
+  const pathAccounts = new Set(kinds.filter(({ kind }) => kind === "path").map(({ folder }) => folder.account_id));
+  const matched = kinds
+    .filter(({ folder, kind }) => kind !== null && (kind !== "leaf" || !pathAccounts.has(folder.account_id)))
+    .map(({ folder }) => folder);
+  if (matched.length > 0) {
+    return { folders: matched.map(({ account_id, path }) => ({ account_id, path })), warning: null };
+  }
+  const wanted = value.replace(/[/.]?\*$/, "").toLowerCase().split(/[/.]/).filter(Boolean).at(-1) ?? "";
+  const closest = folders
+    .map((folder) => ({ path: folder.path, distance: editDistance(wanted, folderSegments(folder.path, folder.delimiter).at(-1)!) }))
+    .sort((left, right) => left.distance - right.distance || left.path.localeCompare(right.path))
+    .map(({ path }) => path)
+    .filter((path, index, all) => all.indexOf(path) === index)
+    .slice(0, 3);
+  return {
+    folders: [],
+    warning: `folder "${value}" not found; it matches nothing` + (closest.length ? `. Closest folders: ${closest.join(", ")}` : "")
+  };
+}
+
+/** True when a filter, or a member of its OR group, scopes by folder. */
+export function hasFolderFilter(filter: SearchFilter): boolean {
+  return filter.kind === "folder" || (filter.kind === "or" && filter.filters.some(hasFolderFilter));
+}
+
+/** Resolve every folder filter, including OR members, against the searched accounts'
+ * folders. Each engine matches the resolved (account, path) pairs exactly. */
+export function resolveFolderFilters(filters: SearchFilter[], folders: readonly FolderRow[], warnings: string[]): SearchFilter[] {
+  return filters.map(function resolve(filter): SearchFilter {
+    if (filter.kind === "or") return { ...filter, filters: filter.filters.map(resolve) };
+    if (filter.kind !== "folder") return filter;
+    const resolved = resolveFolder(filter.value, folders);
+    if (resolved.warning && !warnings.includes(resolved.warning)) warnings.push(resolved.warning);
+    return { ...filter, folders: resolved.folders };
+  });
 }

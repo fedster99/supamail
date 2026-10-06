@@ -142,6 +142,48 @@ describe("cleanBody", () => {
     expect(out.omissions).toEqual(["signature"]);
   });
 
+  const CONTACT_CARD = "Jane Doe\n\nExample Widgets Ltd\n12 High Street, Springfield, AB1 2CD\nhttps://widgets.example";
+
+  it.each([
+    ["a closing", `Sounds good, see you Tuesday.\n\nThanks,\n${CONTACT_CARD}`, "Sounds good, see you Tuesday.\n\nThanks,"],
+    ["a bare web address", "See you Tuesday.\n\nJane Doe\n\nExample Widgets Ltd\n500 Main St, Suite 20\nwww.widgets.example", "See you Tuesday."],
+    ["trailing blank lines", `See you Tuesday.\n\n${CONTACT_CARD}\n\n`, "See you Tuesday."]
+  ])("strips an Outlook contact-card signature after %s", (_label, body, authored) => {
+    const out = cleanBody(body, { includeQuoted: false });
+    expect(out.text).toBe(authored);
+    expect(out.omissions).toEqual(["signature"]);
+    expect(cleanBody(body, { includeQuoted: true }).text).toBe(body.replace(/\s+$/, ""));
+  });
+
+  it.each([
+    ["a link as the last paragraph", "Here is the agenda.\n\nJane Doe\n\nhttps://widgets.example/agenda"],
+    ["contact details passed on", `Please send the invoice to:\n\n${CONTACT_CARD}`],
+    ["a heading over steps", "Plan below.\n\nNext Steps\n\nShip v2, then review\nhttps://widgets.example/plan"],
+    ["a question in the block", "Can you check?\n\nJane Doe\n\nIs 12 High Street, Springfield right?\nhttps://widgets.example"],
+    ["no blank line before the block", "See you Tuesday.\nJane Doe\nExample Widgets Ltd\n12 High Street, Springfield, AB1 2CD\nhttps://widgets.example"],
+    ["a message that is only the card", CONTACT_CARD],
+    ["a lowercase line in place of a name", "Notes below.\n\nsee the office\n\n12 High Street, Springfield, AB1 2CD\nhttps://widgets.example"]
+  ])("keeps %s", (_label, body) => {
+    const out = cleanBody(body, { includeQuoted: false });
+    expect(out.text).toBe(body);
+    expect(out.omissions).toEqual([]);
+  });
+
+  it("always drops Outlook's first-contact banner and image placeholders without reporting them", () => {
+    const body = "You don't often get email from jane@widgets.example. Learn why this is important<https://aka.ms/LearnAboutSenderIdentification>\n\nHi Bob,\uFFFC\n\nThe draft is ready.";
+    const wrapped = "Some people who received this message don\u2019t often get email from jane@widgets.example.\nLearn why this is important\nHi Bob,";
+
+    for (const includeQuoted of [false, true]) {
+      expect(cleanBody(body, { includeQuoted })).toMatchObject({
+        text: "Hi Bob,\n\nThe draft is ready.",
+        omissions: []
+      });
+      expect(cleanBody(wrapped, { includeQuoted }).text).toBe("Hi Bob,");
+    }
+    const mention = "I keep seeing \"Learn why this is important\" in Outlook.";
+    expect(cleanBody(mention, { includeQuoted: false }).text).toBe(mention);
+  });
+
   it("returns a requested range with a stable continuation offset", () => {
     const out = cleanBody("0123456789", {
       includeQuoted: false,
@@ -243,6 +285,32 @@ describe("mapMessageRow", () => {
       body_total_chars: 10,
       body_next_offset: 4
     });
+  });
+  it("drops the session-only \\Recent flag and omits a missing provider thread id", () => {
+    const row = {
+      id: "message-1",
+      account_id: "account-1",
+      folder_path: "INBOX",
+      provider_thread_id: null,
+      subject: "Flags",
+      from_email: "alice@example.test",
+      from_name: "Alice",
+      to_emails: ["me@example.test"],
+      cc_emails: [],
+      flags: ["\\Seen", "\\Recent", "\\recent", "$Label"],
+      window_status: "IN_WINDOW" as const,
+      internal_date: new Date("2026-08-01T00:00:00.000Z"),
+      body_text: "hello",
+      body_plain: null,
+      selected_text_part: null,
+      raw_truncated: false,
+      attachments: []
+    };
+
+    const message = mapMessageRow(row);
+    expect(message.flags).toEqual(["\\Seen", "$Label"]);
+    expect(message).not.toHaveProperty("thread_id");
+    expect(mapMessageRow({ ...row, provider_thread_id: "provider-thread" }).thread_id).toBe("provider-thread");
   });
 });
 

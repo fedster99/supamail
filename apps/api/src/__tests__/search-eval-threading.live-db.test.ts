@@ -43,7 +43,7 @@ liveDb("search evaluation durable threading", () => {
     expect(budgetThread).toMatchObject({
       conversation_id: expect.stringMatching(/^thread_[0-9a-f]{32}$/),
       provider_thread_id: null,
-      message_count: 4
+      match_count: 4
     });
 
     const newsletters = await searchMessages(pool, {

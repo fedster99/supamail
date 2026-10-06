@@ -167,7 +167,6 @@ liveDb("search layer live DB", () => {
     expect(ids).toContain(idByUid.get(3)); // body-only hit, very old
     expect(ids).not.toContain(idByUid.get(4)); // soft-deleted, never surfaces
     expect(ids.indexOf(idByUid.get(1)!)).toBeLessThan(ids.indexOf(idByUid.get(3)!));
-    expect(response.read_only).toBe(true);
   });
 
   it("shows one result per delivery and lists its other stored copies", async () => {
@@ -204,6 +203,50 @@ liveDb("search layer live DB", () => {
     const keys = await deliveryKeys(pool, [...ids, idByUid.get(1)!]);
     expect(keys.get(ids[0])).toBe(keys.get(ids[1]));
     expect(keys.get(idByUid.get(1)!)).not.toBe(keys.get(ids[0]));
+  });
+
+  it("resolves in: to the account's folders by path, last name or role", async () => {
+    await pool.query(
+      `INSERT INTO public.imap_folders (account_id, path, delimiter, special_use, last_synced_at)
+       VALUES ($1, 'INBOX', '.', '\\Inbox', now() - interval '1 hour'),
+              ($1, 'INBOX.INBOX.Legal', '.', NULL, now() - interval '1 hour'),
+              ($1, 'INBOX.INBOX.Sent', '.', '\\Sent', now() - interval '1 hour'),
+              ($1, 'INBOX.Sent Messages', '.', NULL, now() - interval '1 hour')`,
+      [accountId]
+    );
+    for (const [uid, folder] of [[40, "INBOX.INBOX.Legal"], [41, "INBOX.INBOX.Sent"], [42, "INBOX.Sent Messages"]] as const) {
+      await pool.query(
+        `INSERT INTO public.imap_messages (
+           account_id, folder_path, uidvalidity, uid, internal_date, subject, from_email,
+           to_emails, flags, deleted_in_provider, window_status, size_bytes
+         ) VALUES ($1, $2, $3, $4, now(), 'Folder probe', 'me@example.test',
+           ARRAY['you@example.test'], ARRAY['\\Recent', '\\Seen'], false, 'IN_WINDOW', 10)`,
+        [accountId, folder, UIDVALIDITY, uid]
+      );
+    }
+    const folders = async (q: string): Promise<string[]> => (await searchMessages(pool, { q, accounts: [accountId], groupByThread: false }))
+      .results.map((result) => result.identity.folder_path).sort();
+
+    expect(await folders("in:Legal")).toEqual(["INBOX.INBOX.Legal"]);
+    const legal = await searchMessages(pool, { q: "in:Legal", accounts: [accountId] });
+    expect(legal.results[0].flags).toEqual(["\\Seen"]);
+    expect(await folders("in:sent")).toEqual(["INBOX.INBOX.Sent", "INBOX.Sent Messages"]);
+    expect(await folders("in:INBOX.INBOX.* folder probe")).toEqual(["INBOX.INBOX.Legal", "INBOX.INBOX.Sent"]);
+    expect(await folders("-in:sent folder probe")).toEqual(["INBOX.INBOX.Legal"]);
+    const missing = await searchMessages(pool, { q: "in:Legl", accounts: [accountId] });
+    expect(missing.results).toEqual([]);
+    expect(missing.parsed_query.warnings[0]).toMatch(/^folder "Legl" not found; it matches nothing\. Closest folders: INBOX\.INBOX\.Legal/);
+  });
+
+  it("reports a folder synced after the last full account sync as the last sync", async () => {
+    await pool.query("UPDATE public.imap_accounts SET last_sync_finished_at = now() - interval '1 day' WHERE id = $1", [accountId]);
+    await pool.query(
+      `INSERT INTO public.imap_folders (account_id, path, delimiter, last_synced_at)
+       VALUES ($1, 'Live', '/', '2099-01-01T00:00:00Z')`,
+      [accountId]
+    );
+    const response = await searchMessages(pool, { q: "invoice", accounts: [accountId] });
+    expect(response.sync_trust.accounts[0].last_sync_at).toBe("2099-01-01T00:00:00.000Z");
   });
 
   it("never returns a soft-deleted body even when its term matches", async () => {

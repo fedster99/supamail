@@ -68,8 +68,7 @@ export const searchRequestSchema = z
     snippet: z.boolean().optional(),
     includeBody: z.boolean().optional(),
     explain: z.boolean().optional(),
-    groupByThread: z.boolean().optional(),
-    semantic: z.boolean().optional()
+    groupByThread: z.boolean().optional()
   })
   .strict()
   .refine((value) => value.q !== undefined || value.filters !== undefined, {
@@ -92,8 +91,9 @@ export const searchEmailToolDefinition = {
     "and/or a structured filters object (from, to, cc, bcc, anyEmail, subject, body, folder, thread, " +
     "isUnread, isStarred/isFlagged, hasAttachment, after, before, …), scoped to one or all accounts. " +
     "OR joins the operators or words beside it: from:a OR from:b is:unread means (a or b) and unread. " +
-    "Check parsed_query.warnings for an OR that was ignored. " +
-    "All filters COMPOSE with the semantic free-text query — they narrow, never replace it, over the " +
+    "in: takes a folder path, a folder's last name, or a role (in:sent covers every sent folder). " +
+    "Check parsed_query.warnings for an ignored OR, an unknown operator, or a folder that matched nothing. " +
+    "All filters COMPOSE with the free-text query — they narrow, never replace it, over the " +
     "FULL mirror history (no 90-day window). Returns ranked, " +
     "snippet-highlighted results with full mailbox identity (score is null when the order ranks " +
     "nothing: date, size or sender order, or no free-text words), an optional per-result " +
@@ -120,7 +120,7 @@ export const searchEmailToolDefinition = {
           "Structured predicates (alternative or addition to q; they COMPOSE with the free-text query). " +
           "Field filters: from, fromDomain, to, cc, bcc, anyEmail, subject, body, thread, msgid, filename, filetype, mime. " +
           "State filters: isUnread, isRead, isStarred (alias isFlagged), isAnswered, isDraft, hasAttachment, hasBody. " +
-          "Date-range: after / before (ISO 2026-01-01 or relative like 7d/12h). Folder scoping: folder (path; trailing /* matches a subtree).",
+          "Date-range: after / before (ISO 2026-01-01 or relative like 7d/12h). Folder scoping: folder (see its description).",
         properties: {
           from: { type: "string", description: "Sender contains; @domain matches the sender domain." },
           fromDomain: { type: "string", description: "Sender domain exact match (no leading @)." },
@@ -130,9 +130,15 @@ export const searchEmailToolDefinition = {
           anyEmail: { type: "string", description: "Any address field contains: from + to + cc + bcc." },
           subject: { type: "string", description: "Subject contains." },
           body: { type: "string", description: "Body full-text match." },
-          folder: { type: "string", description: "Folder path exact; a trailing /* matches the subtree." },
+          folder: {
+            type: "string",
+            description:
+              "Full folder path, a folder's last name (Legal), or a role (inbox, sent, drafts, trash, archive, junk) " +
+              "that covers every folder for it; a trailing /* matches the folders below a path. " +
+              "parsed_query lists the folders matched and warns when none match."
+          },
           thread: { type: "string", description: "provider_thread_id exact match." },
-          msgid: { type: "string", description: "Normalized RFC Message-ID exact match." },
+          msgid: { type: "string", description: "RFC Message-ID, with or without angle brackets." },
           filename: { type: "string", description: "Attachment filename; * and ? are wildcards (e.g. *.pdf). Without them, matches part of the name." },
           filetype: { type: "string", description: "Attachment class: pdf,image,video,audio,doc,sheet,zip,text." },
           mime: { type: "string", description: "Attachment MIME type exact match." },
@@ -170,8 +176,7 @@ export const searchEmailToolDefinition = {
       snippet: { type: "boolean", default: true },
       includeBody: { type: "boolean", default: false },
       explain: { type: "boolean", default: false },
-      groupByThread: { type: "boolean", default: true, description: "Collapse each conversation to its best message." },
-      semantic: { type: "boolean", default: false, description: "Enables the semantic tier; currently a no-op." }
+      groupByThread: { type: "boolean", default: true, description: "Collapse each conversation to its best message." }
     }
   }
 } as const;

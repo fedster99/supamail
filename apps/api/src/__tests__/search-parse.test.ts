@@ -4,11 +4,13 @@ import {
   filenameGlob,
   filetypeMatch,
   filtersFromStructured,
-  folderMatch,
+  normalizeMessageId,
   isValidAbsoluteDate,
   parseQuery,
   parseTextTerms,
   resolveDate,
+  resolveFolder,
+  resolveFolderFilters,
   resolveRelativeDate,
   tokenize
 } from "../search/index.js";
@@ -266,16 +268,17 @@ describe("email-005 structured filters", () => {
 
   it("narrows by received_after/received_before (date range) and folder scope, paginated", () => {
     const compiled = compileSearch(noText,
-      filtersFromStructured({ after: "2026-01-01", before: "2026-02-01", folder: "INBOX" }),
+      resolveFolderFilters(filtersFromStructured({ after: "2026-01-01", before: "2026-02-01", folder: "inbox" }),
+        [{ account_id: "a", path: "INBOX", delimiter: "/", special_use: null }], []),
       { ...baseCompileOptions, limit: 10, offset: 20 }
     );
     expect(compiled.text).toContain("m.internal_date >=");
     expect(compiled.text).toContain("m.internal_date <");
-    expect(compiled.text).toContain("lower(m.folder_path) =");
+    expect(compiled.text).toContain("(m.account_id, m.folder_path) IN");
     // Pagination: LIMIT n+1 (has_more probe) and the bound offset are present.
     expect(compiled.values).toContain(11);
     expect(compiled.values).toContain(20);
-    expect(compiled.values).toContain("inbox");
+    expect(compiled.values).toContainEqual(["INBOX"]);
   });
 });
 
@@ -497,14 +500,85 @@ describe("shared search rules", () => {
     expect(compiled.values).toContain("%.pdf");
   });
 
-  it("reads a folder as an exact literal path, with a trailing /* for the folders below it", () => {
-    expect(folderMatch("[Gmail]/Sent Mail")).toEqual({ kind: "exact", path: "[Gmail]/Sent Mail" });
-    expect(folderMatch("Archive/*")).toEqual({ kind: "subtree", path: "Archive" });
-    // Only a trailing /* is a subtree; an inner * is part of the path.
-    expect(folderMatch("Projects/*/Notes")).toEqual({ kind: "exact", path: "Projects/*/Notes" });
-    const values = (query: string): unknown[] => compileSearch(noText, parseQuery(query).filters, baseCompileOptions).values;
-    expect(values('in:"[Gmail]/Sent Mail"')).toContain("[gmail]/sent mail");
-    expect(values("in:My_Folder/*")).toContain("my\\_folder/%");
+  describe("folder resolution", () => {
+    const dot = (path: string, special_use: string | null = null) => ({ account_id: "a-dot", path, delimiter: ".", special_use });
+    const slash = (path: string, special_use: string | null = null) => ({ account_id: "a-slash", path, delimiter: "/", special_use });
+    const folders = [
+      dot("INBOX", "\\Inbox"), dot("INBOX.Sent"), dot("INBOX.Sent Messages"), dot("INBOX.INBOX.Sent", "\\Sent"),
+      dot("INBOX.INBOX.Legal"), dot("INBOX.INBOX.Legal.2025"), dot("INBOX.Archive", "\\Archive"),
+      slash("INBOX", "\\Inbox"), slash("Sent Messages", "\\Sent"), slash("Projects/Acme"), slash("[Gmail]/Sent Mail"),
+      slash("Projects/Inbox"), slash("Acme"), slash("Clients/Acme")
+    ];
+    const paths = (value: string): string[] => resolveFolder(value, folders).folders.map((folder) => `${folder.account_id}:${folder.path}`);
+
+    it("maps a role to every folder flagged or named for it, in each account", () => {
+      expect(paths("sent")).toEqual([
+        "a-dot:INBOX.Sent", "a-dot:INBOX.Sent Messages", "a-dot:INBOX.INBOX.Sent", "a-slash:Sent Messages", "a-slash:[Gmail]/Sent Mail"
+      ]);
+      expect(paths("\\Sent")).toEqual(paths("sent"));
+      expect(paths("inbox")).toEqual(["a-dot:INBOX", "a-slash:INBOX"]);
+    });
+
+    it("matches a full path in either delimiter, or a folder's last name, ignoring case", () => {
+      expect(paths("INBOX.INBOX.Legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
+      expect(paths("inbox/inbox/legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
+      expect(paths("Legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
+      expect(paths("[Gmail]/Sent Mail")).toEqual(["a-slash:[Gmail]/Sent Mail"]);
+      // Where a folder has the full path, a last name elsewhere does not count.
+      expect(paths("Acme")).toEqual(["a-slash:Acme"]);
+      expect(paths("Legal")).toEqual(["a-dot:INBOX.INBOX.Legal"]);
+    });
+
+    it("never takes a subfolder named Inbox for the Inbox", () => {
+      expect(paths("INBOX")).toEqual(["a-dot:INBOX", "a-slash:INBOX"]);
+      expect(paths("Projects/Inbox")).toEqual(["a-slash:Projects/Inbox"]);
+    });
+
+    it("reads a trailing /* or delimiter and * as the folders below a full path", () => {
+      expect(paths("INBOX.INBOX.*")).toEqual(["a-dot:INBOX.INBOX.Sent", "a-dot:INBOX.INBOX.Legal", "a-dot:INBOX.INBOX.Legal.2025"]);
+      expect(paths("INBOX/INBOX/*")).toEqual(paths("INBOX.INBOX.*"));
+      expect(paths("Projects/*")).toEqual(["a-slash:Projects/Acme", "a-slash:Projects/Inbox"]);
+      // An inner * is part of the path.
+      expect(paths("Projects/*/Notes")).toEqual([]);
+    });
+
+    it("warns with the closest folders when nothing matches", () => {
+      expect(resolveFolder("Legl", folders)).toEqual({
+        folders: [],
+        warning: 'folder "Legl" not found; it matches nothing. Closest folders: INBOX.INBOX.Legal, INBOX.INBOX.Sent, INBOX.Sent'
+      });
+    });
+
+    it("resolves OR members and compiles exact (account, path) pairs", () => {
+      const warnings: string[] = [];
+      const filters = resolveFolderFilters(parseQuery("in:Legal OR in:nowhere").filters, folders, warnings);
+      expect(filters[0]).toMatchObject({ kind: "or", filters: [
+        { kind: "folder", folders: [{ account_id: "a-dot", path: "INBOX.INBOX.Legal" }] },
+        { kind: "folder", folders: [] }
+      ] });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/^folder "nowhere" not found/);
+      const compiled = compileSearch(noText, resolveFolderFilters(parseQuery("in:Legal").filters, folders, []), baseCompileOptions);
+      expect(compiled.text).toContain("(m.account_id, m.folder_path) IN (SELECT * FROM unnest(");
+      expect(compiled.values).toEqual(expect.arrayContaining([["a-dot"], ["INBOX.INBOX.Legal"]]));
+    });
+  });
+
+  it("matches a Message-ID copied from a header, brackets and case included", () => {
+    expect(normalizeMessageId(" <ABC.123@Example.COM> ")).toBe("abc.123@example.com");
+    expect(parseQuery("msgid:<ABC.123@Example.COM>").filters).toEqual([
+      { kind: "msgid", value: "abc.123@example.com", negated: false, raw: "msgid:<ABC.123@Example.COM>" }
+    ]);
+    expect(filtersFromStructured({ msgid: "<ABC@Example.com>" })[0]).toMatchObject({ kind: "msgid", value: "abc@example.com" });
+  });
+
+  it("warns about an unknown operator and searches it as text; a URL is just text", () => {
+    const parsed = parseQuery("tag:status foo:bar https://example.com/x Re: hello");
+    expect(parsed.freeText).toBe("tag:status foo:bar https://example.com/x Re: hello");
+    expect(parsed.warnings).toEqual([
+      'unknown operator tag:; "tag:status" searched as text',
+      'unknown operator foo:; "foo:bar" searched as text'
+    ]);
   });
 
   it("maps filetype values to one shared MIME table", () => {

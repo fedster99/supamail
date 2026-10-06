@@ -53,6 +53,7 @@ export interface MessageAttachment {
   attachment_id: string;
   filename: string | null;
   mime_type: string | null;
+  /** Decoded file size; for base64 parts, an upper-bound estimate within about 3%. */
   size_bytes: number | null;
   disposition: string | null;
 }
@@ -66,8 +67,8 @@ export interface MessageAttachment {
 export interface MessageDetail {
   /** = imap_messages.id; the stable handle passed back as `message_id`. */
   message_id: string;
-  /** = provider_thread_id (the conversation handle), or null. */
-  thread_id: string | null;
+  /** = provider_thread_id (the provider's conversation handle). Omitted when the provider has none. */
+  thread_id?: string;
   account_id: string;
   folder_path: string;
   subject: string | null;
@@ -90,6 +91,8 @@ export interface MessageDetail {
   body_total_chars?: number;
   body_next_offset?: number | null;
   attachments: MessageAttachment[];
+  /** read_thread lists only files; this counts the inline parts it left out. Present only when > 0. */
+  inline_count?: number;
   /** Parsed select headers, only when the tool was asked to include them. */
   headers?: Record<string, string>;
   /** Other stored copies of this email in the thread. Present only when there are any. */
@@ -133,11 +136,16 @@ export interface MessageAttachmentRow extends ProtectedMetadataColumns {
   disposition: string | null;
 }
 
-/** Load and reveal attachment metadata for one or more messages. */
+/**
+ * Load and reveal attachment metadata for one or more messages. `filesOnly`
+ * keeps parts with `disposition = 'attachment'`, the rule search's
+ * `has:attachment` uses; inline parts such as signature images are left out.
+ */
 export async function loadMessageAttachments(
   client: PgClient,
   messageIds: readonly string[],
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  { filesOnly = false }: { filesOnly?: boolean } = {}
 ): Promise<Map<string, MessageAttachmentRow[]>> {
   const byMessage = new Map<string, MessageAttachmentRow[]>();
   for (const messageId of messageIds) byMessage.set(messageId, []);
@@ -153,6 +161,7 @@ export async function loadMessageAttachments(
     FROM public.imap_attachments attachment
     JOIN public.imap_messages message ON message.id = attachment.message_id
     WHERE attachment.message_id = ANY($1::uuid[])
+      ${filesOnly ? "AND attachment.disposition = 'attachment'" : ""}
     ORDER BY attachment.message_id,
              NULLIF(regexp_replace(coalesce(attachment.part_number, ''), '[^0-9]', '', 'g'), '')::bigint NULLS LAST,
              attachment.part_number
@@ -234,7 +243,7 @@ export function mapMessageRow(
     : cleaned.omissions;
   const detail: MessageDetail = {
     message_id: row.id,
-    thread_id: row.provider_thread_id,
+    ...(row.provider_thread_id === null ? {} : { thread_id: row.provider_thread_id }),
     account_id: row.account_id,
     folder_path: row.folder_path,
     subject: row.subject,
@@ -242,7 +251,8 @@ export function mapMessageRow(
     to: row.to_emails ?? [],
     cc: row.cc_emails ?? [],
     date: row.internal_date.toISOString(),
-    flags: row.flags ?? [],
+    // \Recent describes one IMAP session, not the message.
+    flags: (row.flags ?? []).filter((flag) => flag.toLowerCase() !== "\\recent"),
     window_status: row.window_status,
     body: cleaned.text,
     body_content_status: bodyOmissions.length > 0
@@ -268,6 +278,18 @@ export function mapMessageRow(
 }
 
 const SIGNATURE_DELIMITER = /^-- ?$/;
+// A contact-card signature with no delimiter, as Outlook writes it: a name line,
+// a blank line, then a short block with an address line that ends in a web address.
+const SIGNATURE_NAME_LINE = /^\p{Lu}[\p{L}'’.-]*(?:[ \t]+\p{Lu}[\p{L}'’.-]*){1,3}$/u;
+const SIGNATURE_WEB_LINE = /^(?:https?:\/\/\S+|www\.\S+|[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}(?:\/\S*)?)$/i;
+const SIGNATURE_ADDRESS_LINE = /,.*\b\d{2,}|\b\d{2,}.*,/;
+const MAX_SIGNATURE_BLOCK_LINES = 6;
+const MAX_SIGNATURE_LINE_CHARS = 100;
+// Outlook's first-contact safety tip and the object replacement character left
+// where an inline image was. Neither is text the sender wrote.
+const OUTLOOK_FIRST_CONTACT_BANNER =
+  /^[ \t]*(?:You|Some people who received this message) don['’]t often get email from [^\n]*?(?:\n[ \t]*)?Learn why this is important[^\n]*\n*/gim;
+const OBJECT_REPLACEMENT = /\uFFFC/g;
 const ATTRIBUTION_START = /^On\b/i;
 const ATTRIBUTION_END = /\bwrote:\s*$/i;
 const MAX_ATTRIBUTION_LINES = 4;
@@ -294,9 +316,10 @@ const MAX_QUOTED_HEADER_LINES = 8;
  * Clean a plain-text body for an agent. `body_text` is already HTML-stripped
  * (ADR 0015). When `includeQuoted=false` (the default for read tools) we drop the
  * quoted reply tail introduced by a recognized attribution or trailing
- * quote-only block. It also drops a trailing signature after a `-- ` delimiter.
- * Outlook and Original Message header blocks end the body only when the
- * message's own subject is a reply; a forward uses the same shape for new
+ * quote-only block. It also drops a trailing signature after a `-- ` delimiter
+ * or in Outlook's contact-card shape. Outlook's first-contact banner and U+FFFC
+ * image placeholders are always removed. Outlook and Original Message header
+ * blocks end the body only when the message's own subject is a reply; a forward uses the same shape for new
  * evidence, so it and messages without a known subject stay intact. It returns the full cleaned
  * body unless the caller explicitly supplies `maxChars`. No heavy markdown conversion.
  */
@@ -318,7 +341,10 @@ export function cleanBody(text: string | null, opts: CleanBodyOptions): CleanBod
     ? Math.floor(Number(opts.offset))
     : 0;
 
-  let working = text.replace(/\r\n?/g, "\n");
+  let working = text
+    .replace(/\r\n?/g, "\n")
+    .replace(OBJECT_REPLACEMENT, "")
+    .replace(OUTLOOK_FIRST_CONTACT_BANNER, "");
   const omissions: BodyContentOmission[] = [];
   if (!opts.includeQuoted) {
     const withoutQuotedTail = stripQuotedTail(working, isReplySubject(opts.subject));
@@ -438,7 +464,7 @@ function isQuoteOnlyBoundary(lines: string[], start: number): boolean {
   return tail.length >= MIN_QUOTED_TAIL_LINES && tail.every((line) => /^\s*>/.test(line));
 }
 
-/** Drop a trailing signature introduced by a `-- ` delimiter line. */
+/** Drop a trailing signature introduced by a `-- ` delimiter line or shaped as a contact card. */
 function stripSignature(text: string): string {
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -446,7 +472,37 @@ function stripSignature(text: string): string {
       return lines.slice(0, i).join("\n");
     }
   }
-  return text;
+  return stripContactCard(lines) ?? text;
+}
+
+/**
+ * Match `Name` / blank / up to six short lines that include an address line
+ * (a comma and a number) and end with a web address. The name must follow
+ * authored text that does not introduce it with a colon, so contact details a
+ * sender passes on stay in the body.
+ */
+function stripContactCard(lines: string[]): string | null {
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === "") end--;
+  let start = end;
+  while (start > 0 && lines[start - 1].trim() !== "") start--;
+  const block = lines.slice(start, end).map((line) => line.trim());
+  if (
+    block.length < 2
+    || block.length > MAX_SIGNATURE_BLOCK_LINES
+    || !SIGNATURE_WEB_LINE.test(block[block.length - 1])
+    || !block.slice(0, -1).some((line) => SIGNATURE_ADDRESS_LINE.test(line))
+    || block.some((line) => line.length > MAX_SIGNATURE_LINE_CHARS || /[?!:]$/.test(line))
+  ) {
+    return null;
+  }
+  let name = start;
+  while (name > 0 && lines[name - 1].trim() === "") name--;
+  if (name === start || name === 0 || !SIGNATURE_NAME_LINE.test(lines[name - 1].trim())) return null;
+  const authored = lines.slice(0, name - 1);
+  const lastAuthored = authored.filter((line) => line.trim() !== "").at(-1);
+  if (lastAuthored === undefined || lastAuthored.trim().endsWith(":")) return null;
+  return authored.join("\n");
 }
 
 /**

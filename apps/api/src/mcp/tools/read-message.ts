@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
+import { ACTIVE_ASSIGNMENT_JOIN } from "../../delivery-identity.js";
 import { formatZodIssues } from "../../errors.js";
 import {
   loadMessageAttachments,
@@ -39,11 +40,13 @@ export const readMessageRequestSchema = z
 /**
  * The row `read_message` selects: every {@link MessageDetailRow} column plus the
  * raw `headers_json` (parsed into the optional `headers` block only when the
- * caller asks). Bodies come from the LEFT JOIN (I2); attachments are aggregated
- * by the subquery (all dispositions, incl. inline — I9).
+ * caller asks) and the ids of its other stored copies. Bodies come from the
+ * LEFT JOIN (I2); attachments are loaded separately (all dispositions, incl.
+ * inline — I9).
  */
 interface ReadMessageRow extends MessageDetailRow, ProtectedMetadataColumns {
   headers_json: Record<string, unknown> | null;
+  duplicate_message_ids: string[] | null;
 }
 
 /**
@@ -87,8 +90,11 @@ export const readMessageDefinition: ToolDefinition = {
     "body_total_chars, body_next_offset, body_truncated, body_content_status, and body_omissions " +
     "state whether text is absent and why. " +
     "Also returns the from/to/cc envelope, flags, " +
-    "window_status, and the attachments list (filename, mime_type, size_bytes, disposition — " +
-    "including inline parts). include_quoted=true retains the quoted reply tail and " +
+    "window_status, and every attachment part (filename, mime_type, size_bytes, disposition; " +
+    "disposition inline marks parts such as signature images). window_status: IN_WINDOW is mail in " +
+    "the live sync window; HISTORICAL (backfilled older mail) and EXPIRED (aged out of the window) " +
+    "are archive rows that update less often. duplicate_message_ids lists other stored copies of " +
+    "this email, to move or flag every copy. include_quoted=true retains the quoted reply tail and " +
     "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
     "mirrored (metadata only). Always attaches a sync_trust block describing mirror completeness. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
@@ -187,9 +193,23 @@ export async function runReadMessage(
         b.raw_truncated,
         ${options.includeBody === false
           ? "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"
-          : "b.body_text, b.body_plain, b.selected_text_part"}
+          : "b.body_text, b.body_plain, b.selected_text_part"},
+        copies.duplicate_message_ids
       FROM public.imap_messages m
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+      ${ACTIVE_ASSIGNMENT_JOIN}
+      LEFT JOIN LATERAL (
+        -- Other live stored copies of this email: the delivery key read_thread
+        -- and search collapse copies by.
+        SELECT array_agg(copy.message_id ORDER BY copy.message_id) AS duplicate_message_ids
+        FROM public.imap_thread_assignments copy
+        JOIN public.imap_messages copy_message
+          ON copy_message.id = copy.message_id
+         AND copy_message.deleted_in_provider = false
+        WHERE copy.run_id = ta.run_id
+          AND copy.delivery_key = ta.delivery_key
+          AND copy.message_id <> m.id
+      ) copies ON true
       WHERE m.id = $1
         AND m.deleted_in_provider = false
       `,
@@ -226,6 +246,7 @@ export async function runReadMessage(
     maxChars: request.max_body_chars,
     includeBodyRange: true
   });
+  if (row.duplicate_message_ids?.length) detail.duplicate_message_ids = row.duplicate_message_ids;
   const sync_trust = await syncTrustFor(pool, [row.account_id], metadataProtection);
 
   return { ...detail, sync_trust };

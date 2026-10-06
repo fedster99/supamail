@@ -128,7 +128,7 @@ function unassignedSeedPool() {
   return { pool, query };
 }
 
-function batchConversationPool() {
+function batchConversationPool(conversationOf: (messageId: string) => string = conversationFor) {
   let syncTrustQueryCount = 0;
   const connect = vi.fn(async () => {
     const query = vi.fn(async (
@@ -148,7 +148,7 @@ function batchConversationPool() {
             in_reply_to: null,
             references_header: null,
             account_id: ACCOUNT_ID,
-            conversation_id: conversationFor(messageId)
+            conversation_id: conversationOf(messageId)
           }]
         };
       }
@@ -190,6 +190,142 @@ function batchConversationPool() {
     getSyncTrustQueryCount: () => syncTrustQueryCount
   };
 }
+
+/** One assigned seed whose conversation holds the given rows; attachments come from `files`. */
+function threadRowsPool(rows: Array<Record<string, unknown>>, files: Array<Record<string, unknown>> = []) {
+  const query = vi.fn(async (sql: string): Promise<{ rows: Array<Record<string, unknown>> }> => {
+    if (sql.includes("WHERE m.id = $1")) {
+      return {
+        rows: [{
+          id: "message-seed",
+          provider_thread_id: null,
+          rfc_message_id: "<seed@example.test>",
+          message_id_normalized: "seed@example.test",
+          in_reply_to: null,
+          references_header: null,
+          account_id: ACCOUNT_ID,
+          conversation_id: "conversation-1"
+        }]
+      };
+    }
+    if (sql.includes("WITH delivery_copies")) return { rows };
+    if (sql.includes("FROM public.imap_attachments attachment")) return { rows: files };
+    return { rows: [] };
+  });
+  return { pool: { connect: vi.fn(async () => ({ query, release: vi.fn() })) }, query };
+}
+
+function threadRow(id: string, fields: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id,
+    account_id: ACCOUNT_ID,
+    folder_path: "INBOX",
+    provider_thread_id: null,
+    conversation_id: "conversation-1",
+    subject: "Re: Plan",
+    from_email: "alice@example.test",
+    from_name: "Alice",
+    to_emails: ["bob@example.test"],
+    cc_emails: [],
+    flags: [],
+    window_status: "IN_WINDOW",
+    internal_date: new Date("2026-01-02T03:04:05.000Z"),
+    rfc_message_id: `<${id}@example.test>`,
+    in_reply_to: null,
+    references_header: null,
+    inline_count: 0,
+    body_text: "hello",
+    body_plain: null,
+    selected_text_part: null,
+    ...fields
+  };
+}
+
+describe("read_thread response shape", () => {
+  it("lists each message's files once and counts its inline parts", async () => {
+    const { pool, query } = threadRowsPool(
+      [threadRow("with-files", { inline_count: 3 }), threadRow("plain")],
+      [{
+        attachment_id: "attachment-1",
+        message_id: "with-files",
+        account_id: ACCOUNT_ID,
+        filename: "plan.pdf",
+        mime_type: "application/pdf",
+        size_bytes: "2048",
+        disposition: "attachment"
+      }]
+    );
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED });
+
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+    expect(out).not.toHaveProperty("attachments_index");
+    expect(out.thread).not.toHaveProperty("provider_thread_id");
+    expect(out.messages[0]).toMatchObject({
+      attachments: [{ attachment_id: "attachment-1", filename: "plan.pdf", size_bytes: 2048, disposition: "attachment" }],
+      inline_count: 3
+    });
+    expect(out.messages[0]).not.toHaveProperty("thread_id");
+    expect(out.messages[1].attachments).toEqual([]);
+    expect(out.messages[1]).not.toHaveProperty("inline_count");
+    const attachmentSql = query.mock.calls.find(([sql]) => sql.includes("FROM public.imap_attachments attachment"))?.[0];
+    expect(attachmentSql).toContain("AND attachment.disposition = 'attachment'");
+    const threadSql = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"))?.[0];
+    expect(threadSql).toContain("a.disposition IS DISTINCT FROM 'attachment') AS inline_count");
+  });
+
+  it("reports ancestors the oldest message replies to that are not mirrored", async () => {
+    const { pool } = threadRowsPool([
+      threadRow("oldest", {
+        rfc_message_id: "<c@example.test>",
+        in_reply_to: "<b@example.test>",
+        references_header: "<a@example.test> <b@example.test> <found@example.test>",
+        body_text: "Agreed.\n\nOn Mon, Bob wrote:\n> The history only lives here.\n> Second quoted line."
+      }),
+      threadRow("found", { rfc_message_id: "<found@example.test>" })
+    ]);
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED });
+
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+    expect(out).toMatchObject({
+      omitted_message_count: 0,
+      missing_ancestor_count: 2,
+      thread_content_status: "partial",
+      thread_omissions: ["ancestors_not_mirrored"]
+    });
+    expect(out.messages[0].body).toContain("The history only lives here.");
+  });
+
+  it("leaves ancestors to older_messages when the cap removed older mirrored messages", async () => {
+    const { pool } = threadRowsPool([
+      threadRow("newest", { references_header: "<a@example.test>", thread_total_count: 2 })
+    ]);
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED, max_messages: 1 });
+
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+    expect(out).not.toHaveProperty("missing_ancestor_count");
+    expect(out.thread_omissions).toEqual(["older_messages"]);
+  });
+
+  it("reports a complete thread when every ancestor is mirrored", async () => {
+    const { pool } = threadRowsPool([
+      threadRow("root", { rfc_message_id: "<root@example.test>" }),
+      threadRow("reply", { references_header: "<root@example.test>", in_reply_to: "<root@example.test>" })
+    ]);
+
+    const out = await runReadThread(pool as never, { message_id: MESSAGE_SEED });
+
+    expect(isResult(out)).toBe(true);
+    if (!isResult(out)) return;
+    expect(out).toMatchObject({ thread_content_status: "complete", thread_omissions: [] });
+    expect(out).not.toHaveProperty("missing_ancestor_count");
+  });
+});
 
 describe("read_thread stored assignments", () => {
   it("can select metadata without inline body columns for hosted hydration", async () => {
@@ -283,6 +419,22 @@ describe("read_thread stored assignments", () => {
         { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } },
         { message_id: BROKEN_MESSAGE, error: { code: "tool_failed" } },
         { message_id: MESSAGE_TWO, result: { thread: { conversation_id: conversationFor(MESSAGE_TWO) } } }
+      ]
+    });
+  });
+
+  it("points a later seed from an already returned conversation at the first seed", async () => {
+    const { pool } = batchConversationPool(() => "conversation-shared");
+
+    const out = await runReadThread(pool as never, {
+      message_ids: [MESSAGE_ONE, MISSING_MESSAGE, MESSAGE_TWO]
+    });
+
+    expect(out).toEqual({
+      threads: [
+        expect.objectContaining({ message_id: MESSAGE_ONE, result: expect.anything() }),
+        expect.objectContaining({ message_id: MISSING_MESSAGE, error: expect.objectContaining({ code: "not_found" }) }),
+        { message_id: MESSAGE_TWO, same_thread_as: MESSAGE_ONE }
       ]
     });
   });

@@ -285,7 +285,12 @@ export function parseQuery(input: string): ParsedQuery {
     const field = opMatch ? opMatch[2].toLowerCase() : null;
 
     if (!opMatch || field === null || !KNOWN_OPERATORS.has(field)) {
-      // Free text (includes bare URLs, `-word` negation, "quoted phrases").
+      // Free text (includes bare URLs, `-word` negation, "quoted phrases"). A token
+      // shaped like an operator is searched as text too, but the caller learns why.
+      if (opMatch && /^[^\s/]/.test(opMatch[3])) {
+        const warning = `unknown operator ${opMatch[2]}:; "${token}" searched as text`;
+        if (!warnings.includes(warning)) warnings.push(warning);
+      }
       return "text";
     }
 

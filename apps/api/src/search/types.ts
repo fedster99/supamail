@@ -1,4 +1,5 @@
 import type { WindowStatus } from "../types.js";
+import type { FolderRef } from "./rules.js";
 
 /**
  * Sort modes. `smart` blends relevance and recency (the default); `relevance`
@@ -24,7 +25,8 @@ export type SearchFilter =
   | { kind: "anyEmail"; value: string; negated: boolean; raw: string }
   | { kind: "subject"; value: string; negated: boolean; raw: string }
   | { kind: "body"; value: string; negated: boolean; raw: string }
-  | { kind: "folder"; value: string; negated: boolean; raw: string }
+  /** `folders` is what the value resolved to in the searched accounts (`resolveFolderFilters`). */
+  | { kind: "folder"; value: string; negated: boolean; raw: string; folders?: FolderRef[] }
   | { kind: "thread"; value: string; negated: boolean; raw: string }
   | { kind: "msgid"; value: string; negated: boolean; raw: string }
   | { kind: "flag"; value: string; negated: boolean; raw: string }
@@ -146,13 +148,6 @@ export interface SearchRequest {
    */
   groupByThread?: boolean;
   /**
-   * Opt in to the semantic (Tier 2) retrieval branch. No-op today — the pure
-   * core ships without an embedding model — so this is accepted and ignored
-   * until the gated pgvector tier lands. Declared here to match the MCP/CLI
-   * contract that already exposes it.
-   */
-  semantic?: boolean;
-  /**
    * Frozen clock (ISO timestamp) for recency scoring and relative-date filters.
    * Omitted in production (uses SQL `now()`); the eval pins it so scorecards are
    * reproducible and ranking ties are deterministic.
@@ -194,14 +189,15 @@ export interface SearchResult {
   /** Ranking score; null when the order ranks nothing (date, size or sender order, or no text). */
   score: number | null;
   score_breakdown: ScoreBreakdown | null;
-  /** The conversation this result represents; message_count is how many of its
-   *  messages matched (the collapsed duplicates when grouped by thread). */
+  /** The conversation this result represents; match_count is how many of its
+   *  messages matched (the collapsed duplicates when grouped by thread), not its size. */
   thread: {
     conversation_id: string | null;
     provider_thread_id: string | null;
-    message_count: number;
+    match_count: number;
   };
-  attachments: { count: number };
+  /** Attached files (`has:attachment` counts these) and inline parts such as signature images. */
+  attachments: { files: number; inline: number };
   body: string | null;
   /** Other stored copies of this email that also match, such as a direct and a
    *  list delivery. Present only when there are any. */
@@ -249,6 +245,5 @@ export interface SearchResponse {
     sort: SearchSort;
     warnings: string[];
   };
-  read_only: true;
   timing_ms: { total: number };
 }

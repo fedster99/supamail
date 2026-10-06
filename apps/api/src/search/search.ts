@@ -4,6 +4,7 @@ import { compileSearch, sortRanks } from "./compile.js";
 import { expandConcepts, significantTerms } from "./expand.js";
 import { filtersFromStructured, parseQuery } from "./parse.js";
 import { buildSyncTrust } from "./sync-trust.js";
+import { hasFolderFilter, resolveFolderFilters, type FolderRow } from "./rules.js";
 import type { SearchRequest, SearchResponse, SearchResult, SearchSort } from "./types.js";
 import {
   plaintextMetadataProtection,
@@ -33,6 +34,7 @@ interface ResultRow {
   email_prior: number | string | null;
   score: number | string | null;
   attachment_count: number | null;
+  inline_count: number | null;
   snippet: string | null;
   body: string | null;
 }
@@ -67,7 +69,8 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
     from: { email: row.from_email, name: row.from_name },
     to: row.to_emails ?? [],
     date: row.internal_date.toISOString(),
-    flags: row.flags ?? [],
+    // \Recent describes one IMAP session, not the message.
+    flags: (row.flags ?? []).filter((flag) => flag.toLowerCase() !== "\\recent"),
     window_status: row.window_status,
     body_fetched_at: row.body_fetched_at ? row.body_fetched_at.toISOString() : null,
     snippet: row.snippet ?? null,
@@ -83,9 +86,9 @@ function mapRow(row: ResultRow, explain: boolean, ranked: boolean): SearchResult
     thread: {
       conversation_id: row.conversation_id,
       provider_thread_id: row.provider_thread_id,
-      message_count: row.thread_count ?? 1
+      match_count: row.thread_count ?? 1
     },
-    attachments: { count: row.attachment_count ?? 0 },
+    attachments: { files: row.attachment_count ?? 0, inline: row.inline_count ?? 0 },
     body: row.body ?? null,
     ...(row.duplicate_message_ids?.length ? { duplicate_message_ids: row.duplicate_message_ids } : {})
   };
@@ -156,11 +159,19 @@ export async function searchMessages(
     }
 
     const accountIds = intersectAccounts(requestedIds, accountFilterIds);
+    const folders = filters.some(hasFolderFilter) && !(accountIds !== null && accountIds.length === 0)
+      ? (await client.query<FolderRow>(
+          `SELECT account_id, path, delimiter, special_use FROM public.imap_folders
+           WHERE $1::uuid[] IS NULL OR account_id = ANY($1::uuid[])`,
+          [accountIds]
+        )).rows
+      : [];
+    const resolvedFilters = resolveFolderFilters(filters, folders, warnings);
 
     let rows: ResultRow[] = [];
     // An empty (non-null) account set can never match — skip the query entirely.
     if (!(accountIds !== null && accountIds.length === 0)) {
-      const compiled = compileSearch(parsed.text, filters, {
+      const compiled = compileSearch(parsed.text, resolvedFilters, {
         accountIds,
         windowStatus: request.windowStatus ?? null,
         includeDeleted: request.includeDeleted ?? false,
@@ -190,8 +201,7 @@ export async function searchMessages(
       results,
       page: { limit, offset, returned: results.length, has_more: hasMore },
       sync_trust: syncTrust,
-      parsed_query: { free_text: freeText, filters, sort, warnings },
-      read_only: true,
+      parsed_query: { free_text: freeText, filters: resolvedFilters, sort, warnings },
       timing_ms: { total: Date.now() - startedAt }
     };
   } catch (error) {
