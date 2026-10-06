@@ -78,5 +78,5 @@ row of that UIDVALIDITY, whatever its lane.**
   and reports `RECONCILE_INCOMPLETE` on every reconcile, rather than guessing.
 - Reconcile tombstones and revivals do not call `onMessageUpsert`, as tombstones
   never did; hosts follow `deleted_in_provider` in the database.
-- Folder-missing tombstones are unchanged and still cover `IN_WINDOW` rows only;
-  extending them changes which rows the 30-day purge removes.
+- Folder-missing tombstones are unchanged and still cover only rows inside the
+  live window; extending them changes which rows the 30-day purge removes.

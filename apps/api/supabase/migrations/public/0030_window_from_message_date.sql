@@ -1,25 +1,47 @@
 -- 0030_window_from_message_date.sql
 --
 -- The live window is a cost limit computed from each message's date and the
--- Mailbox Account's live_window_days, never a stored per-row lane. A stored lane
--- goes stale as time passes unless a job rewrites it, and stale lanes hid mail
--- that was still in the provider. Live-window readers now compare internal_date
--- with the account cutoff; imap_messages.window_status is no longer read or
--- written and is removed by a later migration once every host stops reading it.
+-- Mailbox Account's live_window_days, never a stored per-row lane (ADR 0039). A
+-- stored lane goes stale as time passes unless a job rewrites it, and stale lanes
+-- hid mail that was still in the provider. imap_messages.window_status,
+-- imap_folders.last_archive_refresh_at, and imap_accounts.archive_refresh_interval
+-- and archive_flag_sync are no longer read or written; a later migration drops
+-- them once every host stops reading them. This file is re-applied on every
+-- migrate, so each statement is idempotent.
 
--- One unfetched-body index serves the live and the history body backlogs: a
--- date range per folder selects either side of the cutoff, and a backward scan
--- returns the newest old mail first. The two lane-predicated indexes it replaces
--- are only as correct as the lane.
-CREATE INDEX IF NOT EXISTS imap_messages_unfetched_body_idx
-  ON public.imap_messages (account_id, folder_path, internal_date, uid)
-  WHERE deleted_in_provider = false
-    AND body_fetched_at IS NULL;
-
+-- The lane-predicated body indexes are only as correct as the lane.
 DROP INDEX IF EXISTS public.imap_messages_body_backlog_idx;
 DROP INDEX IF EXISTS public.imap_messages_live_body_progress_idx;
 
+-- New mail is every UID above the live head, whatever its date. Under the old
+-- date-filtered incremental, a completed folder's head could sit far below
+-- UIDNEXT over archive mail the history lane owns; start it at UIDNEXT so that
+-- archive is never fetched again as new mail. A live-window UID the old code had
+-- left unfetched is still repaired by reconcile.
+UPDATE public.imap_folders
+SET last_uid = uid_next - 1
+WHERE initial_sync_complete = true
+  AND uid_next IS NOT NULL
+  AND COALESCE(last_uid, 0) < uid_next - 1;
+
+-- The old date-filtered incremental also skipped old mail moved into a folder
+-- after its history snapshot; only the removed archive refresh found it. Re-run
+-- each completed history snapshot once to recover it. The obsolete refresh stamp
+-- marks folders not yet re-run: it is cleared here and never written again.
+UPDATE public.imap_folders f
+SET historical_target_count = NULL,
+    backfill_target_max_uid = NULL,
+    backfill_oldest_uid_synced = NULL,
+    backfill_in_progress = false,
+    last_archive_refresh_at = NULL
+FROM public.imap_accounts a
+WHERE a.id = f.account_id
+  AND a.historical_backfill_mode <> 'off'
+  AND f.last_archive_refresh_at IS NOT NULL
+  AND f.backfill_in_progress = false;
+
 -- Current live body coverage counts rows inside the account's window by date.
+-- The per-account LATERAL lets the cutoff bound the date index scan.
 CREATE OR REPLACE VIEW public.imap_account_progress
 WITH (security_invoker = true)
 AS
@@ -55,39 +77,6 @@ active_body_folder_progress AS (
     AND f.missing_since IS NULL
     AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
   GROUP BY f.account_id
-),
-current_live_body_progress AS (
-  SELECT
-    m.account_id,
-    count(*)::int AS live_bodies_target_count,
-    count(*) FILTER (
-      WHERE m.body_fetched_at IS NOT NULL
-        AND b.message_id IS NOT NULL
-        AND NOT b.raw_truncated
-    )::int AS live_bodies_fetched_count,
-    count(*) FILTER (
-      WHERE f.sync_priority <= 10
-    )::int AS priority_bodies_target_count,
-    count(*) FILTER (
-      WHERE f.sync_priority <= 10
-        AND m.body_fetched_at IS NOT NULL
-        AND b.message_id IS NOT NULL
-        AND NOT b.raw_truncated
-    )::int AS priority_bodies_fetched_count
-  FROM public.imap_messages m
-  JOIN public.imap_folders f
-    ON f.account_id = m.account_id
-   AND f.path = m.folder_path
-  JOIN public.imap_accounts account
-    ON account.id = m.account_id
-  LEFT JOIN public.imap_message_bodies b
-    ON b.message_id = m.id
-  WHERE f.tracked = true
-    AND f.missing_since IS NULL
-    AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
-    AND m.deleted_in_provider = false
-    AND m.internal_date >= now() - account.live_window_days * interval '1 day'
-  GROUP BY m.account_id
 )
 SELECT
   a.id AS account_id,
@@ -135,4 +124,33 @@ SELECT
 FROM public.imap_accounts a
 LEFT JOIN folder_progress p ON p.account_id = a.id
 LEFT JOIN active_body_folder_progress ab ON ab.account_id = a.id
-LEFT JOIN current_live_body_progress b ON b.account_id = a.id;
+LEFT JOIN LATERAL (
+    SELECT
+      count(*)::int AS live_bodies_target_count,
+      count(*) FILTER (
+        WHERE m.body_fetched_at IS NOT NULL
+          AND body.message_id IS NOT NULL
+          AND NOT body.raw_truncated
+      )::int AS live_bodies_fetched_count,
+      count(*) FILTER (
+        WHERE f.sync_priority <= 10
+      )::int AS priority_bodies_target_count,
+      count(*) FILTER (
+        WHERE f.sync_priority <= 10
+          AND m.body_fetched_at IS NOT NULL
+          AND body.message_id IS NOT NULL
+          AND NOT body.raw_truncated
+      )::int AS priority_bodies_fetched_count
+    FROM public.imap_messages m
+    JOIN public.imap_folders f
+      ON f.account_id = m.account_id
+     AND f.path = m.folder_path
+    LEFT JOIN public.imap_message_bodies body
+      ON body.message_id = m.id
+    WHERE f.tracked = true
+      AND f.missing_since IS NULL
+      AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+      AND m.deleted_in_provider = false
+      AND m.account_id = a.id
+      AND m.internal_date >= now() - a.live_window_days * interval '1 day'
+) b ON true;

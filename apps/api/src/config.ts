@@ -174,6 +174,9 @@ export function resetConfigForTests(): void {
  * the expensive sync work, computed from the message date; no row stores it.
  */
 export function getWindowCutoff(account: { live_window_days: number }, now = Date.now()): Date {
+  if (!Number.isSafeInteger(account.live_window_days) || account.live_window_days <= 0) {
+    throw new TypeError(`live_window_days must be a positive integer, got ${String(account.live_window_days)}`);
+  }
   return new Date(now - account.live_window_days * 24 * 60 * 60_000);
 }
 

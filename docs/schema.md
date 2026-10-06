@@ -128,17 +128,8 @@ The live window is computed, never stored: a row is in the window when `internal
 
 `GET /accounts/:id` exposes the account percentages plus a nullable `estimated_full_sync_at`; the estimate remains null until a durable rate model exists. Each folder row also exposes row-current `live_bodies_fetched_count` and `live_bodies_target_count`. Its `bodies_pct` uses those fields instead of the cumulative `bodies_fetched_count`. Folder rows cover every returned folder, including untracked, missing, and pending folders. The account roll-up includes only active eligible folders, so folder targets do not always sum to the account target.
 
-Migration `0030_window_from_message_date` replaces the lane-predicated body
-indexes with `imap_messages_unfetched_body_idx`, which serves the live and the
-history body backlogs. Large existing mirrors should create this exact index
-concurrently before applying the transactional migration:
-
-```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS imap_messages_unfetched_body_idx
-  ON public.imap_messages (account_id, folder_path, internal_date, uid)
-  WHERE deleted_in_provider = false
-    AND body_fetched_at IS NULL;
-```
+Migration `0030_window_from_message_date` drops the lane-predicated body indexes;
+the body backlogs and coverage use the account and folder date indexes.
 
 `imap_folders.status` includes `PENDING_VERIFICATION` for folders that need a missing-mailbox verification pass. Missing-mailbox errors stamp `missing_since`, force `imap_accounts.next_folder_discovery_at = now()`, and move the folder into `PENDING_VERIFICATION`. The scheduler excludes that state from normal sync work, and folder discovery moves a reappeared folder back to `PENDING`.
 

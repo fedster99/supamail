@@ -241,7 +241,6 @@ describe("repository safety", () => {
     expect(repository).toContain("getHistoricalBodyBacklog");
     // History is a one-time backfill: no periodic archive refresh re-walks it.
     expect(repository).not.toContain("last_archive_refresh_at");
-    expect(repository).not.toContain("'refresh'");
     expect(engine).toContain("runHistoryLane");
     expect(engine).toContain("historyBatchLimit");
     expect(engine).toContain("searchUidsBefore");

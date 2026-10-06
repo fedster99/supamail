@@ -2330,19 +2330,23 @@ export class MirrorRepository {
     oldestUidSynced: number,
     targetCount: number,
     expectedUidValidity: number,
+    liveHeadUid: number,
     options: { deadlineAt?: number; signal?: AbortSignal } = {}
   ): Promise<void> {
+    // The snapshot and its live head commit together: every UID at or below the
+    // live head is the snapshot's or the history lane's, never new mail.
     const query = `
       UPDATE public.imap_folders
       SET initial_sync_target_max_uid = $2,
           initial_sync_oldest_uid_synced = $3,
           live_window_target_count = $4,
+          last_uid = GREATEST(COALESCE(last_uid, 0), $6),
           last_progress_at = now()
       WHERE id = $1
         AND (uidvalidity IS NULL OR uidvalidity = $5)
       RETURNING id
     `;
-    const values = [folderId, targetMaxUid, oldestUidSynced, targetCount, expectedUidValidity];
+    const values = [folderId, targetMaxUid, oldestUidSynced, targetCount, expectedUidValidity, liveHeadUid];
     const result = options.deadlineAt === undefined
       ? await this.pool.query<{ id: string }>(query, values)
       : await runMetadataWriteWithDeadline<{ id: string }>(

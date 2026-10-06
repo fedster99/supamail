@@ -58,6 +58,16 @@ describe("parseQuery", () => {
     expect(findFilter(parsed.filters, "from")?.value).toBe("bob@acme.com");
   });
 
+  it("warns on the retired window and lane operators instead of searching their text", () => {
+    const parsed = parseQuery("invoice window:HISTORICAL lane:IN_WINDOW");
+    expect(parsed.freeText).toBe("invoice");
+    expect(parsed.filters).toEqual([]);
+    expect(parsed.warnings).toEqual([
+      "window: is no longer supported; use after: or before:",
+      "lane: is no longer supported; use after: or before:"
+    ]);
+  });
+
   it("routes from:@domain to a domain filter", () => {
     const parsed = parseQuery("from:@acme.com");
     expect(findFilter(parsed.filters, "fromDomain")?.value).toBe("acme.com");

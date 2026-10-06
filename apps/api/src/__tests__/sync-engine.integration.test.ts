@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { closePool, getPool } from "../db.js";
+import { applyPublicMigrations, closePool, getPool } from "../db.js";
 import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type {
@@ -5287,6 +5287,108 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       await engine.syncAccount(h.account.id, "manual");
       // The archive stays the history lane's job; only the new UID arrives.
       expect(await uids()).toEqual([3]);
+    });
+
+    it("starts the live head at UIDNEXT on a fresh folder whose newest UID is old", async () => {
+      const { h, folders, uids } = await setup("window-fresh-old-head", "off", [
+        message(1, new Date()),
+        message(2, oldDate)
+      ]);
+      const engine = h.buildEngine({ folders });
+      const first = await engine.syncAccount(h.account.id, "manual");
+      expect(first.outcome).toBe("success");
+      folders[0].messages.push(message(3, new Date()));
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await uids()).toEqual([1, 3]);
+    });
+
+    it("takes a large burst of new mail over bounded passes without skipping any", async () => {
+      const h = await setupIntegration("window-new-mail-burst", {
+        INITIAL_SYNC_BATCH_SIZE: 50,
+        INCREMENTAL_SYNC_BATCH_SIZE: 2,
+        MAX_RR_FOLDERS_PER_CYCLE: 5
+      });
+      activeAccountIds.push(h.account.id);
+      await h.pool.query(
+        `UPDATE public.imap_accounts SET body_fetch_policy = 'lazy', historical_backfill_mode = 'off' WHERE id = $1`,
+        [h.account.id]
+      );
+      const folders: FixtureFolder[] = [{
+        path: "INBOX", delimiter: "/", specialUse: "\\Inbox", uidValidity: 87_101, messages: [message(1, new Date())]
+      }];
+      const engine = h.buildEngine({ folders });
+      await engine.syncAccount(h.account.id, "manual");
+      // 50 old emails moved in at once: more than one pass of 20 batches of 2.
+      for (let uid = 2; uid <= 51; uid += 1) folders[0].messages.push(message(uid, oldDate));
+      const state = async () => (await h.pool.query<{ last_uid: string; uid_next: string; mirrored: string }>(
+        `SELECT f.last_uid::text, f.uid_next::text,
+                (SELECT count(*) FROM public.imap_messages m WHERE m.account_id = f.account_id)::text AS mirrored
+         FROM public.imap_folders f WHERE f.account_id = $1 AND f.path = 'INBOX'`,
+        [h.account.id]
+      )).rows[0];
+
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      // One pass: 40 UIDs, and the stored UIDNEXT is only what that pass reached.
+      expect(await state()).toEqual({ last_uid: "41", uid_next: "42", mirrored: "41" });
+
+      await dueAllFolders(h.pool, h.account.id);
+      await engine.syncAccount(h.account.id, "manual");
+      expect(await state()).toEqual({ last_uid: "51", uid_next: "52", mirrored: "51" });
+    });
+
+    it("uses each Mailbox Account's own live window", async () => {
+      const { h, folders, uids } = await setup("window-per-account", "off", [
+        message(1, new Date(Date.now() - 60 * 24 * 60 * 60_000)),
+        message(2, new Date(Date.now() - 10 * 24 * 60 * 60_000))
+      ]);
+      await h.pool.query("UPDATE public.imap_accounts SET live_window_days = 30 WHERE id = $1", [h.account.id]);
+      await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+      // A 30-day window leaves the 60-day-old email to history, which is off.
+      expect(await uids()).toEqual([2]);
+      const progress = await h.pool.query<{ live_bodies_target_count: number }>(
+        "SELECT live_bodies_target_count FROM public.imap_account_progress WHERE account_id = $1",
+        [h.account.id]
+      );
+      expect(progress.rows[0]?.live_bodies_target_count).toBe(1);
+    });
+
+    it("repairs folders left by the date-filtered code once, on migrate", async () => {
+      const { h, folders } = await setup("window-upgrade-repair", "metadata_only", [
+        message(1, oldDate),
+        message(2, new Date())
+      ]);
+      await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+      // State the old code could leave: a live head far below UIDNEXT, and a
+      // completed history snapshot with its refresh stamp.
+      await h.pool.query(
+        `UPDATE public.imap_folders
+         SET last_uid = 0, uid_next = 500, last_archive_refresh_at = now()
+         WHERE account_id = $1`,
+        [h.account.id]
+      );
+      await applyPublicMigrations(h.pool);
+      await applyPublicMigrations(h.pool);
+      const folder = (await h.pool.query<{
+        last_uid: string; historical_target_count: number | null; last_archive_refresh_at: Date | null;
+      }>(
+        `SELECT last_uid::text, historical_target_count, last_archive_refresh_at
+         FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      )).rows[0];
+      expect(folder).toEqual({ last_uid: "499", historical_target_count: null, last_archive_refresh_at: null });
+
+      // The re-run snapshot happens once; the cleared stamp keeps later migrates
+      // from re-running it.
+      await dueAllFolders(h.pool, h.account.id);
+      await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+      await applyPublicMigrations(h.pool);
+      const after = (await h.pool.query<{ historical_target_count: number | null }>(
+        "SELECT historical_target_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+        [h.account.id]
+      )).rows[0];
+      expect(after.historical_target_count).toBe(1);
     });
 
     it("backfills history once and never re-walks it", async () => {

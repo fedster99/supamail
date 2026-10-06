@@ -19,7 +19,7 @@ const SPECIAL_OPERATORS = [
   "after", "since", "newer_than", "newer",
   "before", "until", "older_than", "older",
   "larger", "bigger", "smaller",
-  "account",
+  "account", "window", "lane",
   "sort", "limit"
 ];
 const KNOWN_OPERATORS = new Set<string>([
@@ -360,6 +360,11 @@ export function parseQuery(input: string): ParsedQuery {
       }
       case "account":
         accounts.push(rawValue);
+        return null;
+      case "window":
+      case "lane":
+        // Retired lane filter (ADR 0039): say so rather than search for its text.
+        warnings.push(`${field}: is no longer supported; use after: or before:`);
         return null;
       case "sort": {
         const candidate = rawValue.toLowerCase();

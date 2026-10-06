@@ -58,6 +58,8 @@ const HISTORY_METADATA_COMMIT_GRACE_MS = 30_000;
 const SYNC_STATE_WRITE_GRACE_MS = 30_000;
 const UNCHANGED_PROOF_QUERY = { uidValidity: true, uidNext: true, highestModseq: true } as const;
 const SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS = 1_000;
+/** Incremental batches one folder pass takes before it saves progress and yields. */
+const MAX_INCREMENTAL_BATCHES_PER_PASS = 20;
 /** How long a provider that did not activate QRESYNC is left alone before the next try. */
 const QRESYNC_UNAVAILABLE_RETRY_MS = 6 * 60 * 60_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
@@ -1278,9 +1280,13 @@ export class MirrorEngine {
       ].sort((a, b) => a - b);
 
       const incrementalBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+      // New mail has no date limit, so a large move of old mail can arrive at
+      // once. One pass takes a bounded number of batches and saves its progress;
+      // the rest follows on the next passes, oldest UID first.
+      const passUids = incomingUids.slice(0, incrementalBatchSize * MAX_INCREMENTAL_BATCHES_PER_PASS);
       let lastProcessedUid: number | undefined;
-      for (let i = 0; i < incomingUids.length; i += incrementalBatchSize) {
-        const batchUids = incomingUids.slice(i, i + incrementalBatchSize);
+      for (let i = 0; i < passUids.length; i += incrementalBatchSize) {
+        const batchUids = passUids.slice(i, i + incrementalBatchSize);
         const metadata = await this.withIncrementalDeadline(
           client,
           incrementalDeadline,
@@ -1608,9 +1614,12 @@ export class MirrorEngine {
         reconcileDurationMs += Math.max(0, Date.now() - reconcileStartedAt);
       }
 
+      // Store the UIDNEXT this pass actually reached, so the unchanged-folder
+      // proof cannot accept a folder whose new mail is still pending.
+      const newMailComplete = lastProcessedUid === incomingUids[incomingUids.length - 1];
       await this.repository.markFolderSynced(folder.id, {
         uidValidity,
-        uidNext,
+        uidNext: newMailComplete ? uidNext : (lastProcessedUid ?? lastUid) + 1,
         highestModseq: flagScanAttempted ? highestModseq : undefined,
         qresyncHighestModseq: qresyncApplied
           || (flagScanAttempted && reconcileAttempted && reconcileClean === true)
@@ -1807,7 +1816,8 @@ export class MirrorEngine {
 
     // First pass for this folder: take the snapshot. Every UID below UIDNEXT is
     // then either in the window snapshot or archive for the history lane, so the
-    // live head starts at UIDNEXT and takes new mail whatever its date.
+    // live head starts at UIDNEXT and takes new mail whatever its date. Without
+    // UIDNEXT the head stays at the snapshot maximum, as before.
     const snapshotHighWater = uidNext ? uidNext - 1 : 0;
     if (targetMaxUid === null || oldestSynced === null) {
       const snapshot = await this.withInitialSyncDeadline(
@@ -1826,6 +1836,7 @@ export class MirrorEngine {
           0,
           0,
           uidValidity,
+          snapshotHighWater,
           { deadlineAt: initialSyncDeadline, signal }
         );
         await this.repository.markFolderSynced(folder.id, {
@@ -1845,17 +1856,10 @@ export class MirrorEngine {
         oldestSynced,
         sortedTargets.length,
         uidValidity,
+        snapshotHighWater,
         { deadlineAt: initialSyncDeadline, signal }
       );
-      if (snapshotHighWater > Math.max(targetMaxUid, liveHeadUid)) {
-        liveHeadUid = snapshotHighWater;
-        await this.repository.advanceInitialSyncLiveHead(
-          folder.id,
-          liveHeadUid,
-          uidValidity,
-          { deadlineAt: initialSyncDeadline, signal }
-        );
-      }
+      liveHeadUid = Math.max(liveHeadUid, snapshotHighWater);
     }
 
     // Re-search and bound by the snapshot. Any UIDs the provider has expunged

@@ -40,7 +40,7 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
 const liveDb = LIVE_DB_AVAILABLE ? describe : describe.skip;
 
-const config = { IMAP_ENCRYPTION_KEY: "x", IMAP_ALLOW_PRIVATE_HOSTS: false, WINDOW_DAYS: 30 } as unknown as AppConfig;
+const config = { IMAP_ENCRYPTION_KEY: "x", IMAP_ALLOW_PRIVATE_HOSTS: false } as unknown as AppConfig;
 const ACCOUNT_EMAIL = `drafts-live-${process.pid}@example.test`;
 
 liveDb("draft folder resolution (live DB)", () => {
