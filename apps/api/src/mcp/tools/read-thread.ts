@@ -28,6 +28,11 @@ import {
  * The old one-hop References walk remains only as a compatibility fallback for
  * messages that have not been assigned yet.
  *
+ * A page holds the newest `max_messages` messages. When older ones remain, the
+ * response carries `next_cursor` (the oldest returned message); the same
+ * selector with `cursor` returns the messages before it. The boundary is that
+ * message's `(internal_date, id)`, so new replies never shift an older page.
+ *
  * Read-only by construction (SELECTs inside {@link withReadOnlyTx}); never sends,
  * moves, or mutates mail.
  */
@@ -95,6 +100,7 @@ function threadSelect(includeBody: boolean): string {
     ? "b.body_text, b.body_plain, b.selected_text_part"
     : "NULL::text AS body_text, NULL::text AS body_plain, NULL::text AS selected_text_part"},
   stats.total_count AS thread_total_count,
+  stats.remaining_count AS thread_remaining_count,
   stats.participants AS thread_participants,
   representative.duplicate_message_ids
 `;
@@ -108,12 +114,16 @@ type ThreadRow = MessageDetailRow & ProtectedMetadataColumns & {
   inline_count: number;
   duplicate_message_ids: string[] | null;
   thread_total_count: number | string | null;
+  thread_remaining_count: number | string | null;
   thread_participants: string[] | null;
 };
 
 interface FetchedThread {
   rows: ThreadRow[];
+  /** Deliveries in the whole conversation. */
   totalCount: number;
+  /** Deliveries before the cursor (the whole conversation without one). */
+  remainingCount: number;
   participants: string[];
 }
 
@@ -129,6 +139,7 @@ export interface ReadThreadArgs {
   account?: string;
   include_quoted?: boolean;
   max_messages?: number;
+  cursor?: string;
 }
 
 /**
@@ -153,7 +164,8 @@ export const readThreadRequestSchema = z
     thread_id: z.string().optional(),
     account: z.string().uuid().optional(),
     include_quoted: z.boolean().optional(),
-    max_messages: z.number().int().min(1).max(MAX_MESSAGES_CEILING).optional()
+    max_messages: z.number().int().min(1).max(MAX_MESSAGES_CEILING).optional(),
+    cursor: z.string().uuid().optional()
   })
   .strict();
 
@@ -167,7 +179,10 @@ export interface ReadThreadResult {
     message_count: number;
   };
   messages: MessageDetail[];
+  /** Messages older than the returned ones that this page left out. */
   omitted_message_count: number;
+  /** Pass as `cursor` with the same selector to read the older messages. Present only when some remain. */
+  next_cursor?: string;
   /** Earlier messages the oldest returned message replies to that are not in the mirror. Present only when > 0. */
   missing_ancestor_count?: number;
   thread_content_status: "complete" | "partial";
@@ -187,27 +202,23 @@ export const readThreadDefinition: ToolDefinition = {
   name: "read_thread",
   title: "Read one or more email threads (read-only)",
   description:
-    "Reassemble and read one or more conversations from the SupaMail mirror. Supported selectors are " +
-    "message_id (any message in the thread), message_ids (1 to 10 seeds), a durable " +
-    "conversation_id, or a legacy provider thread_id. Direct conversation/thread selectors " +
-    "require account. Duplicate message_ids are collapsed in first-occurrence order; each " +
-    "distinct seed has its own result or error entry, and a seed in a conversation already returned " +
-    "by an earlier seed gets same_thread_as with that seed's message_id. " +
-    "Returns the thread's messages oldest-first. Replies contain newly authored plain text by default. " +
-    "When no older messages were omitted, the oldest mirrored message keeps quoted content. " +
-    "Each message contains its full cleaned body. Recognized quoted reply tails and signatures " +
-    "are stripped unless include_quoted=true. Each message's attachments lists attached files; " +
-    "inline_count counts inline parts such as signature images (read_message lists them). " +
-    "Returns the " +
-    "distinct participants and the accounts read. Each email appears " +
-    "once; its duplicate_message_ids lists its other stored copies, to move or flag every copy. Threading is a " +
-    "ONE-HOP references walk (seed's provider_thread_id + its own id + strict, " +
-    "case-preserving bracketed RFC Message-ID tokens) — it catches direct parents, children, and " +
-    "provider-threaded siblings only when the seed has no stored assignment. Capped to " +
-    "max_messages (default 20), keeping the NEWEST when over the cap; thread_content_status, " +
-    "thread_omissions, and omitted_message_count explicitly report missing older messages, and " +
-    "ancestors_not_mirrored with missing_ancestor_count reports earlier replies that were never mirrored. " +
-    "Each message's body_content_status and body_omissions explicitly report absent source text. " +
+    "Read one conversation from the SupaMail mirror, or up to 10 in one call. Select it with message_id " +
+    "(any message in the conversation), message_ids (1 to 10 seeds), or an account-scoped conversation_id " +
+    "or legacy provider thread_id; pass exactly one selector. " +
+    "Returns the newest max_messages messages (default 20, maximum 100) oldest-first, each with its full " +
+    "cleaned body and its attached files; a body range (body_offset, max_body_chars) exists only on read_message. " +
+    "When older messages remain, omitted_message_count says how many and next_cursor continues into them: " +
+    "call again with the same selector and cursor to read the messages before it; new replies do not shift that page. " +
+    "thread_content_status and thread_omissions report older_messages before this page and ancestors_not_mirrored " +
+    "(missing_ancestor_count) for earlier replies the mirror never held. " +
+    "Replies contain newly authored plain text: recognized quoted reply tails and signatures are stripped " +
+    "unless include_quoted=true. When no older messages remain, the oldest message keeps its quoted content. " +
+    "Each message's body_content_status and body_omissions report absent source text; inline_count counts " +
+    "inline parts such as signature images (read_message lists them). Each email appears once; " +
+    "duplicate_message_ids lists its other stored copies, to move or flag every copy. " +
+    "In a batch, duplicate seeds collapse in first-occurrence order; each distinct seed gets its own result " +
+    "or error, or same_thread_as naming the earlier seed that already returned its conversation. " +
+    "Returns the distinct participants and the accounts read. " +
     "READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
@@ -232,7 +243,8 @@ export const readThreadDefinition: ToolDefinition = {
         not: { anyOf: [
           { required: ["message_id"] },
           { required: ["conversation_id"] },
-          { required: ["thread_id"] }
+          { required: ["thread_id"] },
+          { required: ["cursor"] }
         ] }
       },
       {
@@ -291,7 +303,16 @@ export const readThreadDefinition: ToolDefinition = {
         minimum: 1,
         maximum: MAX_MESSAGES_CEILING,
         default: DEFAULT_MAX_MESSAGES,
-        description: "Max messages to return, keeping the newest when over the cap (default 20)."
+        description: "Messages per page (default 20, maximum 100). Keeps the newest; next_cursor continues into older ones."
+      },
+      cursor: {
+        type: "string",
+        format: "uuid",
+        minLength: 36,
+        maxLength: 36,
+        description:
+          "next_cursor from an earlier read_thread response for this conversation. Returns the messages " +
+          "before it. Not accepted with message_ids."
       }
     }
   }
@@ -344,14 +365,26 @@ function pointRepeatedConversations(
 
 /**
  * Count the full logical conversation and collect its participants, but hydrate
- * bodies/attachments for only the newest requested deliveries. The final SELECT
- * restores oldest-first order for the public response.
+ * bodies/attachments for only the newest requested deliveries before the cursor.
+ * The final SELECT restores oldest-first order for the public response.
  */
-function boundedThreadCtes(limitParameter: string): string {
+function boundedThreadCtes(limitParameter: string, cursorParameter: string): string {
   return `,
+    remaining_representatives AS (
+      SELECT representative.id, representative.duplicate_message_ids, m.internal_date
+      FROM delivery_representatives representative
+      JOIN public.imap_messages m ON m.id = representative.id
+      WHERE ${cursorParameter}::uuid IS NULL
+         OR (m.internal_date, m.id) < (
+           SELECT cursor_message.internal_date, cursor_message.id
+           FROM public.imap_messages cursor_message
+           WHERE cursor_message.id = ${cursorParameter}
+         )
+    ),
     thread_stats AS (
       SELECT
         (SELECT count(*)::int FROM delivery_representatives) AS total_count,
+        (SELECT count(*)::int FROM remaining_representatives) AS remaining_count,
         coalesce((
           SELECT array_agg(first_participant.email ORDER BY
             first_participant.internal_date,
@@ -381,19 +414,24 @@ function boundedThreadCtes(limitParameter: string): string {
         ), '{}'::text[]) AS participants
     ),
     limited_representatives AS (
-      SELECT representative.id, representative.duplicate_message_ids
-      FROM delivery_representatives representative
-      JOIN public.imap_messages m ON m.id = representative.id
-      ORDER BY m.internal_date DESC, m.id DESC
+      SELECT id, duplicate_message_ids
+      FROM remaining_representatives
+      ORDER BY internal_date DESC, id DESC
       LIMIT ${limitParameter}
     )`;
 }
 
+function countOr(value: number | string | null | undefined, fallback: number): number {
+  const count = Number(value ?? fallback);
+  return Number.isFinite(count) ? count : fallback;
+}
+
 function summarizeFetchedRows(rows: ThreadRow[]): FetchedThread {
-  const totalCount = Number(rows[0]?.thread_total_count ?? rows.length);
+  const totalCount = countOr(rows[0]?.thread_total_count, rows.length);
   return {
     rows,
-    totalCount: Number.isFinite(totalCount) ? totalCount : rows.length,
+    totalCount,
+    remainingCount: countOr(rows[0]?.thread_remaining_count, totalCount),
     participants: rows[0]?.thread_participants ?? collectParticipants(rows)
   };
 }
@@ -405,6 +443,7 @@ async function fetchThreadRows(
     | { kind: "provider-thread"; threadId: string; accountId: string }
     | { kind: "keys"; seed: SeedRow },
   maxMessages: number,
+  cursor: string | null,
   { includeBody = true }: ReadThreadOptions
 ): Promise<FetchedThread> {
   if (selector.kind === "conversation") {
@@ -417,7 +456,7 @@ async function fetchThreadRows(
          AND m.account_id = assignment.account_id
         WHERE assignment.account_id = $1
           AND assignment.conversation_id = $2
-          AND m.deleted_in_provider = false`, "assignment.delivery_key")}${boundedThreadCtes("$3")}
+          AND m.deleted_in_provider = false`, "assignment.delivery_key")}${boundedThreadCtes("$3", "$4")}
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
@@ -426,7 +465,7 @@ async function fetchThreadRows(
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
       `,
-      [selector.accountId, selector.conversationId, maxMessages]
+      [selector.accountId, selector.conversationId, maxMessages, cursor]
     );
     return summarizeFetchedRows(result.rows);
   }
@@ -440,7 +479,7 @@ async function fetchThreadRows(
         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
         WHERE m.provider_thread_id = $1
           AND m.account_id = $2
-          AND m.deleted_in_provider = false`, DELIVERY_KEY_SQL)}${boundedThreadCtes("$3")}
+          AND m.deleted_in_provider = false`, DELIVERY_KEY_SQL)}${boundedThreadCtes("$3", "$4")}
       SELECT ${threadSelect(includeBody)}
       FROM limited_representatives representative
       JOIN public.imap_messages m ON m.id = representative.id
@@ -449,7 +488,7 @@ async function fetchThreadRows(
       CROSS JOIN thread_stats stats
       ORDER BY m.internal_date ASC, m.id ASC
       `,
-      [selector.threadId, selector.accountId, maxMessages]
+      [selector.threadId, selector.accountId, maxMessages, cursor]
     );
     return summarizeFetchedRows(result.rows);
   }
@@ -472,7 +511,7 @@ async function fetchThreadRows(
       FROM legacy_candidates candidate
       JOIN public.imap_messages m ON m.id = candidate.id
       ${ACTIVE_ASSIGNMENT_JOIN}
-      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id`, DELIVERY_KEY_SQL)}${boundedThreadCtes("$5")}
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id`, DELIVERY_KEY_SQL)}${boundedThreadCtes("$5", "$6")}
     SELECT ${threadSelect(includeBody)}
     FROM limited_representatives representative
     JOIN public.imap_messages m ON m.id = representative.id
@@ -481,7 +520,7 @@ async function fetchThreadRows(
     CROSS JOIN thread_stats stats
     ORDER BY m.internal_date ASC, m.id ASC
     `,
-    [seed.account_id, seed.provider_thread_id, seed.id, keys, maxMessages]
+    [seed.account_id, seed.provider_thread_id, seed.id, keys, maxMessages, cursor]
   );
   return summarizeFetchedRows(result.rows);
 }
@@ -513,6 +552,14 @@ async function runReadThreadInternal(
       "invalid_input",
       "read_thread accepts one selector mode at a time.",
       "Pass one message_id, one message_ids batch, or one account-scoped conversation/thread id."
+    );
+  }
+
+  if (input.message_ids && input.cursor !== undefined) {
+    return toolError(
+      "invalid_input",
+      "cursor continues one thread, not a message_ids batch.",
+      "Pass cursor with the message_id, conversation_id, or thread_id that returned it."
     );
   }
 
@@ -580,6 +627,7 @@ async function runReadThreadInternal(
     );
   }
   const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;
+  const cursor = input.cursor ?? null;
 
   return withReadOnlyTx(pool, async (client) => {
     let fetched: FetchedThread;
@@ -592,14 +640,14 @@ async function runReadThreadInternal(
         kind: "conversation",
         conversationId,
         accountId: accountScope!
-      }, maxMessages, options);
+      }, maxMessages, cursor, options);
       accountIds = [accountScope!];
     } else if (threadId) {
       fetched = await fetchThreadRows(client, {
         kind: "provider-thread",
         threadId,
         accountId: accountScope!
-      }, maxMessages, options);
+      }, maxMessages, cursor, options);
       accountIds = [accountScope!];
     } else {
       const seedResult = await client.query<SeedRow>(
@@ -632,11 +680,19 @@ async function runReadThreadInternal(
           kind: "conversation",
           conversationId: seed.conversation_id,
           accountId: seed.account_id
-        }, maxMessages, options);
+        }, maxMessages, cursor, options);
       } else {
-        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages, options);
+        fetched = await fetchThreadRows(client, { kind: "keys", seed }, maxMessages, cursor, options);
       }
       accountIds = [seed.account_id];
+    }
+
+    if (fetched.rows.length === 0 && cursor) {
+      return toolError(
+        "not_found",
+        "No messages before cursor.",
+        "Read the thread again without cursor and continue from the next_cursor it returns."
+      );
     }
 
     if (fetched.rows.length === 0 && (conversationId || threadId)) {
@@ -671,7 +727,7 @@ async function runReadThreadInternal(
     // SQL already keeps the newest messages; retain a defensive cap for injected
     // test clients and restore no additional database work in production.
     const kept = rows.length > maxMessages ? rows.slice(rows.length - maxMessages) : rows;
-    const omitted = Math.max(0, totalCount - kept.length);
+    const omitted = Math.max(0, fetched.remainingCount - kept.length);
 
     const messages = kept.map((row, index) => {
       const message = mapMessageRow(row, {
@@ -710,6 +766,7 @@ async function runReadThreadInternal(
       },
       messages,
       omitted_message_count: omitted,
+      ...(omitted > 0 ? { next_cursor: messages[0].message_id } : {}),
       ...(missingAncestors > 0 ? { missing_ancestor_count: missingAncestors } : {}),
       thread_content_status: threadOmissions.length > 0 ? "partial" : "complete",
       thread_omissions: threadOmissions,

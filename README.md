@@ -199,7 +199,9 @@ The MCP server exposes six agent tools: `search_email`, `read_message`,
 reads the same `DATABASE_URL`, and has no remote listener or send capability.
 
 `read_thread` accepts one message seed or a batch of up to ten `message_ids`,
-preserving first-seen order and isolating each thread's result or error.
+preserving first-seen order and isolating each thread's result or error. It
+returns the newest messages first and a `next_cursor` to continue into older
+ones with the same selector.
 `read_message` and `read_thread` return the full available cleaned body for each
 message. `read_message` also accepts an optional body range without a product
 character ceiling. Every message and thread explicitly reports whether text or
