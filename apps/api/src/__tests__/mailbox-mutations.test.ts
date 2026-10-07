@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ImapAbortBinding } from "../imap-connect.js";
+import { InvalidInputError } from "../errors.js";
 import { MailboxMutator, type MovedLocation, toImapFlag } from "../mailbox-mutations.js";
 
 // Mirror ids are UUIDs; any other value names no row.
@@ -376,10 +377,17 @@ describe("MailboxMutator.move", () => {
     expect(moved).toEqual({ uidValidity: 200, uidMap: new Map([[1, 11], [5, 15]]) });
   });
 
-  it("refuses targets from different folders or none", async () => {
+  it("refuses mixed mailboxes, folders, UIDVALIDITY values, or no targets before opening a folder", async () => {
     const { imap, mutator } = connected();
-    await expect(mutator.move([target(1), target(5, "Later")], "Archive")).rejects.toThrow(/one folder/);
-    await expect(mutator.move([], "Archive")).rejects.toThrow(/one folder/);
+    for (const targets of [
+      [target(1), { ...target(5), accountId: "acc-2" }],
+      [target(1), target(5, "Later")],
+      [target(1), { ...target(5), uidValidity: 101 }],
+      []
+    ]) {
+      await expect(mutator.move(targets, "Archive")).rejects.toBeInstanceOf(InvalidInputError);
+    }
+    expect(imap.getMailboxLock).not.toHaveBeenCalled();
     expect(imap.messageMove).not.toHaveBeenCalled();
   });
 });
