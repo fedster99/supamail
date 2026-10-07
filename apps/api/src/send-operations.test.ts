@@ -5,9 +5,13 @@ import {
   type SendOperation, type SendOperationIdentity, type SendOperationStatus,
   type SendOperationStore, type StoredSendError,
 } from "./send-operations.js";
-import { AccountBusyError, InvalidInputError, NoRecipientsError, NotFoundError } from "./errors.js";
+import { AbortError, AccountBusyError, InvalidInputError, NoRecipientsError, NotFoundError } from "./errors.js";
 import { HostValidationError } from "./host-validation.js";
 import { SmtpDeliveryError } from "./smtp-client.js";
+import { sendMessage } from "./send.js";
+import { sendDraft } from "./drafts.js";
+import type { AppConfig } from "./config.js";
+import type { PgPool } from "./db.js";
 
 type Receipt = { delivered: true; recovered?: boolean };
 class MemoryStore implements SendOperationStore<Receipt> {
@@ -101,8 +105,44 @@ describe("durable send operations", () => {
     expect(await runSendOperation(args)).toEqual(receipt);
     expect(args.execute).toHaveBeenCalledTimes(2);
   });
+  it.each(["send_email", "send_draft"] as const)("retries %s after the real primitive aborts before SMTP", async (action) => {
+    // Cancellation must return before either primitive touches these dependencies.
+    const query = vi.fn(() => { throw new Error("Unexpected database query"); });
+    const connect = vi.fn(() => { throw new Error("Unexpected database connection"); });
+    const pool = { query, connect } as unknown as PgPool;
+    const config = {} as AppConfig;
+    const signal = AbortSignal.abort();
+    const request = {
+      accountId: "11111111-1111-4111-8111-111111111111",
+      to: [{ email: "recipient@example.test" }], subject: "Cancellation fixture",
+      body: { format: "plain" as const, text: "Fixture" },
+    };
+    const execute = vi.fn(async (): Promise<Receipt> => {
+      if (action === "send_email") {
+        await sendMessage(pool, config, request, undefined, { signal });
+      } else {
+        await sendDraft(pool, config, "draft-fixture", undefined, { signal });
+      }
+      return receipt;
+    });
+    const args = { ...setup(), action, accountId: request.accountId, request, execute };
+
+    await expect(runSendOperation(args)).rejects.toBeInstanceOf(AbortError);
+    expect(query).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect((await args.store.get(args.operationKey))?.status).toBe("not_delivered");
+    expect(await replaySendOperation(args)).toEqual({ found: false, accountId: request.accountId });
+
+    // The next caller is no longer cancelled. It can claim the SAME key once.
+    execute.mockResolvedValue(receipt);
+    expect(await runSendOperation(args)).toEqual(receipt);
+    expect(await runSendOperation(args)).toEqual(receipt);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
   it.each([
     new SmtpDeliveryError("unknown", "response lost"), new Error("unclassified"),
+    new SmtpDeliveryError("unknown", "response lost during cancellation", { cause: new AbortError() }),
+    Object.assign(new Error("unproven cancellation"), { name: "AbortError" }),
     Object.assign(new Error("forged"), { name: "SmtpDeliveryError", outcome: "not_delivered" }),
   ])("never retries uncertain or untyped errors: $message", async (error) => {
     const args = setup();

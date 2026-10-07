@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { AccountBusyError, InvalidInputError, NoRecipientsError, NotFoundError } from "./errors.js";
+import { AbortError, AccountBusyError, InvalidInputError, NoRecipientsError, NotFoundError } from "./errors.js";
 import { HostValidationError } from "./host-validation.js";
 import { SmtpDeliveryError } from "./smtp-client.js";
 
@@ -126,7 +126,10 @@ function unknown(cause: unknown) {
 
 function safeFailure(error: unknown): boolean {
   if (error instanceof SmtpDeliveryError) return error.outcome === "not_delivered";
-  return error instanceof AccountBusyError
+  // sendMessage/sendDraft surface this typed abort only before SMTP submission.
+  // After delivery, cancellation can skip Sent filing but cannot fail the send.
+  return error instanceof AbortError
+    || error instanceof AccountBusyError
     || error instanceof HostValidationError
     || error instanceof InvalidInputError
     || error instanceof NoRecipientsError

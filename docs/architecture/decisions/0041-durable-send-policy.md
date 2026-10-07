@@ -19,7 +19,9 @@ The module contains the existing hosted policy; no queue or service is added.
 - Claim the operation durably before calling the send primitive.
 - Return stored success without sending or looking up an old draft again.
 - Reject reuse of a key with a different request, action, mailbox or Message-ID.
-- Retry only typed errors that prove no submission, or SMTP `not_delivered`.
+- Retry only typed errors that prove no submission, including a send primitive's
+  pre-SMTP `AbortError`, or SMTP `not_delivered`. Untyped aborts and SMTP
+  `unknown` remain uncertain, even when cancellation is the underlying cause.
 - Never submit again after an unknown outcome. An abandoned claim becomes
   unknown, not retryable. A provider receipt or specific Sent evidence can prove
   success even if writing the final ledger result fails.
