@@ -226,6 +226,8 @@ liveDb("read_message tool live DB", () => {
     expect(byName.get("deck.pdf")?.disposition).toBe("attachment");
     expect(byName.get("deck.pdf")?.size_bytes).toBe(20480);
     expect(byName.get("logo.png")?.disposition).toBe("inline");
+    expect(byName.get("logo.png")?.content_id).toBe("logo@acme");
+    expect(byName.get("deck.pdf")?.content_id).toBeNull();
 
     // Headers omitted unless asked.
     expect(res.headers).toBeUndefined();

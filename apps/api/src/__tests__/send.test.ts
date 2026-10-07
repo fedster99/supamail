@@ -636,13 +636,22 @@ describe("sendMessage orchestration", () => {
       messageId: "<stable@example.test>",
       attachments: [
         { filename: "a.txt", contentType: "text/plain", content: Buffer.from("a").toString("base64") },
-        { filename: "logo.png", content: Buffer.from("png").toString("base64"), cid: "logo", inline: true }
+        { filename: "logo.png", contentType: "image/png", content: Buffer.from("png").toString("base64"), cid: "logo", inline: true }
       ]
     };
 
     const result = await sendMessage({} as never, config, request);
     expect(result.delivered).toBe(true);
     expect(result.rfcMessageId).toBe("<stable@example.test>");
+    const raw = mocks.deliverSmtp.mock.calls[0][1] as Buffer;
+    expect(raw.toString()).toContain("multipart/related");
+    const parsed = await simpleParser(raw, { skipImageLinks: true });
+    expect(parsed.html).toContain('src="cid:logo"');
+    expect(parsed.attachments.map((a) => [a.filename, a.contentDisposition, a.contentId, a.content.toString()])).toEqual([
+      ["logo.png", "inline", "<logo>", "png"],
+      ["a.txt", "attachment", undefined, "a"]
+    ]);
+
     expect(mocks.deliverSmtp.mock.calls[0][2]).toEqual({
       from: account.email_address,
       to: ["list+tag=x@lists.example.test", "cc@example.test", "bcc@example.test"]
