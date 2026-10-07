@@ -583,7 +583,9 @@ async function moveMailboxTargets(
   const folders = new Map<string, ResolvedMessageTarget[]>();
   for (const target of targets) {
     const key = `${target.uidValidity}:${target.folderPath}`;
-    folders.set(key, [...(folders.get(key) ?? []), target]);
+    const folder = folders.get(key) ?? [];
+    folder.push(target);
+    folders.set(key, folder);
   }
   try {
     await repository.markFoldersForReconcile(account.id, [...new Set(targets.map((target) => target.folderPath)), destination]);
