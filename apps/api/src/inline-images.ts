@@ -1,3 +1,4 @@
+import { Parser } from "htmlparser2";
 import { InvalidInputError } from "./errors.js";
 import type { SendRequest } from "./types.js";
 
@@ -11,13 +12,41 @@ export function bareContentId(value: string): string {
 /** CID URLs may percent-encode the identifier (RFC 2392). Never rewrite authored HTML. */
 export function referencedContentIds(html: string | undefined): Set<string> {
   const ids = new Set<string>();
-  for (const match of (html ?? "").matchAll(/(?:\b(?:src|href|background)\s*=\s*["']?|url\(\s*["']?)cid:([^\s"'<>)}]*)/gi)) {
+  const addUrl = (value: string) => {
+    const url = value.trim();
+    if (!/^cid:/i.test(url)) return;
     let id: string;
-    try { id = decodeURIComponent(match[1]); }
+    try { id = decodeURIComponent(url.slice(4)); }
     catch { throw new InvalidInputError("Malformed cid URL in HTML."); }
     if (!CONTENT_ID_PATTERN.test(id)) throw new InvalidInputError("Malformed cid URL in HTML.");
     ids.add(id);
-  }
+  };
+  const addStyle = (css: string) => {
+    const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+    for (const match of withoutComments.matchAll(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi)) {
+      addUrl(match[1] ?? match[2] ?? match[3]);
+    }
+  };
+  let style: string | undefined;
+  const parser = new Parser({
+    onopentag(name, attributes) {
+      for (const attribute of ["src", "href", "background"]) {
+        if (attributes[attribute] !== undefined) addUrl(attributes[attribute]);
+      }
+      if (attributes.style !== undefined) addStyle(attributes.style);
+      if (name === "style") style = "";
+    },
+    ontext(text) { if (style !== undefined) style += text; },
+    onclosetag(name) {
+      if (name === "style" && style !== undefined) {
+        addStyle(style);
+        style = undefined;
+      }
+    }
+  });
+  // The parser decodes attribute entities and ignores comments/prose. Inspection
+  // only: the authored HTML is passed unchanged to the MIME composer.
+  parser.end(html ?? "");
   return ids;
 }
 
@@ -40,7 +69,9 @@ export function validateInlineImages(request: Pick<SendRequest, "body" | "attach
     if (attachment.inline === false || !/^image\/(png|jpeg|gif|webp)$/i.test(attachment.contentType ?? inferredType)) {
       throw new InvalidInputError("CID images require inline disposition and image/png, image/jpeg, image/gif or image/webp (declare contentType or use its filename extension).");
     }
-    if (!html || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(attachment.content) || attachment.content.length === 0) {
+    // A repeated four-character group can overflow V8's regexp stack on valid
+    // multi-megabyte uploads. A flat character class keeps validation stack-safe.
+    if (!html || attachment.content.length === 0 || attachment.content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(attachment.content)) {
       throw new InvalidInputError("CID images require an HTML body and non-empty image bytes.");
     }
     ids.add(attachment.cid);

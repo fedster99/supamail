@@ -621,6 +621,7 @@ describe("sendMessage orchestration", () => {
 
   it("accepts every optional field a typed host passes", async () => {
     const { sendMessage } = await import("../send.js");
+    const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=", "base64");
     const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
     const request: SendRequest = {
       senderName: "Renée Sender",
@@ -629,14 +630,14 @@ describe("sendMessage orchestration", () => {
       cc: [{ email: "cc@example.test" }],
       bcc: [{ email: "bcc@example.test", name: "Hidden" }],
       subject: "Re: Hi",
-      body: { format: "html", text: "Body", html: "<p>Body <img src=\"cid:logo\"></p>" },
+      body: { format: "html", text: "Body", html: '<p>Body <img src=" cid:logo&#64;example.test "></p>' },
       headers: { "X-Trace": "abc" },
       inReplyTo: "<source@example.test>",
       references: "<root@example.test> <source@example.test>",
       messageId: "<stable@example.test>",
       attachments: [
         { filename: "a.txt", contentType: "text/plain", content: Buffer.from("a").toString("base64") },
-        { filename: "logo.png", contentType: "image/png", content: Buffer.from("png").toString("base64"), cid: "logo", inline: true }
+        { filename: "logo.png", contentType: "image/png", content: pngBytes.toString("base64"), cid: "logo@example.test", inline: true }
       ]
     };
 
@@ -646,10 +647,10 @@ describe("sendMessage orchestration", () => {
     const raw = mocks.deliverSmtp.mock.calls[0][1] as Buffer;
     expect(raw.toString()).toContain("multipart/related");
     const parsed = await simpleParser(raw, { skipImageLinks: true });
-    expect(parsed.html).toContain('src="cid:logo"');
-    expect(parsed.attachments.map((a) => [a.filename, a.contentDisposition, a.contentId, a.content.toString()])).toEqual([
-      ["logo.png", "inline", "<logo>", "png"],
-      ["a.txt", "attachment", undefined, "a"]
+    expect(parsed.html).toBe(request.body.html);
+    expect(parsed.attachments.map((a) => [a.filename, a.contentDisposition, a.contentId, a.content])).toEqual([
+      ["logo.png", "inline", "<logo@example.test>", pngBytes],
+      ["a.txt", "attachment", undefined, Buffer.from("a")]
     ]);
 
     expect(mocks.deliverSmtp.mock.calls[0][2]).toEqual({

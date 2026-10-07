@@ -28,6 +28,11 @@ Angle brackets and the `cid:` prefix are not part of the input ID. Duplicate IDs
 `inline:false` with a CID, malformed CID URLs and missing referenced images
 raise `InvalidInputError` before SMTP submission or draft APPEND.
 
+CID inspection parses HTML attributes (`src`, `href`, `background`) and CSS
+`url(...)` in style attributes/elements. Attribute entities, surrounding URL
+whitespace and percent-encoded IDs are normalized for matching; authored HTML
+stays unchanged. HTML comments, script text and prose are not image references.
+
 MailComposer places images under `multipart/related` with the HTML; ordinary
 attachments remain ordinary attachments in the surrounding `multipart/mixed`.
 No remote URL is fetched or rewritten. Content types are declared or inferred;

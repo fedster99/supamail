@@ -68,9 +68,11 @@ describe("draftReplyRequestSchema", () => {
 });
 
 describe("HTML source images", () => {
-  it("returns only the quoted image references with bare Content-IDs", async () => {
+  it.each([
+    '<p>Earlier <img src="cid:original@example.test"></p>',
+    '<p>Earlier <img src=" cid:original&#64;example.test "></p><!-- <img src="cid:unused"> -->'
+  ])("retains quoted image references without rewriting HTML: %s", async (sourceHtml) => {
     const { runDraftReply } = await import("./draft-reply.js");
-    const sourceHtml = '<p>Earlier <img src="cid:original@example.test"></p>';
     const client = {
       query: async (sql: string) => ({ rows: sql.includes("FROM public.imap_attachments") ? [
         { attachment_id: "inline-id", message_id: "source", account_id: "mailbox", content_id: "<original@example.test>", disposition: "inline" },

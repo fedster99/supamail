@@ -221,7 +221,7 @@ liveDb("draft_reply live DB", () => {
   it("retains HTML quote images with the mirrored attachment ID and bare CID", async () => {
     await seedMessage({ uid: 9900, subject: "Inline source", fromEmail: "sender@example.test", body: "Earlier history" });
     const id = idByUid.get(9900)!;
-    const html = '<p>Earlier history <img src="cid:quote@example.test"></p>';
+    const html = '<p>Earlier history <img src=" cid:quote&#64;example.test "></p><!-- <img src="cid:unused"> -->';
     await pool.query("UPDATE public.imap_message_bodies SET body_html = $2 WHERE message_id = $1", [id, html]);
     const image = await pool.query<{ id: string }>(
       `INSERT INTO public.imap_attachments (message_id, filename, mime_type, size_bytes, part_number, content_id, disposition)
