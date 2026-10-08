@@ -104,6 +104,14 @@ export class MailboxMutationError extends Error {
   }
 }
 
+/** COPY succeeded, but removing the source was not confirmed. Do not retry blind. */
+export class MailboxMoveIncompleteError extends Error {
+  constructor() {
+    super("The email may be in both folders. Check both folders before moving it again.");
+    this.name = "MailboxMoveIncompleteError";
+  }
+}
+
 /** The resolved IMAP coordinates of one mirrored message. */
 export interface ResolvedMessageTarget {
   messageId: string;
@@ -267,19 +275,32 @@ export class MailboxMutator {
       );
     }
     const uids = targets.map((target) => target.uid).join(",");
-    return this.withUidScope(first, async () => {
-      const result = await this.client.messageMove(uids, destination, { uid: true });
-      if (!result) {
-        throw new MailboxMutationError(
-          `MOVE failed for UID ${uids} from ${first.folderPath} to ${destination} on ${this.host}`
-        );
-      }
-      if (typeof result !== "object") return { uidMap: null, uidValidity: null };
-      return {
-        uidMap: result.uidMap ?? null,
-        uidValidity: result.uidValidity === undefined ? null : Number(result.uidValidity)
-      };
-    });
+    let removalUnconfirmed = false;
+    try {
+      return await this.withUidScope(first, async () => {
+        let result;
+        try {
+          result = await this.client.messageMove(uids, destination, { uid: true });
+        } catch (error) {
+          removalUnconfirmed = (error as { code?: string } | null)?.code === "MoveIncomplete";
+          throw error;
+        }
+        if (!result) {
+          throw new MailboxMutationError(
+            `MOVE failed for UID ${uids} from ${first.folderPath} to ${destination} on ${this.host}`
+          );
+        }
+        if (typeof result !== "object") return { uidMap: null, uidValidity: null };
+        return {
+          uidMap: result.uidMap ?? null,
+          uidValidity: result.uidValidity === undefined ? null : Number(result.uidValidity)
+        };
+      });
+    } catch (error) {
+      // Keep the known copy effect even if the abort binding wraps the failure.
+      if (removalUnconfirmed) throw new MailboxMoveIncompleteError();
+      throw error;
+    }
   }
 
   /**
@@ -519,9 +540,10 @@ export async function moveMessage(
 
 /**
  * Move mirrored messages to `destination` with one connection per mailbox and one
- * UID MOVE per source folder, so the provider cost does not grow with the number of
- * messages. Every source folder and the destination are durably due before the
- * provider commands, so a host can reconcile them after acknowledgement without a
+ * UID MOVE per source folder, so connection setup is paid once per mailbox.
+ * Database and provider work can still grow with the number of messages. Eligible
+ * tracked source and destination folders are durably due before provider commands,
+ * so a host can reconcile them after acknowledgement without a
  * prompt IDLE/NOTIFY event. A move the server confirms with COPYUID keeps the
  * message id (ADR 0037). Outcomes follow the input order; one folder's failure never
  * hides another message's result. A message already in `destination` is a no-op.

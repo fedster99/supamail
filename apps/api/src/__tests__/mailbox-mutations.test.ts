@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ImapAbortBinding } from "../imap-connect.js";
 import { InvalidInputError } from "../errors.js";
-import { MailboxMutator, type MovedLocation, toImapFlag } from "../mailbox-mutations.js";
+import { MailboxMoveIncompleteError, MailboxMutator, type MovedLocation, toImapFlag } from "../mailbox-mutations.js";
 
 // Mirror ids are UUIDs; any other value names no row.
 const M1 = "11111111-1111-4111-8111-111111111111";
@@ -355,8 +355,9 @@ describe("moveMessages", () => {
 
 describe("MailboxMutator.move", () => {
   const target = (uid: number, folderPath = "INBOX") => ({ messageId: M1, accountId: "acc-1", folderPath, uidValidity: 100, uid });
-  const connected = () => {
+  const connected = (signal?: AbortSignal) => {
     const imap = {
+      close: vi.fn(),
       mailbox: { uidValidity: 100 },
       capabilities: new Map([["MOVE", true]]),
       getMailboxLock: vi.fn(async () => ({ release: vi.fn() })),
@@ -364,7 +365,7 @@ describe("MailboxMutator.move", () => {
     };
     const mutator = Reflect.construct(
       MailboxMutator as unknown as new (...args: unknown[]) => MailboxMutator,
-      [imap, "imap.example.test", new ImapAbortBinding(imap as never, undefined)]
+      [imap, "imap.example.test", new ImapAbortBinding(imap as never, signal)]
     );
     return { imap, mutator };
   };
@@ -375,6 +376,16 @@ describe("MailboxMutator.move", () => {
     expect(imap.getMailboxLock).toHaveBeenCalledExactlyOnceWith("INBOX");
     expect(imap.messageMove).toHaveBeenCalledExactlyOnceWith("1,5", "Archive", { uid: true });
     expect(moved).toEqual({ uidValidity: 200, uidMap: new Map([[1, 11], [5, 15]]) });
+  });
+
+  it.each([false, true])("keeps the incomplete-move error when cancellation races removal: %s", async (abort) => {
+    const controller = new AbortController();
+    const { imap, mutator } = connected(controller.signal);
+    imap.messageMove.mockImplementationOnce(async () => {
+      if (abort) controller.abort();
+      throw Object.assign(new Error("private provider detail"), { code: "MoveIncomplete" });
+    });
+    await expect(mutator.move([target(1), target(5)], "Archive")).rejects.toBeInstanceOf(MailboxMoveIncompleteError);
   });
 
   it("refuses mixed mailboxes, folders, UIDVALIDITY values, or no targets before opening a folder", async () => {

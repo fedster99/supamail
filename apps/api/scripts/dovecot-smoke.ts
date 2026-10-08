@@ -12,6 +12,7 @@ import { openInboxIdleSession } from "../src/inbox-idle.js";
 import { MailboxMutator, moveMessages } from "../src/mailbox-mutations.js";
 import { MirrorRepository } from "../src/repository.js";
 import { MirrorEngine } from "../src/sync-engine.js";
+import { checkMoveFallback } from "./dovecot-move-fallback.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -515,6 +516,7 @@ async function main(): Promise<void> {
     );
     const inboxAfterMove = await moveCheck.status("INBOX", { messages: true });
     await moveCheck.logout();
+    const moveFallback = await checkMoveFallback(imapPort, mailbox, password);
     const assertions: Array<[string, boolean]> = [
       ["sync succeeded", result.outcome === "success"],
       ["discovered Dovecot folders", counts.folders >= 4],
@@ -564,6 +566,7 @@ async function main(): Promise<void> {
       archiveWakeLatencyMs,
       archiveLiveResult,
       archiveQresync,
+      moveFallback,
       batchMove: {
         messages: movedIds.length,
         connections: moveConnections,

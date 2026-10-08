@@ -85,3 +85,23 @@ and leaves the folders due for reconcile, as ADR 0034 does for tombstones.
   updates the same row; a taken key, an untracked folder, a UIDVALIDITY
   mismatch, or an unmirrored folder writes nothing; `moveMessage` end to end; and
   every by-id read refuses a tombstoned row.
+
+## UIDPLUS fallback failure handling (2026-10-08)
+
+Without native MOVE, the pinned ImapFlow patch requires confirmed COPY before
+flagging the source, confirmed STORE before EXPUNGE, and confirmed removal before
+returning COPYUID as a completed move. A false COPY result must never delete the
+source. These guards live in the public core dependency patch, not in a host.
+
+If COPY succeeded but removal fails or disconnects, core reports
+`MailboxMoveIncompleteError` (`move_incomplete` from HTTP). It makes no move
+write-through and tells the caller to check both folders before moving again.
+The error retains the known copy effect even when cancellation races removal.
+The tracked folders were marked due before the command; reconcile observes the
+actual effects. It cannot turn a partial copy/delete into an atomic move, and
+this does not add an exactly-once or automatic retry guarantee.
+
+`imapflow-move-patch.test.ts` covers false/throwing command results. The Dovecot
+smoke exercises successful fallback and real-server rejection of COPY, plus
+injected STORE/EXPUNGE/disconnect failures with actual source/destination counts.
+It also checks each returned destination UID against that email's Message-ID.

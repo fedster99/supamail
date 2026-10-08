@@ -1,3 +1,16 @@
+diff --git a/lib/commands/expunge.js b/lib/commands/expunge.js
+index 6a0846f48d65302c9f5a61ae1ad48b80f08385c9..d9236e91dfdbef35d7d50f954c9c0b4bcf6144e3 100644
+--- a/lib/commands/expunge.js
++++ b/lib/commands/expunge.js
+@@ -21,7 +21,7 @@ module.exports = async (connection, range, options) => {
+ 
+     // Two-step deletion process per IMAP protocol:
+     // Step 1: Mark the target messages with the \Deleted flag.
+-    await connection.messageFlagsAdd(range, ['\\Deleted'], options);
++    if (!(await connection.messageFlagsAdd(range, ['\\Deleted'], options))) return false;
+ 
+     // Step 2: Issue EXPUNGE to permanently remove \Deleted messages.
+     // With UIDPLUS (RFC 4315): "UID EXPUNGE <uids>" removes only the specified UIDs,
 diff --git a/lib/commands/fetch.js b/lib/commands/fetch.js
 index 048215e17a6560d00c8cac6b3a7de1b78449059c..3f269eb83f9d93affa2927db29db074a60857578 100644
 --- a/lib/commands/fetch.js
@@ -174,6 +187,32 @@ index b3902fd0e58e2e28ab743f8de964cdb05e2c9b83..ddf94ad57b0ae8729587fd15733f63f1
          if (needsLsub && !connection.skipLsub) {
              try {
                  await runLsub();
+diff --git a/lib/commands/move.js b/lib/commands/move.js
+index f54867ef6793e07bb0c1e3b98b0bdd01f54a7338..6d68c7b10e711ef7c424767ac5e121fdaa741c63 100644
+--- a/lib/commands/move.js
++++ b/lib/commands/move.js
+@@ -33,7 +33,20 @@ module.exports = async (connection, range, destination, options) => {
+     // emulate MOVE using COPY + flag as \Deleted + EXPUNGE.
+     if (!hasCapability(connection, 'MOVE')) {
+         let result = await connection.messageCopy(range, destination, options);
+-        await connection.messageDelete(range, Object.assign({ silent: true }, options));
++        // COPY can return false on a tagged NO. Never remove the source unless
++        // the server first confirmed the copy.
++        if (!result) return false;
++        try {
++            if (!(await connection.messageDelete(range, Object.assign({ silent: true }, options)))) {
++                throw new Error('Source removal was not confirmed');
++            }
++        } catch (cause) {
++            // The copy is already confirmed. Preserve that distinction so callers
++            // cannot report success or invite a blind retry that creates copies.
++            throw Object.assign(new Error('MOVE copied messages but did not confirm source removal', { cause }), {
++                code: 'MoveIncomplete'
++            });
++        }
+         return result;
+     }
+ 
 diff --git a/lib/commands/notify.js b/lib/commands/notify.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..3405b0ae2bd05954e614d94b4b3081ad8870dd63
