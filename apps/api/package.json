@@ -46,6 +46,7 @@
     "commander": "^12.1.0",
     "dotenv": "^16.4.7",
     "hono": "^4.12.32",
+    "htmlparser2": "^10.1.0",
     "imapflow": "^1.6.1",
     "mailparser": "^3.9.14",
     "nodemailer": "^9.0.3",
