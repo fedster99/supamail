@@ -185,8 +185,8 @@ threshold to a 31-doc synthetic corpus.
 
 ### Phase 2 — Tier 2: opt-in semantic (gated pgvector)
 Stand up the out-of-core embedding job that populates `imap_message_embeddings`
-(already in `0007`), add a vector retrieval branch fused via RRF, and measure with
-`evaluateSearch({ semantic: true })`. Gated three ways (extension present, table
+(already in `0007`), add a vector retrieval branch fused via RRF, and measure it with
+the eval harness. Gated three ways (extension present, table
 populated, per-account flag); absent it, search is unchanged.
 - Expected: semantic 0.00 → ~0.70–0.80; headline ≥ 0.90.
 
