@@ -338,6 +338,33 @@ index fd0c409c24c525cbbb6b841e8d26327eb1b0a635..f0567fa440b4511c223ddcf52404a024
          // Sort numerically for consistent, predictable output order
          return Array.from(results).sort((a, b) => a - b);
      } catch (err) {
+diff --git a/lib/commands/select.js b/lib/commands/select.js
+index 2add50b39ef8fd3a575500599b4757fe4a511b79..c277eba62135eb3b1498795344e3b046aab1cf4a 100644
+--- a/lib/commands/select.js
++++ b/lib/commands/select.js
+@@ -20,6 +20,10 @@ module.exports = async (connection, path, options) => {
+         return;
+     }
+     options = options || {};
++    if (options.knownUidMax !== undefined &&
++        (!Number.isSafeInteger(options.knownUidMax) || options.knownUidMax < 1 || options.knownUidMax > 0xffffffff)) {
++        throw new TypeError('knownUidMax must be a positive 32-bit UID');
++    }
+ 
+     path = normalizePath(connection, path);
+ 
+@@ -62,7 +66,10 @@ module.exports = async (connection, path, options) => {
+                 { type: 'ATOM', value: 'QRESYNC' },
+                 [
+                     { type: 'ATOM', value: options.uidValidity?.toString() },
+-                    { type: 'ATOM', value: options.changedSince.toString() }
++                    { type: 'ATOM', value: options.changedSince.toString() },
++                    // An explicit range avoids providers omitting the latest
++                    // deleted UID when deriving the default from UIDNEXT.
++                    ...(options.knownUidMax === undefined ? [] : [{ type: 'ATOM', value: `1:${options.knownUidMax}` }])
+                 ]
+             ]);
+             map.qresync = true;
 diff --git a/lib/commands/status.js b/lib/commands/status.js
 index 0e15a480d321d746c38f869109f556560737baf0..5f201c8b8084e97ecd41c53af9f529afe3869b61 100644
 --- a/lib/commands/status.js
@@ -377,7 +404,7 @@ index 9369b2afec863bb9b36cc6a8378fd362eb0d107b..f2aeda401a76637860ed31b0f9da6d6b
      ['AUTHENTICATE', require('./commands/authenticate.js')]
  ]);
 diff --git a/lib/imap-flow.d.ts b/lib/imap-flow.d.ts
-index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d60602b82 100644
+index 413ac6f273d7d244ee8e989db497feb5c804c985..415b979372d6374019d42f0b0d5c661ffb8c1a52 100644
 --- a/lib/imap-flow.d.ts
 +++ b/lib/imap-flow.d.ts
 @@ -147,6 +147,8 @@ export interface MailboxObject {
@@ -406,7 +433,7 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d
      /** Set specific paths as special use folders */
      specialUseHints?: {
          /** Path to "Sent Mail" folder */
-@@ -608,6 +620,10 @@ export interface MailboxOpenOptions {
+@@ -608,6 +620,12 @@ export interface MailboxOpenOptions {
      readOnly?: boolean;
      /** Optional description for mailbox lock tracking */
      description?: string;
@@ -414,10 +441,12 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d
 +    uidValidity?: bigint;
 +    /** QRESYNC cursor: last known HIGHESTMODSEQ */
 +    changedSince?: bigint;
++    /** QRESYNC inclusive known-UID upper bound, including deleted messages */
++    knownUidMax?: number;
  }
  
  export interface MailboxLockOptions extends MailboxOpenOptions {
-@@ -800,6 +816,9 @@ export class ImapFlow extends EventEmitter {
+@@ -800,6 +818,9 @@ export class ImapFlow extends EventEmitter {
          }
      ): Promise<StatusObject>;
  

@@ -1000,12 +1000,12 @@ describe("ThrottledImapClient QRESYNC replay", () => {
     const client = new ThrottledImapClient(raw as never, 200, 5_000);
 
     const lock = await client.getMailboxLock("Archive", {
-      qresync: { uidValidity: 7n, changedSince: 10n }
+      qresync: { uidValidity: 7n, changedSince: 10n, knownUidMax: 22 }
     });
 
     expect(raw.getMailboxLock).toHaveBeenCalledWith("Archive", {
       uidValidity: 7n,
-      changedSince: 10n
+      changedSince: 10n, knownUidMax: 22
     });
     expect(lock.qresync).toEqual({
       accepted: true,
@@ -1034,7 +1034,7 @@ describe("ThrottledImapClient QRESYNC replay", () => {
     const client = new ThrottledImapClient(raw as never, 200, 5_000);
 
     const lock = await client.getMailboxLock("Archive", {
-      qresync: { uidValidity: 7n, changedSince: 10n }
+      qresync: { uidValidity: 7n, changedSince: 10n, knownUidMax: 22 }
     });
 
     expect(lock.qresync).toEqual({
@@ -1057,12 +1057,12 @@ describe("ThrottledImapClient QRESYNC replay", () => {
       getMailboxLock: vi.fn(async () => ({ release: vi.fn() }))
     });
     const client = new ThrottledImapClient(raw as never, 200, 5_000);
-    const request = { qresync: { uidValidity: 7n, changedSince: 10n } };
+    const request = { qresync: { uidValidity: 7n, changedSince: 10n, knownUidMax: 22 } };
 
     expect((await client.getMailboxLock("Archive", request)).qresync?.accepted).toBe(false);
     expect((await client.getMailboxLock("Archive", request)).qresync).toBeUndefined();
     expect(raw.getMailboxLock.mock.calls).toEqual([
-      ["Archive", { uidValidity: 7n, changedSince: 10n }],
+      ["Archive", { uidValidity: 7n, changedSince: 10n, knownUidMax: 22 }],
       ["Archive"]
     ]);
   });
