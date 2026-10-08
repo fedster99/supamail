@@ -1118,7 +1118,8 @@ export class MirrorRepository {
           metadataWriteServiceRowsPerSecond: result.metadataWriteServiceRowsPerSecond ?? null,
           reconcileFoldersAttempted: result.reconcileFoldersAttempted ?? 0,
           reconcileProviderUidsSeen: result.reconcileProviderUidsSeen ?? 0,
-          reconcileDurationMs: result.reconcileDurationMs ?? 0
+          reconcileDurationMs: result.reconcileDurationMs ?? 0,
+          folderChecks: result.folderChecks
         })
       ]
     );

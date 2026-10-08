@@ -175,3 +175,35 @@ Migration 0014 performs no mailbox-wide DML and builds no index on the existing 
 ## Migration Boundaries
 
 Public mirror migrations live under `apps/api/supabase/migrations/public/` and are the only migrations that `pnpm migrate`, the CLI, and the API `/migrate` endpoint apply. The manifest records their order and required public schema version. Ids order by their four-digit prefix and the manifest must list them ascending with `schemaVersion` as the last id. A runtime accepts a schema at or after its required version (`isSchemaVersionReady`): behind, the code would miss what a later migration adds; ahead is fine from `0029` on because later migrations are additive, so a host applies a migration before it deploys the runtime that needs it and the running runtime keeps serving. A schema at the required number must be the required id. A schema test holds every migration after `0029` to the additive rule (`findNonAdditiveStatement`): no drop of a column, default, table, index, policy, trigger, or type; no rename; no column type or NOT NULL change; no new check, unique, primary-key, foreign-key, or exclusion constraint; no unique index; no NOT NULL column without a default. Dropping a constraint, adding a nullable or defaulted column, and the drop-and-recreate view or function idiom are allowed. A replaced function or view body is for review to judge. The one exception is a reviewed removal (ADR 0040): its own release, listed in the schema test, applied only after every host runs a core that stopped using what it removes. An older runtime's readiness check cannot know about the removal, so that precondition is the host's release step. `0032` is the first. Deployment-specific schemas must live outside this public migration path.
+
+
+## Per-run folder checks
+
+`imap_sync_runs.metadata.folderChecks` records the live-folder checks that the
+engine actually performed. The same array is returned in `SyncResult`.
+
+Each entry contains `folderIds`, `kind` (`sync` or `status`), worker-clock UTC
+`startedAt`/`finishedAt`, `outcome`, and `deletionsChecked`. A sync entry contains
+one folder ID. A LIST-STATUS check groups folders with the same outcome, storing
+shared times once. No folder names, UIDs, or message content are copied here.
+
+- `completed`: the folder sync returned without incomplete initial work, an
+  exhausted work budget, or an incomplete attempted reconcile. This alone does
+  not prove that every deletion was checked.
+- `partial`: initial work, the work budget, or a reconcile remains incomplete.
+- `failed`: the folder sync threw. Writes before the failure may have committed.
+- `unchanged`: the existing provider status/cursor comparison proved no changes.
+- `changed`: the status response did not match the stored complete cursors;
+  this is a reason to catch up, not proof that catch-up finished.
+
+`deletionsChecked=true` means a complete exact UID comparison, complete QRESYNC
+replay, or unchanged-status proof. It is false when no such proof completed.
+The checks do not add IMAP commands, change folder selection, or advance cursors.
+They use the existing run-finalization write and sync-run retention.
+
+An absent field means an older producer or a run that did not finalize its
+metadata; it is unknown. An empty array means no live-folder check was recorded.
+Body fetches, history imports, and folder discovery are separate work and are
+not live-folder proofs. A failed or unanswered status command supplies no proof.
+A folder omitted from the array is not proven unchanged. Process termination
+before finalization can lose this evidence; it cannot certify a completed check.

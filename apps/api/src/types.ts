@@ -279,10 +279,24 @@ export interface MessageFlagSnapshot {
   flags: string[];
 }
 
+/** Provider checks performed in a run; folder IDs avoid retaining folder names. */
+export interface FolderCheck {
+  /** One folder for sync; a shared STATUS result groups folders with the same outcome. */
+  folderIds: string[];
+  kind: "sync" | "status";
+  startedAt: string;
+  finishedAt: string;
+  outcome: "completed" | "partial" | "failed" | "unchanged" | "changed";
+  /** An exact UID comparison, QRESYNC replay, or unchanged-status proof completed. */
+  deletionsChecked: boolean;
+}
+
 export interface SyncResult {
   runId: string;
   outcome: Exclude<SyncRunStatus, "running">;
   foldersProcessed: number;
+  /** Absent on older producers; an empty array means no live-folder check ran. */
+  folderChecks?: FolderCheck[];
   messagesUpserted: number;
   /** Message-metadata records acknowledged only after their upsert transaction commits. */
   metadataRowsCommitted?: number;
