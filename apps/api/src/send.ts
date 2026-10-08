@@ -43,7 +43,8 @@ import {
  * stop SMTP from accepting the same bytes twice. `deliverSmtp` therefore returns
  * the provider receipt or throws `SmtpDeliveryError` with `not_delivered` or
  * `unknown`. A durable caller may retry only `not_delivered`; it must reconcile
- * `unknown` and never submit it again. Remote wrappers own that durable ledger.
+ * `unknown` and never submit it again. Use core `runSendOperation` for that
+ * policy; hosts provide durable storage.
  *
  * INPUT: the request is parsed first. Malformed input throws `InvalidInputError`
  * before any provider work, never `SmtpDeliveryError`, so a caller fixes it
