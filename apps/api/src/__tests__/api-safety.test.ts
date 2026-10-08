@@ -4,7 +4,7 @@ import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createApiApp } from "../api.js";
 import { AccountBusyError, NoRecipientsError, NotFoundError, UnfetchableContentError } from "../errors.js";
-import { MailboxCapabilityError, MailboxMutationError } from "../mailbox-mutations.js";
+import { MailboxCapabilityError, MailboxMoveIncompleteError, MailboxMutationError } from "../mailbox-mutations.js";
 import { SmtpDeliveryError } from "../smtp-client.js";
 import type {
   AccountDetails,
@@ -1184,6 +1184,20 @@ describe("API safety", () => {
     await expect(res.json()).resolves.toMatchObject({
       error: "capability_unsupported",
       message: expect.stringContaining("UIDPLUS")
+    });
+  });
+
+  it("reports a copied-but-unconfirmed move without inviting a blind retry", async () => {
+    const { app, mutations } = buildApp();
+    mutations.moveMessage.mockRejectedValueOnce(new MailboxMoveIncompleteError() as never);
+    const res = await app.request(`/messages/${messageId}/move`, {
+      method: "POST", headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ folder: "Archive" })
+    });
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toEqual({
+      error: "move_incomplete",
+      message: "The email may be in both folders. Check both folders before moving it again."
     });
   });
 
