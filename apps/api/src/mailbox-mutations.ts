@@ -255,9 +255,10 @@ export class MailboxMutator {
 
   /**
    * MOVE messages of one folder by UID into `destination` with one UID MOVE. Every
-   * target must share the folder and UIDVALIDITY. Requires either the MOVE extension
-   * (a native, atomic, safe move) or UIDPLUS (imapflow falls back to COPY + a
-   * UID-scoped EXPUNGE, which is safe). If the server advertises neither, imapflow
+   * target must share the mailbox, folder and UIDVALIDITY. Requires either MOVE
+   * or UIDPLUS (COPY followed by UID-scoped deletion). UIDPLUS avoids deleting
+   * unrelated messages, but can leave a partial copy; that is reported as incomplete.
+   * If the server advertises neither, imapflow
    * would fall back to COPY + a blanket EXPUNGE that purges ALL \Deleted messages
    * in the folder — so we refuse instead. Returns the server's COPYUID: the
    * destination UIDVALIDITY and the source → destination UID map, both null when
