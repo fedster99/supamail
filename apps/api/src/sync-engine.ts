@@ -36,6 +36,7 @@ import {
 import type { MetadataWriteOptions } from "./repository.js";
 import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
 import type {
+  FolderCheck,
   ImapAccount,
   ImapFolder,
   ImapMessage,
@@ -424,6 +425,7 @@ export class MirrorEngine {
       runId,
       outcome: "success",
       foldersProcessed: 0,
+      folderChecks: [],
       messagesUpserted: 0,
       metadataRowsCommitted: 0,
       metadataWriteDurationMs: 0,
@@ -518,7 +520,7 @@ export class MirrorEngine {
         }
         const catchUpPaths = supplemental
           ? new Set<string>()
-          : await this.recordUnchangedFolders(account, client, options.signal);
+          : await this.recordUnchangedFolders(account, client, result.folderChecks!, options.signal);
 
         const folders = options.bodyBacklogOnly
           ? []
@@ -589,6 +591,14 @@ export class MirrorEngine {
             providerUidsSeen: 0,
             durationMs: 0
           };
+          const check: FolderCheck = {
+            folderIds: [folder.id],
+            kind: "sync",
+            startedAt: new Date().toISOString(),
+            finishedAt: "",
+            outcome: "failed",
+            deletionsChecked: false
+          };
           const qresyncCatchUp = catchUpPaths.has(folder.path);
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
@@ -612,6 +622,11 @@ export class MirrorEngine {
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true)),
               signal: options.signal
             });
+            check.outcome = folderResult.hitLockBudget || !folderResult.initialSyncComplete
+              || (folderResult.reconcileAttempted && !folderResult.reconcileClean)
+              ? "partial" : "completed";
+            check.deletionsChecked = folderResult.qresyncReplayComplete === true
+              || (folderResult.reconcileAttempted && folderResult.reconcileClean);
             throwIfInterrupted();
             result.foldersProcessed += 1;
             result.messagesUpserted += folderResult.messagesUpserted;
@@ -676,6 +691,8 @@ export class MirrorEngine {
             if (isPriorityFolder) priorityFolderFailed = true;
             result.errors.push(sanitizeErrorReason(`${sanitizedPath}: ${message}`));
           } finally {
+            check.finishedAt = new Date().toISOString();
+            result.folderChecks!.push(check);
             if (reconcileTelemetry.attempted) {
               result.reconcileFoldersAttempted! += 1;
               result.reconcileProviderUidsSeen! += reconcileTelemetry.providerUidsSeen;
@@ -943,6 +960,7 @@ export class MirrorEngine {
   private async recordUnchangedFolders(
     account: ImapAccount,
     client: MirrorImapClient,
+    checks: FolderCheck[],
     signal?: AbortSignal
   ): Promise<Set<string>> {
     const changed = new Set<string>();
@@ -953,14 +971,16 @@ export class MirrorEngine {
       return changed;
     }
     // LIST patterns cannot escape "*" or "%", so such names are never probed.
-    const paths = (await this.repository.getTrackedFoldersForWake(account.id))
+    const folders = (await this.repository.getTrackedFoldersForWake(account.id))
       .filter((folder) => folder.qresync_highest_modseq !== null
         && folder.last_reconcile_clean === true
-        && !/[*%]/.test(folder.path))
-      .map((folder) => folder.path);
+        && !/[*%]/.test(folder.path));
+    const folderIds = new Map(folders.map((folder) => [folder.path, folder.id]));
+    const paths = folders.map((folder) => folder.path);
     if (paths.length === 0) return changed;
     const tracked = new Set(paths);
     const statuses = new Map<string, MailboxStatus>();
+    const startedAt = new Date().toISOString();
     try {
       for (const status of await client.listWithStatus(UNCHANGED_PROOF_QUERY, paths)) {
         if (tracked.has(status.path)) statuses.set(status.path, status);
@@ -992,8 +1012,18 @@ export class MirrorEngine {
     // An answered folder that failed the proof changed since its last
     // deletion-complete pass (or its cursors fell behind the provider).
     const verifiedPaths = new Set(verified);
+    const finishedAt = new Date().toISOString();
     for (const proof of proofs) {
       if (!verifiedPaths.has(proof.path)) changed.add(proof.path);
+    }
+    // A status command can cover many folders. Store its common times and
+    // outcome once, rather than duplicating them for every unchanged folder.
+    for (const [outcome, paths] of [["unchanged", verifiedPaths], ["changed", changed]] as const) {
+      if (paths.size > 0) checks.push({
+        folderIds: [...paths].map((path) => folderIds.get(path)!),
+        kind: "status", startedAt, finishedAt, outcome,
+        deletionsChecked: outcome === "unchanged"
+      });
     }
     await this.repository.logEvent(account.id, null, null, null, null, "FOLDERS_VERIFIED_UNCHANGED", {
       probed: paths.length,

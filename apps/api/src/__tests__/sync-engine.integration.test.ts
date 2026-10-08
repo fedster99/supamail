@@ -2850,6 +2850,21 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await dueAllFolders(h.pool, h.account.id);
     const partial = await flakyEngine.syncAccount(h.account.id, "manual");
     expect(partial.outcome).toBe("partial_success");
+    const failedFolder = await h.pool.query<{ id: string }>(
+      "SELECT id FROM public.imap_folders WHERE account_id=$1 AND path='Project-Bravo'",
+      [h.account.id]
+    );
+    expect(partial.folderChecks).toContainEqual(expect.objectContaining({
+      folderIds: [failedFolder.rows[0].id], kind: "sync", outcome: "failed", deletionsChecked: false
+    }));
+    const stored = await h.pool.query<{ metadata: { folderChecks: unknown[] } }>(
+      "SELECT metadata FROM public.imap_sync_runs WHERE id=$1", [partial.runId]
+    );
+    expect(stored.rows[0].metadata.folderChecks).toEqual(partial.folderChecks);
+    expect(JSON.stringify(partial.folderChecks)).not.toContain("Project-Bravo");
+    for (const check of partial.folderChecks!) {
+      expect(Date.parse(check.finishedAt)).toBeGreaterThanOrEqual(Date.parse(check.startedAt));
+    }
 
     const after = (
       await h.pool.query<{
@@ -2909,6 +2924,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect(result.outcome).toBe("success");
       expect(result.hitLockBudget).toBe(true);
       expect(result.foldersProcessed).toBe(1);
+      expect(result.folderChecks).toHaveLength(1);
+      const checkedFolder = await h.pool.query<{ path: string }>(
+        "SELECT path FROM public.imap_folders WHERE id=$1", [result.folderChecks![0].folderIds[0]]
+      );
+      expect(checkedFolder.rows[0].path).toBe("INBOX");
       expect(result.bodiesFetched).toBe(0);
 
       const rows = await h.pool.query<{ folder_path: string; count: string }>(
@@ -5791,6 +5811,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       await dueReconcile(h);
       const partial = await engine.syncAccount(h.account.id, "manual");
       expect(partial.outcome).toBe("success");
+      expect(partial.folderChecks).toContainEqual(expect.objectContaining({
+        kind: "sync", outcome: "partial", deletionsChecked: false
+      }));
       expect(await rows(h)).toEqual([...mirrored, "11:IN_WINDOW:live"]);
       expect(await reconcileState()).toEqual({ clean: false, retry_soon: true });
 
@@ -6456,6 +6479,13 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }).syncAccount(h.account.id, "scheduled");
 
       expect(result.outcome).toBe("success");
+      const checkedFolder = await h.pool.query<{ id: string }>(
+        "SELECT id FROM public.imap_folders WHERE account_id=$1 AND path='Archive-003'",
+        [h.account.id]
+      );
+      expect(result.folderChecks).toContainEqual(expect.objectContaining({
+        folderIds: expect.arrayContaining([checkedFolder.rows[0].id]), kind: "status", outcome: "unchanged", deletionsChecked: true
+      }));
       const after = await folderState(h, "Archive-003");
       expect(after.last_verified_unchanged_at).not.toBeNull();
       expect(after.last_synced_at).toEqual(before.last_synced_at);
