@@ -1,3 +1,4 @@
+import { bareContentId } from "../inline-images.js";
 import type { PgClient, PgPool } from "../db.js";
 import {
   METADATA_PROTECTED_FIELDS,
@@ -55,6 +56,8 @@ export interface MessageAttachment {
   /** Decoded file size; for base64 parts, an upper-bound estimate within about 3%. */
   size_bytes: number | null;
   disposition: string | null;
+  /** Bare, case-sensitive Content-ID for HTML cid references; null when absent. */
+  content_id: string | null;
 }
 
 /**
@@ -131,6 +134,7 @@ export interface MessageAttachmentRow extends ProtectedMetadataColumns {
   mime_type: string | null;
   size_bytes: number | string | null;
   disposition: string | null;
+  content_id?: string | null;
 }
 
 /**
@@ -152,7 +156,7 @@ export async function loadMessageAttachments(
     `
     SELECT attachment.id AS attachment_id, attachment.message_id, message.account_id,
            attachment.filename, attachment.mime_type, attachment.size_bytes,
-           attachment.disposition, attachment.part_number,
+           attachment.disposition, attachment.content_id, attachment.part_number,
            attachment.protected_metadata, attachment.protected_metadata_version,
            attachment.protected_metadata_key_version, attachment.protected_metadata_tokens
     FROM public.imap_attachments attachment
@@ -207,7 +211,7 @@ export interface CleanBodyOptions {
  * one place. part_number is ordered NUMERICALLY (digits extracted) so part 10
  * sorts after part 2, not before it.
  */
-export const ATTACHMENTS_AGG = `COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment_id', a.id, 'filename', a.filename, 'mime_type', a.mime_type, 'size_bytes', a.size_bytes, 'disposition', a.disposition) ORDER BY NULLIF(regexp_replace(a.part_number, '[^0-9]', '', 'g'), '')::bigint NULLS LAST, a.part_number) FROM public.imap_attachments a WHERE a.message_id = m.id), '[]'::jsonb) AS attachments`;
+export const ATTACHMENTS_AGG = `COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment_id', a.id, 'filename', a.filename, 'mime_type', a.mime_type, 'size_bytes', a.size_bytes, 'disposition', a.disposition, 'content_id', a.content_id) ORDER BY NULLIF(regexp_replace(a.part_number, '[^0-9]', '', 'g'), '')::bigint NULLS LAST, a.part_number) FROM public.imap_attachments a WHERE a.message_id = m.id), '[]'::jsonb) AS attachments`;
 
 /**
  * Map a joined message row to {@link MessageDetail}. Body precedence is
@@ -261,7 +265,8 @@ export function mapMessageRow(
       filename: a.filename,
       mime_type: a.mime_type,
       size_bytes: a.size_bytes === null ? null : Number(a.size_bytes),
-      disposition: a.disposition
+      disposition: a.disposition,
+      content_id: a.content_id ? bareContentId(a.content_id) : null
     }))
   };
   if (opts.includeBodyRange) {

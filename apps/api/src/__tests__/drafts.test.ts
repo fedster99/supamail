@@ -1,3 +1,5 @@
+import { simpleParser } from "mailparser";
+import { buildReplyBody } from "../mcp/tools/draft-reply.js";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 // Mirror ids are UUIDs; any other value names no row.
@@ -639,6 +641,43 @@ describe("sendDraft", () => {
     selected_text_part: null,
     selected_text_format: "plain"
   };
+
+  it("round-trips signature, quoted CID images and ordinary attachments through create, update and send", async () => {
+    const { createDraft, updateDraft, sendDraft } = await import("../drafts.js");
+    const signature = '<table><tr><td><img src="cid:logo" width="56" height="52"></td><td style="border-left:1px solid">Best, Alex</td></tr></table>';
+    const quoted = '<p>Original history <img src=" cid:quoted&#64;example.test "></p><!-- <img src="cid:unused"> -->';
+    const logoBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=", "base64");
+    const quoteBytes = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64");
+    const attachments = [
+      { filename: "logo.png", contentType: "image/png", content: logoBytes.toString("base64"), cid: "logo" },
+      { filename: "quoted.gif", contentType: "image/gif", content: quoteBytes.toString("base64"), cid: "quoted@example.test" },
+      { filename: "notes.txt", contentType: "text/plain", content: "bm90ZXM=" }
+    ];
+    const body = buildReplyBody(signature, "Original history", "On Tuesday, Sender wrote:", "html", quoted);
+    const input = { accountId: account.id, to: [{ email: "rcpt@example.test" }], subject: "Re: Hello", body, attachments };
+    await createDraft({} as never, config, input);
+    const created = mocks.append.mock.calls[0][1];
+    const { accountId: _accountId, ...update } = input;
+    mocks.getMessage.mockResolvedValue(draftRow);
+    await updateDraft(draftPool, config, D1, { ...update, subject: "Updated" });
+    const updated = mocks.append.mock.calls[1][1];
+    mocks.getRawMime.mockResolvedValue({ messageId: D1, raw: Buffer.from(updated), source: "fetch", truncated: false });
+    await sendDraft(mockPoolReturningDraft(draftRow), config, D1);
+    const sent = mocks.deliverSmtp.mock.calls[0][1];
+    expect(sent).toEqual(updated);
+    for (const raw of [created, updated, sent]) {
+      expect(raw.toString()).toContain("multipart/related");
+      expect(raw.toString()).toContain("multipart/mixed");
+      const parsed = await simpleParser(raw, { skipImageLinks: true });
+      expect(parsed.html).toContain(signature);
+      expect(parsed.html).toContain(quoted);
+      expect(parsed.text).toContain("Best, Alex");
+      expect(parsed.text).toContain("Original history");
+      expect(parsed.attachments.map((a) => [a.contentId, a.contentDisposition, a.content])).toEqual([
+        ["<logo>", "inline", logoBytes], ["<quoted@example.test>", "inline", quoteBytes], [undefined, "attachment", Buffer.from("notes")]
+      ]);
+    }
+  });
 
   it("throws AccountBusyError before raw fetch or SMTP when the account is busy", async () => {
     mocks.withAccountLock.mockResolvedValueOnce(null);
