@@ -35,6 +35,26 @@ If a server lacks one of these behaviors, support needs either a provider profil
 | Outlook IMAP | Manual smoke pending | None yet. | OAuth is outside v0.1; app-password/basic auth availability depends on tenant policy. |
 | Generic Dovecot hosting | Manual smoke pending | Dovecot/cPanel-style fixture exists. | Verify delimiter, namespace prefix, and missing `SPECIAL-USE` flags on the actual host. |
 
+## QRESYNC deletion ranges
+
+Core sends an explicit `1:<known-uid-max>` range with the saved UIDVALIDITY and
+mod-sequence. The upper bound includes previously observed UIDs even when the
+folder becomes empty. A read-only Purelymail probe found that omitting this
+optional range could omit the newest deleted UID from VANISHED; supplying the
+range returned it. This differs from the implicit range required by
+[RFC 7162 section 3.2.5.1](https://www.rfc-editor.org/rfc/rfc7162#section-3.2.5.1).
+It is a generic request-shape fix, not a provider-specific sync path.
+
+The explicit range prevents new omissions; it cannot recover deletions older
+than an already advanced checkpoint. The existing scheduled exact UID audit
+repairs those rows, as does the existing authoritative recovery barrier. An
+accepted QRESYNC replay is provider evidence, not an independent UID inventory;
+the periodic exact audit remains necessary. No audit interval changes.
+
+Regression coverage checks the encoded command and parsed VANISHED result, then
+uses live Postgres to prove deletion, empty-folder refill, and exact-audit
+recovery after an advanced checkpoint.
+
 ## Automated Coverage
 
 The compatibility gate is split by cost:

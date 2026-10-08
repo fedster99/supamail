@@ -919,7 +919,65 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
   });
 
-  it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
+  it.each(["INBOX", "Sent"])("retains the QRESYNC UID bound through deletion and refill of %s", async (path) => {
+    const h = await setupIntegration("qresync-explicit-bound", {
+      INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const folder = folders.find((item) => item.path === path)!;
+    const message = (uid: number) => makeTextMessage({
+      uid, subject: "bound fixture", from: "a@x.test", to: "u@x.test", body: "fixture"
+    });
+    folder.messages = [message(5), message(6)];
+    folder.highestModseq = 10n;
+    const engine = h.buildEngine({ folders, overrides: { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true } });
+    await engine.syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders SET highest_modseq = 10, qresync_highest_modseq = 10,
+         last_full_reconcile_at = now(),
+         next_reconcile_at = now() + interval '6 hours', next_flag_scan_at = now() + interval '6 hours'
+       WHERE account_id = $1 AND path = $2`, [h.account.id, path]
+    );
+    let removed: number | null = null;
+    class ExplicitRangeClient extends FixtureImapClient {
+      capabilities = new Map<string, boolean>([["QRESYNC", true]]);
+      override async getMailboxLock(selectedPath: string, options: { qresync?: QresyncRequest } = {}): Promise<MailboxLock> {
+        const lock = await super.getMailboxLock(selectedPath);
+        if (!options.qresync || selectedPath !== path) return lock;
+        return { ...lock, qresync: {
+          accepted: true, complete: true, changedFlags: [],
+          // An implicit or shortened bound misses the deleted highest UID.
+          vanishedUids: removed !== null && options.qresync.knownUidMax >= removed ? [removed] : []
+        } };
+      }
+    }
+    // Delete the highest UID, empty the folder, refill it, then delete its new high UID.
+    for (const [uid, deleting] of [[6, true], [5, true], [7, false], [7, true]] as const) {
+      removed = deleting ? uid : null;
+      if (deleting) folder.messages = folder.messages.filter((item) => item.uid !== uid);
+      else folder.messages.push(message(uid));
+      folder.highestModseq! += 1n;
+      const client = new ExplicitRangeClient(folders);
+      client.peekMailboxChanges = () => [{ path, forceReconcile: true, forceFlagScan: true,
+        observed: { path, uidValidity: folder.uidValidity, highestModseq: folder.highestModseq,
+          messages: folder.messages.length, uidNext: uid === 7 ? 8 : 7 } }];
+      const result = await engine.syncAccount(h.account.id, "scheduled", {
+        liveInboxOnly: true, client, clientAccountId: h.account.id, keepClientOpen: true
+      });
+      expect(result.outcome).toBe("success");
+      expect(result.reconcileFoldersAttempted).toBe(0);
+      expect(result.reconcileGapsFound).toBe(deleting ? 1 : 0);
+      const live = await h.pool.query<{ uid: number }>(
+        `SELECT uid::integer AS uid FROM public.imap_messages
+         WHERE account_id = $1 AND folder_path = $2 AND NOT deleted_in_provider ORDER BY uid`,
+        [h.account.id, path]
+      );
+      expect(live.rows.map((row) => row.uid)).toEqual(folder.messages.map((item) => item.uid));
+    }
+  });
+
+  it.each(["forced", "scheduled"])("repairs an already advanced QRESYNC checkpoint with the %s exact audit", async (audit) => {
     const h = await setupIntegration("qresync-forced-inbox-barrier", {
       INITIAL_SYNC_BATCH_SIZE: 50,
       IMAP_QRESYNC_ENABLED: true
@@ -938,14 +996,18 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
        SET highest_modseq = 10,
            qresync_highest_modseq = 10,
            last_full_reconcile_at = now(),
-           next_reconcile_at = now() + interval '6 hours',
+           next_reconcile_at = CASE WHEN $2 = 'scheduled' THEN now() - interval '1 second' ELSE now() + interval '6 hours' END,
            next_flag_scan_at = now() + interval '6 hours'
        WHERE account_id = $1 AND path = 'INBOX'`,
-      [h.account.id]
+      [h.account.id, audit]
     );
 
     folders[0].highestModseq = 11n;
     folders[0].messages.shift();
+    await h.pool.query(
+      `UPDATE public.imap_folders SET highest_modseq = 11, qresync_highest_modseq = 11
+       WHERE account_id = $1 AND path = 'INBOX'`, [h.account.id]
+    );
 
     class CompleteQresyncWithoutVanishedClient extends FixtureImapClient {
       capabilities = new Map<string, boolean>([["QRESYNC", true]]);
@@ -977,7 +1039,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
       liveInboxOnly: true,
-      forceInboxReconcile: true,
+      forceInboxReconcile: audit === "forced",
       client: recoveryClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1185,7 +1247,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n, knownUidMax: 302 } },
       { path: "Archive" }
     ]);
     expect(acknowledge).toHaveBeenCalledWith([change]);
@@ -1402,7 +1464,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(pending.map((change) => change.path)).toEqual(["Projects"]);
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n, knownUidMax: 301 } },
       { path: "Projects" }
     ]);
     const cursors = await h.pool.query<{

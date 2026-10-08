@@ -270,7 +270,7 @@ describe("waitForInboxIdleWake", () => {
     if (opened.status !== "ready") throw new Error("session was not ready");
 
     const lock = await opened.session.syncClient.getMailboxLock("INBOX", {
-      qresync: { uidValidity: 1n, changedSince: 10n }
+      qresync: { uidValidity: 1n, changedSince: 10n, knownUidMax: 10 }
     });
     expect(lock.qresync).toMatchObject({
       accepted: true,

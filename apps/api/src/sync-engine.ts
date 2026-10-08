@@ -1197,7 +1197,10 @@ export class MirrorEngine {
       ? {
           // qresyncWanted proved both cursors are present.
           uidValidity: BigInt(folder.uidvalidity!),
-          changedSince: BigInt(folder.qresync_highest_modseq!)
+          changedSince: BigInt(folder.qresync_highest_modseq!),
+          // Retain the old upper bound even when the newest message was deleted.
+          // Some providers omit that deletion when QRESYNC has no explicit range.
+          knownUidMax: Math.max(1, Number(folder.last_uid ?? 0), Number(folder.uid_next ?? 1) - 1)
         }
       : undefined;
     let qresyncCommandRejected = false;

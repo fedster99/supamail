@@ -92,6 +92,8 @@ export interface MailboxLock {
 export interface QresyncRequest {
   uidValidity: bigint;
   changedSince: bigint;
+  /** Inclusive upper bound of previously observed UIDs, including deleted ones. */
+  knownUidMax: number;
 }
 
 export interface QresyncReplay {
@@ -350,8 +352,9 @@ export class ThrottledImapClient implements MirrorImapClient {
           "getMailboxLock QRESYNC",
           () => this.client.getMailboxLock(path, {
             uidValidity: request.uidValidity,
-            changedSince: request.changedSince
-          } as never)
+            changedSince: request.changedSince,
+            knownUidMax: request.knownUidMax
+          })
         );
       } catch (error) {
         this.qresyncDisabled = true;
