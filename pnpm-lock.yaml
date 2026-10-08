@@ -42,6 +42,9 @@ importers:
       hono:
         specifier: ^4.12.32
         version: 4.12.32
+      htmlparser2:
+        specifier: ^10.1.0
+        version: 10.1.0
       imapflow:
         specifier: ^1.6.1
         version: 1.6.1(patch_hash=210f92cd84c5c713a438207b7286fa176613fcd4a42270e76033d7e75fcd69fb)
