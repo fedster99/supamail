@@ -135,7 +135,7 @@ export interface ImapFolder {
   qresync_highest_modseq: string | null;
   /** The provider MESSAGES a pass proved for `uid_next`; null when unproven. */
   committed_messages?: string | null;
-  /** The provider UNSEEN a pass's complete flag scan committed; null when none. */
+  /** The provider UNSEEN the host observed before window-covering flag work; null when none. */
   committed_unseen?: string | null;
   last_verified_unchanged_at?: Date | null;
   last_uid: string | null;

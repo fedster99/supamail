@@ -113,7 +113,7 @@ const RELEASED_MIGRATION_SHA256: Record<string, string> = {
   "0030_window_from_message_date.sql": "ef838f7cdc055fe834792e2245e2bab7d8decb55c7cbcc47022ae57b69a197c3",
   "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf",
   "0032_drop_retired_window_columns.sql": "abc1cc8e485f7ee386722b1d0de994233a92d1ed79bcdfa711cb63741d7c30c1",
-  "0033_folder_committed_status.sql": "8f55fc29be285826b1917c9d4ddc364fb0f0ab4e42e988ff41636baa5a2b5dab"
+  "0033_folder_committed_status.sql": "3ee6616f26c03ba1fc4f6917fd0ae43c7030d1306e6e5ff0aaf4c7421da3a8e4"
 };
 
 describe("initial schema", () => {

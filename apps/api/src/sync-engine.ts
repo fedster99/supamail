@@ -125,7 +125,7 @@ type FolderSyncResult = {
   qresyncReplayComplete?: boolean;
   /** The folder's stored cursor, once its first sync is complete. */
   committed?: MailboxStatus;
-  /** This pass proved `committed.messages` (see markFolderSynced). */
+  /** This pass proved `committed.messages` for `committed.uidNext`. */
   messagesProven: boolean;
 };
 
@@ -1306,6 +1306,9 @@ export class MirrorEngine {
       let reconcileDurationMs = 0;
       let reconcileAttempted = false;
       let flagScanAttempted = false;
+      // The flag work covered every flag the mirror refreshes: a QRESYNC or
+      // CONDSTORE delta, an unchanged CONDSTORE cursor, or a whole-window scan.
+      let flagScanCoversWindow = false;
       let hitLockBudget = false;
       let qresyncApplied = false;
       let qresyncFallbackRequired = false;
@@ -1434,6 +1437,7 @@ export class MirrorEngine {
             );
           }
           flagScanAttempted = true;
+          flagScanCoversWindow = true;
           qresyncApplied = true;
         }
       }
@@ -1499,6 +1503,7 @@ export class MirrorEngine {
         const condstoreCursorUnchanged = folder.highest_modseq !== null
           && highestModseq !== undefined
           && BigInt(highestModseq) === BigInt(folder.highest_modseq);
+        flagScanCoversWindow = canUseChangedSince || condstoreCursorUnchanged;
         if (canUseChangedSince) {
           for await (const flags of this.withAsyncIterableDeadline(
             client,
@@ -1538,6 +1543,7 @@ export class MirrorEngine {
           const scanEntireWindow = establishingCondstoreCursor
             || options.forceFlagScan === true
             || fullFlagScanDue;
+          flagScanCoversWindow = scanEntireWindow;
           const flagCutoff = scanEntireWindow ? windowCutoff : new Date();
           if (!scanEntireWindow) {
             flagCutoff.setDate(flagCutoff.getDate() - this.config.FLAG_DIFF_WINDOW_DAYS);
@@ -1708,20 +1714,11 @@ export class MirrorEngine {
       // Store only the UIDNEXT this pass reached, so the unchanged-folder proof
       // and the 0030 head repair never pass over pending new mail.
       const newMailComplete = lastProcessedUid === incomingUids[incomingUids.length - 1];
-      // MESSAGES is proven when deletions were checked, or when every new UID
-      // below UIDNEXT was fetched and MESSAGES grew by exactly those: then no
-      // message the committed count covered was expunged.
-      const committedMessages = folder.committed_messages == null
-        ? undefined
-        : Number(folder.committed_messages);
-      const messagesProven = selectedMessages !== undefined && (
-        qresyncApplied
-        || (reconcileAttempted && reconcileClean === true)
-        || (newMailComplete
-          && uidNext !== undefined
-          && committedMessages !== undefined
-          && selectedMessages === committedMessages + incomingUids.length)
-      );
+      // SELECT's MESSAGES is proven for the stored UIDNEXT when deletions were
+      // checked and every new UID below that UIDNEXT was fetched.
+      const messagesProven = selectedMessages !== undefined
+        && newMailComplete
+        && (qresyncApplied || (reconcileAttempted && reconcileClean === true));
       const cursor = await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext: newMailComplete ? uidNext : reachedUidNext(uidNext, lastProcessedUid ?? lastUid),
@@ -1731,7 +1728,7 @@ export class MirrorEngine {
           ? highestModseq
           : undefined,
         messages: messagesProven ? selectedMessages : undefined,
-        unseen: flagScanAttempted ? options.observedUnseen : undefined,
+        unseen: flagScanCoversWindow ? options.observedUnseen : undefined,
         lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,

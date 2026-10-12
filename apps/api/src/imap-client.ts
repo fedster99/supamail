@@ -79,8 +79,8 @@ export interface MailboxChangeObservation {
    */
   status: MailboxStatus;
   /**
-   * This pass proved MESSAGES: a complete reconcile or QRESYNC replay, or every
-   * new UID fetched with MESSAGES grown by exactly those.
+   * This pass proved MESSAGES for the stored UIDNEXT: a clean reconcile or a
+   * complete QRESYNC replay, with every new UID below that UIDNEXT fetched.
    */
   reconcileComplete: boolean;
   /** This pass completed a flag scan or QRESYNC flag replay. */

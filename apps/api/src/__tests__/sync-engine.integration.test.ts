@@ -596,8 +596,12 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ]);
   });
 
-  it("commits MESSAGES after a reconcile or arrivals alone, and clears it when an expunge is unproven", async () => {
-    const h = await setupIntegration("committed-messages", { INITIAL_SYNC_BATCH_SIZE: 50 });
+  it("commits MESSAGES only after deletions were checked, and clears it when new mail is unproven", async () => {
+    // Twenty batches of two: one pass takes at most 40 new UIDs.
+    const h = await setupIntegration("committed-messages", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      INCREMENTAL_SYNC_BATCH_SIZE: 2
+    });
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
     const engine = h.buildEngine({ folders });
@@ -616,49 +620,63 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
     const live = { liveInboxOnly: true, clientAccountId: h.account.id, keepClientOpen: true } as const;
 
-    // One arrival: MESSAGES grew by exactly the new UID, so nothing older left.
-    folders[0].messages.push(inboxMessage(106));
-    const arrival = liveClient(folders, change());
-    const arrived = await engine.syncAccount(h.account.id, "scheduled", { ...live, client: arrival.client });
-    expect(arrived.reconcileFoldersAttempted).toBe(0);
-    expect(arrival.acknowledgeWithStatuses).toHaveBeenCalledWith(expect.anything(), [
-      expect.objectContaining({
-        status: expect.objectContaining({ uidNext: 107, messages: 6 }),
-        reconcileComplete: true
-      })
-    ]);
-    expect((await committedCursor(h, "INBOX")).committed_messages).toBe("6");
-
-    // An expunge hidden by an arrival leaves MESSAGES unchanged at 6. It cannot
-    // be proven without an audit, so the committed count is cleared.
+    // One arrival and one expunge leave MESSAGES at 5. A pass that only
+    // fetches the new UID cannot tell, so it clears the committed count
+    // instead of keeping a 5 that would hide the expunge.
     folders[0].messages = folders[0].messages.filter((message) => message.uid !== 101);
-    folders[0].messages.push(inboxMessage(107));
+    folders[0].messages.push(inboxMessage(106));
     const hidden = liveClient(folders, change());
-    await engine.syncAccount(h.account.id, "scheduled", { ...live, client: hidden.client });
+    const fetched = await engine.syncAccount(h.account.id, "scheduled", { ...live, client: hidden.client });
+    expect(fetched.reconcileFoldersAttempted).toBe(0);
     expect(hidden.acknowledgeWithStatuses).toHaveBeenCalledWith(expect.anything(), [
       expect.objectContaining({
-        status: expect.objectContaining({ uidNext: 108, messages: undefined }),
+        status: expect.objectContaining({ uidNext: 107, messages: undefined }),
         reconcileComplete: false
       })
     ]);
     expect((await committedCursor(h, "INBOX")).committed_messages).toBeNull();
 
+    // The audit the host then forces proves the count again.
     const audit = liveClient(folders, change(true));
     const audited = await engine.syncAccount(h.account.id, "scheduled", { ...live, client: audit.client });
     expect(audited.reconcileGapsFound).toBe(1);
-    expect((await committedCursor(h, "INBOX")).committed_messages).toBe("6");
+    expect(audit.acknowledgeWithStatuses).toHaveBeenCalledWith(expect.anything(), [
+      expect.objectContaining({ status: expect.objectContaining({ messages: 5 }), reconcileComplete: true })
+    ]);
+    expect((await committedCursor(h, "INBOX")).committed_messages).toBe("5");
+
+    // An audit in a pass capped before the last new UID proves nothing for
+    // the UIDNEXT it stores.
+    for (let uid = 107; uid <= 170; uid += 1) folders[0].messages.push(inboxMessage(uid));
+    const capped = liveClient(folders, change(true));
+    await engine.syncAccount(h.account.id, "scheduled", { ...live, client: capped.client });
+    expect(await committedCursor(h, "INBOX")).toEqual(expect.objectContaining({
+      uid_next: "147",
+      committed_messages: null
+    }));
+
+    // A pass that mirrors new UIDs without reporting UIDNEXT also clears it.
+    await h.pool.query(
+      "UPDATE public.imap_folders SET committed_messages = 69 WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    const inbox = (await h.repository.getFoldersForWake(h.account.id, ["INBOX"]))[0];
+    const cursor = await h.repository.markFolderSynced(inbox.id, { uidValidity: 11_001, lastUid: 171 });
+    expect(cursor).toEqual(expect.objectContaining({ uidNext: "147", messages: null }));
   });
 
   it("commits UNSEEN from the host's observation after a flag scan, never SELECT's sequence number", async () => {
     const h = await setupIntegration("committed-unseen", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
-    folders[0].messages = [inboxMessage(101, ["\\Seen"]), inboxMessage(102), inboxMessage(103)];
+    // SELECT reports [UNSEEN 1], the first unseen message's sequence number;
+    // the folder has three unseen messages.
+    folders[0].messages = [inboxMessage(101), inboxMessage(102, ["\\Seen"]), inboxMessage(103), inboxMessage(104)];
     const engine = h.buildEngine({ folders });
     await engine.syncAccount(h.account.id, "manual");
 
-    // A full pass reports every folder it committed. SELECT said [UNSEEN 2],
-    // the first unseen message's sequence number, which is not a count.
+    // A full pass reports every folder it committed, and commits no UNSEEN:
+    // it has no observation, and SELECT's [UNSEEN 1] is not a count.
     await dueAllFolders(h.pool, h.account.id);
     const full = liveClient(folders);
     await engine.syncAccount(h.account.id, "manual", { client: full.client, clientAccountId: h.account.id, keepClientOpen: true });
@@ -675,7 +693,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       path: "INBOX",
       forceReconcile: false,
       forceFlagScan: true,
-      observed: { path: "INBOX", uidValidity: 11_001, unseen: 2 }
+      observed: { path: "INBOX", uidValidity: 11_001, unseen: 3 }
     };
     const flagged = liveClient(folders, change);
     await engine.syncAccount(h.account.id, "scheduled", {
@@ -685,14 +703,30 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       keepClientOpen: true
     });
     expect(flagged.acknowledgeWithStatuses).toHaveBeenCalledWith([change], [
-      expect.objectContaining({ status: expect.objectContaining({ unseen: 2 }), flagScanComplete: true })
+      expect.objectContaining({ status: expect.objectContaining({ unseen: 3 }), flagScanComplete: true })
     ]);
-    expect((await committedCursor(h, "INBOX")).committed_unseen).toBe("2");
+    expect((await committedCursor(h, "INBOX")).committed_unseen).toBe("3");
 
-    // A pass with no observation keeps the committed value.
+    // A routine scan covers only recent mail, so it commits no UNSEEN; nor
+    // does a pass with no observation.
+    await h.pool.query(
+      "UPDATE public.imap_folders SET next_flag_scan_at = now() - interval '1 second' WHERE account_id = $1",
+      [h.account.id]
+    );
+    const routine = liveClient(folders, { ...change, forceFlagScan: false, observed: { ...change.observed, unseen: 9 } });
+    await engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      client: routine.client,
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+    expect(routine.acknowledgeWithStatuses).toHaveBeenCalledWith(expect.anything(), [
+      expect.objectContaining({ flagScanComplete: true })
+    ]);
+    expect((await committedCursor(h, "INBOX")).committed_unseen).toBe("3");
     await dueAllFolders(h.pool, h.account.id);
     await engine.syncAccount(h.account.id, "manual");
-    expect((await committedCursor(h, "INBOX")).committed_unseen).toBe("2");
+    expect((await committedCursor(h, "INBOX")).committed_unseen).toBe("3");
 
     // A new UIDVALIDITY restarts the folder's first sync and clears both.
     folders[0].uidValidity = 11_002;

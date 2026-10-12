@@ -68,11 +68,11 @@ unlike `headers_synced_count`, they also fall on deletes and moves.
 `0033_folder_committed_status` adds nullable `imap_folders.committed_messages`
 and `committed_unseen`: the provider `MESSAGES` and `UNSEEN` a pass proved,
 beside the `uid_next` it reached and the flag cursor `highest_modseq` (ADR 0042).
-`MESSAGES` is written after a complete reconcile or QRESYNC replay, or when the
-pass fetched every new UID and `MESSAGES` grew by exactly those; a pass that
-moves `uid_next` without that proof clears it. `UNSEEN` is written after a
-complete flag scan, from the host's observation of the folder. A UIDVALIDITY
-reset clears both. These are provider values, not mirror counts; the mirror's
+`MESSAGES` is written when the pass checked deletions (a clean reconcile or a
+complete QRESYNC replay) and fetched every new UID below the `uid_next` it
+stores; a pass that mirrors new UIDs without that proof clears it. `UNSEEN` is
+the host's observation of the folder, written after flag work that covered the
+mirror's flag window. A UIDVALIDITY reset clears both. These are provider values, not mirror counts; the mirror's
 own counts stay in `imap_folder_message_counts`.
 
 `0029_active_assignments_view_no_barrier` drops `security_barrier` from

@@ -28,30 +28,42 @@ Three gaps made the cursor weaker than the mirror:
   folder's committed cursor after its write, and the observation carries it:
   UIDVALIDITY, the UIDNEXT the pass reached, and the committed MESSAGES,
   UNSEEN, and HIGHESTMODSEQ. A field the mirror cannot vouch for is absent.
-  `reconcileComplete` means the pass proved MESSAGES; `flagScanComplete` means
-  it completed a flag scan or QRESYNC flag replay.
+  `reconcileComplete` means the pass proved MESSAGES for the stored UIDNEXT;
+  `flagScanComplete` means it completed a flag scan or QRESYNC flag replay.
 - **Every pass reports every cursor it stored.** The engine calls
   `acknowledgeMailboxChangesWithStatuses(changes, observations)` with an
   observation for each folder whose first sync is complete, including folders
   no provider change named and passes that acknowledge no change. A host that
   keeps its own copy of the cursor therefore never falls behind the database.
-  Feeds that only map observations to the acknowledged changes are unaffected.
+  Public core's own IDLE session maps observations to its acknowledged changes
+  and ignores the rest.
 - **`imap_folders` stores committed MESSAGES and UNSEEN** (migration 0033,
   additive), written by the same per-field rule the listener applies:
-  - MESSAGES advances after a complete reconcile or QRESYNC replay. It also
-    advances when the pass fetched every new UID below UIDNEXT and MESSAGES
-    equals the committed count plus the new UIDs present, which proves that no
-    message the committed count covered was expunged. A server without QRESYNC
-    is then not audited on every arrival.
-  - A pass that moves UIDNEXT without that proof clears MESSAGES. One arrival
-    and one expunge leave MESSAGES unchanged; keeping the old count would make
-    the folder look unchanged while the mirror still holds the expunged row.
-  - UNSEEN advances only after a complete flag scan, to the value the host
-    observed before the pass (`MailboxChange.observed.unseen`). The pass has no
-    count of its own: SELECT reports none.
+  - MESSAGES advances to SELECT's count when the pass checked deletions (a
+    clean reconcile or a complete QRESYNC replay) and fetched every new UID
+    below the UIDNEXT it stores, so the committed count describes exactly the
+    folder below the committed UIDNEXT.
+  - A pass that mirrors new UIDs without that proof clears MESSAGES. One
+    arrival and one expunge leave MESSAGES unchanged; keeping the old count
+    would make the folder look unchanged while the mirror still holds the
+    expunged row.
+  - UNSEEN advances only after flag work that covered the mirror's flag window
+    (a QRESYNC or CONDSTORE delta, an unchanged CONDSTORE cursor, or a
+    whole-window scan), to the value the host observed before the pass
+    (`MailboxChange.observed.unseen`). The pass has no count of its own: SELECT
+    reports none. A routine scan of recent mail commits nothing.
   - A UIDVALIDITY reset clears both, with the rest of the folder's sync state.
   - A field with no committed value counts as different to a host comparing
     against it, so the matching reconcile or flag scan runs.
+
+- **No arrival-only proof.** The spec this follows also proposed proving
+  MESSAGES when it equals the committed count plus the new UIDs. That needs
+  SELECT's MESSAGES and UIDNEXT from one snapshot, with no new UID expunged
+  before the incremental SEARCH. ImapFlow reuses an already selected mailbox
+  without SELECT (stale UIDNEXT, live EXISTS), and the SEARCH can see a UID
+  above SELECT's UIDNEXT, so the equation can hold while an older message is
+  gone. Without QRESYNC, a pass that only fetched new mail therefore leaves
+  MESSAGES unproven, and the next comparison asks for an audit.
 
 ## Consequences
 
@@ -73,10 +85,13 @@ Three gaps made the cursor weaker than the mirror:
 
 - Live-DB integration tests: a pass capped at its incremental batch limit
   acknowledges and stores the UIDNEXT it reached, and the next pass the rest;
-  MESSAGES is committed after the first audit and after an arrival-only pass,
-  cleared when an expunge hides behind an arrival, and restored by the audit;
-  UNSEEN comes only from the host's observation after a flag scan, a full pass
-  reports every committed folder, and a UIDVALIDITY reset clears both.
+  MESSAGES is committed after the first audit, cleared by a pass that fetched
+  new mail without an audit (an expunge hidden behind an arrival), restored by
+  the audit, not committed by an audit in a capped pass, and cleared when new
+  UIDs arrive without UIDNEXT; UNSEEN comes only from the host's observation
+  after window-covering flag work, never from SELECT's `[UNSEEN n]` or a
+  routine recent-mail scan; a full pass reports every committed folder; a
+  UIDVALIDITY reset clears both.
 - The fixture IMAP client reports SELECT's `[UNSEEN n]` as ImapFlow does.
 - `public-migrations.live-db.test.ts` applies the migrations twice.
 

@@ -2482,9 +2482,11 @@ export class MirrorRepository {
 
   /**
    * Store a pass's folder cursor and return the committed cursor. `messages` is
-   * the provider MESSAGES the pass proved; when UIDNEXT moves without that
-   * proof the committed count no longer describes the folder, so it is cleared.
-   * `unseen` is the provider UNSEEN a complete flag scan covered.
+   * the provider MESSAGES the pass proved for the stored UIDNEXT. A pass that
+   * mirrors new UIDs without that proof clears it: one arrival and one expunge
+   * leave MESSAGES unchanged, so the old count would hide the expunge.
+   * `unseen` is the provider UNSEEN observed before flag work that covered the
+   * mirror's flag window.
    */
   async markFolderSynced(folderId: string, patch: {
     uidValidity: number;
@@ -2510,7 +2512,8 @@ export class MirrorRepository {
         qresync_highest_modseq = COALESCE($15::numeric, qresync_highest_modseq),
         committed_messages = CASE
           WHEN $17::bigint IS NOT NULL THEN $17::bigint
-          WHEN COALESCE($3::bigint, uid_next) IS DISTINCT FROM uid_next THEN NULL
+          WHEN COALESCE($3::bigint, uid_next) IS DISTINCT FROM uid_next
+            OR COALESCE($4::bigint, last_uid) IS DISTINCT FROM last_uid THEN NULL
           ELSE committed_messages
         END,
         committed_unseen = COALESCE($18::bigint, committed_unseen),
