@@ -1189,7 +1189,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n, knownUids: "1:302" } },
       { path: "Archive" }
     ]);
     expect(acknowledge).toHaveBeenCalledWith([change]);
@@ -1406,7 +1406,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(pending.map((change) => change.path)).toEqual(["Projects"]);
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n, knownUids: "1:301" } },
       { path: "Projects" }
     ]);
     const cursors = await h.pool.query<{
