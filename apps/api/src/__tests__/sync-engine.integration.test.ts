@@ -803,6 +803,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       `UPDATE public.imap_folders
        SET highest_modseq = 10,
            qresync_highest_modseq = 10,
+           -- A failed pass can commit rows above last_uid before recording it.
+           last_uid = 301,
            last_full_reconcile_at = now(),
            next_reconcile_at = now() + interval '6 hours',
            next_flag_scan_at = now() + interval '6 hours'
@@ -876,7 +878,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.flagsUpdated).toBe(1);
     expect(result.reconcileGapsFound).toBe(1);
     expect(acknowledge).toHaveBeenCalledWith([change]);
-    // Servers such as Purelymail report expunges only for UIDs the client names.
+    // Servers such as Purelymail report expunges only for UIDs the client names,
+    // so the replay names stored row 302 even though last_uid still says 301.
     expect(archiveReplay?.knownUids).toBe("1:302");
     expect(fetch.mock.calls.some(([range]) => range === "1:*")).toBe(false);
     const rows = await h.pool.query<{

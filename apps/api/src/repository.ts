@@ -2328,6 +2328,16 @@ export class MirrorRepository {
     );
   }
 
+  /** Highest stored UID in one folder generation; an index lookup on the mirror key. */
+  async getHighestStoredUid(accountId: string, folderPath: string, uidValidity: number): Promise<number> {
+    const result = await this.pool.query<{ uid: string | null }>(
+      `SELECT max(uid)::text AS uid FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = $2 AND uidvalidity = $3`,
+      [accountId, folderPath, uidValidity]
+    );
+    return Number(result.rows[0]?.uid ?? 0);
+  }
+
   // Spec §10.4: capture the SEARCH(since cutoff) snapshot at the start of an
   // initial sync. `oldestUidSynced` is set to `targetMaxUid + 1` as a sentinel
   // so the first downward batch picks up UIDs strictly less than it.
