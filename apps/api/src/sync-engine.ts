@@ -2607,11 +2607,11 @@ export class MirrorEngine {
       ? this.groupBodiesByFolder(messages)
       : messages;
     let processed = 0;
+    const meter = options.meter;
 
     for (let index = 0; index < ordered.length;) {
       if (options.shouldStop?.()) break;
       const batchMessages = this.parsedBodyBatchAt(ordered, index);
-      const meter = options.meter;
       if (meter && !meter.admits(batchMessages.length > 1 ? batchMessages : [ordered[index]])) {
         // Older bodies wait for the next budget; recent ones here continue.
         ordered = ordered.slice(index).filter((message) => !meter.gates(message));

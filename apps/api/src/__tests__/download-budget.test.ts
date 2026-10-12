@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
+import type { AppConfig } from "../config.js";
+import type { PgPool } from "../db.js";
 import { DOWNLOAD_BUDGET_EXEMPT_MS, PassDownloadMeter } from "../download-budget.js";
+import { InvalidInputError } from "../errors.js";
 import type { MirrorImapClient } from "../imap-client.js";
+import type { MirrorRepository } from "../repository.js";
+import { MirrorEngine } from "../sync-engine.js";
 import type { ImapMessage } from "../types.js";
 
 const NOW = Date.parse("2026-10-12T12:00:00Z");
@@ -85,4 +90,26 @@ describe("PassDownloadMeter", () => {
     expect(meter.budgetReached).toBe(true);
     expect(meter.admits([message(DAY, 1)])).toBe(true);
   });
+});
+
+describe("syncAccount downloadBudgetBytes", () => {
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects %s at the boundary before any pass starts",
+    async (downloadBudgetBytes) => {
+      const repository = {
+        getAccount: () => {
+          throw new Error("no pass may start");
+        }
+      } as unknown as MirrorRepository;
+      const engine = new MirrorEngine({
+        pool: {} as PgPool,
+        config: {} as AppConfig,
+        repository,
+        bodyStore: {} as never
+      });
+
+      await expect(engine.syncAccount("account", "manual", { downloadBudgetBytes }))
+        .rejects.toBeInstanceOf(InvalidInputError);
+    }
+  );
 });
