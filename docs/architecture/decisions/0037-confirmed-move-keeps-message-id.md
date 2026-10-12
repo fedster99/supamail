@@ -28,12 +28,15 @@ guess.
 ## Decision
 
 **A move the server confirms with COPYUID moves the row with the message.**
-`moveMessage` and each member of `moveThread` update the source row's
+`moveMessages` (and `moveMessage`, which is one id of it) and each member of
+`moveThread` update the source row's
 `folder_id`, `folder_path`, `uidvalidity`, and `uid` to the destination
 (`MirrorRepository.relocateMovedMessage`). The row keeps its id, so everything
 keyed by it stays attached: body, attachments, thread assignments, and host
 state such as hosted Tags. The destination's next sync upserts the same
 `(account_id, folder_path, uidvalidity, uid)` key and updates this row.
+`moveMessages` opens one connection per mailbox and sends one UID MOVE per source
+folder; the one COPYUID answer maps each moved UID to its row.
 
 Relocation applies only when all of these hold; otherwise the source row is
 tombstoned as in ADR 0034, and the next sync mirrors the copy under a new id:
@@ -82,3 +85,23 @@ and leaves the folders due for reconcile, as ADR 0034 does for tombstones.
   updates the same row; a taken key, an untracked folder, a UIDVALIDITY
   mismatch, or an unmirrored folder writes nothing; `moveMessage` end to end; and
   every by-id read refuses a tombstoned row.
+
+## UIDPLUS fallback failure handling (2026-10-08)
+
+Without native MOVE, the pinned ImapFlow patch requires confirmed COPY before
+flagging the source, confirmed STORE before EXPUNGE, and confirmed removal before
+returning COPYUID as a completed move. A false COPY result must never delete the
+source. These guards live in the public core dependency patch, not in a host.
+
+If COPY succeeded but removal fails or disconnects, core reports
+`MailboxMoveIncompleteError` (`move_incomplete` from HTTP). It makes no move
+write-through and tells the caller to check both folders before moving again.
+The error retains the known copy effect even when cancellation races removal.
+The tracked folders were marked due before the command; reconcile observes the
+actual effects. It cannot turn a partial copy/delete into an atomic move, and
+this does not add an exactly-once or automatic retry guarantee.
+
+`imapflow-move-patch.test.ts` covers false/throwing command results. The Dovecot
+smoke exercises successful fallback and real-server rejection of COPY, plus
+injected STORE/EXPUNGE/disconnect failures with actual source/destination counts.
+It also checks each returned destination UID against that email's Message-ID.

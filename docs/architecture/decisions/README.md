@@ -46,6 +46,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0038-reconcile-every-window-lane.md`: Exact reconcile compares the folder's complete UID list (`UID SEARCH ALL`) with live rows in every window lane, revives its own tombstones whose UID returns, and keeps missing-in-DB repair inside the live window.
 - `0037-confirmed-move-keeps-message-id.md`: A move the server confirms with COPYUID moves the mirror row with the message, so it keeps its id and everything keyed by it; deletes still tombstone; by-id reads never serve a tombstoned row.
 - `0038-sync-status-is-its-own-tool.md`: Read results name their accounts (with a notice only when a mailbox is in its first sync, stopped, or paused); the full sync report is the separate `get_sync_status` tool.
+- `0041-durable-send-policy.md`: Core owns the durable send state machine; hosts provide atomic, scoped storage and authorization. Raw send primitives remain single attempts.
 
 ## Status Values
 

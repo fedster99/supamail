@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { applyPublicMigrations, closePool, getPool } from "../db.js";
+import { closePool, getPool } from "../db.js";
 import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type {
@@ -26,7 +26,6 @@ import {
   setupIntegration,
   teardownIntegration
 } from "./helpers/integration-harness.js";
-import { forgetPublicMigrationsFrom } from "./helpers/public-migrations.js";
 
 const DB_AVAILABLE = Boolean(process.env.DATABASE_URL);
 
@@ -804,6 +803,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       `UPDATE public.imap_folders
        SET highest_modseq = 10,
            qresync_highest_modseq = 10,
+           -- A failed pass can commit rows above last_uid before recording it.
+           last_uid = 301,
            last_full_reconcile_at = now(),
            next_reconcile_at = now() + interval '6 hours',
            next_flag_scan_at = now() + interval '6 hours'
@@ -821,6 +822,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       body: "new"
     }));
 
+    let archiveReplay: QresyncRequest | undefined;
     class QresyncFixtureClient extends FixtureImapClient {
       capabilities = new Map<string, boolean>([["QRESYNC", true]]);
 
@@ -830,6 +832,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       ): Promise<MailboxLock> {
         const lock = await super.getMailboxLock(path);
         if (!options.qresync || path !== "Archive") return lock;
+        archiveReplay = options.qresync;
         return {
           ...lock,
           qresync: {
@@ -875,6 +878,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.flagsUpdated).toBe(1);
     expect(result.reconcileGapsFound).toBe(1);
     expect(acknowledge).toHaveBeenCalledWith([change]);
+    // Servers such as Purelymail report expunges only for UIDs the client names,
+    // so the replay names stored row 302 even though last_uid still says 301.
+    expect(archiveReplay?.knownUids).toBe("1:302");
     expect(fetch.mock.calls.some(([range]) => range === "1:*")).toBe(false);
     const rows = await h.pool.query<{
       uid: string;
@@ -1186,7 +1192,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n, knownUids: "1:302" } },
       { path: "Archive" }
     ]);
     expect(acknowledge).toHaveBeenCalledWith([change]);
@@ -1403,7 +1409,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(pending.map((change) => change.path)).toEqual(["Projects"]);
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n, knownUids: "1:301" } },
       { path: "Projects" }
     ]);
     const cursors = await h.pool.query<{
@@ -2851,6 +2857,21 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await dueAllFolders(h.pool, h.account.id);
     const partial = await flakyEngine.syncAccount(h.account.id, "manual");
     expect(partial.outcome).toBe("partial_success");
+    const failedFolder = await h.pool.query<{ id: string }>(
+      "SELECT id FROM public.imap_folders WHERE account_id=$1 AND path='Project-Bravo'",
+      [h.account.id]
+    );
+    expect(partial.folderChecks).toContainEqual(expect.objectContaining({
+      folderIds: [failedFolder.rows[0].id], kind: "sync", outcome: "failed", deletionsChecked: false
+    }));
+    const stored = await h.pool.query<{ metadata: { folderChecks: unknown[] } }>(
+      "SELECT metadata FROM public.imap_sync_runs WHERE id=$1", [partial.runId]
+    );
+    expect(stored.rows[0].metadata.folderChecks).toEqual(partial.folderChecks);
+    expect(JSON.stringify(partial.folderChecks)).not.toContain("Project-Bravo");
+    for (const check of partial.folderChecks!) {
+      expect(Date.parse(check.finishedAt)).toBeGreaterThanOrEqual(Date.parse(check.startedAt));
+    }
 
     const after = (
       await h.pool.query<{
@@ -2910,6 +2931,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect(result.outcome).toBe("success");
       expect(result.hitLockBudget).toBe(true);
       expect(result.foldersProcessed).toBe(1);
+      expect(result.folderChecks).toHaveLength(1);
+      const checkedFolder = await h.pool.query<{ path: string }>(
+        "SELECT path FROM public.imap_folders WHERE id=$1", [result.folderChecks![0].folderIds[0]]
+      );
+      expect(checkedFolder.rows[0].path).toBe("INBOX");
       expect(result.bodiesFetched).toBe(0);
 
       const rows = await h.pool.query<{ folder_path: string; count: string }>(
@@ -4788,6 +4814,108 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(historyBodies.rows[0].count)).toBe(2);
   });
 
+  it("fetches a stored archive message's missing body before walking more history", async () => {
+    const oldDate = new Date("2023-01-01T00:00:00Z");
+    const h = await setupIntegration("history-missing-body-first", {
+      BODY_BACKFILL_BATCH_SIZE: 1,
+      INITIAL_SYNC_BATCH_SIZE: 10,
+      MAX_RR_FOLDERS_PER_CYCLE: 5
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `
+      UPDATE public.imap_accounts
+      SET body_fetch_policy = 'immediate',
+          historical_backfill_mode = 'metadata_and_bodies',
+          max_backfill_rate = 'small'
+      WHERE id = $1
+      `,
+      [h.account.id]
+    );
+    const old = (uid: number) => makeTextMessage({
+      uid,
+      subject: `old-${uid}`,
+      from: "a@x.test",
+      to: "u@x.test",
+      body: `old-${uid}`,
+      internalDate: oldDate
+    });
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_004,
+      messages: [
+        old(1),
+        old(2),
+        old(3),
+        makeTextMessage({
+          uid: 10,
+          subject: "fresh",
+          from: "a@x.test",
+          to: "u@x.test",
+          body: "fresh",
+          internalDate: new Date()
+        })
+      ]
+    }];
+    const sync = async () => {
+      const result = await h.buildEngine({
+        folders,
+        clientFactory: async () => new FixtureImapClient(folders)
+      }).syncAccount(h.account.id, "manual");
+      expect(result.outcome).toBe("success");
+    };
+    const state = async () => {
+      const messages = await h.pool.query<{ uid: string; has_body: boolean }>(
+        `SELECT m.uid::text AS uid, m.body_fetched_at IS NOT NULL AS has_body
+           FROM public.imap_messages m
+          WHERE m.account_id = $1 AND m.deleted_in_provider = false
+          ORDER BY m.uid`,
+        [h.account.id]
+      );
+      const folder = await h.pool.query<{ backfill_in_progress: boolean; oldest: string | null }>(
+        `SELECT backfill_in_progress, backfill_oldest_uid_synced::text AS oldest
+           FROM public.imap_folders
+          WHERE account_id = $1 AND path = 'INBOX'`,
+        [h.account.id]
+      );
+      return { messages: messages.rows, folder: folder.rows[0] };
+    };
+
+    // One history batch per pass: the walk stores UID 3 with its body and stops.
+    await sync();
+    expect(await state()).toEqual({
+      messages: [{ uid: "3", has_body: true }, { uid: "10", has_body: true }],
+      folder: { backfill_in_progress: true, oldest: "3" }
+    });
+
+    // Reconcile revived UID 3 after its stored body was removed.
+    await h.pool.query(
+      `DELETE FROM public.imap_message_bodies
+        WHERE message_id IN (SELECT id FROM public.imap_messages WHERE account_id = $1 AND uid = 3)`,
+      [h.account.id]
+    );
+    await h.pool.query(
+      "UPDATE public.imap_messages SET body_fetched_at = NULL WHERE account_id = $1 AND uid = 3",
+      [h.account.id]
+    );
+
+    // The next pass fetches that body first; the walk waits and is not marked complete.
+    await sync();
+    expect(await state()).toEqual({
+      messages: [{ uid: "3", has_body: true }, { uid: "10", has_body: true }],
+      folder: { backfill_in_progress: true, oldest: "3" }
+    });
+
+    // Then the walk resumes and finishes with every body stored.
+    for (let pass = 0; pass < 3; pass += 1) await sync();
+    expect(await state()).toEqual({
+      messages: ["1", "2", "3", "10"].map((uid) => ({ uid, has_body: true })),
+      folder: { backfill_in_progress: false, oldest: "1" }
+    });
+  });
+
   it("finishes an in-flight history batch at the safe boundary after the lock budget expires", async () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const recentDate = new Date();
@@ -5427,66 +5555,33 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       expect(progress.rows[0]?.live_bodies_target_count).toBe(1);
     });
 
-    it("repairs folders left by the date-filtered code once, on migrate", async () => {
-      const { h, folders, uids } = await setup("window-upgrade-repair", "metadata_only", [
+    it("re-takes a history snapshot fetching only UIDs without a live row", async () => {
+      const { h, folders, uids } = await setup("window-history-retake", "metadata_only", [
         message(1, oldDate),
-        message(2, new Date())
+        message(2, oldDate),
+        message(3, new Date())
       ]);
       await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
-      // State the old code could leave: a live head far below UIDNEXT, a completed
-      // history snapshot with its refresh stamp, an old email moved in after that
-      // snapshot that nothing fetched, and a body-lane MOVED_OUT tombstone.
-      folders[0].messages.push(message(3, oldDate));
+      // An old email the mirror lost, then a history re-take.
+      await h.pool.query("DELETE FROM public.imap_messages WHERE account_id = $1 AND uid = 1", [h.account.id]);
       await h.pool.query(
         `UPDATE public.imap_folders
-         SET last_uid = 0, uid_next = 4, last_archive_refresh_at = now(),
-             next_reconcile_at = now() - interval '1 second'
+         SET backfill_in_progress = true, backfill_target_max_uid = NULL, backfill_oldest_uid_synced = NULL
          WHERE account_id = $1`,
         [h.account.id]
       );
-      await h.pool.query(
-        `UPDATE public.imap_messages SET deleted_in_provider = true, deleted_reason = 'MOVED_OUT'
-         WHERE account_id = $1 AND uid = 1`,
-        [h.account.id]
-      );
-      // The database comes from before 0030: its repairs have not run yet.
-      await forgetPublicMigrationsFrom(h.pool, "0030_window_from_message_date");
-      await applyPublicMigrations(h.pool);
-      await applyPublicMigrations(h.pool);
-      const folder = async () => (await h.pool.query<{
-        last_uid: string; historical_target_count: number | null; backfill_in_progress: boolean;
-        last_archive_refresh_at: Date | null;
-      }>(
-        `SELECT last_uid::text, historical_target_count, backfill_in_progress, last_archive_refresh_at
-         FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
-        [h.account.id]
-      )).rows[0];
-      // The head moves to UIDNEXT; history keeps its progress and re-runs once.
-      expect(await folder()).toEqual({
-        last_uid: "3", historical_target_count: 1, backfill_in_progress: true, last_archive_refresh_at: null
-      });
-      const reason = await h.pool.query<{ deleted_reason: string }>(
-        "SELECT deleted_reason FROM public.imap_messages WHERE account_id = $1 AND uid = 1",
-        [h.account.id]
-      );
-      expect(reason.rows[0].deleted_reason).toBe("RECONCILE_MISSING");
-
-      // The re-run fetches only the missing old email, then later migrates leave
-      // the folder alone.
-      const fetched: number[][] = [];
+      const fetched: number[] = [];
       class RecordingClient extends FixtureImapClient {
         override async *fetch(range: string | number[] | Record<string, unknown>, query: Record<string, unknown>) {
-          if (Array.isArray(range) && query.envelope) fetched.push([...range]);
+          if (Array.isArray(range) && query.envelope) fetched.push(...range);
           yield* super.fetch(range, query);
         }
       }
       await dueAllFolders(h.pool, h.account.id);
       await h.buildEngine({ folders, clientFactory: async () => new RecordingClient(folders) })
         .syncAccount(h.account.id, "manual");
+      expect(fetched).toEqual([1]);
       expect(await uids()).toEqual([1, 2, 3]);
-      expect(fetched.flat()).not.toContain(2);
-      await applyPublicMigrations(h.pool);
-      expect((await folder()).backfill_in_progress).toBe(false);
     });
 
     it("finishes initial sync without promising new mail it has not fetched", async () => {
@@ -5522,9 +5617,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       // The stored UIDNEXT never runs ahead of the live head.
       expect(Number(done.uid_next)).toBe(Number(done.last_uid) + 1);
 
-      // Re-applying migration 0030 then cannot skip the pending UIDs.
-      await forgetPublicMigrationsFrom(h.pool, "0030_window_from_message_date");
-      await applyPublicMigrations(h.pool);
       for (let i = 0; i < 3; i += 1) {
         await dueAllFolders(h.pool, h.account.id);
         await engine.syncAccount(h.account.id, "manual");
@@ -5559,11 +5651,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
       // Months later the archive is not walked again; reconcile owns deletions.
       beforeSearches.length = 0;
-      // The refresh timestamp the old monthly re-walk used is long past.
-      await h.pool.query(
-        `UPDATE public.imap_folders SET last_archive_refresh_at = now() - interval '400 days' WHERE account_id = $1`,
-        [h.account.id]
-      );
       await dueAllFolders(h.pool, h.account.id);
       await engine.syncAccount(h.account.id, "manual");
       expect(beforeSearches).toEqual([]);
@@ -5731,6 +5818,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       await dueReconcile(h);
       const partial = await engine.syncAccount(h.account.id, "manual");
       expect(partial.outcome).toBe("success");
+      expect(partial.folderChecks).toContainEqual(expect.objectContaining({
+        kind: "sync", outcome: "partial", deletionsChecked: false
+      }));
       expect(await rows(h)).toEqual([...mirrored, "11:IN_WINDOW:live"]);
       expect(await reconcileState()).toEqual({ clean: false, retry_soon: true });
 
@@ -6396,6 +6486,13 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }).syncAccount(h.account.id, "scheduled");
 
       expect(result.outcome).toBe("success");
+      const checkedFolder = await h.pool.query<{ id: string }>(
+        "SELECT id FROM public.imap_folders WHERE account_id=$1 AND path='Archive-003'",
+        [h.account.id]
+      );
+      expect(result.folderChecks).toContainEqual(expect.objectContaining({
+        folderIds: expect.arrayContaining([checkedFolder.rows[0].id]), kind: "status", outcome: "unchanged", deletionsChecked: true
+      }));
       const after = await folderState(h, "Archive-003");
       expect(after.last_verified_unchanged_at).not.toBeNull();
       expect(after.last_synced_at).toEqual(before.last_synced_at);

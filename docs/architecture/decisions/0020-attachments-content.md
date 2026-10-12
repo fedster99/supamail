@@ -45,3 +45,13 @@ places those parts in the bytes APPENDed to Drafts. The CLI and HTTP draft
 create/update surfaces accept the same bounded attachment representation. Because
 `sendDraft` already resends the saved raw MIME, later delivery preserves the parts
 without refetching or reconstructing them.
+
+## Addendum (2026-10-07): CID associations across hosted composition
+
+The existing composer now validates CID associations before producing MIME.
+Message reads reveal Content-ID alongside disposition through the existing
+protected metadata adapter. HTML reply composition preserves source HTML and
+returns only its referenced image IDs; the host resolves bytes with its existing
+ownership and download limits. No new MIME composer, durable image store or
+migration is needed. See [embedded images](../../inline-images.md) for the input,
+replacement-draft and recipient-policy contracts.

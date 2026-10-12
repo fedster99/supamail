@@ -26,6 +26,7 @@ export * from "./repository.js";
 export * from "./runtime.js";
 export * from "./search/index.js";
 export * from "./send.js";
+export * from "./send-operations.js";
 export * from "./smtp-client.js";
 export * from "./sync-engine.js";
 export * from "./target-scheduler.js";

@@ -43,13 +43,13 @@ liveDb("draft_reply live DB", () => {
         account_id, folder_path, uidvalidity, uid, internal_date,
         subject, from_email, from_name, to_emails, to_names,
         cc_emails, cc_names, rfc_message_id, references_header, in_reply_to,
-        provider_thread_id, window_status, size_bytes
+        provider_thread_id, size_bytes
       )
       VALUES (
         $1, 'INBOX', $2, $3, now() - interval '1 hour',
         $4, $5, $6, $7, $8,
         $9, $10, $11, $12, $13,
-        $14, 'IN_WINDOW', $15
+        $14, $15
       )
       RETURNING id
       `,
@@ -218,4 +218,18 @@ liveDb("draft_reply live DB", () => {
     });
     expect("error" in result && result.error.code).toBe("not_found");
   });
+  it("retains HTML quote images with the mirrored attachment ID and bare CID", async () => {
+    await seedMessage({ uid: 9900, subject: "Inline source", fromEmail: "sender@example.test", body: "Earlier history" });
+    const id = idByUid.get(9900)!;
+    const html = '<p>Earlier history <img src=" cid:quote&#64;example.test "></p><!-- <img src="cid:unused"> -->';
+    await pool.query("UPDATE public.imap_message_bodies SET body_html = $2 WHERE message_id = $1", [id, html]);
+    const image = await pool.query<{ id: string }>(
+      `INSERT INTO public.imap_attachments (message_id, filename, mime_type, size_bytes, part_number, content_id, disposition)
+       VALUES ($1, 'quote.png', 'image/png', 100, '2', '<quote@example.test>', 'inline') RETURNING id`, [id]);
+    const draft = await runDraftReply(pool, { source_message_id: id, body: "<p>Best, Alex</p>", body_format: "html" });
+    isDraft(draft);
+    expect(draft.body.html).toContain(html);
+    expect(draft.attachments).toEqual([{ attachmentId: image.rows[0].id, cid: "quote@example.test", inline: true }]);
+  });
+
 });

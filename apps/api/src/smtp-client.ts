@@ -1,3 +1,4 @@
+import { validateInlineImages } from "./inline-images.js";
 import { randomUUID } from "node:crypto";
 import type { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
@@ -179,6 +180,7 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
   if (req.senderName !== undefined && (typeof req.senderName !== "string" || req.senderName.length > 120 || /[\x00-\x1f\x7f]/.test(req.senderName))) {
     throw new InvalidInputError("Sender name must be a single line of at most 120 characters");
   }
+  validateInlineImages(req);
   const messageId = req.messageId ?? `<${randomUUID()}@${domainOf(from.email)}>`;
 
   // Merge convenience threading fields into custom headers without letting an

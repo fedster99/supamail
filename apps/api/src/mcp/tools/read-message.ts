@@ -90,8 +90,8 @@ export const readMessageDefinition: ToolDefinition = {
     "body_total_chars, body_next_offset, body_truncated, body_content_status, and body_omissions " +
     "state whether text is absent and why. " +
     "Also returns the from/to/cc envelope, flags, " +
-    "and every attachment part (filename, mime_type, size_bytes, disposition; " +
-    "disposition inline marks parts such as signature images). duplicate_message_ids lists other stored copies of " +
+    "and every attachment part (filename, mime_type, size_bytes, disposition, content_id; " +
+    "content_id is the bare case-sensitive ID used by HTML cid: URLs, or null; disposition inline marks parts such as signature images). duplicate_message_ids lists other stored copies of " +
     "this email, to move or flag every copy. include_quoted=true retains the quoted reply tail and " +
     "signature; include_headers=true attaches parsed select headers. Attachment BYTES are not " +
     "mirrored (metadata only). Names its account; a notice appears only when that mailbox cannot " +

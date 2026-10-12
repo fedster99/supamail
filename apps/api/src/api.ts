@@ -62,6 +62,7 @@ import {
   MailboxCapabilityError,
   MailboxConflictError,
   MailboxMutationError,
+  MailboxMoveIncompleteError,
   moveMessage,
   moveThread,
   renameFolder,
@@ -457,9 +458,12 @@ export function createApiApp(options: ApiAppOptions): Hono {
       // not a 500 that invites a retry.
       return c.json({ error: "capability_unsupported", message: err.message }, 422);
     }
+    if (err instanceof MailboxMoveIncompleteError) {
+      return c.json({ error: "move_incomplete", message: err.message }, 409);
+    }
     if (err instanceof MailboxMutationError) {
       // A STORE/MOVE/EXPUNGE returned a server-side failure (imapflow signals
-      // these as false/empty). The upstream IMAP server failed to apply the
+      // these as false/empty). The upstream IMAP server did not confirm the
       // verb — 502 Bad Gateway, not a generic 500.
       return c.json({ error: "mailbox_mutation_failed", message: err.message }, 502);
     }

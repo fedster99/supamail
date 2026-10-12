@@ -24,7 +24,8 @@ not a guess.
 ## Decision
 
 After the provider confirms the action, `deleteMessage` (hard and Trash),
-`moveMessage`, and each member of `moveThread` mark exactly that source row
+`moveMessages` (and `moveMessage`), and each member of `moveThread` mark exactly
+that source row
 `(account_id, folder_path, uidvalidity, uid)` as `deleted_in_provider` with
 `deleted_reason = 'PROVIDER_DELETED'`.
 

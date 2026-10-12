@@ -213,3 +213,9 @@ A whole-stack review hardened four send-path edges:
 - RFC 5322 §3.6.4 (message threading: In-Reply-To / References).
 - RFC 5321 §4.5.3.2.6 (10-minute timeout for the final DATA response).
 - RFC 1047 (the final-response synchronization gap and duplicate mail).
+
+## Shared durable policy
+
+ADR 0041 moves the reusable retry/replay state machine into core
+`runSendOperation` and `replaySendOperation`. Hosts still own durable storage and
+authorization. The raw send primitive remains a single, non-retry-safe attempt.

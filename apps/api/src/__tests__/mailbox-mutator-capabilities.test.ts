@@ -137,15 +137,15 @@ describe("B1: capability gates refuse rather than risk a blanket EXPUNGE", () =>
   it("move() throws when the server lacks BOTH MOVE and UIDPLUS and never MOVEs", async () => {
     fake.capabilities = new Map(); // neither
     const mutator = await MailboxMutator.connect({} as never, config, account);
-    await expect(mutator.move(target, "Archive")).rejects.toBeInstanceOf(MailboxCapabilityError);
-    await expect(mutator.move(target, "Archive")).rejects.toThrow(/MOVE or UIDPLUS/);
+    await expect(mutator.move([target], "Archive")).rejects.toBeInstanceOf(MailboxCapabilityError);
+    await expect(mutator.move([target], "Archive")).rejects.toThrow(/MOVE or UIDPLUS/);
     expect(fake.messageMove).not.toHaveBeenCalled();
   });
 
   it("move() proceeds with MOVE present", async () => {
     fake.capabilities = new Map([["MOVE", true]]);
     const mutator = await MailboxMutator.connect({} as never, config, account);
-    const result = await mutator.move(target, "Archive");
+    const result = await mutator.move([target], "Archive");
     expect(result.uidMap?.get(42)).toBe(99);
     expect(fake.messageMove).toHaveBeenCalledWith("42", "Archive", { uid: true });
   });
@@ -153,7 +153,7 @@ describe("B1: capability gates refuse rather than risk a blanket EXPUNGE", () =>
   it("move() proceeds with UIDPLUS present (MOVE absent)", async () => {
     fake.capabilities = new Map([["UIDPLUS", true]]);
     const mutator = await MailboxMutator.connect({} as never, config, account);
-    await expect(mutator.move(target, "Archive")).resolves.toMatchObject({});
+    await expect(mutator.move([target], "Archive")).resolves.toMatchObject({});
     expect(fake.messageMove).toHaveBeenCalledTimes(1);
   });
 });
@@ -175,7 +175,7 @@ describe("M2: a false/empty server result throws instead of reporting success", 
     fake.capabilities = new Map([["MOVE", true]]);
     fake.messageMove.mockResolvedValue(false as never);
     const mutator = await MailboxMutator.connect({} as never, config, account);
-    await expect(mutator.move(target, "Archive")).rejects.toBeInstanceOf(MailboxMutationError);
+    await expect(mutator.move([target], "Archive")).rejects.toBeInstanceOf(MailboxMutationError);
   });
 
   it("expunge throws when DELETE returns false", async () => {
@@ -223,7 +223,7 @@ describe("withUidScope: a UIDVALIDITY mismatch fails closed before any verb runs
 
   it("move rejects with MailboxConflictError and never MOVEs (despite MOVE+UIDPLUS present)", async () => {
     const mutator = await MailboxMutator.connect({} as never, config, account);
-    await expect(mutator.move(target, "Archive")).rejects.toBeInstanceOf(MailboxConflictError);
+    await expect(mutator.move([target], "Archive")).rejects.toBeInstanceOf(MailboxConflictError);
     expect(fake.messageMove).not.toHaveBeenCalled();
   });
 

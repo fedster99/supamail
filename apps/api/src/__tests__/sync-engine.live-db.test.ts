@@ -998,8 +998,8 @@ liveDb("live DB reliability lane", () => {
         `
         INSERT INTO public.imap_messages
           (account_id, folder_path, uidvalidity, uid, internal_date,
-           window_status, deleted_in_provider, body_fetched_at)
-        VALUES ($1, $2, 1, 1, now(), 'IN_WINDOW', false, NULL)
+           deleted_in_provider, body_fetched_at)
+        VALUES ($1, $2, 1, 1, now(), false, NULL)
         `,
         [h.account.id, folderPath]
       );
@@ -1051,8 +1051,8 @@ liveDb("live DB reliability lane", () => {
       const message = await h.pool.query<{ id: string }>(
         `INSERT INTO public.imap_messages
            (account_id, folder_path, uidvalidity, uid, internal_date,
-            window_status, deleted_in_provider, body_fetched_at)
-         VALUES ($1, 'INBOX', 1, $2, now(), 'IN_WINDOW', false, now())
+            deleted_in_provider, body_fetched_at)
+         VALUES ($1, 'INBOX', 1, $2, now(), false, now())
          RETURNING id`,
         [h.account.id, index + 1]
       );
@@ -2631,7 +2631,7 @@ liveDb("live DB reliability lane", () => {
     await h.pool.query(
       `UPDATE public.imap_messages
        SET deleted_in_provider = true, provider_deleted_at = now(),
-           deleted_reason = CASE uid WHEN 3 THEN 'PROVIDER_DELETED' WHEN 4 THEN 'MOVED_OUT' ELSE 'RECONCILE_MISSING' END
+           deleted_reason = CASE uid WHEN 3 THEN 'PROVIDER_DELETED' WHEN 4 THEN 'FOLDER_MISSING' ELSE 'RECONCILE_MISSING' END
        WHERE account_id = $1`,
       [h.account.id]
     );
@@ -2653,7 +2653,7 @@ liveDb("live DB reliability lane", () => {
       [h.account.id]
     );
     expect(states.rows.map((row) => `${row.uid}:${row.deleted_reason}`)).toEqual([
-      "1:null", "2:RECONCILE_MISSING", "3:PROVIDER_DELETED", "4:MOVED_OUT"
+      "1:null", "2:RECONCILE_MISSING", "3:PROVIDER_DELETED", "4:FOLDER_MISSING"
     ]);
   });
 
@@ -2769,7 +2769,7 @@ liveDb("live DB reliability lane", () => {
           provider_deleted_at = now() - interval '31 days',
           deleted_reason = CASE uid
             WHEN 2 THEN 'UIDVALIDITY_RESET'
-            WHEN 3 THEN 'MOVED_OUT'
+            WHEN 3 THEN 'FOLDER_MISSING'
             WHEN 4 THEN 'FOLDER_MISSING'
             WHEN 5 THEN 'RECONCILE_MISSING'
           END

@@ -417,8 +417,9 @@ describe("repository safety", () => {
     expect(source).not.toContain("window_status");
     expect(source).toContain("runPurgeJob");
     expect(source).toContain("provider_deleted_at < now() - interval '30 days'");
-    expect(source).toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING')");
-    expect(source).not.toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'MOVED_OUT', 'FOLDER_MISSING', 'RECONCILE_MISSING')");
+    expect(source).toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'FOLDER_MISSING')");
+    expect(source).not.toContain("'MOVED_OUT'");
+    expect(source).not.toContain("deleted_reason IN ('UIDVALIDITY_RESET', 'FOLDER_MISSING', 'RECONCILE_MISSING')");
     expect(worker).toContain("runRetentionJobs");
 
     // The INSERT-only imap_sync_events audit table and imap_sync_runs are pruned as

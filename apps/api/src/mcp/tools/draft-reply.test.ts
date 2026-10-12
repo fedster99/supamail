@@ -66,3 +66,28 @@ describe("draftReplyRequestSchema", () => {
     expect(() => draftReplyRequestSchema.parse({ ...base, body_format: "markdown" })).toThrow();
   });
 });
+
+describe("HTML source images", () => {
+  it.each([
+    '<p>Earlier <img src="cid:original@example.test"></p>',
+    '<p>Earlier <img src=" cid:original&#64;example.test "></p><!-- <img src="cid:unused"> -->'
+  ])("retains quoted image references without rewriting HTML: %s", async (sourceHtml) => {
+    const { runDraftReply } = await import("./draft-reply.js");
+    const client = {
+      query: async (sql: string) => ({ rows: sql.includes("FROM public.imap_attachments") ? [
+        { attachment_id: "inline-id", message_id: "source", account_id: "mailbox", content_id: "<original@example.test>", disposition: "inline" },
+        { attachment_id: "file-id", message_id: "source", account_id: "mailbox", content_id: null, disposition: "attachment" }
+      ] : sql.includes("FROM public.imap_messages") ? [{
+        id: "source", account_id: "mailbox", account_email: "self@example.test", from_email: "sender@example.test",
+        subject: "Hello", internal_date: new Date("2026-01-01"), body_html: sourceHtml, body_text: "Earlier",
+      }] : [] }),
+      release: () => {},
+    };
+    const result = await runDraftReply({ connect: async () => client } as never, {
+      source_message_id: "source", body: "<p>Best, Alex</p>", body_format: "html",
+    });
+    if ("error" in result) throw new Error(JSON.stringify(result));
+    expect(result.body.html).toContain(sourceHtml);
+    expect(result.attachments).toEqual([{ attachmentId: "inline-id", cid: "original@example.test", inline: true }]);
+  });
+});

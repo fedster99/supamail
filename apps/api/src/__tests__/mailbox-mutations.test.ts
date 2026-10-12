@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ImapAbortBinding } from "../imap-connect.js";
-import { MailboxMutator, type MovedLocation, toImapFlag } from "../mailbox-mutations.js";
+import { InvalidInputError } from "../errors.js";
+import { MailboxMoveIncompleteError, MailboxMutator, type MovedLocation, toImapFlag } from "../mailbox-mutations.js";
 
 // Mirror ids are UUIDs; any other value names no row.
 const M1 = "11111111-1111-4111-8111-111111111111";
@@ -45,7 +46,10 @@ describe("toImapFlag", () => {
 const mutator = vi.hoisted(() => ({
   addFlags: vi.fn(async (_target: { folderPath: string; uidValidity: number; uid: number }, _flags: string[]) => true),
   removeFlags: vi.fn(async (_target: { folderPath: string; uidValidity: number; uid: number }, _flags: string[]) => true),
-  move: vi.fn(async (): Promise<MovedLocation> => ({ uidMap: new Map<number, number>([[42, 99]]), uidValidity: 200 })),
+  move: vi.fn(async (_targets: Array<{ uid: number }>, _destination: string): Promise<MovedLocation> => ({
+    uidMap: new Map<number, number>([[42, 99]]),
+    uidValidity: 200
+  })),
   expunge: vi.fn(async () => true),
   list: vi.fn(async () => [{ path: "Trash", specialUse: "\\Trash" }]),
   createFolder: vi.fn(async (path: string) => ({ path, created: true })),
@@ -196,7 +200,7 @@ describe("moveMessage", () => {
     expect(repo.markFoldersForReconcile.mock.invocationCallOrder[0]).toBeLessThan(
       mutator.move.mock.invocationCallOrder[0]
     );
-    expect(mutator.move).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), "Archive");
+    expect(mutator.move).toHaveBeenCalledWith([expect.objectContaining({ uid: 42 })], "Archive");
     expect(result).toMatchObject({ fromFolder: "INBOX", toFolder: "Archive", newUid: 99 });
   });
 
@@ -268,12 +272,143 @@ describe("moveMessage", () => {
   });
 });
 
+describe("moveMessages", () => {
+  const id = (n: number) => `${String(n).padStart(8, "0")}-0000-4000-8000-000000000000`;
+  const rows = (count: number, overrides: (n: number) => Record<string, unknown> = () => ({})) => {
+    const byId = new Map(Array.from({ length: count }, (_, n) => [id(n), message({ id: id(n), uid: String(n + 1), ...overrides(n) })]));
+    repo.getMessage.mockImplementation(async (messageId: string) => byId.get(messageId) ?? null);
+    return [...byId.keys()];
+  };
+
+  it("moves ten messages of one folder with one connection and one UID MOVE, keeping every id", async () => {
+    const ids = rows(10);
+    mutator.move.mockImplementationOnce(async (targets: Array<{ uid: number }>) => ({
+      uidMap: new Map(targets.map((target) => [target.uid, target.uid + 500])),
+      uidValidity: 200
+    }));
+    const { moveMessages } = await import("../mailbox-mutations.js");
+    const outcomes = await moveMessages({} as never, config, ids, "Archive");
+
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+    expect(mutator.move).toHaveBeenCalledTimes(1);
+    expect(mutator.move.mock.calls[0][0]).toHaveLength(10);
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledExactlyOnceWith("acc-1", ["INBOX", "Archive"]);
+    expect(mutator.logout).toHaveBeenCalledTimes(1);
+    expect(outcomes.map((outcome) => outcome.messageId)).toEqual(ids);
+    expect(outcomes.every((outcome) => "result" in outcome && outcome.result.idKept)).toBe(true);
+    expect(outcomes[3]).toEqual({ messageId: ids[3], result: { messageId: ids[3], fromFolder: "INBOX", toFolder: "Archive", newUid: 504, idKept: true } });
+    expect(repo.relocateMovedMessage).toHaveBeenCalledTimes(10);
+  });
+
+  it("sends one UID MOVE per source folder and keeps the other folder's results when one fails", async () => {
+    const ids = rows(4, (n) => ({ folder_path: n % 2 === 0 ? "INBOX" : "Later" }));
+    mutator.move
+      .mockRejectedValueOnce(new Error("MOVE failed"))
+      .mockImplementationOnce(async (targets: Array<{ uid: number }>) => ({
+        uidMap: new Map(targets.map((target) => [target.uid, target.uid + 500])),
+        uidValidity: 200
+      }));
+    const { moveMessages } = await import("../mailbox-mutations.js");
+    const outcomes = await moveMessages({} as never, config, ids, "Archive");
+
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+    expect(mutator.move).toHaveBeenCalledTimes(2);
+    expect(repo.markFoldersForReconcile).toHaveBeenCalledExactlyOnceWith("acc-1", ["INBOX", "Later", "Archive"]);
+    expect(outcomes.map((outcome) => "error" in outcome)).toEqual([true, false, true, false]);
+    expect(repo.relocateMovedMessage).toHaveBeenCalledTimes(2);
+    expect(repo.markMessageRemovedByProvider).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing id and a no-op in input order without hiding the moved message", async () => {
+    const [moving, staying] = rows(2, (n) => ({ folder_path: n === 0 ? "INBOX" : "Archive" }));
+    const { moveMessages } = await import("../mailbox-mutations.js");
+    const outcomes = await moveMessages({} as never, config, [staying, "not-a-mirror-id", moving], "Archive");
+
+    expect(outcomes[0]).toEqual({ messageId: staying, result: expect.objectContaining({ idKept: true, newUid: 2 }) });
+    expect(outcomes[1]).toEqual({ messageId: "not-a-mirror-id", error: expect.anything() });
+    expect(outcomes[2]).toEqual({ messageId: moving, result: expect.objectContaining({ fromFolder: "INBOX" }) });
+    expect(mutator.move).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ messageId: moving })], "Archive");
+  });
+
+  it("opens one connection per mailbox and moves a repeated id once", async () => {
+    const ids = rows(2, (n) => ({ account_id: `acc-${n + 1}` }));
+    repo.getAccount.mockImplementation(async (accountId: string) => ({ ...account, id: accountId }));
+    const { moveMessages } = await import("../mailbox-mutations.js");
+    const outcomes = await moveMessages({} as never, config, [ids[0], ids[1], ids[0]], "Archive");
+
+    expect(connectSpy).toHaveBeenCalledTimes(2);
+    expect(mutator.move).toHaveBeenCalledTimes(2);
+    expect(outcomes.map((outcome) => outcome.messageId)).toEqual([ids[0], ids[1], ids[0]]);
+  });
+
+  it("fails every message of a mailbox whose connection fails, before any provider command", async () => {
+    const ids = rows(3);
+    connectSpy.mockRejectedValueOnce(new Error("connect failed"));
+    const { moveMessages } = await import("../mailbox-mutations.js");
+    const outcomes = await moveMessages({} as never, config, ids, "Archive");
+
+    expect(outcomes.every((outcome) => "error" in outcome)).toBe(true);
+    expect(mutator.move).not.toHaveBeenCalled();
+    expect(repo.relocateMovedMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("MailboxMutator.move", () => {
+  const target = (uid: number, folderPath = "INBOX") => ({ messageId: M1, accountId: "acc-1", folderPath, uidValidity: 100, uid });
+  const connected = (signal?: AbortSignal) => {
+    const imap = {
+      close: vi.fn(),
+      mailbox: { uidValidity: 100 },
+      capabilities: new Map([["MOVE", true]]),
+      getMailboxLock: vi.fn(async () => ({ release: vi.fn() })),
+      messageMove: vi.fn(async () => ({ uidValidity: 200n, uidMap: new Map([[1, 11], [5, 15]]) }))
+    };
+    const mutator = Reflect.construct(
+      MailboxMutator as unknown as new (...args: unknown[]) => MailboxMutator,
+      [imap, "imap.example.test", new ImapAbortBinding(imap as never, signal)]
+    );
+    return { imap, mutator };
+  };
+
+  it("moves every UID of one folder in one UID MOVE under one folder lock", async () => {
+    const { imap, mutator } = connected();
+    const moved = await mutator.move([target(1), target(5)], "Archive");
+    expect(imap.getMailboxLock).toHaveBeenCalledExactlyOnceWith("INBOX");
+    expect(imap.messageMove).toHaveBeenCalledExactlyOnceWith("1,5", "Archive", { uid: true });
+    expect(moved).toEqual({ uidValidity: 200, uidMap: new Map([[1, 11], [5, 15]]) });
+  });
+
+  it.each([false, true])("keeps the incomplete-move error when cancellation races removal: %s", async (abort) => {
+    const controller = new AbortController();
+    const { imap, mutator } = connected(controller.signal);
+    imap.messageMove.mockImplementationOnce(async () => {
+      if (abort) controller.abort();
+      throw Object.assign(new Error("private provider detail"), { code: "MoveIncomplete" });
+    });
+    await expect(mutator.move([target(1), target(5)], "Archive")).rejects.toBeInstanceOf(MailboxMoveIncompleteError);
+  });
+
+  it("refuses mixed mailboxes, folders, UIDVALIDITY values, or no targets before opening a folder", async () => {
+    const { imap, mutator } = connected();
+    for (const targets of [
+      [target(1), { ...target(5), accountId: "acc-2" }],
+      [target(1), target(5, "Later")],
+      [target(1), { ...target(5), uidValidity: 101 }],
+      []
+    ]) {
+      await expect(mutator.move(targets, "Archive")).rejects.toBeInstanceOf(InvalidInputError);
+    }
+    expect(imap.getMailboxLock).not.toHaveBeenCalled();
+    expect(imap.messageMove).not.toHaveBeenCalled();
+  });
+});
+
 describe("deleteMessage", () => {
   it("moves to the resolved Trash folder by default", async () => {
     repo.getMessage.mockResolvedValue(message());
     const { deleteMessage } = await import("../mailbox-mutations.js");
     const result = await deleteMessage({} as never, config, M1, {});
-    expect(mutator.move).toHaveBeenCalledWith(expect.objectContaining({ uid: 42 }), "Trash");
+    expect(mutator.move).toHaveBeenCalledWith([expect.objectContaining({ uid: 42 })], "Trash");
     expect(mutator.expunge).not.toHaveBeenCalled();
     expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", mode: "trash", trashFolder: "Trash" });
     expect(repo.markFoldersForReconcile).toHaveBeenCalledWith("acc-1", ["INBOX", "Trash"]);

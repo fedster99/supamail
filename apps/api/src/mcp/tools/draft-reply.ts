@@ -1,8 +1,9 @@
+import { bareContentId, referencedContentIds } from "../../inline-images.js";
 import { z } from "zod";
 import { MAX_REFERENCES_LENGTH } from "../../compose-schema.js";
 import type { PgPool } from "../../db.js";
 import { htmlToText } from "../../mime.js";
-import { cleanBody, toolError, withReadOnlyTx } from "../shared.js";
+import { cleanBody, loadMessageAttachments, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   METADATA_PROTECTED_FIELDS,
@@ -58,6 +59,7 @@ interface SourceRow extends ProtectedMetadataColumns {
   account_protected_metadata_tokens: Record<string, string> | null;
   body_text: string | null;
   body_plain: string | null;
+  body_html?: string | null;
   selected_text_part: string | null;
 }
 
@@ -79,6 +81,7 @@ export interface DraftReply {
   };
   threadId: string | null;
   body: { format: "plain" | "html"; text: string; html: string };
+  attachments?: Array<{ attachmentId: string; cid: string; inline: true }>;
   warnings: string[];
 }
 
@@ -93,7 +96,7 @@ export const draftReplyDefinition: ToolDefinition = {
     "(In-Reply-To / References), and equivalent plain/HTML quoted bodies. PRODUCE-ONLY: this NEVER sends, " +
     "saves drafts to IMAP, or writes any file — there is no send flag. The returned " +
     "draftId is a local handle (drf_<source id>), not an IMAP UID. Delivery requires " +
-    "a separate send path outside this MCP server.",
+    "a separate send path outside this MCP server. HTML replies retain source HTML; attachments lists mirrored attachmentId/cid references for images in the quote. Resolve their bytes before sending; do not omit them or collide with their Content-IDs.",
   annotations: {
     readOnlyHint: false,
     destructiveHint: false,
@@ -268,9 +271,10 @@ export function buildReplyBody(
   authored: string,
   sourceText: string | null,
   attribution: string,
-  format: DraftReply["body"]["format"] = "plain"
+  format: DraftReply["body"]["format"] = "plain",
+  sourceHtml?: string | null
 ): DraftReply["body"] {
-  const fullSource = cleanBody(sourceText, { includeQuoted: true }).text ?? "";
+  const fullSource = cleanBody(sourceText ?? (sourceHtml ? htmlToText(sourceHtml) : null), { includeQuoted: true }).text ?? "";
   const authoredText = format === "html" ? htmlToText(authored) : authored;
   return {
     format,
@@ -279,7 +283,7 @@ export function buildReplyBody(
       `${format === "html" ? authored : plainTextToHtml(authored)}\n` +
       `<div><br></div>\n<div class="gmail_quote gmail_quote_container">\n` +
       `<div>${escapeHtml(attribution)}</div>\n` +
-      `${quotedTextToHtml(fullSource)}\n</div>`
+      `${format === "html" && sourceHtml ? `<blockquote>${sourceHtml}</blockquote>` : quotedTextToHtml(fullSource)}\n</div>`
   };
 }
 
@@ -352,6 +356,7 @@ export async function runDraftReply(
         a.protected_metadata_tokens AS account_protected_metadata_tokens,
         b.body_text,
         b.body_plain,
+        b.body_html,
         b.selected_text_part
       FROM public.imap_messages m
       JOIN public.imap_accounts a ON a.id = m.account_id
@@ -417,7 +422,13 @@ export async function runDraftReply(
   const cc = request.reply_all === true ? buildCc(source) : [];
 
   const original = replySource(source);
-  const body = buildReplyBody(request.body, original.text, original.attribution, request.body_format);
+  const body = buildReplyBody(request.body, original.text, original.attribution, request.body_format, source.body_html);
+  const quotedIds = request.body_format === "html" ? referencedContentIds(source.body_html ?? undefined) : new Set<string>();
+  const attachments = quotedIds.size === 0 ? [] : await withReadOnlyTx(pool, async (client) => {
+    const rows = (await loadMessageAttachments(client, [source.id], metadataProtection)).get(source.id) ?? [];
+    return rows.filter((attachment) => attachment.content_id && quotedIds.has(bareContentId(attachment.content_id)))
+      .map((attachment) => ({ attachmentId: attachment.attachment_id, cid: bareContentId(attachment.content_id!), inline: true as const }));
+  });
 
   return {
     draftId: `drf_${source.id}`,
@@ -428,6 +439,7 @@ export async function runDraftReply(
     headers,
     threadId: source.provider_thread_id,
     body,
+    ...(attachments.length > 0 ? { attachments } : {}),
     warnings
   };
 }

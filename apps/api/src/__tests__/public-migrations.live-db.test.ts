@@ -60,11 +60,63 @@ liveDb("public migrations run once", () => {
     expect((await migrateRecording()).filter((text) => migrationSql.has(text))).toEqual([]);
   });
 
-  it("applies every file once more on a database migrated before the record existed", async () => {
-    await getPool().query("DROP SCHEMA supamail_meta CASCADE");
-    await applyPublicMigrations(getPool());
+  it("upgrades a database the old runner left at 0029, repairs included", async () => {
+    // The old runner re-applied every file. Build a database it left at 0029,
+    // with the state the date-filtered engine left, so the new runner also runs
+    // 0030's one-time repairs on its way past 0032.
     const migrations = await readPublicMigrationFiles();
-    expect(await recorded()).toEqual(migrations.map((migration) => migration.id).sort());
+    const legacyCount = migrations.findIndex((migration) => migration.id === "0029_active_assignments_view_no_barrier") + 1;
+    const database = `supamail_legacy_${process.pid}`;
+    await getPool().query(`DROP DATABASE IF EXISTS ${database}`);
+    await getPool().query(`CREATE DATABASE ${database}`);
+    const url = new URL(getConfig().DATABASE_URL);
+    url.pathname = `/${database}`;
+    const legacy = createPool({ DATABASE_URL: url.toString() });
+    try {
+      for (let run = 0; run < 2; run += 1) {
+        await legacy.query(migrations.slice(0, legacyCount).map((migration) => migration.sql).join("\n\n"));
+      }
+      const account = (await legacy.query<{ id: string }>(
+        `INSERT INTO public.imap_accounts (email_address, host, port, username, encrypted_password, historical_backfill_mode)
+         VALUES ('legacy@example.test', 'imap.example.test', 993, 'legacy', '\\x00'::bytea, 'metadata_only')
+         RETURNING id`
+      )).rows[0].id;
+      await legacy.query(
+        `INSERT INTO public.imap_folders (account_id, path, tracked, status, uidvalidity, initial_sync_complete,
+           uid_next, last_uid, historical_target_count, backfill_in_progress, last_archive_refresh_at)
+         VALUES ($1, 'INBOX', true, 'ACTIVE', 7, true, 50, 3, 10, false, now())`,
+        [account]
+      );
+      await legacy.query(
+        `INSERT INTO public.imap_messages (account_id, folder_path, uidvalidity, uid, internal_date,
+           deleted_in_provider, provider_deleted_at, deleted_reason)
+         VALUES ($1, 'INBOX', 7, 1, now() - interval '200 days', true, now(), 'MOVED_OUT')`,
+        [account]
+      );
+      await applyPublicMigrations(legacy);
+      const repaired = (await legacy.query<{ last_uid: string; backfill_in_progress: boolean; historical_target_count: number }>(
+        "SELECT last_uid::text, backfill_in_progress, historical_target_count FROM public.imap_folders WHERE account_id = $1",
+        [account]
+      )).rows[0];
+      // The head moves to UIDNEXT and history is re-taken once, keeping its progress.
+      expect(repaired).toEqual({ last_uid: "49", backfill_in_progress: true, historical_target_count: 10 });
+      const reason = await legacy.query<{ deleted_reason: string }>(
+        "SELECT deleted_reason FROM public.imap_messages WHERE account_id = $1",
+        [account]
+      );
+      expect(reason.rows[0].deleted_reason).toBe("RECONCILE_MISSING");
+      const ids = (await legacy.query<{ id: string }>(
+        "SELECT id FROM supamail_meta.public_migrations ORDER BY id"
+      )).rows.map((row) => row.id);
+      expect(ids).toEqual(migrations.map((migration) => migration.id).sort());
+      const column = await legacy.query(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = 'imap_messages' AND column_name = 'window_status'"
+      );
+      expect(column.rows).toEqual([]);
+    } finally {
+      await legacy.end();
+      await getPool().query(`DROP DATABASE IF EXISTS ${database}`);
+    }
   });
 
   it("applies only migrations missing from the record, in manifest order", async () => {
