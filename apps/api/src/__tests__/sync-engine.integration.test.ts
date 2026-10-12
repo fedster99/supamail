@@ -803,6 +803,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       `UPDATE public.imap_folders
        SET highest_modseq = 10,
            qresync_highest_modseq = 10,
+           -- A failed pass can commit rows above last_uid before recording it.
+           last_uid = 301,
            last_full_reconcile_at = now(),
            next_reconcile_at = now() + interval '6 hours',
            next_flag_scan_at = now() + interval '6 hours'
@@ -820,6 +822,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       body: "new"
     }));
 
+    let archiveReplay: QresyncRequest | undefined;
     class QresyncFixtureClient extends FixtureImapClient {
       capabilities = new Map<string, boolean>([["QRESYNC", true]]);
 
@@ -829,6 +832,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       ): Promise<MailboxLock> {
         const lock = await super.getMailboxLock(path);
         if (!options.qresync || path !== "Archive") return lock;
+        archiveReplay = options.qresync;
         return {
           ...lock,
           qresync: {
@@ -874,6 +878,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.flagsUpdated).toBe(1);
     expect(result.reconcileGapsFound).toBe(1);
     expect(acknowledge).toHaveBeenCalledWith([change]);
+    // Servers such as Purelymail report expunges only for UIDs the client names,
+    // so the replay names stored row 302 even though last_uid still says 301.
+    expect(archiveReplay?.knownUids).toBe("1:302");
     expect(fetch.mock.calls.some(([range]) => range === "1:*")).toBe(false);
     const rows = await h.pool.query<{
       uid: string;
@@ -1185,7 +1192,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_015n, changedSince: 10n, knownUids: "1:302" } },
       { path: "Archive" }
     ]);
     expect(acknowledge).toHaveBeenCalledWith([change]);
@@ -1402,7 +1409,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(pending.map((change) => change.path)).toEqual(["Projects"]);
     expect(idleClient.lockRequests).toEqual([
-      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n } },
+      { path: "Archive", qresync: { uidValidity: 50_016n, changedSince: 10n, knownUids: "1:301" } },
       { path: "Projects" }
     ]);
     const cursors = await h.pool.query<{

@@ -92,6 +92,9 @@ export interface MailboxLock {
 export interface QresyncRequest {
   uidValidity: bigint;
   changedSince: bigint;
+  /** UIDs the mirror knows, as an IMAP sequence set. Some servers (Purelymail)
+   * report expunges in the replay only for UIDs the client names (RFC 7162). */
+  knownUids?: string;
 }
 
 export interface QresyncReplay {
@@ -350,7 +353,8 @@ export class ThrottledImapClient implements MirrorImapClient {
           "getMailboxLock QRESYNC",
           () => this.client.getMailboxLock(path, {
             uidValidity: request.uidValidity,
-            changedSince: request.changedSince
+            changedSince: request.changedSince,
+            knownUids: request.knownUids
           } as never)
         );
       } catch (error) {

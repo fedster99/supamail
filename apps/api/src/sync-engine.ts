@@ -1193,11 +1193,22 @@ export class MirrorEngine {
       && folder.uidvalidity !== null
       && folder.qresync_highest_modseq !== null
       && client.capabilities?.has("QRESYNC") === true;
-    const qresyncRequest = qresyncWanted && !this.qresyncKnownUnavailable(account.id)
+    // Name every UID the mirror holds: some servers (Purelymail) report expunges
+    // only for named UIDs, and RFC 7162 lets any server limit VANISHED to them.
+    // Rows can commit above last_uid before a failed pass records it.
+    const qresyncAllowed = qresyncWanted && !this.qresyncKnownUnavailable(account.id);
+    const knownUidHigh = qresyncAllowed
+      ? Math.max(
+        Number(folder.last_uid ?? 0),
+        await this.repository.getHighestStoredUid(account.id, folder.path, Number(folder.uidvalidity))
+      )
+      : 0;
+    const qresyncRequest = qresyncAllowed
       ? {
           // qresyncWanted proved both cursors are present.
           uidValidity: BigInt(folder.uidvalidity!),
-          changedSince: BigInt(folder.qresync_highest_modseq!)
+          changedSince: BigInt(folder.qresync_highest_modseq!),
+          knownUids: knownUidHigh >= 1 ? `1:${knownUidHigh}` : undefined
         }
       : undefined;
     let qresyncCommandRejected = false;
