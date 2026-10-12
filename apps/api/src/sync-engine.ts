@@ -740,6 +740,7 @@ export class MirrorEngine {
           result.bodiesFetched += historyResult.bodiesFetched;
           result.errors.push(...historyResult.errors);
           if (historyResult.hitLockBudget) result.hitLockBudget = true;
+          result.historyBacklogRemaining = historyResult.historyBacklogRemaining;
         }
 
         if (result.errors.length > 0) {
@@ -2096,7 +2097,7 @@ export class MirrorEngine {
     metadataWriteStats: MetadataWriteStats,
     signal: AbortSignal | undefined,
     assertLive: () => Promise<void>
-  ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
+  ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; historyBacklogRemaining?: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
     }
@@ -2109,6 +2110,7 @@ export class MirrorEngine {
     let hitLockBudget = false;
     const errors: string[] = [];
     let batchesProcessed = 0;
+    let progressed = false;
     const maxBatches = this.historyBatchLimit(account);
 
     while (batchesProcessed < maxBatches) {
@@ -2153,13 +2155,16 @@ export class MirrorEngine {
       }
 
       batchesProcessed += 1;
-
-      if (!batch.processed) {
-        continue;
-      }
+      progressed ||= batch.processed;
     }
 
-    return { messagesUpserted, bodiesFetched, hitLockBudget, errors };
+    // Hosts can yield the lock and schedule another bounded pass. UID-range
+    // advances count as progress even when no messages were found; a failed or
+    // non-advancing pass must not cause an immediate retry loop.
+    const historyBacklogRemaining = progressed && !hitLockBudget && errors.length === 0
+      && batchesProcessed === maxBatches
+      && (await this.repository.getHistoryBacklog(account, 1)).length > 0;
+    return { messagesUpserted, bodiesFetched, hitLockBudget, historyBacklogRemaining, errors };
   }
 
   private async runHistoryBatch(
@@ -2229,7 +2234,7 @@ export class MirrorEngine {
             uidValidity,
             { deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS, signal }
           );
-          return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+          return { messagesUpserted: 0, bodiesFetched: 0, processed: true, hitLockBudget: false };
         }
 
         targetMaxUid = sortedTargets[sortedTargets.length - 1];
@@ -2256,7 +2261,7 @@ export class MirrorEngine {
           deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS,
           signal
         });
-        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+        return { messagesUpserted: 0, bodiesFetched: 0, processed: true, hitLockBudget: false };
       }
 
       // Search only the next bounded UID-address range. The previous implementation
