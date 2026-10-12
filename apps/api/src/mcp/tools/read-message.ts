@@ -113,7 +113,7 @@ export const readMessageDefinition: ToolDefinition = {
         format: "uuid",
         minLength: 36,
         maxLength: 36,
-        description: "The stable message id (imap_messages.id) returned by search_email or read_thread."
+        description: "The stable message id returned by search_email or read_thread."
       },
       include_headers: {
         type: "boolean",
