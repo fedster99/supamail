@@ -74,6 +74,47 @@ describe("patched ImapFlow QRESYNC mailbox lock", () => {
   });
 });
 
+describe("patched ImapFlow QRESYNC SELECT", () => {
+  const require = createRequire(import.meta.url);
+  const select = require("imapflow/lib/commands/select.js") as (
+    connection: unknown,
+    path: string,
+    options: Record<string, unknown>
+  ) => Promise<unknown>;
+  const { compiler } = require("imapflow/lib/handler/imap-handler.js") as {
+    compiler(request: unknown): Promise<Buffer>;
+  };
+
+  async function selectLine(options: Record<string, unknown>): Promise<string> {
+    let request: unknown;
+    const states = { AUTHENTICATED: "AUTHENTICATED", SELECTED: "SELECTED" };
+    const connection = {
+      states,
+      state: states.AUTHENTICATED,
+      folders: new Map([["INBOX", { path: "INBOX", delimiter: "/" }]]),
+      enabled: new Set(["QRESYNC"]),
+      capabilities: new Map(),
+      log: { warn: vi.fn() },
+      async exec(command: string, attributes: unknown) {
+        request = { tag: "A1", command, attributes };
+        throw new Error("captured");
+      }
+    };
+    await expect(select(connection, "INBOX", options)).rejects.toThrow("captured");
+    return (await compiler(request)).toString();
+  }
+
+  it("sends known UIDs as the third QRESYNC parameter", async () => {
+    expect(await selectLine({ uidValidity: 7n, changedSince: 10n, knownUids: "1:412" }))
+      .toBe("A1 SELECT INBOX (QRESYNC (7 10 1:412))");
+  });
+
+  it("keeps the two-parameter form without known UIDs", async () => {
+    expect(await selectLine({ uidValidity: 7n, changedSince: 10n }))
+      .toBe("A1 SELECT INBOX (QRESYNC (7 10))");
+  });
+});
+
 describe("patched ImapFlow message count", () => {
   it("drops EXISTS for a VANISHED report, but not for VANISHED (EARLIER)", async () => {
     const client = selectedClient();

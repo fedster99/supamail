@@ -1197,7 +1197,8 @@ export class MirrorEngine {
       ? {
           // qresyncWanted proved both cursors are present.
           uidValidity: BigInt(folder.uidvalidity!),
-          changedSince: BigInt(folder.qresync_highest_modseq!)
+          changedSince: BigInt(folder.qresync_highest_modseq!),
+          knownUids: Number(folder.last_uid) >= 1 ? `1:${folder.last_uid}` : undefined
         }
       : undefined;
     let qresyncCommandRejected = false;

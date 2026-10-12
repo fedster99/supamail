@@ -338,6 +338,34 @@ index fd0c409c24c525cbbb6b841e8d26327eb1b0a635..f0567fa440b4511c223ddcf52404a024
          // Sort numerically for consistent, predictable output order
          return Array.from(results).sort((a, b) => a - b);
      } catch (err) {
+diff --git a/lib/commands/select.js b/lib/commands/select.js
+index 2add50b39ef8fd3a575500599b4757fe4a511b79..d92cea15f529cc46750816b748618c4b492926de 100644
+--- a/lib/commands/select.js
++++ b/lib/commands/select.js
+@@ -58,13 +58,16 @@ module.exports = async (connection, path, options) => {
+         // the changes (new flags, expunged UIDs) since that point.
+         let extraArgs = [];
+         if (connection.enabled.has('QRESYNC') && options.changedSince && options.uidValidity) {
+-            extraArgs.push([
+-                { type: 'ATOM', value: 'QRESYNC' },
+-                [
+-                    { type: 'ATOM', value: options.uidValidity?.toString() },
+-                    { type: 'ATOM', value: options.changedSince.toString() }
+-                ]
+-            ]);
++            let qresyncArgs = [
++                { type: 'ATOM', value: options.uidValidity?.toString() },
++                { type: 'ATOM', value: options.changedSince.toString() }
++            ];
++            // RFC 7162 known-uids: some servers report expunges only for UIDs the
++            // client names, so a caller that knows its UIDs should send them.
++            if (options.knownUids) {
++                qresyncArgs.push({ type: 'SEQUENCE', value: options.knownUids.toString() });
++            }
++            extraArgs.push([{ type: 'ATOM', value: 'QRESYNC' }, qresyncArgs]);
+             map.qresync = true;
+         }
+ 
 diff --git a/lib/commands/status.js b/lib/commands/status.js
 index 0e15a480d321d746c38f869109f556560737baf0..5f201c8b8084e97ecd41c53af9f529afe3869b61 100644
 --- a/lib/commands/status.js
@@ -377,7 +405,7 @@ index 9369b2afec863bb9b36cc6a8378fd362eb0d107b..f2aeda401a76637860ed31b0f9da6d6b
      ['AUTHENTICATE', require('./commands/authenticate.js')]
  ]);
 diff --git a/lib/imap-flow.d.ts b/lib/imap-flow.d.ts
-index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d60602b82 100644
+index 413ac6f273d7d244ee8e989db497feb5c804c985..fea176256e753c9080cb2e3552724bf84a4b8551 100644
 --- a/lib/imap-flow.d.ts
 +++ b/lib/imap-flow.d.ts
 @@ -147,6 +147,8 @@ export interface MailboxObject {
@@ -406,7 +434,7 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d
      /** Set specific paths as special use folders */
      specialUseHints?: {
          /** Path to "Sent Mail" folder */
-@@ -608,6 +620,10 @@ export interface MailboxOpenOptions {
+@@ -608,6 +620,12 @@ export interface MailboxOpenOptions {
      readOnly?: boolean;
      /** Optional description for mailbox lock tracking */
      description?: string;
@@ -414,10 +442,12 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..8582d5880f8443931c6a848101cbe69d
 +    uidValidity?: bigint;
 +    /** QRESYNC cursor: last known HIGHESTMODSEQ */
 +    changedSince?: bigint;
++    /** QRESYNC known UIDs (RFC 7162), as an IMAP UID sequence set such as "1:412" */
++    knownUids?: string;
  }
  
  export interface MailboxLockOptions extends MailboxOpenOptions {
-@@ -800,6 +816,9 @@ export class ImapFlow extends EventEmitter {
+@@ -800,6 +818,9 @@ export class ImapFlow extends EventEmitter {
          }
      ): Promise<StatusObject>;
  

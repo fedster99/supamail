@@ -104,8 +104,10 @@ deletion-complete QRESYNC mod-sequence cursor and the server advertises QRESYNC.
 That cursor is separate from the flag-only CONDSTORE HIGHESTMODSEQ cursor, so a
 flag scan cannot move replay past unseen VANISHED history. The pinned ImapFlow
 dependency is patched so a replay cursor cannot take its same-mailbox lock fast
-path and silently skip SELECT. SupaMail captures exact changed flags and
-VANISHED UIDs during selection, applies them in bounded writes, and advances
+path and silently skip SELECT, and the replay SELECT names the folder's known
+UID range, because some servers (Purelymail) report VANISHED only for UIDs the
+client names. SupaMail captures exact changed flags and VANISHED UIDs during
+selection, applies them in bounded writes, and advances
 the QRESYNC cursor only after the complete replay succeeds. Rejection, cursor
 invalidity, sequence-only EXPUNGE, malformed events, or capture-budget overflow
 returns immediately to CONDSTORE plus exact UID reconciliation. One rejection

@@ -820,6 +820,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       body: "new"
     }));
 
+    let archiveReplay: QresyncRequest | undefined;
     class QresyncFixtureClient extends FixtureImapClient {
       capabilities = new Map<string, boolean>([["QRESYNC", true]]);
 
@@ -829,6 +830,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       ): Promise<MailboxLock> {
         const lock = await super.getMailboxLock(path);
         if (!options.qresync || path !== "Archive") return lock;
+        archiveReplay = options.qresync;
         return {
           ...lock,
           qresync: {
@@ -874,6 +876,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.flagsUpdated).toBe(1);
     expect(result.reconcileGapsFound).toBe(1);
     expect(acknowledge).toHaveBeenCalledWith([change]);
+    // Servers such as Purelymail report expunges only for UIDs the client names.
+    expect(archiveReplay?.knownUids).toBe("1:302");
     expect(fetch.mock.calls.some(([range]) => range === "1:*")).toBe(false);
     const rows = await h.pool.query<{
       uid: string;
