@@ -112,7 +112,8 @@ const RELEASED_MIGRATION_SHA256: Record<string, string> = {
   "0029_active_assignments_view_no_barrier.sql": "3d44fe55233bc035477c62a8c62c1e58fbda168f5743f43b54b2f2009fb6cc82",
   "0030_window_from_message_date.sql": "ef838f7cdc055fe834792e2245e2bab7d8decb55c7cbcc47022ae57b69a197c3",
   "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf",
-  "0032_drop_retired_window_columns.sql": "abc1cc8e485f7ee386722b1d0de994233a92d1ed79bcdfa711cb63741d7c30c1"
+  "0032_drop_retired_window_columns.sql": "abc1cc8e485f7ee386722b1d0de994233a92d1ed79bcdfa711cb63741d7c30c1",
+  "0033_folder_committed_status.sql": "8f55fc29be285826b1917c9d4ddc364fb0f0ab4e42e988ff41636baa5a2b5dab"
 };
 
 describe("initial schema", () => {
@@ -340,9 +341,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = (await readPublicMigrationFiles()).map((migration) => migration.sql).join("\n\n");
 
-    expect(version).toBe("0032_drop_retired_window_columns");
+    expect(version).toBe("0033_folder_committed_status");
     expect(manifest).toEqual({
-      schemaVersion: "0032_drop_retired_window_columns",
+      schemaVersion: "0033_folder_committed_status",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -375,7 +376,8 @@ describe("initial schema", () => {
         { id: "0029_active_assignments_view_no_barrier", file: "0029_active_assignments_view_no_barrier.sql" },
         { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" },
         { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" },
-        { id: "0032_drop_retired_window_columns", file: "0032_drop_retired_window_columns.sql" }
+        { id: "0032_drop_retired_window_columns", file: "0032_drop_retired_window_columns.sql" },
+        { id: "0033_folder_committed_status", file: "0033_folder_committed_status.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -390,6 +392,8 @@ describe("initial schema", () => {
     expect(sql).toContain("ALTER COLUMN raw_mime DROP NOT NULL");
     expect(sql).toContain("imap_message_bodies_body_head_trgm_idx");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS qresync_highest_modseq numeric");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS committed_messages bigint");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS committed_unseen bigint");
     expect(sql).toContain("left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)");
     expect(sql).toContain("parsed_delivery_sha256 text");
     expect(sql).toContain("cursor_message_id uuid");

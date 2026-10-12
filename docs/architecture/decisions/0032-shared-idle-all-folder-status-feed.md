@@ -1,6 +1,6 @@
 # ADR 0032: Extend the Shared IDLE Session with an All-Folder STATUS Feed
 
-Status: Accepted
+Status: Accepted; amended by ADR 0042 for the observation's cursor and stored MESSAGES and UNSEEN
 
 Date: 2026-08-16
 
@@ -122,7 +122,9 @@ worst-case detection bound is `ceil(non-Inbox tracked folders / 15)` minutes.
 Each live pass consumes at most the same configured batch. Initial connection
 setup records a baseline for every tracked folder, capped by the Mailbox
 Account's effective folder limit.
-Persisted cursors do not include `MESSAGES` or `UNSEEN`. Only the separate,
+Persisted cursors do not include `MESSAGES` or `UNSEEN`. *Amended by ADR 0042:*
+`imap_folders` now stores committed `MESSAGES` and `UNSEEN`; this session still
+seeds reconnect without them. Only the separate,
 deletion-complete QRESYNC cursor can prove that no expunge occurred; the
 flag-only CONDSTORE cursor cannot. Unless that QRESYNC cursor matches the
 current provider modseq, reconnect requests exact reconciliation once. Without

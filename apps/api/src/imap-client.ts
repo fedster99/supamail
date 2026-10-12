@@ -67,9 +67,23 @@ export interface MailboxChange {
   observed: MailboxStatus;
 }
 
+/**
+ * One folder cursor a pass stored. A pass reports one for every folder whose
+ * first sync is complete, not only for the changes it acknowledges.
+ */
 export interface MailboxChangeObservation {
+  /**
+   * The stored cursor: UIDVALIDITY and the UIDNEXT the pass reached, not the
+   * one SELECT reported, then the committed MESSAGES, UNSEEN, and HIGHESTMODSEQ.
+   * A field the mirror cannot vouch for is absent.
+   */
   status: MailboxStatus;
+  /**
+   * This pass proved MESSAGES: a complete reconcile or QRESYNC replay, or every
+   * new UID fetched with MESSAGES grown by exactly those.
+   */
   reconcileComplete: boolean;
+  /** This pass completed a flag scan or QRESYNC flag replay. */
   flagScanComplete: boolean;
 }
 
