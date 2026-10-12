@@ -11,7 +11,7 @@ import type {
 } from "../imap-client.js";
 import { getWindowCutoff, resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
-import { MirrorEngine } from "../sync-engine.js";
+import { MirrorEngine, PROVIDER_OVER_QUOTA_RETRY_MS } from "../sync-engine.js";
 import type { ImapFolder } from "../types.js";
 import {
   plaintextMetadataProtection,
@@ -2520,6 +2520,154 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(row.sync_state_reason).toBe("AUTH_ERROR");
     expect(row.current_backoff_ms).toBe(0);
     expect(row.backoff_until).toBeNull();
+  });
+
+  it("treats OVERQUOTA as the provider's limit with a long backoff, from any pass and any lane", async () => {
+    const overQuota = () => Object.assign(new Error("Command failed"), {
+      authenticationFailed: true,
+      serverResponseCode: "OVERQUOTA",
+      responseStatus: "NO",
+      response: "NO [OVERQUOTA] Account exceeded command or bandwidth limits"
+    });
+    const accountState = async (accountId: string) => (await getPool().query<{
+      sync_state: string;
+      sync_state_reason: string;
+      backoff_wait_ms: number;
+    }>(
+      `SELECT sync_state, sync_state_reason,
+              (extract(epoch from backoff_until - now()) * 1000)::bigint::int AS backoff_wait_ms
+         FROM public.imap_accounts WHERE id = $1`,
+      [accountId]
+    )).rows[0];
+
+    // At LOGIN, in a scheduled pass and in a supplemental live pass.
+    for (const options of [{}, { liveInboxOnly: true }]) {
+      const h = await setupIntegration("over-quota-login");
+      activeAccountIds.push(h.account.id);
+      const engine = h.buildEngine({
+        folders: [],
+        clientFactory: async () => {
+          throw overQuota();
+        }
+      });
+
+      const result = await engine.syncAccount(h.account.id, "manual", options);
+
+      expect(result.outcome).toBe("failed");
+      const state = await accountState(h.account.id);
+      expect(state.sync_state).toBe("DEGRADED");
+      expect(state.sync_state_reason).toBe("RATE_LIMITED");
+      expect(state.backoff_wait_ms).toBeGreaterThan(PROVIDER_OVER_QUOTA_RETRY_MS - 60_000);
+    }
+
+    // In a BYE on a folder: the provider closed the session for the whole account.
+    class OverQuotaByeClient extends FixtureImapClient {
+      override async getMailboxLock(): Promise<MailboxLock> {
+        throw Object.assign(new Error("Connection not available"), {
+          code: "NoConnection",
+          serverResponseCode: "OVERQUOTA"
+        });
+      }
+    }
+    const h = await setupIntegration("over-quota-bye");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const result = await h.buildEngine({
+      folders,
+      clientFactory: async () => new OverQuotaByeClient(folders)
+    }).syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("failed");
+    const state = await accountState(h.account.id);
+    expect(state.sync_state_reason).toBe("RATE_LIMITED");
+    expect(state.backoff_wait_ms).toBeGreaterThan(PROVIDER_OVER_QUOTA_RETRY_MS - 60_000);
+  });
+
+  it("pauses older bodies at the download budget while recent bodies and history metadata continue", async () => {
+    const day = 24 * 60 * 60_000;
+    const h = await setupIntegration("download-budget", {
+      BODY_BACKFILL_BATCH_SIZE: 10,
+      INITIAL_SYNC_BATCH_SIZE: 50
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+          SET body_fetch_policy = 'immediate',
+              historical_backfill_mode = 'metadata_and_bodies',
+              max_backfill_rate = 'aggressive'
+        WHERE id = $1`,
+      [h.account.id]
+    );
+    const message = (uid: number, internalDate: Date) => makeTextMessage({
+      uid,
+      subject: `m-${uid}`,
+      from: "a@x.test",
+      to: "u@x.test",
+      body: `body ${uid}`,
+      internalDate
+    });
+    const messages = [
+      message(1, new Date("2023-01-01T00:00:00Z")),
+      message(2, new Date("2023-02-01T00:00:00Z")),
+      message(3, new Date(Date.now() - 31 * day)),
+      message(4, new Date(Date.now() - 30 * day)),
+      message(5, new Date(Date.now() - 2 * day)),
+      message(6, new Date(Date.now() - day))
+    ];
+    const folders: FixtureFolder[] = [{
+      path: "INBOX",
+      delimiter: "/",
+      specialUse: "\\Inbox",
+      uidValidity: 81_101,
+      messages
+    }];
+    const sync = (downloadBudgetBytes?: number) => h.buildEngine({ folders }).syncAccount(
+      h.account.id,
+      "manual",
+      downloadBudgetBytes === undefined ? {} : { downloadBudgetBytes }
+    );
+    const stored = async () => (await h.pool.query<{ uid: string; has_body: boolean }>(
+      `SELECT uid::text AS uid, body_fetched_at IS NOT NULL AS has_body
+         FROM public.imap_messages
+        WHERE account_id = $1 AND deleted_in_provider = false
+        ORDER BY uid`,
+      [h.account.id]
+    )).rows.map((row) => `${row.uid}:${row.has_body ? "body" : "metadata"}`);
+    const size = (uid: number) => messages.find((candidate) => candidate.uid === uid)!.raw.length;
+
+    // A spent budget: recent bodies arrive, older bodies wait, and history
+    // still stores every message's metadata.
+    const spent = await sync(0);
+    expect(spent.outcome).toBe("success");
+    expect(spent.downloadBudgetReached).toBe(true);
+    expect(spent.downloadedBytes).toBe(size(5) + size(6));
+    expect(await stored()).toEqual([
+      "1:metadata", "2:metadata", "3:metadata", "4:metadata", "5:body", "6:body"
+    ]);
+
+    // Room for one older body: the newest older message comes first.
+    const partial = await sync(size(4));
+    expect(partial.downloadBudgetReached).toBe(true);
+    expect(partial.downloadedBytes).toBe(size(4));
+    expect(await stored()).toEqual([
+      "1:metadata", "2:metadata", "3:metadata", "4:body", "5:body", "6:body"
+    ]);
+
+    // Without a budget everything downloads.
+    const open = await sync();
+    expect(open.downloadBudgetReached).toBe(false);
+    expect(await stored()).toEqual([
+      "1:body", "2:body", "3:body", "4:body", "5:body", "6:body"
+    ]);
+
+    const run = await h.pool.query<{ metadata: { downloadedBytes: number; downloadBudgetReached: boolean } }>(
+      "SELECT metadata FROM public.imap_sync_runs WHERE id = $1",
+      [partial.runId]
+    );
+    expect(run.rows[0].metadata).toMatchObject({
+      downloadedBytes: size(4),
+      downloadBudgetReached: true
+    });
   });
 
   it("Scenario D — UIDVALIDITY reset cap → BROKEN after >2 in 24h (spec §11)", async () => {

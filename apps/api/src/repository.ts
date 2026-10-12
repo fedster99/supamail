@@ -1119,6 +1119,8 @@ export class MirrorRepository {
           reconcileFoldersAttempted: result.reconcileFoldersAttempted ?? 0,
           reconcileProviderUidsSeen: result.reconcileProviderUidsSeen ?? 0,
           reconcileDurationMs: result.reconcileDurationMs ?? 0,
+          downloadedBytes: result.downloadedBytes ?? null,
+          downloadBudgetReached: result.downloadBudgetReached ?? false,
           folderChecks: result.folderChecks
         })
       ]
@@ -1440,10 +1442,14 @@ export class MirrorRepository {
     }
   }
 
+  /**
+   * `minimumBackoffMs` lengthens the next retry when the provider asked the
+   * Mailbox Account to wait (RFC 5530 OVERQUOTA).
+   */
   async markAccountSyncFailed(
     accountId: string,
     error: string,
-    options: SyncStateWriteOptions = {}
+    options: SyncStateWriteOptions & { minimumBackoffMs?: number } = {}
   ): Promise<void> {
     // CTE computes the doubled-and-clamped backoff once so the same value
     // feeds both `current_backoff_ms` and `backoff_until` — without it the
@@ -1520,7 +1526,7 @@ export class MirrorRepository {
           -- uses — so a genuinely-broken account is re-attempted rarely while a
           -- recovered one still heals within the interval.
           WHEN a.consecutive_failures + 1 >= $3 THEN now() + ($8::bigint * interval '1 millisecond')
-          ELSE now() + (next_backoff.jittered_ms * interval '1 millisecond')
+          ELSE now() + (GREATEST(next_backoff.jittered_ms, $10::int) * interval '1 millisecond')
         END
       FROM stuck_state, next_backoff
       WHERE a.id = $1
@@ -1536,7 +1542,8 @@ export class MirrorRepository {
         this.config.STUCK_DEGRADED_BROKEN_THRESHOLD_MS,
         this.config.STUCK_DEGRADED_TERMINAL_THRESHOLD_MS,
         this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS,
-        options.expectedSyncOwner ?? null
+        options.expectedSyncOwner ?? null,
+        options.minimumBackoffMs ?? 0
       ],
       options
     );
@@ -4593,7 +4600,12 @@ export class MirrorRepository {
     }
   }
 
-  async getHistoryBacklog(account: ImapAccount, limit: number): Promise<HistoryBacklogFolder[]> {
+  /** `bodies: false` returns metadata work only: walks and snapshots, never body batches. */
+  async getHistoryBacklog(
+    account: ImapAccount,
+    limit: number,
+    options: { bodies?: boolean } = {}
+  ): Promise<HistoryBacklogFolder[]> {
     if (account.historical_backfill_mode === "off") return [];
 
     const result = await this.pool.query<HistoryBacklogFolder>(
@@ -4620,6 +4632,7 @@ export class MirrorRepository {
           FROM public.imap_messages m
           LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
           WHERE $2::text = 'metadata_and_bodies'
+            AND $6::boolean
             AND m.account_id = f.account_id
             AND m.folder_path = f.path
             AND m.deleted_in_provider = false
@@ -4654,7 +4667,8 @@ export class MirrorRepository {
         account.historical_backfill_mode,
         limit,
         EVIDENCE_VERSIONS_WITHOUT_REFETCH,
-        getWindowCutoff(account)
+        getWindowCutoff(account),
+        options.bodies !== false
       ]
     );
     return result.rows;
@@ -4784,12 +4798,19 @@ export class MirrorRepository {
     }
   }
 
-  async getBodyBacklog(account: ImapAccount, limit: number): Promise<ImapMessage[]> {
+  /** `since` narrows the live-window backlog to mail dated at or after it. */
+  async getBodyBacklog(
+    account: ImapAccount,
+    limit: number,
+    options: { since?: Date } = {}
+  ): Promise<ImapMessage[]> {
     const policy = account.body_fetch_policy || (this.config.BODY_FETCH_POLICY as BodyFetchPolicy);
     if (policy === "lazy") return [];
 
+    const windowCutoff = getWindowCutoff(account);
+    const cutoff = options.since && options.since > windowCutoff ? options.since : windowCutoff;
     const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $5" : "";
-    const params: unknown[] = [account.id, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, getWindowCutoff(account)];
+    const params: unknown[] = [account.id, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, cutoff];
     if (policy === "priority_then_backfill") params.push(this.config.PRIORITY_CUTOFF);
 
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(

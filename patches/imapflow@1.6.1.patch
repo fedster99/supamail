@@ -458,7 +458,7 @@ index 413ac6f273d7d244ee8e989db497feb5c804c985..fea176256e753c9080cb2e3552724bf8
      idle(): Promise<boolean>;
  
 diff --git a/lib/imap-flow.js b/lib/imap-flow.js
-index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecdb061ea36 100644
+index a45fb40307bf6d03e61b463e3a29116df94a6a30..f19d1ed4d5b8fc8e13102afb0127b661d3f3cd90 100644
 --- a/lib/imap-flow.js
 +++ b/lib/imap-flow.js
 @@ -16,6 +16,7 @@ const { LimitedPassthrough } = require('./limited-passthrough');
@@ -469,7 +469,25 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
  const packageInfo = require('../package.json');
  
  const libqp = require('libqp');
-@@ -1805,7 +1806,22 @@ class ImapFlow extends EventEmitter {
+@@ -37,6 +38,7 @@ const {
+     expandRange,
+     AuthenticationFailure,
+     getColorFlags,
++    getStatusCode,
+     hasCapability,
+     unrefTimer
+ } = require('./tools');
+@@ -1776,6 +1778,9 @@ class ImapFlow extends EventEmitter {
+                 .join(' ');
+ 
+         this.byeReason = reason || 'Server closed connection';
++        // Keep the BYE's response code too (RFC 5530, e.g. OVERQUOTA for Gmail's
++        // bandwidth suspension), so callers can classify the close by code.
++        this.byeResponseCode = getStatusCode(parsed) || null;
+         this.untaggedHandlers.BYE = null;
+         this.state = this.states.LOGOUT;
+     }
+@@ -1805,7 +1810,22 @@ class ImapFlow extends EventEmitter {
          this.updateCapabilitiesFromRaw(untagged.attributes);
      }
  
@@ -492,7 +510,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
          if (!this.mailbox) {
              // mailbox closed, ignore
              return;
-@@ -1827,11 +1843,13 @@ class ImapFlow extends EventEmitter {
+@@ -1827,11 +1847,13 @@ class ImapFlow extends EventEmitter {
          this.emit('exists', {
              path: this.mailbox.path,
              count,
@@ -507,7 +525,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
          if (!this.mailbox) {
              // mailbox closed, ignore
              return;
-@@ -1847,7 +1865,8 @@ class ImapFlow extends EventEmitter {
+@@ -1847,7 +1869,8 @@ class ImapFlow extends EventEmitter {
              let payload = {
                  path: this.mailbox.path,
                  seq,
@@ -517,7 +535,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
              };
  
              if (typeof this.options.expungeHandler === 'function') {
-@@ -1881,7 +1900,16 @@ class ImapFlow extends EventEmitter {
+@@ -1881,7 +1904,16 @@ class ImapFlow extends EventEmitter {
              uids = untagged.attributes[0].value;
          }
  
@@ -535,7 +553,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
  
          for (let uid of uidList) {
              let payload = {
-@@ -1904,6 +1932,12 @@ class ImapFlow extends EventEmitter {
+@@ -1904,6 +1936,12 @@ class ImapFlow extends EventEmitter {
      }
  
      async untaggedFetch(untagged, mailbox) {
@@ -548,7 +566,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
          mailbox = mailbox || this.mailbox;
          if (!mailbox) {
              // mailbox closed, ignore
-@@ -1914,7 +1948,8 @@ class ImapFlow extends EventEmitter {
+@@ -1914,7 +1952,8 @@ class ImapFlow extends EventEmitter {
          if (message.flags) {
              let updateEvent = {
                  path: mailbox.path,
@@ -558,7 +576,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
              };
  
              if (message.uid) {
-@@ -1935,6 +1970,20 @@ class ImapFlow extends EventEmitter {
+@@ -1935,6 +1974,20 @@ class ImapFlow extends EventEmitter {
          }
      }
  
@@ -579,7 +597,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
      async ensureSelectedMailbox(path) {
          if (!path) {
              return false;
-@@ -2049,6 +2098,7 @@ class ImapFlow extends EventEmitter {
+@@ -2049,6 +2102,7 @@ class ImapFlow extends EventEmitter {
  
          this.untaggedHandlers.CAPABILITY = (...args) => this.untaggedCapability(...args);
          this.sectionHandlers.CAPABILITY = (...args) => this.sectionCapability(...args);
@@ -587,7 +605,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
  
          this.untaggedHandlers.EXISTS = (...args) => this.untaggedExists(...args);
          this.untaggedHandlers.EXPUNGE = (...args) => this.untaggedExpunge(...args);
-@@ -2056,6 +2106,7 @@ class ImapFlow extends EventEmitter {
+@@ -2056,6 +2110,7 @@ class ImapFlow extends EventEmitter {
          // these methods take an optional second argument, so make sure that some random IMAP tag is not used as the second argument
          this.untaggedHandlers.FETCH = untagged => this.untaggedFetch(untagged);
          this.untaggedHandlers.VANISHED = untagged => this.untaggedVanished(untagged);
@@ -595,7 +613,27 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
  
          let socket = false;
          if (this.options.proxy) {
-@@ -2534,6 +2585,10 @@ class ImapFlow extends EventEmitter {
+@@ -2216,6 +2271,9 @@ class ImapFlow extends EventEmitter {
+         error.code = 'NoConnection';
+         if (byeReason) {
+             error.reason = byeReason;
++            if (this.byeResponseCode) {
++                error.serverResponseCode = this.byeResponseCode;
++            }
+         }
+         return error;
+     }
+@@ -2276,6 +2334,9 @@ class ImapFlow extends EventEmitter {
+                 // connection was closed by an untagged BYE, so the caller sees why.
+                 if (this.byeReason) {
+                     err.reason = this.byeReason;
++                    if (this.byeResponseCode) {
++                        err.serverResponseCode = this.byeResponseCode;
++                    }
+                 }
+                 // Synchronous rejection is safe: connectPromise.catch(noop) is already
+                 // attached, so the rejection is observed immediately. close() is synchronous,
+@@ -2534,6 +2595,10 @@ class ImapFlow extends EventEmitter {
       * @property {Boolean} [statusQuery.highestModseq] if `true` request last known modseq value
       * @property {Boolean} [statusQuery.size] if `true` request total mailbox size in octets (requires STATUS=SIZE or IMAP4rev2)
       * @property {Boolean} [statusQuery.deleted] if `true` request count of messages with \\Deleted flag (requires IMAP4rev2)
@@ -606,7 +644,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
       * @property {Object} [specialUseHints] set specific paths as special use folders, this would override special use flags provided from the server
       * @property {String} [specialUseHints.sent] Path to "Sent Mail" folder
       * @property {String} [specialUseHints.trash] Path to "Trash" folder
-@@ -2554,8 +2609,11 @@ class ImapFlow extends EventEmitter {
+@@ -2554,8 +2619,11 @@ class ImapFlow extends EventEmitter {
       */
      async list(options) {
          options = options || {};
@@ -620,7 +658,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
          return folders;
      }
  
-@@ -2767,6 +2825,18 @@ class ImapFlow extends EventEmitter {
+@@ -2767,6 +2835,18 @@ class ImapFlow extends EventEmitter {
          return await this.run('STATUS', path, query);
      }
  
@@ -639,7 +677,7 @@ index a45fb40307bf6d03e61b463e3a29116df94a6a30..a22b23057cc33a79777684f079794ecd
      /**
       * Starts listening for new or deleted messages from the currently opened mailbox. Only required if {@link ImapFlow#disableAutoIdle} is set to `true`
       * otherwise IDLE is started by default on connection inactivity. NB! If `idle()` is called manually then it does not
-@@ -4182,7 +4252,11 @@ class ImapFlow extends EventEmitter {
+@@ -4182,7 +4262,11 @@ class ImapFlow extends EventEmitter {
                      continue; // Process next lock in queue
                  }
  

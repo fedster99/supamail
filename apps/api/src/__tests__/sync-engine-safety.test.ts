@@ -167,6 +167,17 @@ describe("sync engine safety", () => {
       authenticationFailed: true,
       code: "NoConnection"
     }))).toBe(false);
+    // Their stored reason must not ask the User to sign in again either.
+    const { diagnosticErrorCode: storedReason } = await import("../repository.js");
+    expect(storedReason(describeSyncError(Object.assign(new Error("Command failed"), {
+      authenticationFailed: true,
+      serverResponseCode: "UNAVAILABLE",
+      response: "Temporary System Problem"
+    })))).toBe("SYNC_ERROR");
+    expect(storedReason(describeSyncError(Object.assign(new Error("Connection not available"), {
+      authenticationFailed: true,
+      code: "NoConnection"
+    })))).toBe("CONNECTION_ERROR");
     // Back-compat: plain strings still pattern-match.
     expect(isAuthError("535 5.7.8 authentication failed")).toBe(true);
 
@@ -332,7 +343,7 @@ describe("sync engine safety", () => {
     expect(source.indexOf("getFoldersDueForSync")).toBeLessThan(source.indexOf("fetchBodyBacklog"));
     expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
     expect(source).toContain("account.max_backfill_rate");
-    expect(source).toContain("getHistoryBacklog(account, 1)");
+    expect(source).toContain("getHistoryBacklog(account, 1, {");
     expect(source).toContain("setHistoryBackfillSnapshot");
     expect(source).toContain("advanceHistoryBackfillWatermark");
   });
@@ -346,6 +357,6 @@ describe("sync engine safety", () => {
     expect(config).toContain("BACKFILL_WINDOW_TIMEZONE");
     expect(source).toContain("isWithinBackfillWindow(this.config)");
     expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
-    expect(source.indexOf("isWithinBackfillWindow(this.config)")).toBeLessThan(source.indexOf("getHistoryBacklog(account, 1)"));
+    expect(source.indexOf("isWithinBackfillWindow(this.config)")).toBeLessThan(source.indexOf("getHistoryBacklog(account, 1, {"));
   });
 });

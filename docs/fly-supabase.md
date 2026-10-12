@@ -101,7 +101,7 @@ end-to-end throughput:
 - `metadataThroughputRowsPerSecond` is committed metadata rows divided by the full tick's monotonic wall time. Use this for production throughput.
 - `metadataTelemetryComplete=false` makes both rates `null`, so mixed-version or incomplete results cannot report a misleading rate.
 
-`metadataRowsCommitted` includes acknowledged conflict updates, not only newly discovered email. Per-run write counts, duration, batch attempts/failures, and write-service rate are also stored in `imap_sync_runs.metadata`.
+`metadataRowsCommitted` includes acknowledged conflict updates, not only newly discovered email. Per-run write counts, duration, batch attempts/failures, and write-service rate are also stored in `imap_sync_runs.metadata`, with the IMAP bytes the pass downloaded (`downloadedBytes`) and whether a host download budget paused older bodies (`downloadBudgetReached`, ADR 0042).
 
 Useful Fly commands:
 
