@@ -135,6 +135,24 @@ liveDb("message change outbox", () => {
     expect((await changes()).slice(beforeBatch).sort()).toEqual([idOf(1), idOf(2)].sort());
   });
 
+  it("leaves body and updated_at changes HOT-eligible: no index covers them", async () => {
+    // PostgreSQL makes an update heap-only only when it changes no indexed column,
+    // counting columns in index keys, expressions, and predicates.
+    const indexed = await getPool().query<{ attname: string }>(
+      `SELECT DISTINCT a.attname
+       FROM pg_index i
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum > 0 AND NOT a.attisdropped
+       WHERE i.indrelid = 'public.imap_messages'::regclass
+         AND (a.attnum = ANY(i.indkey::int2[])
+           OR coalesce(pg_get_expr(i.indexprs, i.indrelid), '') ~ ('\\m' || a.attname || '\\M')
+           OR coalesce(pg_get_expr(i.indpred, i.indrelid), '') ~ ('\\m' || a.attname || '\\M'))`
+    );
+    const columns = indexed.rows.map((row) => row.attname);
+    expect(columns).toContain("deleted_in_provider");
+    expect(columns).not.toContain("updated_at");
+    expect(columns).not.toContain("body_fetched_at");
+  });
+
   it("needs no rights on the outbox from a writer", async () => {
     const h = await setupIntegration("message-change-writer-rights", { INITIAL_SYNC_BATCH_SIZE: 10 });
     accountIds.push(h.account.id);
