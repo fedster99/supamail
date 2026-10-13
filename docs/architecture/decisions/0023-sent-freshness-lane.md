@@ -1,6 +1,6 @@
 # ADR 0023: Bounded Sent Freshness Lane
 
-Status: Accepted
+Status: Accepted; amended by ADR 0043, which makes every pass, including Sent, record account health
 
 Date: 2026-07-12
 
@@ -26,6 +26,11 @@ skips folder discovery, flag scans, reconcile, body backlog, and history. It
 finishes its durable sync run and releases `currently_syncing`, but does not update
 the account's full-sweep `last_sync_finished_at` or claim that full-account
 health/backoff was recomputed; the next full sweep owns those transitions.
+
+*Superseded by ADR 0043:* the Sent pass now records account health and
+classifies its failures like every pass. It still leaves
+`last_sync_finished_at` alone, and its success cannot reset backoff while a
+priority folder's last sync is unfinished.
 
 The next full-sweep start time is also the Sent lane's hard scheduling deadline.
 When that deadline arrives, the worker aborts connection setup, throttle waits,

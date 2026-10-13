@@ -25,7 +25,7 @@ import type {
   MailboxStatus,
   MirrorImapClient
 } from "./imap-client.js";
-import { AccountBusyError } from "./errors.js";
+import { AccountBusyError, InvalidInputError, NotFoundError } from "./errors.js";
 import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -43,9 +43,11 @@ import type {
   HistoryBacklogFolder,
   MessageMetadata,
   MirrorHooks,
+  SyncMode,
   SyncResult,
   SyncTriggerType
 } from "./types.js";
+import { SYNC_MODES } from "./types.js";
 import { createImapClient } from "./imap-client.js";
 
 // Patterns from real IMAP/SASL servers. Case-insensitive. Matched against
@@ -62,6 +64,10 @@ const MAX_INCREMENTAL_BATCHES_PER_PASS = 20;
 /** How long a provider that did not activate QRESYNC is left alone before the next try. */
 const QRESYNC_UNAVAILABLE_RETRY_MS = 6 * 60 * 60_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
+/** Modes whose folder lane may run the exact UID audit. */
+const RECONCILE_MODES: ReadonlySet<SyncMode> = new Set(["full", "live", "audit"]);
+/** Modes whose folder lane may run a flag scan. */
+const FLAG_SCAN_MODES: ReadonlySet<SyncMode> = new Set(["full", "live", "flag_scan", "audit"]);
 
 const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
 const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
@@ -305,23 +311,43 @@ export interface MirrorEngineOptions {
 }
 
 export interface SyncAccountOptions {
-  sentOnly?: boolean;
-  /** Run one authoritative folder LIST even when the discovery timer is not due. */
-  forceFolderDiscovery?: boolean;
-  /** Run the supplemental live-change lane (the name is retained for host compatibility). */
-  liveInboxOnly?: boolean;
   /**
-   * Authoritative folders changed by one provider-acknowledged mutation. The
-   * live lane verifies these paths even when IDLE/NOTIFY has not reported them.
-   * Limited to the source and destination of one mutation.
+   * The lanes this pass runs; `full` when absent.
+   * - `full`: discovery when due, due folders, the live body backlog, history,
+   *   and orphaned-run cleanup.
+   * - `live`: folders the host's change feed or `forceReconcileFolders` names,
+   *   or Inbox without them.
+   * - `sent`: due Sent folders, metadata only.
+   * - `first_sync`: discovery when due, then one batch, newest mail first, from
+   *   each folder whose first sync is incomplete.
+   * - `body`: the live body backlog.
+   * - `history`: older-than-window history.
+   * - `flag_scan`: folders whose flag scan is due.
+   * - `audit`: folders whose exact UID audit is due.
+   * Every mode records the Mailbox Account's state when it ends, except that a
+   * `sent`, `flag_scan`, or `audit` pass with nothing due neither logs in nor
+   * changes it. Orphaned-run cleanup is {@link MirrorEngine.closeOrphanedSyncRuns}.
+   */
+  mode?: SyncMode;
+  /** Full pass only: run one authoritative folder LIST even when the discovery timer is not due. */
+  forceFolderDiscovery?: boolean;
+  /**
+   * Live pass only: authoritative folders changed by one provider-acknowledged
+   * mutation. The live lane verifies these paths even when IDLE/NOTIFY has not
+   * reported them. Limited to the source and destination of one mutation.
    */
   forceReconcileFolders?: readonly string[];
-  /** Fetch the current live body backlog without running folder or history work. */
-  bodyBacklogOnly?: boolean;
-  /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
+  /** Live pass only: EXPUNGE is only a hint; force authoritative UID reconciliation now. */
   forceInboxReconcile?: boolean;
-  /** A flags notification may arrive before the normal flag deadline. */
+  /** Live pass only: a flags notification may arrive before the normal flag deadline. */
   forceInboxFlagScan?: boolean;
+  /**
+   * Per tracked folder path, the last time the host proved the provider equal
+   * to the folder's committed cursor. Health then counts a folder's lag from
+   * the later of this proof and its last sync, so a quiet folder no pass
+   * touched is not lagging. Without it, lag counts from the last sync.
+   */
+  folderFreshness?: ReadonlyMap<string, Date>;
   signal?: AbortSignal;
   /** Reuse a host-owned session, such as an Inbox IDLE connection. */
   client?: MirrorImapClient;
@@ -329,6 +355,57 @@ export interface SyncAccountOptions {
   clientAccountId?: string;
   /** Leave a healthy host-owned session open after this pass. */
   keepClientOpen?: boolean;
+}
+
+/**
+ * Reject host input that names work the chosen mode does not run, before the
+ * pass records a run or touches account state.
+ */
+function assertSyncAccountOptions(
+  accountId: string,
+  mode: SyncMode,
+  options: SyncAccountOptions
+): void {
+  if (!SYNC_MODES.includes(mode)) {
+    throw new InvalidInputError(`mode must be one of ${SYNC_MODES.join(", ")}`);
+  }
+  if (mode !== "full" && options.forceFolderDiscovery === true) {
+    throw new InvalidInputError("forceFolderDiscovery applies only to a full pass");
+  }
+  if (mode !== "live" && (options.forceInboxReconcile === true
+    || options.forceInboxFlagScan === true
+    || (options.forceReconcileFolders?.length ?? 0) > 0)) {
+    throw new InvalidInputError(
+      "forceReconcileFolders, forceInboxReconcile, and forceInboxFlagScan apply only to a live pass"
+    );
+  }
+  const forced = new Set(options.forceReconcileFolders ?? []);
+  if (forced.size > 2) {
+    throw new InvalidInputError("forceReconcileFolders accepts at most one source and one destination");
+  }
+  if ([...forced].some((path) => typeof path !== "string" || path.length === 0)) {
+    throw new InvalidInputError("forceReconcileFolders requires non-empty folder paths");
+  }
+  if (options.client && options.keepClientOpen !== true) {
+    throw new InvalidInputError("A host-owned client requires keepClientOpen");
+  }
+  if (options.keepClientOpen && !options.client) {
+    throw new InvalidInputError("keepClientOpen requires a host-owned client");
+  }
+  if (options.client && options.clientAccountId !== accountId) {
+    throw new InvalidInputError("Host-owned client does not match the Mailbox Account");
+  }
+  if (options.folderFreshness !== undefined) {
+    if (!(options.folderFreshness instanceof Map)) {
+      throw new InvalidInputError("folderFreshness must map folder paths to dates");
+    }
+    for (const [path, provenEqualAt] of options.folderFreshness) {
+      if (typeof path !== "string" || path.length === 0
+        || !(provenEqualAt instanceof Date) || !Number.isFinite(provenEqualAt.getTime())) {
+        throw new InvalidInputError("folderFreshness must map non-empty folder paths to valid dates");
+      }
+    }
+  }
 }
 
 export class MirrorEngine {
@@ -380,7 +457,7 @@ export class MirrorEngine {
     for (const account of accounts) {
       if (options.signal?.aborted) break;
       results.push(await this.syncAccount(account.id, "scheduled", {
-        sentOnly: true,
+        mode: "sent",
         signal: options.signal
       }));
     }
@@ -393,26 +470,11 @@ export class MirrorEngine {
     triggerType: SyncTriggerType = "manual",
     options: SyncAccountOptions = {}
   ): Promise<SyncResult> {
-    const supplementalModes = [
-      options.sentOnly === true,
-      options.liveInboxOnly === true,
-      options.bodyBacklogOnly === true
-    ].filter(Boolean).length;
-    if (supplementalModes > 1) {
-      throw new Error("sentOnly, liveInboxOnly, and bodyBacklogOnly cannot be combined");
-    }
-    if (options.client && options.keepClientOpen !== true) {
-      throw new Error("A host-owned client requires keepClientOpen");
-    }
-    if (options.keepClientOpen && !options.client) {
-      throw new Error("keepClientOpen requires a host-owned client");
-    }
-    if (options.client && options.clientAccountId !== accountId) {
-      throw new Error("Host-owned client does not match the Mailbox Account");
-    }
+    const mode = options.mode ?? "full";
+    assertSyncAccountOptions(accountId, mode, options);
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
-    const supplemental = supplementalModes === 1;
+    const fullPass = mode === "full";
 
     const runId = await this.repository.startSyncRun(account.id, triggerType);
     const metadataWriteStats: MetadataWriteStats = {
@@ -423,6 +485,7 @@ export class MirrorEngine {
     };
     const result: SyncResult = {
       runId,
+      mode,
       outcome: "success",
       foldersProcessed: 0,
       folderChecks: [],
@@ -443,6 +506,12 @@ export class MirrorEngine {
     };
     let cancellationCleanupRequired = false;
     const syncOwner = `supamail:${process.pid}:${runId}`;
+    const finalizationOptions = () => ({
+      fullPass,
+      deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
+      signal: options.signal,
+      expectedSyncOwner: syncOwner
+    });
 
     const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async (lock) => {
       const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
@@ -467,15 +536,15 @@ export class MirrorEngine {
         accountSyncStarted = true;
         // Holding the lock proves no other sync of this account is live, so any
         // run still open is a vanished worker's orphan. Cosmetic: never fail the
-        // sync over it, and leave it to full sweeps rather than frequent lanes.
-        if (!supplemental) {
+        // sync over it. Hosts that run no full pass use closeOrphanedSyncRuns.
+        if (fullPass) {
           await this.repository.closeOrphanedSyncRuns(account.id, runId).catch(() => 0);
         }
         throwIfInterrupted();
-        const sentFolders = options.sentOnly
-          ? await this.repository.getSentFoldersDueForSync(account.id)
-          : null;
-        if (options.sentOnly && sentFolders?.length === 0) {
+        // These modes take their folders from durable due times. With nothing
+        // due the pass does not log in and leaves health unchanged.
+        const dueFolders = await this.dueFoldersBeforeLogin(account.id, mode);
+        if (dueFolders?.length === 0) {
           await this.repository.markAccountSyncYielded(account.id, {
             deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
             signal: options.signal,
@@ -488,20 +557,12 @@ export class MirrorEngine {
           ?? await this.clientFactory(account, { signal: options.signal });
         throwIfInterrupted();
 
-        const mailboxChanges = options.liveInboxOnly
+        const mailboxChanges = mode === "live"
           ? [...(client.peekMailboxChanges?.(
               this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE + this.config.MAX_RR_FOLDERS_PER_CYCLE
             ) ?? [])]
           : [];
-        const forceReconcileFolders = options.liveInboxOnly
-          ? [...new Set(options.forceReconcileFolders ?? [])]
-          : [];
-        if (forceReconcileFolders.length > 2) {
-          throw new Error("forceReconcileFolders accepts at most one source and one destination");
-        }
-        if (forceReconcileFolders.some((path) => path.length === 0)) {
-          throw new Error("forceReconcileFolders requires non-empty folder paths");
-        }
+        const forceReconcileFolders = [...new Set(options.forceReconcileFolders ?? [])];
         const forcedReconcilePaths = new Set(forceReconcileFolders);
         const mailboxChangeByPath = new Map(
           mailboxChanges.map((change) => [change.path, change] as const)
@@ -514,27 +575,31 @@ export class MirrorEngine {
         ];
 
         let newlyTrackedFolderPaths: string[] = [];
-        if (!supplemental
+        if ((fullPass || mode === "first_sync")
           && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
           newlyTrackedFolderPaths = await this.discoverFolders(account, client);
         }
-        const catchUpPaths = supplemental
-          ? new Set<string>()
-          : await this.recordUnchangedFolders(account, client, result.folderChecks!, options.signal);
+        const catchUpPaths = fullPass
+          ? await this.recordUnchangedFolders(account, client, result.folderChecks!, options.signal)
+          : new Set<string>();
 
-        const folders = options.bodyBacklogOnly
-          ? []
-          : sentFolders ?? (options.liveInboxOnly
-          ? liveFolderPaths.length > 0
-            ? await this.repository.getFoldersForWake(
-                account.id,
-                liveFolderPaths
-              )
+        let folders: ImapFolder[];
+        if (dueFolders) {
+          folders = dueFolders;
+        } else if (mode === "full") {
+          folders = await this.repository.getFoldersDueForSync(account.id, newlyTrackedFolderPaths);
+        } else if (mode === "live") {
+          folders = liveFolderPaths.length > 0
+            ? await this.repository.getFoldersForWake(account.id, liveFolderPaths)
             : [await this.repository.getInboxFolderForWake(account.id)].filter(
                 (folder): folder is ImapFolder => folder !== null
-              )
-          : await this.repository.getFoldersDueForSync(account.id, newlyTrackedFolderPaths));
-        if (options.liveInboxOnly
+              );
+        } else if (mode === "first_sync") {
+          folders = await this.repository.getFoldersForFirstSync(account.id);
+        } else {
+          folders = [];
+        }
+        if (mode === "live"
           && (options.forceInboxReconcile === true || options.forceInboxFlagScan === true)) {
           const inboxIndex = folders.findIndex((folder) => folder.path.toLowerCase() === "inbox");
           const inboxFolder = inboxIndex >= 0
@@ -603,23 +668,20 @@ export class MirrorEngine {
           try {
             const folderResult = await this.syncFolder(account, folder, client, {
               qresyncCatchUp,
-              allowReconcile: !options.sentOnly
+              allowReconcile: RECONCILE_MODES.has(mode)
                 && (forceKnownReconcile || remainingReconciles > 0),
-              allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
+              allowFlagScan: FLAG_SCAN_MODES.has(mode) && remainingFlagScans > 0,
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
               reconcileTelemetry,
-              forceReconcile: options.liveInboxOnly
-                && (forceKnownReconcile
-                  || mailboxChange?.forceReconcile === true
-                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
-              forceAuthoritativeReconcile: options.liveInboxOnly
-                && (forceKnownReconcile
-                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true)),
-              forceFlagScan: options.liveInboxOnly
-                && (mailboxChange?.forceFlagScan === true
-                  || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true)),
+              forceReconcile: forceKnownReconcile
+                || mailboxChange?.forceReconcile === true
+                || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true),
+              forceAuthoritativeReconcile: forceKnownReconcile
+                || (folder.path.toLowerCase() === "inbox" && options.forceInboxReconcile === true),
+              forceFlagScan: mailboxChange?.forceFlagScan === true
+                || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true),
               signal: options.signal
             });
             check.outcome = folderResult.hitLockBudget || !folderResult.initialSyncComplete
@@ -712,21 +774,18 @@ export class MirrorEngine {
           result.errors.push("Live folder set no longer matches tracked folders");
         }
 
-        if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
+        if (mode !== "sent" && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
+        } else if ((fullPass || mode === "body") && !connectionLost) {
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
         }
 
-        if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
+        if (mode !== "sent" && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly
-          && !options.liveInboxOnly
-          && !options.bodyBacklogOnly
-          && !connectionLost) {
+        } else if ((fullPass || mode === "history") && !connectionLost) {
           const historyResult = await this.runHistoryLane(
             account,
             client,
@@ -757,31 +816,20 @@ export class MirrorEngine {
           }
         }
 
-        if (supplemental) {
-          await this.repository.markAccountSyncYielded(account.id, {
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
-          });
-        } else if (result.outcome === "failed") {
-          await this.repository.markAccountSyncFailed(account.id, result.errors.join("; "), {
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
-          });
+        // Every mode records the account's state the way a full pass does.
+        const finalization = finalizationOptions();
+        if (result.outcome === "failed") {
+          await this.repository.markAccountSyncFailed(account.id, result.errors.join("; "), finalization);
         } else if (result.outcome === "partial_success") {
           await this.repository.markAccountSyncPartial(account.id, result.errors.join("; "), {
-            countsTowardBackoff: !result.hitLockBudget,
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
+            ...finalization,
+            countsTowardBackoff: !result.hitLockBudget
           });
         } else {
           await this.repository.markAccountSyncSucceeded(account.id, {
+            ...finalization,
             countsTowardBackoff: !result.hitLockBudget,
-            deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-            signal: options.signal,
-            expectedSyncOwner: syncOwner
+            folderFreshness: options.folderFreshness
           });
         }
       } catch (error) {
@@ -794,7 +842,7 @@ export class MirrorEngine {
           // Defer database cleanup until withAccountLock has released the
           // advisory lock. A locked account row must not pin mailbox ownership.
           cancellationCleanupRequired = accountSyncStarted;
-          if (!supplemental) {
+          if (fullPass) {
             result.outcome = "partial_success";
             result.errors.push("Sync interrupted by scheduler");
           }
@@ -802,18 +850,13 @@ export class MirrorEngine {
         }
         // Classify on the ERROR OBJECT (imapflow auth failures say "Command failed"
         // in the message and carry the truth in structured props), and persist the
-        // enriched description so the stored reason explains WHY.
+        // enriched description so the stored reason explains WHY. Every mode
+        // classifies the same way: auth, a proven lost lock, or a failure.
         const message = describeSyncError(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
         try {
-          if (supplemental) {
-            await this.repository.markAccountSyncYielded(account.id, {
-              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-              signal: options.signal,
-              expectedSyncOwner: syncOwner
-            });
-          } else if (error instanceof AccountLockLivenessError && !error.retryable) {
+          if (error instanceof AccountLockLivenessError && !error.retryable) {
             // This worker provably no longer owns the account. Another worker
             // may, so write no account state; the next owner records its own.
           } else if (error instanceof AccountAlreadyFinalizedError) {
@@ -821,17 +864,9 @@ export class MirrorEngine {
             // exceeded → BROKEN). Don't re-mark; that would override BROKEN with
             // the DEGRADED/BROKEN-via-threshold CASE expression.
           } else if (isAuthError(error)) {
-            await this.repository.markAccountSyncAuthFailed(account.id, message, {
-              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-              signal: options.signal,
-              expectedSyncOwner: syncOwner
-            });
+            await this.repository.markAccountSyncAuthFailed(account.id, message, finalizationOptions());
           } else {
-            await this.repository.markAccountSyncFailed(account.id, message, {
-              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
-              signal: options.signal,
-              expectedSyncOwner: syncOwner
-            });
+            await this.repository.markAccountSyncFailed(account.id, message, finalizationOptions());
           }
         } catch (finalizationError) {
           if (!options.signal?.aborted) throw finalizationError;
@@ -855,9 +890,9 @@ export class MirrorEngine {
     let runFinished = false;
     try {
       let locked = await runLockedSync();
-      // Supplemental Sent and live Inbox lanes defer to the authoritative full
-      // sweep when another worker owns the Mailbox Account.
-      const yieldedBeforeLock = locked === null && supplemental;
+      // Single-lane passes defer to the authoritative full sweep when another
+      // worker owns the Mailbox Account.
+      const yieldedBeforeLock = locked === null && !fullPass;
       // On direct connections a busy lock is never taken over: its owner may be
       // frozen rather than dead and could resume writing. Server-side TCP probes
       // release a vanished worker's lock (see createPool). Through a session
@@ -912,6 +947,37 @@ export class MirrorEngine {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * The orphaned-run cleanup mode: close sync runs a vanished worker left
+   * `running`. Holding the Mailbox Account's lock proves no other pass of it is
+   * live. It does no provider work, so it records no run and no account state.
+   * Returns the number of runs closed, or null while a pass holds the lock.
+   */
+  async closeOrphanedSyncRuns(accountId: string): Promise<number | null> {
+    const account = await this.repository.getAccount(accountId);
+    if (!account) throw new NotFoundError(`Account not found: ${accountId}`);
+    return await withAccountLock(
+      this.pool,
+      account.lock_id,
+      async () => await this.repository.closeOrphanedSyncRuns(account.id, null),
+      { fenceWrites: true }
+    );
+  }
+
+  /** Due folders for the modes that select from durable due times alone. */
+  private async dueFoldersBeforeLogin(accountId: string, mode: SyncMode): Promise<ImapFolder[] | null> {
+    switch (mode) {
+      case "sent":
+        return await this.repository.getSentFoldersDueForSync(accountId);
+      case "flag_scan":
+        return await this.repository.getFoldersDueForFlagScan(accountId);
+      case "audit":
+        return await this.repository.getFoldersDueForAudit(accountId);
+      default:
+        return null;
     }
   }
 
