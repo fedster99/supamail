@@ -97,12 +97,42 @@ liveDb("message change outbox", () => {
     );
     expect(await changes()).toEqual([idOf(1), idOf(2), idOf(3), idOf(4)]);
 
+    // Sync rewriting a row it already has (an upsert that updates) is a change too.
+    const resync = await h.repository.upsertMessages(h.account.id, folder, Number(folder.uidvalidity), [{
+      uid: 3,
+      internalDate: new Date("2026-06-01T00:00:00.000Z"),
+      sizeBytes: 100,
+      flags: ["\\Seen"],
+      rfcMessageId: "<change-3@example.test>",
+      messageIdNormalized: "change-3@example.test",
+      providerMessageId: null,
+      providerMessageIdNamespace: null,
+      providerThreadId: null,
+      providerThreadIdNamespace: null,
+      inReplyTo: null,
+      referencesHeader: null,
+      subject: "change-3",
+      fromEmail: "sender@example.test",
+      fromName: null,
+      toEmails: ["user@example.test"],
+      toNames: [null],
+      ccEmails: [],
+      ccNames: [],
+      bccEmails: [],
+      headersJson: {},
+      mimeStructure: null,
+      attachments: []
+    }]);
+    expect(resync[0]!.id).toBe(idOf(3));
+    expect((await changes()).at(-1)).toBe(idOf(3));
+    const beforeBatch = (await changes()).length;
+
     // One statement over several rows records each of them.
     await h.pool.query(
       "UPDATE public.imap_messages SET flags = ARRAY['\\Seen'] WHERE account_id = $1 AND uid IN (1, 2)",
       [h.account.id]
     );
-    expect((await changes()).slice(4).sort()).toEqual([idOf(1), idOf(2)].sort());
+    expect((await changes()).slice(beforeBatch).sort()).toEqual([idOf(1), idOf(2)].sort());
   });
 
   it("needs no rights on the outbox from a writer", async () => {
