@@ -134,7 +134,7 @@ describe("setMessageFlags", () => {
     expect(flags).toEqual(["\\Seen"]);
     expect(mutator.removeFlags).not.toHaveBeenCalled();
     expect(mutator.logout).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ messageId: M1, uid: 42, added: ["\\Seen"], removed: [] });
+    expect(result).toMatchObject({ messageId: M1, uid: 42, added: ["\\Seen"], removed: [], mirrorUpdated: true });
   });
 
   it("STOREs -Flagged by UID for unstar", async () => {
@@ -162,9 +162,22 @@ describe("setMessageFlags", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { setMessageFlags } = await import("../mailbox-mutations.js");
     const result = await setMessageFlags({} as never, config, M1, { add: ["seen"] });
-    expect(result).toMatchObject({ messageId: M1, added: ["\\Seen"] });
+    expect(result).toMatchObject({ messageId: M1, added: ["\\Seen"], mirrorUpdated: false });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_failed"));
     warn.mockRestore();
+  });
+
+  it("reports a missing mirror row without retrying the confirmed STORE", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    repo.applyMessageFlags.mockResolvedValueOnce(null);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { setMessageFlags } = await import("../mailbox-mutations.js");
+      const result = await setMessageFlags({} as never, config, M1, { add: ["seen"] });
+      expect(result.mirrorUpdated).toBe(false);
+      expect(mutator.addFlags).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_missing_row"));
+    } finally { warn.mockRestore(); }
   });
 
   it("rejects an empty flag change without connecting", async () => {
@@ -208,7 +221,7 @@ describe("moveMessage", () => {
     repo.getMessage.mockResolvedValue(message());
     const { moveMessage } = await import("../mailbox-mutations.js");
     const result = await moveMessage({} as never, config, M1, "Archive");
-    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", toFolder: "Archive", newUid: 99, idKept: true });
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", toFolder: "Archive", newUid: 99, idKept: true, mirrorUpdated: true });
     expect(repo.relocateMovedMessage).toHaveBeenCalledExactlyOnceWith(
       SOURCE_ROW,
       { folderPath: "Archive", uidValidity: 200, uid: 99 }
@@ -230,6 +243,7 @@ describe("moveMessage", () => {
     const { moveMessage } = await import("../mailbox-mutations.js");
     const result = await moveMessage({} as never, config, M1, "Archive");
     expect(result.idKept).toBe(false);
+    expect(result.mirrorUpdated).toBe(true);
     expect(repo.relocateMovedMessage).toHaveBeenCalledTimes(relocates ? 0 : 1);
     expect(repo.markMessageRemovedByProvider).toHaveBeenCalledExactlyOnceWith(SOURCE_ROW);
   });
@@ -240,7 +254,7 @@ describe("moveMessage", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { moveMessage } = await import("../mailbox-mutations.js");
     const result = await moveMessage({} as never, config, M1, "Archive");
-    expect(result).toMatchObject({ newUid: 99, idKept: false });
+    expect(result).toMatchObject({ newUid: 99, idKept: false, mirrorUpdated: false });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("move_write_through_failed"));
     warn.mockRestore();
   });
@@ -249,7 +263,7 @@ describe("moveMessage", () => {
     repo.getMessage.mockResolvedValue(message());
     const { moveMessage } = await import("../mailbox-mutations.js");
     const result = await moveMessage({} as never, config, M1, "INBOX");
-    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", toFolder: "INBOX", newUid: 42, idKept: true });
+    expect(result).toEqual({ messageId: M1, fromFolder: "INBOX", toFolder: "INBOX", newUid: 42, idKept: true, mirrorUpdated: true });
     expect(connectSpy).not.toHaveBeenCalled();
     expect(mutator.move).not.toHaveBeenCalled();
     expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
@@ -296,7 +310,7 @@ describe("moveMessages", () => {
     expect(mutator.logout).toHaveBeenCalledTimes(1);
     expect(outcomes.map((outcome) => outcome.messageId)).toEqual(ids);
     expect(outcomes.every((outcome) => "result" in outcome && outcome.result.idKept)).toBe(true);
-    expect(outcomes[3]).toEqual({ messageId: ids[3], result: { messageId: ids[3], fromFolder: "INBOX", toFolder: "Archive", newUid: 504, idKept: true } });
+    expect(outcomes[3]).toEqual({ messageId: ids[3], result: { messageId: ids[3], fromFolder: "INBOX", toFolder: "Archive", newUid: 504, idKept: true, mirrorUpdated: true } });
     expect(repo.relocateMovedMessage).toHaveBeenCalledTimes(10);
   });
 
