@@ -60,7 +60,9 @@ async function acquireAccountLock(
     await client.query("COMMIT");
     return true;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
+    // A failed rollback throws, so the caller destroys this session instead of
+    // returning it to the pool.
+    await client.query("ROLLBACK");
     if ((error as { code?: unknown }).code === LOCK_TIMEOUT_SQLSTATE) return false;
     throw error;
   }
