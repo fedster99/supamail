@@ -29,7 +29,7 @@ export const getSyncStatusDefinition: ToolDefinition = {
   title: "Check how up to date the mirrored mail is (read-only)",
   description:
     "Report each mailbox's sync state, last sync time, the share of recent mail and bodies stored, " +
-    "whether older mail is still being stored, and a one-line summary. Call it only when the user " +
+    "whether older mail is still being stored, how many messages could not be read, and a one-line summary. Call it only when the user " +
     "asks about syncing or results seem to be missing; read results already carry a notice when a " +
     "mailbox cannot give a complete answer. Scope to one account UUID via `account`, or omit for " +
     "every account. READ-ONLY: never sends, deletes, moves, or modifies mail.",

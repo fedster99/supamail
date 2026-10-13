@@ -55,6 +55,14 @@ matches its stored flag and deletion-complete QRESYNC cursors after a clean
 audit. Only non-priority health reads it; sync and audit timestamps and due
 times are unchanged.
 
+`0034_folder_unreadable_messages` adds nullable `imap_folders.unreadable_messages`:
+per folder generation, the messages whose metadata could not be read, keyed by
+UID with a fixed code, an attempt count, and the last failure time, and no
+message content. A message with three attempts is skipped by sync and counted by
+`get_sync_status`. A recovered message, one the provider no longer lists after a
+complete audit, and every record on a UIDVALIDITY reset are forgotten; at most
+1,000 are kept per folder.
+
 `0028_folder_message_counts` adds `imap_folder_message_counts`, keyed by
 `(account_id, folder_path)`: each folder's live (not provider-deleted) messages
 and those without `\Seen`. Statement triggers on `imap_messages` apply each

@@ -36,12 +36,14 @@ import {
   MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES,
   MAX_SYNC_FLAGS_PER_EVENT_LOGICAL_BATCH,
   MAX_SYNC_BATCH_SIZE,
+  MAX_UNREADABLE_MESSAGES_PER_FOLDER,
   PARSED_BODY_BATCH_MAX_MESSAGES,
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   splitFlagEventBatches,
   splitFlagWriteBatches,
-  splitMetadataWriteBatches
+  splitMetadataWriteBatches,
+  UNREADABLE_ATTEMPTS_BEFORE_SKIP
 } from "./sync-limits.js";
 import { diagnosticErrorCode, sanitizeErrorReason } from "./sync-diagnostics.js";
 import type {
@@ -60,6 +62,8 @@ import type {
   MessageMetadata,
   SyncResult,
   SyncTriggerType,
+  UnreadableMessageCode,
+  UnreadableMessageRecord,
   UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
 } from "./types.js";
@@ -2445,6 +2449,78 @@ export class MirrorRepository {
     return result.rows;
   }
 
+  /**
+   * Count one more failed read for each message, keyed by UID with a fixed
+   * code and no content, and return the UIDs that reached
+   * UNREADABLE_ATTEMPTS_BEFORE_SKIP and are now skipped. A folder holds at most
+   * MAX_UNREADABLE_MESSAGES_PER_FOLDER records; past that a new message is not
+   * recorded, so its folder fails as before.
+   */
+  async recordUnreadableMessages(
+    folderId: string,
+    uidValidity: number,
+    failures: ReadonlyArray<{ uid: number; code: UnreadableMessageCode }>
+  ): Promise<number[]> {
+    const skipped: number[] = [];
+    await this.changeUnreadableMessages(folderId, uidValidity, (records) => {
+      const failedAt = new Date().toISOString();
+      for (const { uid, code } of failures) {
+        const key = String(uid);
+        const previous = records[key];
+        if (!previous && Object.keys(records).length >= MAX_UNREADABLE_MESSAGES_PER_FOLDER) continue;
+        const attempts = (previous?.attempts ?? 0) + 1;
+        records[key] = { code, attempts, failed_at: failedAt };
+        if (attempts >= UNREADABLE_ATTEMPTS_BEFORE_SKIP) skipped.push(uid);
+      }
+    });
+    return skipped;
+  }
+
+  /**
+   * Keep only the records `keep` accepts: a message read fine after an earlier
+   * failure, or one the provider no longer lists, is forgotten.
+   */
+  async forgetUnreadableMessages(
+    folderId: string,
+    uidValidity: number,
+    keep: (uid: number) => boolean
+  ): Promise<void> {
+    await this.changeUnreadableMessages(folderId, uidValidity, (records) => {
+      for (const uid of Object.keys(records)) {
+        if (!keep(Number(uid))) delete records[uid];
+      }
+    });
+  }
+
+  /**
+   * Change one folder generation's unreadable-message records from their
+   * stored value, never from a copy read earlier in the pass. The account lock
+   * is the only writer of this state, so the read and write need no row lock.
+   */
+  private async changeUnreadableMessages(
+    folderId: string,
+    uidValidity: number,
+    change: (records: Record<string, UnreadableMessageRecord>) => void
+  ): Promise<void> {
+    const current = await this.pool.query<{ unreadable_messages: Record<string, UnreadableMessageRecord> | null }>(
+      // A folder in its first sync stores UIDVALIDITY with its first batch.
+      `SELECT unreadable_messages FROM public.imap_folders
+       WHERE id = $1 AND (uidvalidity IS NULL OR uidvalidity = $2)`,
+      [folderId, uidValidity]
+    );
+    if (!current.rows[0]) return;
+    const before = JSON.stringify(current.rows[0].unreadable_messages ?? {});
+    const records = { ...(current.rows[0].unreadable_messages ?? {}) };
+    change(records);
+    const after = JSON.stringify(records);
+    if (after === before) return;
+    await this.pool.query(
+      `UPDATE public.imap_folders SET unreadable_messages = $3::jsonb
+       WHERE id = $1 AND (uidvalidity IS NULL OR uidvalidity = $2)`,
+      [folderId, uidValidity, Object.keys(records).length > 0 ? after : null]
+    );
+  }
+
   async markFolderSyncStarted(
     folderId: string,
     options: SyncStateWriteOptions = {}
@@ -2748,6 +2824,7 @@ export class MirrorRepository {
             backfill_target_max_uid = NULL,
             backfill_oldest_uid_synced = NULL,
             backfill_since_date = NULL,
+            unreadable_messages = NULL,
             status = 'NEEDS_FULL_RESYNC',
             uidvalidity_reset_count = CASE
               WHEN last_uidvalidity_reset_at IS NULL
