@@ -134,7 +134,7 @@ describe("setMessageFlags", () => {
     expect(flags).toEqual(["\\Seen"]);
     expect(mutator.removeFlags).not.toHaveBeenCalled();
     expect(mutator.logout).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ messageId: M1, uid: 42, added: ["\\Seen"], removed: [] });
+    expect(result).toMatchObject({ messageId: M1, uid: 42, added: ["\\Seen"], removed: [], mirrorUpdated: true });
   });
 
   it("STOREs -Flagged by UID for unstar", async () => {
@@ -165,6 +165,19 @@ describe("setMessageFlags", () => {
     expect(result).toMatchObject({ messageId: M1, added: ["\\Seen"], mirrorUpdated: false });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_failed"));
     warn.mockRestore();
+  });
+
+  it("reports a missing mirror row without retrying the confirmed STORE", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    repo.applyMessageFlags.mockResolvedValueOnce(null);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { setMessageFlags } = await import("../mailbox-mutations.js");
+      const result = await setMessageFlags({} as never, config, M1, { add: ["seen"] });
+      expect(result.mirrorUpdated).toBe(false);
+      expect(mutator.addFlags).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("flag_write_through_missing_row"));
+    } finally { warn.mockRestore(); }
   });
 
   it("rejects an empty flag change without connecting", async () => {
