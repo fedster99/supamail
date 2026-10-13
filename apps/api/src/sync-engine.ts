@@ -324,8 +324,9 @@ export interface SyncAccountOptions {
    * - `history`: older-than-window history.
    * - `flag_scan`: folders whose flag scan is due.
    * - `audit`: folders whose exact UID audit is due.
-   * Every mode records the Mailbox Account's state when it ends. Orphaned-run
-   * cleanup is {@link MirrorEngine.closeOrphanedSyncRuns}.
+   * Every mode records the Mailbox Account's state when it ends, except that a
+   * `sent`, `flag_scan`, or `audit` pass with nothing due neither logs in nor
+   * changes it. Orphaned-run cleanup is {@link MirrorEngine.closeOrphanedSyncRuns}.
    */
   mode?: SyncMode;
   /** Full pass only: run one authoritative folder LIST even when the discovery timer is not due. */
@@ -360,7 +361,11 @@ export interface SyncAccountOptions {
  * Reject host input that names work the chosen mode does not run, before the
  * pass records a run or touches account state.
  */
-function assertSyncAccountOptions(mode: SyncMode, options: SyncAccountOptions): void {
+function assertSyncAccountOptions(
+  accountId: string,
+  mode: SyncMode,
+  options: SyncAccountOptions
+): void {
   if (!SYNC_MODES.includes(mode)) {
     throw new InvalidInputError(`mode must be one of ${SYNC_MODES.join(", ")}`);
   }
@@ -380,6 +385,15 @@ function assertSyncAccountOptions(mode: SyncMode, options: SyncAccountOptions): 
   }
   if ([...forced].some((path) => typeof path !== "string" || path.length === 0)) {
     throw new InvalidInputError("forceReconcileFolders requires non-empty folder paths");
+  }
+  if (options.client && options.keepClientOpen !== true) {
+    throw new InvalidInputError("A host-owned client requires keepClientOpen");
+  }
+  if (options.keepClientOpen && !options.client) {
+    throw new InvalidInputError("keepClientOpen requires a host-owned client");
+  }
+  if (options.client && options.clientAccountId !== accountId) {
+    throw new InvalidInputError("Host-owned client does not match the Mailbox Account");
   }
   if (options.folderFreshness !== undefined) {
     if (!(options.folderFreshness instanceof Map)) {
@@ -457,16 +471,7 @@ export class MirrorEngine {
     options: SyncAccountOptions = {}
   ): Promise<SyncResult> {
     const mode = options.mode ?? "full";
-    assertSyncAccountOptions(mode, options);
-    if (options.client && options.keepClientOpen !== true) {
-      throw new Error("A host-owned client requires keepClientOpen");
-    }
-    if (options.keepClientOpen && !options.client) {
-      throw new Error("keepClientOpen requires a host-owned client");
-    }
-    if (options.client && options.clientAccountId !== accountId) {
-      throw new Error("Host-owned client does not match the Mailbox Account");
-    }
+    assertSyncAccountOptions(accountId, mode, options);
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
     const fullPass = mode === "full";

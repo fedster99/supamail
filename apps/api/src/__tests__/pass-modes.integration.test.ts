@@ -484,7 +484,15 @@ integration("sync pass modes (real Postgres + fixture IMAP)", () => {
       { mode: "live", forceReconcileFolders: [""] },
       { mode: "nonsense" as SyncMode },
       { mode: "body", folderFreshness: new Map([["INBOX", new Date(Number.NaN)]]) },
-      { mode: "body", folderFreshness: { INBOX: new Date() } as unknown as Map<string, Date> }
+      { mode: "body", folderFreshness: { INBOX: new Date() } as unknown as Map<string, Date> },
+      { mode: "live", client: new FixtureImapClient([]) },
+      { mode: "live", keepClientOpen: true },
+      {
+        mode: "live",
+        client: new FixtureImapClient([]),
+        clientAccountId: "00000000-0000-4000-8000-000000000000",
+        keepClientOpen: true
+      }
     ];
     for (const options of invalid) {
       await expect(engine.syncAccount(h.account.id, "scheduled", options))
