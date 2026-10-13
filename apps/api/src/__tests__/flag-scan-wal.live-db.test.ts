@@ -76,10 +76,14 @@ liveDb("flag scan write path", () => {
       h.repository.applyFlagScan(h.account.id, folder, Number(folder.uidvalidity), messages);
 
     // A scan that finds no difference takes no row lock: xmax stays as it was.
+    // WAL is cluster-wide, so take the quietest of three runs; background work only adds.
     let unchanged: Awaited<ReturnType<typeof scan>> | undefined;
-    const unchangedWal = await walBytes(h.pool, async () => {
-      unchanged = await scan(snapshots);
-    });
+    let unchangedWal = Number.POSITIVE_INFINITY;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      unchangedWal = Math.min(unchangedWal, await walBytes(h.pool, async () => {
+        unchanged = await scan(snapshots);
+      }));
+    }
     expect(unchanged).toMatchObject({ flagsChanged: 0 });
     expect(unchanged!.messages).toHaveLength(SCANNED);
     expect((await rows()).map((row) => row.xmax)).toEqual(stored.map((row) => row.xmax));
