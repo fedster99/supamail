@@ -7,6 +7,22 @@ export type SyncState = "INITIAL_SYNC" | "HEALTHY" | "DEGRADED" | "BROKEN" | "PA
 export type FolderStatus = "PENDING" | "SYNCING" | "ACTIVE" | "NEEDS_FULL_RESYNC" | "MISSING" | "PENDING_VERIFICATION";
 export type SyncRunStatus = "running" | "success" | "partial_success" | "failed";
 export type SyncTriggerType = "scheduled" | "manual" | "api" | "backfill";
+/**
+ * The work one sync pass runs. `full` runs every lane: discovery, due folders,
+ * the live body backlog, history, and orphaned-run cleanup. Every other mode
+ * runs one lane, so a host can schedule each lane separately.
+ */
+export const SYNC_MODES = [
+  "full",
+  "live",
+  "sent",
+  "first_sync",
+  "body",
+  "history",
+  "flag_scan",
+  "audit"
+] as const;
+export type SyncMode = (typeof SYNC_MODES)[number];
 
 export interface ImapAccount {
   id: string;
@@ -293,6 +309,7 @@ export interface FolderCheck {
 
 export interface SyncResult {
   runId: string;
+  mode: SyncMode;
   outcome: Exclude<SyncRunStatus, "running">;
   foldersProcessed: number;
   /** Absent on older producers; an empty array means no live-folder check ran. */

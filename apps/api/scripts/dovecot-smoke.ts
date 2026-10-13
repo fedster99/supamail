@@ -369,7 +369,7 @@ async function main(): Promise<void> {
         throw new Error("Dovecot did not produce the first EXISTS wake");
       }
       const liveResult = await engine.syncAccount(account.id, "scheduled", {
-        liveInboxOnly: true,
+        mode: "live",
         client: session.syncClient,
         clientAccountId: session.accountId,
         keepClientOpen: true
@@ -420,7 +420,7 @@ async function main(): Promise<void> {
         throw new Error("Dovecot NOTIFY did not identify Archive");
       }
       archiveLiveResult = await engine.syncAccount(account.id, "scheduled", {
-        liveInboxOnly: true,
+        mode: "live",
         client: session.syncClient,
         clientAccountId: session.accountId,
         keepClientOpen: true
@@ -452,7 +452,7 @@ async function main(): Promise<void> {
     let reconnectResult: Awaited<ReturnType<MirrorEngine["syncAccount"]>>;
     try {
       reconnectResult = await engine.syncAccount(account.id, "scheduled", {
-        liveInboxOnly: true,
+        mode: "live",
         client: reconnectSession.syncClient,
         clientAccountId: reconnectSession.accountId,
         keepClientOpen: true

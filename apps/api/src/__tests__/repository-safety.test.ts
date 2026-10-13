@@ -149,14 +149,15 @@ describe("repository safety", () => {
     // it, the provider returns a generic error (e.g. Rackspace "Command failed",
     // which is not a recognized missing-mailbox signal), the run fails, and
     // consecutive_failures climbs to BROKEN — one deleted folder bricking the
-    // account. All eight readers must carry the exclusion: getTrackedFolderPaths,
+    // account. All eleven readers must carry the exclusion: getTrackedFolderPaths,
     // getFoldersDueForSync (priority + round-robin), getIdleWatchAccounts, getInboxFolderForWake,
-    // getSentFoldersDueForSync, getHistoryBacklog, and getBodyBacklog (the body lane is the one
+    // getSentFoldersDueForSync, getFoldersForFirstSync, getFoldersDueForFlagScan,
+    // getFoldersDueForAudit, getHistoryBacklog, and getBodyBacklog (the body lane is the one
     // un-try/caught reader, so a missed exclusion there bricks directly).
     const syncFilter = "AND missing_since IS NULL AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
     const joinedFilter = "AND f.missing_since IS NULL AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')";
 
-    expect(collapsed.split(syncFilter).length - 1).toBe(8);
+    expect(collapsed.split(syncFilter).length - 1).toBe(11);
     expect(collapsed.split(joinedFilter).length - 1).toBe(3);
   });
 
@@ -278,7 +279,7 @@ describe("repository safety", () => {
     // STUCK_DEGRADED_RETRY_INTERVAL_MS), so it self-heals but is not hammered.
     expect(source).toMatch(/WHEN a\.consecutive_failures \+ 1 >= \$3 THEN now\(\) \+ \(\$8::bigint/);
     // AUTH_ERROR stays terminal: BROKEN with backoff_until NULLed.
-    expect(source).toMatch(/markAccountSyncAuthFailed[\s\S]{0,400}sync_state = 'BROKEN'[\s\S]{0,400}backoff_until = NULL/);
+    expect(source).toMatch(/markAccountSyncAuthFailed[\s\S]{0,600}sync_state = 'BROKEN'[\s\S]{0,400}backoff_until = NULL/);
   });
 
   it("enforces the account cap at create time and worker startup", async () => {
@@ -310,7 +311,9 @@ describe("repository safety", () => {
 
     // PARTIAL block must increment successes, not failures, unless the cycle
     // hit the cooperative lock budget and should stay neutral for backoff.
-    expect(source).toMatch(/markAccountSyncPartial[\s\S]{0,1000}WHEN \$3::boolean THEN consecutive_successes \+ 1/);
+    expect(source).toMatch(
+      /markAccountSyncPartial[\s\S]{0,1600}WHEN \$3::boolean AND folder_health\.priority_folders_finished THEN consecutive_successes \+ 1/
+    );
     expect(source).not.toMatch(/markAccountSyncPartial[\s\S]{0,500}consecutive_failures = consecutive_failures \+ 1/);
   });
 
@@ -325,7 +328,8 @@ describe("repository safety", () => {
   it("escalates long-stuck DEGRADED accounts without compounding exponential backoff", async () => {
     const source = await readFile(resolve(process.cwd(), "src/repository.ts"), "utf8");
 
-    expect(source).toContain("last_priority_sync_succeeded_at = now()");
+    // A success moves the anchor only when no priority folder's last sync is unfinished.
+    expect(source).toContain("WHEN folder_health.priority_folders_finished THEN now()");
     expect(source).toContain("STUCK_DEGRADED_24H");
     expect(source).toContain("STUCK_DEGRADED_TERMINAL");
     expect(source).toContain("STUCK_DEGRADED_RETRY_INTERVAL_MS");

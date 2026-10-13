@@ -326,7 +326,7 @@ liveDb("live DB reliability lane", () => {
     try {
       const engine = h.buildEngine({ folders: oneFolder("Sent") });
       const result = await engine.syncAccount(h.account.id, "scheduled", {
-        sentOnly: true,
+        mode: "sent",
         signal: abort.signal
       });
 

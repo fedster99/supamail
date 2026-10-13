@@ -451,7 +451,7 @@ async function main(): Promise<void> {
         throw new Error("GreenMail STATUS renewal did not identify Archive");
       }
       const archiveLive = await engine.syncAccount(account.id, "scheduled", {
-        liveInboxOnly: true,
+        mode: "live",
         client: opened.session.syncClient,
         clientAccountId: opened.session.accountId,
         keepClientOpen: true
