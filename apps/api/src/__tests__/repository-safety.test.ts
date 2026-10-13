@@ -380,7 +380,7 @@ describe("repository safety", () => {
     expect(source).toContain("FLAGS_CHANGED");
     expect(source).toContain("previousFlags");
     expect(source).toContain("nextFlags");
-    expect(source).toContain("updatedByUid");
+    expect(source).toContain("compareFlags");
     expect(source).toContain("FOR UPDATE");
     expect(source).toContain("set_config('lock_timeout'");
     expect(source).toContain("FLAG_SCAN_TOTAL_TIMEOUT_MS exceeded during flag scan write");

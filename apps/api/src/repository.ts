@@ -359,6 +359,30 @@ function flagsEqual(left: readonly string[] | null | undefined, right: readonly 
     && normalizedLeft.every((flag, index) => flag === normalizedRight[index]);
 }
 
+/**
+ * The scanned snapshots whose stored row has a different flag representation.
+ * Only these are locked and written; a semantic difference is also logged.
+ */
+function compareFlags(
+  messages: readonly MessageFlagSnapshot[],
+  rowsByUid: ReadonlyMap<number, ImapMessage>
+) {
+  return messages.flatMap((message) => {
+    const row = rowsByUid.get(message.uid);
+    if (!row) return [];
+    assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
+    if (flagRepresentationsEqual(row.flags, message.flags)) return [];
+    const semanticallyChanged = !flagsEqual(row.flags, message.flags);
+    return [{
+      row,
+      message,
+      semanticallyChanged,
+      previousFlags: semanticallyChanged ? normalizeFlags(row.flags) : [],
+      nextFlags: semanticallyChanged ? normalizeFlags(message.flags) : []
+    }];
+  });
+}
+
 function flagRepresentationsEqual(
   left: readonly string[] | null | undefined,
   right: readonly string[] | null | undefined
@@ -3237,30 +3261,25 @@ export class MirrorRepository {
       await flagScanDeadline.queryControl(client, "BEGIN", deadlineAt);
       await flagScanDeadline.refreshTimeout(client, deadlineAt);
 
-      // Lock and size the stored side before selecting any flag arrays into the
-      // worker. Legacy rows may individually satisfy the per-message limit but
+      // Size the stored side before selecting any flag arrays into the worker.
+      // Legacy rows may individually satisfy the per-message limit but
       // collectively exceed the transaction budget; materializing them first
-      // defeats the memory bound this guard is meant to provide.
+      // defeats the memory bound this guard is meant to provide. Nothing is
+      // locked here: a scan that finds no difference writes nothing.
       const storedFootprint = await queryWithDeadline<{
         stored_bytes: string;
         stored_flags: string;
       }>(
         client,
         `
-        WITH locked AS MATERIALIZED (
-          SELECT octet_length(to_json(flags)::text)::bigint AS flag_bytes,
-                 cardinality(flags)::bigint AS flag_count
-          FROM public.imap_messages
-          WHERE account_id = $1
-            AND folder_path = $2
-            AND uidvalidity = $3
-            AND uid = ANY($4::bigint[])
-            AND deleted_in_provider = false
-          FOR UPDATE
-        )
-        SELECT COALESCE(sum(flag_bytes), 0)::text AS stored_bytes,
-               COALESCE(sum(flag_count), 0)::text AS stored_flags
-        FROM locked
+        SELECT COALESCE(sum(octet_length(to_json(flags)::text)), 0)::text AS stored_bytes,
+               COALESCE(sum(cardinality(flags)), 0)::text AS stored_flags
+        FROM public.imap_messages
+        WHERE account_id = $1
+          AND folder_path = $2
+          AND uidvalidity = $3
+          AND uid = ANY($4::bigint[])
+          AND deleted_in_provider = false
         `,
         [accountId, folder.path, uidValidity, uids],
         deadlineAt,
@@ -3284,30 +3303,39 @@ export class MirrorRepository {
           AND uidvalidity = $3
           AND uid = ANY($4::bigint[])
           AND deleted_in_provider = false
-        FOR UPDATE
         `,
         [accountId, folder.path, uidValidity, uids],
         deadlineAt,
         flagScanDeadline.remainingMs
       );
-      const existingByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
-      const updatedByUid = new Map<number, ImapMessage>();
-      const changed = messages
-        .map((message) => {
-          const row = existingByUid.get(message.uid);
-          if (!row) return null;
-          assertFlagEventSideWithinLimits(message.uid, row.flags ?? []);
-          if (flagRepresentationsEqual(row.flags, message.flags)) return null;
-          const semanticallyChanged = !flagsEqual(row.flags, message.flags);
-          return {
-            row,
-            message,
-            semanticallyChanged,
-            previousFlags: semanticallyChanged ? normalizeFlags(row.flags) : [],
-            nextFlags: semanticallyChanged ? normalizeFlags(message.flags) : []
-          };
-        })
-        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      // The newest row this transaction has seen for each scanned UID.
+      const rowsByUid = new Map(existing.rows.map((row) => [Number(row.uid), row]));
+      const candidates = compareFlags(messages, rowsByUid);
+      // Lock only the rows whose flags differ, then compare again under the lock:
+      // another writer may have changed or removed one since the read above.
+      // A scan that finds no difference takes no row lock and writes nothing.
+      if (candidates.length > 0) {
+        await flagScanDeadline.refreshTimeout(client, deadlineAt);
+        const locked = await queryWithDeadline<ImapMessage>(
+          client,
+          `
+          SELECT *
+          FROM public.imap_messages
+          WHERE account_id = $1
+            AND folder_path = $2
+            AND uidvalidity = $3
+            AND uid = ANY($4::bigint[])
+            AND deleted_in_provider = false
+          FOR UPDATE
+          `,
+          [accountId, folder.path, uidValidity, candidates.map((entry) => entry.message.uid)],
+          deadlineAt,
+          flagScanDeadline.remainingMs
+        );
+        for (const { message } of candidates) rowsByUid.delete(message.uid);
+        for (const row of locked.rows) rowsByUid.set(Number(row.uid), row);
+      }
+      const changed = compareFlags(candidates.map((entry) => entry.message), rowsByUid);
       const changedByUid = new Map(changed.map((entry) => [entry.message.uid, entry]));
 
       if (changed.length > 0) {
@@ -3347,7 +3375,7 @@ export class MirrorRepository {
             );
           }
           for (const row of updated.rows) {
-            updatedByUid.set(Number(row.uid), row);
+            rowsByUid.set(Number(row.uid), row);
           }
         }
 
@@ -3423,7 +3451,7 @@ export class MirrorRepository {
       await flagScanDeadline.queryControl(client, "COMMIT", deadlineAt, false);
       return {
         messages: messages
-          .map((message) => updatedByUid.get(message.uid) ?? existingByUid.get(message.uid))
+          .map((message) => rowsByUid.get(message.uid))
           .filter((message): message is ImapMessage => message !== undefined),
         flagsChanged: changed.filter((entry) => entry.semanticallyChanged).length
       };
