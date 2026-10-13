@@ -10,6 +10,7 @@ import {
   fetchChangedMessageFlags,
   fetchMessageFlags,
   fetchMessageMetadata,
+  UnreadableMessagesError,
   MessageMovedError,
   parseMessageMetadata,
   providerObjectIdNamespace,
@@ -843,6 +844,34 @@ describe("fetchMessageMetadata uid guard", () => {
         fetchMessageMetadata(metadataStub([{ ...real(100), size }]), [100], 50)
       ).rejects.toThrow(/missing 100/);
     }
+  });
+
+  it("names each unreadable message with a fixed code and keeps reading the rest", async () => {
+    const attachments = Array.from({ length: 5_001 }, (_, index) => ({
+      part: String(index + 1),
+      type: "application/octet-stream",
+      disposition: "attachment",
+      dispositionParameters: { filename: `f${index}.bin` },
+      size: 1
+    }));
+    const client = metadataStub([
+      real(100),
+      { ...real(101), envelope: undefined },
+      { ...real(102), bodyStructure: { type: "text/plain", disposition: { date: new Date(Number.NaN) } } },
+      { ...real(103), envelope: { subject: "x".repeat(9 * 1024 * 1024) } },
+      { ...real(104), bodyStructure: { type: "multipart/mixed", childNodes: attachments } }
+    ]);
+
+    const failure = await fetchMessageMetadata(client, [100, 101, 102, 103, 104, 105], 50).catch((error) => error);
+    expect(failure).toBeInstanceOf(UnreadableMessagesError);
+    expect(failure.messages).toEqual([
+      { uid: 101, code: "fetch_incomplete" },
+      { uid: 102, code: "structure_invalid" },
+      { uid: 103, code: "metadata_too_large" },
+      { uid: 104, code: "too_many_attachments" },
+      { uid: 105, code: "fetch_incomplete" }
+    ]);
+    expect(failure.message).toMatch(/returned 1\/6 requested UIDs; missing 101,102,103,104,105/);
   });
 });
 
