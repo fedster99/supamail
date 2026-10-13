@@ -70,11 +70,17 @@ export class FixtureImapClient implements MirrorImapClient {
     const folder = this.foldersByPath.get(path);
     if (!folder) throw new Error(`Fixture folder not found: ${path}`);
 
+    // Like ImapFlow, `unseen` is SELECT's [UNSEEN n]: the sequence number of
+    // the first unseen message, not a count.
+    const firstUnseen = [...folder.messages]
+      .sort((left, right) => left.uid - right.uid)
+      .findIndex((message) => !(message.flags ?? []).includes("\\Seen"));
     this.mailbox = {
       path,
       uidValidity: folder.uidValidity,
       uidNext: fixtureUidNext(folder),
       exists: folder.messages.length,
+      ...(firstUnseen >= 0 ? { unseen: firstUnseen + 1 } : {}),
       highestModseq: folder.highestModseq
     };
 

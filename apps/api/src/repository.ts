@@ -330,6 +330,15 @@ export interface SyncStateWriteOptions {
   expectedSyncOwner?: string;
 }
 
+/** A folder's stored cursor after a pass: what the mirror proves about the provider. */
+export interface CommittedFolderCursor {
+  uidValidity: string;
+  uidNext: string | null;
+  highestModseq: string | null;
+  messages: string | null;
+  unseen: string | null;
+}
+
 async function runOptionalDeadlineWrite<T extends QueryResultRow>(
   pool: PgPool,
   text: string,
@@ -2471,18 +2480,28 @@ export class MirrorRepository {
     return result.rows.map((row) => row.path);
   }
 
+  /**
+   * Store a pass's folder cursor and return the committed cursor. `messages` is
+   * the provider MESSAGES the pass proved for the stored UIDNEXT. A pass that
+   * mirrors new UIDs without that proof clears it: one arrival and one expunge
+   * leave MESSAGES unchanged, so the old count would hide the expunge.
+   * `unseen` is the provider UNSEEN observed before flag work that covered the
+   * mirror's flag window.
+   */
   async markFolderSynced(folderId: string, patch: {
     uidValidity: number;
     uidNext?: number;
     highestModseq?: string;
     qresyncHighestModseq?: string;
+    messages?: number;
+    unseen?: number;
     lastUid?: number;
     initialComplete?: boolean;
     reconcileClean?: boolean;
     /** The reconcile could not prove the folder's UID list (IncompleteUidListError). */
     reconcileListIncomplete?: boolean;
     flagScanCompleted?: boolean;
-  }, options: { deadlineAt?: number; signal?: AbortSignal } = {}): Promise<void> {
+  }, options: { deadlineAt?: number; signal?: AbortSignal } = {}): Promise<CommittedFolderCursor> {
     const query = `
       UPDATE public.imap_folders
       SET
@@ -2491,6 +2510,13 @@ export class MirrorRepository {
         uid_next = COALESCE($3, uid_next),
         highest_modseq = COALESCE($14::numeric, highest_modseq),
         qresync_highest_modseq = COALESCE($15::numeric, qresync_highest_modseq),
+        committed_messages = CASE
+          WHEN $17::bigint IS NOT NULL THEN $17::bigint
+          WHEN COALESCE($3::bigint, uid_next) IS DISTINCT FROM uid_next
+            OR COALESCE($4::bigint, last_uid) IS DISTINCT FROM last_uid THEN NULL
+          ELSE committed_messages
+        END,
+        committed_unseen = COALESCE($18::bigint, committed_unseen),
         last_uid = COALESCE($4, last_uid),
         initial_sync_complete = COALESCE($5, initial_sync_complete),
         last_synced_at = now(),
@@ -2527,7 +2553,12 @@ export class MirrorRepository {
         END
       WHERE id = $1
         AND (uidvalidity IS NULL OR uidvalidity = $2)
-      RETURNING id
+      RETURNING
+        uidvalidity::text AS uid_validity,
+        uid_next::text,
+        highest_modseq::text,
+        committed_messages::text AS messages,
+        committed_unseen::text AS unseen
     `;
     const values = [
       folderId,
@@ -2545,16 +2576,33 @@ export class MirrorRepository {
       this.config.SYNC_INTERVAL_MS,
       patch.highestModseq ?? null,
       patch.qresyncHighestModseq ?? null,
-      patch.reconcileListIncomplete === true
+      patch.reconcileListIncomplete === true,
+      patch.messages ?? null,
+      patch.unseen ?? null
     ];
+    type CursorRow = {
+      uid_validity: string;
+      uid_next: string | null;
+      highest_modseq: string | null;
+      messages: string | null;
+      unseen: string | null;
+    };
     const result = options.deadlineAt === undefined
-      ? await this.pool.query<{ id: string }>(query, values)
-      : await runMetadataWriteWithDeadline<{ id: string }>(
+      ? await this.pool.query<CursorRow>(query, values)
+      : await runMetadataWriteWithDeadline<CursorRow>(
           this.pool, query, values, options.deadlineAt, options.signal
         );
-    if (result.rows.length !== 1) {
+    const row = result.rows[0];
+    if (result.rows.length !== 1 || !row) {
       throw new Error(`Folder sync state lost generation ${folderId}`);
     }
+    return {
+      uidValidity: row.uid_validity,
+      uidNext: row.uid_next,
+      highestModseq: row.highest_modseq,
+      messages: row.messages,
+      unseen: row.unseen
+    };
   }
 
   // Returns the post-reset `uidvalidity_reset_count`, scoped to a rolling
@@ -2607,6 +2655,8 @@ export class MirrorRepository {
         SET uidvalidity = $3,
             highest_modseq = NULL,
             qresync_highest_modseq = NULL,
+            committed_messages = NULL,
+            committed_unseen = NULL,
             last_uid = NULL,
             initial_sync_complete = false,
             initial_sync_target_max_uid = NULL,

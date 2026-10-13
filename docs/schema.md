@@ -65,6 +65,16 @@ takes before writing messages. The migration backfills once while it blocks
 message writes. `list_folders` reads these rows instead of counting messages;
 unlike `headers_synced_count`, they also fall on deletes and moves.
 
+`0033_folder_committed_status` adds nullable `imap_folders.committed_messages`
+and `committed_unseen`: the provider `MESSAGES` and `UNSEEN` a pass proved,
+beside the `uid_next` it reached and the flag cursor `highest_modseq` (ADR 0042).
+`MESSAGES` is written when the pass checked deletions (a clean reconcile or a
+complete QRESYNC replay) and fetched every new UID below the `uid_next` it
+stores; a pass that mirrors new UIDs without that proof clears it. `UNSEEN` is
+the host's observation of the folder, written after flag work that covered the
+mirror's flag window. A UIDVALIDITY reset clears both. These are provider values, not mirror counts; the mirror's
+own counts stay in `imap_folder_message_counts`.
+
 `0029_active_assignments_view_no_barrier` drops `security_barrier` from
 `imap_thread_active_assignments`. A barrier view is never flattened into the
 query that reads it, so a plain join could not take a per-row index path and
