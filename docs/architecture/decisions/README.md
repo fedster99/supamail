@@ -47,6 +47,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0037-confirmed-move-keeps-message-id.md`: A move the server confirms with COPYUID moves the mirror row with the message, so it keeps its id and everything keyed by it; deletes still tombstone; by-id reads never serve a tombstoned row.
 - `0038-sync-status-is-its-own-tool.md`: Read results name their accounts (with a notice only when a mailbox is in its first sync, stopped, or paused); the full sync report is the separate `get_sync_status` tool.
 - `0041-durable-send-policy.md`: Core owns the durable send state machine; hosts provide atomic, scoped storage and authorization. Raw send primitives remain single attempts.
+- `0044-twenty-second-lock-release-and-bounded-waits.md`: Every pass stops at a 20 s lock budget after finishing one chunk, priority folders included; a flag scan stays one chunk. Sends and draft saves wait up to 25 s in Postgres's lock queue, and a busy pass is an `AccountBusyError` deferral with no run recorded.
 - `0043-every-pass-records-mailbox-state.md`: `syncAccount` runs one explicit `mode` (full, live, sent, first sync, body, history, flag scan, audit), and every mode records health and classifies failures like a full pass. Only full passes move `last_sync_finished_at`. A success cannot reset backoff while a priority folder's last sync is unfinished. Hosts may supply per-folder freshness. Orphaned-run cleanup is its own method.
 
 ## Status Values

@@ -25,6 +25,47 @@ export interface AccountLockOptions {
    * lock's own session. Writes then share fate with the lock: once that session
    * ends, the holder cannot write anything else, however long it was frozen. */
   fenceWrites?: boolean;
+  /** Wait up to this long for a held lock instead of returning at once.
+   * Postgres queues the request ahead of the holder's next try, so it gets the
+   * lock when the holder next releases it. */
+  waitMs?: number;
+}
+
+// lock_not_available: the wait reached lock_timeout.
+const LOCK_TIMEOUT_SQLSTATE = "55P03";
+
+async function acquireAccountLock(
+  client: PgClient,
+  lockId: string | number,
+  waitMs: number | undefined
+): Promise<boolean> {
+  if (waitMs === undefined || waitMs <= 0) {
+    const result = await client.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock($1::bigint) AS locked",
+      [lockId]
+    );
+    return result.rows[0]?.locked === true;
+  }
+  // The advisory lock is session-scoped, so it outlives this transaction; the
+  // transaction only scopes the timeouts to this one wait. A role's shorter
+  // statement_timeout would otherwise end the wait as an error.
+  const wait = Math.ceil(waitMs);
+  await client.query("BEGIN");
+  try {
+    await client.query(
+      "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+      [`${wait}ms`, `${wait + 5_000}ms`]
+    );
+    await client.query("SELECT pg_advisory_lock($1::bigint)", [lockId]);
+    await client.query("COMMIT");
+    return true;
+  } catch (error) {
+    // A failed rollback throws, so the caller destroys this session instead of
+    // returning it to the pool.
+    await client.query("ROLLBACK");
+    if ((error as { code?: unknown }).code === LOCK_TIMEOUT_SQLSTATE) return false;
+    throw error;
+  }
 }
 
 export class AccountLockLivenessError extends Error {
@@ -303,7 +344,8 @@ const abandonedSessionError = (lockId: string | number) =>
  * operation can approach the stale-reaper threshold must supply
  * `heartbeatIntervalMs` so that heartbeat remains fresh for the full lock lifetime.
  *
- * Returns `null` when the lock is held by another session.
+ * Returns `null` when another session holds the lock, at once or, with
+ * `waitMs`, once that wait ends.
  */
 export async function withAccountLock<T>(
   pool: PgPool,
@@ -314,17 +356,14 @@ export async function withAccountLock<T>(
   const client = await pool.connect();
   let releaseError: Error | undefined;
   try {
-    let result: { rows: Array<{ locked: boolean }> };
+    let locked: boolean;
     try {
-      result = await client.query<{ locked: boolean }>(
-        "SELECT pg_try_advisory_lock($1::bigint) AS locked",
-        [lockId]
-      );
+      locked = await acquireAccountLock(client, lockId, options.waitMs);
     } catch (error) {
       releaseError = asError(error, `Account lock acquisition failed for lock ${lockId}`);
       throw releaseError;
     }
-    if (!result.rows[0]?.locked) {
+    if (!locked) {
       return null;
     }
 

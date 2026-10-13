@@ -171,8 +171,9 @@ type SavedDraft = Omit<CreateDraftResult, "accountId">;
  * Compose `req`, APPEND it to the account's Drafts folder, and write its mirror row.
  * Serialized with the sync worker on the per-account advisory lock: a second IMAP
  * connection mid-cycle races and burns the provider's shared per-account command
- * budget (Rackspace caps ~200/min). Non-blocking — if the worker holds the lock,
- * surface a retryable busy error instead of colliding. The lock fences its writes,
+ * budget (Rackspace caps ~200/min). It waits up to ACCOUNT_LOCK_WAIT_MS, since a
+ * pass releases the lock at its next chunk boundary; a lock still held after
+ * that is a retryable busy error instead of a collision. The lock fences its writes,
  * as sync's does: a save that lost the lock cannot write a row that sync already
  * read, and no sync interleaves with the mirror write.
  */
@@ -219,7 +220,11 @@ async function saveDraft(
       );
     }
     return saved;
-  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
+  }, {
+    fenceWrites: true,
+    onPostIrreversibleWarning: (warning) => warnings.push(warning),
+    waitMs: config.ACCOUNT_LOCK_WAIT_MS
+  });
 
   if (result === null) {
     throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft shortly`);
@@ -693,7 +698,8 @@ async function sendDraftAttempt(
 
   // The raw fetch can itself require IMAP, so acquire before it and keep the same
   // account lock through SMTP delivery, Sent APPEND, appender teardown, and draft
-  // cleanup. Contention is proven-unsent: no provider verb has run yet.
+  // cleanup. It waits up to ACCOUNT_LOCK_WAIT_MS like a direct send; contention
+  // after that is proven-unsent: no provider verb has run yet.
   const result = await withAccountLock(pool, account.lock_id, async (lock) => {
     // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
     // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
@@ -801,7 +807,8 @@ async function sendDraftAttempt(
     return { send: { ...send, warnings }, deletedDraftId: messageId, draftDeleted, warnings };
   }, {
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
-    onPostIrreversibleWarning: addWarning
+    onPostIrreversibleWarning: addWarning,
+    waitMs: config.ACCOUNT_LOCK_WAIT_MS
   });
 
   if (result === null) {

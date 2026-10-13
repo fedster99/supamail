@@ -59,7 +59,6 @@ import type {
   MessageFlagSnapshot,
   MessageMetadata,
   SyncResult,
-  SyncRunStatus,
   SyncTriggerType,
   UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
@@ -1146,17 +1145,6 @@ export class MirrorRepository {
           folderChecks: result.folderChecks
         })
       ]
-    );
-  }
-
-  async updateSyncRunStatus(runId: string, status: SyncRunStatus, error?: string): Promise<void> {
-    await this.pool.query(
-      `
-      UPDATE public.imap_sync_runs
-      SET status = $2, finished_at = CASE WHEN $2 != 'running' THEN now() ELSE finished_at END, error = $3
-      WHERE id = $1
-      `,
-      [runId, status, error ? diagnosticErrorCode(error) : null]
     );
   }
 

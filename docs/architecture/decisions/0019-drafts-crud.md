@@ -62,7 +62,8 @@ introduced:
   per-account advisory lock is acquired before the possibly-live `getRawMime`
   fetch and held across SMTP, Sent APPEND, appender teardown, and best-effort draft
   deletion. Contention therefore raises `AccountBusyError` before any provider
-  operation or delivery, and the lock heartbeat stays fresh for its full lifetime.
+  operation or delivery (*amended by ADR 0044:* after waiting up to
+  `ACCOUNT_LOCK_WAIT_MS`), and the lock heartbeat stays fresh for its full lifetime.
   Draft raw fetch may take time, so liveness is synchronously re-proven immediately
   before SMTP. Once delivery is confirmed, later liveness loss skips remaining
   provider cleanup and becomes a warning rather than a thrown retry signal.
