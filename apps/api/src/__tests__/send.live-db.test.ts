@@ -55,7 +55,9 @@ vi.mock("../mailbox-mutations.js", () => ({
 const config = {
   IMAP_ENCRYPTION_KEY: "local-live-db-test-encryption-key",
   IMAP_ALLOW_PRIVATE_HOSTS: false,
-  STALE_HEARTBEAT_MS: 200
+  STALE_HEARTBEAT_MS: 200,
+  // Sends wait for a held lock; a short bound keeps contention tests quick.
+  ACCOUNT_LOCK_WAIT_MS: 200
 } as AppConfig;
 const ACCOUNT_EMAIL = `send-lock-live-${process.pid}@example.test`;
 const SMTP_RECEIPT = {

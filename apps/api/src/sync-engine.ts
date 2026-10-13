@@ -84,6 +84,29 @@ function reachedUidNext(uidNext: number | undefined, lastUid: number): number | 
   return lastUid >= uidNext - 1 ? uidNext : lastUid + 1;
 }
 
+/**
+ * A pass's lock budget (ADR 0044). The pass starts no new chunk once it has
+ * held the account lock for MAX_LOCK_HOLD_MS, so a send or live pass waiting
+ * for the lock gets it at the next chunk boundary. It always finishes one
+ * chunk first, so a slow login or folder discovery cannot leave every pass
+ * without progress.
+ */
+class LockBudget {
+  private chunkFinished = false;
+
+  constructor(private readonly deadline: number) {}
+
+  /** A chunk of work finished. */
+  progressed(): void {
+    this.chunkFinished = true;
+  }
+
+  /** A chunk finished and the pass has held the lock for its whole budget. */
+  get spent(): boolean {
+    return this.chunkFinished && Date.now() >= this.deadline;
+  }
+}
+
 type DiscoveredFolder = {
   path: string;
   delimiter?: string | null;
@@ -348,6 +371,13 @@ export interface SyncAccountOptions {
    * touched is not lagging. Without it, lag counts from the last sync.
    */
   folderFreshness?: ReadonlyMap<string, Date>;
+  /**
+   * Wait up to ACCOUNT_LOCK_WAIT_MS for the account lock instead of deferring
+   * at once. A host sets it when its own lower-lane pass holds the lock: that
+   * pass releases it at its next chunk boundary. A lock still held after the
+   * wait is the same `AccountBusyError` deferral.
+   */
+  waitForLock?: boolean;
   signal?: AbortSignal;
   /** Reuse a host-owned session, such as an Inbox IDLE connection. */
   client?: MirrorImapClient;
@@ -440,7 +470,8 @@ export class MirrorEngine {
 
     for (const account of accounts) {
       if (options.signal?.aborted) break;
-      results.push(await this.syncAccount(account.id, "scheduled", { signal: options.signal }));
+      const result = await this.syncUnlessBusy(account.id, { signal: options.signal });
+      if (result) results.push(result);
     }
 
     return results;
@@ -456,15 +487,28 @@ export class MirrorEngine {
 
     for (const account of accounts) {
       if (options.signal?.aborted) break;
-      results.push(await this.syncAccount(account.id, "scheduled", {
-        mode: "sent",
-        signal: options.signal
-      }));
+      const result = await this.syncUnlessBusy(account.id, { mode: "sent", signal: options.signal });
+      if (result) results.push(result);
     }
 
     return results;
   }
 
+  /** One scheduled pass; null when another session holds the account lock. */
+  private async syncUnlessBusy(accountId: string, options: SyncAccountOptions): Promise<SyncResult | null> {
+    try {
+      return await this.syncAccount(accountId, "scheduled", options);
+    } catch (error) {
+      if (error instanceof AccountBusyError) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Run one pass. When another session holds the account lock, at once or after
+   * `waitForLock`, it throws `AccountBusyError` before recording a run or
+   * changing account state: a deferral, not a failure.
+   */
   async syncAccount(
     accountId: string,
     triggerType: SyncTriggerType = "manual",
@@ -476,7 +520,6 @@ export class MirrorEngine {
     if (!account) throw new Error(`Account not found: ${accountId}`);
     const fullPass = mode === "full";
 
-    const runId = await this.repository.startSyncRun(account.id, triggerType);
     const metadataWriteStats: MetadataWriteStats = {
       rowsCommitted: 0,
       durationMs: 0,
@@ -484,7 +527,7 @@ export class MirrorEngine {
       batchesFailed: 0
     };
     const result: SyncResult = {
-      runId,
+      runId: "",
       mode,
       outcome: "success",
       foldersProcessed: 0,
@@ -505,7 +548,7 @@ export class MirrorEngine {
       errors: []
     };
     let cancellationCleanupRequired = false;
-    const syncOwner = `supamail:${process.pid}:${runId}`;
+    let syncOwner = "";
     const finalizationOptions = () => ({
       fullPass,
       deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
@@ -514,7 +557,11 @@ export class MirrorEngine {
     });
 
     const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async (lock) => {
-      const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
+      // The run is recorded only once the pass holds the lock, so a deferral
+      // leaves no run behind.
+      result.runId = await this.repository.startSyncRun(account.id, triggerType);
+      syncOwner = `supamail:${process.pid}:${result.runId}`;
+      const budget = new LockBudget(Date.now() + this.config.MAX_LOCK_HOLD_MS);
       let accountSyncStarted = false;
       let client: MirrorImapClient | null = null;
       const interruptActiveClient = () => {
@@ -538,7 +585,7 @@ export class MirrorEngine {
         // run still open is a vanished worker's orphan. Cosmetic: never fail the
         // sync over it. Hosts that run no full pass use closeOrphanedSyncRuns.
         if (fullPass) {
-          await this.repository.closeOrphanedSyncRuns(account.id, runId).catch(() => 0);
+          await this.repository.closeOrphanedSyncRuns(account.id, result.runId).catch(() => 0);
         }
         throwIfInterrupted();
         // These modes take their folders from durable due times. With nothing
@@ -626,7 +673,6 @@ export class MirrorEngine {
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
-        let attemptedMailboxChanges = 0;
         const handledMailboxChanges: MailboxChange[] = [];
         const handledMailboxObservations: MailboxChangeObservation[] = [];
         for (const folder of folders) {
@@ -640,16 +686,12 @@ export class MirrorEngine {
           const isPriorityFolder = forceKnownReconcile
             || mailboxChange !== undefined
             || folder.sync_priority <= this.config.PRIORITY_CUTOFF;
-          if (this.isLockBudgetExpired(lockDeadline) && !isPriorityFolder) {
+          // Every folder, Inbox included, waits for the next pass once the
+          // budget is spent; the folder stays due or different, so nothing is lost.
+          if (budget.spent) {
             result.hitLockBudget = true;
             break;
           }
-          if (mailboxChange !== undefined && attemptedMailboxChanges > 0
-            && this.isLockBudgetExpired(lockDeadline)) {
-            result.hitLockBudget = true;
-            break;
-          }
-          if (mailboxChange !== undefined) attemptedMailboxChanges += 1;
 
           const reconcileTelemetry: ReconcileAttemptTelemetry = {
             attempted: false,
@@ -671,8 +713,7 @@ export class MirrorEngine {
               allowReconcile: RECONCILE_MODES.has(mode)
                 && (forceKnownReconcile || remainingReconciles > 0),
               allowFlagScan: FLAG_SCAN_MODES.has(mode) && remainingFlagScans > 0,
-              enforceLockDeadline: !isPriorityFolder,
-              lockDeadline,
+              budget,
               metadataWriteStats,
               reconcileTelemetry,
               forceReconcile: forceKnownReconcile
@@ -684,6 +725,7 @@ export class MirrorEngine {
                 || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true),
               signal: options.signal
             });
+            budget.progressed();
             check.outcome = folderResult.hitLockBudget || !folderResult.initialSyncComplete
               || (folderResult.reconcileAttempted && !folderResult.reconcileClean)
               ? "partial" : "completed";
@@ -694,7 +736,7 @@ export class MirrorEngine {
             result.messagesUpserted += folderResult.messagesUpserted;
             result.flagsUpdated += folderResult.flagsUpdated;
             result.reconcileGapsFound += folderResult.reconcileGapsFound;
-            if (folderResult.hitLockBudget || this.isLockBudgetExpired(lockDeadline)) {
+            if (folderResult.hitLockBudget || budget.spent) {
               result.hitLockBudget = true;
             }
             // A catch-up replay is bounded by the provider's changes, not the
@@ -720,6 +762,7 @@ export class MirrorEngine {
               });
             }
           } catch (error) {
+            budget.progressed();
             throwIfInterrupted();
             // Account-finalising errors (e.g. UIDVALIDITY reset cap exceeded)
             // must escape the per-folder catch so the outer handler sees them
@@ -774,22 +817,22 @@ export class MirrorEngine {
           result.errors.push("Live folder set no longer matches tracked folders");
         }
 
-        if (mode !== "sent" && this.isLockBudgetExpired(lockDeadline)) {
+        if (mode !== "sent" && budget.spent) {
           result.hitLockBudget = true;
         } else if ((fullPass || mode === "body") && !connectionLost) {
-          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
+          const bodyResult = await this.fetchBodyBacklog(account, client, budget, lock.assertLive);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
         }
 
-        if (mode !== "sent" && this.isLockBudgetExpired(lockDeadline)) {
+        if (mode !== "sent" && budget.spent) {
           result.hitLockBudget = true;
         } else if ((fullPass || mode === "history") && !connectionLost) {
           const historyResult = await this.runHistoryLane(
             account,
             client,
-            lockDeadline,
+            budget,
             metadataWriteStats,
             options.signal,
             lock.assertLive
@@ -885,20 +928,20 @@ export class MirrorEngine {
           await client.logout().catch(() => this.abortClient(client!));
         }
       }
-    }, { fenceWrites: true });
+    }, {
+      fenceWrites: true,
+      waitMs: options.waitForLock ? this.config.ACCOUNT_LOCK_WAIT_MS : undefined
+    });
 
     let runFinished = false;
     try {
       let locked = await runLockedSync();
-      // Single-lane passes defer to the authoritative full sweep when another
-      // worker owns the Mailbox Account.
-      const yieldedBeforeLock = locked === null && !fullPass;
       // On direct connections a busy lock is never taken over: its owner may be
       // frozen rather than dead and could resume writing. Server-side TCP probes
       // release a vanished worker's lock (see createPool). Through a session
-      // pooler those probes cannot reach the worker, so the stale-heartbeat
-      // takeover remains the recovery path there.
-      if (locked === null && !yieldedBeforeLock && isSupabaseSessionPoolerUrl(this.config.DATABASE_URL)) {
+      // pooler those probes cannot reach the worker, so a full pass keeps the
+      // stale-heartbeat takeover as the recovery path there.
+      if (locked === null && fullPass && isSupabaseSessionPoolerUrl(this.config.DATABASE_URL)) {
         const recovered = await clearOrphanedLockForAccount(
           this.pool,
           account.lock_id,
@@ -909,6 +952,12 @@ export class MirrorEngine {
         }
       }
 
+      if (locked === null) {
+        // Another session holds the lock: nothing ran and nothing was recorded.
+        // The work stays due or different, so the next pass picks it up.
+        throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the sync shortly`);
+      }
+
       if (cancellationCleanupRequired) {
         await this.repository.markAccountSyncYielded(account.id, {
           deadlineAt: Date.now() + SYNC_CANCELLATION_CLEANUP_TIMEOUT_MS,
@@ -917,21 +966,13 @@ export class MirrorEngine {
       }
 
       applyMetadataWriteStats(result, metadataWriteStats);
-
-      if (locked === null && !yieldedBeforeLock) {
-        result.outcome = "failed";
-        result.errors.push("Account lock busy");
-        await this.repository.updateSyncRunStatus(runId, "failed", "Account lock busy");
-        runFinished = true;
-        return result;
-      }
-
       await this.repository.finishSyncRun(result);
       runFinished = true;
       await this.hooks.onSyncRunCompleted?.(result);
       return result;
     } catch (error) {
-      if (!runFinished) {
+      // Only a pass that recorded a run must close it.
+      if (!runFinished && result.runId) {
         const message = sanitizeErrorReason(describeSyncError(error));
         result.outcome = "failed";
         if (!result.errors.includes(message)) result.errors.push(message);
@@ -942,7 +983,7 @@ export class MirrorEngine {
         } catch (finalizationError) {
           throw new AggregateError(
             [error, finalizationError],
-            `Sync run ${runId} escaped and could not be terminalized`
+            `Sync run ${result.runId} escaped and could not be terminalized`
           );
         }
       }
@@ -1236,8 +1277,7 @@ export class MirrorEngine {
       allowReconcile: boolean;
       allowFlagScan: boolean;
       qresyncCatchUp?: boolean;
-      enforceLockDeadline: boolean;
-      lockDeadline: number;
+      budget: LockBudget;
       metadataWriteStats: MetadataWriteStats;
       reconcileTelemetry: ReconcileAttemptTelemetry;
       forceReconcile?: boolean;
@@ -1362,6 +1402,7 @@ export class MirrorEngine {
           options.metadataWriteStats,
           options.signal
         );
+        options.budget.progressed();
         return {
           messagesUpserted: initial.messagesUpserted,
           flagsUpdated: 0,
@@ -1370,7 +1411,7 @@ export class MirrorEngine {
           reconcileProviderUidsSeen: 0,
           reconcileDurationMs: 0,
           flagScanAttempted: false,
-          hitLockBudget: this.folderHitLockBudget(options),
+          hitLockBudget: options.budget.spent,
           initialSyncComplete: initial.initialSyncComplete,
           reconcileClean: false,
           observedStatus
@@ -1421,7 +1462,8 @@ export class MirrorEngine {
           await this.hooks.onMessageUpsert?.(message);
         }
         lastProcessedUid = batchUids[batchUids.length - 1];
-        if (this.folderHitLockBudget(options)) {
+        options.budget.progressed();
+        if (options.budget.spent) {
           hitLockBudget = true;
           break;
         }
@@ -1472,6 +1514,7 @@ export class MirrorEngine {
           }
           flagScanAttempted = true;
           qresyncApplied = true;
+          options.budget.progressed();
         }
       }
       if (qresyncRequest && (qresyncCommandRejected || qresyncReplay?.accepted === false)) {
@@ -1526,7 +1569,7 @@ export class MirrorEngine {
         || fullFlagScanDue
         || !folder.next_flag_scan_at
         || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
-      if (this.folderHitLockBudget(options)) hitLockBudget = true;
+      if (options.budget.spent) hitLockBudget = true;
       if (!qresyncApplied && !hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
         const flagScanDeadline = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
@@ -1616,9 +1659,14 @@ export class MirrorEngine {
             }
           }
         }
+        options.budget.progressed();
       }
 
-      if (this.folderHitLockBudget(options)) hitLockBudget = true;
+      // A flag scan is one chunk with its own deadline: it has no resume point.
+      // Without a modseq the whole-window scan rides with the scheduled audit
+      // and is due again until that audit runs, so the audit follows it here
+      // rather than wait for a pass the scan would fill again.
+      if (options.budget.spent && !(flagScanAttempted && fullFlagScanDue)) hitLockBudget = true;
       let reconcileClean: boolean | undefined;
       let reconcileListIncomplete = false;
       let backfilled = 0;
@@ -1712,7 +1760,8 @@ export class MirrorEngine {
               for (const message of messages) {
                 await this.hooks.onMessageUpsert?.(message);
               }
-              if (this.folderHitLockBudget(options)) {
+              options.budget.progressed();
+              if (options.budget.spent) {
                 hitLockBudget = true;
                 break;
               }
@@ -1883,14 +1932,6 @@ export class MirrorEngine {
       return;
     }
     void client.logout().catch(() => undefined);
-  }
-
-  private isLockBudgetExpired(deadline: number): boolean {
-    return Date.now() >= deadline;
-  }
-
-  private folderHitLockBudget(options: { enforceLockDeadline: boolean; lockDeadline: number }): boolean {
-    return options.enforceLockDeadline && this.isLockBudgetExpired(options.lockDeadline);
   }
 
   private async upsertMetadataBatch(
@@ -2169,7 +2210,7 @@ export class MirrorEngine {
   private async runHistoryLane(
     account: ImapAccount,
     client: MirrorImapClient,
-    lockDeadline: number,
+    budget: LockBudget,
     metadataWriteStats: MetadataWriteStats,
     signal: AbortSignal | undefined,
     assertLive: () => Promise<void>
@@ -2189,7 +2230,7 @@ export class MirrorEngine {
     const maxBatches = this.historyBatchLimit(account);
 
     while (batchesProcessed < maxBatches) {
-      if (this.isLockBudgetExpired(lockDeadline)) {
+      if (budget.spent) {
         hitLockBudget = true;
         break;
       }
@@ -2204,7 +2245,7 @@ export class MirrorEngine {
           account,
           folder,
           client,
-          lockDeadline,
+          budget,
           metadataWriteStats,
           signal
         );
@@ -2243,16 +2284,16 @@ export class MirrorEngine {
     account: ImapAccount,
     folder: HistoryBacklogFolder,
     client: MirrorImapClient,
-    lockDeadline: number,
+    budget: LockBudget,
     metadataWriteStats: MetadataWriteStats,
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
-    if (this.isLockBudgetExpired(lockDeadline)) {
+    if (budget.spent) {
       return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
     }
 
     if (folder.history_backlog_reason === "body") {
-      return await this.fetchHistoricalBodyBatch(account, folder, client, lockDeadline, signal);
+      return await this.fetchHistoricalBodyBatch(account, folder, client, budget, signal);
     }
 
     const mailboxLock = await client.getMailboxLock(folder.path);
@@ -2320,9 +2361,10 @@ export class MirrorEngine {
           uidValidity,
           { deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS, signal }
         );
+        budget.progressed();
       }
 
-      if (this.isLockBudgetExpired(lockDeadline)) {
+      if (budget.spent) {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
       }
 
@@ -2369,15 +2411,16 @@ export class MirrorEngine {
             signal
           }
         );
+        budget.progressed();
         return {
           messagesUpserted: 0,
           bodiesFetched: 0,
           processed: true,
-          hitLockBudget: this.isLockBudgetExpired(lockDeadline)
+          hitLockBudget: budget.spent
         };
       }
 
-      if (this.isLockBudgetExpired(lockDeadline)) {
+      if (budget.spent) {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
       }
 
@@ -2406,10 +2449,7 @@ export class MirrorEngine {
         bodiesFetched = await this.fetchAndStoreBodies(
           client,
           messages.filter((row) => !row.body_fetched_at),
-          {
-            skipMailboxLock: true,
-            shouldStop: () => this.isLockBudgetExpired(lockDeadline)
-          }
+          { skipMailboxLock: true, budget }
         );
       }
 
@@ -2421,12 +2461,13 @@ export class MirrorEngine {
         uidValidity,
         { complete: !stillRemaining, deadlineAt: progressDeadline, signal }
       );
+      budget.progressed();
 
       return {
         messagesUpserted: messages.length,
         bodiesFetched,
         processed: true,
-        hitLockBudget: this.isLockBudgetExpired(lockDeadline)
+        hitLockBudget: budget.spent
       };
     } finally {
       mailboxLock.release();
@@ -2437,7 +2478,7 @@ export class MirrorEngine {
     account: ImapAccount,
     folder: ImapFolder,
     client: MirrorImapClient,
-    lockDeadline: number,
+    budget: LockBudget,
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
     const backlog = await this.repository.getHistoricalBodyBacklog(
@@ -2458,22 +2499,20 @@ export class MirrorEngine {
       return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
     }
 
-    const fetched = await this.fetchAndStoreBodies(client, backlog, {
-      shouldStop: () => this.isLockBudgetExpired(lockDeadline)
-    });
+    const fetched = await this.fetchAndStoreBodies(client, backlog, { budget });
 
     return {
       messagesUpserted: 0,
       bodiesFetched: fetched,
       processed: fetched > 0,
-      hitLockBudget: this.isLockBudgetExpired(lockDeadline)
+      hitLockBudget: budget.spent
     };
   }
 
   private async fetchBodyBacklog(
     account: ImapAccount,
     client: MirrorImapClient,
-    lockDeadline: number,
+    budget: LockBudget,
     assertLive: () => Promise<void>
   ): Promise<{ fetched: number; hitLockBudget: boolean }> {
     let fetched = 0;
@@ -2481,7 +2520,7 @@ export class MirrorEngine {
     let batchesRemaining = this.config.MAX_BODY_BATCHES_PER_TICK;
 
     while (batchesRemaining > 0) {
-      if (this.isLockBudgetExpired(lockDeadline)) {
+      if (budget.spent) {
         hitLockBudget = true;
         break;
       }
@@ -2504,10 +2543,10 @@ export class MirrorEngine {
         );
 
         await assertLive();
-        fetched += await this.fetchAndStoreBodies(client, logicalBatch);
+        fetched += await this.fetchAndStoreBodies(client, logicalBatch, { budget });
 
         batchesRemaining -= 1;
-        if (this.isLockBudgetExpired(lockDeadline)) {
+        if (budget.spent) {
           hitLockBudget = true;
           break;
         }
@@ -2582,7 +2621,8 @@ export class MirrorEngine {
     messages: ImapMessage[],
     options: {
       skipMailboxLock?: boolean;
-      shouldStop?: () => boolean;
+      /** Stop between bodies once the pass's lock budget is spent. */
+      budget?: LockBudget;
     } = {}
   ): Promise<number> {
     const ordered = this.config.BODY_STORAGE_MODE === "parsed_only"
@@ -2591,7 +2631,7 @@ export class MirrorEngine {
     let processed = 0;
 
     for (let index = 0; index < ordered.length;) {
-      if (options.shouldStop?.()) break;
+      if (options.budget?.spent) break;
       const batchMessages = this.parsedBodyBatchAt(ordered, index);
       if (batchMessages.length > 1) {
         processed += await this.fetchAndStoreBodyBatch(
@@ -2600,12 +2640,12 @@ export class MirrorEngine {
           options.skipMailboxLock
         );
         index += batchMessages.length;
-        continue;
+      } else {
+        await this.fetchAndStoreBody(client, ordered[index], options.skipMailboxLock);
+        processed += 1;
+        index += 1;
       }
-
-      await this.fetchAndStoreBody(client, ordered[index], options.skipMailboxLock);
-      processed += 1;
-      index += 1;
+      options.budget?.progressed();
     }
     return processed;
   }

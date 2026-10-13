@@ -117,9 +117,11 @@ async function sendMessageAttempt(
   // SMTP submission and the matching Sent APPEND are one account-scoped provider
   // operation. Hold the SAME advisory lock used by sync and draft APPENDs across
   // both network verbs so the worker cannot race this send or consume the provider's
-  // per-account command budget concurrently. Acquisition is deliberately
-  // non-blocking: callers get the established transient AccountBusyError before
-  // any irreversible SMTP delivery happens.
+  // per-account command budget concurrently. Acquisition waits up to
+  // ACCOUNT_LOCK_WAIT_MS: a pass releases the lock at least every
+  // MAX_LOCK_HOLD_MS, and Postgres hands it to this waiting request first. A lock
+  // still held after the wait is the established transient AccountBusyError,
+  // raised before any irreversible SMTP delivery happens.
   const result = await withAccountLock(pool, account.lock_id, async (lock) => {
     // Synchronous phase gate: a periodic refresh may have failed since acquisition.
     // Do not cross the irreversible SMTP boundary until heartbeat persistence and
@@ -198,7 +200,8 @@ async function sendMessageAttempt(
     };
   }, {
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
-    onPostIrreversibleWarning: addWarning
+    onPostIrreversibleWarning: addWarning,
+    waitMs: config.ACCOUNT_LOCK_WAIT_MS
   });
 
   if (result === null) {

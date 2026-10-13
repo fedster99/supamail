@@ -90,7 +90,10 @@ const envSchema = z.object({
   IMAP_IDLE_SOCKET_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60_000),
   SMTP_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(10 * 60_000),
   IMAP_MAX_COMMANDS_PER_MINUTE: z.coerce.number().int().positive().default(200),
-  MAX_LOCK_HOLD_MS: z.coerce.number().int().positive().default(10 * 60_000),
+  // A pass stops at the first chunk boundary after this budget, so a send or
+  // live pass waiting ACCOUNT_LOCK_WAIT_MS gets the lock at the next boundary.
+  MAX_LOCK_HOLD_MS: z.coerce.number().int().positive().max(20_000).default(20_000),
+  ACCOUNT_LOCK_WAIT_MS: z.coerce.number().int().positive().max(25_000).default(25_000),
   STALE_HEARTBEAT_MS: z.coerce.number().int().positive().default(5 * 60_000),
   MAX_UIDVALIDITY_RESETS_24H: z.coerce.number().int().positive().default(2),
   FOLDER_MISSING_GRACE_MS: z.coerce.number().int().positive().default(7 * 24 * 60 * 60_000),

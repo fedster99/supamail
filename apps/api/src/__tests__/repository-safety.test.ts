@@ -107,7 +107,13 @@ describe("repository safety", () => {
     expect(source).toContain("clearOrphanedLockForAccount");
     expect(source).toContain("pg_terminate_backend");
     expect(source).not.toContain("pg_try_advisory_xact_lock");
-    expect(source).not.toContain('client.query("BEGIN")');
+    expect(source).not.toContain("pg_advisory_xact_lock");
+    // The bounded wait's transaction only scopes lock_timeout: it commits as
+    // soon as the session-level lock is granted, so no idle transaction holds it.
+    expect(source.split('client.query("BEGIN")').length - 1).toBe(1);
+    expect(source).toMatch(
+      /client\.query\("BEGIN"\);[\s\S]{0,700}SELECT pg_advisory_lock\(\$1::bigint\)"[^\n]*\n\s*await client\.query\("COMMIT"\);/
+    );
   });
 
   it("does not immediately untrack folders after one missing LIST pass", async () => {
