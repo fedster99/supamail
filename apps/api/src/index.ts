@@ -5,6 +5,7 @@ export * from "./crypto.js";
 export * from "./db.js";
 export * from "./delivery-evidence.js";
 export * from "./delivery-identity.js";
+export * from "./download-budget.js";
 export * from "./drafts.js";
 export {
   AbortError,

@@ -51,9 +51,15 @@ export class FixtureImapClient implements MirrorImapClient {
   ) => void;
 
   private readonly foldersByPath: Map<string, FixtureFolder>;
+  /** Message source bytes served; the fixture's stand-in for the session's byte counter. */
+  private sourceBytesServed = 0;
 
   constructor(private readonly folders: FixtureFolder[]) {
     this.foldersByPath = new Map(folders.map((folder) => [folder.path, folder]));
+  }
+
+  receivedBytes(): number {
+    return this.sourceBytesServed;
   }
 
   async logout(): Promise<void> {}
@@ -97,12 +103,11 @@ export class FixtureImapClient implements MirrorImapClient {
 
     for (const message of messages) {
       if (sourceRequest) {
-        yield {
-          ...this.toFetchMessage(message),
-          source: maxSourceLength === undefined
-            ? message.raw
-            : message.raw.subarray(0, maxSourceLength)
-        };
+        const source = maxSourceLength === undefined
+          ? message.raw
+          : message.raw.subarray(0, maxSourceLength);
+        this.sourceBytesServed += source.length;
+        yield { ...this.toFetchMessage(message), source };
         continue;
       }
       yield metadataRequested
@@ -129,6 +134,7 @@ export class FixtureImapClient implements MirrorImapClient {
       ? query.source.maxLength
       : undefined;
     const source = maxLength === undefined ? message.raw : message.raw.subarray(0, maxLength);
+    if (query.source) this.sourceBytesServed += source.length;
 
     return {
       ...this.toFetchMessage(message),
@@ -149,6 +155,7 @@ export class FixtureImapClient implements MirrorImapClient {
     if (!message) return {};
     const maxBytes = typeof options.maxBytes === "number" ? options.maxBytes : undefined;
     const raw = maxBytes === undefined ? message.raw : message.raw.subarray(0, maxBytes);
+    this.sourceBytesServed += raw.length;
 
     return {
       content: (async function* stream() {
