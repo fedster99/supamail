@@ -1,6 +1,6 @@
 # ADR 0008: Enforce Account Lock Budget Cooperatively
 
-Status: Accepted
+Status: Accepted; amended by ADR 0044, which sets a 20 s budget for every folder and lets sends wait for the lock
 
 Date: 2026-05-23
 
@@ -16,6 +16,7 @@ Enforce `MAX_LOCK_HOLD_MS` as a cooperative lock budget:
 
 - `syncAccount` computes a lock deadline immediately after acquiring the advisory lock.
 - Priority folders still get processed even if the deadline has already been reached, and priority folders are not interrupted inside their folder work.
+  *Superseded by ADR 0044:* every folder stops at the 20 s budget, and each pass finishes one chunk first.
 - Non-priority folders check the deadline before starting and between metadata/reconcile batches.
 - Body backlog fetch checks the deadline between batches and is capped by `MAX_BODY_BATCHES_PER_TICK`.
 - `SyncResult.hitLockBudget` records that the cycle reached the budget.
