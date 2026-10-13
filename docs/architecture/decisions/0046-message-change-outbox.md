@@ -42,9 +42,11 @@ deletes the ones it handled.**
 
 ## Consequences
 
-- With no consumer of `(updated_at, id)` left, a later reviewed removal can
-  drop `imap_messages_updated_emit_idx`, making updates that touch no other
-  indexed column HOT-eligible.
+- With no consumer of `(updated_at, id)` left, the reviewed removal `0036`
+  drops `imap_messages_updated_emit_idx`, so an update that touches no other
+  indexed column (a body completion, a move within the indexes' keys) is
+  HOT-eligible. Flag changes stay indexed by the Postgres search layer
+  (`imap_messages_flags_gin`, `imap_messages_unread_date_idx`).
 - Each update of a live message adds one small insert and, once claimed or
   pruned, one delete. That is much less than a non-HOT update's index entries.
 - A consumer stopped for more than seven days loses the changes before that.
