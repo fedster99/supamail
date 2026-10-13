@@ -79,6 +79,9 @@ const PURGE_MESSAGE_BATCH_SIZE = 100;
 // hold up a worker; the daily cadence drains the rest.
 const SYNC_HISTORY_PRUNE_BATCH_SIZE = 50_000;
 const SYNC_HISTORY_PRUNE_MAX_BATCHES = 10;
+// A consumer deletes the change rows it handled. Rows older than this were
+// never claimed (no consumer, or one stopped for a week) and are dropped.
+const MESSAGE_CHANGE_RETENTION_DAYS = 7;
 const PURGE_RECOMPUTE_PAIR_LIMIT = 25_000;
 const RECONCILE_MISSING_UID_LIMIT = 5_000;
 /** Rows one reconcile transaction tombstones or revives before it commits. */
@@ -1823,15 +1826,39 @@ export class MirrorRepository {
   }
 
   /**
+   * Prune imap_message_changes rows no consumer claimed within
+   * MESSAGE_CHANGE_RETENTION_DAYS. The update trigger records a row for every
+   * change to a live message; a consumer deletes the rows it handled, so this
+   * bounds the table when there is no consumer.
+   */
+  async runMessageChangePruneJob(): Promise<{ prunedChanges: number }> {
+    const prunedChanges = await this.pruneSyncHistory(
+      `
+      DELETE FROM public.imap_message_changes
+      WHERE id IN (
+        SELECT id FROM public.imap_message_changes
+        WHERE changed_at < now() - ($1::int * interval '1 day')
+        LIMIT $2
+      )
+      `,
+      MESSAGE_CHANGE_RETENTION_DAYS
+    );
+    return { prunedChanges };
+  }
+
+  /**
    * Run a sync-history DELETE (parameters: retention days, batch size) until a
    * statement removes less than a full batch, or the per-run batch cap is reached.
    * Each statement is its own short transaction.
    */
-  private async pruneSyncHistory(sql: string): Promise<number> {
+  private async pruneSyncHistory(
+    sql: string,
+    retentionDays = this.config.SYNC_EVENT_RETENTION_DAYS
+  ): Promise<number> {
     let pruned = 0;
     for (let batch = 0; batch < SYNC_HISTORY_PRUNE_MAX_BATCHES; batch += 1) {
       const result = await this.pool.query(sql, [
-        this.config.SYNC_EVENT_RETENTION_DAYS,
+        retentionDays,
         SYNC_HISTORY_PRUNE_BATCH_SIZE
       ]);
       const deleted = result.rowCount ?? 0;
@@ -1841,11 +1868,17 @@ export class MirrorRepository {
     return pruned;
   }
 
-  async runRetentionJobs(): Promise<{ purged: number; prunedEvents: number; prunedRuns: number }> {
+  async runRetentionJobs(): Promise<{
+    purged: number;
+    prunedEvents: number;
+    prunedRuns: number;
+    prunedChanges: number;
+  }> {
     const { purged } = await this.runPurgeJob();
     const { prunedEvents } = await this.runSyncEventPruneJob();
     const { prunedRuns } = await this.runSyncRunPruneJob();
-    return { purged, prunedEvents, prunedRuns };
+    const { prunedChanges } = await this.runMessageChangePruneJob();
+    return { purged, prunedEvents, prunedRuns, prunedChanges };
   }
 
   async upsertDiscoveredFolders(

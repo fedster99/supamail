@@ -112,7 +112,8 @@ const RELEASED_MIGRATION_SHA256: Record<string, string> = {
   "0029_active_assignments_view_no_barrier.sql": "3d44fe55233bc035477c62a8c62c1e58fbda168f5743f43b54b2f2009fb6cc82",
   "0030_window_from_message_date.sql": "ef838f7cdc055fe834792e2245e2bab7d8decb55c7cbcc47022ae57b69a197c3",
   "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf",
-  "0032_drop_retired_window_columns.sql": "abc1cc8e485f7ee386722b1d0de994233a92d1ed79bcdfa711cb63741d7c30c1"
+  "0032_drop_retired_window_columns.sql": "abc1cc8e485f7ee386722b1d0de994233a92d1ed79bcdfa711cb63741d7c30c1",
+  "0035_message_change_outbox.sql": "0517f5eade84dd15fa8860b79ead6bd617b53651d94dab1e5023595b5b45de46"
 };
 
 describe("initial schema", () => {
@@ -340,9 +341,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = (await readPublicMigrationFiles()).map((migration) => migration.sql).join("\n\n");
 
-    expect(version).toBe("0032_drop_retired_window_columns");
+    expect(version).toBe("0035_message_change_outbox");
     expect(manifest).toEqual({
-      schemaVersion: "0032_drop_retired_window_columns",
+      schemaVersion: "0035_message_change_outbox",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -375,7 +376,8 @@ describe("initial schema", () => {
         { id: "0029_active_assignments_view_no_barrier", file: "0029_active_assignments_view_no_barrier.sql" },
         { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" },
         { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" },
-        { id: "0032_drop_retired_window_columns", file: "0032_drop_retired_window_columns.sql" }
+        { id: "0032_drop_retired_window_columns", file: "0032_drop_retired_window_columns.sql" },
+        { id: "0035_message_change_outbox", file: "0035_message_change_outbox.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
