@@ -105,3 +105,13 @@ this does not add an exactly-once or automatic retry guarantee.
 smoke exercises successful fallback and real-server rejection of COPY, plus
 injected STORE/EXPUNGE/disconnect failures with actual source/destination counts.
 It also checks each returned destination UID against that email's Message-ID.
+
+## Mirror completion in action results
+
+Single-message flags and move results expose `mirrorUpdated`. A confirmed
+provider action still succeeds when its mirror update fails, but callers can
+now distinguish that from a committed mirror change. For a move, `idKept:false`
+only proves the old row was removed when `mirrorUpdated:true`; a failed mirror
+write can leave the source row live. Hosts must not repeat a confirmed provider
+action merely because its mirror or search visibility is pending. This adds no
+new retry or provider-command behavior.

@@ -369,6 +369,8 @@ export interface FlagChange {
 }
 
 export interface FlagResult {
+  /** Whether the confirmed provider change is also committed in the mirror. */
+  mirrorUpdated: boolean;
   messageId: string;
   folderPath: string;
   uid: number;
@@ -447,25 +449,26 @@ async function writeRemovalThrough(repository: MirrorRepository, target: Resolve
  * reported the destination UID (COPYUID), the row moves with the message and keeps
  * its id, so its body, attachments, threading, and host state stay attached.
  * Otherwise the source row is tombstoned and the next sync of the destination
- * mirrors the copy under a new id. Returns whether the id still names the message.
+ * mirrors the copy under a new id. Reports identity separately from mirror completion.
  */
 async function writeMoveThrough(
   repository: MirrorRepository,
   target: ResolvedMessageTarget,
   destination: string,
   moved: MovedLocation
-): Promise<boolean> {
+): Promise<{ idKept: boolean; mirrorUpdated: boolean }> {
   const uid = moved.uidMap?.get(target.uid);
   try {
     if (uid !== undefined && moved.uidValidity !== null
       && await repository.relocateMovedMessage(target, { folderPath: destination, uidValidity: moved.uidValidity, uid })) {
-      return true;
+      return { idKept: true, mirrorUpdated: true };
     }
     await repository.markMessageRemovedByProvider(target);
+    return { idKept: false, mirrorUpdated: true };
   } catch (error) {
     warnWriteThroughFailed("organize.move_write_through_failed", target, error);
   }
-  return false;
+  return { idKept: false, mirrorUpdated: false };
 }
 
 /**
@@ -501,12 +504,14 @@ export async function setMessageFlags(
     await closeImap(mutator);
   }
 
-  await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
+  const mirrorUpdated = await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
 
-  return { messageId, folderPath: target.folderPath, uid: target.uid, added: add, removed: remove };
+  return { messageId, folderPath: target.folderPath, uid: target.uid, added: add, removed: remove, mirrorUpdated };
 }
 
 export interface MoveResult {
+  /** Whether relocation or removal of the source row committed. */
+  mirrorUpdated: boolean;
   messageId: string;
   fromFolder: string;
   toFolder: string;
@@ -515,8 +520,9 @@ export interface MoveResult {
   newUid: number | null;
   /** True when `messageId` still names the message, now in `toFolder` (ADR 0037).
    * False when the row could not move with it (no COPYUID, a destination that is
-   * not tracked at that UIDVALIDITY, or a failed mirror write): the old id is gone,
-   * and the next sync of `toFolder` mirrors the message under a new id. */
+   * not tracked at that UIDVALIDITY, or a failed mirror write). When false,
+   * mirrorUpdated confirms whether the old id was removed. The destination
+   * sync discovers the moved message; do not retry the provider move. */
   idKept: boolean;
 }
 
@@ -587,8 +593,8 @@ export async function moveMessages(
   return messageIds.map((messageId) => outcomes.get(messageId)!);
 }
 
-function moveResult(target: ResolvedMessageTarget, destination: string, newUid: number | null, idKept: boolean): MoveResult {
-  return { messageId: target.messageId, fromFolder: target.folderPath, toFolder: destination, newUid, idKept };
+function moveResult(target: ResolvedMessageTarget, destination: string, newUid: number | null, idKept: boolean, mirrorUpdated = true): MoveResult {
+  return { messageId: target.messageId, fromFolder: target.folderPath, toFolder: destination, newUid, idKept, mirrorUpdated };
 }
 
 /** Move one mailbox's targets over one connection, one UID MOVE per folder and
@@ -623,9 +629,9 @@ async function moveMailboxTargets(
           continue;
         }
         for (const target of folder) {
-          const idKept = await writeMoveThrough(repository, target, destination, moved);
+          const { idKept, mirrorUpdated } = await writeMoveThrough(repository, target, destination, moved);
           const newUid = moved.uidMap?.get(target.uid) ?? null;
-          outcomes.set(target.messageId, { messageId: target.messageId, result: moveResult(target, destination, newUid, idKept) });
+          outcomes.set(target.messageId, { messageId: target.messageId, result: moveResult(target, destination, newUid, idKept, mirrorUpdated) });
         }
       }
     } finally {
@@ -932,7 +938,7 @@ export async function moveThread(
       if (target.folderPath === destination) continue;
       const location = await mutator.move([target], destination);
       // Per member, so a later member's failure keeps every earlier write.
-      if (!await writeMoveThrough(repository, target, destination, location)) idsNotKept.push(target.messageId);
+      if (!(await writeMoveThrough(repository, target, destination, location)).idKept) idsNotKept.push(target.messageId);
       moved.push(target.messageId);
     }
   } finally {
