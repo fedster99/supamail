@@ -1,13 +1,19 @@
 import { z } from "zod";
-import type { PgClient, PgPool } from "../../db.js";
+import type { PgClient } from "../../db.js";
 import { formatZodIssues } from "../../errors.js";
 import type { ReadAccount } from "../../search/index.js";
 import { buildReadAccounts } from "../../search/index.js";
 import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identity.js";
 import { extractMessageIdTokens } from "../../threading.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
-import type { MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
-import { loadMessageAttachments, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
+import type { MessageDetail, MessageDetailRow, ReadSource, ToolDefinition, ToolEntry } from "../shared.js";
+import {
+  isHostReadTransaction,
+  loadMessageAttachments,
+  mapMessageRow,
+  toolError,
+  withReadOnlyTx
+} from "../shared.js";
 import {
   METADATA_PROTECTED_FIELDS,
   plaintextMetadataProtection,
@@ -487,7 +493,7 @@ async function fetchThreadRows(
 }
 
 async function runReadThreadInternal(
-  pool: PgPool,
+  source: ReadSource,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter,
   options: ReadThreadOptions
@@ -520,16 +526,19 @@ async function runReadThreadInternal(
     const messageIds = [...new Set(input.message_ids)];
     const threads = new Array<ReadThreadBatchResult["threads"][number]>(messageIds.length);
     let nextIndex = 0;
-    // Each item owns one snapshot, including its accounts. Sharing them across
-    // items could describe a different mirror state than the returned thread.
+    // Each item owns one snapshot, including its accounts, and a failed item
+    // leaves the others. Inside a host's transaction every item shares its one
+    // snapshot and connection, so items run in order, and a failed item ends the
+    // read: after a failed statement the transaction cannot run another.
+    const hostTransaction = isHostReadTransaction(source);
     await Promise.all(Array.from(
-      { length: Math.min(THREAD_BATCH_CONCURRENCY, messageIds.length) },
+      { length: Math.min(hostTransaction ? 1 : THREAD_BATCH_CONCURRENCY, messageIds.length) },
       async () => {
         while (nextIndex < messageIds.length) {
           const index = nextIndex++;
           const messageId = messageIds[index];
           try {
-            const result = await runReadThreadInternal(pool, {
+            const result = await runReadThreadInternal(source, {
               message_id: messageId,
               account: input.account,
               include_quoted: input.include_quoted,
@@ -542,7 +551,8 @@ async function runReadThreadInternal(
             } else {
               throw new Error("unexpected nested read_thread batch result");
             }
-          } catch {
+          } catch (error) {
+            if (hostTransaction) throw error;
             threads[index] = {
               message_id: messageId,
               error: toolError(
@@ -581,7 +591,7 @@ async function runReadThreadInternal(
   }
   const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;
 
-  return withReadOnlyTx(pool, async (client) => {
+  return withReadOnlyTx(source, async (client) => {
     let fetched: FetchedThread;
     let accountIds: string[] | null;
 
@@ -719,12 +729,12 @@ async function runReadThreadInternal(
 }
 
 export function runReadThread(
-  pool: PgPool,
+  source: ReadSource,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: ReadThreadOptions = {}
 ): Promise<ReadThreadResult | ReadThreadBatchResult | ReturnType<typeof toolError>> {
-  return runReadThreadInternal(pool, args, metadataProtection, options);
+  return runReadThreadInternal(source, args, metadataProtection, options);
 }
 
 export const readThreadEntry: ToolEntry = {

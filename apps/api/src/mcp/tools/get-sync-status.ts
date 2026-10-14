@@ -1,9 +1,9 @@
 import { z } from "zod";
-import type { PgClient, PgPool } from "../../db.js";
+import type { PgClient } from "../../db.js";
 import { formatZodIssues } from "../../errors.js";
 import { buildSyncStatus, type SyncStatus } from "../../search/index.js";
 import { toolError, withReadOnlyTx } from "../shared.js";
-import type { ToolDefinition, ToolEntry } from "../shared.js";
+import type { ReadSource, ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
   type MetadataProtectionAdapter
@@ -53,7 +53,7 @@ export const getSyncStatusDefinition: ToolDefinition = {
 };
 
 export async function runGetSyncStatus(
-  pool: PgPool,
+  source: ReadSource,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<SyncStatus | ReturnType<typeof toolError>> {
@@ -66,7 +66,7 @@ export async function runGetSyncStatus(
     );
   }
   const accountId = parsed.data.account ?? null;
-  const status = await withReadOnlyTx(pool, (client: PgClient) =>
+  const status = await withReadOnlyTx(source, (client: PgClient) =>
     buildSyncStatus(client, accountId ? [accountId] : null, metadataProtection)
   );
   if (accountId && status.accounts.length === 0) {

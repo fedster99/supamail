@@ -1,8 +1,9 @@
 import { z } from "zod";
-import type { PgClient, PgPool } from "../../db.js";
+import type { PgClient } from "../../db.js";
 import { formatZodIssues } from "../../errors.js";
-import { readAccountsFor, toolError, withReadOnlyTx } from "../shared.js";
-import type { ToolDefinition, ToolEntry } from "../shared.js";
+import { buildReadAccounts, type ReadAccount } from "../../search/index.js";
+import { toolError, withReadOnlyTx } from "../shared.js";
+import type { ReadSource, ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
   type MetadataProtectionAdapter
@@ -41,7 +42,7 @@ interface FolderRow {
 interface ListFoldersResponse {
   folders: FolderRow[];
   totals: { total: number; unread: number };
-  accounts: Awaited<ReturnType<typeof readAccountsFor>>;
+  accounts: ReadAccount[];
 }
 
 /** The MCP tool definition (literal JSON Schema), mirroring `search_email`'s shape. */
@@ -77,11 +78,12 @@ export const listFoldersDefinition: ToolDefinition = {
 };
 
 /**
- * Read folder rows with their stored counts in one read-only transaction;
- * the account names come from their own. Empty result is not an error.
+ * Read folder rows with their stored counts and name their accounts in one
+ * read-only transaction, the host's when it passes one. Empty result is not an
+ * error.
  */
 export async function runListFolders(
-  pool: PgPool,
+  source: ReadSource,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<ListFoldersResponse | ReturnType<typeof toolError>> {
@@ -97,7 +99,7 @@ export async function runListFolders(
 
   const accountId = request.account ?? null;
 
-  const folders = await withReadOnlyTx(pool, async (client: PgClient) => {
+  const { folders, accounts } = await withReadOnlyTx(source, async (client: PgClient) => {
     // `$1` is null when no account scope is requested.
     const result = await client.query<FolderRow>(
       `
@@ -114,19 +116,14 @@ export async function runListFolders(
       `,
       [accountId]
     );
-    return result.rows;
+    const accounts = await buildReadAccounts(client, accountId ? [accountId] : null, metadataProtection);
+    return { folders: result.rows, accounts };
   });
 
   const totals = {
     total: folders.reduce((sum, folder) => sum + folder.total, 0),
     unread: folders.reduce((sum, folder) => sum + folder.unread, 0)
   };
-
-  const accounts = await readAccountsFor(
-    pool,
-    accountId ? [accountId] : null,
-    metadataProtection
-  );
 
   return { folders, totals, accounts };
 }

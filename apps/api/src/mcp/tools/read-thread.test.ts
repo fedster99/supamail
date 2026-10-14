@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { runReadThread } from "./read-thread.js";
 import type { ReadThreadResult } from "./read-thread.js";
+import { READ_ONLY_TRANSACTION_BEGIN } from "../shared.js";
 
 const ACCOUNT_ID = "11111111-1111-1111-1111-111111111111";
 const BATCH_IDS = Array.from(
@@ -451,6 +452,44 @@ describe("read_thread stored assignments", () => {
     expect(connect).toHaveBeenCalledTimes(2);
   });
 
+  it("reads a batch in order inside a host's transaction, on its one connection", async () => {
+    const { pool, connect } = batchConversationPool();
+    const hostTransaction = await pool.connect();
+    connect.mockClear();
+
+    const out = await runReadThread({ hostTransaction } as never, {
+      message_ids: [MESSAGE_ONE, MISSING_MESSAGE, MESSAGE_TWO]
+    });
+
+    expect(out).toMatchObject({
+      threads: [
+        { message_id: MESSAGE_ONE, result: { thread: { conversation_id: conversationFor(MESSAGE_ONE) } } },
+        { message_id: MISSING_MESSAGE, error: { code: "not_found" } },
+        { message_id: MESSAGE_TWO, result: { thread: { conversation_id: conversationFor(MESSAGE_TWO) } } }
+      ]
+    });
+    expect(connect).not.toHaveBeenCalled();
+    const statements = hostTransaction.query.mock.calls.map(([sql]) => String(sql));
+    expect(statements.some((sql) => /\b(BEGIN|COMMIT|ROLLBACK)\b/.test(sql))).toBe(false);
+    const seeds = hostTransaction.query.mock.calls
+      .filter(([sql]) => String(sql).includes("WHERE m.id = $1"))
+      .map(([, values]) => (values as unknown[])[0]);
+    expect(seeds).toEqual([MESSAGE_ONE, MISSING_MESSAGE, MESSAGE_TWO]);
+  });
+
+  it("ends a batch read at a database failure inside a host's transaction", async () => {
+    const { pool } = batchConversationPool();
+    const hostTransaction = await pool.connect();
+
+    await expect(runReadThread({ hostTransaction } as never, {
+      message_ids: [MESSAGE_ONE, BROKEN_MESSAGE, MESSAGE_TWO]
+    })).rejects.toThrow("temporary database failure");
+    const seeds = hostTransaction.query.mock.calls
+      .filter(([sql]) => String(sql).includes("WHERE m.id = $1"))
+      .map(([, values]) => (values as unknown[])[0]);
+    expect(seeds).toEqual([MESSAGE_ONE, BROKEN_MESSAGE]);
+  });
+
   it("returns the batch envelope for one message seed", async () => {
     const { pool, connect } = batchConversationPool();
 
@@ -554,7 +593,7 @@ describe("read_thread stored assignments", () => {
       message_count: 1
     });
     expect(out.messages.map((message) => message.message_id)).toEqual(["message-representative"]);
-    expect(query).toHaveBeenCalledWith("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    expect(query).toHaveBeenCalledWith(READ_ONLY_TRANSACTION_BEGIN);
 
     const conversationCall = query.mock.calls.find(([sql]) => sql.includes("WITH delivery_copies"));
     expect(conversationCall?.[0]).toContain("PARTITION BY m.account_id, assignment.delivery_key");
