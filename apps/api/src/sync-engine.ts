@@ -15,7 +15,8 @@ import {
   PARSED_BODY_BATCH_MAX_SOURCE_BYTES,
   PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES,
   IncompleteUidListError,
-  searchMailboxUids
+  searchMailboxUids,
+  UnreadableMessagesError
 } from "./imap-client.js";
 import type {
   MailboxChange,
@@ -36,7 +37,7 @@ import {
   isMissingMailboxDiagnosticText,
 } from "./sync-diagnostics.js";
 import type { MetadataWriteOptions } from "./repository.js";
-import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
+import { MAX_SYNC_BATCH_SIZE, UNREADABLE_ATTEMPTS_BEFORE_SKIP } from "./sync-limits.js";
 import type {
   FolderCheck,
   ImapAccount,
@@ -178,6 +179,8 @@ type MetadataWriteStats = {
   durationMs: number;
   batchesAttempted: number;
   batchesFailed: number;
+  /** Messages recorded unreadable and skipped in this pass. */
+  unreadableSkipped: number;
 };
 
 export function metadataRowsPerSecond(rowsCommitted: number, durationMs: number): number | null {
@@ -203,6 +206,7 @@ function applyMetadataWriteStats(result: SyncResult, stats: MetadataWriteStats):
   result.metadataWriteBatchesAttempted = stats.batchesAttempted;
   result.metadataWriteBatchesFailed = stats.batchesFailed;
   result.metadataWriteServiceRowsPerSecond = metadataRowsPerSecond(stats.rowsCommitted, durationMs);
+  result.unreadableMessagesSkipped = stats.unreadableSkipped;
 }
 
 // Response codes that mean the credential itself was rejected (RFC 5530).
@@ -579,7 +583,8 @@ export class MirrorEngine {
       rowsCommitted: 0,
       durationMs: 0,
       batchesAttempted: 0,
-      batchesFailed: 0
+      batchesFailed: 0,
+      unreadableSkipped: 0
     };
     const result: SyncResult = {
       runId: "",
@@ -1524,6 +1529,7 @@ export class MirrorEngine {
       ].sort((a, b) => a - b);
 
       const incrementalBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
+      const unreadable = this.skippedUnreadableUids(folder);
       // New mail has no date limit, so a large move of old mail can arrive at
       // once. One pass takes a bounded number of batches and saves its progress;
       // the rest follows on the next passes, oldest UID first.
@@ -1531,11 +1537,18 @@ export class MirrorEngine {
       let lastProcessedUid: number | undefined;
       for (let i = 0; i < passUids.length; i += incrementalBatchSize) {
         const batchUids = passUids.slice(i, i + incrementalBatchSize);
-        const metadata = await this.withIncrementalDeadline(
-          client,
-          incrementalDeadline,
-          "incremental FETCH",
-          () => fetchMessageMetadata(client, batchUids, incrementalBatchSize)
+        const metadata = await this.fetchReadableMetadata(
+          folder,
+          uidValidity,
+          batchUids,
+          unreadable,
+          options.metadataWriteStats,
+          (wanted) => this.withIncrementalDeadline(
+            client,
+            incrementalDeadline,
+            "incremental FETCH",
+            () => fetchMessageMetadata(client, wanted, incrementalBatchSize)
+          )
         );
         const messages = await this.upsertMetadataBatch(
           options.metadataWriteStats,
@@ -1807,6 +1820,12 @@ export class MirrorEngine {
               deadlineAt: reconcileDeadline
             }
           );
+          // The UID list is complete: forget unreadable messages the provider
+          // no longer has, including any this pass skipped.
+          if (folder.unreadable_messages || options.metadataWriteStats.unreadableSkipped > 0) {
+            const listed = new Set(folderUids);
+            await this.repository.forgetUnreadableMessages(folder.id, uidValidity, (uid) => listed.has(uid));
+          }
         } catch (error) {
           if (!(error instanceof IncompleteUidListError)) throw error;
           // Unproven: change nothing, keep the folder's other progress, and let
@@ -1822,16 +1841,27 @@ export class MirrorEngine {
           reconcileProviderUidsSeen += reconcile.providerUidCount;
 
           // Spec §10.7 step 3: missingInDb → fetch + upsert (closes the gap).
-          if (reconcile.missingInDbUids.length > 0) {
+          // A skipped unreadable message is known, not drift, so it is neither
+          // repaired nor counted as a gap.
+          const missingInDb = reconcile.missingInDbUids.filter((uid) => !unreadable.has(uid));
+          let repaired = 0;
+          if (missingInDb.length > 0) {
             const backfillBatchSize = this.config.INCREMENTAL_SYNC_BATCH_SIZE;
-            for (let i = 0; i < reconcile.missingInDbUids.length; i += backfillBatchSize) {
-              const batchUids = reconcile.missingInDbUids.slice(i, i + backfillBatchSize);
-              const metadata = await this.withOperationDeadline(
-                client,
-                reconcileDeadline,
-                "RECONCILE_TOTAL_TIMEOUT_MS",
-                "reconcile backfill FETCH",
-                () => fetchMessageMetadata(client, batchUids, backfillBatchSize)
+            for (let i = 0; i < missingInDb.length; i += backfillBatchSize) {
+              const batchUids = missingInDb.slice(i, i + backfillBatchSize);
+              const metadata = await this.fetchReadableMetadata(
+                folder,
+                uidValidity,
+                batchUids,
+                unreadable,
+                options.metadataWriteStats,
+                (wanted) => this.withOperationDeadline(
+                  client,
+                  reconcileDeadline,
+                  "RECONCILE_TOTAL_TIMEOUT_MS",
+                  "reconcile backfill FETCH",
+                  () => fetchMessageMetadata(client, wanted, backfillBatchSize)
+                )
               );
               this.assertDeadlineAvailable(
                 client,
@@ -1848,6 +1878,7 @@ export class MirrorEngine {
                 { deadlineAt: reconcileDeadline, signal: options.signal }
               );
               backfilled += messages.length;
+              repaired += batchUids.length;
               for (const message of messages) {
                 await this.hooks.onMessageUpsert?.(message);
               }
@@ -1864,10 +1895,10 @@ export class MirrorEngine {
               folder.path,
               null,
               "RECONCILE_BACKFILL",
-              { backfilled, attempted: reconcile.missingInDbUids.length }
+              { backfilled, attempted: missingInDb.length }
             );
           }
-          reconcileGapsFound += reconcile.markedCount + reconcile.revivedCount + reconcile.missingInDbUids.length;
+          reconcileGapsFound += reconcile.markedCount + reconcile.revivedCount + missingInDb.length;
           // Gap count is evidence that the mirror drifted before this pass, not
           // evidence that it is still dirty afterward. Provider-missing rows are
           // tombstoned inside reconcileFolderUids, and every
@@ -1877,7 +1908,7 @@ export class MirrorEngine {
           reconcileClean = !hitLockBudget
             && reconcile.complete
             && !reconcile.missingInDbTruncated
-            && backfilled === reconcile.missingInDbUids.length;
+            && repaired === missingInDb.length;
         }
         reconcileDurationMs += Math.max(0, Date.now() - reconcileStartedAt);
       }
@@ -2041,6 +2072,7 @@ export class MirrorEngine {
     metadata: MessageMetadata[],
     options: MetadataWriteOptions = {}
   ): Promise<ImapMessage[]> {
+    if (metadata.length === 0) return [];
     const startedAt = performance.now();
     stats.batchesAttempted += 1;
     try {
@@ -2059,6 +2091,52 @@ export class MirrorEngine {
     } finally {
       stats.durationMs += Math.max(0, performance.now() - startedAt);
     }
+  }
+
+  /** UIDs of this folder generation recorded unreadable often enough to skip. */
+  private skippedUnreadableUids(folder: ImapFolder): Set<number> {
+    return new Set(Object.entries(folder.unreadable_messages ?? {})
+      .filter(([, record]) => record.attempts >= UNREADABLE_ATTEMPTS_BEFORE_SKIP)
+      .map(([uid]) => Number(uid)));
+  }
+
+  /**
+   * Metadata for `uids` without the messages this folder skips. A message whose
+   * metadata cannot be read is recorded with its code. Once it has failed
+   * UNREADABLE_ATTEMPTS_BEFORE_SKIP times it is skipped and counted, and the
+   * rest of the batch is fetched again; before that, its failure fails the
+   * batch as before, so a passing provider glitch never skips mail.
+   */
+  private async fetchReadableMetadata(
+    folder: ImapFolder,
+    uidValidity: number,
+    uids: number[],
+    skipped: Set<number>,
+    stats: MetadataWriteStats,
+    fetch: (uids: number[]) => Promise<MessageMetadata[]>
+  ): Promise<MessageMetadata[]> {
+    let wanted = uids.filter((uid) => !skipped.has(uid));
+    while (wanted.length > 0) {
+      try {
+        const metadata = await fetch(wanted);
+        // A message that failed in an earlier pass and now reads fine was a
+        // passing glitch: forget its record.
+        const records = folder.unreadable_messages ?? {};
+        const readable = new Set(wanted);
+        if (Object.keys(records).some((uid) => readable.has(Number(uid)))) {
+          await this.repository.forgetUnreadableMessages(folder.id, uidValidity, (uid) => !readable.has(uid));
+        }
+        return metadata;
+      } catch (error) {
+        if (!(error instanceof UnreadableMessagesError)) throw error;
+        const nowSkipped = await this.repository.recordUnreadableMessages(folder.id, uidValidity, error.messages);
+        if (nowSkipped.length < error.messages.length) throw error;
+        for (const uid of nowSkipped) skipped.add(uid);
+        stats.unreadableSkipped += nowSkipped.length;
+        wanted = wanted.filter((uid) => !skipped.has(uid));
+      }
+    }
+    return [];
   }
 
   // Spec §10.4: process one bounded live-head batch, then one snapshot batch
@@ -2146,6 +2224,7 @@ export class MirrorEngine {
     );
     const sortedCandidates = [...new Set(candidates)].sort((a, b) => a - b);
     let messagesUpserted = 0;
+    const unreadable = this.skippedUnreadableUids(folder);
 
     const liveFloor = Math.max(targetMaxUid, liveHeadUid) + 1;
     const liveCandidates = uidNext && uidNext > liveFloor
@@ -2161,14 +2240,17 @@ export class MirrorEngine {
       .sort((a, b) => a - b)
       .slice(0, this.config.INCREMENTAL_SYNC_BATCH_SIZE);
     if (liveBatch.length > 0) {
-      const liveMetadata = await this.withInitialSyncDeadline(
-        client,
-        initialSyncDeadline,
-        "initial sync live-head FETCH",
-        () => fetchMessageMetadata(
+      const liveMetadata = await this.fetchReadableMetadata(
+        folder,
+        uidValidity,
+        liveBatch,
+        unreadable,
+        metadataWriteStats,
+        (wanted) => this.withInitialSyncDeadline(
           client,
-          liveBatch,
-          this.config.INCREMENTAL_SYNC_BATCH_SIZE
+          initialSyncDeadline,
+          "initial sync live-head FETCH",
+          () => fetchMessageMetadata(client, wanted, this.config.INCREMENTAL_SYNC_BATCH_SIZE)
         )
       );
       this.assertDeadlineAvailable(
@@ -2244,11 +2326,18 @@ export class MirrorEngine {
     }
 
     const batch = descending.slice().reverse(); // ascending order for FETCH
-    const metadata = await this.withInitialSyncDeadline(
-      client,
-      initialSyncDeadline,
-      "initial sync FETCH",
-      () => fetchMessageMetadata(client, batch, batchSize)
+    const metadata = await this.fetchReadableMetadata(
+      folder,
+      uidValidity,
+      batch,
+      unreadable,
+      metadataWriteStats,
+      (wanted) => this.withInitialSyncDeadline(
+        client,
+        initialSyncDeadline,
+        "initial sync FETCH",
+        () => fetchMessageMetadata(client, wanted, batchSize)
+      )
     );
     this.assertDeadlineAvailable(
       client,
@@ -2534,7 +2623,14 @@ export class MirrorEngine {
         return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
       }
 
-      const metadata = await fetchMessageMetadata(client, batch, batchSize);
+      const metadata = await this.fetchReadableMetadata(
+        folder,
+        uidValidity,
+        batch,
+        this.skippedUnreadableUids(folder),
+        metadataWriteStats,
+        (wanted) => fetchMessageMetadata(client, wanted, batchSize)
+      );
       const historyWriteDeadline = Date.now() + Math.min(
         HISTORY_METADATA_COMMIT_GRACE_MS,
         this.config.INCREMENTAL_TOTAL_TIMEOUT_MS

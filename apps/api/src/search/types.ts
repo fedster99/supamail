@@ -223,13 +223,15 @@ export interface SyncStatusAccount {
   live_headers_complete_pct: number;
   live_bodies_complete_pct: number;
   historical_bodies_complete_pct: number;
+  /** Messages sync skipped because their metadata could not be read. */
+  unreadable_messages: number;
 }
 
 /**
  * The full sync report `get_sync_status` returns. `fully_synced` is true only
  * when no account has a reason in `degraded_reasons`: every account is HEALTHY,
- * past its first sync, done storing older mail, and at 100% of recent mail and
- * bodies.
+ * past its first sync, done storing older mail, at 100% of recent mail and
+ * bodies, and has no message sync could not read.
  */
 export interface SyncStatus {
   summary: string;

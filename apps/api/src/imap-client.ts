@@ -18,7 +18,9 @@ import {
   MAX_SYNC_FLAG_FETCH_BYTES,
   MAX_SYNC_FLAGS_PER_FETCH,
   MAX_SYNC_METADATA_FETCH_BYTES,
+  MAX_SYNC_ATTACHMENTS_PER_BATCH,
   MAX_SYNC_BATCH_SIZE,
+  MAX_SYNC_METADATA_BATCH_BYTES,
   flagSnapshotFootprint,
   metadataMessageFootprint
 } from "./sync-limits.js";
@@ -28,7 +30,8 @@ import type {
   ImapMessage,
   MessageBodyInput,
   MessageFlagSnapshot,
-  MessageMetadata
+  MessageMetadata,
+  UnreadableMessageCode
 } from "./types.js";
 
 const MAX_QRESYNC_VANISHED_UIDS = 10_000;
@@ -670,6 +673,46 @@ export const METADATA_HEADER_FIELDS = [
   "thread-topic"
 ] as const;
 
+/**
+ * Some requested messages' metadata could not be read: the server's FETCH
+ * response lacked them or a required field, or what it returned cannot be
+ * parsed or stored. Every other UID in the batch was read.
+ */
+export class UnreadableMessagesError extends Error {
+  constructor(
+    readonly messages: ReadonlyArray<{ uid: number; code: UnreadableMessageCode }>,
+    requested: number
+  ) {
+    super(
+      `IMAP metadata fetch returned ${requested - messages.length}/${requested} requested UIDs; missing ${messages
+        .slice(0, 10)
+        .map((message) => message.uid)
+        .join(",")}`
+    );
+    this.name = "UnreadableMessagesError";
+  }
+}
+
+/** One complete FETCH response as storable metadata, or why it cannot be stored. */
+function readMessageMetadata(
+  msg: FetchMessage,
+  providerNamespace: ProviderObjectIdNamespace | null
+): { metadata: MessageMetadata; footprint: ReturnType<typeof metadataMessageFootprint> } | { code: UnreadableMessageCode } {
+  let metadata: MessageMetadata;
+  let footprint: ReturnType<typeof metadataMessageFootprint>;
+  try {
+    metadata = parseMessageMetadata(msg, providerNamespace);
+    footprint = metadataMessageFootprint(metadata);
+  } catch {
+    // Parsing one response does no I/O: a failure is this message's own data.
+    return { code: "structure_invalid" };
+  }
+  // The same per-message limits the metadata write enforces.
+  if (footprint.bytes + 2 > MAX_SYNC_METADATA_BATCH_BYTES) return { code: "metadata_too_large" };
+  if (footprint.attachments > MAX_SYNC_ATTACHMENTS_PER_BATCH) return { code: "too_many_attachments" };
+  return { metadata, footprint };
+}
+
 export async function fetchMessageMetadata(
   client: MirrorImapClient,
   uids: number[],
@@ -686,6 +729,7 @@ export async function fetchMessageMetadata(
     if (batch.length === 0) continue;
     const expected = new Set(batch);
     const returned = new Map<number, MessageMetadata>();
+    const unreadable = new Map<number, UnreadableMessageCode>();
 
     for await (const msg of client.fetch(batch, {
       uid: true,
@@ -711,8 +755,12 @@ export async function fetchMessageMetadata(
         && msg.headers !== undefined
         && msg.bodyStructure !== undefined;
       if (!hasRequestedMetadata) continue;
-      const parsed = parseMessageMetadata(msg, providerNamespace);
-      const footprint = metadataMessageFootprint(parsed);
+      const read = readMessageMetadata(msg, providerNamespace);
+      if ("code" in read) {
+        if (!returned.has(msg.uid)) unreadable.set(msg.uid, read.code);
+        continue;
+      }
+      const { metadata: parsed, footprint } = read;
       const previous = returned.get(msg.uid);
       if (previous) {
         const previousFootprint = metadataMessageFootprint(previous);
@@ -726,16 +774,13 @@ export async function fetchMessageMetadata(
         throw new Error("IMAP metadata fetch exceeded the aggregate memory budget");
       }
       returned.set(msg.uid, parsed);
+      unreadable.delete(msg.uid);
     }
 
-    const missing = batch.filter((uid) => !returned.has(uid));
-    if (missing.length > 0) {
-      throw new Error(
-        `IMAP metadata fetch returned ${returned.size}/${expected.size} requested UIDs; missing ${missing
-          .slice(0, 10)
-          .join(",")}`
-      );
-    }
+    const failures = batch
+      .filter((uid) => !returned.has(uid))
+      .map((uid) => ({ uid, code: unreadable.get(uid) ?? "fetch_incomplete" as const }));
+    if (failures.length > 0) throw new UnreadableMessagesError(failures, expected.size);
     messages.push(...batch.map((uid) => returned.get(uid)!));
   }
 

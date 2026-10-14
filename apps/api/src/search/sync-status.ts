@@ -1,4 +1,5 @@
 import type { PgClient, PgPool } from "../db.js";
+import { UNREADABLE_ATTEMPTS_BEFORE_SKIP } from "../sync-limits.js";
 import type { ReadAccount, ReadAccountNotice, SyncStatus, SyncStatusAccount } from "./types.js";
 import {
   METADATA_PROTECTED_FIELDS,
@@ -26,6 +27,7 @@ interface StatusRow extends AccountRow {
   live_headers_complete_pct: number;
   live_bodies_complete_pct: number;
   historical_bodies_complete_pct: number;
+  unreadable_messages: number;
 }
 
 const ACCOUNT_COLUMNS = `
@@ -98,7 +100,8 @@ type StatusReason =
   | "headers_incomplete"
   | "bodies_incomplete"
   | "historical_backfill_in_progress"
-  | "historical_bodies_incomplete";
+  | "historical_bodies_incomplete"
+  | "unreadable_messages";
 
 /**
  * Every way one mailbox can fall short of fully synced, in summary order. Older
@@ -117,6 +120,7 @@ function accountReasons(account: SyncStatusAccount, storesOlderBodies: boolean):
   if (storesOlderBodies && account.historical_bodies_complete_pct < 100) {
     reasons.push("historical_bodies_incomplete");
   }
+  if (account.unreadable_messages > 0) reasons.push("unreadable_messages");
   return reasons;
 }
 
@@ -135,6 +139,8 @@ function describeAccount(account: SyncStatusAccount, reasons: StatusReason[]): s
       case "headers_incomplete": return `${account.live_headers_complete_pct}% of recent mail stored`;
       case "bodies_incomplete": return `${account.live_bodies_complete_pct}% of recent bodies stored`;
       case "historical_backfill_in_progress": return "storing older mail";
+      case "unreadable_messages":
+        return `${account.unreadable_messages} ${account.unreadable_messages === 1 ? "message" : "messages"} could not be read`;
       default: return `${account.historical_bodies_complete_pct}% of older bodies stored`;
     }
   });
@@ -171,13 +177,22 @@ export async function buildSyncStatus(
       ) AS historical_backfill_in_progress,
       coalesce(p.live_headers_complete_pct, 0) AS live_headers_complete_pct,
       coalesce(p.live_bodies_complete_pct, 0) AS live_bodies_complete_pct,
-      coalesce(p.historical_bodies_complete_pct, 0) AS historical_bodies_complete_pct
+      coalesce(p.historical_bodies_complete_pct, 0) AS historical_bodies_complete_pct,
+      -- Messages sync skipped because their metadata could not be read.
+      (
+        SELECT count(*)::int
+        FROM public.imap_folders f, jsonb_each(f.unreadable_messages) unreadable
+        WHERE f.account_id = a.id
+          AND f.tracked = true
+          AND f.missing_since IS NULL
+          AND (unreadable.value->>'attempts')::int >= $2
+      ) AS unreadable_messages
     FROM public.imap_accounts a
     LEFT JOIN public.imap_account_progress p ON p.account_id = a.id
     WHERE ($1::uuid[] IS NULL OR a.id = ANY($1::uuid[]))
     ORDER BY a.id
     `,
-    [accountIds]
+    [accountIds, UNREADABLE_ATTEMPTS_BEFORE_SKIP]
   );
 
   const rows = await revealAccounts(result.rows, metadataProtection);
@@ -192,7 +207,8 @@ export async function buildSyncStatus(
     historical_backfill_in_progress: row.historical_backfill_in_progress,
     live_headers_complete_pct: row.live_headers_complete_pct,
     live_bodies_complete_pct: row.live_bodies_complete_pct,
-    historical_bodies_complete_pct: row.historical_bodies_complete_pct
+    historical_bodies_complete_pct: row.historical_bodies_complete_pct,
+    unreadable_messages: row.unreadable_messages
   }));
 
   const perAccount = accounts.map((account, index) => ({

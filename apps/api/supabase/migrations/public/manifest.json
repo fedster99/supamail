@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0033_folder_committed_status",
+  "schemaVersion": "0034_folder_unreadable_messages",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -132,6 +132,10 @@
     {
       "id": "0033_folder_committed_status",
       "file": "0033_folder_committed_status.sql"
+    },
+    {
+      "id": "0034_folder_unreadable_messages",
+      "file": "0034_folder_unreadable_messages.sql"
     }
   ]
 }

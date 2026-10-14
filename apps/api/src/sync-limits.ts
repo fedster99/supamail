@@ -20,6 +20,10 @@ export const MAX_SYNC_FLAGS_PER_FETCH = MAX_SYNC_FLAGS_PER_LOGICAL_BATCH;
 export const PARSED_BODY_BATCH_MAX_MESSAGES = 10;
 export const PARSED_BODY_BATCH_MAX_SOURCE_BYTES = 4 * 1024 * 1024;
 export const PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES = 8 * 1024 * 1024;
+/** A message whose metadata cannot be read this many times is recorded and skipped. */
+export const UNREADABLE_ATTEMPTS_BEFORE_SKIP = 3;
+/** Unreadable messages one folder may record; past it the folder fails as before. */
+export const MAX_UNREADABLE_MESSAGES_PER_FOLDER = 1_000;
 
 const MESSAGE_SERIALIZATION_OVERHEAD_BYTES = 128;
 const ATTACHMENT_SERIALIZATION_OVERHEAD_BYTES = 64;

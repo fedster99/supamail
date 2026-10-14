@@ -113,7 +113,8 @@ const RELEASED_MIGRATION_SHA256: Record<string, string> = {
   "0030_window_from_message_date.sql": "ef838f7cdc055fe834792e2245e2bab7d8decb55c7cbcc47022ae57b69a197c3",
   "0031_active_assignments_view_columns.sql": "632a2d7d17f33ec2b32e0f3e5f2e61cdacbf7520845e04e6cafc508a6dc2b7cf",
   "0032_drop_retired_window_columns.sql": "abc1cc8e485f7ee386722b1d0de994233a92d1ed79bcdfa711cb63741d7c30c1",
-  "0033_folder_committed_status.sql": "3ee6616f26c03ba1fc4f6917fd0ae43c7030d1306e6e5ff0aaf4c7421da3a8e4"
+  "0033_folder_committed_status.sql": "3ee6616f26c03ba1fc4f6917fd0ae43c7030d1306e6e5ff0aaf4c7421da3a8e4",
+  "0034_folder_unreadable_messages.sql": "ec9bcf2b954d86d1d55b66ca5c4ee2be50030524049777e0bb672f9f46add107"
 };
 
 describe("initial schema", () => {
@@ -341,9 +342,9 @@ describe("initial schema", () => {
     const version = await getRequiredPublicSchemaVersion();
     const sql = (await readPublicMigrationFiles()).map((migration) => migration.sql).join("\n\n");
 
-    expect(version).toBe("0033_folder_committed_status");
+    expect(version).toBe("0034_folder_unreadable_messages");
     expect(manifest).toEqual({
-      schemaVersion: "0033_folder_committed_status",
+      schemaVersion: "0034_folder_unreadable_messages",
       migrations: [
         { id: "0001_imap_mirror", file: "0001_imap_mirror.sql" },
         { id: "0002_stuck_degraded_escalation", file: "0002_stuck_degraded_escalation.sql" },
@@ -377,7 +378,8 @@ describe("initial schema", () => {
         { id: "0030_window_from_message_date", file: "0030_window_from_message_date.sql" },
         { id: "0031_active_assignments_view_columns", file: "0031_active_assignments_view_columns.sql" },
         { id: "0032_drop_retired_window_columns", file: "0032_drop_retired_window_columns.sql" },
-        { id: "0033_folder_committed_status", file: "0033_folder_committed_status.sql" }
+        { id: "0033_folder_committed_status", file: "0033_folder_committed_status.sql" },
+        { id: "0034_folder_unreadable_messages", file: "0034_folder_unreadable_messages.sql" }
       ]
     });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.imap_accounts");
@@ -394,6 +396,7 @@ describe("initial schema", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS qresync_highest_modseq numeric");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS committed_messages bigint");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS committed_unseen bigint");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS unreadable_messages jsonb");
     expect(sql).toContain("left(coalesce(body_text, body_plain, selected_text_part, ''), 131072)");
     expect(sql).toContain("parsed_delivery_sha256 text");
     expect(sql).toContain("cursor_message_id uuid");

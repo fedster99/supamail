@@ -177,8 +177,27 @@ export interface ImapFolder {
   backfill_target_max_uid: string | null;
   backfill_oldest_uid_synced: string | null;
   backfill_since_date: Date | null;
+  /**
+   * Messages of this folder generation whose metadata could not be read, by
+   * UID, with no content. One with UNREADABLE_ATTEMPTS_BEFORE_SKIP attempts is
+   * skipped. Null when there are none.
+   */
+  unreadable_messages?: Record<string, UnreadableMessageRecord> | null;
   created_at: Date;
   updated_at: Date;
+}
+
+/** Why one message's metadata could not be read. A fixed code; no content. */
+export type UnreadableMessageCode =
+  | "fetch_incomplete"
+  | "structure_invalid"
+  | "metadata_too_large"
+  | "too_many_attachments";
+
+export interface UnreadableMessageRecord {
+  code: UnreadableMessageCode;
+  attempts: number;
+  failed_at: string;
 }
 
 export type HistoryBacklogReason = "snapshot" | "metadata" | "body";
@@ -338,6 +357,8 @@ export interface SyncResult {
   /** True when the host's download budget paused older mail's bodies in this pass. */
   downloadBudgetReached?: boolean;
   hitLockBudget: boolean;
+  /** Messages whose metadata failed a third time in this pass, now recorded and skipped. */
+  unreadableMessagesSkipped?: number;
   errors: string[];
 }
 
