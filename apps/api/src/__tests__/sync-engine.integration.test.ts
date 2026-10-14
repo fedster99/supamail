@@ -3255,7 +3255,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(after.sync_state).toBe("DEGRADED");
   });
 
-  it("Scenario G.1 — lock budget still allows priority folders and skips lower priority work", async () => {
+  it("Scenario G.1 — a spent lock budget still finishes one chunk, then defers every other folder", async () => {
     const h = await setupIntegration("G-priority-budget", {
       INITIAL_SYNC_BATCH_SIZE: 50,
       MAX_LOCK_HOLD_MS: 1
@@ -3268,6 +3268,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         specialUse: "\\Inbox",
         uidValidity: 100,
         messages: [makeTextMessage({ uid: 1, subject: "priority", from: "a@x.test", to: "u@x.test", body: "priority" })]
+      },
+      {
+        // Priority folders no longer skip the budget: Sent waits for the next pass.
+        path: "Sent",
+        delimiter: "/",
+        specialUse: "\\Sent",
+        uidValidity: 150,
+        messages: [makeTextMessage({ uid: 1, subject: "sent", from: "u@x.test", to: "b@x.test", body: "sent" })]
       },
       {
         path: "Project-Charlie",

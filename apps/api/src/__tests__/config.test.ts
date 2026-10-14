@@ -56,6 +56,25 @@ describe("config sent-folder polling", () => {
   });
 });
 
+describe("config account lock budget and wait", () => {
+  beforeEach(() => {
+    resetConfigForTests();
+  });
+
+  it("releases the lock every 20 s and lets sends wait 25 s by default", () => {
+    const config = getConfig(baseEnv);
+
+    expect(config.MAX_LOCK_HOLD_MS).toBe(20_000);
+    expect(config.ACCOUNT_LOCK_WAIT_MS).toBe(25_000);
+  });
+
+  it("rejects a longer lock hold or wait, which would let a pass outlast a waiting send", () => {
+    expect(() => getConfig({ ...baseEnv, MAX_LOCK_HOLD_MS: "600000" })).toThrow();
+    resetConfigForTests();
+    expect(() => getConfig({ ...baseEnv, ACCOUNT_LOCK_WAIT_MS: "60000" })).toThrow();
+  });
+});
+
 describe("config SMTP delivery timeout", () => {
   beforeEach(() => {
     resetConfigForTests();

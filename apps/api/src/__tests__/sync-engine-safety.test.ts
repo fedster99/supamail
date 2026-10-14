@@ -15,11 +15,12 @@ describe("sync engine safety", () => {
     expect(bodyBacklogReadLimit(500, 3)).toBe(500);
   });
 
-  it("terminalizes a sync run when account-lock acquisition throws", async () => {
+  it("records no sync run when account-lock acquisition throws", async () => {
     const finishSyncRun = vi.fn(async () => undefined);
+    const startSyncRun = vi.fn(async () => "run-1");
     const repository = {
       getAccount: vi.fn(async () => ({ id: "account-1", lock_id: "42" })),
-      startSyncRun: vi.fn(async () => "run-1"),
+      startSyncRun,
       finishSyncRun
     };
     const pool = {
@@ -36,12 +37,9 @@ describe("sync engine safety", () => {
     await expect(engine.syncAccount("account-1", "scheduled"))
       .rejects.toThrow("timeout exceeded when trying to connect");
 
-    expect(finishSyncRun).toHaveBeenCalledOnce();
-    expect(finishSyncRun).toHaveBeenCalledWith(expect.objectContaining({
-      runId: "run-1",
-      outcome: "failed",
-      errors: [expect.stringContaining("timeout exceeded when trying to connect")]
-    }));
+    // A pass records its run only once it holds the lock, so nothing is left running.
+    expect(startSyncRun).not.toHaveBeenCalled();
+    expect(finishSyncRun).not.toHaveBeenCalled();
   });
 
   it("passes the worker shutdown signal into an in-flight full sync", async () => {

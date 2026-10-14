@@ -67,7 +67,9 @@ than a provider failure or outage signal.
   leaves other due work queued, and does not refresh the full-priority health
   timestamp. It also proves a scheduler abort closes the active IMAP client,
   cancels pending connection/throttle work, and remains a neutral scheduling
-  yield even under account-lock contention.
+  yield even under account-lock contention. *Amended by ADR 0044:* a Sent pass
+  that finds the lock busy defers with `AccountBusyError` and records no run;
+  the worker skips that account.
 
 ## References
 
