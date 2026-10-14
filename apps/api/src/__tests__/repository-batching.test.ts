@@ -565,7 +565,7 @@ describe("repository flag scan deadline", () => {
       async query(query: string | { text: string }) {
         const sql = (typeof query === "string" ? query : query.text).trim();
         calls.push(sql);
-        if (sql.includes("WITH locked AS MATERIALIZED")) {
+        if (sql.includes("octet_length(to_json(flags)::text)")) {
           return {
             rows: [{
               stored_bytes: String(MAX_SYNC_FLAG_EVENT_LOGICAL_BYTES + 1),
@@ -591,9 +591,7 @@ describe("repository flag scan deadline", () => {
     )).rejects.toThrow(/stored flags exceed the aggregate logical event limit/i);
 
     expect(calls.some((sql) => sql.startsWith("SELECT *"))).toBe(false);
-    expect(calls.find((sql) => sql.includes("WITH locked AS MATERIALIZED"))).toContain(
-      "octet_length(to_json(flags)::text)"
-    );
+    expect(calls.some((sql) => sql.includes("FOR UPDATE"))).toBe(false);
     expect(calls.at(-1)).toBe("ROLLBACK");
   });
 
@@ -751,7 +749,7 @@ describe("repository flag scan deadline", () => {
     const kind = (sql: string): string => {
       if (sql === "BEGIN" || sql === "COMMIT") return sql;
       if (sql.startsWith("SELECT set_config")) return "TIMEOUT";
-      if (sql.startsWith("SELECT *")) return "SELECT";
+      if (sql.startsWith("SELECT *")) return sql.includes("FOR UPDATE") ? "LOCK" : "SELECT";
       if (sql.includes("UPDATE public.imap_messages")) return "UPDATE";
       if (sql.includes("INSERT INTO public.imap_sync_events")) return "EVENT";
       return "OTHER";
@@ -763,6 +761,8 @@ describe("repository flag scan deadline", () => {
       "TIMEOUT",
       "SELECT",
       "TIMEOUT",
+      "LOCK",
+      "TIMEOUT",
       "UPDATE",
       "TIMEOUT",
       "EVENT",
@@ -772,7 +772,7 @@ describe("repository flag scan deadline", () => {
     const timeoutValues = calls
       .filter((call) => kind(call.sql) === "TIMEOUT")
       .map((call) => call.params[0]);
-    expect(timeoutValues).toEqual(["990ms", "970ms", "950ms", "930ms", "910ms"]);
+    expect(timeoutValues).toEqual(["990ms", "970ms", "950ms", "930ms", "910ms", "890ms"]);
     for (const call of calls.filter((candidate) => kind(candidate.sql) === "TIMEOUT")) {
       expect(call.sql).toContain("set_config('lock_timeout'");
       expect(call.sql).toContain("set_config('statement_timeout'");
@@ -813,9 +813,47 @@ describe("repository flag scan deadline", () => {
 
     expect(result.flagsChanged).toBe(50);
     expect(result.messages).toHaveLength(50);
-    expect(calls).toHaveLength(11);
+    expect(calls).toHaveLength(13);
+    expect(calls.filter((sql) => sql.includes("FOR UPDATE"))).toHaveLength(1);
     expect(calls.filter((sql) => sql.includes("UPDATE public.imap_messages"))).toHaveLength(1);
     expect(calls.filter((sql) => sql.includes("INSERT INTO public.imap_sync_events"))).toHaveLength(1);
+  });
+
+  it("writes nothing for a row another writer already changed or removed", async () => {
+    const calls: string[] = [];
+    const row = (uid: number, flags: string[]) => ({
+      id: `00000000-0000-4000-8000-${String(uid).padStart(12, "0")}`,
+      uid: String(uid),
+      flags
+    }) as unknown as ImapMessage;
+    const client = {
+      async query(query: string | { text: string; values?: unknown[] }) {
+        const normalized = (typeof query === "string" ? query : query.text).trim();
+        calls.push(normalized);
+        if (normalized.startsWith("SELECT *") && normalized.includes("FOR UPDATE")) {
+          // UID 1 now has the scanned flags; UID 2 was deleted meanwhile.
+          return { rows: [row(1, ["\\Seen"])] };
+        }
+        if (normalized.startsWith("SELECT *")) return { rows: [row(1, []), row(2, [])] };
+        return { rows: [] };
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as PgPool;
+    const repository = new MirrorRepository(pool, { FLAG_SCAN_TOTAL_TIMEOUT_MS: 10_000 } as AppConfig);
+
+    const result = await repository.applyFlagScan(
+      "00000000-0000-4000-8000-000000000001",
+      folder,
+      42_001,
+      [{ uid: 1, flags: ["\\Seen"] }, { uid: 2, flags: ["\\Seen"] }]
+    );
+
+    expect(result.flagsChanged).toBe(0);
+    expect(result.messages.map((message) => Number(message.uid))).toEqual([1]);
+    expect(calls.some((sql) => sql.includes("UPDATE public.imap_messages"))).toBe(false);
+    expect(calls.some((sql) => sql.includes("INSERT INTO public.imap_sync_events"))).toBe(false);
+    expect(calls.at(-1)).toBe("COMMIT");
   });
 
   it("keeps split flag statements inside one logical transaction", async () => {
