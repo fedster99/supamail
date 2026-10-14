@@ -51,6 +51,7 @@ function makeAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
 function makeSyncResult(): SyncResult {
   return {
     runId: "sync-run-1",
+    mode: "full",
     outcome: "success",
     foldersProcessed: 1,
     messagesUpserted: 0,

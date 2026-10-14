@@ -101,6 +101,7 @@ async function main(): Promise<void> {
       "src/__tests__/provider-compatibility.integration.test.ts",
       "src/__tests__/sync-engine.integration.test.ts",
       "src/__tests__/sync-engine.live-db.test.ts",
+      "src/__tests__/pass-modes.integration.test.ts",
       "src/__tests__/threading-repository.live-db.test.ts",
       "src/__tests__/repository-threading-headers.live-db.test.ts",
       "src/__tests__/metadata-protection.live-db.test.ts",

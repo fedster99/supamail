@@ -339,6 +339,29 @@ export interface CommittedFolderCursor {
   unseen: string | null;
 }
 
+/** How a finished pass records the Mailbox Account's state. */
+export interface PassFinalizationOptions extends SyncStateWriteOptions {
+  /**
+   * A full pass moves the full-sync schedule (`last_sync_finished_at`), which
+   * hosts and the worker read to pace full passes. A single-lane pass leaves
+   * it alone. Defaults to true.
+   */
+  fullPass?: boolean;
+}
+
+/**
+ * Tracked priority folders whose last sync started and did not finish. Their
+ * failure is still current whatever a later single-lane pass proved, so a Sent
+ * or body success cannot reset the backoff an Inbox failure set.
+ */
+function unfinishedPriorityFolder(priorityCutoffParam: string): string {
+  return `tracked = true
+    AND missing_since IS NULL
+    AND status = 'SYNCING'
+    AND initial_sync_complete = true
+    AND sync_priority <= ${priorityCutoffParam}`;
+}
+
 async function runOptionalDeadlineWrite<T extends QueryResultRow>(
   pool: PgPool,
   text: string,
@@ -1118,6 +1141,7 @@ export class MirrorRepository {
         result.reconcileGapsFound,
         diagnosticCodes[0] ?? null,
         JSON.stringify({
+          mode: result.mode,
           errors: diagnosticCodes,
           hitLockBudget: result.hitLockBudget,
           metadataRowsCommitted: result.metadataRowsCommitted ?? 0,
@@ -1194,16 +1218,33 @@ export class MirrorRepository {
     }
   }
 
+  /**
+   * Record a successful pass and recompute health from folder state. A host may
+   * supply `folderFreshness`: per folder path, the last time it proved the
+   * provider equal to the folder's committed cursor. Lag then counts from the
+   * later of that proof and the folder's last sync, so a quiet folder no pass
+   * touched is not lagging. Without it, lag counts from the last sync alone.
+   */
   async markAccountSyncSucceeded(
     accountId: string,
-    options: SyncStateWriteOptions & { countsTowardBackoff?: boolean } = {}
+    options: PassFinalizationOptions & {
+      countsTowardBackoff?: boolean;
+      folderFreshness?: ReadonlyMap<string, Date>;
+    } = {}
   ): Promise<void> {
     const countsTowardBackoff = options.countsTowardBackoff ?? true;
+    const freshness = [...(options.folderFreshness ?? new Map<string, Date>())];
     const result = await runOptionalDeadlineWrite<{ id: string }>(
       this.pool,
       `
-      WITH folder_health AS (
+      WITH host_freshness AS (
+        -- A host clock ahead of the database never makes a folder fresher than now.
+        SELECT path, least(proven_equal_at, now()) AS proven_equal_at
+        FROM unnest($13::text[], $14::timestamptz[]) AS proof(path, proven_equal_at)
+      ),
+      folder_health AS (
         SELECT
+          count(*) FILTER (WHERE ${unfinishedPriorityFolder("$3")}) = 0 AS priority_folders_finished,
           count(*) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
@@ -1253,7 +1294,9 @@ export class MirrorRepository {
                   < now() - ($7::bigint * interval '1 millisecond')
               )
           ) AS overall_reconcile_unhealthy_count,
-          max(extract(epoch from (now() - last_synced_at))) FILTER (
+          max(extract(epoch from (
+            now() - greatest(last_synced_at, host.proven_equal_at)
+          ))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
               AND missing_since IS NULL
@@ -1261,7 +1304,7 @@ export class MirrorRepository {
               AND last_synced_at IS NOT NULL
           ) AS priority_lag_seconds,
           max(extract(epoch from (
-            now() - greatest(last_synced_at, last_verified_unchanged_at)
+            now() - greatest(last_synced_at, last_verified_unchanged_at, host.proven_equal_at)
           ))) FILTER (
             WHERE tracked = true
               AND status != 'MISSING'
@@ -1275,8 +1318,9 @@ export class MirrorRepository {
               AND last_uidvalidity_reset_at IS NOT NULL
               AND last_uidvalidity_reset_at > now() - ($11::bigint * interval '1 millisecond')
           ) AS recent_uidvalidity_reset_count
-        FROM public.imap_folders
-        WHERE account_id = $1
+        FROM public.imap_folders folder
+        LEFT JOIN host_freshness host ON host.path = folder.path
+        WHERE folder.account_id = $1
       ),
       folder_cap AS (
         SELECT
@@ -1295,9 +1339,12 @@ export class MirrorRepository {
       SET
         currently_syncing = false,
         sync_started_by = NULL,
-        last_sync_finished_at = now(),
+        last_sync_finished_at = CASE WHEN $15::boolean THEN now() ELSE last_sync_finished_at END,
         last_heartbeat_at = now(),
-        last_priority_sync_succeeded_at = now(),
+        last_priority_sync_succeeded_at = CASE
+          WHEN folder_health.priority_folders_finished THEN now()
+          ELSE last_priority_sync_succeeded_at
+        END,
         priority_sync_lag_seconds = ceil(folder_health.priority_lag_seconds)::int,
         overall_sync_lag_seconds = ceil(folder_health.overall_lag_seconds)::int,
         sync_state = CASE
@@ -1326,19 +1373,20 @@ export class MirrorRepository {
           ELSE NULL
         END,
         consecutive_successes = CASE
-          WHEN $8::boolean THEN consecutive_successes + 1
+          WHEN $8::boolean AND folder_health.priority_folders_finished THEN consecutive_successes + 1
           ELSE consecutive_successes
         END,
         consecutive_failures = CASE
-          WHEN $8::boolean THEN 0
+          WHEN $8::boolean AND folder_health.priority_folders_finished THEN 0
           ELSE consecutive_failures
         END,
         current_backoff_ms = CASE
-          WHEN $8::boolean AND consecutive_successes + 1 >= 3 THEN 0
+          WHEN $8::boolean AND folder_health.priority_folders_finished
+            AND consecutive_successes + 1 >= 3 THEN 0
           ELSE current_backoff_ms
         END,
         backoff_until = CASE
-          WHEN $8::boolean THEN NULL
+          WHEN $8::boolean AND folder_health.priority_folders_finished THEN NULL
           ELSE backoff_until
         END
       FROM folder_health, folder_cap
@@ -1358,7 +1406,10 @@ export class MirrorRepository {
         this.config.FOLDER_COUNT_WARN_THRESHOLD,
         this.config.FOLDER_COUNT_ENFORCE_THRESHOLD,
         this.config.RECENT_UIDVALIDITY_RESET_DEGRADED_MS,
-        options.expectedSyncOwner ?? null
+        options.expectedSyncOwner ?? null,
+        freshness.map(([path]) => path),
+        freshness.map(([, provenEqualAt]) => provenEqualAt.toISOString()),
+        options.fullPass ?? true
       ],
       options
     );
@@ -1374,42 +1425,59 @@ export class MirrorRepository {
   async markAccountSyncPartial(
     accountId: string,
     error: string,
-    options: SyncStateWriteOptions & { countsTowardBackoff?: boolean } = {}
+    options: PassFinalizationOptions & { countsTowardBackoff?: boolean } = {}
   ): Promise<void> {
     const countsTowardBackoff = options.countsTowardBackoff ?? true;
     const result = await runOptionalDeadlineWrite<{ id: string }>(
       this.pool,
       `
+      WITH folder_health AS (
+        SELECT count(*) FILTER (WHERE ${unfinishedPriorityFolder("$6")}) = 0 AS priority_folders_finished
+        FROM public.imap_folders
+        WHERE account_id = $1
+      )
       UPDATE public.imap_accounts
       SET
         currently_syncing = false,
         sync_started_by = NULL,
-        last_sync_finished_at = now(),
+        last_sync_finished_at = CASE WHEN $5::boolean THEN now() ELSE last_sync_finished_at END,
         last_heartbeat_at = now(),
-        last_priority_sync_succeeded_at = now(),
+        last_priority_sync_succeeded_at = CASE
+          WHEN folder_health.priority_folders_finished THEN now()
+          ELSE last_priority_sync_succeeded_at
+        END,
         sync_state = 'DEGRADED',
         sync_state_reason = $2,
         consecutive_successes = CASE
-          WHEN $3::boolean THEN consecutive_successes + 1
+          WHEN $3::boolean AND folder_health.priority_folders_finished THEN consecutive_successes + 1
           ELSE consecutive_successes
         END,
         consecutive_failures = CASE
-          WHEN $3::boolean THEN 0
+          WHEN $3::boolean AND folder_health.priority_folders_finished THEN 0
           ELSE consecutive_failures
         END,
         current_backoff_ms = CASE
-          WHEN $3::boolean AND consecutive_successes + 1 >= 3 THEN 0
+          WHEN $3::boolean AND folder_health.priority_folders_finished
+            AND consecutive_successes + 1 >= 3 THEN 0
           ELSE current_backoff_ms
         END,
         backoff_until = CASE
-          WHEN $3::boolean THEN NULL
+          WHEN $3::boolean AND folder_health.priority_folders_finished THEN NULL
           ELSE backoff_until
         END
+      FROM folder_health
       WHERE id = $1
         AND ($4::text IS NULL OR sync_started_by = $4)
       RETURNING id
       `,
-      [accountId, diagnosticErrorCode(error), countsTowardBackoff, options.expectedSyncOwner ?? null],
+      [
+        accountId,
+        diagnosticErrorCode(error),
+        countsTowardBackoff,
+        options.expectedSyncOwner ?? null,
+        options.fullPass ?? true,
+        this.config.PRIORITY_CUTOFF
+      ],
       options
     );
     if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
@@ -1423,7 +1491,7 @@ export class MirrorRepository {
   async markAccountSyncAuthFailed(
     accountId: string,
     error: string,
-    options: SyncStateWriteOptions = {}
+    options: PassFinalizationOptions = {}
   ): Promise<void> {
     const result = await runOptionalDeadlineWrite<{ id: string }>(
       this.pool,
@@ -1432,7 +1500,7 @@ export class MirrorRepository {
       SET
         currently_syncing = false,
         sync_started_by = NULL,
-        last_sync_finished_at = now(),
+        last_sync_finished_at = CASE WHEN $4::boolean THEN now() ELSE last_sync_finished_at END,
         sync_state = 'BROKEN',
         sync_state_reason = $2,
         consecutive_failures = consecutive_failures + 1,
@@ -1443,7 +1511,12 @@ export class MirrorRepository {
         AND ($3::text IS NULL OR sync_started_by = $3)
       RETURNING id
       `,
-      [accountId, diagnosticErrorCode(`AUTH_ERROR: ${error}`), options.expectedSyncOwner ?? null],
+      [
+        accountId,
+        diagnosticErrorCode(`AUTH_ERROR: ${error}`),
+        options.expectedSyncOwner ?? null,
+        options.fullPass ?? true
+      ],
       options
     );
     if (result.rows.length !== 1 && options.expectedSyncOwner === undefined) {
@@ -1458,7 +1531,7 @@ export class MirrorRepository {
   async markAccountSyncFailed(
     accountId: string,
     error: string,
-    options: SyncStateWriteOptions & { minimumBackoffMs?: number } = {}
+    options: PassFinalizationOptions & { minimumBackoffMs?: number } = {}
   ): Promise<void> {
     // CTE computes the doubled-and-clamped backoff once so the same value
     // feeds both `current_backoff_ms` and `backoff_until` — without it the
@@ -1505,7 +1578,7 @@ export class MirrorRepository {
       SET
         currently_syncing = false,
         sync_started_by = NULL,
-        last_sync_finished_at = now(),
+        last_sync_finished_at = CASE WHEN $11::boolean THEN now() ELSE a.last_sync_finished_at END,
         sync_state = CASE
           WHEN stuck_state.is_terminal_stuck_degraded THEN 'BROKEN'
           WHEN stuck_state.is_stuck_degraded THEN 'BROKEN'
@@ -1552,7 +1625,8 @@ export class MirrorRepository {
         this.config.STUCK_DEGRADED_TERMINAL_THRESHOLD_MS,
         this.config.STUCK_DEGRADED_RETRY_INTERVAL_MS,
         options.expectedSyncOwner ?? null,
-        options.minimumBackoffMs ?? 0
+        options.minimumBackoffMs ?? 0,
+        options.fullPass ?? true
       ],
       options
     );
@@ -1568,7 +1642,7 @@ export class MirrorRepository {
    * lock busy. The one-hour window keeps this an index range scan; older
    * orphans are left to the startup sweep.
    */
-  async closeOrphanedSyncRuns(accountId: string, currentRunId: string): Promise<number> {
+  async closeOrphanedSyncRuns(accountId: string, currentRunId: string | null): Promise<number> {
     const result = await this.pool.query(
       `
       UPDATE public.imap_sync_runs
@@ -1576,7 +1650,7 @@ export class MirrorRepository {
           finished_at = now(),
           error = COALESCE(error, 'WORKER_REAPED')
       WHERE account_id = $1
-        AND id <> $2
+        AND ($2::uuid IS NULL OR id <> $2::uuid)
         AND status = 'running'
         AND finished_at IS NULL
         AND started_at > now() - interval '1 hour'
@@ -2328,6 +2402,73 @@ export class MirrorRepository {
       LIMIT $2
       `,
       [accountId, this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE]
+    );
+    return result.rows;
+  }
+
+  /**
+   * Folders the first-sync pass works on: tracked folders whose first sync is
+   * incomplete, priority folders first. Each pass takes one batch from each,
+   * newest mail first within the folder.
+   */
+  async getFoldersForFirstSync(accountId: string): Promise<ImapFolder[]> {
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+        AND initial_sync_complete = false
+      ORDER BY sync_priority, path
+      LIMIT $2
+      `,
+      [accountId, this.config.MAX_PRIORITY_FOLDERS_PER_CYCLE + this.config.MAX_RR_FOLDERS_PER_CYCLE]
+    );
+    return result.rows;
+  }
+
+  /** Synced folders whose flag scan is due, longest overdue first. */
+  async getFoldersDueForFlagScan(accountId: string): Promise<ImapFolder[]> {
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+        AND initial_sync_complete = true
+        AND (next_flag_scan_at IS NULL OR next_flag_scan_at <= now())
+      ORDER BY next_flag_scan_at NULLS FIRST, sync_priority, path
+      LIMIT $2
+      `,
+      [accountId, this.config.MAX_FLAG_SCANS_PER_CYCLE]
+    );
+    return result.rows;
+  }
+
+  /** Synced folders whose exact UID audit is due, longest overdue first. */
+  async getFoldersDueForAudit(accountId: string): Promise<ImapFolder[]> {
+    const result = await this.pool.query<ImapFolder>(
+      `
+      SELECT *
+      FROM public.imap_folders
+      WHERE account_id = $1
+        AND tracked = true
+        AND missing_since IS NULL
+        AND status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+        AND initial_sync_complete = true
+        AND (
+          last_full_reconcile_at IS NULL
+          OR next_reconcile_at IS NULL
+          OR next_reconcile_at <= now()
+        )
+      ORDER BY next_reconcile_at NULLS FIRST, sync_priority, path
+      LIMIT $2
+      `,
+      [accountId, this.config.MAX_RECONCILES_PER_CYCLE]
     );
     return result.rows;
   }

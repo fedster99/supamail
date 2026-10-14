@@ -278,9 +278,9 @@ describe("sync engine safety", () => {
     // Both the body backlog and the history lane stop once the client is dead.
     // The live metadata wake skips bodies; its dedicated body follow-up skips history.
     expect(source).toContain(
-      "} else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {"
+      "} else if ((fullPass || mode === \"body\") && !connectionLost) {"
     );
-    expect(source).toContain("&& !options.bodyBacklogOnly");
+    expect(source).toContain("} else if ((fullPass || mode === \"history\") && !connectionLost) {");
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {

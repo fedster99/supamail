@@ -223,7 +223,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(stillDue.map((folder) => folder.path)).toContain("INBOX");
     expect(stillDue.map((folder) => folder.path)).not.toContain("Sent");
     const account = await h.repository.getAccount(h.account.id);
-    expect(account?.last_priority_sync_succeeded_at?.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+    // The Sent pass records health like every pass, but leaves the full-sync
+    // schedule to the full lane.
+    expect(account!.last_priority_sync_succeeded_at!.getTime()).toBeGreaterThan(Date.now() - 60_000);
     expect(account?.last_sync_finished_at?.toISOString()).toBe("2026-01-01T00:00:00.000Z");
 
     const runsBeforeNoop = await h.pool.query<{ count: string }>(
@@ -318,13 +320,13 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id]
     );
     await expect(engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: "00000000-0000-4000-8000-000000000000",
       keepClientOpen: true
     })).rejects.toThrow("Host-owned client does not match the Mailbox Account");
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       forceInboxReconcile: true,
       forceInboxFlagScan: true,
       client: idleClient,
@@ -405,7 +407,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(followupKeys).toContain("INBOX:106");
     expect(followupKeys).toContain("Sent:201");
     const bodyFollowup = await engine.syncAccount(h.account.id, "scheduled", {
-      bodyBacklogOnly: true,
+      mode: "body",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -488,7 +490,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChangesWithStatuses = acknowledgeWithStatuses;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -570,7 +572,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       forceFlagScan: false,
       observed: { path: "INBOX", uidValidity: 11_001, uidNext: 151 }
     };
-    const live = { liveInboxOnly: true, clientAccountId: h.account.id, keepClientOpen: true } as const;
+    const live = { mode: "live", clientAccountId: h.account.id, keepClientOpen: true } as const;
 
     const capped = liveClient(folders, change);
     const first = await engine.syncAccount(h.account.id, "scheduled", { ...live, client: capped.client });
@@ -618,7 +620,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       forceFlagScan: false,
       observed: { path: "INBOX", uidValidity: 11_001 }
     });
-    const live = { liveInboxOnly: true, clientAccountId: h.account.id, keepClientOpen: true } as const;
+    const live = { mode: "live", clientAccountId: h.account.id, keepClientOpen: true } as const;
 
     // One arrival and one expunge leave MESSAGES at 5. A pass that only
     // fetches the new UID cannot tell, so it clears the committed count
@@ -697,7 +699,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     };
     const flagged = liveClient(folders, change);
     await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: flagged.client,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -715,7 +717,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     );
     const routine = liveClient(folders, { ...change, forceFlagScan: false, observed: { ...change.observed, unseen: 9 } });
     await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: routine.client,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -778,7 +780,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     workClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       forceReconcileFolders: ["INBOX", "Archive"],
       client: workClient,
       clientAccountId: h.account.id,
@@ -827,7 +829,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     lateClient.acknowledgeMailboxChangesWithStatuses = acknowledgeLate;
 
     const duplicate = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: lateClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -879,7 +881,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     workClient.peekMailboxChanges = () => [];
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       forceReconcileFolders: ["INBOX", "Trash"],
       client: workClient,
       clientAccountId: h.account.id,
@@ -946,7 +948,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChangesWithStatuses = acknowledgeWithStatuses;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1084,7 +1086,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1199,7 +1201,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       forceInboxReconcile: true,
       client: recoveryClient,
       clientAccountId: h.account.id,
@@ -1301,7 +1303,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1400,7 +1402,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1616,7 +1618,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     };
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1681,7 +1683,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1781,7 +1783,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true,
@@ -1844,7 +1846,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.peekMailboxChanges = (limit) => pending.slice(0, limit);
     idleClient.acknowledgeMailboxChanges = acknowledge;
     const liveOptions = {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1901,7 +1903,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1917,7 +1919,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(folder.rows[0].initial_sync_complete).toBe(true);
 
     const retry = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1945,7 +1947,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1983,7 +1985,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -2107,7 +2109,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     idleClient.acknowledgeMailboxChanges = acknowledge;
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -2136,7 +2138,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     overflowClient.acknowledgeMailboxChanges = acknowledgeOverflow;
 
     const overflowResult = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: overflowClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -2162,7 +2164,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     quietClient.acknowledgeMailboxChanges = vi.fn();
 
     const quietResult = await engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       client: quietClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -2757,7 +2759,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     )).rows[0];
 
     // At LOGIN, in a scheduled pass and in a supplemental live pass.
-    for (const options of [{}, { liveInboxOnly: true }]) {
+    for (const options of [{}, { mode: "live" as const }]) {
       const h = await setupIntegration("over-quota-login");
       activeAccountIds.push(h.account.id);
       const engine = h.buildEngine({
@@ -4194,7 +4196,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const client = new UnusableFixtureImapClient(folders);
     const engine = h.buildEngine({ folders });
     const run = engine.syncAccount(h.account.id, "scheduled", {
-      liveInboxOnly: true,
+      mode: "live",
       forceReconcileFolders: ["INBOX"],
       client,
       clientAccountId: h.account.id,
@@ -6921,7 +6923,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       const live = await h.buildEngine({
         folders: [],
         clientFactory: clientWith(() => ({ uidNext: 10, highestModseq: 500n }))
-      }).syncAccount(h.account.id, "scheduled", { liveInboxOnly: true });
+      }).syncAccount(h.account.id, "scheduled", { mode: "live" });
       expect(live.outcome).toBe("success");
       expect(proofCalls.at(-1)).toEqual([]);
       expect((await folderState(h, "Archive-003")).last_verified_unchanged_at).toBeNull();

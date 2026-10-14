@@ -1,6 +1,6 @@
 # ADR 0031: Hosts May Use Inbox IDLE as a Wake Hint
 
-Status: Accepted
+Status: Accepted; amended by ADR 0043, which makes the live lane record account health
 
 Date: 2026-08-14
 
