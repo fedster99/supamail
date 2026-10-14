@@ -48,6 +48,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0038-sync-status-is-its-own-tool.md`: Read results name their accounts (with a notice only when a mailbox is in its first sync, stopped, or paused); the full sync report is the separate `get_sync_status` tool.
 - `0041-durable-send-policy.md`: Core owns the durable send state machine; hosts provide atomic, scoped storage and authorization. Raw send primitives remain single attempts.
 - `0042-host-download-budget.md`: Core counts each pass's IMAP bytes and accepts a host-supplied budget that pauses older mail's bodies (dated before the newest 7 days) while new mail, metadata, and recent bodies continue; `OVERQUOTA` is a provider limit with an hour's backoff, never a bad password.
+- `0047-committed-folder-cursor.md`: Each pass's change-feed observation is the folder cursor it stored, with the UIDNEXT it reached; every pass reports every stored cursor, and `imap_folders` keeps committed MESSAGES and UNSEEN under the listener's per-field proof rule.
 
 ## Status Values
 

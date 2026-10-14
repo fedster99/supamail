@@ -30,6 +30,7 @@ import { AccountBusyError, InvalidInputError } from "./errors.js";
 import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
+import type { CommittedFolderCursor } from "./repository.js";
 import {
   isAuthDiagnosticText,
   isMissingMailboxDiagnosticText,
@@ -79,6 +80,24 @@ function reachedUidNext(uidNext: number | undefined, lastUid: number): number | 
   return lastUid >= uidNext - 1 ? uidNext : lastUid + 1;
 }
 
+/** A stored folder cursor in the mailbox-change feed's status shape. */
+function committedStatus(path: string, cursor: CommittedFolderCursor): MailboxStatus {
+  const messages = cursor.messages === null ? undefined : Number(cursor.messages);
+  return {
+    path,
+    uidValidity: Number(cursor.uidValidity),
+    uidNext: cursor.uidNext === null ? undefined : Number(cursor.uidNext),
+    exists: messages,
+    messages,
+    unseen: cursor.unseen === null ? undefined : Number(cursor.unseen),
+    highestModseq: cursor.highestModseq === null ? undefined : BigInt(cursor.highestModseq)
+  };
+}
+
+function nonNegativeCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 type DiscoveredFolder = {
   path: string;
   delimiter?: string | null;
@@ -105,7 +124,10 @@ type FolderSyncResult = {
   initialSyncComplete: boolean;
   reconcileClean: boolean;
   qresyncReplayComplete?: boolean;
-  observedStatus: MailboxStatus;
+  /** The folder's stored cursor, once its first sync is complete. */
+  committed?: MailboxStatus;
+  /** This pass proved `committed.messages` for `committed.uidNext`. */
+  messagesProven: boolean;
 };
 
 type ReconcileAttemptTelemetry = {
@@ -598,7 +620,10 @@ export class MirrorEngine {
         let remainingFlagScans = this.config.MAX_FLAG_SCANS_PER_CYCLE;
         let attemptedMailboxChanges = 0;
         const handledMailboxChanges: MailboxChange[] = [];
-        const handledMailboxObservations: MailboxChangeObservation[] = [];
+        // Every folder cursor this pass stored, so a host that compares the
+        // provider with the committed cursor learns each commit, including
+        // folders no provider change named.
+        const folderObservations: MailboxChangeObservation[] = [];
         for (const folder of folders) {
           throwIfInterrupted();
           // Prove this session still owns the account before each folder writes.
@@ -655,6 +680,7 @@ export class MirrorEngine {
               forceFlagScan: options.liveInboxOnly
                 && (mailboxChange?.forceFlagScan === true
                   || (folder.path.toLowerCase() === "inbox" && options.forceInboxFlagScan === true)),
+              observedUnseen: nonNegativeCount(mailboxChange?.observed.unseen),
               signal: options.signal
             });
             check.outcome = folderResult.hitLockBudget || !folderResult.initialSyncComplete
@@ -676,6 +702,14 @@ export class MirrorEngine {
               && !(qresyncCatchUp && folderResult.qresyncReplayComplete === true)) {
               remainingFlagScans -= 1;
             }
+            if (folderResult.committed) {
+              folderObservations.push({
+                status: folderResult.committed,
+                reconcileComplete: folderResult.messagesProven,
+                flagScanComplete: folderResult.qresyncReplayComplete === true
+                  || folderResult.flagScanAttempted
+              });
+            }
             if (mailboxChange !== undefined
               && folderResult.initialSyncComplete
               && !folderResult.hitLockBudget
@@ -684,13 +718,6 @@ export class MirrorEngine {
                 || folderResult.qresyncReplayComplete === true)
               && (!mailboxChange.forceFlagScan || folderResult.flagScanAttempted)) {
               handledMailboxChanges.push(mailboxChange);
-              handledMailboxObservations.push({
-                status: folderResult.observedStatus,
-                reconcileComplete: folderResult.qresyncReplayComplete === true
-                  || (folderResult.reconcileAttempted && folderResult.reconcileClean),
-                flagScanComplete: folderResult.qresyncReplayComplete === true
-                  || folderResult.flagScanAttempted
-              });
             }
           } catch (error) {
             throwIfInterrupted();
@@ -791,15 +818,15 @@ export class MirrorEngine {
           result.outcome = priorityFolderFailed ? "failed" : "partial_success";
         }
 
-        if (handledMailboxChanges.length > 0) {
-          if (client.acknowledgeMailboxChangesWithStatuses) {
+        if (client.acknowledgeMailboxChangesWithStatuses) {
+          if (handledMailboxChanges.length > 0 || folderObservations.length > 0) {
             client.acknowledgeMailboxChangesWithStatuses(
               handledMailboxChanges,
-              handledMailboxObservations
+              folderObservations
             );
-          } else {
-            client.acknowledgeMailboxChanges?.(handledMailboxChanges);
           }
+        } else if (handledMailboxChanges.length > 0) {
+          client.acknowledgeMailboxChanges?.(handledMailboxChanges);
         }
 
         if (supplemental) {
@@ -1236,6 +1263,8 @@ export class MirrorEngine {
       /** Host recovery barriers require a complete UID proof even after QRESYNC replay. */
       forceAuthoritativeReconcile?: boolean;
       forceFlagScan?: boolean;
+      /** The provider UNSEEN the host observed before this pass, if any. */
+      observedUnseen?: number;
       signal?: AbortSignal;
     }
   ): Promise<FolderSyncResult> {
@@ -1285,11 +1314,10 @@ export class MirrorEngine {
     try {
       const mailbox = client.mailbox;
       if (!mailbox) throw new Error("Mailbox not available after lock");
-      const observedStatus: MailboxStatus = {
-        ...mailbox,
-        path: folder.path,
-        messages: mailbox.messages ?? mailbox.exists
-      };
+      // MESSAGES as SELECT reported it. The session updates its mailbox on later
+      // EXISTS and EXPUNGE responses, so read it before any other command.
+      // SELECT's [UNSEEN n] is a sequence number, not a count, and is not used.
+      const selectedMessages = nonNegativeCount(mailbox.messages ?? mailbox.exists);
 
       const uidValidity = Number(mailbox.uidValidity);
       const uidNext = mailbox.uidNext ?? undefined;
@@ -1324,7 +1352,7 @@ export class MirrorEngine {
           hitLockBudget: false,
           initialSyncComplete: false,
           reconcileClean: false,
-          observedStatus
+          messagesProven: false
         };
       }
 
@@ -1336,6 +1364,9 @@ export class MirrorEngine {
       let reconcileDurationMs = 0;
       let reconcileAttempted = false;
       let flagScanAttempted = false;
+      // The flag work covered every flag the mirror refreshes: a QRESYNC or
+      // CONDSTORE delta, an unchanged CONDSTORE cursor, or a whole-window scan.
+      let flagScanCoversWindow = false;
       let hitLockBudget = false;
       let qresyncApplied = false;
       let qresyncFallbackRequired = false;
@@ -1365,7 +1396,8 @@ export class MirrorEngine {
           hitLockBudget: this.folderHitLockBudget(options),
           initialSyncComplete: initial.initialSyncComplete,
           reconcileClean: false,
-          observedStatus
+          committed: initial.committed && committedStatus(folder.path, initial.committed),
+          messagesProven: false
         };
       }
 
@@ -1463,6 +1495,7 @@ export class MirrorEngine {
             );
           }
           flagScanAttempted = true;
+          flagScanCoversWindow = true;
           qresyncApplied = true;
         }
       }
@@ -1528,6 +1561,7 @@ export class MirrorEngine {
         const condstoreCursorUnchanged = folder.highest_modseq !== null
           && highestModseq !== undefined
           && BigInt(highestModseq) === BigInt(folder.highest_modseq);
+        flagScanCoversWindow = canUseChangedSince || condstoreCursorUnchanged;
         if (canUseChangedSince) {
           for await (const flags of this.withAsyncIterableDeadline(
             client,
@@ -1567,6 +1601,7 @@ export class MirrorEngine {
           const scanEntireWindow = establishingCondstoreCursor
             || options.forceFlagScan === true
             || fullFlagScanDue;
+          flagScanCoversWindow = scanEntireWindow;
           const flagCutoff = scanEntireWindow ? windowCutoff : new Date();
           if (!scanEntireWindow) {
             flagCutoff.setDate(flagCutoff.getDate() - this.config.FLAG_DIFF_WINDOW_DAYS);
@@ -1737,7 +1772,12 @@ export class MirrorEngine {
       // Store only the UIDNEXT this pass reached, so the unchanged-folder proof
       // and the 0030 head repair never pass over pending new mail.
       const newMailComplete = lastProcessedUid === incomingUids[incomingUids.length - 1];
-      await this.repository.markFolderSynced(folder.id, {
+      // SELECT's MESSAGES is proven for the stored UIDNEXT when deletions were
+      // checked and every new UID below that UIDNEXT was fetched.
+      const messagesProven = selectedMessages !== undefined
+        && newMailComplete
+        && (qresyncApplied || (reconcileAttempted && reconcileClean === true));
+      const cursor = await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext: newMailComplete ? uidNext : reachedUidNext(uidNext, lastProcessedUid ?? lastUid),
         highestModseq: flagScanAttempted ? highestModseq : undefined,
@@ -1745,6 +1785,8 @@ export class MirrorEngine {
           || (flagScanAttempted && reconcileAttempted && reconcileClean === true)
           ? highestModseq
           : undefined,
+        messages: messagesProven ? selectedMessages : undefined,
+        unseen: flagScanCoversWindow ? options.observedUnseen : undefined,
         lastUid: lastProcessedUid,
         initialComplete: true,
         reconcileClean,
@@ -1767,7 +1809,8 @@ export class MirrorEngine {
         initialSyncComplete: true,
         reconcileClean: reconcileClean === true,
         qresyncReplayComplete: qresyncApplied,
-        observedStatus
+        committed: committedStatus(folder.path, cursor),
+        messagesProven
       };
     } finally {
       if (options.reconcileTelemetry.startedAt !== undefined) {
@@ -1925,7 +1968,12 @@ export class MirrorEngine {
     windowCutoff: Date,
     metadataWriteStats: MetadataWriteStats,
     signal?: AbortSignal
-  ): Promise<{ messagesUpserted: number; initialSyncComplete: boolean }> {
+  ): Promise<{
+    messagesUpserted: number;
+    initialSyncComplete: boolean;
+    /** The stored cursor when this batch completed the first sync. */
+    committed?: CommittedFolderCursor;
+  }> {
     const initialSyncDeadline = Date.now() + this.config.INITIAL_SYNC_BATCH_TIMEOUT_MS;
     let targetMaxUid: number | null = folder.initial_sync_target_max_uid
       ? Number(folder.initial_sync_target_max_uid)
@@ -1960,13 +2008,13 @@ export class MirrorEngine {
           snapshotHighWater,
           { deadlineAt: initialSyncDeadline, signal }
         );
-        await this.repository.markFolderSynced(folder.id, {
+        const committed = await this.repository.markFolderSynced(folder.id, {
           uidValidity,
           uidNext,
           lastUid: snapshotHighWater,
           initialComplete: true
         }, { deadlineAt: initialSyncDeadline, signal });
-        return { messagesUpserted: 0, initialSyncComplete: true };
+        return { messagesUpserted: 0, initialSyncComplete: true, committed };
       }
 
       targetMaxUid = sortedTargets[sortedTargets.length - 1];
@@ -2059,13 +2107,13 @@ export class MirrorEngine {
 
     if (inSnapshot.length === 0) {
       // Everything in the original snapshot has gone away — done.
-      await this.repository.markFolderSynced(folder.id, {
+      const committed = await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext: reachedUidNext(uidNext, completionLastUid),
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
-      return { messagesUpserted, initialSyncComplete: true };
+      return { messagesUpserted, initialSyncComplete: true, committed };
     }
 
     // Collect up to one batch of UIDs strictly less than the watermark,
@@ -2081,13 +2129,13 @@ export class MirrorEngine {
 
     if (descending.length === 0) {
       // Watermark already at or below the minimum — initial sync is complete.
-      await this.repository.markFolderSynced(folder.id, {
+      const committed = await this.repository.markFolderSynced(folder.id, {
         uidValidity,
         uidNext: reachedUidNext(uidNext, completionLastUid),
         lastUid: completionLastUid,
         initialComplete: true
       }, { deadlineAt: initialSyncDeadline, signal });
-      return { messagesUpserted, initialSyncComplete: true };
+      return { messagesUpserted, initialSyncComplete: true, committed };
     }
 
     const batch = descending.slice().reverse(); // ascending order for FETCH
@@ -2133,16 +2181,14 @@ export class MirrorEngine {
 
     // Was that the last batch?
     const stillRemaining = inSnapshot.some((uid) => uid < newOldestSynced);
-    if (!stillRemaining) {
-      await this.repository.markFolderSynced(folder.id, {
-        uidValidity,
-        uidNext: reachedUidNext(uidNext, completionLastUid),
-        lastUid: completionLastUid,
-        initialComplete: true
-      }, { deadlineAt: initialSyncDeadline, signal });
-    }
-
-    return { messagesUpserted, initialSyncComplete: !stillRemaining };
+    if (stillRemaining) return { messagesUpserted, initialSyncComplete: false };
+    const committed = await this.repository.markFolderSynced(folder.id, {
+      uidValidity,
+      uidNext: reachedUidNext(uidNext, completionLastUid),
+      lastUid: completionLastUid,
+      initialComplete: true
+    }, { deadlineAt: initialSyncDeadline, signal });
+    return { messagesUpserted, initialSyncComplete: true, committed };
   }
 
   private historyBatchLimit(account: ImapAccount): number {
