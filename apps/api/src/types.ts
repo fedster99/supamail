@@ -312,6 +312,10 @@ export interface SyncResult {
   reconcileFoldersAttempted?: number;
   reconcileProviderUidsSeen?: number;
   reconcileDurationMs?: number;
+  /** IMAP bytes the pass received, in every lane. Absent when the session cannot count them. */
+  downloadedBytes?: number;
+  /** True when the host's download budget paused older mail's bodies in this pass. */
+  downloadBudgetReached?: boolean;
   hitLockBudget: boolean;
   errors: string[];
 }

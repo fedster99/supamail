@@ -25,7 +25,8 @@ import type {
   MailboxStatus,
   MirrorImapClient
 } from "./imap-client.js";
-import { AccountBusyError } from "./errors.js";
+import { PassDownloadMeter } from "./download-budget.js";
+import { AccountBusyError, InvalidInputError } from "./errors.js";
 import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
@@ -161,7 +162,24 @@ const AUTH_RESPONSE_CODES = new Set(["AUTHENTICATIONFAILED", "AUTHORIZATIONFAILE
 // imapflow tags ANY error thrown from its login/authenticate exec with
 // authenticationFailed=true, so these must be exempted BEFORE trusting the flag —
 // otherwise a transiently-down server terminal-bricks the account.
-const TRANSIENT_RESPONSE_CODES = new Set(["UNAVAILABLE", "INUSE", "LIMIT", "SERVERBUG"]);
+const TRANSIENT_RESPONSE_CODES = new Set(["UNAVAILABLE", "INUSE", "LIMIT", "SERVERBUG", "OVERQUOTA"]);
+
+/**
+ * How long a Mailbox Account waits after the provider answers OVERQUOTA. Gmail
+ * suspends IMAP for 1–24 hours when an account passes its bandwidth limit, and
+ * every login during the suspension is another refusal.
+ */
+export const PROVIDER_OVER_QUOTA_RETRY_MS = 60 * 60_000;
+
+/**
+ * RFC 5530 OVERQUOTA at LOGIN, on a command, or in a BYE. On a read-only sync
+ * session it means the provider's command or bandwidth limit (Gmail: "BYE
+ * [OVERQUOTA] Account exceeded command or bandwidth limits"), never a rejected
+ * credential. Classified by the response code, never by the server's text.
+ */
+export function isProviderOverQuotaError(error: unknown): boolean {
+  return extractImapResponseCode(error) === "OVERQUOTA";
+}
 
 /**
  * Classify an auth failure from the ERROR OBJECT, not just its message. imapflow's
@@ -226,7 +244,10 @@ export function describeSyncError(error: unknown): string {
   ) {
     parts.push(`[status=${responseStatus.trim().toUpperCase()}]`);
   }
-  if ((error as { authenticationFailed?: unknown }).authenticationFailed === true) parts.push("[AUTH]");
+  // Only a credential rejection carries the auth marker. imapflow flags every
+  // LOGIN failure, including transient refusals and dropped connections, and
+  // the stored reason must not tell the User to sign in again for those.
+  if (isAuthError(error)) parts.push("[AUTH]");
   parts.push(error.message);
   const response = (error as { response?: unknown }).response;
   const responseText = (error as { responseText?: unknown }).responseText;
@@ -329,6 +350,14 @@ export interface SyncAccountOptions {
   clientAccountId?: string;
   /** Leave a healthy host-owned session open after this pass. */
   keepClientOpen?: boolean;
+  /**
+   * IMAP bytes this pass may download before older mail's bodies pause: the
+   * host's remaining provider download budget. Older mail is bodies dated
+   * before the newest 7 days, in the body backlog and the history lane; once
+   * they pause, history continues with metadata only. New mail, metadata, and
+   * recent bodies never wait, and their bytes count. Absent means no budget.
+   */
+  downloadBudgetBytes?: number;
 }
 
 export class MirrorEngine {
@@ -410,6 +439,10 @@ export class MirrorEngine {
     if (options.client && options.clientAccountId !== accountId) {
       throw new Error("Host-owned client does not match the Mailbox Account");
     }
+    if (options.downloadBudgetBytes !== undefined
+      && !(Number.isSafeInteger(options.downloadBudgetBytes) && options.downloadBudgetBytes >= 0)) {
+      throw new InvalidInputError("downloadBudgetBytes must be a non-negative integer");
+    }
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
     const supplemental = supplementalModes === 1;
@@ -448,6 +481,7 @@ export class MirrorEngine {
       const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
       let accountSyncStarted = false;
       let client: MirrorImapClient | null = null;
+      let meter: PassDownloadMeter | null = null;
       const interruptActiveClient = () => {
         if (client) this.abortClient(client);
       };
@@ -486,6 +520,7 @@ export class MirrorEngine {
 
         client = options.client
           ?? await this.clientFactory(account, { signal: options.signal });
+        meter = new PassDownloadMeter(client, options.downloadBudgetBytes, this.config.BODY_RAW_MAX_BYTES);
         throwIfInterrupted();
 
         const mailboxChanges = options.liveInboxOnly
@@ -664,6 +699,9 @@ export class MirrorEngine {
             // and skips re-marking; otherwise markAccountSyncPartial overrides
             // the BROKEN state with DEGRADED.
             if (error instanceof AccountAlreadyFinalizedError) throw error;
+            // The provider asked the whole Mailbox Account to wait; no other
+            // folder can succeed, and the pass must record the long backoff.
+            if (isProviderOverQuotaError(error)) throw error;
             const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
             const message = describeSyncError(error);
             if (isConnectionLostError(error)) {
@@ -715,7 +753,13 @@ export class MirrorEngine {
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
-          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
+          const bodyResult = await this.fetchBodyBacklog(
+            account,
+            client,
+            lockDeadline,
+            lock.assertLive,
+            meter
+          );
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
@@ -733,7 +777,8 @@ export class MirrorEngine {
             lockDeadline,
             metadataWriteStats,
             options.signal,
-            lock.assertLive
+            lock.assertLive,
+            meter
           );
           throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
@@ -807,7 +852,16 @@ export class MirrorEngine {
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
         try {
-          if (supplemental) {
+          if (isProviderOverQuotaError(error)) {
+            // Every pass records the provider's request to wait, so the host's
+            // next pass and listener honor the long backoff.
+            await this.repository.markAccountSyncFailed(account.id, message, {
+              minimumBackoffMs: PROVIDER_OVER_QUOTA_RETRY_MS,
+              deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
+              signal: options.signal,
+              expectedSyncOwner: syncOwner
+            });
+          } else if (supplemental) {
             await this.repository.markAccountSyncYielded(account.id, {
               deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
               signal: options.signal,
@@ -844,6 +898,10 @@ export class MirrorEngine {
         }
       } finally {
         options.signal?.removeEventListener("abort", interruptActiveClient);
+        if (meter) {
+          result.downloadedBytes = meter.downloadedBytes;
+          result.downloadBudgetReached = meter.budgetReached;
+        }
         if (client && (client.usable === false || options.signal?.aborted)) {
           this.abortClient(client);
         } else if (client && !options.keepClientOpen) {
@@ -2106,7 +2164,8 @@ export class MirrorEngine {
     lockDeadline: number,
     metadataWriteStats: MetadataWriteStats,
     signal: AbortSignal | undefined,
-    assertLive: () => Promise<void>
+    assertLive: () => Promise<void>,
+    meter: PassDownloadMeter
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
@@ -2129,7 +2188,11 @@ export class MirrorEngine {
       }
       await assertLive();
 
-      const [folder] = await this.repository.getHistoryBacklog(account, 1);
+      // Once the budget pauses older bodies, history takes metadata work only,
+      // so mail stays findable by sender, subject, and date while bodies wait.
+      const [folder] = await this.repository.getHistoryBacklog(account, 1, {
+        bodies: !meter.budgetReached
+      });
       if (!folder) break;
 
       let batch: HistoryBatchResult;
@@ -2140,10 +2203,12 @@ export class MirrorEngine {
           client,
           lockDeadline,
           metadataWriteStats,
+          meter,
           signal
         );
       } catch (error) {
         if (error instanceof AccountAlreadyFinalizedError) throw error;
+        if (isProviderOverQuotaError(error)) throw error;
         const message = describeSyncError(error);
         if (isMissingMailboxError(error)) {
           await this.repository.markFolderPendingVerification(
@@ -2179,6 +2244,7 @@ export class MirrorEngine {
     client: MirrorImapClient,
     lockDeadline: number,
     metadataWriteStats: MetadataWriteStats,
+    meter: PassDownloadMeter,
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
     if (this.isLockBudgetExpired(lockDeadline)) {
@@ -2186,7 +2252,7 @@ export class MirrorEngine {
     }
 
     if (folder.history_backlog_reason === "body") {
-      return await this.fetchHistoricalBodyBatch(account, folder, client, lockDeadline, signal);
+      return await this.fetchHistoricalBodyBatch(account, folder, client, lockDeadline, meter, signal);
     }
 
     const mailboxLock = await client.getMailboxLock(folder.path);
@@ -2342,7 +2408,8 @@ export class MirrorEngine {
           messages.filter((row) => !row.body_fetched_at),
           {
             skipMailboxLock: true,
-            shouldStop: () => this.isLockBudgetExpired(lockDeadline)
+            shouldStop: () => this.isLockBudgetExpired(lockDeadline),
+            meter
           }
         );
       }
@@ -2372,6 +2439,7 @@ export class MirrorEngine {
     folder: ImapFolder,
     client: MirrorImapClient,
     lockDeadline: number,
+    meter: PassDownloadMeter,
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
     const backlog = await this.repository.getHistoricalBodyBacklog(
@@ -2393,7 +2461,8 @@ export class MirrorEngine {
     }
 
     const fetched = await this.fetchAndStoreBodies(client, backlog, {
-      shouldStop: () => this.isLockBudgetExpired(lockDeadline)
+      shouldStop: () => this.isLockBudgetExpired(lockDeadline),
+      meter
     });
 
     return {
@@ -2408,7 +2477,8 @@ export class MirrorEngine {
     account: ImapAccount,
     client: MirrorImapClient,
     lockDeadline: number,
-    assertLive: () => Promise<void>
+    assertLive: () => Promise<void>,
+    meter: PassDownloadMeter
   ): Promise<{ fetched: number; hitLockBudget: boolean }> {
     let fetched = 0;
     let hitLockBudget = false;
@@ -2424,9 +2494,17 @@ export class MirrorEngine {
         this.config.BODY_BACKFILL_BATCH_SIZE,
         batchesRemaining
       );
-      const backlog = await this.repository.getBodyBacklog(account, readLimit);
+      // Once older bodies pause, read only recent ones, so a long older
+      // backlog cannot hide new mail behind it.
+      const budgetReached = meter.budgetReached;
+      const backlog = await this.repository.getBodyBacklog(
+        account,
+        readLimit,
+        budgetReached ? { since: meter.recentSince } : {}
+      );
       if (backlog.length === 0) break;
 
+      let budgetReachedNow = false;
       for (
         let offset = 0;
         offset < backlog.length && batchesRemaining > 0;
@@ -2438,16 +2516,21 @@ export class MirrorEngine {
         );
 
         await assertLive();
-        fetched += await this.fetchAndStoreBodies(client, logicalBatch);
+        fetched += await this.fetchAndStoreBodies(client, logicalBatch, { meter });
 
         batchesRemaining -= 1;
         if (this.isLockBudgetExpired(lockDeadline)) {
           hitLockBudget = true;
           break;
         }
+        if (!budgetReached && meter.budgetReached) {
+          budgetReachedNow = true;
+          break;
+        }
       }
 
-      if (hitLockBudget || backlog.length < readLimit) break;
+      if (hitLockBudget) break;
+      if (!budgetReachedNow && backlog.length < readLimit) break;
     }
 
     return { fetched, hitLockBudget };
@@ -2517,16 +2600,24 @@ export class MirrorEngine {
     options: {
       skipMailboxLock?: boolean;
       shouldStop?: () => boolean;
+      meter?: PassDownloadMeter;
     } = {}
   ): Promise<number> {
-    const ordered = this.config.BODY_STORAGE_MODE === "parsed_only"
+    let ordered = this.config.BODY_STORAGE_MODE === "parsed_only"
       ? this.groupBodiesByFolder(messages)
       : messages;
     let processed = 0;
+    const meter = options.meter;
 
     for (let index = 0; index < ordered.length;) {
       if (options.shouldStop?.()) break;
       const batchMessages = this.parsedBodyBatchAt(ordered, index);
+      if (meter && !meter.admits(batchMessages.length > 1 ? batchMessages : [ordered[index]])) {
+        // Older bodies wait for the next budget; recent ones here continue.
+        ordered = ordered.slice(index).filter((message) => !meter.gates(message));
+        index = 0;
+        continue;
+      }
       if (batchMessages.length > 1) {
         processed += await this.fetchAndStoreBodyBatch(
           client,

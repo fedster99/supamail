@@ -44,6 +44,10 @@ export function isMissingMailboxDiagnosticText(error: string): boolean {
 
 /** Return a fixed operational code. Never return provider text. */
 export function diagnosticErrorCode(error: string): string {
+  // RFC 5530 OVERQUOTA is the provider's command or bandwidth limit. It wins
+  // over auth text, because a provider may also say "login failed" while it
+  // suspends the account.
+  if (/\[OVERQUOTA\]/i.test(error)) return "RATE_LIMITED";
   // Classify authentication before credential redaction. Redaction intentionally
   // removes text after LOGIN/AUTHENTICATE and can otherwise hide the signal.
   if (isAuthDiagnosticText(error)) return "AUTH_ERROR";

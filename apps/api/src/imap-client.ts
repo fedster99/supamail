@@ -172,6 +172,8 @@ export interface MirrorImapClient {
   ): Promise<FetchMessage | false | null>;
   search(query: Record<string, unknown>, options: { uid: true }): Promise<number[] | false>;
   download(range: string, part?: string, options?: Record<string, unknown>): Promise<DownloadResult>;
+  /** IMAP bytes this connection has received from the server so far. */
+  receivedBytes?(): number;
 }
 
 export class ThrottledImapClient implements MirrorImapClient {
@@ -203,6 +205,10 @@ export class ThrottledImapClient implements MirrorImapClient {
 
   async connect(): Promise<void> {
     await this.client.connect();
+  }
+
+  receivedBytes(): number {
+    return this.client.stats().received;
   }
 
   async logout(): Promise<void> {
