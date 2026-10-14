@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0034_folder_unreadable_messages",
+  "schemaVersion": "0035_message_change_outbox",
   "migrations": [
     {
       "id": "0001_imap_mirror",
@@ -136,6 +136,10 @@
     {
       "id": "0034_folder_unreadable_messages",
       "file": "0034_folder_unreadable_messages.sql"
+    },
+    {
+      "id": "0035_message_change_outbox",
+      "file": "0035_message_change_outbox.sql"
     }
   ]
 }
