@@ -7,7 +7,7 @@ import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import { InvalidInputError } from "./errors.js";
 import type { PgPool } from "./db.js";
-import { connectAbortableImap, type ImapAbortBinding } from "./imap-connect.js";
+import { connectAbortableImap, type ActionSocket, type ImapAbortBinding } from "./imap-connect.js";
 import { getProviderProfile } from "./provider-profiles.js";
 import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
@@ -411,6 +411,11 @@ export class SentFolderAppender {
     // append-only verb surface on top (ADR 0017/0022).
     const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
     return new SentFolderAppender(client, abort);
+  }
+
+  /** The append verbs over a socket the caller owns; the caller logs it out. */
+  static over(socket: ActionSocket): SentFolderAppender {
+    return new SentFolderAppender(socket.client, socket.abort);
   }
 
   /** List mailboxes so the caller can resolve the Sent folder by special-use. */

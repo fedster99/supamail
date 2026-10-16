@@ -7,6 +7,8 @@ import {
   connectAbortableImap,
   uidValidityMatches,
   uidValidityMismatchMessage,
+  type ActionConnection,
+  type ActionSocket,
   type ImapAbortBinding
 } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
@@ -178,6 +180,11 @@ export class MailboxMutator {
     // mutation verb surface on top (ADR 0018/0022).
     const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
     return new MailboxMutator(client, account.host, abort);
+  }
+
+  /** The mutation verbs over a socket the caller owns; the caller logs it out. */
+  static over(socket: ActionSocket, account: ImapAccount): MailboxMutator {
+    return new MailboxMutator(socket.client, account.host, socket.abort);
   }
 
   /** True iff the connected server advertises `name` (e.g. "UIDPLUS", "MOVE").
@@ -692,7 +699,7 @@ export async function deleteMessageInLock(
   pool: PgPool,
   config: AppConfig,
   messageId: string,
-  options: DeleteOptions = {}
+  options: DeleteOptions & { connection?: ActionConnection } = {}
 ): Promise<DeleteResult> {
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(
@@ -712,10 +719,13 @@ async function deleteLoadedMessage(
   repository: MirrorRepository,
   account: ImapAccount,
   target: ResolvedMessageTarget,
-  options: DeleteOptions
+  options: DeleteOptions & { connection?: ActionConnection }
 ): Promise<DeleteResult> {
   const messageId = target.messageId;
-  const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
+  // A caller's action connection is reused and stays open for its next step.
+  const mutator = options.connection
+    ? MailboxMutator.over(await options.connection.get(), account)
+    : await MailboxMutator.connect(pool, config, account, { signal: options.signal });
   let trashFolder: string | null = null;
   try {
     // The changed folders are durably due before the provider command, as for a move.
@@ -737,7 +747,7 @@ async function deleteLoadedMessage(
       await mutator.move([target], trashFolder);
     }
   } finally {
-    await closeImap(mutator);
+    if (!options.connection) await closeImap(mutator);
   }
   await writeRemovalThrough(repository, target);
   return { messageId, fromFolder: target.folderPath, mode: options.hard ? "expunge" : "trash", trashFolder };

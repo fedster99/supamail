@@ -14,16 +14,24 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
   return {
     ...actual,
     SentFolderAppender: {
-      connect: async () => ({
+      over: () => ({
         list: async () => [{ path: "Drafts", specialUse: "\\Drafts" }],
         append: async () => {
           provider.appends += 1;
           return { uidValidity: 100, uid: provider.nextUid++ };
         },
-        searchByMessageId: async () => ({ uids: [], uidValidity: 100 }),
-        logout: async () => undefined,
-        close: () => undefined
+        searchByMessageId: async () => ({ uids: [], uidValidity: 100 })
       })
+    }
+  };
+});
+vi.mock("../imap-connect.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../imap-connect.js")>();
+  return {
+    ...actual,
+    ActionConnection: class {
+      async get() { return { client: {}, abort: {} }; }
+      async close() {}
     }
   };
 });
@@ -105,13 +113,15 @@ liveDb("draft folder resolution (live DB)", () => {
 
   // The provider side of a draft delete: it confirms every UID EXPUNGE and MOVE.
   function confirmEveryRemoval(): void {
-    vi.spyOn(MailboxMutator, "connect").mockResolvedValue({
+    const mutator = {
       list: async () => [{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Trash", specialUse: "\\Trash" }],
       expunge: async () => true,
       move: async () => ({ uidMap: null }),
       logout: async () => undefined,
       close: () => undefined
-    } as unknown as MailboxMutator);
+    } as unknown as MailboxMutator;
+    vi.spyOn(MailboxMutator, "connect").mockResolvedValue(mutator);
+    vi.spyOn(MailboxMutator, "over").mockReturnValue(mutator);
   }
 
   async function removedState(id: string): Promise<{ deleted_in_provider: boolean; deleted_reason: string | null }> {

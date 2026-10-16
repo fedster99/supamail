@@ -1066,4 +1066,40 @@ describe("ThrottledImapClient QRESYNC replay", () => {
       ["Archive"]
     ]);
   });
+
+  it("selects the still-selected mailbox again on the first lock after a host reuses the session", async () => {
+    const raw = Object.assign(new EventEmitter(), {
+      mailbox: { path: "INBOX", uidNext: 40 },
+      close: vi.fn(),
+      mailboxOpen: vi.fn(async () => undefined),
+      getMailboxLock: vi.fn(async () => ({ release: vi.fn() }))
+    });
+    const client = new ThrottledImapClient(raw as never, 200, 5_000);
+
+    await client.getMailboxLock("INBOX");
+    expect(raw.mailboxOpen).not.toHaveBeenCalled();
+
+    client.invalidateSelection();
+    await client.getMailboxLock("INBOX");
+    await client.getMailboxLock("INBOX");
+    // One fresh SELECT for the reused session, then ImapFlow's fast path again.
+    expect(raw.mailboxOpen.mock.calls).toEqual([["INBOX"]]);
+    expect(raw.getMailboxLock).toHaveBeenCalledTimes(3);
+  });
+
+  it("needs no extra SELECT when the reused session first locks another mailbox or replays QRESYNC", async () => {
+    const raw = Object.assign(new EventEmitter(), {
+      mailbox: { path: "INBOX", uidValidity: 7n, highestModseq: 12n, qresync: true },
+      close: vi.fn(),
+      mailboxOpen: vi.fn(async () => undefined),
+      getMailboxLock: vi.fn(async () => ({ release: vi.fn() }))
+    });
+    const client = new ThrottledImapClient(raw as never, 200, 5_000);
+
+    client.invalidateSelection();
+    await client.getMailboxLock("Sent");
+    client.invalidateSelection();
+    await client.getMailboxLock("INBOX", { qresync: { uidValidity: 7n, changedSince: 10n } });
+    expect(raw.mailboxOpen).not.toHaveBeenCalled();
+  });
 });

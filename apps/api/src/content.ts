@@ -8,6 +8,8 @@ import {
   connectAbortableImap,
   uidValidityMatches,
   uidValidityMismatchMessage,
+  type ActionConnection,
+  type ActionSocket,
   type ImapAbortBinding
 } from "./imap-connect.js";
 import { cleanBody } from "./mcp/shared.js";
@@ -170,6 +172,11 @@ export class ContentImapClient {
     // download/fetch read verb surface on top (ADR 0020/0022).
     const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
     return new ContentImapClient(client, abort);
+  }
+
+  /** The read verbs over a socket the caller owns; the caller logs it out. */
+  static over(socket: ActionSocket): ContentImapClient {
+    return new ContentImapClient(socket.client, socket.abort);
   }
 
   /**
@@ -485,7 +492,7 @@ export async function getRawMime(
   config: AppConfig,
   messageId: string,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
-  options: { signal?: AbortSignal } = {}
+  options: { signal?: AbortSignal; connection?: ActionConnection } = {}
 ): Promise<RawMimeResult> {
   throwIfAborted(options.signal);
   if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
@@ -516,7 +523,10 @@ export async function getRawMime(
   // raw_mime not stored (parsed_only) or no body row yet → on-demand FETCH.
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const { message, account } = await loadMessageAndAccount(repository, messageId);
-  const reader = await ContentImapClient.connect(pool, config, account, options);
+  // A caller's action connection is reused and stays open for its next step.
+  const reader = options.connection
+    ? ContentImapClient.over(await options.connection.get())
+    : await ContentImapClient.connect(pool, config, account, options);
   try {
     const raw = await reader.fetchOneSource(
       message.folder_path,
@@ -526,7 +536,7 @@ export async function getRawMime(
     );
     return { messageId, raw, source: "fetch", truncated: raw.length >= config.BODY_RAW_MAX_BYTES };
   } finally {
-    await closeImap(reader);
+    if (!options.connection) await closeImap(reader);
   }
 }
 
