@@ -57,7 +57,7 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   ownership; immediately after SMTP acceptance it marks the operation confirmed.
   Known-lost liveness therefore cannot cross the irreversible boundary, while a
   later liveness/unlock failure is a warning on the delivered result. If the
-  non-blocking lock is unavailable, it throws
+  lock is still unavailable after the bounded wait (ADR 0042), it throws
   `AccountBusyError` before SMTP delivery; the HTTP surface maps that to
   `503 account_busy` plus `Retry-After`. This makes that specific failure
   proven-unsent and safe for a caller to retry, while preserving the existing

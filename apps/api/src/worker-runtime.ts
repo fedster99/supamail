@@ -18,7 +18,7 @@ const THREADING_STEPS_PER_ACCOUNT_TICK = 10;
 const THREADING_LANE_BUDGET_MS = 20_000;
 
 export interface WorkerSyncResult {
-  runId: string;
+  runId: string | null;
   outcome: string;
   foldersProcessed: number;
   messagesUpserted: number;

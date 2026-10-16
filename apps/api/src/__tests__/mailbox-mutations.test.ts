@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ImapAbortBinding } from "../imap-connect.js";
-import { InvalidInputError } from "../errors.js";
+import { AccountBusyError, InvalidInputError } from "../errors.js";
 import { MailboxMoveIncompleteError, MailboxMutator, type MovedLocation, toImapFlag } from "../mailbox-mutations.js";
 
 // Mirror ids are UUIDs; any other value names no row.
@@ -68,6 +68,15 @@ const repo = vi.hoisted(() => ({
   relocateMovedMessage: vi.fn(async (_source: unknown, _destination: unknown) => true)
 }));
 
+const lock = vi.hoisted(() => ({
+  withAccountLock: vi.fn(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>, _options?: unknown) => fn({}))
+}));
+
+vi.mock("../locks.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../locks.js")>();
+  return { ...actual, withAccountLock: lock.withAccountLock };
+});
+
 // MailboxMutator.connect is intercepted via vi.spyOn (the real lib functions call
 // it as a runtime property access, so the spy is picked up). A module self-mock
 // with {...actual} would NOT intercept those internal calls (ESM lexical binding),
@@ -89,6 +98,7 @@ const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOS
 
 const account = {
   id: "acc-1",
+  lock_id: "4242",
   provider_profile: "generic-imap",
   host: "imap.example.test",
   port: 993,
@@ -111,6 +121,7 @@ function message(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  lock.withAccountLock.mockImplementation(async (_pool, _lockId, fn) => fn({}));
   connectSpy.mockResolvedValue(mutator as unknown as MailboxMutator);
   mutator.move.mockResolvedValue({ uidMap: new Map<number, number>([[42, 99]]), uidValidity: 200 });
   repo.relocateMovedMessage.mockResolvedValue(true);
@@ -737,5 +748,65 @@ describe("abort signal", () => {
     expect(imap.messageFlagsRemove).not.toHaveBeenCalled();
     expect(imap.logout).not.toHaveBeenCalled();
     expect(repo.applyMessageFlags).not.toHaveBeenCalled();
+  });
+});
+
+describe("account lock", () => {
+  const lockOptions = () => lock.withAccountLock.mock.calls.map(([, lockId, , options]) => ({ lockId, options }));
+
+  it("waits for the account lock and writes flags through inside it", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    let inLock = false;
+    lock.withAccountLock.mockImplementationOnce(async (_pool, _lockId, fn) => {
+      inLock = true;
+      try { return await fn({}); } finally { inLock = false; }
+    });
+    repo.applyMessageFlags.mockImplementationOnce(async () => {
+      expect(inLock).toBe(true);
+      return ["\\Seen"];
+    });
+    const { setMessageFlags } = await import("../mailbox-mutations.js");
+    await setMessageFlags({} as never, config, M1, { add: ["seen"] });
+
+    expect(lockOptions()).toEqual([{ lockId: "4242", options: { fenceWrites: true, waitMs: 25_000 } }]);
+    expect(repo.applyMessageFlags).toHaveBeenCalledTimes(1);
+  });
+
+  it("raises AccountBusyError before connecting when a sync keeps the lock", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    lock.withAccountLock.mockResolvedValue(null);
+    const { setMessageFlags, deleteMessage } = await import("../mailbox-mutations.js");
+
+    await expect(setMessageFlags({} as never, config, M1, { add: ["seen"] })).rejects.toBeInstanceOf(AccountBusyError);
+    await expect(deleteMessage({} as never, config, M1, { hard: true })).rejects.toBeInstanceOf(AccountBusyError);
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(repo.applyMessageFlags).not.toHaveBeenCalled();
+    expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
+  });
+
+  it("reports a busy mailbox per message in a batch move and moves nothing", async () => {
+    repo.getMessage.mockResolvedValue(message());
+    lock.withAccountLock.mockResolvedValue(null);
+    const { moveMessages } = await import("../mailbox-mutations.js");
+
+    const [outcome] = await moveMessages({} as never, config, [M1], "Archive");
+    expect("error" in outcome && outcome.error).toBeInstanceOf(AccountBusyError);
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(repo.markFoldersForReconcile).not.toHaveBeenCalled();
+  });
+
+  it("deletes without taking the lock again for a caller that already holds it", async () => {
+    repo.getMessage.mockResolvedValue(message({ folder_path: "Drafts" }));
+    const { deleteMessageInLock } = await import("../mailbox-mutations.js");
+
+    await deleteMessageInLock({} as never, config, M1, { hard: true });
+    expect(lock.withAccountLock).not.toHaveBeenCalled();
+    expect(mutator.expunge).toHaveBeenCalledTimes(1);
+  });
+
+  it("changes folders under the account lock", async () => {
+    const { createFolder } = await import("../mailbox-mutations.js");
+    await createFolder({} as never, config, "acc-1", "Projects");
+    expect(lockOptions()).toEqual([{ lockId: "4242", options: { waitMs: 25_000 } }]);
   });
 });

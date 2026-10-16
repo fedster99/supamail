@@ -66,6 +66,7 @@ const mocks = vi.hoisted(() => ({
     mode: opts.hard ? "expunge" : "trash",
     trashFolder: opts.hard ? null : "Trash"
   })),
+  deleteMessageInLock: vi.fn(),
   getAccount: vi.fn(),
   getMessage: vi.fn(),
   markFoldersForReconcile: vi.fn(async () => undefined),
@@ -99,7 +100,10 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
 
 vi.mock("../content.js", () => ({ getRawMime: mocks.getRawMime }));
 vi.mock("../host-validation.js", () => ({ assertSafeSmtpTarget: mocks.assertSafeSmtpTarget }));
-vi.mock("../mailbox-mutations.js", () => ({ deleteMessage: mocks.deleteMessage }));
+vi.mock("../mailbox-mutations.js", () => ({
+  deleteMessage: mocks.deleteMessage,
+  deleteMessageInLock: mocks.deleteMessageInLock
+}));
 vi.mock("../locks.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../locks.js")>();
   return { ...actual, withAccountLock: mocks.withAccountLock };
@@ -172,9 +176,11 @@ beforeEach(() => {
     host: "smtp.example.test", port: 587, secure: false, username: "user@example.test", password: "secret"
   });
   mocks.assertSafeSmtpTarget.mockResolvedValue({ isPrivateHost: false });
-  mocks.deleteMessage.mockImplementation(async (_pool, _config, id: string, opts: { hard?: boolean }) => ({
+  const deleted = async (_pool: unknown, _config: unknown, id: string, opts: { hard?: boolean }) => ({
     messageId: id, fromFolder: "Drafts", mode: opts.hard ? "expunge" : "trash", trashFolder: opts.hard ? null : "Trash"
-  }));
+  });
+  mocks.deleteMessage.mockImplementation(deleted);
+  mocks.deleteMessageInLock.mockImplementation(deleted);
 });
 
 describe("createDraft", () => {
@@ -312,10 +318,11 @@ describe("createDraft", () => {
     // A short deadline: the provider already holds the draft.
     expect(writeOptions.deadlineAt).toBeGreaterThan(Date.now());
     expect(writeOptions.deadlineAt).toBeLessThanOrEqual(Date.now() + 5_000);
-    // The lock fences the write, as sync's lock does, and the save is confirmed
-    // once the provider holds the draft.
+    // The lock fences the write, as sync's lock does, waits for a sync holding it,
+    // and the save is confirmed once the provider holds the draft.
     expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), {
       fenceWrites: true,
+      waitMs: 25_000,
       onPostIrreversibleWarning: expect.any(Function)
     });
     expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
@@ -506,9 +513,9 @@ describe("updateDraft", () => {
     });
 
     expect(mocks.append).toHaveBeenCalledTimes(1);
-    expect(mocks.deleteMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteMessageInLock).toHaveBeenCalledTimes(1);
     // Old draft removed by a hard delete (reuses email-002), not trashed.
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(
+    expect(mocks.deleteMessageInLock).toHaveBeenCalledWith(
       draftPool,
       config,
       D1,
@@ -519,6 +526,25 @@ describe("updateDraft", () => {
     });
   });
 
+  it("holds one account lock across the new APPEND and the old draft's delete", async () => {
+    mocks.getMessage.mockResolvedValue(draftRow);
+    let inLock = false;
+    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => {
+      inLock = true;
+      try { return await fn(mockAccountLock()); } finally { inLock = false; }
+    });
+    mocks.deleteMessageInLock.mockImplementationOnce(async (_pool: unknown, _config: unknown, id: string) => {
+      expect(inLock).toBe(true);
+      return { messageId: id, fromFolder: "Drafts", mode: "expunge", trashFolder: null };
+    });
+    const { updateDraft } = await import("../drafts.js");
+    await updateDraft(draftPool, config, D1, { to: [{ email: "rcpt@example.test" }], subject: "v3", body: { format: "plain", text: "v3" } });
+
+    expect(mocks.withAccountLock).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteMessageInLock).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
   it("refuses an ordinary email, so a draft update can never rewrite or remove it", async () => {
     mocks.getMessage.mockResolvedValue({ ...draftRow, folder_path: "INBOX" });
     const { updateDraft } = await import("../drafts.js");
@@ -526,7 +552,7 @@ describe("updateDraft", () => {
       updateDraft(draftPool, config, D1, { to: [], subject: "s", body: { format: "plain", text: "b" } })
     ).rejects.toMatchObject({ name: "NotFoundError", message: expect.stringMatching(/Draft not found/) });
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   it("accepts a \\Draft-flagged message outside a Drafts folder", async () => {
@@ -557,7 +583,7 @@ describe("updateDraft", () => {
     }
     expect(mocks.getMessage).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   it("throws for an unknown draft without appending or deleting", async () => {
@@ -567,14 +593,14 @@ describe("updateDraft", () => {
       updateDraft(draftPool, config, "missing", { to: [], subject: "s", body: { format: "plain", text: "b" } })
     ).rejects.toThrow(/Draft not found/);
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   // ── Review PR-A (decision 1): the revised draft is already filed, so a failed
   //    delete of the OLD draft must downgrade to a warning, not fail the update. ─
   it("STILL reports the update when the old-draft delete rejects (best-effort cleanup)", async () => {
     mocks.getMessage.mockResolvedValue(draftRow);
-    mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
+    mocks.deleteMessageInLock.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
     const { updateDraft } = await import("../drafts.js");
 
     const result = await updateDraft(draftPool, config, D1, {
@@ -603,7 +629,7 @@ describe("updateDraft", () => {
     ).rejects.toBeInstanceOf(AccountBusyError);
     // The APPEND 503'd BEFORE the still-unlocked delete-old ran — no orphaned second draft.
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 });
 
@@ -689,7 +715,7 @@ describe("sendDraft", () => {
     expect(mocks.getRawMime).not.toHaveBeenCalled();
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   it("RESENDS the draft's raw bytes over SMTP, APPENDs them to Sent, then deletes the draft", async () => {
@@ -728,14 +754,14 @@ describe("sendDraft", () => {
     expect(sentFlags).toContain("\\Seen");
 
     // Delete happens AFTER the send.
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(
+    expect(mocks.deleteMessageInLock).toHaveBeenCalledWith(
       pool,
       config,
       D1,
       expect.objectContaining({ hard: true })
     );
     const deliverOrder = mocks.deliverSmtp.mock.invocationCallOrder[0];
-    const deleteOrder = mocks.deleteMessage.mock.invocationCallOrder[0];
+    const deleteOrder = mocks.deleteMessageInLock.mock.invocationCallOrder[0];
     expect(deliverOrder).toBeLessThan(deleteOrder);
     expect(result).toMatchObject({
       deletedDraftId: D1,
@@ -781,7 +807,7 @@ describe("sendDraft", () => {
     await expect(sendDraft(pool, config, D1)).rejects.toThrow(/no recipients/);
     expect(mocks.getRawMime).not.toHaveBeenCalled();
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   it("throws when the draft is not found", async () => {
@@ -804,7 +830,7 @@ describe("sendDraft", () => {
     expect(error.outcome).toBe("not_delivered");
     expect(error.message).toMatch(/truncated/i);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   it("does NOT submit over SMTP when the raw fetch fails (fail closed — no empty/garbage send)", async () => {
@@ -818,7 +844,7 @@ describe("sendDraft", () => {
     expect(error.outcome).toBe("not_delivered");
     expect(error.message).toMatch(/UIDVALIDITY/);
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   // ── Review PR-A (decision 1): the post-send cleanup is best-effort. The send
@@ -858,13 +884,13 @@ describe("sendDraft", () => {
     expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), { signal: abort.signal });
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
-    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
   });
 
   it("STILL reports delivered when the post-send draft delete rejects (best-effort cleanup)", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     // The cleanup EXPUNGE fails (e.g. no UIDPLUS) AFTER a successful send.
-    mocks.deleteMessage.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
+    mocks.deleteMessageInLock.mockRejectedValueOnce(new Error("Hard delete needs the UIDPLUS extension"));
     const { sendDraft } = await import("../drafts.js");
 
     const result = await sendDraft(pool, config, D1);
@@ -917,7 +943,7 @@ describe("sendDraft", () => {
     mocks.close.mockImplementationOnce(() => {
       expect(lockHeld).toBe(true);
     });
-    mocks.deleteMessage.mockImplementationOnce(async () => {
+    mocks.deleteMessageInLock.mockImplementationOnce(async () => {
       expect(lockHeld).toBe(true);
       return { messageId: D1, fromFolder: "Drafts", mode: "expunge", trashFolder: null };
     });

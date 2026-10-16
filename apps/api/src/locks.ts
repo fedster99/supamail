@@ -25,7 +25,13 @@ export interface AccountLockOptions {
    * lock's own session. Writes then share fate with the lock: once that session
    * ends, the holder cannot write anything else, however long it was frozen. */
   fenceWrites?: boolean;
+  /** Wait up to this long for a held lock instead of returning `null` at once.
+   * Postgres queues the waiter ahead of later try-locks, so it waits for the
+   * current holder only. */
+  waitMs?: number;
 }
+
+const QUERY_CANCELED = "57014";
 
 export class AccountLockLivenessError extends Error {
   constructor(message: string, readonly retryable: boolean) {
@@ -270,6 +276,35 @@ async function queryWithTimeout<T>(
 }
 
 /**
+ * Take the account lock. Without a wait, one try. With a wait, one blocking
+ * `pg_advisory_lock` statement under a statement timeout: it is the first
+ * statement on the connection, so session-aware poolers route it as a lock.
+ */
+async function acquireAccountLock(
+  client: PgClient,
+  lockId: string | number,
+  waitMs: number | undefined
+): Promise<boolean> {
+  if (waitMs === undefined) {
+    const result = await client.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock($1::bigint) AS locked",
+      [lockId]
+    );
+    return result.rows[0]?.locked === true;
+  }
+  if (!Number.isSafeInteger(waitMs) || waitMs <= 0) {
+    throw new Error("Account lock wait must be a positive whole number of milliseconds");
+  }
+  try {
+    await queryWithTimeout(client, "SELECT pg_advisory_lock($1::bigint)", [lockId], waitMs);
+    return true;
+  } catch (error) {
+    if ((error as { code?: string } | null)?.code === QUERY_CANCELED) return false;
+    throw error;
+  }
+}
+
+/**
  * Close a fenced session to further work, wait for queued work, then unlock.
  * Returns false for an abandoned session: it was already ended (which released
  * the lock) and may hold an open transaction, so the caller must destroy the
@@ -303,7 +338,8 @@ const abandonedSessionError = (lockId: string | number) =>
  * operation can approach the stale-reaper threshold must supply
  * `heartbeatIntervalMs` so that heartbeat remains fresh for the full lock lifetime.
  *
- * Returns `null` when the lock is held by another session.
+ * Returns `null` when another session holds the lock, at once or, with
+ * `waitMs`, after waiting that long.
  */
 export async function withAccountLock<T>(
   pool: PgPool,
@@ -314,18 +350,11 @@ export async function withAccountLock<T>(
   const client = await pool.connect();
   let releaseError: Error | undefined;
   try {
-    let result: { rows: Array<{ locked: boolean }> };
     try {
-      result = await client.query<{ locked: boolean }>(
-        "SELECT pg_try_advisory_lock($1::bigint) AS locked",
-        [lockId]
-      );
+      if (!(await acquireAccountLock(client, lockId, options.waitMs))) return null;
     } catch (error) {
       releaseError = asError(error, `Account lock acquisition failed for lock ${lockId}`);
       throw releaseError;
-    }
-    if (!result.rows[0]?.locked) {
-      return null;
     }
 
     let irreversibleConfirmed = false;

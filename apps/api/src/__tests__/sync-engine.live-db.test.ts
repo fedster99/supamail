@@ -283,8 +283,8 @@ liveDb("live DB reliability lane", () => {
     await timeout(listWasEntered, "first sync entered LIST");
     const second = await engine.syncAccount(h.account.id, "manual");
 
-    expect(second.outcome).toBe("failed");
-    expect(second.errors.some((error) => error.includes("Account lock busy"))).toBe(true);
+    // The second pass finds the lock held: it defers and records nothing.
+    expect(second).toMatchObject({ outcome: "deferred", runId: null, errors: [] });
     expect(factoryCalls).toBe(1);
 
     releaseList();
@@ -314,7 +314,7 @@ liveDb("live DB reliability lane", () => {
     await expect(engine.fetchBody(message.rows[0].id, true)).resolves.toBe(true);
   });
 
-  it("lets a Sent pass yield neutrally whenever the account lock is busy", async () => {
+  it("defers a Sent pass whenever the account lock is busy, recording no run", async () => {
     const h = await setupIntegration("live-sent-lock-yield", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);
     const account = await h.repository.getAccount(h.account.id);
@@ -330,13 +330,12 @@ liveDb("live DB reliability lane", () => {
         signal: abort.signal
       });
 
-      expect(result.outcome).toBe("success");
-      expect(result.errors).toEqual([]);
-      const run = await h.pool.query<{ status: string; error: string | null }>(
-        "SELECT status, error FROM public.imap_sync_runs WHERE id = $1",
-        [result.runId]
+      expect(result).toMatchObject({ outcome: "deferred", runId: null, errors: [] });
+      const runs = await h.pool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM public.imap_sync_runs WHERE account_id = $1",
+        [h.account.id]
       );
-      expect(run.rows[0]).toEqual({ status: "success", error: null });
+      expect(runs.rows[0].count).toBe("0");
     } finally {
       await locker.query("SELECT pg_advisory_unlock_all()");
       locker.release();
@@ -374,8 +373,7 @@ liveDb("live DB reliability lane", () => {
     try {
       const engine = h.buildEngine({ folders: oneFolder(), overrides: { STALE_HEARTBEAT_MS: 1_000 } });
       const busy = await engine.syncAccount(h.account.id, "manual");
-      expect(busy.outcome).toBe("failed");
-      expect(busy.errors).toEqual(["Account lock busy"]);
+      expect(busy).toMatchObject({ outcome: "deferred", runId: null, errors: [] });
       await expect(clearOrphanedLocks(h.pool, 1_000)).resolves.toEqual({ terminatedBackends: 0, accountsReset: 0, runsClosed: 0 });
 
       const owner = await frozenOwner.query<{ alive: number }>("SELECT 1 AS alive");
@@ -419,7 +417,7 @@ liveDb("live DB reliability lane", () => {
 
     await expect(timeout(engine.syncAccount(h.account.id, "manual"), "slow sync", 15_000))
       .resolves.toMatchObject({ outcome: "success" });
-    expect(contender).toMatchObject({ outcome: "failed", errors: ["Account lock busy"] });
+    expect(contender).toMatchObject({ outcome: "deferred", runId: null, errors: [] });
   });
 
   it("writes nothing more once the account lock session is gone, not even in the current folder", async () => {

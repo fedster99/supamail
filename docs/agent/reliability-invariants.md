@@ -57,6 +57,15 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 ## Concurrency And Connections
 
 - One IMAP operation per account at a time across worker and API.
+- Every direct write (draft create/update/send, send, delete, flags, moves, thread
+  verbs, folder changes) runs under `withInteractiveAccountLock`: it waits up to
+  25 seconds for the current holder, then raises `AccountBusyError` before any
+  provider command (ADR 0042). A caller that already holds the lock uses the
+  `InLock` variant; a second `withAccountLock` from another session would wait on
+  the caller.
+- A sync pass opens its run only after it holds the lock. A pass that finds the
+  lock held returns `outcome: "deferred"` with `runId: null` and writes no run and
+  no account state.
 - Direct `sendMessage` and `sendDraft` share that account lock. Draft send acquires
   before a possibly-live raw fetch; both hold through SMTP, Sent APPEND, and
   appender teardown, with draft cleanup also inside the same lock.
@@ -68,7 +77,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   refresh errors retry; known-lost/unknown liveness cannot cross that boundary.
 - `pg_advisory_unlock` must return true. False/error destroys the pool client rather
   than returning a possibly lock-owning session to the pool.
-- Send lock contention must raise `AccountBusyError` before delivery. Once SMTP is
+- Send lock contention that outlasts the bounded wait must raise `AccountBusyError` before delivery. Once SMTP is
   confirmed, heartbeat/unlock, SMTP transport close, APPEND, appender teardown,
   and draft-cleanup failures are warnings, never thrown retry signals.
 - Direct mailbox actions (mutations, drafts, send) accept an optional AbortSignal.
@@ -82,7 +91,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Every runtime Postgres pool must handle its `error` event. node-postgres has already removed an idle client before emitting this event; log the lost session and let a later checkout reconnect. Never let database restart/failover or administrator termination of an idle session become an uncaught process exception.
 - Worker startup must fail if advisory lock self-test fails.
 - Every runtime ImapFlow client must have an `error` listener before connecting. Promise rejection remains the command/error contract, but EventEmitter's special unhandled `error` behavior must never turn a late event after intentional cancellation into a process crash. Combined API+worker mode installs the worker process handlers with an owner-level close callback before worker startup checks; SIGTERM/SIGINT and fatal events stop the worker and close the API immediately, cancel the lock-test retry budget, and skip later startup maintenance, while fatal events also retain a nonzero process exit status.
-- On direct connections nothing may take over an account lock whose session is still alive. A stale heartbeat cannot tell a dead worker from a frozen one, and a frozen worker that resumes after losing its lock could write stale mailbox state. Contention stays "Account lock busy".
+- On direct connections nothing may take over an account lock whose session is still alive. A stale heartbeat cannot tell a dead worker from a frozen one, and a frozen worker that resumes after losing its lock could write stale mailbox state. Contention defers the pass.
 - Every direct pooled session sets server-side TCP liveness (`tcp_keepalives_idle=30`, `tcp_keepalives_interval=10`, `tcp_keepalives_count=3`, `tcp_user_timeout=60000`). A vanished worker's sessions, and their locks, are released in about a minute; a stalled but alive worker keeps answering probes and keeps its locks. A proxy that refuses the settings is logged and only loses that faster release. Other session-mode proxies are treated as direct connections, and hosts that pass their own pool to `MirrorEngine` must apply the same settings themselves.
 - Through a Supabase session pooler, probes reach the pooler rather than the worker, so heartbeat-based takeover of stale lock holders remains the recovery path there. It must stay conservative: only a heartbeat older than `STALE_HEARTBEAT_MS`.
 - Sync runs with `withAccountLock(..., { fenceWrites: true })`: every repository query during the locked sync uses the lock's own session (`lockedSessionPool`), one at a time. Writes therefore share fate with the lock; once that session ends (liveness timeout, takeover or failover), the holder cannot write anything else, including the rest of the current folder. Hosts that write mirror rows during a sync outside the repository must resolve their pool through `lockedSessionPool`. A cancelled or failed transaction abandons the session: it is ended from another connection, which releases the lock, and the client is destroyed. Losing a fenced session fails that sync, not the process.

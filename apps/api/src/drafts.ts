@@ -3,12 +3,13 @@ import { DRAFT_INPUT_SCHEMA, DRAFT_UPDATE_SCHEMA, parseInput } from "./compose-s
 import type { AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
-import { AccountBusyError, NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
+import { NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { METADATA_HEADER_FIELDS } from "./imap-client.js";
 import { closeImap } from "./imap-connect.js";
-import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
-import { deleteMessage, type MailboxActionOptions } from "./mailbox-mutations.js";
+import { withInteractiveAccountLock } from "./interactive-lock.js";
+import { accountLockHeartbeatIntervalMs, type AccountLock } from "./locks.js";
+import { deleteMessage, deleteMessageInLock, type MailboxActionOptions } from "./mailbox-mutations.js";
 import { normalizeMessageId, parseHeaders } from "./mime.js";
 import { DRAFTS_VOCABULARY, getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
@@ -167,14 +168,33 @@ function buildDraftMessageId(domain: string, idempotencyKey: string): string {
 
 type SavedDraft = Omit<CreateDraftResult, "accountId">;
 
+interface ComposedDraft {
+  request: SendRequest;
+  raw: Buffer;
+  rfcMessageId: string;
+  idempotencyKey: string | null;
+}
+
+async function composeDraft(
+  account: ImapAccount,
+  req: SendRequest,
+  idempotencyKey?: string | null
+): Promise<ComposedDraft> {
+  // With an idempotency key, stamp a deterministic Message-ID (buildRawMime honors
+  // req.messageId) so a retry finds its own prior APPEND instead of duping.
+  const request: SendRequest = idempotencyKey
+    ? { ...req, messageId: buildDraftMessageId(domainOf(account.email_address), idempotencyKey) }
+    : req;
+  const { raw, messageId: rfcMessageId } = await buildRawMime(request, { email: account.email_address });
+  return { request, raw, rfcMessageId, idempotencyKey: idempotencyKey ?? null };
+}
+
 /**
- * Compose `req`, APPEND it to the account's Drafts folder, and write its mirror row.
- * Serialized with the sync worker on the per-account advisory lock: a second IMAP
- * connection mid-cycle races and burns the provider's shared per-account command
- * budget (Rackspace caps ~200/min). Non-blocking — if the worker holds the lock,
- * surface a retryable busy error instead of colliding. The lock fences its writes,
- * as sync's does: a save that lost the lock cannot write a row that sync already
- * read, and no sync interleaves with the mirror write.
+ * Compose `req`, APPEND it to the account's Drafts folder, and write its mirror row,
+ * under the per-account advisory lock: one IMAP operation per Mailbox Account at a
+ * time. The save waits for a sync that holds the lock (withInteractiveAccountLock).
+ * The lock fences its writes, as sync's does: a save that lost the lock cannot write
+ * a row that sync already read, and no sync interleaves with the mirror write.
  */
 async function saveDraft(
   pool: PgPool,
@@ -185,46 +205,53 @@ async function saveDraft(
   idempotencyKey?: string | null,
   signal?: AbortSignal
 ): Promise<SavedDraft> {
-  // With an idempotency key, stamp a deterministic Message-ID (buildRawMime honors
-  // req.messageId) so a retry finds its own prior APPEND instead of duping.
-  const composeReq: SendRequest = idempotencyKey
-    ? { ...req, messageId: buildDraftMessageId(domainOf(account.email_address), idempotencyKey) }
-    : req;
-  const { raw, messageId: rfcMessageId } = await buildRawMime(composeReq, { email: account.email_address });
-
+  const composed = await composeDraft(account, req, idempotencyKey);
   // One array: the lock adds its post-confirmation warnings after the callback returns.
   const warnings: string[] = [];
-  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
-    const savedAt = new Date();
-    const filed = await fileDraft(pool, config, repository, account, raw, rfcMessageId, savedAt, idempotencyKey, signal);
-    // The provider holds the draft now. A later mirror or lock failure must not fail
-    // the save: a retry without an idempotency key would file a second draft.
-    lock.confirmIrreversible();
-    const saved: SavedDraft = {
-      draftsFolderPath: filed.draftsFolderPath,
-      rfcMessageId,
-      messageId: null,
-      appendedUid: filed.appended?.uid ?? null,
-      warnings
-    };
-    if (!filed.appended) return saved;
-    try {
-      saved.messageId = filed.retried
-        ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...filed.appended })
-        : await mirrorSavedDraft(repository, account.id, filed.draftsFolderPath, filed.appended.uidValidity,
-          savedDraftMetadata(composeReq, account, { raw, rfcMessageId, uid: filed.appended.uid, savedAt }));
-    } catch (error) {
-      warnings.push(
-        `Saved, but the draft id is available only after the next sync: ${error instanceof Error ? error.message : String(error)}.`
-      );
-    }
-    return saved;
-  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
+  return await withInteractiveAccountLock(
+    pool,
+    account,
+    (lock) => fileAndMirrorDraft(pool, config, repository, account, composed, lock, warnings, signal),
+    { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) }
+  );
+}
 
-  if (result === null) {
-    throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft shortly`);
+/** The locked part of a save: file the draft, then write its mirror row. */
+async function fileAndMirrorDraft(
+  pool: PgPool,
+  config: AppConfig,
+  repository: MirrorRepository,
+  account: ImapAccount,
+  composed: ComposedDraft,
+  lock: AccountLock,
+  warnings: string[],
+  signal: AbortSignal | undefined
+): Promise<SavedDraft> {
+  const { request: composeReq, raw, rfcMessageId, idempotencyKey } = composed;
+  const savedAt = new Date();
+  const filed = await fileDraft(pool, config, repository, account, raw, rfcMessageId, savedAt, idempotencyKey, signal);
+  // The provider holds the draft now. A later mirror or lock failure must not fail
+  // the save: a retry without an idempotency key would file a second draft.
+  lock.confirmIrreversible();
+  const saved: SavedDraft = {
+    draftsFolderPath: filed.draftsFolderPath,
+    rfcMessageId,
+    messageId: null,
+    appendedUid: filed.appended?.uid ?? null,
+    warnings
+  };
+  if (!filed.appended) return saved;
+  try {
+    saved.messageId = filed.retried
+      ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...filed.appended })
+      : await mirrorSavedDraft(repository, account.id, filed.draftsFolderPath, filed.appended.uidValidity,
+        savedDraftMetadata(composeReq, account, { raw, rfcMessageId, uid: filed.appended.uid, savedAt }));
+  } catch (error) {
+    warnings.push(
+      `Saved, but the draft id is available only after the next sync: ${error instanceof Error ? error.message : String(error)}.`
+    );
   }
-  return result;
+  return saved;
 }
 
 /** File the composed bytes in Drafts, or find the copy that an earlier attempt with
@@ -583,21 +610,25 @@ export async function updateDraft(
   const account = await repository.getAccount(draft.account_id);
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.account_id}`);
 
-  const saved = await saveDraft(pool, config, repository, account, { ...request, accountId: account.id }, undefined, options.signal);
-
-  // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
-  // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
-  // EXPUNGE) must NOT fail the update — we downgrade it to a warning and report the
-  // update as done. A lingering old draft self-heals on the next Drafts sync.
-  let replacedDraftDeleted = true;
-  try {
-    await deleteMessage(pool, config, messageId, { hard: true, metadataProtection, signal: options.signal });
-  } catch (error) {
-    replacedDraftDeleted = false;
-    saved.warnings.push(
-      `Updated, but removing the previous draft failed: ${error instanceof Error ? error.message : String(error)}. The old copy self-heals on the next sync.`
-    );
-  }
+  const composed = await composeDraft(account, { ...request, accountId: account.id });
+  const warnings: string[] = [];
+  // One lock across the APPEND and the delete, so no sync runs between them.
+  const { saved, replacedDraftDeleted } = await withInteractiveAccountLock(pool, account, async (lock) => {
+    const saved = await fileAndMirrorDraft(pool, config, repository, account, composed, lock, warnings, options.signal);
+    // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
+    // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
+    // EXPUNGE) must NOT fail the update — we downgrade it to a warning and report the
+    // update as done. A lingering old draft self-heals on the next Drafts sync.
+    try {
+      await deleteMessageInLock(pool, config, messageId, { hard: true, metadataProtection, signal: options.signal });
+      return { saved, replacedDraftDeleted: true };
+    } catch (error) {
+      warnings.push(
+        `Updated, but removing the previous draft failed: ${error instanceof Error ? error.message : String(error)}. The old copy self-heals on the next sync.`
+      );
+      return { saved, replacedDraftDeleted: false };
+    }
+  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
 
   return { accountId: account.id, ...saved, replacedMessageId: messageId, replacedDraftDeleted };
 }
@@ -694,7 +725,7 @@ async function sendDraftAttempt(
   // The raw fetch can itself require IMAP, so acquire before it and keep the same
   // account lock through SMTP delivery, Sent APPEND, appender teardown, and draft
   // cleanup. Contention is proven-unsent: no provider verb has run yet.
-  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
+  return await withInteractiveAccountLock(pool, account, async (lock) => {
     // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
     // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
     // body + HTML + formatting regardless of lazy mirror-body state.
@@ -789,7 +820,7 @@ async function sendDraftAttempt(
     }
     if (providerWorkAllowed) {
       try {
-        await deleteMessage(pool, config, messageId, { hard: true, metadataProtection, signal });
+        await deleteMessageInLock(pool, config, messageId, { hard: true, metadataProtection, signal });
         draftDeleted = true;
       } catch (error) {
         addWarning(
@@ -803,11 +834,6 @@ async function sendDraftAttempt(
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
     onPostIrreversibleWarning: addWarning
   });
-
-  if (result === null) {
-    throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the draft send shortly`);
-  }
-  return result;
 }
 
 /**
