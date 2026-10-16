@@ -164,6 +164,19 @@ const AUTH_RESPONSE_CODES = new Set(["AUTHENTICATIONFAILED", "AUTHORIZATIONFAILE
 const TRANSIENT_RESPONSE_CODES = new Set(["UNAVAILABLE", "INUSE", "LIMIT", "SERVERBUG"]);
 
 /**
+ * Split a refused LOGIN by RFC 5530. `credentials_rejected`: the server named the
+ * credential (AUTHENTICATIONFAILED, AUTHORIZATIONFAILED, EXPIRED), a verdict on the
+ * password. `login_refused`: any other refusal, such as a bare NO, `[ALERT]` or a
+ * connection limit, which may pass on its own. `null`: not a login refusal (a
+ * transient code, a dead connection, or another error).
+ */
+export function classifyLoginRefusal(error: unknown): "credentials_rejected" | "login_refused" | null {
+  if (!error || typeof error !== "object" || !isAuthError(error)) return null;
+  const responseCode = extractImapResponseCode(error);
+  return responseCode && AUTH_RESPONSE_CODES.has(responseCode) ? "credentials_rejected" : "login_refused";
+}
+
+/**
  * Classify an auth failure from the ERROR OBJECT, not just its message. imapflow's
  * login/authenticate failures throw with `message: "Command failed"` and put the real
  * signal in structured properties (`authenticationFailed: true`, `serverResponseCode`,
@@ -488,8 +501,12 @@ export class MirrorEngine {
           return;
         }
 
-        client = options.client
-          ?? await this.clientFactory(account, { signal: options.signal });
+        if (options.client) {
+          client = options.client;
+          client.invalidateSelection?.();
+        } else {
+          client = await this.clientFactory(account, { signal: options.signal });
+        }
         throwIfInterrupted();
 
         const mailboxChanges = options.liveInboxOnly

@@ -138,6 +138,43 @@ export async function connectAbortableImap(
   return { client, abort: new ImapAbortBinding(client, signal) };
 }
 
+/** A connected action client and the binding that closes it on abort. */
+export interface ActionSocket {
+  client: ImapFlow;
+  abort: ImapAbortBinding;
+}
+
+/**
+ * One direct action's IMAP connection. A multi-step action (draft update, draft
+ * send) opens it on first use and gives every step the same socket, so it logs in
+ * once. It opens a new socket only when the last one died (an SMTP submission can
+ * outlast an idle IMAP socket) and logs out once at the end.
+ */
+export class ActionConnection {
+  private socket: ActionSocket | null = null;
+
+  constructor(
+    private readonly pool: PgPool,
+    private readonly config: AppConfig,
+    private readonly account: ImapAccount,
+    private readonly signal?: AbortSignal
+  ) {}
+
+  async get(): Promise<ActionSocket> {
+    if (this.socket?.client.usable) return this.socket;
+    this.socket?.abort.close();
+    this.socket = null;
+    this.socket = await connectAbortableImap(this.pool, this.config, this.account, this.signal);
+    return this.socket;
+  }
+
+  async close(): Promise<void> {
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) await closeImap(socket.abort);
+  }
+}
+
 export class ImapAbortBinding {
   private readonly closeOnAbort = () => this.client.close();
 

@@ -63,6 +63,12 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   provider command (ADR 0042). A caller that already holds the lock uses the
   `InLock` variant; a second `withAccountLock` from another session would wait on
   the caller.
+- A multi-step direct action (draft update, draft send) uses one
+  `ActionConnection`: one login, reopened only if the socket died, logged out
+  once (ADR 0043).
+- A host-owned sync client reused across passes is invalidated at the start of
+  each pass, so the next lock on the still-selected mailbox sends SELECT and
+  reads UIDNEXT again. Never CLOSE to force this: CLOSE expunges `\Deleted`.
 - A sync pass opens its run only after it holds the lock. A pass that finds the
   lock held returns `outcome: "deferred"` with `runId: null` and writes no run and
   no account state.

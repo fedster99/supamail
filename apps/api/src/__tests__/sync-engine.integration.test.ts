@@ -313,6 +313,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const idleClient = new FixtureImapClient(folders);
     const logout = vi.spyOn(idleClient, "logout");
     const list = vi.spyOn(idleClient, "list");
+    const invalidateSelection = vi.fn();
+    Object.assign(idleClient, { invalidateSelection });
     const beforeWake = await h.pool.query<{ last_sync_finished_at: Date | null }>(
       "SELECT last_sync_finished_at FROM public.imap_accounts WHERE id = $1",
       [h.account.id]
@@ -333,6 +335,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
 
     expect(result.outcome).toBe("success");
+    // A reused host session refreshes its selected mailbox before the pass.
+    expect(invalidateSelection).toHaveBeenCalledTimes(1);
     expect(result.foldersProcessed).toBe(1);
     expect(result.reconcileGapsFound).toBe(2);
     expect(result.flagsUpdated).toBe(1);
