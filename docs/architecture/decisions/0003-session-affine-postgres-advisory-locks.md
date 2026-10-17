@@ -32,8 +32,8 @@ The checks above still let a holder write the rest of the unit it was in when it
 - Worker startup fails fast if lock semantics are unsafe.
 - Provider work never starts when the initial lock heartbeat cannot be persisted.
 - Known-lost/unknown lock liveness cannot cross an irreversible boundary.
-- On direct connections no live lock holder is ever terminated; contention
-  reports "Account lock busy".
+- On direct connections no live lock holder is ever terminated; a contended
+  sync pass defers without a run (ADR 0042).
 - Session-pooler deployments keep the stale-heartbeat takeover, because
   server-side probes cannot reach the worker there. Fenced sync writes make that
   takeover safe: the terminated holder cannot write afterwards.

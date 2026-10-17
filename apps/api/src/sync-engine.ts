@@ -414,7 +414,6 @@ export class MirrorEngine {
     if (!account) throw new Error(`Account not found: ${accountId}`);
     const supplemental = supplementalModes === 1;
 
-    const runId = await this.repository.startSyncRun(account.id, triggerType);
     const metadataWriteStats: MetadataWriteStats = {
       rowsCommitted: 0,
       durationMs: 0,
@@ -422,7 +421,7 @@ export class MirrorEngine {
       batchesFailed: 0
     };
     const result: SyncResult = {
-      runId,
+      runId: null,
       outcome: "success",
       foldersProcessed: 0,
       folderChecks: [],
@@ -442,9 +441,14 @@ export class MirrorEngine {
       errors: []
     };
     let cancellationCleanupRequired = false;
-    const syncOwner = `supamail:${process.pid}:${runId}`;
+    let syncOwner = "";
 
     const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async (lock) => {
+      // The run row exists only once this pass holds the lock, so a pass that
+      // finds the lock held records nothing (outcome "deferred" below).
+      const runId = await this.repository.startSyncRun(account.id, triggerType);
+      result.runId = runId;
+      syncOwner = `supamail:${process.pid}:${runId}`;
       const lockDeadline = Date.now() + this.config.MAX_LOCK_HOLD_MS;
       let accountSyncStarted = false;
       let client: MirrorImapClient | null = null;
@@ -855,15 +859,12 @@ export class MirrorEngine {
     let runFinished = false;
     try {
       let locked = await runLockedSync();
-      // Supplemental Sent and live Inbox lanes defer to the authoritative full
-      // sweep when another worker owns the Mailbox Account.
-      const yieldedBeforeLock = locked === null && supplemental;
       // On direct connections a busy lock is never taken over: its owner may be
       // frozen rather than dead and could resume writing. Server-side TCP probes
       // release a vanished worker's lock (see createPool). Through a session
-      // pooler those probes cannot reach the worker, so the stale-heartbeat
-      // takeover remains the recovery path there.
-      if (locked === null && !yieldedBeforeLock && isSupabaseSessionPoolerUrl(this.config.DATABASE_URL)) {
+      // pooler those probes cannot reach the worker, so a full pass keeps the
+      // stale-heartbeat takeover as the recovery path there.
+      if (locked === null && !supplemental && isSupabaseSessionPoolerUrl(this.config.DATABASE_URL)) {
         const recovered = await clearOrphanedLockForAccount(
           this.pool,
           account.lock_id,
@@ -872,6 +873,13 @@ export class MirrorEngine {
         if (recovered) {
           locked = await runLockedSync();
         }
+      }
+
+      // Another session holds the lock: a direct mailbox action or another
+      // worker's pass. Nothing ran and nothing is recorded; the caller retries.
+      if (locked === null) {
+        result.outcome = "deferred";
+        return result;
       }
 
       if (cancellationCleanupRequired) {
@@ -883,20 +891,12 @@ export class MirrorEngine {
 
       applyMetadataWriteStats(result, metadataWriteStats);
 
-      if (locked === null && !yieldedBeforeLock) {
-        result.outcome = "failed";
-        result.errors.push("Account lock busy");
-        await this.repository.updateSyncRunStatus(runId, "failed", "Account lock busy");
-        runFinished = true;
-        return result;
-      }
-
       await this.repository.finishSyncRun(result);
       runFinished = true;
       await this.hooks.onSyncRunCompleted?.(result);
       return result;
     } catch (error) {
-      if (!runFinished) {
+      if (!runFinished && result.runId !== null) {
         const message = sanitizeErrorReason(describeSyncError(error));
         result.outcome = "failed";
         if (!result.errors.includes(message)) result.errors.push(message);
@@ -907,7 +907,7 @@ export class MirrorEngine {
         } catch (finalizationError) {
           throw new AggregateError(
             [error, finalizationError],
-            `Sync run ${runId} escaped and could not be terminalized`
+            `Sync run ${result.runId} escaped and could not be terminalized`
           );
         }
       }

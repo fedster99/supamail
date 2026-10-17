@@ -1,10 +1,11 @@
 import { SEND_REQUEST_SCHEMA, parseInput } from "./compose-schema.js";
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
-import { AccountBusyError, NotFoundError, throwIfAborted } from "./errors.js";
+import { NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { closeImap } from "./imap-connect.js";
-import { accountLockHeartbeatIntervalMs, withAccountLock } from "./locks.js";
+import { withInteractiveAccountLock } from "./interactive-lock.js";
+import { accountLockHeartbeatIntervalMs } from "./locks.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import { MirrorRepository } from "./repository.js";
 import {
@@ -117,10 +118,10 @@ async function sendMessageAttempt(
   // SMTP submission and the matching Sent APPEND are one account-scoped provider
   // operation. Hold the SAME advisory lock used by sync and draft APPENDs across
   // both network verbs so the worker cannot race this send or consume the provider's
-  // per-account command budget concurrently. Acquisition is deliberately
-  // non-blocking: callers get the established transient AccountBusyError before
-  // any irreversible SMTP delivery happens.
-  const result = await withAccountLock(pool, account.lock_id, async (lock) => {
+  // per-account command budget concurrently. Acquisition waits a bounded time for
+  // a sync; still held after that, callers get the transient AccountBusyError
+  // before any irreversible SMTP delivery happens.
+  return await withInteractiveAccountLock(pool, account, async (lock) => {
     // Synchronous phase gate: a periodic refresh may have failed since acquisition.
     // Do not cross the irreversible SMTP boundary until heartbeat persistence and
     // ownership by this exact Postgres session are both re-proven.
@@ -200,9 +201,4 @@ async function sendMessageAttempt(
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
     onPostIrreversibleWarning: addWarning
   });
-
-  if (result === null) {
-    throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the send shortly`);
-  }
-  return result;
 }

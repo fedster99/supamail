@@ -291,9 +291,16 @@ export interface FolderCheck {
   deletionsChecked: boolean;
 }
 
+/**
+ * `deferred`: another session held the account lock (a direct mailbox action or
+ * another worker's pass), so the pass did nothing and recorded no run. Retry it.
+ */
+export type SyncOutcome = Exclude<SyncRunStatus, "running"> | "deferred";
+
 export interface SyncResult {
-  runId: string;
-  outcome: Exclude<SyncRunStatus, "running">;
+  /** The recorded `imap_sync_runs` row; null only for a deferred pass. */
+  runId: string | null;
+  outcome: SyncOutcome;
   foldersProcessed: number;
   /** Absent on older producers; an empty array means no live-folder check ran. */
   folderChecks?: FolderCheck[];

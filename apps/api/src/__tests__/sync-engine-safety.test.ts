@@ -15,12 +15,11 @@ describe("sync engine safety", () => {
     expect(bodyBacklogReadLimit(500, 3)).toBe(500);
   });
 
-  it("terminalizes a sync run when account-lock acquisition throws", async () => {
-    const finishSyncRun = vi.fn(async () => undefined);
+  it("records no run when account-lock acquisition throws", async () => {
     const repository = {
       getAccount: vi.fn(async () => ({ id: "account-1", lock_id: "42" })),
       startSyncRun: vi.fn(async () => "run-1"),
-      finishSyncRun
+      finishSyncRun: vi.fn(async () => undefined)
     };
     const pool = {
       connect: vi.fn(async () => {
@@ -36,12 +35,44 @@ describe("sync engine safety", () => {
     await expect(engine.syncAccount("account-1", "scheduled"))
       .rejects.toThrow("timeout exceeded when trying to connect");
 
-    expect(finishSyncRun).toHaveBeenCalledOnce();
-    expect(finishSyncRun).toHaveBeenCalledWith(expect.objectContaining({
-      runId: "run-1",
-      outcome: "failed",
-      errors: [expect.stringContaining("timeout exceeded when trying to connect")]
-    }));
+    // The run row is created only once the pass holds the lock.
+    expect(repository.startSyncRun).not.toHaveBeenCalled();
+    expect(repository.finishSyncRun).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a full pass", {}],
+    ["a live pass", { liveInboxOnly: true }]
+  ])("defers %s while another session holds the account lock, recording nothing", async (_name, options) => {
+    const client = {
+      query: vi.fn(async () => ({ rows: [{ locked: false }] })),
+      release: vi.fn()
+    };
+    const repository = {
+      getAccount: vi.fn(async () => ({ id: "account-1", lock_id: "42" })),
+      startSyncRun: vi.fn(async () => "run-1"),
+      finishSyncRun: vi.fn(async () => undefined),
+      markAccountSyncStarted: vi.fn(async () => undefined),
+      markAccountSyncYielded: vi.fn(async () => undefined),
+      markAccountSyncFailed: vi.fn(async () => undefined)
+    };
+    const clientFactory = vi.fn();
+    const engine = new MirrorEngine({
+      pool: { connect: vi.fn(async () => client) } as never,
+      config: {} as never,
+      repository: repository as never,
+      clientFactory
+    });
+
+    const result = await engine.syncAccount("account-1", "scheduled", options);
+
+    expect(result).toMatchObject({ runId: null, outcome: "deferred", errors: [] });
+    expect(clientFactory).not.toHaveBeenCalled();
+    expect(repository.startSyncRun).not.toHaveBeenCalled();
+    expect(repository.finishSyncRun).not.toHaveBeenCalled();
+    expect(repository.markAccountSyncStarted).not.toHaveBeenCalled();
+    expect(repository.markAccountSyncYielded).not.toHaveBeenCalled();
+    expect(repository.markAccountSyncFailed).not.toHaveBeenCalled();
   });
 
   it("passes the worker shutdown signal into an in-flight full sync", async () => {
