@@ -496,6 +496,7 @@ export async function startWorkerRuntime(options: WorkerRuntimeOptions = {}): Pr
       purged: r.purged,
       prunedEvents: r.prunedEvents,
       prunedRuns: r.prunedRuns,
+      prunedChanges: r.prunedChanges,
       threadStandbysRetired: standbys.runsRetired,
       threadStandbyAccountsFailed: standbys.accountsFailed,
       threadRunsDeleted: threadRuns.runsDeleted,

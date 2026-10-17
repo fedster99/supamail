@@ -194,6 +194,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - Purge is a strict safety valve for trapdoor delete reasons only.
 - Do not purge `RECONCILE_MISSING` rows.
 - `imap_sync_events` and `imap_sync_runs` rows are operational history, not mirror data. Daily retention deletes both past `SYNC_EVENT_RETENTION_DAYS` (default 90) in bounded statements, repeated up to a per-run cap. A run still marked `running` is kept for at least seven days so its lock holder or the startup lock sweep can close it.
+- `imap_message_changes` is a change outbox, not history (ADR 0046). The `imap_messages` update trigger writes it in the writer's transaction for every writer; never write it from application code or depend on `updated_at` order instead. A consumer deletes only rows it has durably handed on. Daily retention deletes rows older than seven days.
 
 ## Verification Anchor
 
