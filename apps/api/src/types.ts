@@ -320,6 +320,8 @@ export interface SyncResult {
   reconcileProviderUidsSeen?: number;
   reconcileDurationMs?: number;
   hitLockBudget: boolean;
+  /** A bounded history pass advanced durable progress and still has eligible work. */
+  historyBacklogRemaining?: boolean;
   errors: string[];
 }
 
