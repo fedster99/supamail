@@ -804,6 +804,21 @@ describe("account lock", () => {
     expect(mutator.expunge).toHaveBeenCalledTimes(1);
   });
 
+  it("reuses a caller's action connection for the in-lock delete and leaves it open", async () => {
+    repo.getMessage.mockResolvedValue(message({ folder_path: "Drafts" }));
+    const socket = { client: {}, abort: {} };
+    const connection = { get: vi.fn(async () => socket) };
+    const overSpy = vi.spyOn(MailboxMutator, "over").mockReturnValue(mutator as unknown as MailboxMutator);
+    const { deleteMessageInLock } = await import("../mailbox-mutations.js");
+
+    await deleteMessageInLock({} as never, config, M1, { hard: true, connection: connection as never });
+    expect(overSpy).toHaveBeenCalledWith(socket, account);
+    expect(connectSpy).not.toHaveBeenCalled();
+    expect(mutator.expunge).toHaveBeenCalledTimes(1);
+    expect(mutator.logout).not.toHaveBeenCalled();
+    overSpy.mockRestore();
+  });
+
   it("changes folders under the account lock", async () => {
     const { createFolder } = await import("../mailbox-mutations.js");
     await createFolder({} as never, config, "acc-1", "Projects");

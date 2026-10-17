@@ -18,6 +18,7 @@ import type { AppConfig } from "../config.js";
 const fake = vi.hoisted(() => ({
   connectImpl: vi.fn(async () => undefined),
   close: vi.fn(),
+  logout: vi.fn(async () => undefined),
   lastClient: undefined as { emit(event: string, error: Error): boolean } | undefined,
   lastOptions: undefined as unknown
 }));
@@ -33,6 +34,8 @@ vi.mock("imapflow", async () => {
       }
       connect = fake.connectImpl;
       close = fake.close;
+      logout = fake.logout;
+      usable = true;
     }
   };
 });
@@ -50,6 +53,7 @@ vi.mock("../crypto.js", () => ({
 }));
 
 const {
+  ActionConnection,
   connectAbortableImap,
   connectImap,
   ImapAbortBinding,
@@ -276,5 +280,38 @@ describe("shared UIDVALIDITY fail-closed comparison (CC-4)", () => {
     expect(uidValidityMismatchMessage("INBOX", 100, 101, "fetch")).toBe(
       "UIDVALIDITY changed for INBOX (mirror 100 != server 101); refusing to fetch by stale UID"
     );
+  });
+});
+
+describe("ActionConnection (one login per multi-step action)", () => {
+  it("gives every step the same socket and logs out once", async () => {
+    const connection = new ActionConnection({} as never, config, account);
+    const first = await connection.get();
+    const second = await connection.get();
+
+    expect(second).toBe(first);
+    expect(fake.connectImpl).toHaveBeenCalledTimes(1);
+    await connection.close();
+    await connection.close();
+    expect(fake.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a new socket only when the last one died", async () => {
+    const connection = new ActionConnection({} as never, config, account);
+    const first = await connection.get();
+    (first.client as { usable: boolean }).usable = false;
+
+    const second = await connection.get();
+    expect(second).not.toBe(first);
+    expect(fake.connectImpl).toHaveBeenCalledTimes(2);
+    // The dead socket is closed, not logged out.
+    expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens nothing for an action that never needed IMAP", async () => {
+    const connection = new ActionConnection({} as never, config, account);
+    await connection.close();
+    expect(fake.connectImpl).not.toHaveBeenCalled();
+    expect(fake.logout).not.toHaveBeenCalled();
   });
 });

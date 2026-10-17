@@ -160,6 +160,11 @@ export interface MirrorImapClient {
     observations: readonly MailboxChangeObservation[]
   ): void;
   getMailboxLock(path: string, options?: { qresync?: QresyncRequest }): Promise<MailboxLock>;
+  /**
+   * A host reuses this session for another pass. The mailbox still selected from
+   * the last pass may report an old UIDNEXT, so the next lock on it selects again.
+   */
+  invalidateSelection?(): void;
   fetch(
     range: string | number[] | Record<string, unknown>,
     query: Record<string, unknown>,
@@ -178,6 +183,7 @@ export class ThrottledImapClient implements MirrorImapClient {
   private readonly throttle: ImapThrottle;
   private qresyncDisabled = false;
   private invalidated = false;
+  private selectionStale = false;
 
   constructor(
     private readonly client: ImapFlow,
@@ -285,12 +291,28 @@ export class ThrottledImapClient implements MirrorImapClient {
     this.mailboxChangeFeed?.acknowledge(changes);
   }
 
+  invalidateSelection(): void {
+    this.selectionStale = true;
+  }
+
   async getMailboxLock(
     path: string,
     options: { qresync?: QresyncRequest } = {}
   ): Promise<MailboxLock> {
     await this.throttle.acquire(this.signal);
     const request = options.qresync;
+    if (this.selectionStale) {
+      this.selectionStale = false;
+      // ImapFlow takes the lock without SELECT when the mailbox is already
+      // selected, and an untagged EXISTS updates only `exists`. A reused session
+      // would then keep the last pass's UIDNEXT, and incremental sync, which reads
+      // up to UIDNEXT - 1, would wait a pass for each new message. A QRESYNC lock
+      // selects again by itself. Never CLOSE: it expunges \Deleted messages.
+      const selected = this.client.mailbox;
+      if (selected && selected.path === path && (!request || this.qresyncDisabled)) {
+        await this.withCommandTimeout("mailboxOpen", () => this.client.mailboxOpen(path));
+      }
+    }
     if (!request || this.qresyncDisabled) {
       return await this.withCommandTimeout("getMailboxLock", () => this.client.getMailboxLock(path));
     }

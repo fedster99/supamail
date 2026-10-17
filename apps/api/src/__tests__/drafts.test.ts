@@ -37,6 +37,8 @@ const mocks = vi.hoisted(() => ({
   logout: vi.fn(async () => undefined),
   close: vi.fn(),
   connect: vi.fn(),
+  // IMAP logins: one per opened ActionConnection.
+  logins: { count: 0 },
   // sendDraft now RESENDS the draft's raw bytes: getRawMime → deliverSmtp → APPEND
   // to Sent. The raw fetch and the SMTP submit are both mocked.
   getRawMime: vi.fn(async (_pool: unknown, _config: unknown, _id: string) => ({
@@ -87,13 +89,32 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
     deliverSmtp: mocks.deliverSmtp,
     resolveSmtpCreds: mocks.resolveSmtpCreds,
     SentFolderAppender: {
-      connect: vi.fn(async () => ({
+      over: vi.fn(() => ({
         list: mocks.list,
         append: mocks.append,
-        searchByMessageId: mocks.searchByMessageId,
-        logout: mocks.logout,
-        close: mocks.close
+        searchByMessageId: mocks.searchByMessageId
       }))
+    }
+  };
+});
+
+vi.mock("../imap-connect.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../imap-connect.js")>();
+  return {
+    ...actual,
+    // One fake socket per action: the first get() logs in, close() logs out once.
+    ActionConnection: class {
+      private open = false;
+      async get() {
+        if (!this.open) mocks.logins.count += 1;
+        this.open = true;
+        return { client: {}, abort: {} };
+      }
+      async close() {
+        if (!this.open) return;
+        this.open = false;
+        await actual.closeImap({ logout: mocks.logout, close: mocks.close });
+      }
     }
   };
 });
@@ -150,6 +171,7 @@ function mockAccountLock() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.logins.count = 0;
   // Default: the account lock is free — run the wrapped IMAP work through.
   mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => fn(mockAccountLock()));
   mocks.lockAssertLive.mockResolvedValue(undefined);
@@ -543,6 +565,10 @@ describe("updateDraft", () => {
     expect(mocks.withAccountLock).toHaveBeenCalledTimes(1);
     expect(mocks.deleteMessageInLock).toHaveBeenCalledTimes(1);
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
+    // The delete reuses the APPEND's connection: one login for the update.
+    expect(mocks.deleteMessageInLock.mock.calls[0][3].connection).toBeDefined();
+    expect(mocks.logins.count).toBe(1);
+    expect(mocks.logout).toHaveBeenCalledTimes(1);
   });
 
   it("refuses an ordinary email, so a draft update can never rewrite or remove it", async () => {
@@ -732,7 +758,16 @@ describe("sendDraft", () => {
 
     // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
     // parsed mirror fields — there is no SendRequest reconstruction anymore.
-    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), { signal: undefined });
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), {
+      signal: undefined,
+      connection: expect.anything()
+    });
+    // The raw fetch, the Sent APPEND and the draft delete share one connection.
+    const [, , , , rawOptions] = mocks.getRawMime.mock.calls[0] as unknown[];
+    const connection = (rawOptions as { connection: unknown }).connection;
+    expect(mocks.deleteMessageInLock.mock.calls[0][3].connection).toBe(connection);
+    expect(mocks.logins.count).toBe(1);
+    expect(mocks.logout).toHaveBeenCalledTimes(1);
     const rawBytes = mocks.getRawMime.mock.results[0].value as Promise<{ raw: Buffer }>;
     const expectedRaw = (await rawBytes).raw;
 
@@ -881,7 +916,10 @@ describe("sendDraft", () => {
 
     // AbortError, not SmtpDeliveryError: the message was proven not submitted.
     expect(error.name).toBe("AbortError");
-    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), { signal: abort.signal });
+    expect(mocks.getRawMime).toHaveBeenCalledWith(pool, config, D1, expect.anything(), {
+      signal: abort.signal,
+      connection: expect.anything()
+    });
     expect(mocks.deliverSmtp).not.toHaveBeenCalled();
     expect(mocks.append).not.toHaveBeenCalled();
     expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
@@ -954,7 +992,7 @@ describe("sendDraft", () => {
     expect(lockHeld).toBe(false);
   });
 
-  it("downgrades appender logout plus fallback-close failure after delivery to a warning", async () => {
+  it("downgrades connection logout plus fallback-close failure after delivery to a warning", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     mocks.logout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
     mocks.close.mockImplementationOnce(() => {
@@ -964,7 +1002,7 @@ describe("sendDraft", () => {
     const { sendDraft } = await import("../drafts.js");
     const result = await sendDraft(pool, config, D1);
     expect(result.send.delivered).toBe(true);
-    expect(result.warnings.join(" ")).toMatch(/closing the Sent connection failed: socket close failed/i);
+    expect(result.warnings.join(" ")).toMatch(/closing the mailbox connection failed: socket close failed/i);
   });
 
   it("reports draftDeleted=true and no cleanup warning on the happy path", async () => {
