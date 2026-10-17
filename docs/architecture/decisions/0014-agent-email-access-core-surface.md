@@ -22,6 +22,8 @@ Core owns:
 
 Remote deployments may wrap the shared contract with their own transport, authentication, authorization, and secret storage. Those deployment concerns are not part of this repository's core schema.
 
+Each read tool call is one read-only transaction (REPEATABLE READ, with a 15-second statement ceiling), opened in one statement (`READ_ONLY_TRANSACTION_BEGIN`). A tool takes a pool, or a host's open read-only transaction as `{ hostTransaction }`. In the host's transaction the tool adds its reads to the host's snapshot and leaves COMMIT, ROLLBACK, and release to the host, so a host can read its own rows in the same snapshot and pay for one transaction. A batch `read_thread` in a host's transaction reads its items in order, and a database failure ends the whole read, because the transaction cannot continue after it. (Amended 2026-10-13.)
+
 Mailbox mutations and sending are separate explicitly accepted capabilities. They do not silently expand the local MCP tool set.
 
 ## Consequences

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { cleanBody, mapMessageRow, withReadOnlyTx } from "./shared.js";
+import { cleanBody, mapMessageRow, READ_ONLY_TRANSACTION_BEGIN, withReadOnlyTx } from "./shared.js";
 import { buildCc, buildReferences, quoteText, reSubject } from "./tools/draft-reply.js";
 import { MAX_REFERENCES_LENGTH } from "../compose-schema.js";
 
@@ -319,6 +319,42 @@ describe("quoteText", () => {
 });
 
 describe("withReadOnlyTx", () => {
+  it("opens its read-only snapshot in one statement and commits", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [] }));
+    const release = vi.fn();
+    const pool = { connect: vi.fn(async () => ({ query, release })) } as never;
+
+    await expect(withReadOnlyTx(pool, async (client) => {
+      await client.query("SELECT 1");
+      return "read";
+    })).resolves.toBe("read");
+
+    expect(query.mock.calls.map(([sql]) => sql)).toEqual([READ_ONLY_TRANSACTION_BEGIN, "SELECT 1", "COMMIT"]);
+    expect(READ_ONLY_TRANSACTION_BEGIN).toBe(
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout = '15s'"
+    );
+    expect(release).toHaveBeenCalledWith(undefined);
+  });
+
+  it("runs inside a host's transaction and leaves its end and release to the host", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [] }));
+    const release = vi.fn();
+    const hostTransaction = { query, release } as never;
+
+    await expect(withReadOnlyTx({ hostTransaction }, async (client) => {
+      expect(client).toBe(hostTransaction);
+      await client.query("SELECT 1");
+      return "read";
+    })).resolves.toBe("read");
+    const failure = new Error("read failed");
+    await expect(withReadOnlyTx({ hostTransaction }, async () => {
+      throw failure;
+    })).rejects.toBe(failure);
+
+    expect(query.mock.calls.map(([sql]) => sql)).toEqual(["SELECT 1"]);
+    expect(release).not.toHaveBeenCalled();
+  });
+
   it("evicts the client when rollback fails", async () => {
     const workError = new Error("read failed");
     const rollbackError = new Error("rollback failed");

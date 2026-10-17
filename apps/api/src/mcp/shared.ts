@@ -7,8 +7,6 @@ import {
   type MetadataProtectionAdapter,
   type ProtectedMetadataColumns
 } from "../metadata-protection.js";
-import { buildReadAccounts } from "../search/index.js";
-import type { ReadAccount } from "../search/types.js";
 
 /**
  * The shared MCP foundation (ADR 0014/0016). Every agent-email tool and the
@@ -507,21 +505,45 @@ function stripContactCard(lines: string[]): string | null {
 }
 
 /**
- * Run `fn` inside a read-only transaction — the exact wrapper copied from
- * `searchMessages` (search.ts), with REPEATABLE READ added so multi-statement
- * tools resolve an active projection from one snapshot: BEGIN REPEATABLE READ
- * READ ONLY; SET LOCAL transaction_read_only = on; SET LOCAL statement_timeout
- * = '15s'; run fn; COMMIT; ROLLBACK on error; release in finally. The connection
- * is injected (no global pool reach-in) and only SELECTs run inside, so a tool
- * can never send, mutate, or schedule.
+ * A read-only transaction its host already opened, with the settings
+ * {@link READ_ONLY_TRANSACTION_BEGIN} sets. A tool given one runs its statements
+ * inside it and leaves COMMIT, ROLLBACK, and release to the host, so a host can
+ * add its own reads to the same snapshot and one tool call costs one transaction.
+ * After a statement fails the transaction is aborted, so the host must end it.
  */
-export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
+export interface HostReadTransaction {
+  readonly hostTransaction: PgClient;
+}
+
+/** Where a read tool runs: a pool it opens its own transaction from, or a host's open one. */
+export type ReadSource = PgPool | HostReadTransaction;
+
+/**
+ * Every read-only tool transaction starts with this one statement, so opening
+ * it costs one round trip: one REPEATABLE READ snapshot, read-only, with a
+ * 15-second statement ceiling.
+ */
+export const READ_ONLY_TRANSACTION_BEGIN =
+  "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout = '15s'";
+
+export function isHostReadTransaction(source: ReadSource): source is HostReadTransaction {
+  return typeof (source as Partial<HostReadTransaction>).hostTransaction?.query === "function";
+}
+
+/**
+ * Run `fn` inside a read-only transaction, so multi-statement tools resolve an
+ * active projection from one snapshot. Given a host's transaction, `fn` runs in
+ * it. Otherwise this opens one from the pool with {@link READ_ONLY_TRANSACTION_BEGIN},
+ * runs `fn`, and COMMITs, or ROLLs BACK on error, then releases the connection.
+ * The connection is injected (no global pool reach-in) and only SELECTs run
+ * inside, so a tool can never send, mutate, or schedule.
+ */
+export async function withReadOnlyTx<T>(source: ReadSource, fn: (client: PgClient) => Promise<T>): Promise<T> {
+  if (isHostReadTransaction(source)) return fn(source.hostTransaction);
+  const client = await source.connect();
   let releaseError: Error | undefined;
   try {
-    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    await client.query("SET LOCAL transaction_read_only = on");
-    await client.query("SET LOCAL statement_timeout = '15s'");
+    await client.query(READ_ONLY_TRANSACTION_BEGIN);
     const result = await fn(client);
     await client.query("COMMIT");
     return result;
@@ -546,20 +568,4 @@ export function toolError(
   hint: string
 ): { error: { code: string; message: string; hint: string } } {
   return { error: { code, message, hint } };
-}
-
-/**
- * Name the accounts a read came from, with a notice only when a mailbox cannot
- * give a complete answer. `null` means "every account in this database". Runs
- * read-only.
- */
-export async function readAccountsFor(
-  pool: PgPool,
-  accountIds: string[] | null,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
-): Promise<ReadAccount[]> {
-  return withReadOnlyTx(
-    pool,
-    (client) => buildReadAccounts(client, accountIds, metadataProtection)
-  );
 }
