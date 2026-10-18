@@ -218,7 +218,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(result.foldersProcessed).toBe(1);
-    expect(result.bodiesFetched).toBe(0);
     const stillDue = await h.repository.getFoldersDueForSync(h.account.id);
     expect(stillDue.map((folder) => folder.path)).toContain("INBOX");
     expect(stillDue.map((folder) => folder.path)).not.toContain("Sent");
@@ -408,17 +407,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const followupKeys = followupBacklog.map((message) => `${message.folder_path}:${message.uid}`);
     expect(followupKeys).toContain("INBOX:106");
     expect(followupKeys).toContain("Sent:201");
-    const bodyFollowup = await engine.syncAccount(h.account.id, "scheduled", {
-      bodyBacklogOnly: true,
-      client: idleClient,
-      clientAccountId: h.account.id,
-      keepClientOpen: true
-    });
-    expect(bodyFollowup.outcome).toBe("success");
-    expect(bodyFollowup.foldersProcessed).toBe(0);
-    expect(bodyFollowup.messagesUpserted).toBe(0);
-    expect(bodyFollowup.bodiesFetched).toBeGreaterThanOrEqual(2);
+    // Bodies download beside the lock on the host's session (ADR 0044).
+    const bodyFollowup = await engine.syncBodies(h.account.id, { client: idleClient });
+    expect(bodyFollowup.committed).toBeGreaterThanOrEqual(2);
     expect(list).not.toHaveBeenCalled();
+    expect(logout).not.toHaveBeenCalled();
     const fetchedByFollowup = await h.pool.query<{ body_fetched_at: Date | null }>(
       `SELECT body_fetched_at
        FROM public.imap_messages
@@ -2189,7 +2182,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
   });
 
-  it.each(["body", "history"] as const)(
+  it.each(["history"] as const)(
     "recognizes shutdown after the %s lane without changing account health",
     async (lane) => {
       const h = await setupIntegration(`full-sync-${lane}-abort`);
@@ -2203,26 +2196,17 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       const healthBefore = await accountHealthSnapshot(h.pool, h.account.id);
       const abort = new AbortController();
       const internal = engine as unknown as {
-        fetchBodyBacklog: () => Promise<{ fetched: number; hitLockBudget: boolean }>;
         runHistoryLane: () => Promise<{
           messagesUpserted: number;
-          bodiesFetched: number;
           hitLockBudget: boolean;
           errors: string[];
         }>;
       };
 
-      if (lane === "body") {
-        vi.spyOn(internal, "fetchBodyBacklog").mockImplementation(async () => {
-          abort.abort();
-          return { fetched: 0, hitLockBudget: false };
-        });
-      } else {
-        vi.spyOn(internal, "runHistoryLane").mockImplementation(async () => {
-          abort.abort();
-          return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
-        });
-      }
+      vi.spyOn(internal, "runHistoryLane").mockImplementation(async () => {
+        abort.abort();
+        return { messagesUpserted: 0, hitLockBudget: false, errors: [] };
+      });
 
       const [result] = await engine.syncDueAccounts(1, { signal: abort.signal });
 
@@ -2940,7 +2924,6 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         "SELECT path FROM public.imap_folders WHERE id=$1", [result.folderChecks![0].folderIds[0]]
       );
       expect(checkedFolder.rows[0].path).toBe("INBOX");
-      expect(result.bodiesFetched).toBe(0);
 
       const rows = await h.pool.query<{ folder_path: string; count: string }>(
         `
@@ -3111,9 +3094,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(4);
-    expect(backlogSpy).toHaveBeenCalledTimes(1);
-    expect(backlogSpy.mock.calls[0]?.[1]).toBe(4);
+    expect(backlogSpy).not.toHaveBeenCalled();
+    const bodies = await engine.syncBodies(h.account.id);
+    expect(bodies).toEqual({ committed: 4, gone: 0, skipped: 0, remaining: true });
+    expect(backlogSpy).toHaveBeenCalledTimes(2);
+    expect(backlogSpy.mock.calls.map((call) => call[1])).toEqual([2, 2]);
 
     const bodyCount = await h.pool.query<{ count: string }>(
       `
@@ -3287,7 +3272,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(3);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(3);
     expect(sourceFetches).toBe(1);
     expect(downloads).toBe(0);
   });
@@ -3353,13 +3338,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     }
 
-    const result = await h.buildEngine({
+    const engine = h.buildEngine({
       folders,
       clientFactory: async () => new CountingFolderBatchClient(folders)
-    }).syncAccount(h.account.id, "manual");
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(4);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(4);
     expect(sourceRanges).toHaveLength(2);
     expect(sourceRanges.every((range) => range.length === 2)).toBe(true);
     expect(downloads).toBe(0);
@@ -3416,13 +3402,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     }
 
     const client = new MissingBatchUidClient(folders);
-    const result = await h.buildEngine({
+    const engine = h.buildEngine({
       folders,
       clientFactory: async () => client
-    }).syncAccount(h.account.id, "manual");
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(3);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(3);
     expect(client.downloads).toEqual(["2"]);
     const rows = await h.pool.query<{
       uid: string;
@@ -3494,12 +3481,19 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     }
 
-    const result = await h.buildEngine({
+    const engine = h.buildEngine({
       folders,
       clientFactory: async () => new GoneBatchUidClient(folders)
-    }).syncAccount(h.account.id, "manual");
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
+    expect(await engine.syncBodies(h.account.id)).toEqual({
+      committed: 2,
+      gone: 1,
+      skipped: 0,
+      remaining: true
+    });
     const rows = await h.pool.query<{
       uid: string;
       body_fetched_at: Date | null;
@@ -3562,14 +3556,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     };
 
-    const failed = await new MirrorEngine({
+    const engine = new MirrorEngine({
       pool: h.pool,
       config: h.config,
       metadataProtection: failingProtection,
       clientFactory: async () => new FixtureImapClient(folders)
-    }).syncAccount(h.account.id, "manual");
-
-    expect(failed.outcome).toBe("failed");
+    });
+    expect((await engine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+    await expect(engine.syncBodies(h.account.id)).rejects.toThrow("injected evidence batch failure");
     const rows = await h.pool.query<{ body_rows: string }>(
       `SELECT count(b.message_id)::text AS body_rows
        FROM public.imap_messages m
@@ -3615,12 +3609,12 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     };
 
-    const failed = await h.buildEngine({
+    const failing = h.buildEngine({
       folders,
       bodyStore: failingStore
-    }).syncAccount(h.account.id, "manual");
-
-    expect(failed.outcome).toBe("failed");
+    });
+    expect((await failing.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+    await expect(failing.syncBodies(h.account.id)).rejects.toThrow("injected body store failure");
     const afterFailure = await h.pool.query<{
       uid: string;
       body_fetched_at: Date | null;
@@ -3661,15 +3655,15 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     ]);
 
     const retriedUids: string[] = [];
-    const retried = await h.buildEngine({
+    const retrying = h.buildEngine({
       folders,
       hooks: {
         onBodyFetched(message) {
           retriedUids.push(String(message.uid));
         }
       }
-    }).syncAccount(h.account.id, "manual");
-    expect(retried.outcome).toBe("success");
+    });
+    expect((await retrying.syncBodies(h.account.id)).committed).toBe(2);
     expect(retriedUids).toEqual(["2", "3"]);
     const completed = await h.pool.query<{
       uid: string;
@@ -3745,13 +3739,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     }
 
-    const result = await h.buildEngine({
+    const engine = h.buildEngine({
       folders,
       clientFactory: async () => new CountingStreamingFallbackClient(folders)
-    }).syncAccount(h.account.id, "manual");
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(2);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(2);
     expect(sourceFetches).toBe(0);
     expect(downloads).toBe(2);
   });
@@ -3877,7 +3872,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(1);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(1);
 
     const body = (
       await h.pool.query<{
@@ -3962,9 +3957,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     };
 
-    const result = await h.buildEngine({ folders, bodyStore }).syncAccount(h.account.id, "manual");
+    const engine = h.buildEngine({ folders, bodyStore });
+    const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(1);
     expect(observed).toEqual([{
       search_extract: "searchable before payload storage",
       raw_mime: null,
@@ -4527,7 +4524,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(active.missing_since).toBeNull();
   });
 
-  it("Scenario L — three-lane sync runs hot, body, then history under the lock budget", async () => {
+  it("Scenario L — a pass runs hot then history; bodies follow beside the lock", async () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const recentDate = new Date();
     const h = await setupIntegration("L-three-lane", {
@@ -4612,9 +4609,16 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.outcome).toBe("success");
     expect(result.hitLockBudget).toBe(false);
     expect(events.indexOf("hot:INBOX:10")).toBeGreaterThanOrEqual(0);
-    expect(events.indexOf("body:IN_WINDOW:INBOX:10")).toBeGreaterThan(events.indexOf("hot:INBOX:10"));
-    expect(events.indexOf("history:INBOX:1")).toBeGreaterThan(events.indexOf("body:IN_WINDOW:INBOX:10"));
-    expect(events.indexOf("body:HISTORICAL:INBOX:1")).toBeGreaterThan(events.indexOf("history:INBOX:1"));
+    expect(events.indexOf("history:INBOX:1")).toBeGreaterThan(events.indexOf("hot:INBOX:10"));
+    // The pass holds the lock for metadata only (ADR 0044).
+    expect(events.filter((event) => event.startsWith("body:"))).toEqual([]);
+
+    // Bodies download beside the lock: the live window first, then the archive.
+    expect(await engine.syncBodies(h.account.id, { maxUnits: 2 })).toMatchObject({ committed: 2 });
+    expect(events.filter((event) => event.startsWith("body:"))).toEqual([
+      "body:IN_WINDOW:INBOX:10",
+      "body:HISTORICAL:INBOX:1"
+    ]);
 
     const archive = (
       await h.pool.query<{
@@ -4665,7 +4669,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       BODY_BACKFILL_BATCH_SIZE: 1,
       INITIAL_SYNC_BATCH_SIZE: 10,
       MAX_BODY_BATCHES_PER_TICK: 1,
-      MAX_LOCK_HOLD_MS: 50,
+      MAX_LOCK_HOLD_MS: 5_000,
       MAX_RR_FOLDERS_PER_CYCLE: 5
     });
     activeAccountIds.push(blocked.account.id);
@@ -4680,10 +4684,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [blocked.account.id]
     );
 
+    let bodySourceFetches = 0;
     class SlowBodyClient extends FixtureImapClient {
-      override async fetchOne(range: string) {
-        await new Promise((resolve) => setTimeout(resolve, 75));
-        return await super.fetchOne(range);
+      override async fetchOne(range: string, query: Record<string, unknown>, options?: Record<string, unknown>) {
+        if (query.source) {
+          bodySourceFetches += 1;
+          await new Promise((resolve) => setTimeout(resolve, 75));
+        }
+        return await super.fetchOne(range, query, options);
       }
     }
 
@@ -4693,9 +4701,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
     const blockedResult = await blockedEngine.syncAccount(blocked.account.id, "manual");
     expect(blockedResult.outcome).toBe("success");
-    expect(blockedResult.hitLockBudget).toBe(true);
+    // A slow body download no longer spends the pass's lock budget (ADR 0044).
+    expect(bodySourceFetches).toBe(0);
+    expect(blockedResult.hitLockBudget).toBe(false);
 
-    const skippedHistory = (
+    const walkedHistory = (
       await blocked.pool.query<{
         historical_target_count: number | null;
         historical_message_count: string;
@@ -4718,11 +4728,14 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         [blocked.account.id]
       )
     ).rows[0];
-    expect(skippedHistory.historical_target_count).toBeNull();
-    expect(Number(skippedHistory.historical_message_count)).toBe(0);
+    expect(walkedHistory.historical_target_count).toBe(1);
+    expect(Number(walkedHistory.historical_message_count)).toBe(1);
+    // The slow download happens in the body run instead.
+    expect((await blockedEngine.syncBodies(blocked.account.id)).committed).toBeGreaterThan(0);
+    expect(bodySourceFetches).toBeGreaterThan(0);
   });
 
-  it("batches small parsed-only bodies during inline historical backfill", async () => {
+  it("batches small parsed-only archive bodies beside the lock", async () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const h = await setupIntegration("history-body-batch", {
       BODY_STORAGE_MODE: "parsed_only",
@@ -4797,13 +4810,18 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     }
 
-    const result = await h.buildEngine({
+    const engine = h.buildEngine({
       folders,
       clientFactory: async () => new CountingHistoryBodyClient(folders)
-    }).syncAccount(h.account.id, "manual");
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
 
     expect(result.outcome).toBe("success");
-    expect(sourceRanges).toEqual([[1, 2]]);
+    expect(sourceRanges).toEqual([]);
+    // One read holds the live body and the newest archive body: one UID-set
+    // FETCH; the last archive body streams alone.
+    expect(await engine.syncBodies(h.account.id, { maxUnits: 2 })).toMatchObject({ committed: 3 });
+    expect(sourceRanges).toEqual([[10, 2]]);
     expect(downloads).toBe(1);
     const historyBodies = await h.pool.query<{ count: string }>(
       `
@@ -4818,7 +4836,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(Number(historyBodies.rows[0].count)).toBe(2);
   });
 
-  it("fetches a stored archive message's missing body before walking more history", async () => {
+  it("fetches a revived archive body beside the lock while history keeps walking", async () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const h = await setupIntegration("history-missing-body-first", {
       BODY_BACKFILL_BATCH_SIZE: 1,
@@ -4864,11 +4882,12 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       ]
     }];
     const sync = async () => {
-      const result = await h.buildEngine({
+      const engine = h.buildEngine({
         folders,
         clientFactory: async () => new FixtureImapClient(folders)
-      }).syncAccount(h.account.id, "manual");
-      expect(result.outcome).toBe("success");
+      });
+      expect((await engine.syncAccount(h.account.id, "manual")).outcome).toBe("success");
+      await engine.syncBodies(h.account.id);
     };
     const state = async () => {
       const messages = await h.pool.query<{ uid: string; has_body: boolean }>(
@@ -4887,7 +4906,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       return { messages: messages.rows, folder: folder.rows[0] };
     };
 
-    // One history batch per pass: the walk stores UID 3 with its body and stops.
+    // One history batch per pass stores UID 3; its body follows beside the lock.
     await sync();
     expect(await state()).toEqual({
       messages: [{ uid: "3", has_body: true }, { uid: "10", has_body: true }],
@@ -4905,15 +4924,15 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id]
     );
 
-    // The next pass fetches that body first; the walk waits and is not marked complete.
+    // History no longer waits for bodies: the walk stores UID 2 and both bodies follow.
     await sync();
     expect(await state()).toEqual({
-      messages: [{ uid: "3", has_body: true }, { uid: "10", has_body: true }],
-      folder: { backfill_in_progress: true, oldest: "3" }
+      messages: ["2", "3", "10"].map((uid) => ({ uid, has_body: true })),
+      folder: { backfill_in_progress: true, oldest: "2" }
     });
 
-    // Then the walk resumes and finishes with every body stored.
-    for (let pass = 0; pass < 3; pass += 1) await sync();
+    // Then the walk finishes with every body stored.
+    for (let pass = 0; pass < 2; pass += 1) await sync();
     expect(await state()).toEqual({
       messages: ["1", "2", "3", "10"].map((uid) => ({ uid, has_body: true })),
       folder: { backfill_in_progress: false, oldest: "1" }
@@ -6338,7 +6357,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     const first = await engine.syncAccount(h.account.id, "manual");
     expect(first.outcome).toBe("success");
-    expect(first.bodiesFetched).toBe(0);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(0);
 
     const before = await h.pool.query<{ count: string }>(
       `
@@ -6388,10 +6407,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
     expect(sync.status).toBe(200);
     await expect(sync.json()).resolves.toMatchObject({
-      result: {
-        outcome: "success",
-        bodiesFetched: 1
-      }
+      result: { outcome: "success" },
+      bodies: { committed: 1 }
     });
 
     const after = await h.pool.query<{ count: string }>(

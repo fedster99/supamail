@@ -1094,11 +1094,10 @@ export class MirrorRepository {
         finished_at = now(),
         folders_processed = $3,
         messages_upserted = $4,
-        bodies_fetched = $5,
-        flags_updated = $6,
-        reconcile_gaps_found = $7,
-        error = $8,
-        metadata = $9
+        flags_updated = $5,
+        reconcile_gaps_found = $6,
+        error = $7,
+        metadata = $8
       WHERE id = $1
       `,
       [
@@ -1106,7 +1105,6 @@ export class MirrorRepository {
         result.outcome,
         result.foldersProcessed,
         result.messagesUpserted,
-        result.bodiesFetched,
         result.flagsUpdated,
         result.reconcileGapsFound,
         diagnosticCodes[0] ?? null,
@@ -3478,7 +3476,9 @@ export class MirrorRepository {
    * `RECONCILE_MISSING` so it leaves the body backlog; the next reconcile revives
    * it if the UID is still listed, so a transient miss loses nothing.
    */
-  async markMessageGone(messageId: string): Promise<void> {
+  async markMessageGone(message: Pick<ImapMessage, "id" | "folder_path" | "uidvalidity" | "uid">): Promise<void> {
+    // Only the row still at the UID that came back gone: a confirmed move keeps
+    // the id at a new folder and UID (ADR 0037) and stays live.
     await this.pool.query(
       `
       UPDATE public.imap_messages
@@ -3486,9 +3486,12 @@ export class MirrorRepository {
           provider_deleted_at = now(),
           deleted_reason = 'RECONCILE_MISSING'
       WHERE id = $1
+        AND folder_path = $2
+        AND uidvalidity = $3
+        AND uid = $4
         AND deleted_in_provider = false
       `,
-      [messageId]
+      [message.id, message.folder_path, message.uidvalidity, message.uid]
     );
   }
 
@@ -4587,94 +4590,28 @@ export class MirrorRepository {
   async getHistoryBacklog(account: ImapAccount, limit: number): Promise<HistoryBacklogFolder[]> {
     if (account.historical_backfill_mode === "off") return [];
 
+    // Archive bodies are the body lane's work (ADR 0044); history finds headers.
     const result = await this.pool.query<HistoryBacklogFolder>(
       `
-      WITH candidates AS (
-        SELECT
-          f.*,
-          CASE
-            -- A stored message without a body comes before finding more history:
-            -- reconcile can revive archive mail whose body is gone, and a walk
-            -- over a large folder takes many passes. An evidence upgrade of a
-            -- stored body waits for the walk.
-            WHEN body_backlog.missing_body THEN 0
-            WHEN f.backfill_in_progress = true THEN 1
-            WHEN f.historical_target_count IS NULL THEN 2
-            WHEN body_backlog.missing_body IS NOT NULL THEN 3
-            ELSE NULL
-          END AS history_backlog_rank
-        FROM public.imap_folders f
-        -- One scan per folder: NULL when no archive body is due, true when a
-        -- body is missing, false when only an evidence upgrade is due.
-        CROSS JOIN LATERAL (
-          SELECT bool_or(m.body_fetched_at IS NULL) AS missing_body
-          FROM public.imap_messages m
-          LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-          WHERE $2::text = 'metadata_and_bodies'
-            AND m.account_id = f.account_id
-            AND m.folder_path = f.path
-            AND m.deleted_in_provider = false
-            AND m.internal_date < $5
-            AND (
-              m.body_fetched_at IS NULL
-              OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
-            )
-        ) body_backlog
-        WHERE f.account_id = $1
-          AND f.tracked = true
-          -- A deleted folder discovery has flagged (missing_since) must not be
-          -- backfilled either; the history lane SELECTs it too and would fail.
-          AND f.missing_since IS NULL
-          AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
-          AND f.initial_sync_complete = true
-      )
       SELECT
-        candidates.*,
-        CASE history_backlog_rank
-          WHEN 1 THEN 'metadata'
-          WHEN 2 THEN 'snapshot'
-          ELSE 'body'
-        END AS history_backlog_reason
-      FROM candidates
-      WHERE history_backlog_rank IS NOT NULL
-      ORDER BY history_backlog_rank, sync_priority, path
-      LIMIT $3
+        f.*,
+        CASE WHEN f.backfill_in_progress = true THEN 'metadata' ELSE 'snapshot' END
+          AS history_backlog_reason
+      FROM public.imap_folders f
+      WHERE f.account_id = $1
+        AND f.tracked = true
+        -- A deleted folder discovery has flagged (missing_since) must not be
+        -- backfilled either; the history lane SELECTs it too and would fail.
+        AND f.missing_since IS NULL
+        AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
+        AND f.initial_sync_complete = true
+        AND (f.backfill_in_progress = true OR f.historical_target_count IS NULL)
+      ORDER BY f.backfill_in_progress DESC, f.sync_priority, f.path
+      LIMIT $2
       `,
-      [
-        account.id,
-        account.historical_backfill_mode,
-        limit,
-        EVIDENCE_VERSIONS_WITHOUT_REFETCH,
-        getWindowCutoff(account)
-      ]
+      [account.id, limit]
     );
     return result.rows;
-  }
-
-  async getHistoricalBodyBacklog(
-    account: ImapAccount,
-    folder: ImapFolder,
-    limit: number
-  ): Promise<ImapMessage[]> {
-    const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
-      `
-      SELECT m.*
-      FROM public.imap_messages m
-      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
-      WHERE m.account_id = $1
-        AND m.folder_path = $2
-        AND m.deleted_in_provider = false
-        AND m.internal_date < $5
-        AND (
-          m.body_fetched_at IS NULL
-          OR NOT coalesce(b.structured_evidence_extractor_version = ANY($4::text[]), false)
-        )
-      ORDER BY (m.body_fetched_at IS NULL) DESC, m.internal_date DESC, m.uid DESC
-      LIMIT $3
-      `,
-      [account.id, folder.path, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, getWindowCutoff(account)]
-    );
-    return await Promise.all(result.rows.map((row) => this.revealMessage(row)));
   }
 
   async setHistoryBackfillSnapshot(
@@ -4775,13 +4712,34 @@ export class MirrorRepository {
     }
   }
 
-  async getBodyBacklog(account: ImapAccount, limit: number): Promise<ImapMessage[]> {
+  /**
+   * Bodies due for download, live-window rows first. `includeArchive` adds rows
+   * dated before the window (the caller checks `metadata_and_bodies` and the
+   * backfill window), missing bodies before evidence upgrades. `excludeIds`
+   * names rows the caller is backing off.
+   */
+  async getBodyBacklog(
+    account: ImapAccount,
+    limit: number,
+    options: { includeArchive?: boolean; excludeIds?: readonly string[] } = {}
+  ): Promise<ImapMessage[]> {
     const policy = account.body_fetch_policy || (this.config.BODY_FETCH_POLICY as BodyFetchPolicy);
-    if (policy === "lazy") return [];
+    const includeLive = policy !== "lazy";
+    const includeArchive = options.includeArchive === true;
+    if (!includeLive && !includeArchive) return [];
 
-    const priorityClause = policy === "priority_then_backfill" ? "AND f.sync_priority <= $5" : "";
-    const params: unknown[] = [account.id, limit, EVIDENCE_VERSIONS_WITHOUT_REFETCH, getWindowCutoff(account)];
-    if (policy === "priority_then_backfill") params.push(this.config.PRIORITY_CUTOFF);
+    const params: unknown[] = [
+      account.id,
+      limit,
+      EVIDENCE_VERSIONS_WITHOUT_REFETCH,
+      getWindowCutoff(account),
+      includeLive,
+      includeArchive,
+      [...(options.excludeIds ?? [])]
+    ];
+    const priorityClause = policy === "priority_then_backfill"
+      ? `AND f.sync_priority <= $${params.push(this.config.PRIORITY_CUTOFF)}`
+      : "";
 
     const result = await this.pool.query<ImapMessage & ProtectedMetadataColumns>(
       `
@@ -4791,26 +4749,59 @@ export class MirrorRepository {
       LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
       WHERE m.account_id = $1
         AND f.tracked = true
-        -- The body lane SELECTs the folder too (getMailboxLock on folder_path), so a
-        -- folder discovery flagged missing/gone must be excluded here as well — the
-        -- body fetch is the one un-try/caught reader, so a deleted folder here throws
-        -- straight to the account-level catch and bricks the account to BROKEN. Keep
-        -- this filter in lockstep with getFoldersDueForSync / getHistoryBacklog.
+        -- A body download SELECTs the folder too, so a folder discovery flagged
+        -- missing or gone stays out. Keep this filter in lockstep with
+        -- getFoldersDueForSync / getHistoryBacklog.
         AND f.missing_since IS NULL
         AND f.status NOT IN ('MISSING', 'PENDING_VERIFICATION')
         AND m.deleted_in_provider = false
-        AND m.internal_date >= $4
+        AND NOT (m.id = ANY($7::uuid[]))
         AND (
           m.body_fetched_at IS NULL
           OR NOT coalesce(b.structured_evidence_extractor_version = ANY($3::text[]), false)
         )
-        ${priorityClause}
-      ORDER BY f.sync_priority, m.uid DESC
+        AND (
+          ($5::boolean AND m.internal_date >= $4 ${priorityClause})
+          OR ($6::boolean AND m.internal_date < $4)
+        )
+      ORDER BY
+        m.internal_date >= $4 DESC,
+        CASE WHEN m.internal_date >= $4 THEN false ELSE m.body_fetched_at IS NOT NULL END,
+        f.sync_priority,
+        m.uid DESC
       LIMIT $2
       `,
       params
     );
     return await Promise.all(result.rows.map((row) => this.revealMessage(row)));
+  }
+
+  /**
+   * The rows a body commit may still write, read under the account lock: present
+   * and not provider-deleted, with their current physical identity.
+   */
+  async getBodyCommitRows(messageIds: readonly string[]): Promise<Array<{
+    id: string;
+    folder_path: string;
+    uidvalidity: string;
+    uid: string;
+  }>> {
+    if (messageIds.length === 0) return [];
+    const result = await this.pool.query<{
+      id: string;
+      folder_path: string;
+      uidvalidity: string;
+      uid: string;
+    }>(
+      `
+      SELECT id::text, folder_path, uidvalidity::text, uid::text
+      FROM public.imap_messages
+      WHERE id = ANY($1::uuid[])
+        AND deleted_in_provider = false
+      `,
+      [[...messageIds]]
+    );
+    return result.rows;
   }
 
   async logEvent(

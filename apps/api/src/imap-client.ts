@@ -944,12 +944,11 @@ const FULL_MESSAGE_DOWNLOAD_CHUNK_BYTES = 1024 * 1024;
 
 /**
  * A message UID present at metadata-sync time is no longer in its folder at
- * body-fetch time — moved by a provider filter, or deleted. Terminal and benign:
- * the body lane catches this and tombstones the row (`RECONCILE_MISSING`) instead of
- * erroring the account. Without it a gone UID makes `fetchOne` return false, the
- * download fallback fetches `false.content` (undefined) and crashes `streamToBuffer`,
- * and because the body lane is the one un-try/caught reader that throw bricks the
- * whole account to BROKEN and re-loops every backfill.
+ * body-fetch time: moved by a provider filter, or deleted. Terminal and benign:
+ * `syncBodies` tombstones the row (`RECONCILE_MISSING`) if it is still at that
+ * UID, and the next reconcile revives a UID that is still listed. Without it a
+ * gone UID makes `fetchOne` return false and the download fallback fails on
+ * `false.content`.
  */
 export class MessageMovedError extends Error {
   constructor(
@@ -958,6 +957,17 @@ export class MessageMovedError extends Error {
   ) {
     super(`message uid ${uid} is no longer present in ${folderPath}`);
     this.name = "MessageMovedError";
+  }
+}
+
+/**
+ * The folder's UIDVALIDITY no longer matches the row: the stored UIDs name other
+ * messages now. Metadata sync owns the reset; a body download leaves these rows.
+ */
+export class BodySourceChangedError extends Error {
+  constructor(public readonly folderPath: string) {
+    super(`UIDVALIDITY of ${folderPath} changed before body fetch`);
+    this.name = "BodySourceChangedError";
   }
 }
 
@@ -998,8 +1008,7 @@ function isParsedOnlySourceTruncated(
 export async function fetchFullMessageBodyBatch(
   client: MirrorImapClient,
   config: AppConfig,
-  messages: ImapMessage[],
-  options: { skipMailboxLock?: boolean } = {}
+  messages: ImapMessage[]
 ): Promise<BodyBatchFetchResult> {
   if (messages.length === 0) return { bodies: [], missingMessages: [] };
   if (config.BODY_STORAGE_MODE !== "parsed_only") {
@@ -1041,7 +1050,7 @@ export async function fetchFullMessageBodyBatch(
     throw new Error("body batch fetch exceeds aggregate source limit");
   }
 
-  const lock = options.skipMailboxLock ? null : await client.getMailboxLock(folderPath);
+  const lock = await client.getMailboxLock(folderPath);
   try {
     const mailbox = client.mailbox;
     if (!mailbox || mailbox.path !== folderPath) {
@@ -1050,7 +1059,7 @@ export async function fetchFullMessageBodyBatch(
     const serverUidValidity = Number(mailbox.uidValidity);
     for (const message of messages) {
       if (serverUidValidity !== Number(message.uidvalidity)) {
-        throw new Error("UIDVALIDITY changed before body batch fetch");
+        throw new BodySourceChangedError(folderPath);
       }
     }
 
@@ -1123,35 +1132,24 @@ export async function fetchFullMessageBodyBatch(
       missingMessages: messages.filter((message) => !seen.has(Number(message.uid)))
     };
   } finally {
-    lock?.release();
+    lock.release();
   }
 }
 
 export async function fetchFullMessageBody(
   client: MirrorImapClient,
   config: AppConfig,
-  message: ImapMessage,
-  options: { skipMailboxLock?: boolean } = {}
+  message: ImapMessage
 ): Promise<MessageBodyInput> {
-  // When the caller already holds the mailbox lock for this message's folder (the
-  // history-backfill snapshot loop does), re-acquiring it here would DEADLOCK —
-  // imapflow's mailbox lock is a non-reentrant per-connection mutex — and the command
-  // timeout would then close the whole connection. Such callers pass skipMailboxLock,
-  // and we reuse the already-selected mailbox after asserting it is the expected folder.
-  const lock = options.skipMailboxLock ? null : await client.getMailboxLock(message.folder_path);
+  const lock = await client.getMailboxLock(message.folder_path);
 
   try {
     const mailbox = client.mailbox;
-    if (options.skipMailboxLock && (!mailbox || mailbox.path !== message.folder_path)) {
-      throw new Error(
-        `fetchFullMessageBody: expected ${message.folder_path} to be selected when skipping the mailbox lock`
-      );
-    }
     if (mailbox) {
       const serverUidValidity = Number(mailbox.uidValidity);
       const storedUidValidity = Number(message.uidvalidity);
       if (serverUidValidity !== storedUidValidity) {
-        throw new Error("UIDVALIDITY changed before body fetch");
+        throw new BodySourceChangedError(message.folder_path);
       }
     }
 
@@ -1248,6 +1246,6 @@ export async function fetchFullMessageBody(
       evidence: rawTruncated ? [] : parsed.evidence
     };
   } finally {
-    lock?.release();
+    lock.release();
   }
 }

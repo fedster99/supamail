@@ -2,17 +2,76 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
-  bodyBacklogReadLimit,
+  BodyDownloadTimeoutError,
   isConnectionLostError,
   isMissingMailboxError,
   MirrorEngine
 } from "../sync-engine.js";
 
 describe("sync engine safety", () => {
-  it("combines only whole configured body batches under the 500-row read cap", () => {
-    expect(bodyBacklogReadLimit(10, 4)).toBe(40);
-    expect(bodyBacklogReadLimit(200, 3)).toBe(400);
-    expect(bodyBacklogReadLimit(500, 3)).toBe(500);
+  it("closes only the body connection at the download deadline and backs that message off", async () => {
+    vi.useFakeTimers();
+    try {
+      const message = {
+        id: "message-1",
+        account_id: "account-1",
+        folder_path: "INBOX",
+        uidvalidity: "7",
+        uid: "5",
+        size_bytes: "81920"
+      };
+      const repository = {
+        getAccount: vi.fn(async () => ({
+          id: "account-1",
+          lock_id: "42",
+          sync_state: "HEALTHY",
+          historical_backfill_mode: "off"
+        })),
+        getBodyBacklog: vi.fn(async (_account: unknown, _limit: number, options: { excludeIds?: string[] }) =>
+          options.excludeIds?.includes(message.id) ? [] : [message])
+      };
+      let rejectFetch: (error: Error) => void = () => undefined;
+      const client = {
+        mailbox: { path: "INBOX", uidValidity: 7 },
+        getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+        // A trickling provider: the FETCH ends only when the socket closes.
+        fetchOne: vi.fn(() => new Promise((_, reject) => { rejectFetch = reject; })),
+        close: vi.fn(() => rejectFetch(new Error("Connection closed"))),
+        logout: vi.fn(async () => undefined)
+      };
+      const engine = new MirrorEngine({
+        pool: {} as never,
+        config: {
+          BODY_STORAGE_MODE: "raw_mime",
+          BODY_RAW_MAX_BYTES: 1_000_000,
+          BODY_BACKFILL_BATCH_SIZE: 10,
+          MAX_BODY_BATCHES_PER_TICK: 4
+        } as never,
+        repository: repository as never,
+        clientFactory: async () => client as never
+      });
+
+      const run = engine.syncBodies("account-1", { client: client as never });
+      const settled = expect(run).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
+      // 60 s plus 8 KiB/s of the declared 80 KiB.
+      await vi.advanceTimersByTimeAsync(69_999);
+      expect(client.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await settled;
+      expect(client.close).toHaveBeenCalledTimes(1);
+      // A host-owned session is never logged out by the engine.
+      expect(client.logout).not.toHaveBeenCalled();
+
+      // The next run skips the message while it backs off, and needs no connection.
+      expect(await engine.syncBodies("account-1", { client: client as never }))
+        .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+      expect(repository.getBodyBacklog.mock.calls[1][2]).toEqual({
+        includeArchive: false,
+        excludeIds: [message.id]
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("records no run when account-lock acquisition throws", async () => {
@@ -127,13 +186,12 @@ describe("sync engine safety", () => {
   it("handles a moved-out body-fetch UID with a recoverable tombstone instead of bricking the account", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    // A UID gone from its folder at body-fetch time must be caught as a benign
-    // MessageMovedError and taken out of the backlog — NOT re-thrown into the
-    // account-level catch, which bricks the account to BROKEN and re-loops every
-    // backfill. The tombstone is the same in every lane and recoverable: the
-    // next reconcile revives a UID that is still listed.
+    // A UID gone from its folder at body-fetch time is a benign MessageMovedError.
+    // The commit tombstones the row only while it is still at that UID, so a
+    // confirmed move keeps it live; the next reconcile revives a UID still listed.
     expect(source).toContain("error instanceof MessageMovedError");
-    expect(source).toContain("markMessageGone(message.id)");
+    expect(source).toContain("markMessageGone(message)");
+    expect(source).toContain("row.uid !== String(message.uid)");
   });
 
   it("commits the search extract and threading evidence before handing off the body payload", async () => {
@@ -147,10 +205,7 @@ describe("sync engine safety", () => {
     expect(completionWrite).toBeGreaterThan(payloadWrite);
 
     const batchEvidenceWrite = source.indexOf("await this.repository.storeBodyEvidenceBatch(");
-    const batchPayloadWrite = source.indexOf(
-      "await this.commitBodyPayload(message, body)",
-      batchEvidenceWrite
-    );
+    const batchPayloadWrite = source.indexOf("await this.bodyStore.store(body)", batchEvidenceWrite);
     expect(batchEvidenceWrite).toBeGreaterThan(-1);
     expect(batchPayloadWrite).toBeGreaterThan(batchEvidenceWrite);
   });
@@ -295,12 +350,10 @@ describe("sync engine safety", () => {
 
     expect(source).toContain("isConnectionLostError(error)");
     expect(source).toContain("connectionLost = true");
-    // Both the body backlog and the history lane stop once the client is dead.
-    // The live metadata wake skips bodies; its dedicated body follow-up skips history.
-    expect(source).toContain(
-      "} else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {"
-    );
-    expect(source).toContain("&& !options.bodyBacklogOnly");
+    // The history lane stops once the client is dead; the live wake skips it.
+    expect(source).toContain(`} else if (!options.sentOnly
+          && !options.liveInboxOnly
+          && !connectionLost) {`);
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {
@@ -357,11 +410,14 @@ describe("sync engine safety", () => {
     expect(source).toContain("reconcile UID SEARCH");
   });
 
-  it("runs history after the hot and body lanes under the same lock budget", async () => {
+  it("runs history after the hot lane and fetches bodies only beside the lock", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    expect(source.indexOf("getFoldersDueForSync")).toBeLessThan(source.indexOf("fetchBodyBacklog"));
-    expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
+    expect(source.indexOf("getFoldersDueForSync")).toBeLessThan(source.indexOf("runHistoryLane"));
+    // ADR 0044: one body path, downloaded beside the lock and committed under it.
+    expect(source.match(/fetchFullMessageBody\(/g)).toHaveLength(1);
+    expect(source.match(/fetchFullMessageBodyBatch\(/g)).toHaveLength(1);
+    expect(source).toContain("withInteractiveAccountLock(this.pool, account, async () => {");
     expect(source).toContain("account.max_backfill_rate");
     expect(source).toContain("getHistoryBacklog(account, 1)");
     expect(source).toContain("setHistoryBackfillSnapshot");
@@ -376,7 +432,6 @@ describe("sync engine safety", () => {
     expect(config).toContain("BACKFILL_WINDOW_END_HOUR");
     expect(config).toContain("BACKFILL_WINDOW_TIMEZONE");
     expect(source).toContain("isWithinBackfillWindow(this.config)");
-    expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
     expect(source.indexOf("isWithinBackfillWindow(this.config)")).toBeLessThan(source.indexOf("getHistoryBacklog(account, 1)"));
   });
 });

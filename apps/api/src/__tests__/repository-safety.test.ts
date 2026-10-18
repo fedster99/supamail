@@ -238,7 +238,9 @@ describe("repository safety", () => {
     expect(repository).toContain("setHistoryBackfillSnapshot");
     expect(repository).toContain("advanceHistoryBackfillWatermark");
     expect(repository).toContain("markHistoryBackfillComplete");
-    expect(repository).toContain("getHistoricalBodyBacklog");
+    // Archive bodies download beside the lock through getBodyBacklog (ADR 0044).
+    expect(repository).not.toContain("getHistoricalBodyBacklog");
+    expect(repository).toContain("includeArchive");
     // History is a one-time backfill: no periodic archive refresh re-walks it.
     expect(repository).not.toContain("last_archive_refresh_at");
     expect(engine).toContain("runHistoryLane");

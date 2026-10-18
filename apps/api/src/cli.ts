@@ -111,7 +111,8 @@ program
   .requiredOption("--account-id <id>", "Account UUID")
   .action(async (options) => {
     const result = await engine.syncAccount(options.accountId, "manual");
-    console.log(JSON.stringify(result, null, 2));
+    const bodies = await engine.syncBodies(options.accountId);
+    console.log(JSON.stringify({ ...result, bodies }, null, 2));
   });
 
 program

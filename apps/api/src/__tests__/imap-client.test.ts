@@ -365,39 +365,6 @@ describe("fetchFullMessageBody mailbox locking", () => {
     expect(batch.bodies.map(({ body }) => body.rawTruncated)).toEqual([false, false]);
   });
 
-  it("reuses the selected mailbox without re-locking when skipMailboxLock is set (no nested-lock deadlock)", async () => {
-    const client = notesClient();
-    await client.getMailboxLock("INBOX.Notes"); // caller already holds the lock
-    const locks = countLocks(client);
-    const body = await fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true });
-    expect(locks()).toBe(0);
-    expect(body.messageId).toBe("m1");
-    expect(body.rawBytes).toBeGreaterThan(0);
-  });
-
-  it("throws when skipMailboxLock is set but the wrong folder is selected", async () => {
-    const client = new FixtureImapClient([
-      {
-        path: "INBOX",
-        delimiter: ".",
-        specialUse: "\\Inbox",
-        uidValidity: 1,
-        messages: [makeTextMessage({ uid: 1, subject: "x", from: "a@example.test", to: "b@example.test", body: "x" })]
-      },
-      {
-        path: "INBOX.Notes",
-        delimiter: ".",
-        specialUse: undefined,
-        uidValidity: 1,
-        messages: [makeTextMessage({ uid: 1273, subject: "n", from: "a@example.test", to: "b@example.test", body: "n" })]
-      }
-    ]);
-    await client.getMailboxLock("INBOX"); // wrong folder selected
-    await expect(
-      fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true })
-    ).rejects.toThrow(/expected INBOX\.Notes to be selected/);
-  });
-
   it("throws MessageMovedError when the UID is gone from the folder (moved/deleted)", async () => {
     // INBOX.Notes is still present and selectable, but no longer contains uid 1273 —
     // a filter moved it, or it was deleted, between metadata sync and this body fetch.

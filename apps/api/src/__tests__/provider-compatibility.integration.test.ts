@@ -256,7 +256,7 @@ integration("provider compatibility fixtures (real Postgres + fixture IMAP)", ()
 
     const result = await engine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(1);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(1);
 
     const body = (
       await h.pool.query<{ raw_bytes: string; raw_truncated: boolean; raw_mime_length: string }>(
@@ -305,7 +305,7 @@ integration("provider compatibility fixtures (real Postgres + fixture IMAP)", ()
 
     const result = await engine.syncAccount(h.account.id, "manual");
     expect(result.outcome).toBe("success");
-    expect(result.bodiesFetched).toBe(1);
+    expect((await engine.syncBodies(h.account.id)).committed).toBe(1);
 
     const body = (
       await h.pool.query<{ raw_bytes: string; raw_truncated: boolean; raw_mime_length: string }>(

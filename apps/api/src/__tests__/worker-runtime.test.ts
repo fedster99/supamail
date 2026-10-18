@@ -237,7 +237,7 @@ describe("worker runtime logging", () => {
         metadataWriteBatchesAttempted: 1,
         metadataWriteBatchesFailed: 0,
         metadataWriteServiceRowsPerSecond: 999,
-        bodiesFetched: 1,
+        bodies: { committed: 1 },
         errors: []
       },
       {
@@ -250,7 +250,7 @@ describe("worker runtime logging", () => {
         metadataWriteBatchesAttempted: 0,
         metadataWriteBatchesFailed: 0,
         metadataWriteServiceRowsPerSecond: null,
-        bodiesFetched: 0,
+        bodies: { committed: 0 },
         errors: ["[ProviderFailure] Archive: provider exploded"]
       },
       {
@@ -263,11 +263,25 @@ describe("worker runtime logging", () => {
         metadataWriteBatchesAttempted: 1,
         metadataWriteBatchesFailed: 1,
         metadataWriteServiceRowsPerSecond: 0,
-        bodiesFetched: 0,
+        bodies: null,
         errors: [
           "[Error] [AUTHENTICATIONFAILED] [AUTH] Command failed",
           "LOGIN mailbox@example.com super-secret"
         ]
+      },
+      {
+        runId: "run-bodies-failed",
+        outcome: "success",
+        foldersProcessed: 1,
+        messagesUpserted: 0,
+        metadataRowsCommitted: 0,
+        metadataWriteDurationMs: 0,
+        metadataWriteBatchesAttempted: 0,
+        metadataWriteBatchesFailed: 0,
+        metadataWriteServiceRowsPerSecond: null,
+        bodies: null,
+        bodyError: "LOGIN mailbox@example.com super-secret",
+        errors: []
       }
     ];
 
@@ -287,19 +301,27 @@ describe("worker runtime logging", () => {
       metadataTelemetryComplete: true,
       metadataWriteServiceRowsPerSecond: 0,
       bodiesFetched: 0,
+      bodyError: null,
       errors: ["AUTH_ERROR", "SYNC_ERROR"]
     });
     expect(sink.error.mock.calls[0][0]).not.toContain("super-secret");
-    expect(sink.warn).toHaveBeenCalledTimes(1);
+    expect(sink.warn).toHaveBeenCalledTimes(2);
     expect(JSON.parse(sink.warn.mock.calls[0][0])).toMatchObject({
       event: "sync.account.partial_success",
       runId: "run-partial",
       errors: ["SYNC_ERROR"]
     });
+    expect(JSON.parse(sink.warn.mock.calls[1][0])).toMatchObject({
+      event: "sync.account.bodies_failed",
+      runId: "run-bodies-failed",
+      bodiesFetched: 0,
+      bodyError: "SYNC_ERROR"
+    });
+    expect(sink.warn.mock.calls[1][0]).not.toContain("super-secret");
     expect(sink.log).toHaveBeenCalledTimes(1);
     expect(JSON.parse(sink.log.mock.calls[0][0])).toMatchObject({
       event: "sync.tick.completed",
-      accounts: 3,
+      accounts: 4,
       durationMs: 42,
       metadataRowsCommitted: 3,
       metadataWriteDurationMs: 400,
@@ -328,7 +350,6 @@ describe("worker runtime logging", () => {
       outcome: "success",
       foldersProcessed: 1,
       messagesUpserted: 2,
-      bodiesFetched: 0,
       errors: []
     }], 100, sink);
 
@@ -348,7 +369,6 @@ describe("worker runtime logging", () => {
       metadataWriteDurationMs: 0,
       metadataWriteBatchesAttempted: 1,
       metadataWriteBatchesFailed: 0,
-      bodiesFetched: 0,
       errors: []
     }], 100, sink);
 
@@ -368,7 +388,6 @@ describe("worker runtime logging", () => {
       metadataWriteDurationMs: 20,
       metadataWriteBatchesAttempted: 2,
       metadataWriteBatchesFailed: 1,
-      bodiesFetched: 0,
       errors: ["one batch failed"]
     }], 100, sink);
 
