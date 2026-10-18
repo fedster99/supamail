@@ -1467,21 +1467,23 @@ export class MirrorEngine {
         || options.forceAuthoritativeReconcile
         || (!qresyncApplied && options.forceReconcile)
         || scheduledReconcileDue;
-      // Without a modseq nothing else re-reads flags on mail older than
-      // FLAG_DIFF_WINDOW_DAYS, so each scheduled exact reconcile also scans flags
-      // over the whole window: RECONCILE_INTERVAL_MS bounds flag staleness there.
+      // Modseqs and QRESYNC replays are hints: some servers (Purelymail) accept
+      // a complete replay that omits flag changes. Each scheduled exact reconcile
+      // therefore also reads flags over the whole window, whatever the server
+      // claims, so RECONCILE_INTERVAL_MS bounds flag staleness on every server.
       // A forced reconcile after a known move stays narrow.
-      const fullFlagScanDue = highestModseq === undefined && scheduledReconcileDue;
+      const fullFlagScanDue = scheduledReconcileDue && options.allowReconcile;
       const flagScanDue = qresyncFallbackRequired
         || options.forceFlagScan
         || fullFlagScanDue
         || !folder.next_flag_scan_at
         || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
-      if (!qresyncApplied && !hitLockBudget && flagScanDue && options.allowFlagScan) {
+      if ((!qresyncApplied || fullFlagScanDue) && !hitLockBudget && flagScanDue && options.allowFlagScan) {
         flagScanAttempted = true;
         const flagScanDeadline = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
-        const canUseChangedSince = folder.highest_modseq !== null
+        const canUseChangedSince = !fullFlagScanDue
+          && folder.highest_modseq !== null
           && highestModseq !== undefined
           && BigInt(highestModseq) > BigInt(folder.highest_modseq);
         const condstoreCursorUnchanged = folder.highest_modseq !== null
@@ -1517,7 +1519,7 @@ export class MirrorEngine {
               await this.hooks.onMessageUpsert?.(message);
             }
           }
-        } else if (!condstoreCursorUnchanged) {
+        } else if (fullFlagScanDue || !condstoreCursorUnchanged) {
           // Establishing a CONDSTORE cursor must cover the entire active mirror
           // window. Otherwise a flag changed before the first persisted modseq
           // could be skipped forever when the cursor advances.

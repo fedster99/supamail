@@ -4,6 +4,7 @@ import { closePool, getPool } from "../db.js";
 import { DatabaseBodyStore, type BodyStore } from "../body-store.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
 import type {
+  FetchMessage,
   MailboxChange,
   MailboxLock,
   MirrorImapClient,
@@ -101,6 +102,43 @@ async function accountHealthSnapshot(pool: ReturnType<typeof getPool>, accountId
       [accountId]
     )
   ).rows[0];
+}
+
+/**
+ * A CONDSTORE/QRESYNC server whose change log lost a change: the QRESYNC
+ * replay for `path` is accepted and complete but names nothing, and a
+ * CHANGEDSINCE flag fetch returns nothing. Plain FETCH and SEARCH still see
+ * the current flags.
+ */
+class OmittingQresyncFixtureClient extends FixtureImapClient {
+  capabilities = new Map<string, boolean>([["QRESYNC", true], ["CONDSTORE", true]]);
+  replayRequested = false;
+
+  constructor(folders: FixtureFolder[], private readonly replayPath: string) {
+    super(folders);
+  }
+
+  override async getMailboxLock(
+    path: string,
+    options: { qresync?: QresyncRequest } = {}
+  ): Promise<MailboxLock> {
+    const lock = await super.getMailboxLock(path);
+    if (!options.qresync || path !== this.replayPath) return lock;
+    this.replayRequested = true;
+    return {
+      ...lock,
+      qresync: { accepted: true, complete: true, vanishedUids: [], changedFlags: [] }
+    };
+  }
+
+  override async *fetch(
+    range: string | number[] | Record<string, unknown>,
+    query: Record<string, unknown>,
+    options?: Record<string, unknown>
+  ): AsyncIterable<FetchMessage> {
+    if (options?.changedSince !== undefined) return;
+    yield* super.fetch(range, query);
+  }
 }
 
 integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
@@ -928,6 +966,104 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       changedFlagCount: 1,
       vanishedUidCount: 1
     });
+  });
+
+  it("re-reads Inbox flags on the scheduled reconcile even after a complete QRESYNC replay omits a change", async () => {
+    const h = await setupIntegration("qresync-omitted-flag-change", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true };
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    const readUid = folders[0].messages[0].uid;
+    await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
+    // Both modseq cursors are current and both audits are due: the scheduled
+    // exact reconcile and the flag scan.
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_reconcile_clean = true,
+           last_full_reconcile_at = now() - interval '7 hours',
+           next_reconcile_at = now() - interval '1 minute',
+           next_flag_scan_at = now() - interval '1 minute',
+           next_sync_due_at = CASE WHEN path = 'INBOX'
+             THEN now() - interval '1 second'
+             ELSE now() + interval '1 hour' END
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+
+    // The User reads the message in webmail. The provider bumps HIGHESTMODSEQ
+    // but its change log lost the change: the QRESYNC replay is accepted and
+    // complete yet names nothing, and CHANGEDSINCE (same log) returns nothing.
+    folders[0].messages[0].flags = ["\\Seen"];
+    folders[0].highestModseq = 11n;
+    const client = new OmittingQresyncFixtureClient(folders, "INBOX");
+    const engine = h.buildEngine({ folders, overrides, clientFactory: async () => client });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled");
+
+    expect(result.outcome).toBe("success");
+    expect(client.replayRequested).toBe(true);
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    const row = await h.pool.query<{ flags: string[] }>(
+      `SELECT flags FROM public.imap_messages
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND uid = $2`,
+      [h.account.id, readUid]
+    );
+    expect(row.rows[0].flags).toContain("\\Seen");
+    expect(result.flagsUpdated).toBe(1);
+  });
+
+  it("trusts a complete QRESYNC replay on a routine pass that is not reconcile-due", async () => {
+    const h = await setupIntegration("qresync-routine-no-scan", {
+      INITIAL_SYNC_BATCH_SIZE: 50,
+      IMAP_QRESYNC_ENABLED: true
+    });
+    activeAccountIds.push(h.account.id);
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true };
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           qresync_highest_modseq = 10,
+           last_reconcile_clean = true,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = now() - interval '1 minute',
+           next_sync_due_at = CASE WHEN path = 'INBOX'
+             THEN now() - interval '1 second'
+             ELSE now() + interval '1 hour' END
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    folders[0].highestModseq = 11n;
+    const client = new OmittingQresyncFixtureClient(folders, "INBOX");
+    const search = vi.spyOn(client, "search");
+    const fetch = vi.spyOn(client, "fetch");
+    const engine = h.buildEngine({ folders, overrides, clientFactory: async () => client });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled");
+
+    expect(result.outcome).toBe("success");
+    expect(client.replayRequested).toBe(true);
+    // The replay stands in for the due flag scan and nothing audits the folder.
+    expect(result.reconcileFoldersAttempted).toBe(0);
+    expect(search.mock.calls.some(([criteria]) => criteria.since instanceof Date)).toBe(false);
+    expect(search.mock.calls.some(([criteria]) => criteria.all === true)).toBe(false);
+    expect(fetch.mock.calls.some(([, query]) => query.flags === true && query.envelope === undefined))
+      .toBe(false);
+    const folder = await h.pool.query<{ highest_modseq: string; qresync_highest_modseq: string }>(
+      `SELECT highest_modseq::text, qresync_highest_modseq::text
+       FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+    expect(folder.rows[0]).toEqual({ highest_modseq: "11", qresync_highest_modseq: "11" });
   });
 
   it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
