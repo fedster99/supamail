@@ -91,7 +91,7 @@ persisted folder modseq in bounded write batches and advances the cursor only
 after every batch succeeds. After a live pass, the sync engine acknowledges the
 provider snapshot field by field: new-message cursors after incremental fetch,
 deletion counts after a clean reconcile or QRESYNC replay, and flag state after
-a flag scan or QRESYNC replay. Any deletion or flag dimension that the pass did
+a flag scan (a QRESYNC replay is not flag proof; ADR 0044). Any deletion or flag dimension that the pass did
 not prove becomes a one-shot recovery marker rather than an accepted cursor;
 even a later matching aggregate STATUS result cannot erase that missing proof.
 Recovery markers are re-emitted while the rotation continues probing other

@@ -100,6 +100,8 @@ type FolderSyncResult = {
   reconcileProviderUidsSeen: number;
   reconcileDurationMs: number;
   flagScanAttempted: boolean;
+  /** A SEARCH + FETCH over the window ran; only this spends a flag-scan slot. */
+  flagWindowScanned?: boolean;
   hitLockBudget: boolean;
   initialSyncComplete: boolean;
   reconcileClean: boolean;
@@ -627,6 +629,7 @@ export class MirrorEngine {
               allowReconcile: !options.sentOnly
                 && (forceKnownReconcile || remainingReconciles > 0),
               allowFlagScan: !options.sentOnly && remainingFlagScans > 0,
+              allowFlagDelta: !options.sentOnly,
               enforceLockDeadline: !isPriorityFolder,
               lockDeadline,
               metadataWriteStats,
@@ -656,12 +659,9 @@ export class MirrorEngine {
             if (folderResult.hitLockBudget || this.isLockBudgetExpired(lockDeadline)) {
               result.hitLockBudget = true;
             }
-            // A catch-up replay is bounded by the provider's changes, not the
-            // folder size, so it does not spend the shared flag-scan slots.
-            if (folderResult.flagScanAttempted
-              && !(qresyncCatchUp && folderResult.qresyncReplayComplete === true)) {
-              remainingFlagScans -= 1;
-            }
+            // QRESYNC and CHANGEDSINCE read only the provider's changes, not the
+            // folder, so only a window scan spends the shared flag-scan slots.
+            if (folderResult.flagWindowScanned) remainingFlagScans -= 1;
             if (mailboxChange !== undefined
               && folderResult.initialSyncComplete
               && !folderResult.hitLockBudget
@@ -674,8 +674,7 @@ export class MirrorEngine {
                 status: folderResult.observedStatus,
                 reconcileComplete: folderResult.qresyncReplayComplete === true
                   || (folderResult.reconcileAttempted && folderResult.reconcileClean),
-                flagScanComplete: folderResult.qresyncReplayComplete === true
-                  || folderResult.flagScanAttempted
+                flagScanComplete: folderResult.flagScanAttempted
               });
             }
           } catch (error) {
@@ -1186,6 +1185,8 @@ export class MirrorEngine {
     options: {
       allowReconcile: boolean;
       allowFlagScan: boolean;
+      /** A CHANGEDSINCE delta may run without a flag-scan slot. */
+      allowFlagDelta?: boolean;
       qresyncCatchUp?: boolean;
       enforceLockDeadline: boolean;
       lockDeadline: number;
@@ -1295,6 +1296,7 @@ export class MirrorEngine {
       let reconcileDurationMs = 0;
       let reconcileAttempted = false;
       let flagScanAttempted = false;
+      let flagWindowScanned = false;
       let hitLockBudget = false;
       let qresyncApplied = false;
       let qresyncFallbackRequired = false;
@@ -1421,7 +1423,8 @@ export class MirrorEngine {
               { deadlineAt: qresyncWriteDeadline, signal: options.signal }
             );
           }
-          flagScanAttempted = true;
+          // Some servers (Purelymail) send a complete replay without the flag
+          // changes, so a replay never stands in for the flag read below.
           qresyncApplied = true;
         }
       }
@@ -1467,29 +1470,36 @@ export class MirrorEngine {
         || options.forceAuthoritativeReconcile
         || (!qresyncApplied && options.forceReconcile)
         || scheduledReconcileDue;
-      // Modseqs and QRESYNC replays are hints: some servers (Purelymail) accept
-      // a complete replay that omits flag changes. Each scheduled exact reconcile
-      // therefore also reads flags over the whole window, whatever the server
-      // claims, so RECONCILE_INTERVAL_MS bounds flag staleness on every server.
-      // A forced reconcile after a known move stays narrow.
+      // A modseq past the flag cursor means some message changed: CHANGEDSINCE
+      // names exactly which, so read it now rather than on the scan schedule.
+      const condstoreCursorBehind = folder.highest_modseq !== null
+        && highestModseq !== undefined
+        && BigInt(highestModseq) > BigInt(folder.highest_modseq);
+      // Modseqs are still hints, so each scheduled exact reconcile also reads
+      // flags over the whole window on every server, within its reconcile slot:
+      // RECONCILE_INTERVAL_MS bounds flag staleness even where CHANGEDSINCE is
+      // wrong. A forced reconcile after a known move stays narrow.
       const fullFlagScanDue = scheduledReconcileDue && options.allowReconcile;
       const flagScanDue = qresyncFallbackRequired
         || options.forceFlagScan
         || fullFlagScanDue
+        || condstoreCursorBehind
         || !folder.next_flag_scan_at
         || new Date(folder.next_flag_scan_at).getTime() <= Date.now();
       if (this.folderHitLockBudget(options)) hitLockBudget = true;
-      if ((!qresyncApplied || fullFlagScanDue) && !hitLockBudget && flagScanDue && options.allowFlagScan) {
+      // CHANGEDSINCE reads only changed messages, so it needs no flag-scan slot;
+      // the full scan rides on the reconcile slot.
+      if (!hitLockBudget && flagScanDue
+        && (options.allowFlagScan || fullFlagScanDue
+          || (condstoreCursorBehind && options.allowFlagDelta === true))) {
         flagScanAttempted = true;
         const flagScanDeadline = Date.now() + this.config.FLAG_SCAN_TOTAL_TIMEOUT_MS;
-        const canUseChangedSince = !fullFlagScanDue
-          && folder.highest_modseq !== null
-          && highestModseq !== undefined
-          && BigInt(highestModseq) > BigInt(folder.highest_modseq);
         const condstoreCursorUnchanged = folder.highest_modseq !== null
           && highestModseq !== undefined
           && BigInt(highestModseq) === BigInt(folder.highest_modseq);
-        if (canUseChangedSince) {
+        // CHANGEDSINCE covers every message, the window scan only the window, so
+        // a due window scan runs after the delta, never instead of it.
+        if (condstoreCursorBehind) {
           for await (const flags of this.withAsyncIterableDeadline(
             client,
             flagScanDeadline,
@@ -1519,7 +1529,9 @@ export class MirrorEngine {
               await this.hooks.onMessageUpsert?.(message);
             }
           }
-        } else if (fullFlagScanDue || !condstoreCursorUnchanged) {
+        }
+        if (fullFlagScanDue || (!condstoreCursorBehind && !condstoreCursorUnchanged)) {
+          flagWindowScanned = true;
           // Establishing a CONDSTORE cursor must cover the entire active mirror
           // window. Otherwise a flag changed before the first persisted modseq
           // could be skipped forever when the cursor advances.
@@ -1724,6 +1736,7 @@ export class MirrorEngine {
         reconcileProviderUidsSeen,
         reconcileDurationMs,
         flagScanAttempted,
+        flagWindowScanned,
         hitLockBudget,
         initialSyncComplete: true,
         reconcileClean: reconcileClean === true,

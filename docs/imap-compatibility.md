@@ -75,7 +75,9 @@ compatibility contract. Enable `IMAP_QRESYNC_ENABLED=true` only for a canary
 whose capability evidence confirms QRESYNC. SupaMail persists UIDVALIDITY plus
 a deletion-complete QRESYNC mod-sequence cursor that is separate from the
 flag-only CONDSTORE cursor, forces a real re-select, and applies changed flags
-and VANISHED UIDs in bounded batches. A rejected or incomplete replay falls back to
+and VANISHED UIDs in bounded batches. A replay is never flag proof: Purelymail
+returns a complete replay without flag changes, while its `CHANGEDSINCE` is
+exact, so flags always come from CONDSTORE (ADR 0044). A rejected or incomplete replay falls back to
 CONDSTORE and exact UID reconciliation. Periodic exact reconciliation stays
 enabled even after successful QRESYNC replay.
 

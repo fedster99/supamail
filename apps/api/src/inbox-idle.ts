@@ -1152,10 +1152,12 @@ class ReusableInboxIdleSession implements InboxIdleSession {
     "exists",
     data as Parameters<ReusableInboxIdleSession["wake"]>[1]
   );
-  private readonly onExpunge = (data: unknown) => this.wake(
-    "expunge",
-    data as Parameters<ReusableInboxIdleSession["wake"]>[1]
-  );
+  // VANISHED (EARLIER) only answers this session's own QRESYNC SELECT or
+  // CHANGEDSINCE FETCH (RFC 7162 section 3.2.10): history, not a new change.
+  private readonly onExpunge = (data: unknown) => {
+    if ((data as { earlier?: unknown } | null)?.earlier === true) return;
+    this.wake("expunge", data as Parameters<ReusableInboxIdleSession["wake"]>[1]);
+  };
   private readonly onFlags = (data: unknown) => this.wake(
     "flags",
     data as Parameters<ReusableInboxIdleSession["wake"]>[1]
