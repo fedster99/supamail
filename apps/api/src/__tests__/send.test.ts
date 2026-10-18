@@ -225,7 +225,6 @@ function mockAccountLock() {
 
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
-  const { throwIfAborted } = await import("../errors.js");
   return {
     ...actual,
     deliverSmtp: mocks.deliverSmtp,
@@ -237,15 +236,37 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
       password: "secret"
     })),
     SentFolderAppender: {
-      connect: vi.fn(async (_pool: unknown, _config: unknown, _account: unknown, options?: { signal?: AbortSignal }) => {
-        throwIfAborted(options?.signal);
-        return {
-          list: mocks.appenderList,
-          append: mocks.appenderAppend,
-          logout: mocks.appenderLogout,
-          close: mocks.appenderClose
-        };
-      })
+      over: vi.fn(() => ({ list: mocks.appenderList, append: mocks.appenderAppend }))
+    }
+  };
+});
+
+// The real Sent filing, spied so a test can see what the send passes it.
+vi.mock("../filed-message.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../filed-message.js")>();
+  return { ...actual, fileSentCopy: vi.fn(actual.fileSentCopy) };
+});
+
+vi.mock("../imap-connect.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../imap-connect.js")>();
+  const { throwIfAborted } = await import("../errors.js");
+  return {
+    ...actual,
+    // The send's one action connection: get() logs in (refusing after abort, as the
+    // real connect does), close() logs out through the shared teardown.
+    ActionConnection: class {
+      private open = false;
+      constructor(_pool: unknown, _config: unknown, _account: unknown, private readonly signal?: AbortSignal) {}
+      async get() {
+        throwIfAborted(this.signal);
+        this.open = true;
+        return { client: {}, abort: {} };
+      }
+      async close() {
+        if (!this.open) return;
+        this.open = false;
+        await actual.closeImap({ logout: mocks.appenderLogout, close: mocks.appenderClose });
+      }
     }
   };
 });
@@ -253,6 +274,9 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
 vi.mock("../repository.js", () => ({
   MirrorRepository: class {
     getAccount = mocks.getAccount;
+    // Sent is not mirrored here, so the copy is left to sync; filed-message.test.ts
+    // covers the mirror itself.
+    getFoldersForWake = vi.fn(async () => []);
   }
 }));
 
@@ -313,7 +337,8 @@ describe("sendMessage orchestration", () => {
       expect.anything(),
       account.lock_id,
       expect.any(Function),
-      expect.objectContaining({ heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
+      // Fenced writes: the Sent copy's mirror row shares fate with the lock (ADR 0044).
+      expect.objectContaining({ fenceWrites: true, heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
     );
 
     // The bytes delivered and the bytes appended must be byte-identical.
@@ -329,7 +354,27 @@ describe("sendMessage orchestration", () => {
     expect(result.accepted).toEqual(["rcpt@example.test"]);
     expect(result.rejected).toEqual([]);
     expect(result.smtpResponse).toBe("250 queued");
+    // Sent is not mirrored in this fixture, so sync mirrors the copy later.
+    expect(result.messageId).toBeNull();
     expect(result.warnings).toEqual([]);
+  });
+
+  it("files the Sent copy with the host's body store and the delivered bytes", async () => {
+    const hostStore = { store: vi.fn() };
+    const { sendMessage } = await import("../send.js");
+    const { fileSentCopy } = await import("../filed-message.js");
+    const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOSTS: false } as never;
+    await sendMessage({} as never, config, {
+      accountId: "11111111-1111-4111-8111-111111111111",
+      to: [{ email: "rcpt@example.test" }],
+      subject: "Hi",
+      body: { format: "plain", text: "Body" }
+    }, undefined, { bodyStore: hostStore });
+    const [, filingConfig, bodyStore, filingAccount, , raw] = vi.mocked(fileSentCopy).mock.calls[0];
+    expect(filingConfig).toBe(config);
+    expect(bodyStore).toBe(hostStore);
+    expect(filingAccount).toBe(account);
+    expect((raw as Buffer).equals(mocks.deliverSmtp.mock.calls[0][1])).toBe(true);
   });
 
   it("holds the per-account lock across SMTP delivery and Sent APPEND", async () => {

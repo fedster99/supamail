@@ -73,14 +73,22 @@ const mocks = vi.hoisted(() => ({
   getMessage: vi.fn(),
   markFoldersForReconcile: vi.fn(async () => undefined),
   getFoldersForWake: vi.fn(),
-  upsertMessages: vi.fn(),
   getLiveMessageId: vi.fn(),
   withAccountLock: vi.fn(),
   lockAssertLive: vi.fn(),
   lockConfirmIrreversible: vi.fn(),
   searchByMessageId: vi.fn(),
+  mirrorFiledMessage: vi.fn(),
   poolConnect: vi.fn()
 }));
+
+// The filed-message mirror is covered by filed-message.test.ts; here only the
+// draft wiring is. The Sent copy keeps the real path, which leaves an unmirrored
+// Sent to sync.
+vi.mock("../filed-message.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../filed-message.js")>();
+  return { ...actual, mirrorFiledMessage: mocks.mirrorFiledMessage, fileSentCopy: vi.fn(actual.fileSentCopy) };
+});
 
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
@@ -136,7 +144,6 @@ vi.mock("../repository.js", () => ({
     getMessage = mocks.getMessage;
     markFoldersForReconcile = mocks.markFoldersForReconcile;
     getFoldersForWake = mocks.getFoldersForWake;
-    upsertMessages = mocks.upsertMessages;
     getLiveMessageId = mocks.getLiveMessageId;
   }
 }));
@@ -178,8 +185,9 @@ beforeEach(() => {
   mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
   mocks.searchByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
   mocks.append.mockResolvedValue({ uid: 7, uidValidity: 100 });
-  mocks.getFoldersForWake.mockResolvedValue([draftsFolder]);
-  mocks.upsertMessages.mockResolvedValue([{ id: N1 }]);
+  mocks.getFoldersForWake.mockImplementation(async (_accountId: string, paths: string[]) =>
+    paths.includes("Drafts") ? [draftsFolder] : []);
+  mocks.mirrorFiledMessage.mockResolvedValue(N1);
   mocks.getLiveMessageId.mockResolvedValue(null);
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);
   mocks.getAccount.mockResolvedValue(account);
@@ -239,7 +247,7 @@ describe("createDraft", () => {
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
     // Nothing new reached the provider, so nothing new is marked or written.
     expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
-    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(mocks.mirrorFiledMessage).not.toHaveBeenCalled();
     expect(mocks.getLiveMessageId).toHaveBeenCalledWith({ accountId: "11111111-1111-4111-8111-111111111111", folderPath: "Drafts", uidValidity: 100, uid: 42 });
   });
 
@@ -319,27 +327,25 @@ describe("createDraft", () => {
     expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
-  it("writes the saved draft's mirror row from its APPENDUID and the composed values", async () => {
+  it("mirrors the saved draft from its APPENDUID on the save's own connection", async () => {
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
       accountId: "11111111-1111-4111-8111-111111111111",
-      senderName: " Ada ",
-      to: [{ email: "rcpt@example.test", name: "Rcpt" }],
-      cc: [{ email: "cc@example.test" }],
+      to: [{ email: "rcpt@example.test" }],
       subject: "My draft",
-      body: { format: "plain", text: "Hello" },
-      inReplyTo: "<parent@example.test>"
+      body: { format: "plain", text: "Hello" }
     });
 
-    expect(mocks.getFoldersForWake).toHaveBeenCalledWith("11111111-1111-4111-8111-111111111111", ["Drafts"]);
-    expect(mocks.upsertMessages).toHaveBeenCalledTimes(1);
-    expect(mocks.upsertMessages.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
-    const [accountId, folder, uidValidity, [metadata], writeOptions] = mocks.upsertMessages.mock.calls[0];
-    const [, raw, , savedAt] = mocks.append.mock.calls[0];
-    expect([accountId, folder, uidValidity]).toEqual(["11111111-1111-4111-8111-111111111111", draftsFolder, 100]);
-    // A short deadline: the provider already holds the draft.
-    expect(writeOptions.deadlineAt).toBeGreaterThan(Date.now());
-    expect(writeOptions.deadlineAt).toBeLessThanOrEqual(Date.now() + 5_000);
+    expect(mocks.mirrorFiledMessage).toHaveBeenCalledTimes(1);
+    const [, mirrorConfig, bodyStore, socket, accountId, filed] = mocks.mirrorFiledMessage.mock.calls[0];
+    const [, raw] = mocks.append.mock.calls[0];
+    expect(mirrorConfig).toBe(config);
+    // Without a host store, the OSS database store that sync also defaults to.
+    expect(bodyStore.constructor.name).toBe("DatabaseBodyStore");
+    expect(socket).toEqual({ client: {}, abort: {} });
+    expect(accountId).toBe("11111111-1111-4111-8111-111111111111");
+    expect(filed).toEqual({ folderPath: "Drafts", appended: { uid: 7, uidValidity: 100 }, raw });
+    expect(mocks.logins.count).toBe(1);
     // The lock fences the write, as sync's lock does, waits for a sync holding it,
     // and the save is confirmed once the provider holds the draft.
     expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), {
@@ -349,29 +355,17 @@ describe("createDraft", () => {
     });
     expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
     expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
-    expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeLessThan(mocks.upsertMessages.mock.invocationCallOrder[0]);
-    expect(metadata).toMatchObject({
-      uid: 7,
-      internalDate: savedAt,
-      sizeBytes: (raw as Buffer).length,
-      flags: ["\\Draft", "\\Seen"],
-      rfcMessageId: result.rfcMessageId,
-      inReplyTo: "<parent@example.test>",
-      subject: "My draft",
-      fromEmail: "user@example.test",
-      fromName: "Ada",
-      toEmails: ["rcpt@example.test"],
-      toNames: ["Rcpt"],
-      ccEmails: ["cc@example.test"],
-      ccNames: [null],
-      bccEmails: [],
-      providerMessageId: null,
-      mimeStructure: null,
-      attachments: []
-    });
-    // headers_json keeps the same header subset sync stores.
-    expect(Object.keys(metadata.headersJson).sort()).toEqual(["in-reply-to", "message-id"]);
+    expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeLessThan(mocks.mirrorFiledMessage.mock.invocationCallOrder[0]);
     expect(result).toMatchObject({ messageId: N1, warnings: [] });
+  });
+
+  it("passes the host's body store to the mirror", async () => {
+    const hostStore = { store: vi.fn() };
+    const { createDraft } = await import("../drafts.js");
+    await createDraft({} as never, config, {
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
+    }, undefined, { bodyStore: hostStore });
+    expect(mocks.mirrorFiledMessage.mock.calls[0][2]).toBe(hostStore);
   });
 
   it("leaves the id to sync when the server returns no APPENDUID", async () => {
@@ -380,22 +374,31 @@ describe("createDraft", () => {
     const result = await createDraft({} as never, config, {
       accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
-    expect(mocks.upsertMessages).not.toHaveBeenCalled();
+    expect(mocks.mirrorFiledMessage).not.toHaveBeenCalled();
     expect(result).toMatchObject({ messageId: null, appendedUid: null, warnings: [] });
   });
 
-  it.each([
-    ["Drafts is not a tracked mirrored folder", []],
-    ["the mirrored Drafts folder has another UIDVALIDITY", [{ ...draftsFolder, uidvalidity: "99" }]],
-    ["sync has not read Drafts yet", [{ ...draftsFolder, uidvalidity: null }]]
-  ])("leaves the id to sync when %s", async (_case, folders) => {
-    mocks.getFoldersForWake.mockResolvedValueOnce(folders);
+  it("leaves the id to sync when Drafts is not mirrored at the APPENDUID's UIDVALIDITY", async () => {
+    mocks.mirrorFiledMessage.mockResolvedValueOnce(null);
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
       accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
-    expect(mocks.upsertMessages).not.toHaveBeenCalled();
     expect(result).toMatchObject({ messageId: null, appendedUid: 7, warnings: [] });
+  });
+
+  it("reports a mirror warning on a saved draft", async () => {
+    mocks.mirrorFiledMessage.mockImplementationOnce(async (...args: unknown[]) => {
+      (args[6] as (warning: string) => void)("Mirrored, but the body is readable only after the next sync: storage down.");
+      return N1;
+    });
+    const { createDraft } = await import("../drafts.js");
+    const result = await createDraft({} as never, config, {
+      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
+    });
+    expect(result).toMatchObject({
+      messageId: N1, warnings: ["Mirrored, but the body is readable only after the next sync: storage down."]
+    });
   });
 
   it("reports a saved draft when the lock fails after the APPEND", async () => {
@@ -414,7 +417,7 @@ describe("createDraft", () => {
   });
 
   it("reports a saved draft when its mirror write fails", async () => {
-    mocks.upsertMessages.mockRejectedValueOnce(new Error("database unavailable"));
+    mocks.mirrorFiledMessage.mockRejectedValueOnce(new Error("database unavailable"));
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
       accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
@@ -546,6 +549,18 @@ describe("updateDraft", () => {
     expect(result).toMatchObject({
       replacedMessageId: D1, replacedDraftDeleted: true, draftsFolderPath: "Drafts", messageId: N1, warnings: []
     });
+    // The revised draft is mirrored from its APPENDUID, as create's is.
+    const [, , , , , filed] = mocks.mirrorFiledMessage.mock.calls[0];
+    expect(filed).toEqual({ folderPath: "Drafts", appended: { uid: 7, uidValidity: 100 }, raw: mocks.append.mock.calls[0][1] });
+  });
+
+  it("mirrors the revised draft with the host's body store", async () => {
+    mocks.getMessage.mockResolvedValue(draftRow);
+    const hostStore = { store: vi.fn() };
+    const { updateDraft } = await import("../drafts.js");
+    await updateDraft(draftPool, config, D1, { to: [], subject: "s", body: { format: "plain", text: "b" } }, undefined,
+      { bodyStore: hostStore });
+    expect(mocks.mirrorFiledMessage.mock.calls[0][2]).toBe(hostStore);
   });
 
   it("holds one account lock across the new APPEND and the old draft's delete", async () => {
@@ -1011,6 +1026,21 @@ describe("sendDraft", () => {
     const result = await sendDraft(pool, config, D1);
     expect(result.draftDeleted).toBe(true);
     expect(result.warnings).toEqual([]);
+    // Fenced writes: the Sent copy's row and the draft's tombstone share fate with the lock.
+    expect(mocks.withAccountLock.mock.calls[0][3]).toMatchObject({ fenceWrites: true });
+    // Sent is not mirrored in this fixture, so sync mirrors the copy later.
+    expect(result.send.messageId).toBeNull();
+  });
+
+  it("files the Sent copy with the host's body store and the resent bytes", async () => {
+    const hostStore = { store: vi.fn() };
+    const pool = mockPoolReturningDraft(draftRow);
+    const { sendDraft } = await import("../drafts.js");
+    const { fileSentCopy } = await import("../filed-message.js");
+    await sendDraft(pool, config, D1, undefined, { bodyStore: hostStore });
+    const [, , bodyStore, , , raw] = vi.mocked(fileSentCopy).mock.calls[0];
+    expect(bodyStore).toBe(hostStore);
+    expect((raw as Buffer).equals(mocks.deliverSmtp.mock.calls[0][1])).toBe(true);
   });
 });
 

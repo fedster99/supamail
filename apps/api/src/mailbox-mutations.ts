@@ -1,4 +1,5 @@
 import type { ImapFlow } from "imapflow";
+import type { BodyStore } from "./body-store.js";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { InvalidInputError, MailboxConflictError, NotFoundError, throwIfAborted } from "./errors.js";
@@ -74,6 +75,9 @@ export { MailboxConflictError };
 /** Caller controls for one direct mailbox action. */
 export interface MailboxActionOptions {
   signal?: AbortSignal;
+  /** Where an action that files a message stores its body (ADR 0044); the host's
+   * sync store. Defaults to the OSS database store, as sync does. */
+  bodyStore?: BodyStore;
 }
 
 /** A SupaMail well-known flag name mapped to its IMAP system flag. */

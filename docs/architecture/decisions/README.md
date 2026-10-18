@@ -49,6 +49,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0041-durable-send-policy.md`: Core owns the durable send state machine; hosts provide atomic, scoped storage and authorization. Raw send primitives remain single attempts.
 - `0042-writes-wait-for-the-account-lock.md`: Every direct write waits up to 25 seconds for the account lock, so no sync interleaves with it; a sync pass that finds the lock held defers and records nothing.
 - `0043-one-login-per-action-and-reused-sessions-reselect.md`: A multi-step action logs in once through `ActionConnection`; a host-owned sync session selects its mailbox again at the start of each pass; `classifyLoginRefusal` separates a rejected password from other refused logins.
+- `0044-filed-messages-are-mirrored-at-once.md`: A draft or Sent copy that an action files is mirrored at once from APPENDUID: the row from the server's metadata for that UID, the body from the filed bytes; failures stay warnings and sync stays authoritative.
 
 ## Status Values
 

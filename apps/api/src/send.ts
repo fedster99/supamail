@@ -3,13 +3,13 @@ import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
-import { closeImap } from "./imap-connect.js";
+import { actionBodyStore, fileSentCopy, type SentCopy } from "./filed-message.js";
+import { ActionConnection } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { accountLockHeartbeatIntervalMs } from "./locks.js";
-import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
+import type { MailboxActionOptions } from "./mailbox-mutations.js";
 import { MirrorRepository } from "./repository.js";
 import {
-  SentFolderAppender,
   buildRawMime,
   buildSendEnvelope,
   deliverSmtp,
@@ -26,9 +26,9 @@ import {
  * The send/reply primitive (email-001, ADR 0017). Loads the account, validates
  * the SMTP target (SSRF guard), composes deterministic RFC-822 bytes, then holds
  * the account advisory lock across SMTP submission and APPEND of the SAME bytes
- * to the Sent folder. It does NOT insert a mirror row — the next sync pass FETCHes
- * the real Sent copy and mirrors it with a server-assigned UID, so identity is
- * never guessed.
+ * to the Sent folder. When the server answers the APPEND with APPENDUID, the copy
+ * is mirrored at once from that UID (ADR 0044), so a read right after the send
+ * finds it; otherwise the next sync mirrors it. Identity is never guessed.
  *
  * This lives OUTSIDE src/mcp/ on purpose: the agent surface stays zero-send. The
  * caller (CLI with --confirm, the single-account HTTP API, or a remote runtime)
@@ -61,12 +61,12 @@ export async function sendMessage(
   config: AppConfig,
   req: SendRequest,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
-  options: { signal?: AbortSignal } = {}
+  options: MailboxActionOptions = {}
 ): Promise<SendResult> {
   const request = parseInput(SEND_REQUEST_SCHEMA, req);
   let deliveryConfirmed = false;
   try {
-    return await sendMessageAttempt(pool, config, request, metadataProtection, options.signal, () => {
+    return await sendMessageAttempt(pool, config, request, metadataProtection, options, () => {
       deliveryConfirmed = true;
     });
   } catch (error) {
@@ -92,11 +92,12 @@ async function sendMessageAttempt(
   config: AppConfig,
   req: SendRequest,
   metadataProtection: MetadataProtectionAdapter,
-  signal: AbortSignal | undefined,
+  { signal, bodyStore: hostBodyStore }: MailboxActionOptions,
   confirmDelivery: () => void
 ): Promise<SendResult> {
   throwIfAborted(signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
+  const bodyStore = actionBodyStore(repository, hostBodyStore);
   const account = await repository.getAccount(req.accountId);
   if (!account) {
     throw new NotFoundError(`Account not found: ${req.accountId}`);
@@ -138,44 +139,25 @@ async function sendMessageAttempt(
     lock.confirmIrreversible();
 
     // Delivery succeeded; file the identical bytes to Sent while the account lock
-    // remains held. An APPEND failure is non-fatal — the mail is already sent and
-    // the next sync recovers a copy if the provider auto-filed it.
-    let appendedToSent = false;
-    let appendedUid: number | null = null;
-    let sentFolderPath: string | null = null;
-    let appender: SentFolderAppender | null = null;
+    // remains held, and mirror the copy at once (ADR 0044). Every failure from here
+    // is a warning — the mail is already sent.
+    let sent: SentCopy = { appendedToSent: false, appendedUid: null, sentFolderPath: null, messageId: null };
     let lockLiveForFiling = true;
     try {
+      await lock.assertLive();
+    } catch (error) {
+      lockLiveForFiling = false;
+      addWarning(
+        `Delivered, but filing to Sent was skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
+      );
+    }
+    if (lockLiveForFiling) {
+      const connection = new ActionConnection(pool, config, account, signal);
       try {
-        await lock.assertLive();
-      } catch (error) {
-        lockLiveForFiling = false;
-        addWarning(
-          `Delivered, but filing to Sent was skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
-        );
-      }
-
-      if (lockLiveForFiling) {
+        sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, addWarning);
+      } finally {
         try {
-          appender = await SentFolderAppender.connect(pool, config, account, { signal });
-          const profile = getProviderProfile(account.provider_profile);
-          const mailboxes = await appender.list();
-          // Resolve Sent via the shared role-keyed resolver: the "sent" role consults the
-          // provider profile's priority winner for its fallback (behavior preserved).
-          sentFolderPath = resolveSpecialUseFolder(mailboxes, "sent", profile);
-          const appended = await appender.append(sentFolderPath, raw, ["\\Seen"], new Date());
-          appendedToSent = true;
-          appendedUid = appended?.uid ?? null;
-        } catch (error) {
-          addWarning(
-            `Delivered, but filing to Sent failed: ${error instanceof Error ? error.message : String(error)}. The next sync will mirror the copy if the provider auto-filed it.`
-          );
-        }
-      }
-    } finally {
-      if (appender) {
-        try {
-          await closeImap(appender);
+          await connection.close();
         } catch (error) {
           // SMTP is already confirmed. Teardown failure is diagnostic only; never
           // turn it into a thrown response that could invite a duplicate re-send.
@@ -192,12 +174,11 @@ async function sendMessageAttempt(
       accepted: delivery.accepted,
       rejected: delivery.rejected,
       smtpResponse: delivery.response,
-      appendedToSent,
-      appendedUid,
-      sentFolderPath,
+      ...sent,
       warnings
     };
   }, {
+    fenceWrites: true,
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
     onPostIrreversibleWarning: addWarning
   });

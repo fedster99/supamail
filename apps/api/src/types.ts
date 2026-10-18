@@ -412,6 +412,10 @@ export interface SendResult {
   /** From UIDPLUS APPENDUID when available, else null. */
   appendedUid: number | null;
   sentFolderPath: string | null;
+  /** The Sent copy's mirror id, readable at once (ADR 0044). Null without
+   * APPENDUID, when Sent is not mirrored yet, or after a failed mirror write; the
+   * next sync then mirrors the copy. */
+  messageId: string | null;
   warnings: string[];
 }
 
