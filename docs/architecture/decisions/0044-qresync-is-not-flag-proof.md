@@ -28,6 +28,11 @@ So a flag changed in webmail or on a phone never reached the mirror.
   every server, inside the reconcile slot, so `RECONCILE_INTERVAL_MS` bounds flag
   staleness even where a server's `CHANGEDSINCE` is wrong. It runs after the
   `CHANGEDSINCE` read, never instead of it: the window scan misses older mail.
+  It never blocks its reconcile: it reads newest mail first, starts no batch
+  after half of `FLAG_SCAN_TOTAL_TIMEOUT_MS`, and records an early stop as
+  `FLAG_BACKSTOP_INCOMPLETE`. Establishing a new flag cursor still scans the
+  whole window or fails.
+- An unchanged modseq proves no flag changed, so it counts as a flag read.
 - The Sent-only lane (ADR 0023) still reads no flags.
 - A shared IDLE session ignores `VANISHED (EARLIER)`: it only answers the
   session's own QRESYNC SELECT or `CHANGEDSINCE` FETCH (RFC 7162 section 3.2.10),
@@ -38,5 +43,7 @@ So a flag changed in webmail or on a phone never reached the mirror.
 - A flag changed outside SupaMail arrives in the next pass on that folder, with
   one extra command, and within one reconcile interval in the worst case.
 - One full-window flag read per folder per reconcile interval: a 9,000-message
-  window is about 180 FETCH batches of 50.
+  window is about 180 FETCH batches of 50. A window too large to read in half
+  the flag deadline converges newest first and logs `FLAG_BACKSTOP_INCOMPLETE`;
+  older mail there relies on `CHANGEDSINCE`.
 - No provider switch: every server takes the same path.

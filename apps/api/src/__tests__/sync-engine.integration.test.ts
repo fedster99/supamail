@@ -893,6 +893,16 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
           }
         };
       }
+
+      // CHANGEDSINCE names nothing here, so UID 301's flag must come from the replay.
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ): AsyncIterable<FetchMessage> {
+        if (options?.changedSince !== undefined) return;
+        yield* super.fetch(range, query);
+      }
     }
 
     const idleClient = new QresyncFixtureClient(folders);
@@ -991,8 +1001,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     folders[0].highestModseq = 10n;
     const readUid = folders[0].messages[0].uid;
     await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
-    // Both modseq cursors are current and both audits are due: the scheduled
-    // exact reconcile and the flag scan.
+    // Both modseq cursors are current and only the scheduled exact reconcile is
+    // due, so only the backstop can read the flag.
     await h.pool.query(
       `UPDATE public.imap_folders
        SET highest_modseq = 10,
@@ -1000,7 +1010,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
            last_reconcile_clean = true,
            last_full_reconcile_at = now() - interval '7 hours',
            next_reconcile_at = now() - interval '1 minute',
-           next_flag_scan_at = now() - interval '1 minute',
+           next_flag_scan_at = now() + interval '6 hours',
            next_sync_due_at = CASE WHEN path = 'INBOX'
              THEN now() - interval '1 second'
              ELSE now() + interval '1 hour' END
@@ -1179,6 +1189,176 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(search.mock.calls.some(([criteria]) => criteria.all === true)).toBe(false);
     expect(fetch.mock.calls.some(([, query]) => query.flags === true && query.envelope === undefined))
       .toBe(false);
+  });
+
+  it("never lets a slow backstop flag scan block its scheduled reconcile", async () => {
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50, INCREMENTAL_SYNC_BATCH_SIZE: 1, FLAG_SCAN_TOTAL_TIMEOUT_MS: 150 };
+    const h = await setupIntegration("flag-backstop-soft-stop", overrides);
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           last_reconcile_clean = true,
+           last_full_reconcile_at = now() - interval '7 hours',
+           next_reconcile_at = now() - interval '1 minute',
+           next_flag_scan_at = now() + interval '1 hour',
+           next_sync_due_at = CASE WHEN path = 'INBOX'
+             THEN now() - interval '1 second'
+             ELSE now() + interval '1 hour' END
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    // Each one-message flag FETCH takes 60 ms against a 150 ms flag deadline.
+    class SlowFlagsClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ): AsyncIterable<FetchMessage> {
+        void options;
+        if (query.flags === true && query.envelope === undefined) {
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        }
+        yield* super.fetch(range, query);
+      }
+    }
+    const engine = h.buildEngine({ folders, overrides, clientFactory: async () => new SlowFlagsClient(folders) });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled");
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    const folder = await h.pool.query<{ rescheduled: boolean }>(
+      `SELECT next_reconcile_at > now() AS rescheduled FROM public.imap_folders
+       WHERE account_id = $1 AND path = 'INBOX'`,
+      [h.account.id]
+    );
+    expect(folder.rows[0].rescheduled).toBe(true);
+    const incomplete = await h.pool.query<{ payload: { scanned: number; total: number } }>(
+      `SELECT payload FROM public.imap_sync_events
+       WHERE account_id = $1 AND folder_path = 'INBOX' AND event_type = 'FLAG_BACKSTOP_INCOMPLETE'`,
+      [h.account.id]
+    );
+    expect(incomplete.rows).toHaveLength(1);
+    expect(incomplete.rows[0].payload.scanned).toBeLessThan(incomplete.rows[0].payload.total);
+  });
+
+  it("keeps the Sent-only pass free of flag reads when the Sent modseq moved", async () => {
+    const h = await setupIntegration("sent-no-flag-delta");
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[1].highestModseq = 10n;
+    await h.buildEngine({ folders }).syncAccount(h.account.id, "manual");
+    await h.pool.query(
+      "UPDATE public.imap_folders SET highest_modseq = 10 WHERE account_id = $1 AND path = 'Sent'",
+      [h.account.id]
+    );
+    await dueAllFolders(h.pool, h.account.id);
+    // A send APPENDs to Sent, which moves its modseq.
+    folders[1].highestModseq = 11n;
+    const client = new FixtureImapClient(folders);
+    const fetch = vi.spyOn(client, "fetch");
+    const engine = h.buildEngine({ folders, clientFactory: async () => client });
+
+    const [result] = await engine.syncDueSentFolders(1);
+
+    expect(result.outcome).toBe("success");
+    const fetchCalls = fetch.mock.calls as unknown as Array<[unknown, unknown, { changedSince?: bigint }?]>;
+    expect(fetchCalls.some(([, , options]) => options?.changedSince !== undefined)).toBe(false);
+  });
+
+  it("spends a flag-scan slot only on a window scan, never on a CHANGEDSINCE delta", async () => {
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50, MAX_FLAG_SCANS_PER_CYCLE: 1 };
+    const h = await setupIntegration("flag-delta-no-slot", overrides);
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
+    // Inbox (first) has a moved modseq, so a delta; Sent has no modseq and a due
+    // routine window scan, which needs the only flag-scan slot.
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = CASE WHEN path = 'INBOX' THEN 10 END,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = CASE WHEN path = 'Sent'
+             THEN now() - interval '1 minute' ELSE now() + interval '6 hours' END,
+           next_sync_due_at = now() - interval '1 second'
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    folders[0].highestModseq = 11n;
+    folders[0].messages[0].flags = ["\\Seen"];
+    folders[1].messages[0].flags = ["\\Flagged"];
+
+    const result = await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "scheduled");
+
+    expect(result.outcome).toBe("success");
+    const rows = await h.pool.query<{ folder_path: string; flags: string[] }>(
+      `SELECT folder_path, flags FROM public.imap_messages
+       WHERE account_id = $1 AND ((folder_path = 'INBOX' AND uid = $2) OR (folder_path = 'Sent' AND uid = $3))
+       ORDER BY folder_path`,
+      [h.account.id, folders[0].messages[0].uid, folders[1].messages[0].uid]
+    );
+    expect(rows.rows).toEqual([
+      { folder_path: "INBOX", flags: ["\\Seen"] },
+      { folder_path: "Sent", flags: ["\\Flagged"] }
+    ]);
+  });
+
+  it("runs the backstop flag scan only with the reconcile slot it rides on", async () => {
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50, MAX_RECONCILES_PER_CYCLE: 1 };
+    const h = await setupIntegration("flag-backstop-reconcile-slot", overrides);
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[0].highestModseq = 10n;
+    folders.push({
+      path: "Archive",
+      delimiter: "/",
+      uidValidity: 50_021,
+      highestModseq: 10n,
+      messages: [makeTextMessage({ uid: 301, subject: "archived", from: "b@x.test", to: "u@x.test", body: "b" })]
+    });
+    await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
+    // Inbox and Archive are both reconcile-due with current cursors; one slot.
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = 10,
+           last_reconcile_clean = true,
+           last_full_reconcile_at = now() - interval '7 hours',
+           next_reconcile_at = CASE WHEN path = 'Sent'
+             THEN now() + interval '6 hours' ELSE now() - interval '1 minute' END,
+           next_flag_scan_at = now() + interval '6 hours',
+           next_sync_due_at = CASE WHEN path = 'Sent'
+             THEN now() + interval '1 hour' ELSE now() - interval '1 second' END
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    const flagFetchPaths: string[] = [];
+    class RecordingClient extends FixtureImapClient {
+      override async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>,
+        options?: Record<string, unknown>
+      ): AsyncIterable<FetchMessage> {
+        void options;
+        if (query.flags === true && query.envelope === undefined && this.mailbox) {
+          flagFetchPaths.push(this.mailbox.path);
+        }
+        yield* super.fetch(range, query);
+      }
+    }
+    const engine = h.buildEngine({ folders, overrides, clientFactory: async () => new RecordingClient(folders) });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled");
+
+    expect(result.outcome).toBe("success");
+    expect(result.reconcileFoldersAttempted).toBe(1);
+    expect(flagFetchPaths.length).toBeGreaterThan(0);
+    expect(new Set(flagFetchPaths)).toEqual(new Set(["INBOX"]));
   });
 
   it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
