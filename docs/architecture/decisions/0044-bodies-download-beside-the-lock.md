@@ -29,10 +29,11 @@ tombstones by id alone.
   A body download changes no mirror row, so it runs beside the lock on its own
   connection and commits under the lock. Attachment downloads already run beside
   the lock (ADR 0042).
-- `MirrorEngine.syncBodies(accountId, { client?, clientAccountId?, signal?, maxUnits? })`
+- `MirrorEngine.syncBodies(accountId, { openClient?, clientAccountId?, signal?, maxUnits? })`
   is the one body path. It reads at most `maxUnits` backlog batches and stops at
-  `MAX_LOCK_HOLD_MS`; `remaining` says bodies may be left. A host-owned client
-  must name its Mailbox Account. Shutdown closes the body connection. A unit is
+  `MAX_LOCK_HOLD_MS`; `remaining` says bodies may be left. A host that reuses a
+  session passes `openClient`, called only once a body is due, and names its
+  Mailbox Account. Shutdown closes the body connection. A unit is
   one bounded parsed-only UID-set fetch (up to 10 same-folder messages, 8 MiB) or
   one message. For each unit:
   1. **Read, no lock.** `getBodyBacklog` returns live-window rows first; in

@@ -409,7 +409,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(followupKeys).toContain("Sent:201");
     // Bodies download beside the lock on the host's session (ADR 0044).
     const bodyFollowup = await engine.syncBodies(h.account.id, {
-      client: idleClient,
+      openClient: async () => idleClient,
       clientAccountId: h.account.id
     });
     expect(bodyFollowup.committed).toBeGreaterThanOrEqual(2);

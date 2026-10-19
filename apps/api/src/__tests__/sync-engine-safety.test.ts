@@ -78,7 +78,7 @@ describe("sync engine safety", () => {
       try {
         const client = tricklingClient();
         const { engine, repository } = bodyEngine({ client });
-        const own = { client: client as never, clientAccountId: "account-1" };
+        const own = { openClient: async () => client as never, clientAccountId: "account-1" };
 
         const run = engine.syncBodies("account-1", own);
         const settled = expect(run).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
@@ -104,7 +104,7 @@ describe("sync engine safety", () => {
         // After 1 min it is retried; a second failure backs it off for 2 min.
         const retry = tricklingClient();
         await vi.advanceTimersByTimeAsync(60_000);
-        const retried = engine.syncBodies("account-1", { client: retry as never, clientAccountId: "account-1" });
+        const retried = engine.syncBodies("account-1", { openClient: async () => retry as never, clientAccountId: "account-1" });
         const retriedSettled = expect(retried).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
         await vi.advanceTimersByTimeAsync(70_000);
         await retriedSettled;
@@ -113,7 +113,7 @@ describe("sync engine safety", () => {
         expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [message.id] });
         await vi.advanceTimersByTimeAsync(20_000);
         const third = tricklingClient();
-        const thirdRun = engine.syncBodies("account-1", { client: third as never, clientAccountId: "account-1" });
+        const thirdRun = engine.syncBodies("account-1", { openClient: async () => third as never, clientAccountId: "account-1" });
         const thirdSettled = expect(thirdRun).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
         await vi.waitFor(() => expect(third.fetchOne).toHaveBeenCalled());
         await vi.advanceTimersByTimeAsync(70_000);
@@ -172,11 +172,20 @@ describe("sync engine safety", () => {
       expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [] });
     });
 
+    it("opens a host session only once a body is due", async () => {
+      const { engine, repository } = bodyEngine({ client: tricklingClient() });
+      repository.getBodyBacklog.mockResolvedValue([]);
+      const openClient = vi.fn(async () => tricklingClient() as never);
+      expect(await engine.syncBodies("account-1", { openClient, clientAccountId: "account-1" }))
+        .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+      expect(openClient).not.toHaveBeenCalled();
+    });
+
     it("refuses a host-owned client that names another Mailbox Account", async () => {
       const { engine, repository } = bodyEngine({ client: tricklingClient() });
-      await expect(engine.syncBodies("account-1", { client: {} as never }))
+      await expect(engine.syncBodies("account-1", { openClient: async () => ({}) as never }))
         .rejects.toThrow("Host-owned client does not match the Mailbox Account");
-      await expect(engine.syncBodies("account-1", { client: {} as never, clientAccountId: "account-2" }))
+      await expect(engine.syncBodies("account-1", { openClient: async () => ({}) as never, clientAccountId: "account-2" }))
         .rejects.toThrow("Host-owned client does not match the Mailbox Account");
       expect(repository.getAccount).not.toHaveBeenCalled();
     });

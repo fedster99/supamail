@@ -435,20 +435,22 @@ export class MirrorEngine {
    * (ADR 0044). Live-window bodies come first, then, in `metadata_and_bodies`
    * mode inside the backfill window, archive bodies. A run reads at most
    * `maxUnits` backlog batches and stops at `MAX_LOCK_HOLD_MS`; `remaining` says
-   * bodies may be left. Writes no sync run and no account state. A host-owned
-   * `client` must name its Mailbox Account; the engine never logs it out, and
-   * closes it only at a unit deadline or on abort.
+   * bodies may be left. Writes no sync run and no account state. A host that
+   * reuses a session passes `openClient`, called only once a body is due, so an
+   * empty backlog costs no login; it must name its Mailbox Account. The engine
+   * never logs a host session out, and closes it only at a unit deadline or on
+   * abort.
    */
   async syncBodies(
     accountId: string,
     options: {
-      client?: MirrorImapClient;
+      openClient?: () => Promise<MirrorImapClient>;
       clientAccountId?: string;
       signal?: AbortSignal;
       maxUnits?: number;
     } = {}
   ): Promise<BodySyncResult> {
-    if (options.client && options.clientAccountId !== accountId) {
+    if (options.openClient && options.clientAccountId !== accountId) {
       throw new Error("Host-owned client does not match the Mailbox Account");
     }
     const account = await this.repository.getAccount(accountId);
@@ -460,7 +462,7 @@ export class MirrorEngine {
       && isWithinBackfillWindow(this.config);
     const maxUnits = options.maxUnits ?? this.config.MAX_BODY_BATCHES_PER_TICK;
     const budgetEndsAt = Date.now() + this.config.MAX_LOCK_HOLD_MS;
-    let client = options.client ?? null;
+    let client: MirrorImapClient | null = null;
     // Shutdown closes the body connection, which also ends a streamed download.
     const interrupt = () => {
       if (client) this.abortClient(client);
@@ -475,14 +477,16 @@ export class MirrorEngine {
           excludeIds: this.backedOffBodyIds()
         });
         if (backlog.length === 0) return result;
-        client ??= await this.clientFactory(account, { signal: options.signal });
+        client ??= options.openClient
+          ? await options.openClient()
+          : await this.clientFactory(account, { signal: options.signal });
         if (!await this.syncBodyBatch(account, client, backlog, result, budgetEndsAt, options.signal)) break;
       }
       result.remaining = true;
       return result;
     } finally {
       options.signal?.removeEventListener("abort", interrupt);
-      if (client && !options.client) await client.logout().catch(() => this.abortClient(client!));
+      if (client && !options.openClient) await client.logout().catch(() => this.abortClient(client!));
     }
   }
 
