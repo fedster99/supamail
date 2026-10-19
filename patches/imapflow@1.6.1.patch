@@ -339,10 +339,10 @@ index fd0c409c24c525cbbb6b841e8d26327eb1b0a635..f0567fa440b4511c223ddcf52404a024
          return Array.from(results).sort((a, b) => a - b);
      } catch (err) {
 diff --git a/lib/commands/select.js b/lib/commands/select.js
-index 2add50b39ef8fd3a575500599b4757fe4a511b79..d92cea15f529cc46750816b748618c4b492926de 100644
+index 2add50b39ef8fd3a575500599b4757fe4a511b79..c9bcb6f51ae2173446caf495e2152249cf837fd7 100644
 --- a/lib/commands/select.js
 +++ b/lib/commands/select.js
-@@ -58,13 +58,16 @@ module.exports = async (connection, path, options) => {
+@@ -58,16 +58,30 @@ module.exports = async (connection, path, options) => {
          // the changes (new flags, expunged UIDs) since that point.
          let extraArgs = [];
          if (connection.enabled.has('QRESYNC') && options.changedSince && options.uidValidity) {
@@ -366,6 +366,20 @@ index 2add50b39ef8fd3a575500599b4757fe4a511b79..d92cea15f529cc46750816b748618c4b
              map.qresync = true;
          }
  
++        // Selecting the mailbox that is already selected: collect its pending
++        // changes first. Some servers (Purelymail) hold a removal made by another
++        // session and deliver it as a live VANISHED or EXPUNGE after the new
++        // SELECT, without the [CLOSED] code that marks the switch (RFC 7162
++        // section 3.2.11). The new count already excludes that message, so the
++        // late response would lower EXISTS a second time. NOOP delivers it while
++        // it still belongs to the old selection (RFC 3501 section 6.1.2).
++        if (connection.state === connection.states.SELECTED && connection.mailbox && connection.mailbox.path === path) {
++            await connection.run('NOOP');
++        }
++
+         let encodedPath = encodePath(connection, path);
+ 
+         // SELECT opens the mailbox read-write; EXAMINE opens it read-only.
 diff --git a/lib/commands/status.js b/lib/commands/status.js
 index 0e15a480d321d746c38f869109f556560737baf0..5f201c8b8084e97ecd41c53af9f529afe3869b61 100644
 --- a/lib/commands/status.js
