@@ -207,6 +207,30 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     expect(await rows()).toEqual([{ uid: "1", fetched: false, deleted: false, evidence: false }]);
   });
 
+  it("reports a failed body run beside the recorded pass and leaves account health alone", async () => {
+    const folders = inbox([message(1)]);
+    h = await setupIntegration("bodies-run-fails", { BODY_BACKFILL_BATCH_SIZE: 5 });
+    accounts.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const engine = h.buildEngine({
+      folders,
+      bodyStore: { store: async () => { throw new Error("store refused after LOGIN user@example.test secret"); } }
+    });
+    const result = await engine.syncAccountWithBodies(h.account.id, "manual");
+    expect(result.outcome).toBe("success");
+    expect(result.bodies).toBeNull();
+    expect(result.bodyError).toEqual(expect.any(String));
+    expect(result.bodyError).not.toContain("secret");
+    const account = await h.repository.getAccount(h.account.id);
+    expect(account?.sync_state).not.toBe("BROKEN");
+    expect(account?.backoff_until ?? null).toBeNull();
+    const run = await h.pool.query<{ status: string }>(
+      "SELECT status FROM public.imap_sync_runs WHERE account_id = $1 ORDER BY started_at DESC LIMIT 1",
+      [h.account.id]
+    );
+    expect(run.rows[0].status).toBe("success");
+  });
+
   it("refetches one body on demand through the same fenced commit", async () => {
     const folders = inbox([message(1)]);
     await setup("bodies-fetch-body", folders);
@@ -219,6 +243,13 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     expect(await rows()).toEqual([{ uid: "1", fetched: true, deleted: false, evidence: true }]);
     expect(await engine.fetchBody(row.id)).toBe(false);
     expect(await engine.fetchBody(row.id, true)).toBe(true);
+
+    // A tombstoned row takes no body, and the refetch says so.
+    await h.pool.query(
+      "UPDATE public.imap_messages SET deleted_in_provider = true, deleted_reason = 'RECONCILE_MISSING' WHERE id = $1",
+      [row.id]
+    );
+    expect(await engine.fetchBody(row.id, true)).toBe(false);
   });
 
   it("downloads live-window bodies before archive bodies, missing before upgrades", async () => {

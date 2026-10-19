@@ -418,7 +418,8 @@ export class MirrorEngine {
     const pass = await this.syncAccount(accountId, triggerType, { signal: options.signal });
     let bodies: BodySyncResult | null = null;
     let bodyError: string | null = null;
-    if (!options.signal?.aborted) {
+    // A failed pass has just backed the account off; its bodies wait with it.
+    if (pass.outcome !== "failed" && !options.signal?.aborted) {
       try {
         bodies = await this.syncBodies(accountId, { signal: options.signal });
       } catch (error) {
@@ -1033,8 +1034,8 @@ export class MirrorEngine {
     // Download beside the lock, then the same fenced commit as syncBodies (ADR 0044).
     const client = await this.clientFactory(account);
     try {
-      await this.commitBodies(account, await this.downloadBodyUnit(client, [message], undefined));
-      return true;
+      const written = await this.commitBodies(account, await this.downloadBodyUnit(client, [message], undefined));
+      return written.committed > 0;
     } finally {
       await client.logout().catch(() => this.abortClient(client));
     }
