@@ -79,7 +79,9 @@ and VANISHED UIDs in bounded batches. A replay is never flag proof: Purelymail
 returns a complete replay without flag changes, while its `CHANGEDSINCE` is
 exact, so flags always come from CONDSTORE (ADR 0044). A rejected or incomplete
 replay falls back to CONDSTORE and exact UID reconciliation. Periodic exact reconciliation stays
-enabled even after successful QRESYNC replay.
+enabled even after successful QRESYNC replay. Re-selecting the selected mailbox
+sends NOOP first, because some servers (Purelymail) omit `[CLOSED]` and deliver
+the previous selection's pending removals after the new SELECT.
 
 NOTIFY is an optional real-time wake layer, not a correctness dependency.
 Enable `IMAP_NOTIFY_ENABLED=true` only for a canary whose capability evidence
