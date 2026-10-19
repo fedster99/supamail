@@ -41,6 +41,7 @@ pnpm --filter @supamail/web build
 | Deployment files or CI | `pnpm typecheck`, `pnpm test`, `pnpm build`, plus inspect the affected config |
 | GreenMail/protocol behavior | `pnpm smoke:greenmail` when Docker/local environment permits |
 | Dovecot/generic-hosting protocol behavior | `pnpm smoke:dovecot` when Docker/local environment permits |
+| IMAP IDLE watcher capacity | `IDLE_SCALE_WATCHERS=<count> IDLE_SCALE_DURATION_MS=<ms> pnpm smoke:idle-scale`; use `apps/api/fly.idle-scale.toml` only with a disposable Fly app |
 | Local Supabase dry run behavior | `pnpm --filter @supamail/api dry-run:local` when local Supabase is available |
 
 ## Heavy Reliability Gate
