@@ -24,6 +24,10 @@ On direct connections, recovery no longer terminates a lock-holding session whos
 
 The checks above still let a holder write the rest of the unit it was in when its lock was lost. Sync now runs with `fenceWrites`: every repository query inside the locked sync uses the lock's own session, serialized so transactions stay isolated. Writes and lock share one session, so no holder can write after losing the lock, with any number of workers. A cancelled or failed transaction ends the session from another connection and destroys the client, which releases the lock. Cost: one session per active sync carries its writes, the same session that already held the lock.
 
+### Amendment: bodies download beside the lock (ADR 0044)
+
+The lock serializes every mirror write and every mailbox-changing IMAP command. A read-only body download changes no mirror row, so it runs on its own connection beside the lock and commits under it, write-fenced. A slow provider download therefore never holds the lock. Sync proves ownership before each folder and history batch.
+
 ## Consequences
 
 - Supabase transaction pooler URLs are not supported.

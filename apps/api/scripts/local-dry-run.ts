@@ -124,6 +124,7 @@ async function main(): Promise<void> {
 
   try {
     const firstSync = await engine.syncAccount(account.id, "manual");
+    await engine.syncBodies(account.id);
     const secondSync = await engine.syncAccount(account.id, "manual");
     const counts = await pool.query<{
       accounts: string;

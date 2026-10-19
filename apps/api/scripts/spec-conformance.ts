@@ -1419,7 +1419,7 @@ async function scenarioPendingVerificationRediscovery() {
 }
 
 async function scenarioThreeLaneHistory() {
-  console.log("\nScenario L: three-lane engine runs hot, body, then history");
+  console.log("\nScenario L: a pass runs hot then history headers; bodies follow beside the lock (ADR 0044)");
   const oldDate = new Date("2023-01-01T00:00:00Z");
   const recentDate = new Date();
   const { pool, config, repository, account } = await setup("three-lane", {
@@ -1500,15 +1500,22 @@ async function scenarioThreeLaneHistory() {
     });
 
     const result = await engine.syncAccount(account.id, "manual");
-    assert(result.outcome === "success", "three-lane sync succeeds", result.errors.join("|"));
-    assert(result.hitLockBudget === false, "three-lane sync does not hit budget when body is quick", `result=${JSON.stringify(result)}`);
+    assert(result.outcome === "success", "the sync pass succeeds", result.errors.join("|"));
+    assert(result.hitLockBudget === false, "the sync pass does not hit the budget", `result=${JSON.stringify(result)}`);
     assert(
       events.indexOf("hot:INBOX:10") >= 0
-        && events.indexOf("body:IN_WINDOW:INBOX:10") > events.indexOf("hot:INBOX:10")
-        && events.indexOf("history:INBOX:1") > events.indexOf("body:IN_WINDOW:INBOX:10")
-        && events.indexOf("body:HISTORICAL:INBOX:1") > events.indexOf("history:INBOX:1"),
-      "lane order is hot headers, live body, history headers, history body",
+        && events.indexOf("history:INBOX:1") > events.indexOf("hot:INBOX:10")
+        && !events.some((event) => event.startsWith("body:")),
+      "a pass mirrors hot headers, then history headers, and no body",
       `events=${events.join(",")}`
+    );
+    const bodies = await engine.syncBodies(account.id, { maxUnits: 2 });
+    const bodyEvents = events.filter((event) => event.startsWith("body:"));
+    assert(
+      bodies.committed === 2
+        && bodyEvents.join(",") === "body:IN_WINDOW:INBOX:10,body:HISTORICAL:INBOX:1",
+      "bodies follow beside the lock, live window first",
+      `bodies=${JSON.stringify(bodies)} events=${bodyEvents.join(",")}`
     );
 
     const archive = (
@@ -1547,7 +1554,7 @@ async function scenarioThreeLaneHistory() {
     BODY_BACKFILL_BATCH_SIZE: 1,
     INITIAL_SYNC_BATCH_SIZE: 10,
     MAX_BODY_BATCHES_PER_TICK: 1,
-    MAX_LOCK_HOLD_MS: 50,
+    MAX_LOCK_HOLD_MS: 5_000,
     MAX_RR_FOLDERS_PER_CYCLE: 5
   });
   try {
@@ -1603,10 +1610,14 @@ async function scenarioThreeLaneHistory() {
         ]
       }
     ];
+    let bodySourceFetches = 0;
     class SlowBodyClient extends FixtureImapClient {
-      override async fetchOne(range: string) {
-        await new Promise((resolve) => setTimeout(resolve, 75));
-        return await super.fetchOne(range);
+      override async fetchOne(range: string, query: Record<string, unknown>, options?: Record<string, unknown>) {
+        if (query.source) {
+          bodySourceFetches += 1;
+          await new Promise((resolve) => setTimeout(resolve, 75));
+        }
+        return await super.fetchOne(range, query, options);
       }
     }
     const engine = new MirrorEngine({
@@ -1616,9 +1627,13 @@ async function scenarioThreeLaneHistory() {
       clientFactory: async () => new SlowBodyClient(folders) as unknown as MirrorImapClient
     });
     const result = await engine.syncAccount(blocked.account.id, "manual");
-    assert(result.hitLockBudget === true, "body lane can exhaust the shared lock budget", `result=${JSON.stringify(result)}`);
+    assert(
+      result.hitLockBudget === false && bodySourceFetches === 0,
+      "a slow body download no longer spends the pass's lock budget",
+      `result=${JSON.stringify(result)} bodySourceFetches=${bodySourceFetches}`
+    );
 
-    const skipped = (
+    const walked = (
       await blocked.pool.query<{
         historical_target_count: number | null;
         historical_message_count: string;
@@ -1642,9 +1657,9 @@ async function scenarioThreeLaneHistory() {
       )
     ).rows[0];
     assert(
-      skipped.historical_target_count === null && Number(skipped.historical_message_count) === 0,
-      "history lane is skipped when body lane exhausts the lock budget",
-      `skipped=${JSON.stringify(skipped)}`
+      walked.historical_target_count === 1 && Number(walked.historical_message_count) === 1,
+      "history walks while bodies wait for their own run",
+      `walked=${JSON.stringify(walked)}`
     );
   } finally {
     await teardown(blocked.pool, blocked.account.id);

@@ -54,7 +54,6 @@ function makeSyncResult(): SyncResult {
     outcome: "success",
     foldersProcessed: 1,
     messagesUpserted: 0,
-    bodiesFetched: 0,
     flagsUpdated: 0,
     reconcileGapsFound: 0,
     hitLockBudget: false,
@@ -176,7 +175,11 @@ function buildApp(options: {
     getMessage: vi.fn(async () => ({ id: messageId }) as never)
   };
   const engine = {
-    syncAccount: vi.fn(async () => makeSyncResult()),
+    syncAccountWithBodies: vi.fn(async () => ({
+      ...makeSyncResult(),
+      bodies: { committed: 0, gone: 0, skipped: 0, remaining: false },
+      bodyError: null
+    })),
     fetchBody: vi.fn(async () => true)
   };
   const applyMigration = vi.fn(options.applyMigration ?? (async () => undefined));

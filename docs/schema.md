@@ -177,6 +177,13 @@ Migration 0014 performs no mailbox-wide DML and builds no index on the existing 
 Public mirror migrations live under `apps/api/supabase/migrations/public/` and are the only migrations that `pnpm migrate`, the CLI, and the API `/migrate` endpoint apply. The manifest records their order and required public schema version. Ids order by their four-digit prefix and the manifest must list them ascending with `schemaVersion` as the last id. A runtime accepts a schema at or after its required version (`isSchemaVersionReady`): behind, the code would miss what a later migration adds; ahead is fine from `0029` on because later migrations are additive, so a host applies a migration before it deploys the runtime that needs it and the running runtime keeps serving. A schema at the required number must be the required id. A schema test holds every migration after `0029` to the additive rule (`findNonAdditiveStatement`): no drop of a column, default, table, index, policy, trigger, or type; no rename; no column type or NOT NULL change; no new check, unique, primary-key, foreign-key, or exclusion constraint; no unique index; no NOT NULL column without a default. Dropping a constraint, adding a nullable or defaulted column, and the drop-and-recreate view or function idiom are allowed. A replaced function or view body is for review to judge. The one exception is a reviewed removal (ADR 0040): its own release, listed in the schema test, applied only after every host runs a core that stopped using what it removes. An older runtime's readiness check cannot know about the removal, so that precondition is the host's release step. `0032` is the first. Deployment-specific schemas must live outside this public migration path.
 
 
+## Sync runs no longer count bodies
+
+Since ADR 0044 bodies download beside the account lock, outside any sync run.
+New `imap_sync_runs.bodies_fetched` values therefore stay 0; read body progress
+from `imap_account_progress` and the folder body counters. The column is dropped
+in a later release, once hosts stop reading it.
+
 ## Per-run folder checks
 
 `imap_sync_runs.metadata.folderChecks` records the live-folder checks that the

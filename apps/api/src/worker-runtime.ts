@@ -27,7 +27,9 @@ export interface WorkerSyncResult {
   metadataWriteBatchesAttempted?: number;
   metadataWriteBatchesFailed?: number;
   metadataWriteServiceRowsPerSecond?: number | null;
-  bodiesFetched: number;
+  /** The body run after a full pass (ADR 0044); absent for Sent-only passes. */
+  bodies?: { committed: number } | null;
+  bodyError?: string | null;
   errors: string[];
 }
 
@@ -196,7 +198,8 @@ function loggedOutcome(result: WorkerSyncResult) {
     metadataWriteServiceRowsPerSecond: metadataTelemetryComplete && metadataWriteBatchesAttempted > 0
       ? metadataRowsPerSecond(metadataRowsCommitted, metadataWriteDurationMs)
       : null,
-    bodiesFetched: result.bodiesFetched,
+    bodiesFetched: result.bodies?.committed ?? 0,
+    bodyError: result.bodyError ? diagnosticErrorCode(result.bodyError) : null,
     errors: [...new Set(result.errors.map(diagnosticErrorCode))]
   };
 }
@@ -231,6 +234,9 @@ export function logSyncTick(
       sink.error(JSON.stringify({ event: "sync.account.failed", ...outcome }));
     } else if (outcome.outcome === "partial_success") {
       sink.warn(JSON.stringify({ event: "sync.account.partial_success", ...outcome }));
+    }
+    if (outcome.bodyError) {
+      sink.warn(JSON.stringify({ event: "sync.account.bodies_failed", ...outcome }));
     }
   }
 
