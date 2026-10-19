@@ -215,6 +215,23 @@ describe("waitForInboxIdleWake", () => {
     expect(client.listenerCount("close")).toBe(0);
   });
 
+  it("does not wake for VANISHED (EARLIER), which answers the session's own command", async () => {
+    const client = new FakeIdleClient();
+    const opened = await openInboxIdleSession(pool, config, account, {
+      clientFactory: async () => client
+    });
+    if (opened.status !== "ready") throw new Error("session was not ready");
+    const wait = opened.session.wait();
+    await vi.waitFor(() => expect(client.idleStarted).toBe(true));
+    // A CHANGEDSINCE flag delta on a QRESYNC session also returns past expunges.
+    client.emit("expunge", { path: "INBOX", uid: 17, vanished: true, earlier: true });
+    expect(opened.session.syncClient.peekMailboxChanges?.()).toEqual([]);
+    client.emit("expunge", { path: "INBOX", uid: 18, vanished: true, earlier: false });
+
+    await expect(wait).resolves.toMatchObject({ status: "wake", wake: { kind: "expunge", uid: 18 } });
+    opened.session.close();
+  });
+
   it("keeps a reusable session open for the authoritative sync", async () => {
     const client = new FakeIdleClient();
     const opened = await openInboxIdleSession(pool, config, account, {
