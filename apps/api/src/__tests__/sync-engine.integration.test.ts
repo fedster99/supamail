@@ -4962,6 +4962,55 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(active.missing_since).toBeNull();
   });
 
+  it("continues bounded history across empty UID ranges and checks new mail between passes", async () => {
+    const h = await setupIntegration("history-continuation", {
+      BODY_BACKFILL_BATCH_SIZE: 2,
+      INITIAL_SYNC_BATCH_SIZE: 10
+    });
+    activeAccountIds.push(h.account.id);
+    await h.pool.query(
+      `UPDATE public.imap_accounts SET body_fetch_policy = 'immediate',
+       historical_backfill_mode = 'metadata_and_bodies', max_backfill_rate = 'normal'
+       WHERE id = $1`, [h.account.id]
+    );
+    const message = (uid: number, old: boolean) => makeTextMessage({
+      uid, subject: `message-${uid}`, from: "a@x.test", to: "u@x.test", body: "body",
+      internalDate: old ? new Date("2023-01-01T00:00:00Z") : new Date()
+    });
+    const folders: FixtureFolder[] = [{
+      path: "INBOX", delimiter: "/", specialUse: "\\Inbox", uidValidity: 81_099,
+      messages: [message(1, true), message(20, true), message(30, false)]
+    }];
+    const engine = h.buildEngine({ folders });
+    const sync = () => engine.syncAccount(h.account.id, "manual");
+    const first = await sync();
+    expect(first.outcome).toBe("success");
+    expect(first.historyBacklogRemaining).toBe(true);
+    // Three batches of two UID positions: 20..15, then 14..9 (all empty).
+    const empty = await sync();
+    expect(empty.messagesUpserted).toBe(0);
+    expect(empty.historyBacklogRemaining).toBe(true);
+    expect(empty.hitLockBudget).toBe(false);
+
+    folders[0].messages.push(message(31, false));
+    await dueAllFolders(h.pool, h.account.id);
+    const withNewMail = await sync();
+    expect(withNewMail.historyBacklogRemaining).toBe(true);
+    expect((await h.pool.query(
+      `SELECT body_fetched_at IS NOT NULL AS complete FROM public.imap_messages
+       WHERE account_id = $1 AND uid = 31`, [h.account.id]
+    )).rows).toEqual([{ complete: true }]);
+
+    const drained = await sync();
+    expect(drained.outcome).toBe("success");
+    expect(drained.historyBacklogRemaining).toBe(false);
+    expect((await h.pool.query(
+      `SELECT uid::text, body_fetched_at IS NOT NULL AS complete FROM public.imap_messages
+       WHERE account_id = $1 ORDER BY uid`, [h.account.id]
+    )).rows).toEqual([1, 20, 30, 31].map(uid => ({ uid: String(uid), complete: true })));
+    expect((await sync()).historyBacklogRemaining).toBe(false);
+  });
+
   it("Scenario L — three-lane sync runs hot, body, then history under the lock budget", async () => {
     const oldDate = new Date("2023-01-01T00:00:00Z");
     const recentDate = new Date();
@@ -5494,6 +5543,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       }
     }).syncAccount(h.account.id, "manual");
     expect(failed.outcome).not.toBe("success");
+    expect(failed.historyBacklogRemaining).not.toBe(true);
 
     const afterFailure = await h.pool.query<{
       backfill_in_progress: boolean;
