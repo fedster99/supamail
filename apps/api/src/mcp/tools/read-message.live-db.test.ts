@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closePool, getPool } from "../../db.js";
+import { READ_ONLY_TRANSACTION_BEGIN } from "../shared.js";
 import { runReadMessage } from "./read-message.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
@@ -347,5 +348,33 @@ liveDb("read_message tool live DB", () => {
       body_total_chars: 10,
       body_next_offset: 7
     });
+  });
+
+  it("reads inside a host's read-only transaction, which keeps one snapshot and stays open", async () => {
+    const messageId = idByUid.get(1)!;
+    const host = await pool.connect();
+    try {
+      await host.query(READ_ONLY_TRANSACTION_BEGIN);
+      const before = await runReadMessage({ hostTransaction: host }, { message_id: messageId });
+      if ("error" in before) throw new Error("unexpected error envelope");
+      // A write committed after the snapshot is not seen by a later read in it.
+      await pool.query("UPDATE public.imap_messages SET subject = 'Renamed later' WHERE id = $1", [messageId]);
+      const again = await runReadMessage({ hostTransaction: host }, { message_id: messageId });
+      if ("error" in again) throw new Error("unexpected error envelope");
+      expect(again.subject).toBe(before.subject);
+      expect(again.accounts.map((a) => a.account_id)).toEqual([accountId]);
+      // The tool left the transaction to its host: it is still open and read-only.
+      const settings = await host.query<{ timeout: string; read_only: string }>(
+        "SELECT current_setting('statement_timeout') AS timeout, current_setting('transaction_read_only') AS read_only"
+      );
+      expect(settings.rows[0]).toEqual({ timeout: "15s", read_only: "on" });
+      await host.query("COMMIT");
+    } catch (error) {
+      await host.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      host.release();
+      await pool.query("UPDATE public.imap_messages SET subject = 'Project kickoff' WHERE id = $1", [messageId]);
+    }
   });
 });

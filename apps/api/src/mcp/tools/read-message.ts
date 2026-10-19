@@ -1,19 +1,19 @@
 import { z } from "zod";
-import type { PgClient, PgPool } from "../../db.js";
+import type { PgClient } from "../../db.js";
 import { ACTIVE_ASSIGNMENT_JOIN } from "../../delivery-identity.js";
 import { formatZodIssues } from "../../errors.js";
 import {
   loadMessageAttachments,
   mapMessageRow,
-  readAccountsFor,
   toolError,
   withReadOnlyTx,
   type MessageDetail,
   type MessageDetailRow,
+  type ReadSource,
   type ToolDefinition,
   type ToolEntry
 } from "../shared.js";
-import type { ReadAccount } from "../../search/index.js";
+import { buildReadAccounts, type ReadAccount } from "../../search/index.js";
 import {
   METADATA_PROTECTED_FIELDS,
   plaintextMetadataProtection,
@@ -142,16 +142,17 @@ export const readMessageDefinition: ToolDefinition = {
 };
 
 /**
- * Validate raw tool arguments and read one message from the mirror. The injected
- * pool keeps this transport-agnostic: the local stdio binding and any remote
- * binding call this same function.
+ * Validate raw tool arguments and read one message from the mirror in one
+ * read-only transaction, the host's when it passes one. The injected source
+ * keeps this transport-agnostic: the local stdio binding and any remote binding
+ * call this same function.
  *
  * Body precedence is `coalesce(body_text, body_plain, selected_text_part)` (I2);
  * raw_mime is never read. Attachments include every disposition (I9). Returns the
  * `not_found` error envelope when no message matches.
  */
 export async function runReadMessage(
-  pool: PgPool,
+  source: ReadSource,
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
   options: ReadMessageOptions = {}
@@ -168,7 +169,7 @@ export async function runReadMessage(
   const includeHeaders = request.include_headers ?? false;
   const includeQuoted = request.include_quoted ?? false;
 
-  const row = await withReadOnlyTx(pool, async (client: PgClient) => {
+  const read = await withReadOnlyTx(source, async (client: PgClient) => {
     const result = await client.query<ReadMessageRow>(
       `
       SELECT
@@ -216,10 +217,11 @@ export async function runReadMessage(
     const row = result.rows[0] ?? null;
     if (!row) return null;
     const attachments = await loadMessageAttachments(client, [row.id], metadataProtection);
-    return { ...row, attachments: attachments.get(row.id) ?? [] };
+    const accounts = await buildReadAccounts(client, [row.account_id], metadataProtection);
+    return { row: { ...row, attachments: attachments.get(row.id) ?? [] }, accounts };
   });
 
-  if (!row) {
+  if (!read) {
     return toolError(
       "not_found",
       `No message with id ${request.message_id} in this mirror.`,
@@ -229,6 +231,7 @@ export async function runReadMessage(
     );
   }
 
+  const { row, accounts } = read;
   const revealed = await revealMetadataRecord(
     metadataProtection,
     { kind: "message", accountId: row.account_id, recordId: row.id },
@@ -245,7 +248,6 @@ export async function runReadMessage(
     includeBodyRange: true
   });
   if (row.duplicate_message_ids?.length) detail.duplicate_message_ids = row.duplicate_message_ids;
-  const accounts = await readAccountsFor(pool, [row.account_id], metadataProtection);
 
   return { ...detail, accounts };
 }
