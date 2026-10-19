@@ -29,9 +29,12 @@ tombstones by id alone.
   A body download changes no mirror row, so it runs beside the lock on its own
   connection and commits under the lock. Attachment downloads already run beside
   the lock (ADR 0042).
-- `MirrorEngine.syncBodies(accountId, { client?, signal?, maxUnits? })` is the
-  one body path. A unit is one bounded parsed-only UID-set fetch (up to 10
-  same-folder messages, 8 MiB) or one message. For each unit:
+- `MirrorEngine.syncBodies(accountId, { client?, clientAccountId?, signal?, maxUnits? })`
+  is the one body path. It reads at most `maxUnits` backlog batches and stops at
+  `MAX_LOCK_HOLD_MS`; `remaining` says bodies may be left. A host-owned client
+  must name its Mailbox Account. Shutdown closes the body connection. A unit is
+  one bounded parsed-only UID-set fetch (up to 10 same-folder messages, 8 MiB) or
+  one message. For each unit:
   1. **Read, no lock.** `getBodyBacklog` returns live-window rows first; in
      `metadata_and_bodies` mode and inside the backfill window it then returns
      archive rows, missing bodies before evidence upgrades. Both arms share the
@@ -40,9 +43,12 @@ tombstones by id alone.
      (`invalidateSelection`), so it sees every UID stored before the read. The
      unit has a deadline of 60 s plus 8 KiB/s of declared size, at most 30 min;
      on expiry the engine closes this connection and the run ends with
-     `BodyDownloadTimeoutError`.
-  3. **Commit, under the lock.** `withInteractiveAccountLock` with `fenceWrites`
-     keeps the downloaded rows that still exist and are not provider-deleted,
+     `BodyDownloadTimeoutError`. A unit's result is all or nothing: a unit that
+     fails, times out or is aborted stores no body and tombstones nothing. A
+     command on a closed connection raises `ImapConnectionClosedError`, never
+     an empty result that would read as a gone message.
+  3. **Commit, under the lock, as soon as the unit arrives.**
+     `withInteractiveAccountLock` with `fenceWrites` keeps the downloaded rows that still exist and are not provider-deleted,
      then writes, in the ADR 0028 order: evidence, `BodyStore.store`,
      `completeBodyStorage`. A message the provider reports gone is tombstoned
      only while its row still has the downloaded
@@ -58,11 +64,15 @@ tombstones by id alone.
 - `syncAccount` fetches no bodies. Removed: the in-lock body lane,
   `bodyBacklogOnly`, the history inline body fetch, the history reason `body`
   and its scan, `getHistoricalBodyBacklog`, `skipMailboxLock`,
-  `SyncResult.bodiesFetched` and the id-only `markMessageGone`.
+  `SyncResult.bodiesFetched` and the id-only `markMessageGone`. A sync run no
+  longer counts bodies, so new `imap_sync_runs.bodies_fetched` values stay 0;
+  body progress is `imap_account_progress` and the folder body counters. The
+  column is dropped in a later release, once hosts stop reading it.
 - `fetchBody(id, force)` downloads beside the lock and commits through the same
   fenced commit.
-- The worker runs `syncBodies` after each `syncAccount`. A host that keeps a
-  listener runs it on a second connection.
+- `syncAccountWithBodies` runs the pass, then `syncBodies`, and reports a failed
+  body run beside the recorded pass. The worker, REST sync and CLI sync use it.
+  A host that keeps a listener runs `syncBodies` on a second connection.
 
 ## Consequences
 

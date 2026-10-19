@@ -175,8 +175,11 @@ function buildApp(options: {
     getMessage: vi.fn(async () => ({ id: messageId }) as never)
   };
   const engine = {
-    syncAccount: vi.fn(async () => makeSyncResult()),
-    syncBodies: vi.fn(async () => ({ committed: 0, gone: 0, skipped: 0, remaining: false })),
+    syncAccountWithBodies: vi.fn(async () => ({
+      ...makeSyncResult(),
+      bodies: { committed: 0, gone: 0, skipped: 0, remaining: false },
+      bodyError: null
+    })),
     fetchBody: vi.fn(async () => true)
   };
   const applyMigration = vi.fn(options.applyMigration ?? (async () => undefined));

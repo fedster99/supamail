@@ -9,35 +9,33 @@ import {
 } from "../sync-engine.js";
 
 describe("sync engine safety", () => {
-  it("closes only the body connection at the download deadline and backs that message off", async () => {
-    vi.useFakeTimers();
-    try {
-      const message = {
-        id: "message-1",
-        account_id: "account-1",
-        folder_path: "INBOX",
-        uidvalidity: "7",
-        uid: "5",
-        size_bytes: "81920"
-      };
+  describe("syncBodies beside the lock (ADR 0044)", () => {
+    const message = {
+      id: "message-1",
+      account_id: "account-1",
+      folder_path: "INBOX",
+      uidvalidity: "7",
+      uid: "5",
+      size_bytes: "81920",
+      mime_structure: { type: "text/plain" }
+    };
+
+    function bodyEngine(options: {
+      client: Record<string, unknown>;
+      account?: Record<string, unknown>;
+      config?: Record<string, unknown>;
+    }) {
       const repository = {
         getAccount: vi.fn(async () => ({
           id: "account-1",
           lock_id: "42",
           sync_state: "HEALTHY",
-          historical_backfill_mode: "off"
+          historical_backfill_mode: "off",
+          ...options.account
         })),
-        getBodyBacklog: vi.fn(async (_account: unknown, _limit: number, options: { excludeIds?: string[] }) =>
-          options.excludeIds?.includes(message.id) ? [] : [message])
-      };
-      let rejectFetch: (error: Error) => void = () => undefined;
-      const client = {
-        mailbox: { path: "INBOX", uidValidity: 7 },
-        getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
-        // A trickling provider: the FETCH ends only when the socket closes.
-        fetchOne: vi.fn(() => new Promise((_, reject) => { rejectFetch = reject; })),
-        close: vi.fn(() => rejectFetch(new Error("Connection closed"))),
-        logout: vi.fn(async () => undefined)
+        getBodyBacklog: vi.fn(async (_account: unknown, _limit: number, backlog: { excludeIds?: string[] }) =>
+          backlog.excludeIds?.includes(message.id) ? [] : [message]),
+        storeBodyEvidence: vi.fn(async () => undefined)
       };
       const engine = new MirrorEngine({
         pool: {} as never,
@@ -45,33 +43,170 @@ describe("sync engine safety", () => {
           BODY_STORAGE_MODE: "raw_mime",
           BODY_RAW_MAX_BYTES: 1_000_000,
           BODY_BACKFILL_BATCH_SIZE: 10,
-          MAX_BODY_BATCHES_PER_TICK: 4
+          MAX_BODY_BATCHES_PER_TICK: 4,
+          MAX_LOCK_HOLD_MS: 600_000,
+          ...options.config
         } as never,
         repository: repository as never,
-        clientFactory: async () => client as never
+        clientFactory: async () => options.client as never
       });
-
-      const run = engine.syncBodies("account-1", { client: client as never });
-      const settled = expect(run).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
-      // 60 s plus 8 KiB/s of the declared 80 KiB.
-      await vi.advanceTimersByTimeAsync(69_999);
-      expect(client.close).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      await settled;
-      expect(client.close).toHaveBeenCalledTimes(1);
-      // A host-owned session is never logged out by the engine.
-      expect(client.logout).not.toHaveBeenCalled();
-
-      // The next run skips the message while it backs off, and needs no connection.
-      expect(await engine.syncBodies("account-1", { client: client as never }))
-        .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
-      expect(repository.getBodyBacklog.mock.calls[1][2]).toEqual({
-        includeArchive: false,
-        excludeIds: [message.id]
-      });
-    } finally {
-      vi.useRealTimers();
+      return { engine, repository };
     }
+
+    /** A trickling provider: the FETCH ends only when the socket closes. */
+    function tricklingClient() {
+      let rejectFetch: (error: Error) => void = () => undefined;
+      const client = {
+        usable: true,
+        mailbox: { path: "INBOX", uidValidity: 7 } as Record<string, unknown> | false,
+        invalidateSelection: vi.fn(),
+        getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+        fetchOne: vi.fn(() => new Promise((_, reject) => { rejectFetch = reject; })),
+        close: vi.fn(() => {
+          client.usable = false;
+          client.mailbox = false;
+          rejectFetch(new Error("Connection closed"));
+        }),
+        logout: vi.fn(async () => undefined)
+      };
+      return client;
+    }
+
+    it("closes only the body connection at the deadline and backs the message off, doubling", async () => {
+      // The MIME parser schedules with setImmediate, which must stay real.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        const client = tricklingClient();
+        const { engine, repository } = bodyEngine({ client });
+        const own = { client: client as never, clientAccountId: "account-1" };
+
+        const run = engine.syncBodies("account-1", own);
+        const settled = expect(run).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
+        // 60 s plus 8 KiB/s of the declared 80 KiB.
+        await vi.advanceTimersByTimeAsync(69_999);
+        expect(client.close).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await settled;
+        expect(client.close).toHaveBeenCalledTimes(1);
+        expect(client.invalidateSelection).toHaveBeenCalledTimes(1);
+        // A host-owned session is never logged out, and nothing was written.
+        expect(client.logout).not.toHaveBeenCalled();
+        expect(repository.storeBodyEvidence).not.toHaveBeenCalled();
+
+        // The next run skips the message for 1 min and opens no connection.
+        expect(await engine.syncBodies("account-1", own))
+          .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+        expect(repository.getBodyBacklog.mock.calls[1][2]).toEqual({
+          includeArchive: false,
+          excludeIds: [message.id]
+        });
+
+        // After 1 min it is retried; a second failure backs it off for 2 min.
+        const retry = tricklingClient();
+        await vi.advanceTimersByTimeAsync(60_000);
+        const retried = engine.syncBodies("account-1", { client: retry as never, clientAccountId: "account-1" });
+        const retriedSettled = expect(retried).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
+        await vi.advanceTimersByTimeAsync(70_000);
+        await retriedSettled;
+        await vi.advanceTimersByTimeAsync(110_000);
+        expect((await engine.syncBodies("account-1", own)).committed).toBe(0);
+        expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [message.id] });
+        await vi.advanceTimersByTimeAsync(20_000);
+        const third = tricklingClient();
+        const thirdRun = engine.syncBodies("account-1", { client: third as never, clientAccountId: "account-1" });
+        const thirdSettled = expect(thirdRun).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
+        await vi.waitFor(() => expect(third.fetchOne).toHaveBeenCalled());
+        await vi.advanceTimersByTimeAsync(70_000);
+        await thirdSettled;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("never commits a stream that the deadline cut off between chunks", async () => {
+      // The MIME parser schedules with setImmediate, which must stay real.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        let endStream: () => void = () => undefined;
+        const client = {
+          usable: true,
+          mailbox: { path: "INBOX", uidValidity: 7 } as Record<string, unknown> | false,
+          getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+          fetchOne: vi.fn(async () => ({ uid: 5, bodyStructure: { type: "text/plain" }, size: 81_920 })),
+          // ImapFlow ends the chunk stream quietly once its connection closes.
+          download: vi.fn(async () => ({
+            content: (async function* () {
+              yield Buffer.from("Subject: cut\r\n\r\npartial");
+              await new Promise<void>((resolve) => { endStream = resolve; });
+            })()
+          })),
+          close: vi.fn(() => {
+            client.usable = false;
+            client.mailbox = false;
+            endStream();
+          }),
+          logout: vi.fn(async () => undefined)
+        };
+        const { engine, repository } = bodyEngine({ client, config: { BODY_STORAGE_MODE: "parsed_only" } });
+        const run = engine.syncBodies("account-1");
+        const settled = expect(run).rejects.toBeInstanceOf(BodyDownloadTimeoutError);
+        await vi.advanceTimersByTimeAsync(70_000);
+        await settled;
+        expect(repository.storeBodyEvidence).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("closes the body connection on shutdown and backs nothing off", async () => {
+      const client = tricklingClient();
+      const { engine, repository } = bodyEngine({ client });
+      const abort = new AbortController();
+      const run = engine.syncBodies("account-1", { signal: abort.signal });
+      await vi.waitFor(() => expect(client.fetchOne).toHaveBeenCalled());
+      abort.abort();
+      await expect(run).rejects.toThrow();
+      expect(client.close).toHaveBeenCalled();
+      expect(repository.storeBodyEvidence).not.toHaveBeenCalled();
+      await engine.syncBodies("account-1", { signal: new AbortController().signal }).catch(() => undefined);
+      expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [] });
+    });
+
+    it("refuses a host-owned client that names another Mailbox Account", async () => {
+      const { engine, repository } = bodyEngine({ client: tricklingClient() });
+      await expect(engine.syncBodies("account-1", { client: {} as never }))
+        .rejects.toThrow("Host-owned client does not match the Mailbox Account");
+      await expect(engine.syncBodies("account-1", { client: {} as never, clientAccountId: "account-2" }))
+        .rejects.toThrow("Host-owned client does not match the Mailbox Account");
+      expect(repository.getAccount).not.toHaveBeenCalled();
+    });
+
+    it.each(["PAUSED", "BROKEN"])("downloads nothing for a %s account", async (state) => {
+      const client = tricklingClient();
+      const { engine, repository } = bodyEngine({ client, account: { sync_state: state } });
+      expect(await engine.syncBodies("account-1"))
+        .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+      expect(repository.getBodyBacklog).not.toHaveBeenCalled();
+    });
+
+    it("adds archive bodies only in metadata_and_bodies mode inside the backfill window", async () => {
+      const outside = new Date().getUTCHours();
+      const cases = [
+        [{ historical_backfill_mode: "metadata_and_bodies" }, {}, true],
+        [{ historical_backfill_mode: "metadata_only" }, {}, false],
+        [{ historical_backfill_mode: "metadata_and_bodies" }, {
+          BACKFILL_WINDOW_START_HOUR: (outside + 1) % 24,
+          BACKFILL_WINDOW_END_HOUR: (outside + 2) % 24,
+          BACKFILL_WINDOW_TIMEZONE: "UTC"
+        }, false]
+      ] as const;
+      for (const [account, config, includeArchive] of cases) {
+        const { engine, repository } = bodyEngine({ client: tricklingClient(), account, config });
+        repository.getBodyBacklog.mockResolvedValue([]);
+        await engine.syncBodies("account-1");
+        expect(repository.getBodyBacklog.mock.calls[0][2]).toMatchObject({ includeArchive });
+      }
+    });
   });
 
   it("records no run when account-lock acquisition throws", async () => {

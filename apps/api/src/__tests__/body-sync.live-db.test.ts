@@ -39,8 +39,10 @@ class GatedBodyClient extends FixtureImapClient {
     this.gate = new Promise((resolve) => { this.open = resolve; });
   }
 
+  gatedUids: Set<string> | null = null;
+
   override async fetchOne(range: string, query: Record<string, unknown>, options?: Record<string, unknown>) {
-    if (query.source) {
+    if (query.source && (this.gatedUids === null || this.gatedUids.has(range))) {
       this.enter();
       await this.gate;
       if (this.goneUids.has(range)) return false;
@@ -156,6 +158,67 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     expect(await h.buildEngine({ folders, clientFactory: async () => client }).syncBodies(h.account.id))
       .toEqual({ committed: 0, gone: 1, skipped: 0, remaining: false });
     expect(await rows()).toEqual([{ uid: "1", fetched: false, deleted: true, evidence: false }]);
+  });
+
+  it("commits each unit before the next one downloads", async () => {
+    const folders = inbox([message(1), message(2)]);
+    await setup("bodies-per-unit", folders);
+    const client = new GatedBodyClient(folders);
+    client.gatedUids = new Set(["1"]);
+    const bodies = h.buildEngine({ folders, clientFactory: async () => client }).syncBodies(h.account.id);
+    await client.entered;
+
+    // Newest first: UID 2 is stored while UID 1 still downloads.
+    expect(await rows()).toEqual([
+      { uid: "1", fetched: false, deleted: false, evidence: false },
+      { uid: "2", fetched: true, deleted: false, evidence: true }
+    ]);
+    client.open();
+    expect(await bodies).toEqual({ committed: 2, gone: 0, skipped: 0, remaining: false });
+  });
+
+  it("runs the body run after the pass and reports it beside the pass", async () => {
+    const folders = inbox([message(1)]);
+    h = await setupIntegration("bodies-with-pass", { BODY_BACKFILL_BATCH_SIZE: 5 });
+    accounts.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const result = await h.buildEngine({ folders }).syncAccountWithBodies(h.account.id, "manual");
+    expect(result).toMatchObject({
+      outcome: "success",
+      bodies: { committed: 1, gone: 0, skipped: 0, remaining: false },
+      bodyError: null
+    });
+    expect(await rows()).toEqual([{ uid: "1", fetched: true, deleted: false, evidence: true }]);
+  });
+
+  it("treats shutdown during the body run as a neutral stop", async () => {
+    const folders = inbox([message(1)]);
+    h = await setupIntegration("bodies-shutdown", { BODY_BACKFILL_BATCH_SIZE: 5 });
+    accounts.push(h.account.id);
+    await h.pool.query("UPDATE public.imap_accounts SET body_fetch_policy = 'immediate' WHERE id = $1", [h.account.id]);
+    const client = new GatedBodyClient(folders);
+    const abort = new AbortController();
+    const engine = h.buildEngine({ folders, clientFactory: async () => client });
+    const run = engine.syncAccountWithBodies(h.account.id, "manual", { signal: abort.signal });
+    await client.entered;
+    abort.abort();
+    client.open();
+    expect(await run).toMatchObject({ outcome: "success", bodies: null, bodyError: null });
+    expect(await rows()).toEqual([{ uid: "1", fetched: false, deleted: false, evidence: false }]);
+  });
+
+  it("refetches one body on demand through the same fenced commit", async () => {
+    const folders = inbox([message(1)]);
+    await setup("bodies-fetch-body", folders);
+    const [row] = (await h.pool.query<{ id: string }>(
+      "SELECT id FROM public.imap_messages WHERE account_id = $1",
+      [h.account.id]
+    )).rows;
+    const engine = h.buildEngine({ folders });
+    expect(await engine.fetchBody(row.id)).toBe(true);
+    expect(await rows()).toEqual([{ uid: "1", fetched: true, deleted: false, evidence: true }]);
+    expect(await engine.fetchBody(row.id)).toBe(false);
+    expect(await engine.fetchBody(row.id, true)).toBe(true);
   });
 
   it("downloads live-window bodies before archive bodies, missing before upgrades", async () => {

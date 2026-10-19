@@ -399,34 +399,57 @@ export class MirrorEngine {
 
     for (const account of accounts) {
       if (options.signal?.aborted) break;
-      const pass = await this.syncAccount(account.id, "scheduled", { signal: options.signal });
-      let bodies: BodySyncResult | null = null;
-      let bodyError: string | null = null;
-      if (!options.signal?.aborted) {
-        try {
-          bodies = await this.syncBodies(account.id, { signal: options.signal });
-        } catch (error) {
-          // A shutdown during the body run is a neutral stop, like the pass's.
-          if (!options.signal?.aborted) bodyError = sanitizeErrorReason(describeSyncError(error));
-        }
-      }
-      results.push({ ...pass, bodies, bodyError });
+      results.push(await this.syncAccountWithBodies(account.id, "scheduled", options));
     }
 
     return results;
   }
 
   /**
+   * One full sync: the pass, then its body run beside the lock (ADR 0044). A
+   * failed body run is reported beside the recorded pass, never instead of it;
+   * the next run retries.
+   */
+  async syncAccountWithBodies(
+    accountId: string,
+    triggerType: SyncTriggerType,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ScheduledSyncResult> {
+    const pass = await this.syncAccount(accountId, triggerType, { signal: options.signal });
+    let bodies: BodySyncResult | null = null;
+    let bodyError: string | null = null;
+    if (!options.signal?.aborted) {
+      try {
+        bodies = await this.syncBodies(accountId, { signal: options.signal });
+      } catch (error) {
+        // A shutdown during the body run is a neutral stop, like the pass's.
+        if (!options.signal?.aborted) bodyError = sanitizeErrorReason(describeSyncError(error));
+      }
+    }
+    return { ...pass, bodies, bodyError };
+  }
+
+  /**
    * Download due bodies beside the account lock and commit each unit under it
    * (ADR 0044). Live-window bodies come first, then, in `metadata_and_bodies`
-   * mode inside the backfill window, archive bodies. Writes no sync run and no
-   * account state. Pass a host-owned `client` to reuse one session; the engine
-   * never logs it out, and closes it only when a unit passes its deadline.
+   * mode inside the backfill window, archive bodies. A run reads at most
+   * `maxUnits` backlog batches and stops at `MAX_LOCK_HOLD_MS`; `remaining` says
+   * bodies may be left. Writes no sync run and no account state. A host-owned
+   * `client` must name its Mailbox Account; the engine never logs it out, and
+   * closes it only at a unit deadline or on abort.
    */
   async syncBodies(
     accountId: string,
-    options: { client?: MirrorImapClient; signal?: AbortSignal; maxUnits?: number } = {}
+    options: {
+      client?: MirrorImapClient;
+      clientAccountId?: string;
+      signal?: AbortSignal;
+      maxUnits?: number;
+    } = {}
   ): Promise<BodySyncResult> {
+    if (options.client && options.clientAccountId !== accountId) {
+      throw new Error("Host-owned client does not match the Mailbox Account");
+    }
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
     const result: BodySyncResult = { committed: 0, gone: 0, skipped: 0, remaining: false };
@@ -435,40 +458,29 @@ export class MirrorEngine {
     const includeArchive = account.historical_backfill_mode === "metadata_and_bodies"
       && isWithinBackfillWindow(this.config);
     const maxUnits = options.maxUnits ?? this.config.MAX_BODY_BATCHES_PER_TICK;
+    const budgetEndsAt = Date.now() + this.config.MAX_LOCK_HOLD_MS;
     let client = options.client ?? null;
+    // Shutdown closes the body connection, which also ends a streamed download.
+    const interrupt = () => {
+      if (client) this.abortClient(client);
+    };
+    options.signal?.addEventListener("abort", interrupt, { once: true });
     try {
-      for (let unit = 0; unit < maxUnits; unit += 1) {
+      for (let batch = 0; batch < maxUnits; batch += 1) {
         options.signal?.throwIfAborted();
+        if (Date.now() >= budgetEndsAt) break;
         const backlog = await this.repository.getBodyBacklog(account, this.config.BODY_BACKFILL_BATCH_SIZE, {
           includeArchive,
           excludeIds: this.backedOffBodyIds()
         });
         if (backlog.length === 0) return result;
         client ??= await this.clientFactory(account, { signal: options.signal });
-
-        const { downloaded, failure } = await this.downloadBodies(client, backlog);
-        let written: Omit<BodySyncResult, "remaining">;
-        try {
-          written = await this.commitBodies(account, downloaded);
-        } catch (error) {
-          if (!(error instanceof AccountBusyError)) {
-            // The failing row is unknown; keep the batch from blocking the backlog.
-            this.backOffBodies(backlog);
-            throw error;
-          }
-          // A long holder: these bodies download again on a later run.
-          result.remaining = true;
-          return result;
-        }
-        result.committed += written.committed;
-        result.gone += written.gone;
-        result.skipped += written.skipped;
-        // Metadata sync owns a UIDVALIDITY reset; those rows wait for it.
-        if (failure && !(failure instanceof BodySourceChangedError)) throw failure;
+        if (!await this.syncBodyBatch(account, client, backlog, result, budgetEndsAt, options.signal)) break;
       }
       result.remaining = true;
       return result;
     } finally {
+      options.signal?.removeEventListener("abort", interrupt);
       if (client && !options.client) await client.logout().catch(() => this.abortClient(client!));
     }
   }
@@ -1021,9 +1033,7 @@ export class MirrorEngine {
     // Download beside the lock, then the same fenced commit as syncBodies (ADR 0044).
     const client = await this.clientFactory(account);
     try {
-      const { downloaded, failure } = await this.downloadBodies(client, [message]);
-      await this.commitBodies(account, downloaded);
-      if (failure) throw failure;
+      await this.commitBodies(account, await this.downloadBodyUnit(client, [message], undefined));
       return true;
     } finally {
       await client.logout().catch(() => this.abortClient(client));
@@ -2467,53 +2477,93 @@ export class MirrorEngine {
   }
 
   /**
-   * Download one backlog batch beside the lock (ADR 0044), one unit at a time: a
-   * bounded parsed-only UID-set fetch or one message. Each unit may take 60 s
-   * plus 8 KiB/s of declared size, at most 30 min; on expiry this connection
-   * closes, which also ends a streamed download between its chunks. The first
-   * failing unit is backed off and ends the batch; what it downloaded before
-   * still commits.
+   * Download one backlog batch beside the lock, one unit at a time (a bounded
+   * parsed-only UID-set fetch or one message), and commit each unit under the
+   * lock as soon as it arrives, so memory and the lock hold stay at one unit.
+   * A failed unit is backed off and ends the run. Returns false when the run
+   * stops early: the lock stayed busy or the run budget ran out.
    */
-  private async downloadBodies(
+  private async syncBodyBatch(
+    account: ImapAccount,
     client: MirrorImapClient,
-    backlog: ImapMessage[]
-  ): Promise<{ downloaded: DownloadedBodies; failure: unknown }> {
+    backlog: ImapMessage[],
+    result: BodySyncResult,
+    budgetEndsAt: number,
+    signal: AbortSignal | undefined
+  ): Promise<boolean> {
     const ordered = this.config.BODY_STORAGE_MODE === "parsed_only"
       ? this.groupBodiesByFolder(backlog)
       : backlog;
-    const downloaded: DownloadedBodies = { batches: [], single: [], gone: [] };
     // A reused session selects each folder again, so it sees every UID the
     // backlog read just returned and a present message never looks gone.
     client.invalidateSelection?.();
     for (let index = 0; index < ordered.length;) {
+      if (Date.now() >= budgetEndsAt) return false;
       const batch = this.parsedBodyBatchAt(ordered, index);
       const unit = batch.length > 1 ? batch : [ordered[index]];
-      try {
-        await this.withBodyDeadline(client, unit, async () => {
-          if (batch.length > 1) {
-            const fetched = await fetchFullMessageBodyBatch(client, this.config, unit);
-            // A set FETCH can omit a response or its source; that is no
-            // evidence the message is gone. The individual download decides.
-            for (const message of fetched.missingMessages) {
-              await this.downloadOneBody(client, message, downloaded);
-            }
-            downloaded.batches.push(fetched.bodies);
-          } else {
-            await this.downloadOneBody(client, unit[0], downloaded);
-          }
-        });
-      } catch (error) {
-        this.backOffBodies(unit);
-        return { downloaded, failure: error };
-      }
       index += unit.length;
+
+      let downloaded: DownloadedBodies;
+      try {
+        downloaded = await this.downloadBodyUnit(client, unit, signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        this.backOffBodies(unit);
+        // Metadata sync owns a UIDVALIDITY reset; these rows wait for it.
+        if (error instanceof BodySourceChangedError) continue;
+        throw error;
+      }
+
+      let written: Omit<BodySyncResult, "remaining">;
+      try {
+        written = await this.commitBodies(account, downloaded);
+      } catch (error) {
+        // A long lock holder: this unit downloads again on a later run.
+        if (error instanceof AccountBusyError) return false;
+        this.backOffBodies(unit);
+        throw error;
+      }
+      result.committed += written.committed;
+      result.gone += written.gone;
+      result.skipped += written.skipped;
     }
-    return { downloaded, failure: null };
+    return true;
   }
 
+  /**
+   * One unit's download. Its result is all or nothing: a unit that fails, passes
+   * its deadline or is aborted contributes no body and no gone message.
+   */
+  private async downloadBodyUnit(
+    client: MirrorImapClient,
+    unit: ImapMessage[],
+    signal: AbortSignal | undefined
+  ): Promise<DownloadedBodies> {
+    const downloaded: DownloadedBodies = { batches: [], single: [], gone: [] };
+    await this.withBodyDeadline(client, unit, signal, async () => {
+      if (unit.length > 1) {
+        const fetched = await fetchFullMessageBodyBatch(client, this.config, unit);
+        // A set FETCH can omit a response or its source; that is no evidence
+        // the message is gone. The individual download decides.
+        for (const message of fetched.missingMessages) {
+          await this.downloadOneBody(client, message, downloaded);
+        }
+        downloaded.batches.push(fetched.bodies);
+      } else {
+        await this.downloadOneBody(client, unit[0], downloaded);
+      }
+    });
+    return downloaded;
+  }
+
+  /**
+   * A unit may take 60 s plus 8 KiB/s of declared size, at most 30 min; on expiry
+   * this connection closes, which also ends a streamed download between chunks.
+   */
   private async withBodyDeadline(
     client: MirrorImapClient,
     unit: readonly ImapMessage[],
+    signal: AbortSignal | undefined,
     run: () => Promise<void>
   ): Promise<void> {
     const declaredBytes = unit.reduce(
@@ -2539,6 +2589,7 @@ export class MirrorEngine {
     }
     // A closed connection can end a stream early instead of failing it.
     if (timedOut) throw new BodyDownloadTimeoutError(unit.length, deadlineMs);
+    signal?.throwIfAborted();
   }
 
   private async downloadOneBody(

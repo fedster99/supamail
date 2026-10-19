@@ -110,9 +110,8 @@ program
   .description("Trigger one account sync")
   .requiredOption("--account-id <id>", "Account UUID")
   .action(async (options) => {
-    const result = await engine.syncAccount(options.accountId, "manual");
-    const bodies = await engine.syncBodies(options.accountId);
-    console.log(JSON.stringify({ ...result, bodies }, null, 2));
+    const result = await engine.syncAccountWithBodies(options.accountId, "manual");
+    console.log(JSON.stringify(result, null, 2));
   });
 
 program

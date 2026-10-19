@@ -78,12 +78,11 @@ import {
 import type {
   AccountDetails,
   AccountSummary,
-  BodySyncResult,
   ImapFolder,
   ImapMessage,
   SendRequest,
+  ScheduledSyncResult,
   SendResult,
-  SyncResult,
   UpdateAccountCredentialsInput,
   UpdateAccountSettingsInput
 } from "./types.js";
@@ -100,8 +99,7 @@ interface ApiRepository {
 }
 
 interface ApiEngine {
-  syncAccount(id: string, source: "api"): Promise<SyncResult>;
-  syncBodies(id: string): Promise<BodySyncResult>;
+  syncAccountWithBodies(id: string, source: "api"): Promise<ScheduledSyncResult>;
   fetchBody(id: string, force?: boolean): Promise<boolean>;
 }
 
@@ -531,10 +529,9 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
-    const result = await options.engine.syncAccount(id, "api");
-    // Bodies download beside the lock after the pass (ADR 0044).
-    const bodies = await options.engine.syncBodies(id);
-    return c.json({ result, bodies });
+    // The pass, then its bodies beside the lock (ADR 0044).
+    const result = await options.engine.syncAccountWithBodies(id, "api");
+    return c.json({ result });
   });
 
   app.patch("/accounts/:id/credentials", async (c) => {

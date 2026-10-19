@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 import {
+  ImapConnectionClosedError,
   fetchFullMessageBody,
   fetchFullMessageBodyBatch,
   fetchChangedMessageFlags,
@@ -117,6 +118,31 @@ describe("fetchMessageMetadata", () => {
     expect(source).toContain("withCommandTimeout");
     expect(source).toContain("IMAP_COMMAND_TIMEOUT_MS exceeded");
     expect(source).toContain("this.client.close()");
+  });
+
+  it("refuses a body command on a closed connection instead of reading it as a gone message", async () => {
+    // ImapFlow answers fetchOne and download on a closed connection with an
+    // empty result, which a body fetch would otherwise read as a gone UID.
+    const rawClient = Object.assign(new EventEmitter(), {
+      mailbox: false,
+      usable: false,
+      capabilities: new Map<string, boolean | number>(),
+      close: vi.fn(() => undefined),
+      fetchOne: vi.fn(async () => undefined),
+      download: vi.fn(async () => ({})),
+      fetch: vi.fn()
+    });
+    const client = new ThrottledImapClient(rawClient as never, 60, 1_000);
+    await expect(client.fetchOne("5", { source: true }, { uid: true }))
+      .rejects.toBeInstanceOf(ImapConnectionClosedError);
+    await expect(client.download("5", undefined, { uid: true }))
+      .rejects.toBeInstanceOf(ImapConnectionClosedError);
+    await expect((async () => {
+      for await (const _ of client.fetch([5], { source: true }, { uid: true })) break;
+    })()).rejects.toBeInstanceOf(ImapConnectionClosedError);
+    expect(rawClient.fetchOne).not.toHaveBeenCalled();
+    expect(rawClient.download).not.toHaveBeenCalled();
+    expect(rawClient.fetch).not.toHaveBeenCalled();
   });
 
   it("marks a command-timed-out client unusable", async () => {

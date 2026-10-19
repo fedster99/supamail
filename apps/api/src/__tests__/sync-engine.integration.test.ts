@@ -2182,10 +2182,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
   });
 
-  it.each(["history"] as const)(
-    "recognizes shutdown after the %s lane without changing account health",
-    async (lane) => {
-      const h = await setupIntegration(`full-sync-${lane}-abort`);
+  it(
+    "recognizes shutdown after the history lane without changing account health",
+    async () => {
+      const h = await setupIntegration("full-sync-history-abort");
       activeAccountIds.push(h.account.id);
       const folders = buildInboxAndSentFolders();
       const engine = h.buildEngine({ folders });
@@ -6407,8 +6407,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
     expect(sync.status).toBe(200);
     await expect(sync.json()).resolves.toMatchObject({
-      result: { outcome: "success" },
-      bodies: { committed: 1 }
+      result: { outcome: "success", bodies: { committed: 1 }, bodyError: null }
     });
 
     const after = await h.pool.query<{ count: string }>(

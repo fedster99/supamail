@@ -421,6 +421,7 @@ export class ThrottledImapClient implements MirrorImapClient {
     options?: Record<string, unknown>
   ): AsyncIterable<FetchMessage> {
     await this.throttle.acquire(this.signal);
+    this.assertOpen("fetch");
     const iterator = (this.client.fetch(
       range as never,
       query as never,
@@ -458,6 +459,7 @@ export class ThrottledImapClient implements MirrorImapClient {
     options?: Record<string, unknown>
   ): Promise<FetchMessage | false | null> {
     await this.throttle.acquire(this.signal);
+    this.assertOpen("fetchOne");
     return await this.withCommandTimeout(
       "fetchOne",
       async () => await this.client.fetchOne(range, query as never, options as never) as FetchMessage | false | null
@@ -474,10 +476,15 @@ export class ThrottledImapClient implements MirrorImapClient {
 
   async download(range: string, part?: string, options?: Record<string, unknown>): Promise<DownloadResult> {
     await this.throttle.acquire(this.signal);
+    this.assertOpen("download");
     return await this.withCommandTimeout(
       "download",
       async () => await this.client.download(range, part as never, options as never) as DownloadResult
     );
+  }
+
+  private assertOpen(operation: string): void {
+    if (this.invalidated || this.client.usable === false) throw new ImapConnectionClosedError(operation);
   }
 
   private async withCommandTimeout<T>(operation: string, run: () => Promise<T>): Promise<T> {
@@ -961,6 +968,18 @@ export class MessageMovedError extends Error {
 }
 
 /**
+ * The IMAP connection closed (deadline, abort, server BYE or socket loss) before
+ * or during a command. ImapFlow answers a command on a closed connection with an
+ * empty result, so without this check a closed connection reads as a gone message.
+ */
+export class ImapConnectionClosedError extends Error {
+  constructor(operation: string) {
+    super(`IMAP connection closed during ${operation}`);
+    this.name = "ImapConnectionClosedError";
+  }
+}
+
+/**
  * The folder's UIDVALIDITY no longer matches the row: the stored UIDs name other
  * messages now. Metadata sync owns the reset; a body download leaves these rows.
  */
@@ -1145,12 +1164,11 @@ export async function fetchFullMessageBody(
 
   try {
     const mailbox = client.mailbox;
-    if (mailbox) {
-      const serverUidValidity = Number(mailbox.uidValidity);
-      const storedUidValidity = Number(message.uidvalidity);
-      if (serverUidValidity !== storedUidValidity) {
-        throw new BodySourceChangedError(message.folder_path);
-      }
+    if (!mailbox || mailbox.path !== message.folder_path) {
+      throw new Error(`body fetch expected ${message.folder_path} to be selected`);
+    }
+    if (Number(mailbox.uidValidity) !== Number(message.uidvalidity)) {
+      throw new BodySourceChangedError(message.folder_path);
     }
 
     const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
@@ -1216,6 +1234,9 @@ export async function fetchFullMessageBody(
       parsed = await parseRawMime(rawMime);
     }
 
+    // A stream whose connection closed between chunks ends without an error; the
+    // cut-off source is not the message.
+    if (client.usable === false) throw new ImapConnectionClosedError("body download");
     const rawTruncated = streamParsedOnly
       ? isParsedOnlySourceTruncated(
         rawBytes,
