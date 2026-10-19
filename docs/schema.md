@@ -6,6 +6,7 @@ The mirror owns these neutral tables in `public`:
 - `imap_folders`
 - `imap_folder_message_counts`
 - `imap_messages`
+- `imap_message_changes`
 - `imap_message_bodies`
 - `imap_attachments`
 - `imap_message_evidence`
@@ -64,6 +65,12 @@ from `imap_folders` so their row locks never meet the folder-row locks sync
 takes before writing messages. The migration backfills once while it blocks
 message writes. `list_folders` reads these rows instead of counting messages;
 unlike `headers_synced_count`, they also fall on deletes and moves.
+
+`0035_message_change_outbox` adds `imap_message_changes`: one row per update of
+a live (not provider-deleted) message, written by a `SECURITY DEFINER` statement
+trigger in the writer's transaction (ADR 0046). New messages are not recorded;
+consumers find them by `(created_at, id)`. A consumer reads rows in `id` order and
+deletes the ones it handled; retention deletes rows older than seven days.
 
 `0029_active_assignments_view_no_barrier` drops `security_barrier` from
 `imap_thread_active_assignments`. A barrier view is never flattened into the
