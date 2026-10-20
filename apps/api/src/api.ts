@@ -726,7 +726,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
     const input = DRAFT_BODY_SCHEMA.parse(await parseJsonBody(c));
     // Optional idempotent create: a retry carrying the same Idempotency-Key returns the
-    // existing draft instead of filing a duplicate (search-before-APPEND in createDraft).
+    // existing draft instead of filing a duplicate (createDraft looks in Drafts first).
     // Normalize blank/whitespace to "no key" so "" and "   " behave identically
     // (both fall back to a non-idempotent APPEND) instead of "" silently duping while
     // "   " derives a useless Message-ID.
