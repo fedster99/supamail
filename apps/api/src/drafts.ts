@@ -275,9 +275,9 @@ async function fileDraft(
 
   // Idempotency: a retried create (same key -> same Message-ID) finds its prior
   // APPEND and returns that UID instead of filing a duplicate draft. Runs under
-  // the same lock as the APPEND, so search + append are atomic per account.
+  // the same lock as the APPEND, so lookup + append are atomic per account.
   if (idempotencyKey) {
-    const existing = await appender.searchByMessageId(draftsFolderPath, rfcMessageId);
+    const existing = await appender.findByMessageId(draftsFolderPath, rfcMessageId);
     if (existing.uids.length > 0) {
       return {
         draftsFolderPath,
