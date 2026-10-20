@@ -735,7 +735,7 @@ async function sendDraftAttempt(
         }
       }
 
-      return { send: { ...send, warnings }, deletedDraftId: messageId, draftDeleted, warnings };
+      return { send, deletedDraftId: messageId, draftDeleted, warnings };
     } finally {
       try {
         await connection.close();

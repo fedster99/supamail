@@ -152,8 +152,6 @@ const config = { IMAP_ENCRYPTION_KEY: "0123456789abcdef", IMAP_ALLOW_PRIVATE_HOS
 /** A pool whose only query is the Drafts folder lookup used by draft actions. */
 const draftPool = { query: vi.fn(async () => ({ rows: [{ path: "Drafts" }] })) } as never;
 const draftRow = { id: D1, account_id: "11111111-1111-4111-8111-111111111111", folder_path: "Drafts", flags: [], deleted_in_provider: false };
-/** The tracked, mirrored Drafts folder at the APPENDUID's UIDVALIDITY. */
-const draftsFolder = { id: "folder-drafts", account_id: "11111111-1111-4111-8111-111111111111", path: "Drafts", uidvalidity: "100" };
 
 const account = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -185,8 +183,7 @@ beforeEach(() => {
   mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
   mocks.findByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
   mocks.append.mockResolvedValue({ uid: 7, uidValidity: 100 });
-  mocks.getFoldersForWake.mockImplementation(async (_accountId: string, paths: string[]) =>
-    paths.includes("Drafts") ? [draftsFolder] : []);
+  mocks.getFoldersForWake.mockResolvedValue([]);
   mocks.mirrorFiledMessage.mockResolvedValue(N1);
   mocks.getLiveMessageId.mockResolvedValue(null);
   mocks.list.mockResolvedValue([{ path: "Drafts", specialUse: "\\Drafts" }, { path: "Sent", specialUse: "\\Sent" }]);

@@ -5,7 +5,7 @@ import { uidValidityMatches, type ActionConnection, type ActionSocket } from "./
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import type { MirrorRepository } from "./repository.js";
 import { SentFolderAppender, type AppendedUid } from "./smtp-client.js";
-import type { ImapAccount } from "./types.js";
+import type { ImapAccount, SendResult } from "./types.js";
 
 /** Bound on the row write; the provider already holds the message. The body store
  * keeps its own request bounds, as it does for sync. */
@@ -82,13 +82,7 @@ export async function mirrorFiledMessage(
 }
 
 /** The delivered message's copy in Sent, as {@link fileSentCopy} filed it. */
-export interface SentCopy {
-  appendedToSent: boolean;
-  appendedUid: number | null;
-  sentFolderPath: string | null;
-  /** The copy's mirror id, readable at once; null until the next sync mirrors it. */
-  messageId: string | null;
-}
+export type SentCopy = Pick<SendResult, "appendedToSent" | "appendedUid" | "sentFolderPath" | "messageId">;
 
 /**
  * File the delivered bytes to Sent with `\Seen` and mirror the copy at once
