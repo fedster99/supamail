@@ -27,8 +27,7 @@ import {
  * the SMTP target (SSRF guard), composes deterministic RFC-822 bytes, then holds
  * the account advisory lock across SMTP submission and APPEND of the SAME bytes
  * to the Sent folder. When the server answers the APPEND with APPENDUID, the copy
- * is mirrored at once from that UID (ADR 0046), so a read right after the send
- * finds it; otherwise the next sync mirrors it. Identity is never guessed.
+ * is mirrored at once from that UID (ADR 0046), when the folder identity checks pass; otherwise the next sync mirrors it. Identity is never guessed.
  *
  * This lives OUTSIDE src/mcp/ on purpose: the agent surface stays zero-send. The
  * caller (CLI with --confirm, the single-account HTTP API, or a remote runtime)

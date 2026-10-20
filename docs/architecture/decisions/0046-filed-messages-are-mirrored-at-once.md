@@ -72,12 +72,11 @@ named for it, and nothing else. The sync read adapter still gains no write verb.
 
 ## Verification
 
-- `filed-message.test.ts`: the row comes from the server's metadata for the named
-  UID; the body comes from the filed bytes in the body lane's order, with or
-  without raw retention; an untracked, unread, or other-UIDVALIDITY folder reads
-  nothing and writes nothing; another byte count or a body at the cap leaves the
-  body to the body lane; a failed body store keeps the id; Sent filing and mirror
-  failures are warnings.
+- `filed-message.test.ts`: the host store completes before the body is marked
+  readable; mismatched folder identity prevents writes; changed size, the byte
+  cap, and existing bodies skip storage; storage failure keeps the row id;
+  mirror failure preserves confirmed Sent filing. Real database and protocol
+  tests below cover successful filing rather than repeating it in mocks.
 - `drafts.test.ts`, `send.test.ts`: create, update and both sends hold fenced
   locks; create and update pass the APPENDUID, bytes, socket and host body store
   to the mirror; both sends pass the delivered bytes and host body store to the

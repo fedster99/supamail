@@ -294,8 +294,8 @@ async function fileDraft(
 /**
  * Create a draft: compose RFC-822 bytes (email-001 buildRawMime), APPEND them with
  * `\Draft` to the resolved Drafts folder, and write the draft's mirror row from the
- * server's APPENDUID, so the returned `messageId` works at once (ADR 0033). Identity
- * is never guessed: without APPENDUID the next sync of Drafts mirrors the copy.
+ * server's APPENDUID, when the folder identity checks pass (ADR 0046). Without a mirror id, the next
+ * sync of Drafts mirrors the copy.
  */
 export async function createDraft(
   pool: PgPool,

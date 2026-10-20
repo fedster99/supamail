@@ -475,7 +475,7 @@ async function main(): Promise<void> {
       throw new Error("GreenMail basic STATUS fallback did not converge Archive promptly");
     }
 
-    // Send path (email-001, ADR 0045): reply to a mirrored message over SMTP, which
+    // Send path (email-001, ADR 0046): reply to a mirrored message over SMTP, which
     // APPENDs a copy to Sent. Sent is tracked first, so the send mirrors that copy at
     // once from APPENDUID: the row is readable by the returned id before any sync,
     // carries the threading In-Reply-To header (the NULL provider_thread_id path),
