@@ -360,7 +360,7 @@ export async function runSendOperation<T>({
 }
 
 /** The operation action a keyed draft save records. */
-export const DRAFT_SAVE_ACTION = "save_draft";
+const DRAFT_SAVE_ACTION = "save_draft";
 
 export interface ReplayDraftSaveOptions<T> {
   store: SendOperationStore<T>;

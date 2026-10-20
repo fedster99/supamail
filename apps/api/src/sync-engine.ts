@@ -1203,10 +1203,12 @@ export class MirrorEngine {
       deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
       signal: options.signal
     });
-    // A catch-up replay may run without the shared slots: a rejected or partial
+    // A replay reads only provider changes and is never a flag read, so it needs
+    // no flag-scan slot; an ordinary pass needs the reconcile slot its exact
+    // fallback would use. A catch-up replay needs neither: a rejected or partial
     // replay applies nothing, advances no cursor, and the proof retries it.
     const qresyncWanted = this.config.IMAP_QRESYNC_ENABLED
-      && (options.qresyncCatchUp === true || (options.allowFlagScan && options.allowReconcile))
+      && (options.qresyncCatchUp === true || options.allowReconcile)
       && folder.initial_sync_complete
       && folder.uidvalidity !== null
       && folder.qresync_highest_modseq !== null
@@ -1392,23 +1394,16 @@ export class MirrorEngine {
         if (qresyncReplay.accepted && qresyncReplay.complete) {
           const qresyncWriteDeadline = qresyncDeadline!;
           for (let i = 0; i < qresyncReplay.changedFlags.length; i += MAX_SYNC_BATCH_SIZE) {
-            this.assertDeadlineAvailable(
+            flagsUpdated += await this.writeFlags(
               client,
-              qresyncWriteDeadline,
-              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
-              "QRESYNC flag write"
-            );
-            const scan = await this.repository.applyFlagScan(
-              account.id,
+              account,
               folder,
               uidValidity,
               qresyncReplay.changedFlags.slice(i, i + MAX_SYNC_BATCH_SIZE),
-              { deadlineAt: qresyncWriteDeadline, signal: options.signal }
+              qresyncWriteDeadline,
+              "QRESYNC flag write",
+              options.signal
             );
-            flagsUpdated += scan.flagsChanged;
-            for (const message of scan.messages) {
-              await this.hooks.onMessageUpsert?.(message);
-            }
           }
           for (let i = 0; i < qresyncReplay.vanishedUids.length; i += MAX_SYNC_BATCH_SIZE) {
             this.assertDeadlineAvailable(
@@ -1513,23 +1508,16 @@ export class MirrorEngine {
               incrementalBatchSize
             )
           )) {
-            this.assertDeadlineAvailable(
+            flagsUpdated += await this.writeFlags(
               client,
-              flagScanDeadline,
-              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
-              "flag scan write"
-            );
-            const scan = await this.repository.applyFlagScan(
-              account.id,
+              account,
               folder,
               uidValidity,
               flags,
-              { deadlineAt: flagScanDeadline, signal: options.signal }
+              flagScanDeadline,
+              "flag scan write",
+              options.signal
             );
-            flagsUpdated += scan.flagsChanged;
-            for (const message of scan.messages) {
-              await this.hooks.onMessageUpsert?.(message);
-            }
           }
         }
         if (flagBackstopDue
@@ -1576,23 +1564,16 @@ export class MirrorEngine {
               "flag scan FETCH",
               () => fetchMessageFlags(client, batchUids, incrementalBatchSize)
             );
-            this.assertDeadlineAvailable(
+            flagsUpdated += await this.writeFlags(
               client,
-              flagScanDeadline,
-              "FLAG_SCAN_TOTAL_TIMEOUT_MS",
-              "flag scan write"
-            );
-            const scan = await this.repository.applyFlagScan(
-              account.id,
+              account,
               folder,
               uidValidity,
               flags,
-              { deadlineAt: flagScanDeadline, signal: options.signal }
+              flagScanDeadline,
+              "flag scan write",
+              options.signal
             );
-            flagsUpdated += scan.flagsChanged;
-            for (const message of scan.messages) {
-              await this.hooks.onMessageUpsert?.(message);
-            }
           }
         }
       }
@@ -1766,6 +1747,31 @@ export class MirrorEngine {
       }
       mailboxLock.release();
     }
+  }
+
+  /** Writes one batch of provider flags and returns how many rows changed. */
+  private async writeFlags(
+    client: MirrorImapClient,
+    account: ImapAccount,
+    folder: ImapFolder,
+    uidValidity: number,
+    flags: Parameters<MirrorRepository["applyFlagScan"]>[3],
+    deadlineAt: number,
+    operation: string,
+    signal?: AbortSignal
+  ): Promise<number> {
+    this.assertDeadlineAvailable(client, deadlineAt, "FLAG_SCAN_TOTAL_TIMEOUT_MS", operation);
+    const scan = await this.repository.applyFlagScan(
+      account.id,
+      folder,
+      uidValidity,
+      flags,
+      { deadlineAt, signal }
+    );
+    for (const message of scan.messages) {
+      await this.hooks.onMessageUpsert?.(message);
+    }
+    return scan.flagsChanged;
   }
 
   private async withIncrementalDeadline<T>(
