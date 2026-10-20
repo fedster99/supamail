@@ -980,11 +980,12 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(await flags(starred.uid)).toEqual(["\\Flagged"]);
   });
 
-  it("keeps the scheduled audit time across a forced Inbox reconcile", async () => {
+  it("keeps the scheduled audit, and its window flag read, across a forced Inbox reconcile", async () => {
     const overrides = { INITIAL_SYNC_BATCH_SIZE: 50 };
     const h = await setupIntegration("forced-reconcile-keeps-schedule", overrides);
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
+    const [message] = folders[0].messages;
     const engine = h.buildEngine({ folders, overrides });
     await engine.syncAccount(h.account.id, "manual");
     // A listener reconnect forces an Inbox reconcile on the listener's client.
@@ -995,24 +996,31 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       clientAccountId: h.account.id,
       keepClientOpen: true
     });
+    // No routine flag scan is due, so only the audit's window read sees flags.
     const schedule = async (due: string) => (await h.pool.query<{ next: string }>(
-      `UPDATE public.imap_folders SET next_reconcile_at = now() + $2::interval, last_full_reconcile_at = now()
+      `UPDATE public.imap_folders
+       SET next_reconcile_at = now() + $2::interval, last_full_reconcile_at = now(),
+           next_flag_scan_at = now() + interval '6 hours'
        WHERE account_id = $1 AND path = 'INBOX' RETURNING next_reconcile_at::text AS next`,
       [h.account.id, due]
     )).rows[0].next;
-    const next = async () => (await h.pool.query<{ next: string }>(
-      "SELECT next_reconcile_at::text AS next FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
-      [h.account.id]
-    )).rows[0].next;
+    const inbox = async () => (await h.pool.query<{ next: string; flags: string[] }>(
+      `SELECT f.next_reconcile_at::text AS next, m.flags FROM public.imap_folders f
+       JOIN public.imap_messages m ON m.account_id = f.account_id AND m.folder_path = f.path
+       WHERE f.account_id = $1 AND f.path = 'INBOX' AND m.uid = $2`,
+      [h.account.id, message.uid]
+    )).rows[0];
+    message.flags = ["\\Seen"];
 
     const planned = await schedule("2 hours");
     expect((await forced()).reconcileFoldersAttempted).toBe(1);
-    expect(await next()).toBe(planned);
+    expect(await inbox()).toEqual({ next: planned, flags: [] });
 
-    // The scheduled audit itself moves its schedule.
     await schedule("-1 minute");
     expect((await forced()).reconcileFoldersAttempted).toBe(1);
-    expect(new Date(await next()).getTime()).toBeGreaterThan(Date.now() + 5 * 60 * 60_000);
+    const audited = await inbox();
+    expect(audited.flags).toEqual(["\\Seen"]);
+    expect(new Date(audited.next).getTime()).toBeGreaterThan(Date.now() + 5 * 60 * 60_000);
   });
 
   it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {

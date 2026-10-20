@@ -1480,7 +1480,8 @@ export class MirrorEngine {
       // - the backstop: modseqs are hints, so each scheduled exact reconcile also
       //   reads the whole window on every server, inside the reconcile slot, and
       //   RECONCILE_INTERVAL_MS bounds flag staleness even where CHANGEDSINCE is
-      //   wrong (a forced reconcile after a known move stays narrow);
+      //   wrong. A forced reconcile stays narrow unless the schedule is also due;
+      //   a mailbox mutation makes it due (markFoldersForReconcile);
       // - the routine scan on its schedule, which spends a flag-scan slot;
       // - an unchanged modseq, which proves no flag changed and reads nothing.
       const flagDeltaDue = flagCursorBehind && options.allowFlagDelta;

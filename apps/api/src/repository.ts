@@ -2510,10 +2510,11 @@ export class MirrorRepository {
             THEN now() + ($10::bigint * interval '1 millisecond')
           WHEN $6::boolean = false
             THEN now() + ($13::bigint * interval '1 millisecond')
-          -- Only the scheduled audit moves its own schedule: a forced reconcile
-          -- (a listener reconnect or an expunge wake, often hourly) would
-          -- otherwise postpone it, and the window flag read it carries, forever.
-          WHEN $6::boolean = true AND ($17::boolean OR next_reconcile_at IS NULL)
+          -- Only a clean scheduled audit pushes its own schedule out. A clean
+          -- forced reconcile (a listener reconnect or an expunge wake) keeps it;
+          -- otherwise frequent forced runs postpone the audit, and the window
+          -- flag read it carries, indefinitely.
+          WHEN $6::boolean = true AND $17::boolean
             THEN now()
               + ($10::bigint * interval '1 millisecond')
               + ((random() * 900000)::int * interval '1 millisecond')
