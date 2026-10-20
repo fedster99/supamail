@@ -337,7 +337,7 @@ describe("sendMessage orchestration", () => {
       expect.anything(),
       account.lock_id,
       expect.any(Function),
-      // Fenced writes: the Sent copy's mirror row shares fate with the lock (ADR 0044).
+      // Fenced writes: the Sent copy's mirror row shares fate with the lock (ADR 0045).
       expect.objectContaining({ fenceWrites: true, heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
     );
 
