@@ -105,6 +105,31 @@ async function accountHealthSnapshot(pool: ReturnType<typeof getPool>, accountId
 }
 
 /**
+ * Only Inbox is due; every folder's modseq cursors are 10 after a clean
+ * reconcile, and each audit is due now or hours away.
+ */
+async function dueInboxAt(
+  pool: ReturnType<typeof getPool>,
+  accountId: string,
+  due: { reconcileDue: boolean; flagScanDue: boolean }
+): Promise<void> {
+  await pool.query(
+    `UPDATE public.imap_folders
+     SET highest_modseq = 10,
+         qresync_highest_modseq = 10,
+         last_reconcile_clean = true,
+         last_full_reconcile_at = CASE WHEN $2 THEN now() - interval '7 hours' ELSE now() END,
+         next_reconcile_at = now() + CASE WHEN $2 THEN interval '-1 minute' ELSE interval '6 hours' END,
+         next_flag_scan_at = now() + CASE WHEN $3 THEN interval '-1 minute' ELSE interval '6 hours' END,
+         next_sync_due_at = CASE WHEN path = 'INBOX'
+           THEN now() - interval '1 second'
+           ELSE now() + interval '1 hour' END
+     WHERE account_id = $1`,
+    [accountId, due.reconcileDue, due.flagScanDue]
+  );
+}
+
+/**
  * A CONDSTORE/QRESYNC server whose QRESYNC replay for `replayPath` is accepted
  * and complete but names no flag change, as Purelymail's is. CHANGEDSINCE
  * returns `changedSinceUids` (Purelymail: the real changes); with none it
@@ -1003,20 +1028,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
     // Both modseq cursors are current and only the scheduled exact reconcile is
     // due, so only the backstop can read the flag.
-    await h.pool.query(
-      `UPDATE public.imap_folders
-       SET highest_modseq = 10,
-           qresync_highest_modseq = 10,
-           last_reconcile_clean = true,
-           last_full_reconcile_at = now() - interval '7 hours',
-           next_reconcile_at = now() - interval '1 minute',
-           next_flag_scan_at = now() + interval '6 hours',
-           next_sync_due_at = CASE WHEN path = 'INBOX'
-             THEN now() - interval '1 second'
-             ELSE now() + interval '1 hour' END
-       WHERE account_id = $1`,
-      [h.account.id]
-    );
+    await dueInboxAt(h.pool, h.account.id, { reconcileDue: true, flagScanDue: false });
 
     // The User reads the message in webmail. The provider bumps HIGHESTMODSEQ
     // but its change log lost the change: the QRESYNC replay is accepted and
@@ -1052,20 +1064,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const readUid = folders[0].messages[0].uid;
     await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
     // Neither audit is due: only the moved modseq can trigger a flag read.
-    await h.pool.query(
-      `UPDATE public.imap_folders
-       SET highest_modseq = 10,
-           qresync_highest_modseq = 10,
-           last_reconcile_clean = true,
-           last_full_reconcile_at = now(),
-           next_reconcile_at = now() + interval '6 hours',
-           next_flag_scan_at = now() + interval '6 hours',
-           next_sync_due_at = CASE WHEN path = 'INBOX'
-             THEN now() - interval '1 second'
-             ELSE now() + interval '1 hour' END
-       WHERE account_id = $1`,
-      [h.account.id]
-    );
+    await dueInboxAt(h.pool, h.account.id, { reconcileDue: false, flagScanDue: false });
 
     // Purelymail on the wire: the STORE moves the modseq, the QRESYNC replay
     // names nothing, and CHANGEDSINCE names exactly the changed message.
@@ -1117,20 +1116,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       [h.account.id, oldUid]
     );
     expect(before.rowCount).toBe(1);
-    await h.pool.query(
-      `UPDATE public.imap_folders
-       SET highest_modseq = 10,
-           qresync_highest_modseq = 10,
-           last_reconcile_clean = true,
-           last_full_reconcile_at = now() - interval '7 hours',
-           next_reconcile_at = now() - interval '1 minute',
-           next_flag_scan_at = now() + interval '6 hours',
-           next_sync_due_at = CASE WHEN path = 'INBOX'
-             THEN now() - interval '1 second'
-             ELSE now() + interval '1 hour' END
-       WHERE account_id = $1`,
-      [h.account.id]
-    );
+    await dueInboxAt(h.pool, h.account.id, { reconcileDue: true, flagScanDue: false });
 
     // A star on mail older than the window: only CHANGEDSINCE can name it.
     folders[0].messages.find((message) => message.uid === oldUid)!.flags = ["\\Flagged"];
@@ -1160,20 +1146,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const folders = buildInboxAndSentFolders();
     folders[0].highestModseq = 10n;
     await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
-    await h.pool.query(
-      `UPDATE public.imap_folders
-       SET highest_modseq = 10,
-           qresync_highest_modseq = 10,
-           last_reconcile_clean = true,
-           last_full_reconcile_at = now(),
-           next_reconcile_at = now() + interval '6 hours',
-           next_flag_scan_at = now() - interval '1 minute',
-           next_sync_due_at = CASE WHEN path = 'INBOX'
-             THEN now() - interval '1 second'
-             ELSE now() + interval '1 hour' END
-       WHERE account_id = $1`,
-      [h.account.id]
-    );
+    await dueInboxAt(h.pool, h.account.id, { reconcileDue: false, flagScanDue: true });
     const client = new OmittingQresyncFixtureClient(folders, "INBOX");
     const search = vi.spyOn(client, "search");
     const fetch = vi.spyOn(client, "fetch");
@@ -1198,19 +1171,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const folders = buildInboxAndSentFolders();
     folders[0].highestModseq = 10n;
     await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
-    await h.pool.query(
-      `UPDATE public.imap_folders
-       SET highest_modseq = 10,
-           last_reconcile_clean = true,
-           last_full_reconcile_at = now() - interval '7 hours',
-           next_reconcile_at = now() - interval '1 minute',
-           next_flag_scan_at = now() + interval '1 hour',
-           next_sync_due_at = CASE WHEN path = 'INBOX'
-             THEN now() - interval '1 second'
-             ELSE now() + interval '1 hour' END
-       WHERE account_id = $1`,
-      [h.account.id]
-    );
+    await dueInboxAt(h.pool, h.account.id, { reconcileDue: true, flagScanDue: false });
     // Each one-message flag FETCH takes 60 ms against a 150 ms flag deadline.
     class SlowFlagsClient extends FixtureImapClient {
       override async *fetch(
@@ -1359,6 +1320,38 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.reconcileFoldersAttempted).toBe(1);
     expect(flagFetchPaths.length).toBeGreaterThan(0);
     expect(new Set(flagFetchPaths)).toEqual(new Set(["INBOX"]));
+  });
+
+  it("requests a QRESYNC replay with the reconcile slot even after the flag-scan slots are spent", async () => {
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50, IMAP_QRESYNC_ENABLED: true, MAX_FLAG_SCANS_PER_CYCLE: 1 };
+    const h = await setupIntegration("qresync-without-flag-slot", overrides);
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    folders[1].highestModseq = 10n;
+    await h.buildEngine({ folders, overrides }).syncAccount(h.account.id, "manual");
+    // Inbox (no modseq) takes the only flag-scan slot with its routine window
+    // scan; Sent then has a QRESYNC cursor, a moved modseq and a reconcile slot.
+    await h.pool.query(
+      `UPDATE public.imap_folders
+       SET highest_modseq = CASE WHEN path = 'Sent' THEN 10 END,
+           qresync_highest_modseq = CASE WHEN path = 'Sent' THEN 10 END,
+           last_reconcile_clean = true,
+           last_full_reconcile_at = now(),
+           next_reconcile_at = now() + interval '6 hours',
+           next_flag_scan_at = CASE WHEN path = 'INBOX'
+             THEN now() - interval '1 minute' ELSE now() + interval '6 hours' END,
+           next_sync_due_at = now() - interval '1 second'
+       WHERE account_id = $1`,
+      [h.account.id]
+    );
+    folders[1].highestModseq = 11n;
+    const client = new OmittingQresyncFixtureClient(folders, "Sent");
+    const engine = h.buildEngine({ folders, overrides, clientFactory: async () => client });
+
+    const result = await engine.syncAccount(h.account.id, "scheduled");
+
+    expect(result.outcome).toBe("success");
+    expect(client.replayRequested).toBe(true);
   });
 
   it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
