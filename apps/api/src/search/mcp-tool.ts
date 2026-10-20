@@ -162,7 +162,7 @@ export const searchEmailToolDefinition = {
         ]
       },
       includeDeleted: { type: "boolean", default: false },
-      sort: { enum: ["smart", "relevance", "recent", "oldest", "size", "sender"], default: "smart" },
+      sort: { type: "string", enum: ["smart", "relevance", "recent", "oldest", "size", "sender"], default: "smart" },
       limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
       offset: { type: "integer", minimum: 0, default: 0 },
       snippet: { type: "boolean", default: true },

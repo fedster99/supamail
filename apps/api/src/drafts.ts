@@ -215,7 +215,7 @@ async function saveDraft(
   }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
 }
 
-/** The locked part of a save: file the draft, then mirror it (ADR 0044). */
+/** The locked part of a save: file the draft, then mirror it (ADR 0045). */
 async function fileAndMirrorDraft(
   repository: MirrorRepository,
   config: AppConfig,
@@ -695,7 +695,7 @@ async function sendDraftAttempt(
           `Delivered, but filing to Sent and draft cleanup were skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
         );
       }
-      // File the same bytes to Sent and mirror the copy at once (ADR 0044).
+      // File the same bytes to Sent and mirror the copy at once (ADR 0045).
       if (providerWorkAllowed) {
         sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, addWarning);
       }

@@ -25,7 +25,7 @@ export interface FiledMessage {
 }
 
 /**
- * Mirror a message this action just filed, as sync would (ADR 0044). The server's
+ * Mirror a message this action just filed, as sync would (ADR 0045). The server's
  * APPENDUID names it, so nothing is guessed: read that one UID's metadata on the
  * action's own connection, write the row through sync's upsert, then store the
  * body from the filed bytes when the server holds exactly that many bytes.
@@ -92,7 +92,7 @@ export interface SentCopy {
 
 /**
  * File the delivered bytes to Sent with `\Seen` and mirror the copy at once
- * (ADR 0044). Delivery already happened, so every failure here is a warning: a
+ * (ADR 0045). Delivery already happened, so every failure here is a warning: a
  * thrown error could invite a duplicate send.
  */
 export async function fileSentCopy(

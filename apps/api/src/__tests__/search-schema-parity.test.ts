@@ -47,3 +47,14 @@ describe("search_email filter schema parity", () => {
     expect(keys.length).toBe(new Set(keys).size);
   });
 });
+
+// Directory scanners reject a parameter without a declared JSON type.
+describe("search_email input schema types", () => {
+  it("declares a type, const, or combinator for every top-level parameter", () => {
+    const properties = (searchEmailToolDefinition.inputSchema as { properties: Record<string, object> }).properties;
+    const untyped = Object.entries(properties)
+      .filter(([, schema]) => !["type", "const", "oneOf", "anyOf"].some((key) => key in schema))
+      .map(([name]) => name);
+    expect(untyped).toEqual([]);
+  });
+});

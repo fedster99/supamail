@@ -475,7 +475,7 @@ async function main(): Promise<void> {
       throw new Error("GreenMail basic STATUS fallback did not converge Archive promptly");
     }
 
-    // Send path (email-001, ADR 0044): reply to a mirrored message over SMTP, which
+    // Send path (email-001, ADR 0045): reply to a mirrored message over SMTP, which
     // APPENDs a copy to Sent. Sent is tracked first, so the send mirrors that copy at
     // once from APPENDUID: the row is readable by the returned id before any sync,
     // carries the threading In-Reply-To header (the NULL provider_thread_id path),
@@ -539,7 +539,7 @@ async function main(): Promise<void> {
       ["send delivered", sendResult.delivered === true],
       ["send appended to Sent", sendResult.appendedToSent === true],
       ["sent copy readable at once by its id", sentAtOnce?.rfc_message_id === replyMessageId],
-      ["sent copy threads at once via In-Reply-To", sentAtOnce?.in_reply_to === (sourceRow?.rfc_message_id ?? null)],
+      ["sent copy carries In-Reply-To at once", sentAtOnce?.in_reply_to === (sourceRow?.rfc_message_id ?? null)],
       ["sync kept the sent copy id", sentCopy.rows.some((row) => row.id === sendResult.messageId)],
       ["resync succeeded", resyncResult.outcome === "success"],
       ["sent reply mirrored on resync", filedSomewhere],

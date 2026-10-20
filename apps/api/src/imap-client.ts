@@ -1008,7 +1008,7 @@ function messageBodyInput(
 
 /**
  * The body of a message this action just filed, parsed from the bytes it filed
- * (ADR 0044). The caller proves the server holds exactly as many bytes and that
+ * (ADR 0045). The caller proves the server holds exactly as many bytes and that
  * they are under the body cap, so the source is complete.
  */
 export async function filedMessageBody(
@@ -1117,7 +1117,7 @@ export async function fetchFullMessageBodyBatch(
           start: 0,
           maxLength: sourceLimit
         },
-        // A row a draft save wrote before ADR 0044 has no BODYSTRUCTURE until sync
+        // A row a draft save wrote before ADR 0045 has no BODYSTRUCTURE until sync
         // reads it again (ADR 0033); select its text part from the server's.
         ...(messages.some((message) => message.mime_structure == null) ? { bodyStructure: true } : {})
       },
@@ -1192,7 +1192,7 @@ export async function fetchFullMessageBody(
     const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
     let fetched: FetchMessage | false | null = null;
     // Parsed-only streams the source below and needs a FETCH only for a row with no
-    // BODYSTRUCTURE, which a draft save wrote before ADR 0044 until sync read it
+    // BODYSTRUCTURE, which a draft save wrote before ADR 0045 until sync read it
     // again (ADR 0033). That row's size is the composed size, so take the server's.
     if (!streamParsedOnly || message.mime_structure == null) {
       fetched = await client.fetchOne(

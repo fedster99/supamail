@@ -198,7 +198,7 @@ async function seedMaildir(vmailRoot: string): Promise<void> {
   const sent = await createMaildir(accountRoot, "Sent");
   const archive = await createMaildir(accountRoot, "Archive");
   const trash = await createMaildir(accountRoot, "Trash");
-  // Empty until the draft step saves one (ADR 0044).
+  // Empty until the draft step saves one (ADR 0045).
   await createMaildir(accountRoot, "Drafts");
 
   await Promise.all([
@@ -521,7 +521,7 @@ async function main(): Promise<void> {
     await moveCheck.logout();
     const moveFallback = await checkMoveFallback(imapPort, mailbox, password);
 
-    // A saved draft is mirrored at once from APPENDUID (ADR 0044): the row from the
+    // A saved draft is mirrored at once from APPENDUID (ADR 0045): the row from the
     // server's metadata, the body from the filed bytes. The next sync keeps both.
     // The idempotency key makes the save search Drafts first, so Drafts is still
     // selected when the mirror reads the new UID back.

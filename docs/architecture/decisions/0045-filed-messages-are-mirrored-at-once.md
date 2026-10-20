@@ -1,4 +1,4 @@
-# ADR 0044: A Message An Action Files Is Mirrored At Once
+# ADR 0045: A Message An Action Files Is Mirrored At Once
 
 Status: Accepted
 
@@ -62,8 +62,10 @@ named for it, and nothing else. The sync read adapter still gains no write verb.
 
 ## Consequences
 
-- A sent copy and a saved draft are readable, searchable and listed with their
-  attachments in the same response. A reply's thread shows it at once.
+- A sent copy and a saved draft are readable by their returned mirror id with
+  their stored body and attachment metadata before the action returns, when the
+  guards above pass. Search indexing and derived conversation assignment still
+  follow their existing processing paths; this change does not wait for them.
 - Each mirrored APPEND costs one SELECT and one FETCH of one UID's metadata on an
   open connection, and one body store write that sync would otherwise do later.
 - An action that files a message holds the account lock for that extra time.
@@ -84,8 +86,8 @@ named for it, and nothing else. The sync read adapter still gains no write verb.
   once with its body, and a later sync upsert keeps its id.
 - Dovecot smoke: a draft saved with an idempotency key is readable at once with
   its body and BODYSTRUCTURE, and the next sync keeps its id and body.
-- GreenMail smoke: a send returns the Sent copy's id, readable at once and
-  threaded, and the next sync keeps it. GreenMail reports an RFC822.SIZE smaller
+- GreenMail smoke: a send returns the Sent copy's id, readable at once with its
+  In-Reply-To header, and the next sync keeps it. GreenMail reports an RFC822.SIZE smaller
   than the stored bytes, so there the body is left to the body lane.
 
 ## References

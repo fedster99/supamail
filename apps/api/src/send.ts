@@ -27,7 +27,7 @@ import {
  * the SMTP target (SSRF guard), composes deterministic RFC-822 bytes, then holds
  * the account advisory lock across SMTP submission and APPEND of the SAME bytes
  * to the Sent folder. When the server answers the APPEND with APPENDUID, the copy
- * is mirrored at once from that UID (ADR 0044), so a read right after the send
+ * is mirrored at once from that UID (ADR 0045), so a read right after the send
  * finds it; otherwise the next sync mirrors it. Identity is never guessed.
  *
  * This lives OUTSIDE src/mcp/ on purpose: the agent surface stays zero-send. The
@@ -139,7 +139,7 @@ async function sendMessageAttempt(
     lock.confirmIrreversible();
 
     // Delivery succeeded; file the identical bytes to Sent while the account lock
-    // remains held, and mirror the copy at once (ADR 0044). Every failure from here
+    // remains held, and mirror the copy at once (ADR 0045). Every failure from here
     // is a warning — the mail is already sent.
     let sent: SentCopy = { appendedToSent: false, appendedUid: null, sentFolderPath: null, messageId: null };
     let lockLiveForFiling = true;
