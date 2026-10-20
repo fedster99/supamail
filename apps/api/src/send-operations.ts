@@ -359,6 +359,76 @@ export async function runSendOperation<T>({
   }
 }
 
+/** The operation action a keyed draft save records. */
+export const DRAFT_SAVE_ACTION = "save_draft";
+
+export interface ReplayDraftSaveOptions<T> {
+  store: SendOperationStore<T>;
+  operationKey: string;
+  request: unknown;
+}
+export interface RunDraftSaveOptions<T> extends ReplayDraftSaveOptions<T> {
+  accountId: string;
+  execute: () => Promise<T>;
+}
+
+/**
+ * Return a recorded draft save before composing it again, so a replay works after
+ * the source message or the draft itself is gone. A changed request is a conflict.
+ */
+export async function replayDraftSaveOperation<T>({
+  store,
+  operationKey,
+  request,
+}: ReplayDraftSaveOptions<T>): Promise<{ found: false } | { found: true; result: T }> {
+  assertOperationKey(operationKey);
+  const row = await store.get(operationKey);
+  if (!row) return { found: false };
+  if (!sameIntent(row, DRAFT_SAVE_ACTION, hashSendRequest(request))) throw conflict();
+  return row.status === "succeeded" && row.result != null
+    ? { found: true, result: row.result }
+    : { found: false };
+}
+
+/**
+ * Run one keyed draft save.
+ *
+ * Unlike SMTP, filing a draft is safe to run again: the save derives its Message-ID
+ * from the key and finds an earlier copy in Drafts before APPEND. So any attempt
+ * without a recorded result simply runs, and there is no unknown outcome. The store
+ * records the request and result: a replay returns the same draft even after it was
+ * sent or deleted, and the same key with a changed request is a conflict.
+ */
+export async function runDraftSaveOperation<T>({
+  store,
+  operationKey,
+  accountId,
+  request,
+  execute,
+}: RunDraftSaveOptions<T>): Promise<T> {
+  assertOperationKey(operationKey);
+  const operation = {
+    operationKey,
+    action: DRAFT_SAVE_ACTION,
+    accountId,
+    requestHash: hashSendRequest(request),
+    rfcMessageId: null,
+  };
+  const { row } = await store.start(operation);
+  if (!sameSendOperation(row, operation)) throw conflict();
+  if (row.status === "succeeded" && row.result != null) return row.result;
+
+  const result = await execute();
+  // The provider holds the draft. A ledger outage must not fail the save; the
+  // next replay files nothing new and records it then.
+  try {
+    const finished = await store.finish(operationKey, "succeeded", result, null);
+    return finished?.result ?? result;
+  } catch {
+    return result;
+  }
+}
+
 function assertOperationKey(key: unknown): asserts key is string {
   if (!isValidIdempotencyKey(key)) {
     throw new SendOperationError("idempotency_required", "idempotency_key must be 1 to 200 characters and not blank.", "Provide a unique idempotency_key for this exact send.");

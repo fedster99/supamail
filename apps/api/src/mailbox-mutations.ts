@@ -75,7 +75,7 @@ export { MailboxConflictError };
 /** Caller controls for one direct mailbox action. */
 export interface MailboxActionOptions {
   signal?: AbortSignal;
-  /** Where an action that files a message stores its body (ADR 0045); the host's
+  /** Where an action that files a message stores its body (ADR 0046); the host's
    * sync store. Defaults to the OSS database store, as sync does. */
   bodyStore?: BodyStore;
 }

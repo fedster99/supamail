@@ -8,7 +8,7 @@ import type { ImapFolder } from "../types.js";
 
 // The provider side of a draft save: Drafts answers each APPEND with APPENDUID
 // 100/<next UID>, starting at 50, keeps the bytes, and answers a FETCH of that UID
-// with its metadata (ADR 0045).
+// with its metadata (ADR 0046).
 const provider = vi.hoisted(() => ({ nextUid: 50, appends: 0, stored: new Map<number, Buffer>() }));
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
@@ -23,7 +23,7 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
           provider.stored.set(uid, raw);
           return { uidValidity: 100, uid };
         },
-        searchByMessageId: async () => ({ uids: [], uidValidity: 100 })
+        findByMessageId: async () => ({ uids: [], uidValidity: 100 })
       })
     }
   };

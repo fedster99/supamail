@@ -3,7 +3,7 @@ import { buildRawMime } from "../smtp-client.js";
 import { fileSentCopy, mirrorFiledMessage } from "../filed-message.js";
 
 /**
- * ADR 0045: a message an action files is mirrored at once from the server's
+ * ADR 0046: a message an action files is mirrored at once from the server's
  * APPENDUID. The row comes from the server's own metadata for that UID; the body
  * comes from the filed bytes when the server holds exactly that many bytes.
  */

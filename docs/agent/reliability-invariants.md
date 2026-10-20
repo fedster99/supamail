@@ -11,7 +11,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - `delivery_key` is the derived delivery-copy identity; `conversation_id` is the derived transitive reply-component identity. Both are account-scoped.
 - Keep application-specific identity, relationship, and business-domain models outside SupaMail core.
 - Never treat IMAP UID as globally unique.
-- Only an action that files a message (a draft save, or a send's Sent copy) inserts a message row outside sync (ADR 0033, ADR 0045). It writes only from the server's APPENDUID, only into a tracked folder that sync has read at that UIDVALIDITY, from the server's own metadata for that UID, and stores the body from the filed bytes only when the server holds exactly that many bytes. It leaves `last_uid` unchanged, so the next sync reads the UID again and keeps the row id. The write runs under a write-fenced account lock, and its failures are warnings, never action failures. A parsed-only body fetch for a row without BODYSTRUCTURE (a draft saved before ADR 0045) asks the server for it before it selects the body part.
+- Only an action that files a message (a draft save, or a send's Sent copy) inserts a message row outside sync (ADR 0033, ADR 0046). It writes only from the server's APPENDUID, only into a tracked folder that sync has read at that UIDVALIDITY, from the server's own metadata for that UID, and stores the body from the filed bytes only when the server holds exactly that many bytes. It leaves `last_uid` unchanged, so the next sync reads the UID again and keeps the row id. The write runs under a write-fenced account lock, and its failures are warnings, never action failures. A parsed-only body fetch for a row without BODYSTRUCTURE (a draft saved before ADR 0046) asks the server for it before it selects the body part.
 - A provider-confirmed move with COPYUID relocates the source row to the destination key the server reported, so the message keeps its id (ADR 0037); without COPYUID, and for every delete, it tombstones exactly the source row `(account_id, folder_path, uidvalidity, uid)` as `PROVIDER_DELETED` (ADR 0034). A destination is never guessed. A failed mirror write never fails the confirmed action; the folder is already due for reconcile.
 - By-id reads (`read_message`, attachments, raw MIME, headers, the shared loader) never serve a tombstoned row.
 - Store raw and normalized Message-ID separately.
@@ -74,7 +74,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   no account state.
 - Direct `sendMessage` and `sendDraft` share that account lock with fenced writes.
   Draft send acquires before a possibly-live raw fetch; both hold through SMTP,
-  Sent APPEND, the Sent copy's mirror write (ADR 0045), and connection teardown,
+  Sent APPEND, the Sent copy's mirror write (ADR 0046), and connection teardown,
   with draft cleanup also inside the same lock.
 - Lock acquisition must fail closed when its initial heartbeat cannot persist.
   Long outbound operations refresh heartbeat below `STALE_HEARTBEAT_MS` for their

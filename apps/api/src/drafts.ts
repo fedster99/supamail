@@ -215,7 +215,7 @@ async function saveDraft(
   }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
 }
 
-/** The locked part of a save: file the draft, then mirror it (ADR 0045). */
+/** The locked part of a save: file the draft, then mirror it (ADR 0046). */
 async function fileAndMirrorDraft(
   repository: MirrorRepository,
   config: AppConfig,
@@ -272,9 +272,9 @@ async function fileDraft(
 
   // Idempotency: a retried create (same key -> same Message-ID) finds its prior
   // APPEND and returns that UID instead of filing a duplicate draft. Runs under
-  // the same lock as the APPEND, so search + append are atomic per account.
+  // the same lock as the APPEND, so lookup + append are atomic per account.
   if (idempotencyKey) {
-    const existing = await appender.searchByMessageId(draftsFolderPath, rfcMessageId);
+    const existing = await appender.findByMessageId(draftsFolderPath, rfcMessageId);
     if (existing.uids.length > 0) {
       return {
         draftsFolderPath,
@@ -695,7 +695,7 @@ async function sendDraftAttempt(
           `Delivered, but filing to Sent and draft cleanup were skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
         );
       }
-      // File the same bytes to Sent and mirror the copy at once (ADR 0045).
+      // File the same bytes to Sent and mirror the copy at once (ADR 0046).
       if (providerWorkAllowed) {
         sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, addWarning);
       }
