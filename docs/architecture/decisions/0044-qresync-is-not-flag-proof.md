@@ -32,6 +32,10 @@ So a flag changed in webmail or on a phone never reached the mirror.
   after half of `FLAG_SCAN_TOTAL_TIMEOUT_MS`, and records an early stop as
   `FLAG_BACKSTOP_INCOMPLETE`. Establishing a new flag cursor still scans the
   whole window or fails.
+- Only a scheduled reconcile moves `next_reconcile_at`. A forced one (a listener
+  reconnect or an expunge wake) keeps it; otherwise forced Inbox reconciles,
+  every 1-2 h in production, postpone the scheduled audit and its window flag
+  read indefinitely (found 2026-10-20, after the first deploy).
 - An unchanged modseq proves no flag changed, so it counts as a flag read.
 - The Sent-only lane (ADR 0023) still reads no flags.
 - A shared IDLE session ignores `VANISHED (EARLIER)`: it only answers the

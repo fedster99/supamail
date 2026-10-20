@@ -2472,6 +2472,8 @@ export class MirrorRepository {
     reconcileClean?: boolean;
     /** The reconcile could not prove the folder's UID list (IncompleteUidListError). */
     reconcileListIncomplete?: boolean;
+    /** The reconcile ran because the schedule was due, not because a pass forced it. */
+    reconcileScheduled?: boolean;
     flagScanCompleted?: boolean;
   }, options: { deadlineAt?: number; signal?: AbortSignal } = {}): Promise<void> {
     const query = `
@@ -2508,7 +2510,10 @@ export class MirrorRepository {
             THEN now() + ($10::bigint * interval '1 millisecond')
           WHEN $6::boolean = false
             THEN now() + ($13::bigint * interval '1 millisecond')
-          WHEN $6::boolean = true
+          -- Only the scheduled audit moves its own schedule: a forced reconcile
+          -- (a listener reconnect or an expunge wake, often hourly) would
+          -- otherwise postpone it, and the window flag read it carries, forever.
+          WHEN $6::boolean = true AND ($17::boolean OR next_reconcile_at IS NULL)
             THEN now()
               + ($10::bigint * interval '1 millisecond')
               + ((random() * 900000)::int * interval '1 millisecond')
@@ -2536,7 +2541,8 @@ export class MirrorRepository {
       this.config.SYNC_INTERVAL_MS,
       patch.highestModseq ?? null,
       patch.qresyncHighestModseq ?? null,
-      patch.reconcileListIncomplete === true
+      patch.reconcileListIncomplete === true,
+      patch.reconcileScheduled === true
     ];
     const result = options.deadlineAt === undefined
       ? await this.pool.query<{ id: string }>(query, values)

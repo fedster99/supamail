@@ -1717,6 +1717,7 @@ export class MirrorEngine {
         initialComplete: true,
         reconcileClean,
         reconcileListIncomplete,
+        reconcileScheduled: reconcileAttempted && scheduledReconcileDue,
         flagScanCompleted: flagScanAttempted ? true : undefined
       }, {
         deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,

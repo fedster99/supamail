@@ -980,6 +980,41 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(await flags(starred.uid)).toEqual(["\\Flagged"]);
   });
 
+  it("keeps the scheduled audit time across a forced Inbox reconcile", async () => {
+    const overrides = { INITIAL_SYNC_BATCH_SIZE: 50 };
+    const h = await setupIntegration("forced-reconcile-keeps-schedule", overrides);
+    activeAccountIds.push(h.account.id);
+    const folders = buildInboxAndSentFolders();
+    const engine = h.buildEngine({ folders, overrides });
+    await engine.syncAccount(h.account.id, "manual");
+    // A listener reconnect forces an Inbox reconcile on the listener's client.
+    const forced = () => engine.syncAccount(h.account.id, "scheduled", {
+      liveInboxOnly: true,
+      forceInboxReconcile: true,
+      client: new FixtureImapClient(folders),
+      clientAccountId: h.account.id,
+      keepClientOpen: true
+    });
+    const schedule = async (due: string) => (await h.pool.query<{ next: string }>(
+      `UPDATE public.imap_folders SET next_reconcile_at = now() + $2::interval, last_full_reconcile_at = now()
+       WHERE account_id = $1 AND path = 'INBOX' RETURNING next_reconcile_at::text AS next`,
+      [h.account.id, due]
+    )).rows[0].next;
+    const next = async () => (await h.pool.query<{ next: string }>(
+      "SELECT next_reconcile_at::text AS next FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    )).rows[0].next;
+
+    const planned = await schedule("2 hours");
+    expect((await forced()).reconcileFoldersAttempted).toBe(1);
+    expect(await next()).toBe(planned);
+
+    // The scheduled audit itself moves its schedule.
+    await schedule("-1 minute");
+    expect((await forced()).reconcileFoldersAttempted).toBe(1);
+    expect(new Date(await next()).getTime()).toBeGreaterThan(Date.now() + 5 * 60 * 60_000);
+  });
+
   it("runs an exact Inbox reconciliation for a forced recovery barrier after complete QRESYNC", async () => {
     const h = await setupIntegration("qresync-forced-inbox-barrier", {
       INITIAL_SYNC_BATCH_SIZE: 50,
