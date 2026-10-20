@@ -50,6 +50,8 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0042-writes-wait-for-the-account-lock.md`: Every direct write waits up to 25 seconds for the account lock, so no sync interleaves with it; a sync pass that finds the lock held defers and records nothing.
 - `0043-one-login-per-action-and-reused-sessions-reselect.md`: A multi-step action logs in once through `ActionConnection`; a host-owned sync session selects its mailbox again at the start of each pass; `classifyLoginRefusal` separates a rejected password from other refused logins.
 - `0044-qresync-is-not-flag-proof.md`: A QRESYNC replay never stands in for a flag read (Purelymail omits flag changes from it); `CHANGEDSINCE` runs whenever the modseq moves, and each scheduled reconcile scans flags over the whole window on every server.
+- `0046-filed-messages-are-mirrored-at-once.md`: A draft or Sent copy that an action files is mirrored at once from APPENDUID: the row from the server's metadata for that UID, the body from the filed bytes; failures stay warnings and sync stays authoritative.
+- `0045-keyed-draft-saves.md`: A keyed draft save happens once: Drafts lookup reads the 50 newest Message-IDs before SEARCH, and a host store records the save so a replay returns the same draft and a changed request is `idempotency_conflict`.
 
 ## Status Values
 

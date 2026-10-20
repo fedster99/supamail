@@ -71,7 +71,9 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   that "reused pattern" is now an actual shared function, `connectImap`
   (`imap-connect.ts`) — `SentFolderAppender` obtains its socket there (and so
   inherits the close-on-connect-error guard it previously lacked); the append-only
-  verb surface is unchanged.
+  verb surface is unchanged. Update (ADR 0046): after an APPEND with APPENDUID the
+  send path reads back that one UID's metadata to mirror the Sent copy; it reads
+  nothing else.
 - **Reuse the frozen AES-256-GCM envelope for the SMTP secret.** SMTP credentials
   are stored in nullable `smtp_*` columns on `imap_accounts` (migration 0009),
   with `encrypted_smtp_password` using the same envelope as `encrypted_password`
