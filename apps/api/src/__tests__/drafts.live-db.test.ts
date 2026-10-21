@@ -20,7 +20,7 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
           provider.appends += 1;
           return { uidValidity: 100, uid: provider.nextUid++ };
         },
-        searchByMessageId: async () => ({ uids: [], uidValidity: 100 })
+        findByMessageId: async () => ({ uids: [], uidValidity: 100 })
       })
     }
   };

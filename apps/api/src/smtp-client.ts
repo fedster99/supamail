@@ -8,6 +8,7 @@ import { decryptPassword } from "./crypto.js";
 import { InvalidInputError } from "./errors.js";
 import type { PgPool } from "./db.js";
 import { connectAbortableImap, type ActionSocket, type ImapAbortBinding } from "./imap-connect.js";
+import { normalizeMessageId, parseHeaders } from "./mime.js";
 import { getProviderProfile } from "./provider-profiles.js";
 import type { ImapAccount, SendAttachment, SendRecipient, SendRequest } from "./types.js";
 
@@ -388,11 +389,18 @@ export interface AppendedUid {
 }
 
 /**
+ * How many of a folder's newest messages a Message-ID lookup reads directly. One
+ * mailbox files at most about one draft per second under its account lock, so a
+ * retry inside a provider's SEARCH lag finds its draft among far fewer.
+ */
+const RECENT_MESSAGE_ID_WINDOW = 50;
+
+/**
  * Write-only, single-verb IMAP client for filing the sent copy. Its socket comes
  * from the one shared {@link connectImap} prelude (decrypt + assertSafeImapTarget +
- * the close-on-connect-error guard, imap-connect.ts); it exposes ONLY `append()`
- * (and `list()` so the caller can resolve the Sent folder). The sync path can never
- * write; the send path can never read-sync.
+ * the close-on-connect-error guard, imap-connect.ts); it exposes ONLY `append()`,
+ * `list()` so the caller can resolve the Sent folder, and `findByMessageId()` for an
+ * idempotent draft. The sync path can never write; the send path can never read-sync.
  */
 export class SentFolderAppender {
   private constructor(
@@ -444,25 +452,36 @@ export class SentFolderAppender {
   }
 
   /**
-   * SEARCH `folderPath` for messages carrying an exact Message-ID header, returning
-   * their UIDs and the mailbox UIDVALIDITY. Used for idempotent draft creation
-   * (search-before-APPEND): a retried create derives the same Message-ID, so a prior
-   * APPEND is found instead of duped. SEARCH needs the mailbox selected, so it takes
-   * the folder lock for the search.
+   * Find the messages in `folderPath` that carry an exact Message-ID header, with the
+   * mailbox UIDVALIDITY. Used for idempotent draft creation: a retried create derives
+   * the same Message-ID, so a prior APPEND is found instead of duped. A provider's
+   * SEARCH index can trail a fresh APPEND (Purelymail: 16.5 s measured), so the newest
+   * messages are read directly first; SEARCH covers a retry long after the save.
    */
-  searchByMessageId(
+  findByMessageId(
     folderPath: string,
     rfcMessageId: string
   ): Promise<{ uids: number[]; uidValidity: number }> {
     return this.abort.run(async () => {
       const lock = await this.client.getMailboxLock(folderPath);
       try {
-        const uids = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
         const selected = this.client.mailbox;
         if (!selected || typeof selected.uidValidity !== "bigint") {
           throw new Error(`Selected mailbox ${folderPath} reported no UIDVALIDITY`);
         }
-        return { uids: Array.isArray(uids) ? uids : [], uidValidity: Number(selected.uidValidity) };
+        const wanted = normalizeMessageId(rfcMessageId);
+        const uids: number[] = [];
+        if (selected.exists > 0) {
+          const from = Math.max(1, selected.exists - RECENT_MESSAGE_ID_WINDOW + 1);
+          for await (const message of this.client.fetch(`${from}:*`, { uid: true, headers: ["message-id"] })) {
+            if (normalizeMessageId(parseHeaders(message.headers)["message-id"]) === wanted) uids.push(message.uid);
+          }
+        }
+        if (uids.length === 0) {
+          const found = await this.client.search({ header: { "message-id": rfcMessageId } }, { uid: true });
+          if (Array.isArray(found)) uids.push(...found);
+        }
+        return { uids, uidValidity: Number(selected.uidValidity) };
       } finally {
         lock.release();
       }

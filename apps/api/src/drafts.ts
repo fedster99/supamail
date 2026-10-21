@@ -71,10 +71,11 @@ import { isMirrorId } from "./mirror-id.js";
  * Drafts folder we file to. */
 export type DraftInput = Omit<SendRequest, "bcc"> & {
   /** Optional idempotency key: a retried create with the same key derives the same
-   * Message-ID and returns the EXISTING draft (search-before-APPEND) instead of a dup.
-   * The key is the operation identity (Stripe-style) — reusing it with a different
-   * payload returns the first draft UNCHANGED, it does not update it. Blank/whitespace
-   * keys are treated as no key. */
+   * Message-ID and returns the EXISTING draft (found in Drafts before APPEND) instead
+   * of a dup. The key is the operation identity (Stripe-style) — reusing it with a
+   * different payload returns the first draft UNCHANGED, it does not update it; a host
+   * that records saves with `runDraftSaveOperation` rejects that reuse instead.
+   * Blank/whitespace keys are treated as no key. */
   idempotencyKey?: string;
 };
 
@@ -159,7 +160,7 @@ const DRAFT_MIRROR_WRITE_TIMEOUT_MS = 5_000;
 
 /**
  * Derive a stable Message-ID from an idempotency key so a retried create maps to the
- * SAME message and can be found by search-before-APPEND instead of duplicating.
+ * SAME message and is found in Drafts before APPEND instead of duplicating.
  */
 function buildDraftMessageId(domain: string, idempotencyKey: string): string {
   const digest = createHash("sha256").update(`${domain}:${idempotencyKey}`).digest("hex");
@@ -275,9 +276,9 @@ async function fileDraft(
 
   // Idempotency: a retried create (same key -> same Message-ID) finds its prior
   // APPEND and returns that UID instead of filing a duplicate draft. Runs under
-  // the same lock as the APPEND, so search + append are atomic per account.
+  // the same lock as the APPEND, so lookup + append are atomic per account.
   if (idempotencyKey) {
-    const existing = await appender.searchByMessageId(draftsFolderPath, rfcMessageId);
+    const existing = await appender.findByMessageId(draftsFolderPath, rfcMessageId);
     if (existing.uids.length > 0) {
       return {
         draftsFolderPath,

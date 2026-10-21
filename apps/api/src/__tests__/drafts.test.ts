@@ -78,7 +78,7 @@ const mocks = vi.hoisted(() => ({
   withAccountLock: vi.fn(),
   lockAssertLive: vi.fn(),
   lockConfirmIrreversible: vi.fn(),
-  searchByMessageId: vi.fn(),
+  findByMessageId: vi.fn(),
   poolConnect: vi.fn()
 }));
 
@@ -92,7 +92,7 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
       over: vi.fn(() => ({
         list: mocks.list,
         append: mocks.append,
-        searchByMessageId: mocks.searchByMessageId
+        findByMessageId: mocks.findByMessageId
       }))
     }
   };
@@ -176,7 +176,7 @@ beforeEach(() => {
   mocks.withAccountLock.mockImplementation(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>) => fn(mockAccountLock()));
   mocks.lockAssertLive.mockResolvedValue(undefined);
   mocks.lockConfirmIrreversible.mockImplementation(() => undefined);
-  mocks.searchByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
+  mocks.findByMessageId.mockResolvedValue({ uids: [], uidValidity: 100 }); // default: idempotency miss
   mocks.append.mockResolvedValue({ uid: 7, uidValidity: 100 });
   mocks.getFoldersForWake.mockResolvedValue([draftsFolder]);
   mocks.upsertMessages.mockResolvedValue([{ id: N1 }]);
@@ -225,7 +225,7 @@ describe("createDraft", () => {
 
   it("returns the existing draft (no duplicate APPEND) on an idempotent retry", async () => {
     // Same Idempotency-Key -> same derived Message-ID -> search finds the prior APPEND.
-    mocks.searchByMessageId.mockResolvedValueOnce({ uids: [41, 42], uidValidity: 100 });
+    mocks.findByMessageId.mockResolvedValueOnce({ uids: [41, 42], uidValidity: 100 });
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
       accountId: "11111111-1111-4111-8111-111111111111",
@@ -234,7 +234,7 @@ describe("createDraft", () => {
       body: { format: "plain", text: "Hello" },
       idempotencyKey: "req-key-1"
     });
-    expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
+    expect(mocks.findByMessageId).toHaveBeenCalledTimes(1);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
     // Nothing new reached the provider, so nothing new is marked or written.
@@ -244,7 +244,7 @@ describe("createDraft", () => {
   });
 
   it("returns the mirror id of the draft an earlier attempt saved", async () => {
-    mocks.searchByMessageId.mockResolvedValueOnce({ uids: [42], uidValidity: 100 });
+    mocks.findByMessageId.mockResolvedValueOnce({ uids: [42], uidValidity: 100 });
     mocks.getLiveMessageId.mockResolvedValueOnce(N1);
     const { createDraft } = await import("../drafts.js");
     const result = await createDraft({} as never, config, {
@@ -262,8 +262,8 @@ describe("createDraft", () => {
       body: { format: "plain", text: "Hello" },
       idempotencyKey: "req-key-2"
     });
-    expect(mocks.searchByMessageId).toHaveBeenCalledTimes(1);
-    const [folder, msgId] = mocks.searchByMessageId.mock.calls[0];
+    expect(mocks.findByMessageId).toHaveBeenCalledTimes(1);
+    const [folder, msgId] = mocks.findByMessageId.mock.calls[0];
     expect(folder).toBe("Drafts");
     // Deterministic <draft-{sha256[0:32]}@domain> stamped into the composed bytes.
     expect(String(msgId)).toMatch(/^<draft-[0-9a-f]{32}@example\.test>$/);
@@ -278,7 +278,7 @@ describe("createDraft", () => {
       subject: "My draft",
       body: { format: "plain", text: "Hello" }
     });
-    expect(mocks.searchByMessageId).not.toHaveBeenCalled();
+    expect(mocks.findByMessageId).not.toHaveBeenCalled();
     expect(mocks.append).toHaveBeenCalledTimes(1);
   });
 
