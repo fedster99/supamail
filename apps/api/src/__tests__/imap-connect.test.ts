@@ -55,6 +55,7 @@ vi.mock("../crypto.js", () => ({
 const {
   ActionConnection,
   timeImapStep,
+  IMAP_STEPS,
   connectAbortableImap,
   connectImap,
   ImapAbortBinding,
@@ -320,6 +321,10 @@ describe("ActionConnection (one login per multi-step action)", () => {
     await connection.close();
     expect(steps).toEqual(["connect", "logout"]);
     expect(fake.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("names every step a draft save or update reports", () => {
+    expect(IMAP_STEPS).toEqual(["connect", "list", "find", "append", "delete", "logout"]);
   });
 
   it("reports a step that fails, and still rejects with its error", async () => {

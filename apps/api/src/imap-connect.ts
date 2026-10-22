@@ -143,7 +143,8 @@ export async function connectAbortableImap(
  * covers the host check, password decryption, TLS and login; `delete` removes the
  * replaced draft, with its mirror update.
  */
-export type ImapStep = "connect" | "list" | "find" | "append" | "delete" | "logout";
+export const IMAP_STEPS = ["connect", "list", "find", "append", "delete", "logout"] as const;
+export type ImapStep = (typeof IMAP_STEPS)[number];
 export type ImapStepTimer = (step: ImapStep, ms: number) => void;
 
 /** Run one step and report its duration; a timer that throws never changes the step. */
