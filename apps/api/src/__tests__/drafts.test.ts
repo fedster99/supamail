@@ -105,6 +105,8 @@ vi.mock("../imap-connect.js", async (importOriginal) => {
     // One fake socket per action: the first get() logs in, close() logs out once.
     ActionConnection: class {
       private open = false;
+      constructor(_pool: unknown, _config: unknown, _account: unknown, _signal?: unknown,
+        readonly onStep?: (step: string, ms: number) => void) {}
       async get() {
         if (!this.open) mocks.logins.count += 1;
         this.open = true;
@@ -280,6 +282,22 @@ describe("createDraft", () => {
     });
     expect(mocks.findByMessageId).not.toHaveBeenCalled();
     expect(mocks.append).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports each IMAP step it names, in order, without the lookup when unkeyed", async () => {
+    const { createDraft } = await import("../drafts.js");
+    const input = { accountId: "11111111-1111-4111-8111-111111111111", to: [{ email: "rcpt@example.test" }],
+      subject: "s", body: { format: "plain" as const, text: "b" } };
+    const steps: string[] = [];
+    await createDraft({} as never, config, input, undefined, { onImapStep: (step, ms) => {
+      expect(ms).toBeGreaterThanOrEqual(0);
+      steps.push(step);
+    } });
+    expect(steps).toEqual(["list", "append"]);
+    steps.length = 0;
+    await createDraft({} as never, config, { ...input, idempotencyKey: "k-1" }, undefined,
+      { onImapStep: (step) => steps.push(step) });
+    expect(steps).toEqual(["list", "find", "append"]);
   });
 
   it("does not APPEND when Drafts cannot be marked due first", async () => {
@@ -546,6 +564,15 @@ describe("updateDraft", () => {
     expect(result).toMatchObject({
       replacedMessageId: D1, replacedDraftDeleted: true, draftsFolderPath: "Drafts", messageId: N1, warnings: []
     });
+  });
+
+  it("reports the old draft's delete as its own step", async () => {
+    mocks.getMessage.mockResolvedValue(draftRow);
+    const { updateDraft } = await import("../drafts.js");
+    const steps: string[] = [];
+    await updateDraft(draftPool, config, D1, { to: [{ email: "rcpt@example.test" }], subject: "s",
+      body: { format: "plain", text: "v2" } }, undefined, { onImapStep: (step) => steps.push(step) });
+    expect(steps).toEqual(["list", "append", "delete"]);
   });
 
   it("holds one account lock across the new APPEND and the old draft's delete", async () => {

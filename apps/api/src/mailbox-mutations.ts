@@ -9,7 +9,8 @@ import {
   uidValidityMismatchMessage,
   type ActionConnection,
   type ActionSocket,
-  type ImapAbortBinding
+  type ImapAbortBinding,
+  type ImapStepTimer
 } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { loadMessageAndAccount } from "./message-loader.js";
@@ -74,6 +75,8 @@ export { MailboxConflictError };
 /** Caller controls for one direct mailbox action. */
 export interface MailboxActionOptions {
   signal?: AbortSignal;
+  /** Receives each IMAP step's duration where an action names its steps (draft save and update). */
+  onImapStep?: ImapStepTimer;
 }
 
 /** A SupaMail well-known flag name mapped to its IMAP system flag. */

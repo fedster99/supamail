@@ -138,6 +138,25 @@ export async function connectAbortableImap(
   return { client, abort: new ImapAbortBinding(client, signal) };
 }
 
+/**
+ * The IMAP steps of a draft save or update, named for a caller's timing. `connect`
+ * covers the host check, password decryption, TLS and login; `delete` removes the
+ * replaced draft, with its mirror update.
+ */
+export type ImapStep = "connect" | "list" | "find" | "append" | "delete" | "logout";
+export type ImapStepTimer = (step: ImapStep, ms: number) => void;
+
+/** Run one step and report its duration; a timer that throws never changes the step. */
+export async function timeImapStep<T>(onStep: ImapStepTimer | undefined, step: ImapStep, work: () => Promise<T>): Promise<T> {
+  if (!onStep) return await work();
+  const startedAt = performance.now();
+  try {
+    return await work();
+  } finally {
+    try { onStep(step, performance.now() - startedAt); } catch { /* timing never changes an action */ }
+  }
+}
+
 /** A connected action client and the binding that closes it on abort. */
 export interface ActionSocket {
   client: ImapFlow;
@@ -157,21 +176,23 @@ export class ActionConnection {
     private readonly pool: PgPool,
     private readonly config: AppConfig,
     private readonly account: ImapAccount,
-    private readonly signal?: AbortSignal
+    private readonly signal?: AbortSignal,
+    readonly onStep?: ImapStepTimer
   ) {}
 
   async get(): Promise<ActionSocket> {
     if (this.socket?.client.usable) return this.socket;
     this.socket?.abort.close();
     this.socket = null;
-    this.socket = await connectAbortableImap(this.pool, this.config, this.account, this.signal);
+    this.socket = await timeImapStep(this.onStep, "connect",
+      () => connectAbortableImap(this.pool, this.config, this.account, this.signal));
     return this.socket;
   }
 
   async close(): Promise<void> {
     const socket = this.socket;
     this.socket = null;
-    if (socket) await closeImap(socket.abort);
+    if (socket) await timeImapStep(this.onStep, "logout", () => closeImap(socket.abort));
   }
 }
 

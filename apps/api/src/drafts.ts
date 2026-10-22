@@ -6,7 +6,7 @@ import type { PgClient, PgPool } from "./db.js";
 import { NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { METADATA_HEADER_FIELDS } from "./imap-client.js";
-import { ActionConnection } from "./imap-connect.js";
+import { ActionConnection, timeImapStep } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { accountLockHeartbeatIntervalMs, type AccountLock } from "./locks.js";
 import { deleteMessage, deleteMessageInLock, type MailboxActionOptions } from "./mailbox-mutations.js";
@@ -203,14 +203,14 @@ async function saveDraft(
   repository: MirrorRepository,
   account: ImapAccount,
   req: SendRequest,
-  idempotencyKey?: string | null,
-  signal?: AbortSignal
+  idempotencyKey: string | null | undefined,
+  options: MailboxActionOptions
 ): Promise<SavedDraft> {
   const composed = await composeDraft(account, req, idempotencyKey);
   // One array: the lock adds its post-confirmation warnings after the callback returns.
   const warnings: string[] = [];
   return await withInteractiveAccountLock(pool, account, async (lock) => {
-    const connection = new ActionConnection(pool, config, account, signal);
+    const connection = new ActionConnection(pool, config, account, options.signal, options.onImapStep);
     try {
       return await fileAndMirrorDraft(repository, account, composed, lock, warnings, connection);
     } finally {
@@ -268,7 +268,8 @@ async function fileDraft(
 ): Promise<{ draftsFolderPath: string; appended: AppendedUid | null; retried: boolean }> {
   const appender = SentFolderAppender.over(await connection.get());
   const profile = getProviderProfile(account.provider_profile);
-  const mailboxes = await appender.list();
+  const step = connection.onStep;
+  const mailboxes = await timeImapStep(step, "list", () => appender.list());
   // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
   // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
   // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
@@ -278,7 +279,7 @@ async function fileDraft(
   // APPEND and returns that UID instead of filing a duplicate draft. Runs under
   // the same lock as the APPEND, so lookup + append are atomic per account.
   if (idempotencyKey) {
-    const existing = await appender.findByMessageId(draftsFolderPath, rfcMessageId);
+    const existing = await timeImapStep(step, "find", () => appender.findByMessageId(draftsFolderPath, rfcMessageId));
     if (existing.uids.length > 0) {
       return {
         draftsFolderPath,
@@ -291,7 +292,7 @@ async function fileDraft(
   // Drafts is durably due before the provider command, as for a move, so a host
   // can reconcile it after acknowledgement without a prompt IDLE/NOTIFY event.
   await repository.markFoldersForReconcile(account.id, [draftsFolderPath]);
-  const appended = await appender.append(draftsFolderPath, raw, DRAFT_FLAGS, savedAt);
+  const appended = await timeImapStep(step, "append", () => appender.append(draftsFolderPath, raw, DRAFT_FLAGS, savedAt));
   return { draftsFolderPath, appended, retried: false };
 }
 
@@ -384,7 +385,7 @@ export async function createDraft(
   const account = await repository.getAccount(request.accountId);
   if (!account) throw new NotFoundError(`Account not found: ${request.accountId}`);
 
-  const saved = await saveDraft(pool, config, repository, account, request, request.idempotencyKey, options.signal);
+  const saved = await saveDraft(pool, config, repository, account, request, request.idempotencyKey, options);
   return { accountId: account.id, ...saved };
 }
 
@@ -610,7 +611,7 @@ export async function updateDraft(
   // One lock across the APPEND and the delete, so no sync runs between them, and
   // one connection, so one login per update.
   const { saved, replacedDraftDeleted } = await withInteractiveAccountLock(pool, account, async (lock) => {
-    const connection = new ActionConnection(pool, config, account, options.signal);
+    const connection = new ActionConnection(pool, config, account, options.signal, options.onImapStep);
     try {
       const saved = await fileAndMirrorDraft(repository, account, composed, lock, warnings, connection);
       // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
@@ -618,9 +619,9 @@ export async function updateDraft(
       // EXPUNGE) must NOT fail the update — we downgrade it to a warning and report
       // the update as done. A lingering old draft self-heals on the next Drafts sync.
       try {
-        await deleteMessageInLock(pool, config, messageId, {
+        await timeImapStep(connection.onStep, "delete", () => deleteMessageInLock(pool, config, messageId, {
           hard: true, metadataProtection, signal: options.signal, connection
-        });
+        }));
         return { saved, replacedDraftDeleted: true };
       } catch (error) {
         warnings.push(
