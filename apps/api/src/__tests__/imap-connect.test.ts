@@ -54,6 +54,7 @@ vi.mock("../crypto.js", () => ({
 
 const {
   ActionConnection,
+  timeImapStep,
   connectAbortableImap,
   connectImap,
   ImapAbortBinding,
@@ -306,6 +307,27 @@ describe("ActionConnection (one login per multi-step action)", () => {
     expect(fake.connectImpl).toHaveBeenCalledTimes(2);
     // The dead socket is closed, not logged out.
     expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports one connect and one logout, and a throwing timer changes nothing", async () => {
+    const steps: string[] = [];
+    const connection = new ActionConnection({} as never, config, account, undefined, (step) => {
+      steps.push(step);
+      throw new Error("timer failed");
+    });
+    await connection.get();
+    await connection.get();
+    await connection.close();
+    expect(steps).toEqual(["connect", "logout"]);
+    expect(fake.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a step that fails, and still rejects with its error", async () => {
+    const steps: string[] = [];
+    await expect(timeImapStep((step) => steps.push(step), "append", async () => {
+      throw new Error("NO quota");
+    })).rejects.toThrow("NO quota");
+    expect(steps).toEqual(["append"]);
   });
 
   it("opens nothing for an action that never needed IMAP", async () => {
