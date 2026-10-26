@@ -38,7 +38,7 @@ import { isMirrorId } from "./mirror-id.js";
  *
  * - Create  = buildRawMime (email-001) → APPEND `\Draft` to the Drafts folder via
  *   the write-only {@link SentFolderAppender} (email-001's generic appender), then
- *   write the draft's mirror row from its APPENDUID (ADR 0033).
+ *   mirror the draft, row and body, from its APPENDUID (ADR 0033, ADR 0046).
  * - List/Get = read the MIRROR — drafts are already-synced messages in the Drafts
  *   folder (provider-profiles.ts intentionally mirrors Drafts).
  * - Update  = APPEND-new + delete-old. IMAP drafts are immutable (a message has a
@@ -240,11 +240,18 @@ async function fileAndMirrorDraft(
     warnings
   };
   if (!filed.appended) return saved;
+  const appended = filed.appended;
   try {
-    saved.messageId = filed.retried
-      ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...filed.appended })
-      : await mirrorFiledMessage(repository, config, bodyStore, await connection.get(), account.id,
-        { folderPath: filed.draftsFolderPath, appended: filed.appended, raw }, (warning) => warnings.push(warning));
+    // A retry that found an earlier attempt's copy mirrors only its row when it is
+    // not mirrored yet: that attempt's bytes may differ from these, so its body is
+    // left to the body lane.
+    saved.messageId = (filed.retried
+      ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...appended })
+      : null)
+      ?? await timeImapStep(connection.onStep, "mirror", async () => mirrorFiledMessage(repository, config, bodyStore,
+        await connection.get(), account.id,
+        { folderPath: filed.draftsFolderPath, appended, raw: filed.retried ? null : raw },
+        (warning) => warnings.push(warning)));
   } catch (error) {
     warnings.push(
       `Saved, but the draft id is available only after the next sync: ${error instanceof Error ? error.message : String(error)}.`

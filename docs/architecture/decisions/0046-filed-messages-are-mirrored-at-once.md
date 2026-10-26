@@ -2,25 +2,23 @@
 
 Status: Accepted
 
-Date: 2026-10-18
+Date: 2026-10-26
 
 ## Context
 
 ADR 0033 had a saved draft write its row from APPENDUID and values the save
 composed, and left the body to the body lane. A sent copy wrote no row at all.
-A hosted deployment measured the cost over 14 days:
+A hosted deployment measured the gap over 14 days to 2026-10-26:
 
-- A sent copy reached the mirror a median of 28 seconds after the send, and 182
-  of 880 took more than a minute. 47 of 112 agent sends were followed by a read
-  within two minutes; a read that cannot see the reply invites a second one.
-- Bodies of rows that sync wrote arrived a median of 3 seconds later. Bodies of
-  rows that a draft save wrote arrived a median of 183 seconds later, and the
-  slowest tenth after 18 minutes. Nothing woke the body lane for them, so they
-  waited for the next full sync pass. Until then a draft could not be read,
-  searched, or updated without its body.
-- On every connected server, most saved drafts reached the mirror within ten
-  seconds of the save, which only the APPENDUID write does. The servers answer
-  APPEND with APPENDUID.
+- A draft's body landed a median of 14 s after its row (slowest tenth 50 s).
+  `read_message` right after `save_draft` came back partial, with no body, 14
+  times across 4 tenants, a median of 4 s after the save; reads about 15 s later
+  succeeded.
+- The Sent copy of a send landed a median of 16.5 s after the send finished
+  (slowest tenth 77 s, slowest 197 s), so a read in that window could not see it.
+- The connected servers answer APPEND with APPENDUID, and their RFC822.SIZE
+  equals the stored bytes on 2,685 of 2,687 Drafts and Sent rows (the other 2
+  were truncated).
 
 ## Decision
 
@@ -37,11 +35,16 @@ and a draft send.
   has the server's flags, BODYSTRUCTURE, attachment rows and provider ids. The
   composed-metadata row of ADR 0033 is removed.
 - **The body is the filed bytes.** The action already holds the exact bytes it
-  filed. When the server reports exactly that many bytes and they are under
-  `BODY_RAW_MAX_BYTES`, the action parses them and stores the body in the body
-  lane's order: evidence, the host's `BodyStore`, then `completeBodyStorage`.
-  Otherwise the body lane stores the body as before. No body bytes are fetched
-  again.
+  filed. When the server reports exactly that many bytes, under
+  `BODY_RAW_MAX_BYTES` and the body lane's 4 MiB batch bound, the action parses
+  them and stores the body in the body lane's order: evidence, the host's
+  `BodyStore`, then `completeBodyStorage`. A larger body, or another byte count,
+  is left to the body lane, which streams it on a worker rather than in the
+  request. No stored body is fetched again.
+- **Keyed retries.** A keyed save that finds an earlier attempt's copy returns its
+  live row id. When that copy has no row yet, the retry mirrors the row only: the
+  earlier attempt's bytes may differ from this one's, so its body is left to the
+  body lane.
 - **The host's body store.** `MailboxActionOptions.bodyStore` takes the store the
   host gives sync; without one the action uses the OSS database store, as sync
   does. Sync hooks do not run; they belong to sync.
@@ -68,19 +71,23 @@ named for it, and nothing else. The sync read adapter still gains no write verb.
   follow their existing processing paths; this change does not wait for them.
 - Each mirrored APPEND costs one SELECT and one FETCH of one UID's metadata on an
   open connection, and one body store write that sync would otherwise do later.
-- An action that files a message holds the account lock for that extra time.
+  A draft save reports it as the `mirror` step of `IMAP_STEPS`. An action that
+  files a message holds the account lock for that extra time.
+- A reply seeded from an assigned message joins its conversation in `read_thread`
+  when the threading lane next assigns it, and hosted search sees it when its
+  index next drains; neither waits on the action.
 
 ## Verification
 
-- `filed-message.test.ts`: the host store completes before the body is marked
-  readable; mismatched folder identity prevents writes; changed size, the byte
-  cap, and existing bodies skip storage; storage failure keeps the row id;
+- `filed-message.test.ts`: evidence, the host store and readability happen in the
+  body lane's order; mismatched folder identity prevents writes; changed size,
+  the byte cap, the 4 MiB bound, no filed bytes and existing bodies skip storage; storage failure keeps the row id;
   mirror failure preserves confirmed Sent filing. Real database and protocol
   tests below cover successful filing rather than repeating it in mocks.
-- `drafts.test.ts`, `send.test.ts`: create, update and both sends hold fenced
-  locks; create and update pass the APPENDUID, bytes, socket and host body store
-  to the mirror; both sends pass the delivered bytes and host body store to the
-  Sent filing.
+- `drafts.test.ts`, `send.test.ts`: create and both sends hold fenced locks;
+  create and update pass the APPENDUID, bytes, socket and host body store to the
+  mirror and time it as `mirror`; a keyed retry mirrors only the earlier copy's
+  row; both sends pass the delivered bytes and host body store to the Sent filing.
 - `drafts.live-db.test.ts`: against real Postgres, a saved draft is readable at
   once with its body, and a later sync upsert keeps its id.
 - Dovecot smoke: a draft saved with an idempotency key is readable at once with

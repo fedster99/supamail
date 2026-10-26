@@ -140,10 +140,11 @@ export async function connectAbortableImap(
 
 /**
  * The IMAP steps of a draft save or update, named for a caller's timing. `connect`
- * covers the host check, password decryption, TLS and login; `delete` removes the
+ * covers the host check, password decryption, TLS and login; `mirror` reads the
+ * filed UID back and stores its row and body (ADR 0046); `delete` removes the
  * replaced draft, with its mirror update.
  */
-export const IMAP_STEPS = ["connect", "list", "find", "append", "delete", "logout"] as const;
+export const IMAP_STEPS = ["connect", "list", "find", "append", "mirror", "delete", "logout"] as const;
 export type ImapStep = (typeof IMAP_STEPS)[number];
 export type ImapStepTimer = (step: ImapStep, ms: number) => void;
 

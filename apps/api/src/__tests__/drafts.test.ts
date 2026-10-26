@@ -244,10 +244,14 @@ describe("createDraft", () => {
     expect(mocks.findByMessageId).toHaveBeenCalledTimes(1);
     expect(mocks.append).not.toHaveBeenCalled();
     expect(result.appendedUid).toBe(42); // highest UID of the existing match
-    // Nothing new reached the provider, so nothing new is marked or written.
+    // Nothing new reached the provider, so nothing new is marked.
     expect(mocks.markFoldersForReconcile).not.toHaveBeenCalled();
-    expect(mocks.mirrorFiledMessage).not.toHaveBeenCalled();
     expect(mocks.getLiveMessageId).toHaveBeenCalledWith({ accountId: "11111111-1111-4111-8111-111111111111", folderPath: "Drafts", uidValidity: 100, uid: 42 });
+    // The earlier copy is not mirrored yet: mirror its row, but not these bytes as
+    // its body, since the earlier attempt's bytes may differ.
+    const [, , , , , filed] = mocks.mirrorFiledMessage.mock.calls[0];
+    expect(filed).toEqual({ folderPath: "Drafts", appended: { uid: 42, uidValidity: 100 }, raw: null });
+    expect(result.messageId).toBe(N1);
   });
 
   it("returns the mirror id of the draft an earlier attempt saved", async () => {
@@ -258,6 +262,7 @@ describe("createDraft", () => {
       accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }, idempotencyKey: "req-key-1"
     });
     expect(result).toMatchObject({ messageId: N1, warnings: [] });
+    expect(mocks.mirrorFiledMessage).not.toHaveBeenCalled();
   });
 
   it("searches by the derived Message-ID then APPENDs when an idempotency key has no prior draft", async () => {
@@ -298,11 +303,11 @@ describe("createDraft", () => {
       expect(ms).toBeGreaterThanOrEqual(0);
       steps.push(step);
     } });
-    expect(steps).toEqual(["list", "append"]);
+    expect(steps).toEqual(["list", "append", "mirror"]);
     steps.length = 0;
     await createDraft({} as never, config, { ...input, idempotencyKey: "k-1" }, undefined,
       { onImapStep: (step) => steps.push(step) });
-    expect(steps).toEqual(["list", "find", "append"]);
+    expect(steps).toEqual(["list", "find", "append", "mirror"]);
   });
 
   it("does not APPEND when Drafts cannot be marked due first", async () => {
@@ -584,7 +589,7 @@ describe("updateDraft", () => {
     const steps: string[] = [];
     await updateDraft(draftPool, config, D1, { to: [{ email: "rcpt@example.test" }], subject: "s",
       body: { format: "plain", text: "v2" } }, undefined, { onImapStep: (step) => steps.push(step) });
-    expect(steps).toEqual(["list", "append", "delete"]);
+    expect(steps).toEqual(["list", "append", "mirror", "delete"]);
   });
 
   it("holds one account lock across the new APPEND and the old draft's delete", async () => {

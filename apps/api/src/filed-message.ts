@@ -5,6 +5,7 @@ import { uidValidityMatches, type ActionConnection, type ActionSocket } from "./
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import type { MirrorRepository } from "./repository.js";
 import { SentFolderAppender, type AppendedUid } from "./smtp-client.js";
+import { PARSED_BODY_BATCH_MAX_SOURCE_BYTES } from "./sync-limits.js";
 import type { ImapAccount, SendResult } from "./types.js";
 
 /** Bound on the row write; the provider already holds the message. The body store
@@ -17,18 +18,21 @@ export function actionBodyStore(repository: MirrorRepository, bodyStore?: BodySt
   return bodyStore ?? new DatabaseBodyStore(repository);
 }
 
-/** A message this action just filed with APPEND, and the server's APPENDUID for it. */
+/** A message this action just filed with APPEND, and the server's APPENDUID for it.
+ * `raw` is the exact bytes filed, or null when this action did not file them. */
 export interface FiledMessage {
   folderPath: string;
   appended: AppendedUid;
-  raw: Buffer;
+  raw: Buffer | null;
 }
 
 /**
  * Mirror a message this action just filed, as sync would (ADR 0046). The server's
  * APPENDUID names it, so nothing is guessed: read that one UID's metadata on the
  * action's own connection, write the row through sync's upsert, then store the
- * body from the filed bytes when the server holds exactly that many bytes.
+ * body from the filed bytes when the server holds exactly that many bytes. A body
+ * over the body lane's batch bound (4 MiB) is left to the body lane, which streams
+ * it on a worker instead of the request.
  *
  * Only a tracked folder that sync already read at the APPENDUID's UIDVALIDITY
  * qualifies; otherwise this returns null and the next sync mirrors the message.
@@ -68,9 +72,12 @@ export async function mirrorFiledMessage(
 
   const deadlineAt = Date.now() + FILED_ROW_WRITE_TIMEOUT_MS;
   const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], { deadlineAt });
-  if (!row.body_fetched_at && metadata.sizeBytes === filed.raw.length && filed.raw.length < config.BODY_RAW_MAX_BYTES) {
+  if (!row) throw new Error("the mirror write returned no row");
+  const raw = filed.raw;
+  if (raw && !row.body_fetched_at && metadata.sizeBytes === raw.length
+    && raw.length < config.BODY_RAW_MAX_BYTES && raw.length <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES) {
     try {
-      const body = await filedMessageBody(config, row, filed.raw, metadata.mimeStructure);
+      const body = await filedMessageBody(config, row, raw, metadata.mimeStructure);
       await repository.storeBodyEvidence(body);
       await bodyStore.store(body);
       await repository.completeBodyStorage(row.id);

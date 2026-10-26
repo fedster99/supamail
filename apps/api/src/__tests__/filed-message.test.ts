@@ -11,9 +11,9 @@ const config = {
   BODY_RAW_MAX_BYTES: 25 * 1024 * 1024, BODY_STORAGE_MODE: "parsed_only"
 } as AppConfig;
 
-async function fixture() {
+async function fixture(text = "The filed bytes.") {
   const { raw } = await buildRawMime({ accountId: account.id, to: [{ email: "rcpt@example.test" }],
-    subject: "Filed body", body: { format: "plain", text: "The filed bytes." } }, { email: "sender@example.test" });
+    subject: "Filed body", body: { format: "plain", text } }, { email: "sender@example.test" });
   const server = { uidValidity: 100n, size: raw.length };
   const client = {
     usable: true, capabilities: new Map(),
@@ -39,21 +39,22 @@ async function fixture() {
   const warn = vi.fn();
   const socket = { client, abort: { run: <T>(fn: () => Promise<T>) => fn() } };
   return { raw, server, client, repository, store, warn,
-    mirror: (settings = config) => mirrorFiledMessage(repository as never, settings, store, socket as never,
-      account.id, { folderPath: "Sent", appended: { uid: 7, uidValidity: 100 }, raw }, warn),
+    mirror: (settings = config, filedRaw: Buffer | null = raw) => mirrorFiledMessage(repository as never, settings,
+      store, socket as never, account.id, { folderPath: "Sent", appended: { uid: 7, uidValidity: 100 }, raw: filedRaw }, warn),
     sent: () => fileSentCopy(repository as never, config, store, account as never,
       { get: async () => socket } as never, raw, warn) };
 }
 
-it("stores the filed body through the host store before marking it readable", async () => {
+it("stores the filed body as the body lane does: evidence, host store, then readable", async () => {
   const f = await fixture();
-  f.store.store.mockImplementation(async () => {
-    expect(f.repository.completeBodyStorage).not.toHaveBeenCalled();
-  });
   expect(await f.mirror()).toBe(rowId);
   expect(f.store.store).toHaveBeenCalledWith(expect.objectContaining({ messageId: rowId,
     bodyText: expect.stringContaining("The filed bytes."), rawTruncated: false }));
   expect(f.repository.completeBodyStorage).toHaveBeenCalledWith(rowId);
+  const order = [f.repository.storeBodyEvidence, f.store.store, f.repository.completeBodyStorage]
+    .map((step) => step.mock.invocationCallOrder[0]);
+  expect(order).toEqual([...order].sort((a, b) => a - b));
+  expect(f.warn).not.toHaveBeenCalled();
 });
 
 it("never writes a row without matching tracked and provider folder identities", async () => {
@@ -70,13 +71,14 @@ it("never writes a row without matching tracked and provider folder identities",
 });
 
 it("keeps the row but leaves unsafe or already stored bodies alone", async () => {
-  for (const reason of ["size changed", "at cap", "already stored"]) {
-    const f = await fixture();
+  for (const reason of ["size changed", "at cap", "already stored", "no filed bytes", "over batch bound"]) {
+    const f = reason === "over batch bound" ? await fixture("x".repeat(4 * 1024 * 1024)) : await fixture();
     if (reason === "size changed") f.server.size++;
     if (reason === "already stored") {
       f.repository.upsertMessages.mockResolvedValue([{ id: rowId, body_fetched_at: new Date(), headers_json: {} }]);
     }
-    expect(await f.mirror(reason === "at cap" ? { ...config, BODY_RAW_MAX_BYTES: f.raw.length } : config)).toBe(rowId);
+    expect(await f.mirror(reason === "at cap" ? { ...config, BODY_RAW_MAX_BYTES: f.raw.length } : config,
+      reason === "no filed bytes" ? null : f.raw)).toBe(rowId);
     expect(f.store.store).not.toHaveBeenCalled();
     expect(f.repository.completeBodyStorage).not.toHaveBeenCalled();
   }
