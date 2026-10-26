@@ -7,8 +7,9 @@ import { MirrorRepository } from "../repository.js";
 import type { ImapFolder } from "../types.js";
 
 // The provider side of a draft save: Drafts answers each APPEND with APPENDUID
-// 100/<next UID>, starting at 50.
-const provider = vi.hoisted(() => ({ nextUid: 50, appends: 0 }));
+// 100/<next UID>, starting at 50, keeps the bytes, and answers a FETCH of that UID
+// with its metadata (ADR 0046).
+const provider = vi.hoisted(() => ({ nextUid: 50, appends: 0, stored: new Map<number, Buffer>() }));
 vi.mock("../smtp-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../smtp-client.js")>();
   return {
@@ -16,9 +17,11 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
     SentFolderAppender: {
       over: () => ({
         list: async () => [{ path: "Drafts", specialUse: "\\Drafts" }],
-        append: async () => {
+        append: async (_path: string, raw: Buffer) => {
           provider.appends += 1;
-          return { uidValidity: 100, uid: provider.nextUid++ };
+          const uid = provider.nextUid++;
+          provider.stored.set(uid, raw);
+          return { uidValidity: 100, uid };
         },
         findByMessageId: async () => ({ uids: [], uidValidity: 100 })
       })
@@ -27,10 +30,45 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
 });
 vi.mock("../imap-connect.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../imap-connect.js")>();
+  const { simpleParser } = await import("mailparser");
+  const client = {
+    usable: true,
+    capabilities: new Map<string, boolean>(),
+    mailbox: null as null | { path: string; uidValidity: bigint },
+    mailboxOpen: async (path: string) => {
+      client.mailbox = { path, uidValidity: 100n };
+    },
+    getMailboxLock: async (path: string) => {
+      client.mailbox = { path, uidValidity: 100n };
+      return { release: () => undefined };
+    },
+    fetch: async function* (uids: number[]) {
+      for (const uid of uids) {
+        const raw = provider.stored.get(uid);
+        if (!raw) continue;
+        const parsed = await simpleParser(raw);
+        const to = Array.isArray(parsed.to) ? parsed.to : parsed.to ? [parsed.to] : [];
+        yield {
+          uid,
+          flags: new Set(["\\Draft", "\\Seen"]),
+          internalDate: new Date(),
+          size: raw.length,
+          envelope: {
+            subject: parsed.subject,
+            messageId: parsed.messageId,
+            from: parsed.from?.value,
+            to: to.flatMap((list) => list.value)
+          },
+          headers: raw.subarray(0, raw.indexOf("\r\n\r\n") + 4),
+          bodyStructure: { type: "text/plain", part: "1", size: raw.length }
+        };
+      }
+    }
+  };
   return {
     ...actual,
     ActionConnection: class {
-      async get() { return { client: {}, abort: {} }; }
+      async get() { return { client, abort: { run: <T>(command: () => Promise<T>) => command() } }; }
       async close() {}
     }
   };
@@ -48,7 +86,14 @@ vi.mock("../imap-connect.js", async (importOriginal) => {
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
 const liveDb = LIVE_DB_AVAILABLE ? describe : describe.skip;
 
-const config = { IMAP_ENCRYPTION_KEY: "x", IMAP_ALLOW_PRIVATE_HOSTS: false } as unknown as AppConfig;
+const config = {
+  IMAP_ENCRYPTION_KEY: "x",
+  IMAP_ALLOW_PRIVATE_HOSTS: false,
+  IMAP_MAX_COMMANDS_PER_MINUTE: 1_000,
+  IMAP_COMMAND_TIMEOUT_MS: 5_000,
+  BODY_RAW_MAX_BYTES: 25 * 1024 * 1024,
+  BODY_STORAGE_MODE: "raw_mime"
+} as unknown as AppConfig;
 const ACCOUNT_EMAIL = `drafts-live-${process.pid}@example.test`;
 
 liveDb("draft folder resolution (live DB)", () => {
@@ -172,7 +217,7 @@ liveDb("draft folder resolution (live DB)", () => {
     expect(await repository.getLiveMessageId({ accountId, folderPath: "Drafts", uidValidity: 100, uid: 9 })).toBeNull();
   });
 
-  it("a saved draft is readable at once, and the next sync keeps its id", async () => {
+  it("a saved draft is readable at once with its body, and the next sync keeps its id", async () => {
     const saved = await createDraft(pool, config, {
       accountId,
       to: [{ email: "rcpt@example.test", name: "Rcpt" }],
@@ -191,7 +236,8 @@ liveDb("draft folder resolution (live DB)", () => {
       subject: "Saved draft",
       toEmails: ["rcpt@example.test"],
       flags: ["\\Draft", "\\Seen"],
-      body: null
+      // The body is stored from the filed bytes, not left to the body lane.
+      body: "saved body"
     });
 
     // Sync reads UID 50 again (it is above last_uid) and writes the server's view.

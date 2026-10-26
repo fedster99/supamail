@@ -475,10 +475,19 @@ async function main(): Promise<void> {
       throw new Error("GreenMail basic STATUS fallback did not converge Archive promptly");
     }
 
-    // Send path (email-001): reply to a mirrored message over SMTP, which APPENDs
-    // a copy to Sent. The next sync FETCHes that copy; assert it is mirrored and
-    // carries the threading In-Reply-To header (the NULL provider_thread_id path).
+    // Send path (email-001, ADR 0046): reply to a mirrored message over SMTP, which
+    // APPENDs a copy to Sent. Sent is tracked first, so the send mirrors that copy at
+    // once from APPENDUID: the row is readable by the returned id before any sync,
+    // carries the threading In-Reply-To header (the NULL provider_thread_id path),
+    // and the next sync keeps the id. GreenMail reports an RFC822.SIZE smaller than
+    // the stored bytes, so the body is left to the body lane here; the Dovecot smoke
+    // proves the body is stored at once.
     await ensureSentFolder();
+    await pool.query(
+      "UPDATE public.imap_accounts SET next_folder_discovery_at = now() WHERE id = $1",
+      [account.id]
+    );
+    await engine.syncAccount(account.id, "manual");
     const source = await pool.query<{ id: string; rfc_message_id: string | null }>(
       "SELECT id, rfc_message_id FROM public.imap_messages WHERE account_id = $1 ORDER BY internal_date DESC LIMIT 1",
       [account.id]
@@ -494,6 +503,13 @@ async function main(): Promise<void> {
       references: sourceRow?.rfc_message_id ?? undefined,
       messageId: replyMessageId
     });
+    const sentAtOnce = sendResult.messageId === null ? null : (await pool.query<{
+      rfc_message_id: string | null;
+      in_reply_to: string | null;
+    }>(
+      "SELECT rfc_message_id, in_reply_to FROM public.imap_messages WHERE id = $1",
+      [sendResult.messageId]
+    )).rows[0] ?? null;
 
     // Force folder re-discovery so the resync picks up the (just-created) Sent
     // folder and the message we APPENDed into it; discovery is otherwise gated by
@@ -504,9 +520,9 @@ async function main(): Promise<void> {
     );
     // Re-sync so the Sent copy (and the delivered copy in INBOX) are mirrored.
     const resyncResult = await engine.syncAccount(account.id, "manual");
-    const sentCopy = await pool.query<{ folder_path: string; in_reply_to: string | null }>(
+    const sentCopy = await pool.query<{ id: string; folder_path: string; in_reply_to: string | null }>(
       `
-      SELECT folder_path, in_reply_to
+      SELECT id, folder_path, in_reply_to
       FROM public.imap_messages
       WHERE account_id = $1
         AND rfc_message_id = $2
@@ -522,6 +538,9 @@ async function main(): Promise<void> {
     const sendAssertions: Array<[string, boolean]> = [
       ["send delivered", sendResult.delivered === true],
       ["send appended to Sent", sendResult.appendedToSent === true],
+      ["sent copy readable at once by its id", sentAtOnce?.rfc_message_id === replyMessageId],
+      ["sent copy carries In-Reply-To at once", sentAtOnce?.in_reply_to === (sourceRow?.rfc_message_id ?? null)],
+      ["sync kept the sent copy id", sentCopy.rows.some((row) => row.id === sendResult.messageId)],
       ["resync succeeded", resyncResult.outcome === "success"],
       ["sent reply mirrored on resync", filedSomewhere],
       ["sent reply threads via In-Reply-To", threadingPresent]

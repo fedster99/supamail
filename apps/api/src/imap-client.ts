@@ -972,6 +972,60 @@ export interface BodyBatchFetchResult {
   missingMessages: ImapMessage[];
 }
 
+type ParsedSource = Awaited<ReturnType<typeof parseRawMime>>;
+
+async function* oneChunk(source: Buffer): AsyncIterable<Buffer> {
+  yield source;
+}
+
+/** The body-lane input of one parsed source; every body path builds it here. */
+function messageBodyInput(
+  message: ImapMessage,
+  parsed: ParsedSource,
+  source: { rawMime: Buffer; rawMimeSha256?: string | null; rawBytes: number; rawTruncated: boolean },
+  mimeStructure: unknown
+): MessageBodyInput {
+  const selected = selectBodyTextPart(mimeStructure);
+  return {
+    messageId: message.id,
+    rawMime: source.rawMime,
+    rawMimeSha256: source.rawTruncated ? null : source.rawMimeSha256,
+    rawBytes: source.rawBytes,
+    rawTruncated: source.rawTruncated,
+    bodyText: parsed.bodyText,
+    bodyHtml: parsed.bodyHtml,
+    bodyPlain: parsed.bodyPlain,
+    selectedTextPart: selected?.part ?? null,
+    selectedTextFormat: selected?.format ?? null,
+    headersJson: Object.keys(parsed.headersJson).length > 0 ? parsed.headersJson : message.headers_json,
+    mimeStructure,
+    parserWarnings: source.rawTruncated
+      ? [...parsed.parserWarnings, "artifact_evidence_omitted_raw_truncated"]
+      : parsed.parserWarnings,
+    evidence: source.rawTruncated ? [] : parsed.evidence
+  };
+}
+
+/**
+ * The body of a message this action just filed, parsed from the bytes it filed
+ * (ADR 0046). The caller proves the server holds exactly as many bytes and that
+ * they are under the body cap, so the source is complete.
+ */
+export async function filedMessageBody(
+  config: AppConfig,
+  message: ImapMessage,
+  raw: Buffer,
+  mimeStructure: unknown
+): Promise<MessageBodyInput> {
+  const parsed = await parseRawMimeStream(oneChunk(raw));
+  return messageBodyInput(message, parsed, {
+    rawMime: config.BODY_STORAGE_MODE === "parsed_only" ? Buffer.alloc(0) : raw,
+    rawMimeSha256: parsed.rawMimeSha256,
+    rawBytes: parsed.rawBytes,
+    rawTruncated: false
+  }, mimeStructure);
+}
+
 function isParsedOnlySourceTruncated(
   rawBytes: number,
   expectedBytes: number,
@@ -1063,8 +1117,8 @@ export async function fetchFullMessageBodyBatch(
           start: 0,
           maxLength: sourceLimit
         },
-        // A row a draft save wrote has no BODYSTRUCTURE until sync reads it again
-        // (ADR 0033); select its text part from the server's.
+        // A row a draft save wrote before ADR 0046 has no BODYSTRUCTURE until sync
+        // reads it again (ADR 0033); select its text part from the server's.
         ...(messages.some((message) => message.mime_structure == null) ? { bodyStructure: true } : {})
       },
       { uid: true }
@@ -1082,39 +1136,19 @@ export async function fetchFullMessageBodyBatch(
       if (source.length !== Number(message.size_bytes)) continue;
       seen.add(uid);
 
-      const parsed = await parseRawMimeStream((async function* () {
-        yield source;
-      })());
-      const rawTruncated = isParsedOnlySourceTruncated(
-        parsed.rawBytes,
-        Number(message.size_bytes),
-        config.BODY_RAW_MAX_BYTES
-      );
-      const mimeStructure = message.mime_structure ?? fetched.bodyStructure ?? null;
-      const selected = selectBodyTextPart(mimeStructure);
-
+      const parsed = await parseRawMimeStream(oneChunk(source));
       bodies.push({
         message,
-        body: {
-          messageId: message.id,
+        body: messageBodyInput(message, parsed, {
           rawMime: Buffer.alloc(0),
-          rawMimeSha256: rawTruncated ? null : parsed.rawMimeSha256,
+          rawMimeSha256: parsed.rawMimeSha256,
           rawBytes: parsed.rawBytes,
-          rawTruncated,
-          bodyText: parsed.bodyText,
-          bodyHtml: parsed.bodyHtml,
-          bodyPlain: parsed.bodyPlain,
-          selectedTextPart: selected?.part ?? null,
-          selectedTextFormat: selected?.format ?? null,
-          headersJson: Object.keys(parsed.headersJson).length > 0
-            ? parsed.headersJson
-            : message.headers_json,
-          mimeStructure,
-          parserWarnings: rawTruncated
-            ? [...parsed.parserWarnings, "artifact_evidence_omitted_raw_truncated"]
-            : parsed.parserWarnings,
-          evidence: rawTruncated ? [] : parsed.evidence
-        }
+          rawTruncated: isParsedOnlySourceTruncated(
+            parsed.rawBytes,
+            Number(message.size_bytes),
+            config.BODY_RAW_MAX_BYTES
+          )
+        }, message.mime_structure ?? fetched.bodyStructure ?? null)
       });
     }
 
@@ -1158,8 +1192,8 @@ export async function fetchFullMessageBody(
     const streamParsedOnly = config.BODY_STORAGE_MODE === "parsed_only";
     let fetched: FetchMessage | false | null = null;
     // Parsed-only streams the source below and needs a FETCH only for a row with no
-    // BODYSTRUCTURE, which a draft save writes until sync reads it again (ADR 0033).
-    // That row's size is the composed size, so take the server's size too.
+    // BODYSTRUCTURE, which a draft save wrote before ADR 0046 until sync read it
+    // again (ADR 0033). That row's size is the composed size, so take the server's.
     if (!streamParsedOnly || message.mime_structure == null) {
       fetched = await client.fetchOne(
         String(message.uid),
@@ -1184,7 +1218,7 @@ export async function fetchFullMessageBody(
 
     let rawMime: Buffer = Buffer.alloc(0);
     let rawBytes = 0;
-    let rawMimeSha256: string | null | undefined;
+    let rawMimeSha256: string | undefined;
     let parsed;
     if (streamParsedOnly) {
       const downloaded = await client.download(String(message.uid), undefined, {
@@ -1225,28 +1259,12 @@ export async function fetchFullMessageBody(
         config.BODY_RAW_MAX_BYTES
       )
       : rawBytes >= config.BODY_RAW_MAX_BYTES;
-    if (rawTruncated) rawMimeSha256 = null;
-    const mimeStructure = fetched?.bodyStructure ?? message.mime_structure;
-    const selected = selectBodyTextPart(mimeStructure);
-
-    return {
-      messageId: message.id,
-      rawMime,
-      rawMimeSha256,
-      rawBytes,
-      rawTruncated,
-      bodyText: parsed.bodyText,
-      bodyHtml: parsed.bodyHtml,
-      bodyPlain: parsed.bodyPlain,
-      selectedTextPart: selected?.part ?? null,
-      selectedTextFormat: selected?.format ?? null,
-      headersJson: Object.keys(parsed.headersJson).length > 0 ? parsed.headersJson : message.headers_json,
-      mimeStructure,
-      parserWarnings: rawTruncated
-        ? [...parsed.parserWarnings, "artifact_evidence_omitted_raw_truncated"]
-        : parsed.parserWarnings,
-      evidence: rawTruncated ? [] : parsed.evidence
-    };
+    return messageBodyInput(
+      message,
+      parsed,
+      { rawMime, rawMimeSha256, rawBytes, rawTruncated },
+      fetched?.bodyStructure ?? message.mime_structure
+    );
   } finally {
     lock?.release();
   }

@@ -1,4 +1,5 @@
 import type { ImapFlow } from "imapflow";
+import type { BodyStore } from "./body-store.js";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
 import { InvalidInputError, MailboxConflictError, NotFoundError, throwIfAborted } from "./errors.js";
@@ -77,6 +78,9 @@ export interface MailboxActionOptions {
   signal?: AbortSignal;
   /** Receives each IMAP step's duration where an action names its steps (draft save and update). */
   onImapStep?: ImapStepTimer;
+  /** Where an action that files a message stores its body (ADR 0046); the host's
+   * sync store. Defaults to the OSS database store, as sync does. */
+  bodyStore?: BodyStore;
 }
 
 /** A SupaMail well-known flag name mapped to its IMAP system flag. */
