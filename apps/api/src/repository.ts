@@ -43,7 +43,7 @@ import {
   splitFlagWriteBatches,
   splitMetadataWriteBatches
 } from "./sync-limits.js";
-import { diagnosticErrorCode, sanitizeErrorReason } from "./sync-diagnostics.js";
+import { diagnosticErrorCode, sanitizeErrorReason, safeSyncFailures } from "./sync-diagnostics.js";
 import type {
   AccountDetails,
   AccountProgress,
@@ -1112,6 +1112,7 @@ export class MirrorRepository {
         diagnosticCodes[0] ?? null,
         JSON.stringify({
           errors: diagnosticCodes,
+          failures: safeSyncFailures(result.failures),
           hitLockBudget: result.hitLockBudget,
           metadataRowsCommitted: result.metadataRowsCommitted ?? 0,
           metadataWriteDurationMs: result.metadataWriteDurationMs ?? 0,

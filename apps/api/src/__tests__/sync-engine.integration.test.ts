@@ -1838,6 +1838,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("failed");
     expect(result.errors).toContain("Live folder set no longer matches tracked folders");
+    expect(result.failures).toContainEqual({ stage: "folder_sync", code: "FOLDER_SET_CHANGED" });
     expect(acknowledge).not.toHaveBeenCalled();
   });
 

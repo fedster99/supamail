@@ -1,3 +1,4 @@
+import type { SyncFailure } from "./sync-diagnostics.js";
 export type BodyFetchPolicy = "immediate" | "lazy" | "priority_then_backfill";
 export type BodyStorageMode = "raw_mime" | "parsed_only";
 export type LiveWindowDays = 30 | 90 | 180;
@@ -321,6 +322,8 @@ export interface SyncResult {
   reconcileDurationMs?: number;
   hitLockBudget: boolean;
   errors: string[];
+  /** Bounded, fixed code/stage pairs; absent on older producers. */
+  failures?: SyncFailure[];
 }
 
 export interface MirrorHooks {
