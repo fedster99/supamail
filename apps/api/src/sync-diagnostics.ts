@@ -61,7 +61,7 @@ export function diagnosticErrorCode(error: string): string {
 // Diagnostic detail is independent of the legacy health/backoff classification.
 // Never persist arbitrary error properties, messages, response text or causes.
 export const SYNC_FAILURE_STAGES = [
-  "account_lock", "account_start", "connect", "folder_discovery", "folder_status",
+  "account_start", "connect", "folder_discovery", "folder_status",
   "folder_selection", "folder_sync", "body_backlog", "history", "account_finish",
   "run_finish"
 ] as const;
@@ -86,6 +86,7 @@ const ERROR_NAMES = new Map([
   ["AccountAlreadyFinalizedError", "ACCOUNT_ALREADY_FINALIZED"],
   ["IncompleteUidListError", "INCOMPLETE_UID_LIST"],
   ["HostValidationError", "HOST_VALIDATION_FAILED"],
+  ["SyncDeadlineError", "SYNC_DEADLINE_EXCEEDED"],
   ["SyncInterruptedError", "SYNC_INTERRUPTED"], ["AbortError", "ABORTED"]
 ]);
 const FAILURE_CODES = new Set([
@@ -97,7 +98,13 @@ export interface SyncFailure {
   stage: SyncFailureStage;
   code: string;
 }
-const MAX_SYNC_FAILURES = 32;
+/** A local engine deadline, distinct from a provider/socket timeout. */
+export class SyncDeadlineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SyncDeadlineError";
+  }
+}
 
 export function syncFailureCode(error: unknown): string {
   if (!error || typeof error !== "object") return "SYNC_ERROR";
@@ -117,12 +124,13 @@ export function syncFailureCode(error: unknown): string {
 
 export function recordSyncFailure(failures: SyncFailure[], stage: SyncFailureStage, error: unknown): void {
   const code = syncFailureCode(error);
-  if (failures.length < MAX_SYNC_FAILURES && !failures.some(f => f.stage === stage && f.code === code)) {
+  if (!failures.some(f => f.stage === stage && f.code === code)) {
     failures.push({ stage, code });
   }
 }
 
-/** Validate again at the durable boundary, including callers outside the engine. */
+/** Fixed vocabularies plus deduplication bound storage without discarding later
+ * failures. Validate again at the durable boundary, including outside callers. */
 export function safeSyncFailures(input: unknown): SyncFailure[] {
   if (!Array.isArray(input)) return [];
   const failures: SyncFailure[] = [];
@@ -131,7 +139,6 @@ export function safeSyncFailures(input: unknown): SyncFailure[] {
     const { stage, code } = value;
     if (!SYNC_FAILURE_STAGES.includes(stage) || !FAILURE_CODES.has(code)) continue;
     if (!failures.some(f => f.stage === stage && f.code === code)) failures.push({ stage, code });
-    if (failures.length === MAX_SYNC_FAILURES) break;
   }
   return failures;
 }

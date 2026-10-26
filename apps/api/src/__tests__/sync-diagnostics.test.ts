@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { recordSyncFailure, safeSyncFailures, syncFailureCode, SYNC_FAILURE_STAGES, type SyncFailure } from "../sync-diagnostics.js";
+import { recordSyncFailure, safeSyncFailures, syncFailureCode, SyncDeadlineError, SYNC_FAILURE_STAGES, type SyncFailure } from "../sync-diagnostics.js";
 
 import { MirrorRepository } from "../repository.js";
 import type { SyncResult } from "../types.js";
@@ -26,6 +26,10 @@ describe("structured sync failures", () => {
     expect(syncFailureCode(Object.assign(new Error(privateText), properties))).toBe(expected);
   });
 
+  it("recognizes the engine's own deadlines without interpreting their message", () => {
+    expect(syncFailureCode(new SyncDeadlineError(privateText))).toBe("SYNC_DEADLINE_EXCEEDED");
+  });
+
   it("never stores arbitrary properties, free text, or nested causes", () => {
     const failures: SyncFailure[] = [];
     recordSyncFailure(failures, "connect", Object.assign(new Error(privateText), {
@@ -45,11 +49,12 @@ describe("structured sync failures", () => {
         for (let i = 0; i < 10; i++) recordSyncFailure(failures, stage, { code });
       }
     }
-    expect(failures).toHaveLength(32);
-    expect(new Set(failures.map(f => JSON.stringify(f))).size).toBe(32);
+    expect(failures).toHaveLength(SYNC_FAILURE_STAGES.length * 4);
+    expect(new Set(failures.map(f => JSON.stringify(f))).size).toBe(failures.length);
+    expect(failures).toContainEqual({ stage: "run_finish", code: "DB_QUERY_CANCELED" });
     expect(failures.slice(0, 2)).toEqual([
-      { stage: "account_lock", code: "ECONNRESET" },
-      { stage: "account_lock", code: "ETIMEDOUT" }
+      { stage: "account_start", code: "ECONNRESET" },
+      { stage: "account_start", code: "ETIMEDOUT" }
     ]);
   });
 
@@ -84,6 +89,6 @@ describe("structured sync failures", () => {
     expect(safeSyncFailures(undefined)).toEqual([]);
     const many = SYNC_FAILURE_STAGES.flatMap(stage =>
       ["ECONNRESET", "ETIMEDOUT", "EPIPE", "DB_QUERY_CANCELED"].map(code => ({ stage, code })));
-    expect(safeSyncFailures(many)).toHaveLength(32);
+    expect(safeSyncFailures([...many, ...many])).toEqual(many);
   });
 });

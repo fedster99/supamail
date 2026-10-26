@@ -31,6 +31,7 @@ import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import {
   recordSyncFailure,
+  SyncDeadlineError,
   type SyncFailure,
   type SyncFailureStage,
   isAuthDiagnosticText,
@@ -438,6 +439,7 @@ export class MirrorEngine {
       batchesAttempted: 0,
       batchesFailed: 0
     };
+    const failures: SyncFailure[] = [];
     const result: SyncResult = {
       runId: null,
       outcome: "success",
@@ -457,10 +459,9 @@ export class MirrorEngine {
       reconcileDurationMs: 0,
       hitLockBudget: false,
       errors: [],
-      failures: []
+      failures
     };
-    const failures = result.failures!;
-    let failureStage: SyncFailureStage = "account_lock";
+    let failureStage: SyncFailureStage = "account_start";
     let cancellationCleanupRequired = false;
     let syncOwner = "";
 
@@ -1842,7 +1843,7 @@ export class MirrorEngine {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => {
         this.abortClient(client);
-        reject(new Error(`${timeoutName} exceeded during ${operation}`));
+        reject(new SyncDeadlineError(`${timeoutName} exceeded during ${operation}`));
       }, remainingMs);
     });
 
@@ -1862,7 +1863,7 @@ export class MirrorEngine {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       this.abortClient(client);
-      throw new Error(`${timeoutName} exceeded before ${operation}`);
+      throw new SyncDeadlineError(`${timeoutName} exceeded before ${operation}`);
     }
     return remainingMs;
   }
