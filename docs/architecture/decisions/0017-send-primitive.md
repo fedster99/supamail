@@ -1,6 +1,6 @@
 # ADR 0017: SMTP Send/Reply Is a Separately-Gated Primitive Outside the Agent Surface
 
-Status: Accepted
+Status: Accepted; amended by ADR 0046
 
 Date: 2026-06-21
 
@@ -71,7 +71,9 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   that "reused pattern" is now an actual shared function, `connectImap`
   (`imap-connect.ts`) — `SentFolderAppender` obtains its socket there (and so
   inherits the close-on-connect-error guard it previously lacked); the append-only
-  verb surface is unchanged.
+  verb surface is unchanged. Update (ADR 0046): after an APPEND with APPENDUID the
+  send path reads back that one UID's metadata to mirror the Sent copy; it reads
+  nothing else.
 - **Reuse the frozen AES-256-GCM envelope for the SMTP secret.** SMTP credentials
   are stored in nullable `smtp_*` columns on `imap_accounts` (migration 0009),
   with `encrypted_smtp_password` using the same envelope as `encrypted_password`
@@ -81,10 +83,10 @@ sendMessage(pool, config, req: SendRequest): Promise<SendResult>
   `assertSafeImapTarget` (private/reserved-range rejection, DNS resolution check),
   differing only in the allowed submission/relay ports (25/465/587) and in that
   `secure=false` means STARTTLS (a TLS upgrade), not plaintext.
-- **No immediate mirror insert.** The APPEND files a real message in Sent; the
-  existing sync pass FETCHes and mirrors it with a server-assigned UID on the next
-  tick. Identity (`folder + UIDVALIDITY + UID`) is never guessed. APPENDUID is
-  captured into `SendResult` for observability, not used to fabricate a row.
+- **No guessed mirror row.** The APPEND files a real message in Sent. Identity
+  (`folder + UIDVALIDITY + UID`) is never guessed. *Amended by ADR 0046:* when the
+  server answers with APPENDUID, the send reads that UID back and mirrors the copy
+  at once; otherwise the next sync pass mirrors it.
 - **Provider SMTP defaults are explicit-only.** `ProviderProfile` gains an optional
   `smtpDefaults` hook, set ONLY for the real `rackspace` mapping
   (`secure.emailsrvr.com:465`). Generic IMAP requires explicit columns — ship the

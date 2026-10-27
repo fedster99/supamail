@@ -1,6 +1,6 @@
 # ADR 0033: A Saved Draft Writes Its Own Mirror Row From APPENDUID
 
-Status: Accepted
+Status: Accepted; amended by ADR 0046
 
 Date: 2026-10-03
 
@@ -57,7 +57,10 @@ a 5-second deadline; the other mirror steps are single indexed queries.
   copy's live mirror id, if one exists. It does not write a row, because the
   earlier attempt's bytes may differ from this request's.
 
-Sent APPENDs (ADR 0017) are unchanged and still insert no row.
+*Amended by ADR 0046:* the row now comes from the server's metadata for the
+APPENDUID's UID, read on the save's own connection, and the body from the filed
+bytes; a retry mirrors an unmirrored earlier copy's row only. Sent copies are
+mirrored the same way.
 
 ## Consequences
 

@@ -9,6 +9,7 @@ import { ImapFlow } from "imapflow";
 import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { openInboxIdleSession } from "../src/inbox-idle.js";
+import { createDraft, getDraft } from "../src/drafts.js";
 import { MailboxMutator, moveMessages } from "../src/mailbox-mutations.js";
 import { MirrorRepository } from "../src/repository.js";
 import { MirrorEngine } from "../src/sync-engine.js";
@@ -197,6 +198,8 @@ async function seedMaildir(vmailRoot: string): Promise<void> {
   const sent = await createMaildir(accountRoot, "Sent");
   const archive = await createMaildir(accountRoot, "Archive");
   const trash = await createMaildir(accountRoot, "Trash");
+  // Empty until the draft step saves one (ADR 0046).
+  await createMaildir(accountRoot, "Drafts");
 
   await Promise.all([
     writeFile(path.join(inbox, "new", "1.eml"), plainMessage("1", "Dovecot smoke 1", "Dovecot INBOX message 1.")),
@@ -517,6 +520,27 @@ async function main(): Promise<void> {
     const inboxAfterMove = await moveCheck.status("INBOX", { messages: true });
     await moveCheck.logout();
     const moveFallback = await checkMoveFallback(imapPort, mailbox, password);
+
+    // A saved draft is mirrored at once from APPENDUID (ADR 0046): the row from the
+    // server's metadata, the body from the filed bytes. The next sync keeps both.
+    // The idempotency key makes the save search Drafts first, so Drafts is still
+    // selected when the mirror reads the new UID back.
+    const draftText = `Dovecot draft body ${Date.now()} readable before any sync.`;
+    const savedDraft = await createDraft(pool, config, {
+      accountId: account.id,
+      to: [{ email: "recipient@example.test" }],
+      subject: "Dovecot draft smoke",
+      body: { format: "plain", text: draftText },
+      idempotencyKey: `dovecot-draft-${Date.now()}`
+    });
+    const draftAtOnce = savedDraft.messageId ? await getDraft(pool, config, savedDraft.messageId) : null;
+    const draftStructure = savedDraft.messageId === null ? null : (await pool.query<{ mime_structure: unknown }>(
+      "SELECT mime_structure FROM public.imap_messages WHERE id = $1",
+      [savedDraft.messageId]
+    )).rows[0]?.mime_structure ?? null;
+    const draftSync = await engine.syncAccount(account.id, "manual");
+    const draftAfterSync = savedDraft.messageId ? await getDraft(pool, config, savedDraft.messageId) : null;
+
     const assertions: Array<[string, boolean]> = [
       ["sync succeeded", result.outcome === "success"],
       ["discovered Dovecot folders", counts.folders >= 4],
@@ -545,7 +569,11 @@ async function main(): Promise<void> {
         && movedRows.rows.every((row) => moveOutcomes.some((outcome) =>
           "result" in outcome && outcome.messageId === row.id && outcome.result.newUid === Number(row.uid)))],
       ["batch move took exactly the moved messages out of INBOX on the server",
-        inboxAfterMove.messages === (inboxBeforeMove.messages ?? 0) - movedIds.length]
+        inboxAfterMove.messages === (inboxBeforeMove.messages ?? 0) - movedIds.length],
+      ["draft save returned its mirror id without warnings", savedDraft.messageId !== null && savedDraft.warnings.length === 0],
+      ["draft row is the server's view at once", draftStructure !== null],
+      ["draft body readable at once", Boolean(draftAtOnce?.body?.includes(draftText))],
+      ["sync kept the draft id and body", draftSync.outcome === "success" && Boolean(draftAfterSync?.body?.includes(draftText))]
     ];
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
@@ -572,7 +600,8 @@ async function main(): Promise<void> {
         connections: moveConnections,
         inboxBefore: inboxBeforeMove.messages,
         inboxAfter: inboxAfterMove.messages
-      }
+      },
+      draft: { savedDraft, bodyAtOnce: draftAtOnce?.body ?? null }
     }, null, 2));
   } finally {
     const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";
