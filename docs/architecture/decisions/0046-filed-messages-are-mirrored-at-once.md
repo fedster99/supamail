@@ -41,6 +41,9 @@ and a draft send.
   `BodyStore`, then `completeBodyStorage`. A larger body, or another byte count,
   is left to the body lane, which streams it on a worker rather than in the
   request. No stored body is fetched again.
+  `buildRawMime` writes every line break as CRLF (RFC 5322), as servers store
+  a filed message; with bare LF breaks a multi-line body never matched the
+  server's byte count (found in production on 2026-10-28: 4 of 5 drafts).
 - **Keyed retries.** A keyed save that finds an earlier attempt's copy returns its
   live row id. When that copy has no row yet, the retry mirrors the row only: the
   earlier attempt's bytes may differ from this one's, so its body is left to the

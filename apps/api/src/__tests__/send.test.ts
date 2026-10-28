@@ -62,6 +62,22 @@ describe("buildRawMime", () => {
     expect(headerValue(raw, "References")).toContain("<source-msg@peer.test>");
   });
 
+  it("writes every line break as CRLF, as a mail server stores the filed copy", async () => {
+    // A server stores and sizes a filed message with CRLF breaks (RFC 5322); bytes
+    // with bare breaks differ in size, so the filed body could not be stored at once.
+    for (const body of [
+      { format: "plain" as const, text: "Hi Bob,\nline two\r\n\r\nThanks,\rAlex" },
+      { format: "html" as const, html: "<p>Hi Bob,</p>\n<p>line two</p>\r<p>Thanks</p>" }
+    ]) {
+      const { raw } = await buildRawMime({ ...base, body }, FROM);
+      const bytes = raw.toString("latin1");
+      expect(bytes).not.toMatch(/(?<!\r)\n|\r(?!\n)/);
+      const parsed = await simpleParser(raw);
+      if (body.format === "plain") expect(parsed.text?.trim()).toBe("Hi Bob,\nline two\n\nThanks,\nAlex");
+      else expect(parsed.html).toContain("<p>line two</p>");
+    }
+  });
+
   it("encodes Cc into the visible headers", async () => {
     const req: SendRequest = {
       ...base,

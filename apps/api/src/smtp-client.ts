@@ -191,14 +191,18 @@ export async function buildRawMime(req: SendRequest, from: SendRecipient): Promi
   // the bytes that are both delivered AND filed to Sent.
   assertSafeCustomHeaders(headers);
 
+  // RFC 5322 bytes use CRLF line breaks. Mail servers store a filed message that
+  // way, so composing anything else makes the filed copy's size differ from these
+  // bytes and blocks storing its body at once (ADR 0046).
+  const lines = (value: string | undefined) => value?.replace(/\r\n?|\n/g, "\r\n");
   const composer = new MailComposer({
     from: toAddress({ ...from, name: req.senderName?.trim() || from.name }),
     to: req.to.map(toAddress),
     cc: req.cc?.map(toAddress),
     bcc: req.bcc?.map(toAddress),
     subject: req.subject,
-    text: req.body.text ?? (req.body.format === "plain" ? "" : undefined),
-    html: req.body.html ?? (req.body.format === "html" ? req.body.text ?? "" : undefined),
+    text: lines(req.body.text ?? (req.body.format === "plain" ? "" : undefined)),
+    html: lines(req.body.html ?? (req.body.format === "html" ? req.body.text ?? "" : undefined)),
     messageId,
     inReplyTo: req.inReplyTo ?? headers["In-Reply-To"] ?? headers["in-reply-to"],
     references: req.references ?? headers.References ?? headers.references,
