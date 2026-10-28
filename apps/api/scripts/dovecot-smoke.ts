@@ -525,7 +525,8 @@ async function main(): Promise<void> {
     // server's metadata, the body from the filed bytes. The next sync keeps both.
     // The idempotency key makes the save search Drafts first, so Drafts is still
     // selected when the mirror reads the new UID back.
-    const draftText = `Dovecot draft body ${Date.now()} readable before any sync.`;
+    // Several lines, as agents write them: every break must reach the server as CRLF.
+    const draftText = `Dovecot draft body ${Date.now()}\nreadable before any sync.\n\nThanks`;
     const savedDraft = await createDraft(pool, config, {
       accountId: account.id,
       to: [{ email: "recipient@example.test" }],
