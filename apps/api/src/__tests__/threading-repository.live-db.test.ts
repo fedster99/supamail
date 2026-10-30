@@ -1420,6 +1420,160 @@ liveDb("ThreadingRepository live DB", () => {
     expect(retainedHistory.rows[0]?.count).toBe("0");
   });
 
+  /** An active conversation of a root and one reply; returns the next reply's id. */
+  async function activeConversationWithNewReply(label: string, target = repository): Promise<{
+    accountId: string;
+    replyId: string;
+  }> {
+    const accountId = await createAccount(label);
+    if (target !== repository) await markMetadataProtected(accountId);
+    await seedMessage(accountId, { uid: 1, subject: "Plan", rfcMessageId: `<${label}-root@example.test>` });
+    await seedMessage(accountId, {
+      uid: 2,
+      subject: "Re: Plan",
+      rfcMessageId: `<${label}-b1@example.test>`,
+      inReplyTo: `<${label}-root@example.test>`,
+      referencesHeader: `<${label}-root@example.test>`
+    });
+    await seedMessage(accountId, { uid: 3, subject: "Other", rfcMessageId: `<${label}-other@example.test>` });
+    const ready = await drainUntilReady(accountId, {}, target);
+    await activateReviewed(target, accountId, ready.runId as string);
+    // A mirror write queues the new reply for the active run, as for a filed copy.
+    const replyId = await seedMessage(accountId, {
+      uid: 4,
+      subject: "Re: Plan",
+      rfcMessageId: `<${label}-reply@example.test>`,
+      inReplyTo: `<${label}-b1@example.test>`,
+      referencesHeader: `<${label}-unmirrored@example.test> <${label}-root@example.test> <${label}-b1@example.test>`
+    });
+    return { accountId, replyId };
+  }
+
+  const assignNow = { maxClosureMessages: 500, requestedBy: "live-test" };
+
+  it("assigns one queued message at once exactly as the lane would", async () => {
+    const { accountId, replyId } = await activeConversationWithNewReply("assign-now");
+    const before = await activeProjection(accountId);
+
+    expect(await repository.assignQueuedMessage(accountId, replyId, assignNow)).toBe("assigned");
+    const after = await activeProjection(accountId);
+    const byUid = new Map(after.map((row) => [row.uid, row]));
+    expect(byUid.get("4")?.conversation_id).toBe(byUid.get("1")?.conversation_id);
+    expect(byUid.get("2")?.conversation_id).toBe(byUid.get("1")?.conversation_id);
+    expect(byUid.get("3")).toEqual(before.find((row) => row.uid === "3"));
+    // Nothing is left for the lane, and the run records that it is caught up.
+    const run = await pool.query<{ pending: boolean; caught_up: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM public.imap_thread_work_queue q WHERE q.run_id = run.id)
+                OR EXISTS (SELECT 1 FROM public.imap_thread_subject_work w WHERE w.run_id = run.id) AS pending,
+              run.caught_up_revision = clock.revision AS caught_up
+       FROM public.imap_thread_runs run
+       JOIN public.imap_thread_evidence_clock clock ON clock.account_id = run.account_id
+       WHERE run.account_id = $1 AND run.status = 'active'`,
+      [accountId]
+    );
+    expect(run.rows).toEqual([{ pending: false, caught_up: true }]);
+    expect(await repository.assignQueuedMessage(accountId, replyId, assignNow)).toBe("skipped");
+
+    // The lane, given every member again, computes the same projection.
+    for (const row of after) {
+      const id = await pool.query<{ id: string }>(
+        "SELECT id FROM public.imap_messages WHERE account_id = $1 AND uid = $2",
+        [accountId, row.uid]
+      );
+      await enqueueMessage(accountId, id.rows[0].id);
+    }
+    const lane = await drainUntilIdle(accountId);
+    expect(lane.length).toBeGreaterThan(0);
+    expect(lane.map((result) => result.assignmentsChanged)).toEqual(lane.map(() => 0));
+  });
+
+  it("leaves a queued message to the lane, unchanged, when it cannot assign it now", async () => {
+    const { accountId, replyId } = await activeConversationWithNewReply("assign-later");
+    const queued = async () => (await pool.query(
+      `SELECT queue.attempts, queue.available_at <= now() AS ready, run.attempts AS run_attempts,
+              run.last_error, run.available_at <= now() AS run_ready,
+              (SELECT count(*) FROM public.imap_thread_operations o WHERE o.run_id = run.id)::int AS operations
+       FROM public.imap_thread_work_queue queue
+       JOIN public.imap_thread_runs run ON run.id = queue.run_id
+       WHERE queue.message_id = $1`,
+      [replyId]
+    )).rows;
+    const initial = await queued();
+    expect(initial).toEqual([expect.objectContaining({ attempts: 0, ready: true, run_ready: true })]);
+
+    // A conversation over the request bound fails closed and records nothing.
+    await expect(repository.assignQueuedMessage(accountId, replyId, { ...assignNow, maxClosureMessages: 2 }))
+      .rejects.toBeInstanceOf(ThreadingClosureLimitError);
+    // The lane, or anything else, holds the threading lock.
+    const holder = await pool.connect();
+    try {
+      await holder.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [`supamail.threading:${accountId}`]);
+      expect(await repository.assignQueuedMessage(accountId, replyId, assignNow)).toBe("busy");
+      await holder.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [`supamail.threading:${accountId}`]);
+    } finally {
+      holder.release();
+    }
+    // Paused, or backing off after a lane failure.
+    await pool.query(
+      "UPDATE public.imap_thread_state SET paused_at = now(), pause_reason = 'live test' WHERE account_id = $1",
+      [accountId]
+    );
+    expect(await repository.assignQueuedMessage(accountId, replyId, assignNow)).toBe("skipped");
+    await pool.query(
+      "UPDATE public.imap_thread_state SET paused_at = NULL, pause_reason = NULL WHERE account_id = $1",
+      [accountId]
+    );
+    await pool.query(
+      `UPDATE public.imap_thread_runs SET available_at = now() + interval '1 hour'
+       WHERE account_id = $1 AND status = 'active'`,
+      [accountId]
+    );
+    expect(await repository.assignQueuedMessage(accountId, replyId, assignNow)).toBe("skipped");
+    await pool.query(
+      "UPDATE public.imap_thread_runs SET available_at = now() WHERE account_id = $1 AND status = 'active'",
+      [accountId]
+    );
+    expect(await queued()).toEqual(initial);
+
+    await drainUntilIdle(accountId);
+    const assigned = new Map((await activeProjection(accountId)).map((row) => [row.uid, row.conversation_id]));
+    expect(assigned.get("4")).toBe(assigned.get("1"));
+  });
+
+  it("never takes the threading lock of an account whose first projection is building", async () => {
+    const accountId = await createAccount("assign-initial-build");
+    const messageId = await seedMessage(accountId, { uid: 1, subject: "Plan", rfcMessageId: "<assign-initial-build@example.test>" });
+    await repository.drainAccount(accountId, { batchSize: 1, requestedBy: "live-test" });
+    // The lane holds the lock from its last build pass into the first activation;
+    // an action must not take it in between, or that activation fails.
+    const lane = await pool.connect();
+    try {
+      await lane.query("SELECT pg_advisory_lock(hashtextextended($1, 0))", [`supamail.threading:${accountId}`]);
+      expect(await repository.assignQueuedMessage(accountId, messageId, assignNow)).toBe("skipped");
+      await lane.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [`supamail.threading:${accountId}`]);
+    } finally {
+      lane.release();
+    }
+  });
+
+  it("assigns a protected account's message only through its protection adapter", async () => {
+    const adapter = new OpaqueThreadingAdapter();
+    const protectedRepository = new ThreadingRepository(pool, { metadataProtection: adapter });
+    const { accountId, replyId } = await activeConversationWithNewReply("assign-protected", protectedRepository);
+
+    await expect(repository.assignQueuedMessage(accountId, replyId, assignNow))
+      .rejects.toThrow("protected threading metadata requires its protection adapter");
+    expect(await protectedRepository.assignQueuedMessage(accountId, replyId, assignNow)).toBe("assigned");
+    const rows = await pool.query<{ message_id: string; conversation_id: string; protected: boolean }>(
+      `SELECT message_id, conversation_id, protected_metadata IS NOT NULL AS protected
+       FROM public.imap_thread_active_assignments WHERE account_id = $1`,
+      [accountId]
+    );
+    const reply = rows.rows.find((row) => row.message_id === replyId);
+    expect(reply?.protected).toBe(true);
+    expect(rows.rows.filter((row) => row.conversation_id === reply?.conversation_id)).toHaveLength(3);
+  });
+
   it("rolls back protected assignment history across bounded pages", async () => {
     const accountId = await createAccount("paged-protected-rollback");
     await markMetadataProtected(accountId);

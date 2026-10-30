@@ -133,7 +133,8 @@ batch also have hard caps. If a previously accepted
 weak subject bucket later grows beyond its cap, the worker first dissolves the
 old weak edges in bounded components. Work is serialized per account, retries
 are persisted before releasing the account lock, and processing is idempotent
-per run.
+per run. A mailbox action may also run the incremental step for the one message
+it filed, under the same lock; it never persists a retry (ADR 0046).
 
 An aggregate closure/evidence-limit failure, PostgreSQL statement timeout, or
 repository-owned aggregate metadata-protection deadline in page-scaled

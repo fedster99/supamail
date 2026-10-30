@@ -9,7 +9,9 @@ import { openInboxIdleSession } from "../src/inbox-idle.js";
 import { MirrorRepository } from "../src/repository.js";
 import { sendMessage } from "../src/send.js";
 import { createDraft, getDraft, listDrafts, sendDraft, updateDraft } from "../src/drafts.js";
+import { runReadThread } from "../src/mcp/tools/read-thread.js";
 import { MirrorEngine } from "../src/sync-engine.js";
+import { ThreadingRepository } from "../src/threading-repository.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -479,7 +481,7 @@ async function main(): Promise<void> {
     // APPENDs a copy to Sent. Sent is tracked first, so the send mirrors that copy at
     // once from APPENDUID: the row is readable by the returned id before any sync,
     // carries the threading In-Reply-To header (the NULL provider_thread_id path),
-    // and the next sync keeps the id. GreenMail reports an RFC822.SIZE smaller than
+    // is in the original's conversation, and the next sync keeps the id. GreenMail reports an RFC822.SIZE smaller than
     // the stored bytes, so the body is left to the body lane here; the Dovecot smoke
     // proves the body is stored at once.
     await ensureSentFolder();
@@ -493,6 +495,14 @@ async function main(): Promise<void> {
       [account.id]
     );
     const sourceRow = source.rows[0];
+    // The conversation view is live: the threading lane built and activated it.
+    // Without it, read_thread would find the reply by its In-Reply-To alone.
+    const threading = new ThreadingRepository(pool);
+    let threadingActive = false;
+    for (let pass = 0; pass < 100 && !threadingActive; pass += 1) {
+      threadingActive = (await threading.drainAccount(account.id, { requestedBy: "greenmail-smoke", activateInitial: true })).active;
+    }
+    if (!threadingActive) throw new Error("GreenMail smoke could not activate the conversation view");
     const replyMessageId = `<greenmail-reply-${Date.now()}@example.test>`;
     const sendResult = await sendMessage(pool, config, {
       accountId: account.id,
@@ -510,6 +520,9 @@ async function main(): Promise<void> {
       "SELECT rfc_message_id, in_reply_to FROM public.imap_messages WHERE id = $1",
       [sendResult.messageId]
     )).rows[0] ?? null;
+    const conversation = sourceRow ? await runReadThread(pool, { message_id: sourceRow.id }) : null;
+    const inConversationAtOnce = conversation !== null && "messages" in conversation
+      && conversation.messages.some((message) => message.message_id === sendResult.messageId);
 
     // Force folder re-discovery so the resync picks up the (just-created) Sent
     // folder and the message we APPENDed into it; discovery is otherwise gated by
@@ -540,6 +553,7 @@ async function main(): Promise<void> {
       ["send appended to Sent", sendResult.appendedToSent === true],
       ["sent copy readable at once by its id", sentAtOnce?.rfc_message_id === replyMessageId],
       ["sent copy carries In-Reply-To at once", sentAtOnce?.in_reply_to === (sourceRow?.rfc_message_id ?? null)],
+      ["sent reply in the original's conversation at once", inConversationAtOnce],
       ["sync kept the sent copy id", sentCopy.rows.some((row) => row.id === sendResult.messageId)],
       ["resync succeeded", resyncResult.outcome === "success"],
       ["sent reply mirrored on resync", filedSomewhere],

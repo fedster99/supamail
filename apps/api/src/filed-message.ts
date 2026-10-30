@@ -1,16 +1,25 @@
 import { DatabaseBodyStore, type BodyStore } from "./body-store.js";
 import type { AppConfig } from "./config.js";
+import type { PgPool } from "./db.js";
 import { fetchMessageMetadata, filedMessageBody, ThrottledImapClient } from "./imap-client.js";
 import { uidValidityMatches, type ActionConnection, type ActionSocket } from "./imap-connect.js";
+import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import type { MirrorRepository } from "./repository.js";
 import { SentFolderAppender, type AppendedUid } from "./smtp-client.js";
 import { PARSED_BODY_BATCH_MAX_SOURCE_BYTES } from "./sync-limits.js";
+import { ThreadingRepository } from "./threading-repository.js";
 import type { ImapAccount, SendResult } from "./types.js";
 
 /** Bound on the row write; the provider already holds the message. The body store
  * keeps its own request bounds, as it does for sync. */
 const FILED_ROW_WRITE_TIMEOUT_MS = 5_000;
+
+/** Request bounds on putting a filed message in its conversation. A larger
+ * conversation or a slower database leaves it to the threading lane. */
+const FILED_ASSIGNMENT_MAX_CLOSURE_MESSAGES = 500;
+const FILED_ASSIGNMENT_STATEMENT_TIMEOUT_MS = 1_000;
+const FILED_ASSIGNMENT_PROTECTION_TIMEOUT_MS = 1_000;
 
 /** Where an action stores the bodies it files: the host's store, else the OSS
  * database store that sync also defaults to. */
@@ -86,6 +95,36 @@ export async function mirrorFiledMessage(
     }
   }
   return row.id;
+}
+
+/**
+ * Put a message this action filed and mirrored into its conversation now, as the
+ * threading lane would, so a conversation read shows it when the action returns
+ * (ADR 0046). Call it once, after the account lock is released, so the action
+ * never holds a second database session while it holds the lock. When it cannot
+ * run now (the lane holds the account, the conversation is large, the database is
+ * slow) it changes nothing and leaves the message to the lane, as before. It never
+ * throws: the provider already holds the message.
+ */
+export async function assignFiledMessage(
+  pool: PgPool,
+  metadataProtection: MetadataProtectionAdapter,
+  accountId: string,
+  messageId: string | null
+): Promise<void> {
+  if (!messageId) return;
+  try {
+    await new ThreadingRepository(pool, {
+      metadataProtection,
+      projectionStatementTimeoutMs: FILED_ASSIGNMENT_STATEMENT_TIMEOUT_MS,
+      metadataProtectionTimeoutMs: FILED_ASSIGNMENT_PROTECTION_TIMEOUT_MS
+    }).assignQueuedMessage(accountId, messageId, {
+      maxClosureMessages: FILED_ASSIGNMENT_MAX_CLOSURE_MESSAGES,
+      requestedBy: "mailbox-action"
+    });
+  } catch {
+    // The threading lane assigns the message, as before.
+  }
 }
 
 /** The delivered message's copy in Sent, as {@link fileSentCopy} filed it. */

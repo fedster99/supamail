@@ -6,7 +6,7 @@ import type { PgClient, PgPool } from "./db.js";
 import { NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import type { BodyStore } from "./body-store.js";
-import { actionBodyStore, fileSentCopy, mirrorFiledMessage, type SentCopy } from "./filed-message.js";
+import { actionBodyStore, assignFiledMessage, fileSentCopy, mirrorFiledMessage, type SentCopy } from "./filed-message.js";
 import { ActionConnection, timeImapStep } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { accountLockHeartbeatIntervalMs, type AccountLock } from "./locks.js";
@@ -320,6 +320,7 @@ export async function createDraft(
   if (!account) throw new NotFoundError(`Account not found: ${request.accountId}`);
 
   const saved = await saveDraft(pool, config, repository, account, request, request.idempotencyKey, options);
+  await assignFiledMessage(pool, metadataProtection, account.id, saved.messageId);
   return { accountId: account.id, ...saved };
 }
 
@@ -569,6 +570,7 @@ export async function updateDraft(
     }
   }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
 
+  await assignFiledMessage(pool, metadataProtection, account.id, saved.messageId);
   return { accountId: account.id, ...saved, replacedMessageId: messageId, replacedDraftDeleted };
 }
 
@@ -665,7 +667,7 @@ async function sendDraftAttempt(
   // The raw fetch can itself require IMAP, so acquire before it and keep the same
   // account lock through SMTP delivery, Sent APPEND, appender teardown, and draft
   // cleanup. Contention is proven-unsent: no provider verb has run yet.
-  return await withInteractiveAccountLock(pool, account, async (lock) => {
+  const result = await withInteractiveAccountLock(pool, account, async (lock) => {
     // One connection for the raw fetch, the Sent APPEND and the draft delete. It is
     // opened again only if it died while SMTP ran, which can outlast an idle socket.
     const connection = new ActionConnection(pool, config, account, signal);
@@ -762,6 +764,8 @@ async function sendDraftAttempt(
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
     onPostIrreversibleWarning: addWarning
   });
+  await assignFiledMessage(pool, metadataProtection, account.id, result.send.messageId);
+  return result;
 }
 
 /**

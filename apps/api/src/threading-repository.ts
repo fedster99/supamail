@@ -1434,6 +1434,74 @@ export class ThreadingRepository {
     );
   }
 
+  /**
+   * Assign one queued message of the active run now, as the lane's incremental
+   * step would, so a message a mailbox action just filed is in its conversation
+   * when the action returns (ADR 0046). This is not a lane pass: it projects only
+   * this message's ready queue row and the closure it pulls in, and does no lane
+   * upkeep (build runs, evidence repair, subject work, failure backoff). When it
+   * cannot run now it changes nothing and leaves the row to the lane: "busy" when
+   * another session holds the threading lock; "skipped" when the account is
+   * paused, has no live active run, is backing off, has queued evidence to repair,
+   * or has no ready row for this message. A failure, such as a closure over
+   * `maxClosureMessages`, rolls back and throws.
+   */
+  async assignQueuedMessage(
+    accountId: string,
+    messageId: string,
+    options: { maxClosureMessages: number; requestedBy: string }
+  ): Promise<"assigned" | "busy" | "skipped"> {
+    if (!Number.isSafeInteger(options.maxClosureMessages) || options.maxClosureMessages <= 0) {
+      throw new Error("threading closure message bound must be a positive safe integer");
+    }
+    return this.withMetadataProtectionDeadline(async () => {
+      // Take the lane's lock only when the active run has this message ready, so
+      // an account still building its first projection stays the lane's alone.
+      const queued = await this.pool.query(
+        `SELECT 1 FROM public.imap_thread_state state
+         JOIN public.imap_thread_work_queue queue
+           ON queue.run_id = state.active_run_id AND queue.message_id = $2 AND queue.available_at <= now()
+         WHERE state.account_id = $1 AND state.paused_at IS NULL`,
+        [accountId, messageId]
+      );
+      if (!queued.rows[0]) return "skipped";
+      await this.assertMetadataProtectionCompatibility(accountId);
+      const closureLimits: ClosureLimits = {
+        maxMessages: options.maxClosureMessages,
+        maxEvidenceBytes: DEFAULT_MAX_CLOSURE_EVIDENCE_BYTES,
+        maxCriteriaKeys: DEFAULT_MAX_CLOSURE_CRITERIA_KEYS
+      };
+      const outcome = await this.withAccountLock(accountId, async (client) => {
+        await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+        try {
+          const state = await this.lockProjectionState(client, accountId);
+          const run = state?.active_run_id && !state.paused_at ? await this.loadRun(client, state.active_run_id) : null;
+          const live = run?.status === "active" && this.algorithms.has(run.algorithm_version) && run.available_at <= new Date();
+          const seed = live
+            ? await client.query(
+                `SELECT message_id FROM public.imap_thread_work_queue
+                 WHERE run_id = $1 AND message_id = $2 AND available_at <= now()
+                 FOR UPDATE SKIP LOCKED`,
+                [run.id, messageId]
+              )
+            : null;
+          if (!run || !seed?.rows[0]) {
+            await client.query("COMMIT");
+            return "skipped" as const;
+          }
+          await this.projectSeeds(client, run, [messageId], closureLimits, options.requestedBy);
+          if (!(await this.runHasAnyWork(client, run.id))) await this.markRunCaughtUp(client, run);
+          await client.query("COMMIT");
+          return "assigned" as const;
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        }
+      });
+      return outcome ?? "busy";
+    });
+  }
+
   private async drainAccountWithinMetadataDeadline(
     accountId: string,
     options: DrainThreadingOptions
@@ -1506,14 +1574,8 @@ export class ThreadingRepository {
         // this bounded projection transaction finishes.
         await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
         try {
-          if (this.projectionStatementTimeoutMs !== null) {
-            await client.query(
-              "SELECT set_config('statement_timeout', $1, true)",
-              [`${this.projectionStatementTimeoutMs}ms`]
-            );
-          }
-          const state = await this.lockState(client, accountId);
-          if (await this.hasQueuedBodyEvidenceGap(client, accountId)) {
+          const state = await this.lockProjectionState(client, accountId);
+          if (!state) {
             await client.query("COMMIT");
             return this.emptyResult(accountId);
           }
@@ -3511,6 +3573,18 @@ export class ThreadingRepository {
     const ids = work.rows.map((row) => row.message_id);
     if (ids.length === 0) return this.resultForRun(run.account_id, run);
     attempted(ids, true, true);
+    return this.projectSeeds(client, run, ids, closureLimits, requestedBy);
+  }
+
+  /** The incremental step: assign the closure of queued `ids` with strong evidence
+   * only, then consume the closure's queue rows. */
+  private async projectSeeds(
+    client: PgClient,
+    run: ThreadRun,
+    ids: string[],
+    closureLimits: ClosureLimits,
+    requestedBy: string
+  ): Promise<ThreadingRunResult> {
     const closure = await this.expandClosure(client, run, ids, closureLimits);
     const assignments = this.timeStageSync(
       "assignment_computation",
@@ -4530,6 +4604,22 @@ export class ThreadingRepository {
       [run.account_id, run.cursor_message_id, limit]
     );
     return result.rows;
+  }
+
+  /**
+   * Open a projection in the caller's READ COMMITTED transaction: bound each
+   * statement, then lock thread state, the write barrier. Returns null when queued
+   * body evidence must be repaired first, which only the lane's preflight does.
+   */
+  private async lockProjectionState(client: PgClient, accountId: string): Promise<ThreadState | null> {
+    if (this.projectionStatementTimeoutMs !== null) {
+      await client.query(
+        "SELECT set_config('statement_timeout', $1, true)",
+        [`${this.projectionStatementTimeoutMs}ms`]
+      );
+    }
+    const state = await this.lockState(client, accountId);
+    return (await this.hasQueuedBodyEvidenceGap(client, accountId)) ? null : state;
   }
 
   private async lockState(client: PgClient, accountId: string): Promise<ThreadState> {
