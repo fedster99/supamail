@@ -19,6 +19,11 @@ A hosted deployment measured the gap over 14 days to 2026-10-26:
 - The connected servers answer APPEND with APPENDUID, and their RFC822.SIZE
   equals the stored bytes on 2,685 of 2,687 Drafts and Sent rows (the other 2
   were truncated).
+- With the row mirrored at once, a reply still joined its conversation only when
+  the threading lane next ran. Over 7 days to 2026-10-30, a sent reply was in
+  its conversation at most 5.0 s (median) and 14.4 s (75th percentile) after the
+  send finished, and never sooner than 1.9 s; a saved reply never sooner than
+  1.3 s. A `read_thread` right after the action did not show the agent's reply.
 
 ## Decision
 
@@ -59,26 +64,48 @@ and a draft send.
   a warning and keeps the id. Sync repairs both.
 - **Sync stays authoritative.** The write leaves `last_uid` unchanged. Sync reads
   the UID again, keeps the row id, and does not fetch a stored body again.
+- **The conversation is assigned at once.** After the action releases the
+  account lock, `assignFiledMessage` runs the threading lane's incremental step
+  for the mirrored message: `ThreadingRepository.assignQueuedMessage` consumes
+  that message's ready queue row in the active run and assigns the conversation
+  closure it pulls in with the run's own executor, under the lane's per-account
+  threading lock and state barrier. It does no lane upkeep: no build runs,
+  evidence repair, subject work or failure backoff. It takes that lock only when
+  the active run has the message ready, so an account still building its first
+  projection stays the lane's. When another session holds the threading lock,
+  the account has no live active run or is backing off, queued evidence waits
+  for repair, the closure exceeds 500 messages, or a statement or the protection
+  work exceeds 1 s, it changes nothing and leaves the message to the lane, as
+  before; on a paused account the message waits until threading resumes. A wait
+  for a database connection is bounded by the pool, as for the action's other
+  steps. It never fails the action and adds no warning; for a send, a thrown
+  error would report an unknown delivery outcome. It runs after the account lock
+  so the action never holds a second database session while it holds the lock.
 - **Send results.** `SendResult.messageId` is the Sent copy's mirror id, or null.
   Both send paths now hold the account lock with fenced writes and use one
   `ActionConnection` for the Sent APPEND and its mirror.
 
 This amends ADR 0017: the send path may read back the one UID the server just
 named for it, and nothing else. The sync read adapter still gains no write verb.
+It amends ADR 0024: besides the lane, an action may run the incremental step for
+the one message it filed.
 
 ## Consequences
 
 - A sent copy and a saved draft are readable by their returned mirror id with
   their stored body and attachment metadata before the action returns, when the
-  guards above pass. Search indexing and derived conversation assignment still
-  follow their existing processing paths; this change does not wait for them.
+  guards above pass, and a reply is in its conversation in `read_thread`. Hosted
+  search sees it when its index next drains; the action does not wait for that.
 - Each mirrored APPEND costs one SELECT and one FETCH of one UID's metadata on an
   open connection, and one body store write that sync would otherwise do later.
   A draft save reports it as the `mirror` step of `IMAP_STEPS`. An action that
   files a message holds the account lock for that extra time.
-- A reply seeded from an assigned message joins its conversation in `read_thread`
-  when the threading lane next assigns it, and hosted search sees it when its
-  index next drains; neither waits on the action.
+- Assigning the conversation adds about 20 ms for a new conversation and about
+  140-190 ms for a reply into a 180-200 message one, measured on a local 10,000
+  message mailbox; a 500-message closure took 280-360 ms. A conversation over the
+  bound fails in about 12 ms and waits for the lane. For a reply, the active run
+  then has nothing left for that message; a new conversation still leaves its
+  subject work, and a standby or candidate run its own queue row, to the lane.
 
 ## Verification
 
@@ -93,15 +120,26 @@ named for it, and nothing else. The sync read adapter still gains no write verb.
   row; both sends pass the delivered bytes and host body store to the Sent filing.
 - `drafts.live-db.test.ts`: against real Postgres, a saved draft is readable at
   once with its body, and a later sync upsert keeps its id.
+- `filed-thread.live-db.test.ts`: each of send, draft create, update and draft
+  send returns with its copy in the original's conversation; with the threading
+  lock held, or the state row held past the statement bound, the action still
+  succeeds with no warning and the lane assigns the copy later.
+- `threading-repository.live-db.test.ts`: the entry's projection is the lane's
+  (the lane, given every member again, changes nothing) and leaves the run
+  caught up; a closure over the bound, the held lock, a pause and a backoff leave
+  the queue row and run unchanged; the lock of an account still building its
+  first projection is never taken; a protected account is assigned only through
+  its adapter.
 - Dovecot smoke: a draft saved with an idempotency key is readable at once with
   its body and BODYSTRUCTURE, and the next sync keeps its id and body.
 - GreenMail smoke: a send returns the Sent copy's id, readable at once with its
-  In-Reply-To header, and the next sync keeps it. GreenMail reports an RFC822.SIZE smaller
+  In-Reply-To header and in the original's conversation, and the next sync keeps it. GreenMail reports an RFC822.SIZE smaller
   than the stored bytes, so there the body is left to the body lane.
 
 ## References
 
 - ADR 0017: the send primitive; amended here.
+- ADR 0024: durable conversation threading; amended here.
 - ADR 0028: the body store seam and the body lane's storage order.
 - ADR 0033: the saved draft row; its composed metadata is superseded here.
 - ADR 0043: `ActionConnection`.

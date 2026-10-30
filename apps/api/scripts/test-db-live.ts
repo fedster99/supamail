@@ -115,6 +115,7 @@ async function main(): Promise<void> {
       "src/__tests__/drafts.live-db.test.ts",
       "src/__tests__/move-relocation.live-db.test.ts",
       "src/__tests__/send.live-db.test.ts",
+      "src/__tests__/filed-thread.live-db.test.ts",
       "src/mcp/tools/read-message.live-db.test.ts",
       "src/mcp/tools/read-thread.live-db.test.ts",
       "src/mcp/tools/list-folders.live-db.test.ts",

@@ -3,7 +3,7 @@ import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
 import { NotFoundError, throwIfAborted } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
-import { actionBodyStore, fileSentCopy, type SentCopy } from "./filed-message.js";
+import { actionBodyStore, assignFiledMessage, fileSentCopy, type SentCopy } from "./filed-message.js";
 import { ActionConnection } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { accountLockHeartbeatIntervalMs } from "./locks.js";
@@ -122,7 +122,7 @@ async function sendMessageAttempt(
   // per-account command budget concurrently. Acquisition waits a bounded time for
   // a sync; still held after that, callers get the transient AccountBusyError
   // before any irreversible SMTP delivery happens.
-  return await withInteractiveAccountLock(pool, account, async (lock) => {
+  const result = await withInteractiveAccountLock(pool, account, async (lock) => {
     // Synchronous phase gate: a periodic refresh may have failed since acquisition.
     // Do not cross the irreversible SMTP boundary until heartbeat persistence and
     // ownership by this exact Postgres session are both re-proven.
@@ -182,4 +182,6 @@ async function sendMessageAttempt(
     heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
     onPostIrreversibleWarning: addWarning
   });
+  await assignFiledMessage(pool, metadataProtection, account.id, result.messageId);
+  return result;
 }
