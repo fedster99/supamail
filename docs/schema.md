@@ -207,3 +207,33 @@ Body fetches, history imports, and folder discovery are separate work and are
 not live-folder proofs. A failed or unanswered status command supplies no proof.
 A folder omitted from the array is not proven unchanged. Process termination
 before finalization can lose this evidence; it cannot certify a completed check.
+
+### Sync failure diagnostics
+
+`imap_sync_runs.metadata.failures` retains distinct `{stage, code}` pairs in
+occurrence order. Fixed vocabularies and deduplication bound its size without
+discarding a later failure. The engine captures these from structured errors
+before converting them to the legacy error summary. Stages distinguish connect,
+folder discovery/status/selection/sync, body backlog, history, account state and
+run finalization. Codes distinguish allowlisted socket and database failures,
+IMAP response codes/statuses, and engine errors such as failed account-lock liveness
+or a changed tracked-folder set. Engine deadlines use `SYNC_DEADLINE_EXCEEDED`,
+distinct from provider/socket timeouts. Unknown errors remain `SYNC_ERROR` at their
+observed stage; no message, folder name, credential, stack or nested cause is
+stored. The repository validates and projects the fixed fields again on write.
+
+The existing `error` and `metadata.errors` summaries and health/backoff decisions
+are unchanged. Multiple folders with the same failure/stage produce one pair;
+this is bounded diagnostic evidence, not a failure-event counter. An absent
+`failures` field is an older producer, not evidence of a successful run. An empty
+array means no failure was captured by this producer. Failures before a run row
+exists or when Postgres cannot finalize it still require worker logs. Successful
+scheduled preemption of a supplemental pass is not recorded as a failure.
+
+For a known run, read `status`, `error`, and `metadata->'failures'` together.
+A failed run may already have committed some mailbox changes. Neither a code nor
+a stage alone establishes a provider root cause. The detail uses the existing
+run-finalization write and retention; it adds no provider calls or schema change.
+The phase is deliberately coarse: `folder_sync` narrows the investigation but
+does not identify an individual IMAP command or assign a code to one folder.
+This is operator SQL evidence, not a new alert or a change to customer log views.

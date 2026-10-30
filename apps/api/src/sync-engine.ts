@@ -30,6 +30,10 @@ import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock 
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import {
+  recordSyncFailure,
+  SyncDeadlineError,
+  type SyncFailure,
+  type SyncFailureStage,
   isAuthDiagnosticText,
   isMissingMailboxDiagnosticText,
 } from "./sync-diagnostics.js";
@@ -435,6 +439,7 @@ export class MirrorEngine {
       batchesAttempted: 0,
       batchesFailed: 0
     };
+    const failures: SyncFailure[] = [];
     const result: SyncResult = {
       runId: null,
       outcome: "success",
@@ -453,14 +458,17 @@ export class MirrorEngine {
       reconcileProviderUidsSeen: 0,
       reconcileDurationMs: 0,
       hitLockBudget: false,
-      errors: []
+      errors: [],
+      failures
     };
+    let failureStage: SyncFailureStage = "account_start";
     let cancellationCleanupRequired = false;
     let syncOwner = "";
 
     const runLockedSync = () => withAccountLock(this.pool, account.lock_id, async (lock) => {
       // The run row exists only once this pass holds the lock, so a pass that
       // finds the lock held records nothing (outcome "deferred" below).
+      failureStage = "account_start";
       const runId = await this.repository.startSyncRun(account.id, triggerType);
       result.runId = runId;
       syncOwner = `supamail:${process.pid}:${runId}`;
@@ -503,6 +511,7 @@ export class MirrorEngine {
           return;
         }
 
+        failureStage = "connect";
         if (options.client) {
           client = options.client;
           client.invalidateSelection?.();
@@ -536,15 +545,18 @@ export class MirrorEngine {
             .filter((path) => !forcedReconcilePaths.has(path))
         ];
 
+        failureStage = "folder_discovery";
         let newlyTrackedFolderPaths: string[] = [];
         if (!supplemental
           && (options.forceFolderDiscovery === true || this.shouldDiscoverFolders(account))) {
           newlyTrackedFolderPaths = await this.discoverFolders(account, client);
         }
+        failureStage = "folder_status";
         const catchUpPaths = supplemental
           ? new Set<string>()
           : await this.recordUnchangedFolders(account, client, result.folderChecks!, options.signal);
 
+        failureStage = "folder_selection";
         const folders = options.bodyBacklogOnly
           ? []
           : sentFolders ?? (options.liveInboxOnly
@@ -587,6 +599,7 @@ export class MirrorEngine {
         let attemptedMailboxChanges = 0;
         const handledMailboxChanges: MailboxChange[] = [];
         const handledMailboxObservations: MailboxChangeObservation[] = [];
+        failureStage = "folder_sync";
         for (const folder of folders) {
           throwIfInterrupted();
           // Prove this session still owns the account before each folder writes.
@@ -684,6 +697,7 @@ export class MirrorEngine {
             // and skips re-marking; otherwise markAccountSyncPartial overrides
             // the BROKEN state with DEGRADED.
             if (error instanceof AccountAlreadyFinalizedError) throw error;
+            recordSyncFailure(failures, failureStage, error);
             const sanitizedPath = folder.path.replace(/[\x00-\x1F\x7F]+/g, " ").slice(0, 200);
             const message = describeSyncError(error);
             if (isConnectionLostError(error)) {
@@ -730,11 +744,13 @@ export class MirrorEngine {
         if (mailboxChanges.some((change) => !selectedFolderPaths.has(change.path))) {
           priorityFolderFailed = true;
           result.errors.push("Live folder set no longer matches tracked folders");
+          failures.push({ stage: "folder_sync", code: "FOLDER_SET_CHANGED" });
         }
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
         } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
+          failureStage = "body_backlog";
           const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
@@ -747,13 +763,15 @@ export class MirrorEngine {
           && !options.liveInboxOnly
           && !options.bodyBacklogOnly
           && !connectionLost) {
+          failureStage = "history";
           const historyResult = await this.runHistoryLane(
             account,
             client,
             lockDeadline,
             metadataWriteStats,
             options.signal,
-            lock.assertLive
+            lock.assertLive,
+            failures
           );
           throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
@@ -766,6 +784,7 @@ export class MirrorEngine {
           result.outcome = priorityFolderFailed ? "failed" : "partial_success";
         }
 
+        failureStage = "account_finish";
         if (handledMailboxChanges.length > 0) {
           if (client.acknowledgeMailboxChangesWithStatuses) {
             client.acknowledgeMailboxChangesWithStatuses(
@@ -817,12 +836,15 @@ export class MirrorEngine {
           if (!supplemental) {
             result.outcome = "partial_success";
             result.errors.push("Sync interrupted by scheduler");
+            recordSyncFailure(failures, failureStage, new SyncInterruptedError());
           }
           return;
         }
         // Classify on the ERROR OBJECT (imapflow auth failures say "Command failed"
         // in the message and carry the truth in structured props), and persist the
         // enriched description so the stored reason explains WHY.
+        recordSyncFailure(failures, failureStage, error);
+        failureStage = "account_finish";
         const message = describeSyncError(error);
         result.outcome = "failed";
         result.errors.push(sanitizeErrorReason(message));
@@ -907,12 +929,14 @@ export class MirrorEngine {
 
       applyMetadataWriteStats(result, metadataWriteStats);
 
+      failureStage = "run_finish";
       await this.repository.finishSyncRun(result);
       runFinished = true;
       await this.hooks.onSyncRunCompleted?.(result);
       return result;
     } catch (error) {
       if (!runFinished && result.runId !== null) {
+        recordSyncFailure(failures, failureStage, error);
         const message = sanitizeErrorReason(describeSyncError(error));
         result.outcome = "failed";
         if (!result.errors.includes(message)) result.errors.push(message);
@@ -1819,7 +1843,7 @@ export class MirrorEngine {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => {
         this.abortClient(client);
-        reject(new Error(`${timeoutName} exceeded during ${operation}`));
+        reject(new SyncDeadlineError(`${timeoutName} exceeded during ${operation}`));
       }, remainingMs);
     });
 
@@ -1839,7 +1863,7 @@ export class MirrorEngine {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       this.abortClient(client);
-      throw new Error(`${timeoutName} exceeded before ${operation}`);
+      throw new SyncDeadlineError(`${timeoutName} exceeded before ${operation}`);
     }
     return remainingMs;
   }
@@ -2160,7 +2184,8 @@ export class MirrorEngine {
     lockDeadline: number,
     metadataWriteStats: MetadataWriteStats,
     signal: AbortSignal | undefined,
-    assertLive: () => Promise<void>
+    assertLive: () => Promise<void>,
+    failures: SyncFailure[]
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
@@ -2198,6 +2223,7 @@ export class MirrorEngine {
         );
       } catch (error) {
         if (error instanceof AccountAlreadyFinalizedError) throw error;
+        recordSyncFailure(failures, "history", error);
         const message = describeSyncError(error);
         if (isMissingMailboxError(error)) {
           await this.repository.markFolderPendingVerification(

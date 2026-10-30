@@ -218,6 +218,53 @@ liveDb("live DB reliability lane", () => {
     })).map((row) => row.id)).toContain(h.account.id);
   });
 
+  it.each(["connect", "folder_discovery", "folder_sync", "account_finish", "run_finish"] as const)(
+    "retains safe failure detail from %s through the durable run, then recovers",
+    async (stage) => {
+      const h = await setupIntegration(`live-failure-${stage}`);
+      activeAccountIds.push(h.account.id);
+      const privateText = "LOGIN owner@example.test secret-password Private Folder";
+      const failure = Object.assign(new Error(privateText), { code: "ECONNRESET" });
+      const engine = h.buildEngine({
+        folders: oneFolder(),
+        clientFactory: async () => {
+          if (stage === "connect") throw failure;
+          const client = new HookedFixtureImapClient(oneFolder(), async () => {
+            if (stage === "folder_sync") throw failure;
+          });
+          if (stage === "folder_discovery") vi.spyOn(client, "list").mockRejectedValue(failure);
+          return client;
+        }
+      });
+      if (stage === "account_finish") {
+        vi.spyOn(h.repository, "markAccountSyncSucceeded").mockRejectedValueOnce(failure);
+      }
+      if (stage === "run_finish") {
+        vi.spyOn(h.repository, "finishSyncRun").mockRejectedValueOnce(failure);
+        await expect(engine.syncAccount(h.account.id, "manual")).rejects.toBe(failure);
+      } else {
+        const result = await engine.syncAccount(h.account.id, "manual");
+        expect(result.outcome).not.toBe("success");
+        expect(result.failures).toContainEqual({ stage, code: "ECONNRESET" });
+      }
+      const stored = await h.pool.query(
+        "SELECT status, error, metadata FROM public.imap_sync_runs WHERE account_id = $1",
+        [h.account.id]
+      );
+      expect(stored.rows).toHaveLength(1);
+      expect(stored.rows[0].metadata.failures).toEqual([{ stage, code: "ECONNRESET" }]);
+      expect(JSON.stringify(stored.rows)).not.toContain("owner@example.test");
+      expect(JSON.stringify(stored.rows)).not.toContain("secret-password");
+      expect(JSON.stringify(stored.rows)).not.toContain("Private Folder");
+      const recovery = await h.buildEngine({ folders: oneFolder() }).syncAccount(h.account.id, "manual");
+      expect(recovery.outcome).toBe("success");
+      const recovered = await h.pool.query(
+        "SELECT metadata FROM public.imap_sync_runs WHERE id = $1", [recovery.runId]
+      );
+      expect(recovered.rows[0].metadata.failures).toEqual([]);
+    }
+  );
+
   it("stores only a fixed code in pending-folder event diagnostics", async () => {
     const h = await setupIntegration("live-folder-diagnostic-code");
     activeAccountIds.push(h.account.id);

@@ -1811,8 +1811,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(acknowledge).toHaveBeenCalledWith([change]);
   });
 
-  it("retains a mailbox change when its tracked folder no longer matches", async () => {
-    const h = await setupIntegration("live-change-missing-folder");
+  it.each([false, true])("retains an unmatched mailbox change (Inbox reconcile: %s)", async (forceInboxReconcile) => {
+    const h = await setupIntegration("live-change-missing-folder", { INITIAL_SYNC_BATCH_SIZE: 50 });
     activeAccountIds.push(h.account.id);
     const folders = buildInboxAndSentFolders();
     const engine = h.buildEngine({ folders });
@@ -1831,6 +1831,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     const result = await engine.syncAccount(h.account.id, "scheduled", {
       liveInboxOnly: true,
+      forceInboxReconcile,
       client: idleClient,
       clientAccountId: h.account.id,
       keepClientOpen: true
@@ -1838,6 +1839,16 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("failed");
     expect(result.errors).toContain("Live folder set no longer matches tracked folders");
+    expect(result.failures).toContainEqual({ stage: "folder_sync", code: "FOLDER_SET_CHANGED" });
+    expect(result.folderChecks).toHaveLength(forceInboxReconcile ? 1 : 0);
+    expect(result.folderChecks!.every(check => check.outcome === "completed")).toBe(true);
+    const stored = await h.pool.query(
+      "SELECT error, metadata FROM public.imap_sync_runs WHERE id = $1", [result.runId]
+    );
+    expect(stored.rows[0].error).toBe("SYNC_ERROR");
+    expect(stored.rows[0].metadata.failures).toEqual([
+      { stage: "folder_sync", code: "FOLDER_SET_CHANGED" }
+    ]);
     expect(acknowledge).not.toHaveBeenCalled();
   });
 
@@ -4137,6 +4148,13 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(timedOut.outcome).toBe("failed");
     expect(timedOut.errors[0]).toContain("INITIAL_SYNC_BATCH_TIMEOUT_MS exceeded during initial sync FETCH");
+    const failedRun = await h.pool.query(
+      "SELECT error, metadata FROM public.imap_sync_runs WHERE id = $1", [timedOut.runId]
+    );
+    expect(failedRun.rows[0].error).toBe("SYNC_TIMEOUT");
+    expect(failedRun.rows[0].metadata.failures).toContainEqual({
+      stage: "folder_sync", code: "SYNC_DEADLINE_EXCEEDED"
+    });
     expect(closeCalls).toBeGreaterThan(0);
 
     const afterTimeout = (
