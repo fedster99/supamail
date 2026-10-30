@@ -52,6 +52,7 @@ ADRs record durable decisions that coding agents should not rediscover or casual
 - `0044-qresync-is-not-flag-proof.md`: A QRESYNC replay never stands in for a flag read (Purelymail omits flag changes from it); `CHANGEDSINCE` runs whenever the modseq moves, and each scheduled reconcile scans flags over the whole window on every server.
 - `0045-keyed-draft-saves.md`: A keyed draft save happens once: Drafts lookup reads the 50 newest Message-IDs before SEARCH, and a host store records the save so a replay returns the same draft and a changed request is `idempotency_conflict`.
 - `0046-filed-messages-are-mirrored-at-once.md`: A draft or Sent copy that an action files is mirrored at once from APPENDUID: the row from the server's metadata for that UID, the body from the filed bytes; failures stay warnings and sync stays authoritative.
+- `0047-a-new-mailbox-is-read-text-first.md`: A large body backlog is read text first, after initial sync finishes its metadata in one pass; the full body follows, and coverage counts a body complete only then.
 
 ## Status Values
 
