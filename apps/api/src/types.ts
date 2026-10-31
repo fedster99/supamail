@@ -320,6 +320,9 @@ export interface SyncResult {
   reconcileProviderUidsSeen?: number;
   reconcileDurationMs?: number;
   hitLockBudget: boolean;
+  /** The pass ended early because a direct mailbox write was waiting for the
+   * account lock. Work may remain; like a spent budget, it is not a failure. */
+  yieldedToWriter: boolean;
   errors: string[];
 }
 

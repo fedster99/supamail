@@ -48,7 +48,8 @@ sync first, hits all three on every write.
 - A write may wait for the current sync step, and fails with `AccountBusyError`
   only after 25 seconds. Lower-lane passes can still hold the lock for up to
   `MAX_LOCK_HOLD_MS`, and priority folders may run past it, so a write during a
-  long first sync can still be busy.
+  long first sync can still be busy. ADR 0048 closes this: a pass now gives way
+  to a waiting write after its current unit.
 - A deferred pass leaves no trace in `imap_sync_runs`. A lock held for a long
   time shows as an account whose last finished sync grows old, not as a stream
   of failed runs.
