@@ -453,6 +453,7 @@ export class MirrorEngine {
       reconcileProviderUidsSeen: 0,
       reconcileDurationMs: 0,
       hitLockBudget: false,
+      yieldedToWriter: false,
       errors: []
     };
     let cancellationCleanupRequired = false;
@@ -580,6 +581,19 @@ export class MirrorEngine {
           );
           folders.splice(firstOrdinary < 0 ? folders.length : firstOrdinary, 0, ...extra);
         }
+        // Each unit of work (a folder, a body batch, a history batch) starts at a
+        // boundary that proves this session still owns the account. A worker that
+        // lost its lock (for example across a network partition) stops there;
+        // writes already under way in the previous unit may land. Once one unit
+        // has run, a direct write waiting for the lock ends the pass, so the write
+        // waits for one unit instead of the whole pass (ADR 0048).
+        let unitsStarted = 0;
+        const atBoundary = async (): Promise<boolean> => {
+          await lock.assertLive();
+          if (unitsStarted > 0 && lock.writerWaiting()) result.yieldedToWriter = true;
+          unitsStarted += 1;
+          return result.yieldedToWriter;
+        };
         let priorityFolderFailed = false;
         let connectionLost = false;
         let remainingReconciles = this.config.MAX_RECONCILES_PER_CYCLE;
@@ -589,10 +603,7 @@ export class MirrorEngine {
         const handledMailboxObservations: MailboxChangeObservation[] = [];
         for (const folder of folders) {
           throwIfInterrupted();
-          // Prove this session still owns the account before each folder writes.
-          // A worker that lost its lock (for example across a network partition)
-          // stops here; writes already under way in the previous folder may land.
-          await lock.assertLive();
+          if (await atBoundary()) break;
           const mailboxChange = mailboxChangeByPath.get(folder.path);
           const forceKnownReconcile = forcedReconcilePaths.has(folder.path);
           const isPriorityFolder = forceKnownReconcile
@@ -734,8 +745,11 @@ export class MirrorEngine {
 
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
-        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
-          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
+        } else if (!options.sentOnly
+          && !options.liveInboxOnly
+          && !connectionLost
+          && !result.yieldedToWriter) {
+          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, atBoundary);
           throwIfInterrupted();
           result.bodiesFetched += bodyResult.fetched;
           if (bodyResult.hitLockBudget) result.hitLockBudget = true;
@@ -746,14 +760,15 @@ export class MirrorEngine {
         } else if (!options.sentOnly
           && !options.liveInboxOnly
           && !options.bodyBacklogOnly
-          && !connectionLost) {
+          && !connectionLost
+          && !result.yieldedToWriter) {
           const historyResult = await this.runHistoryLane(
             account,
             client,
             lockDeadline,
             metadataWriteStats,
             options.signal,
-            lock.assertLive
+            atBoundary
           );
           throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
@@ -791,14 +806,14 @@ export class MirrorEngine {
           });
         } else if (result.outcome === "partial_success") {
           await this.repository.markAccountSyncPartial(account.id, result.errors.join("; "), {
-            countsTowardBackoff: !result.hitLockBudget,
+            countsTowardBackoff: !result.hitLockBudget && !result.yieldedToWriter,
             deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
             signal: options.signal,
             expectedSyncOwner: syncOwner
           });
         } else {
           await this.repository.markAccountSyncSucceeded(account.id, {
-            countsTowardBackoff: !result.hitLockBudget,
+            countsTowardBackoff: !result.hitLockBudget && !result.yieldedToWriter,
             deadlineAt: Date.now() + SYNC_STATE_WRITE_GRACE_MS,
             signal: options.signal,
             expectedSyncOwner: syncOwner
@@ -2160,7 +2175,7 @@ export class MirrorEngine {
     lockDeadline: number,
     metadataWriteStats: MetadataWriteStats,
     signal: AbortSignal | undefined,
-    assertLive: () => Promise<void>
+    atBoundary: () => Promise<boolean>
   ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
       return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
@@ -2181,7 +2196,7 @@ export class MirrorEngine {
         hitLockBudget = true;
         break;
       }
-      await assertLive();
+      if (await atBoundary()) break;
 
       const [folder] = await this.repository.getHistoryBacklog(account, 1);
       if (!folder) break;
@@ -2462,10 +2477,11 @@ export class MirrorEngine {
     account: ImapAccount,
     client: MirrorImapClient,
     lockDeadline: number,
-    assertLive: () => Promise<void>
+    atBoundary: () => Promise<boolean>
   ): Promise<{ fetched: number; hitLockBudget: boolean }> {
     let fetched = 0;
     let hitLockBudget = false;
+    let yielded = false;
     let batchesRemaining = this.config.MAX_BODY_BATCHES_PER_TICK;
 
     while (batchesRemaining > 0) {
@@ -2491,7 +2507,10 @@ export class MirrorEngine {
           offset + this.config.BODY_BACKFILL_BATCH_SIZE
         );
 
-        await assertLive();
+        if (await atBoundary()) {
+          yielded = true;
+          break;
+        }
         fetched += await this.fetchAndStoreBodies(client, logicalBatch);
 
         batchesRemaining -= 1;
@@ -2501,7 +2520,7 @@ export class MirrorEngine {
         }
       }
 
-      if (hitLockBudget || backlog.length < readLimit) break;
+      if (hitLockBudget || yielded || backlog.length < readLimit) break;
     }
 
     return { fetched, hitLockBudget };

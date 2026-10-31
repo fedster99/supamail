@@ -8,6 +8,11 @@ export interface AccountLock {
    * the advisory lock. Throws before an irreversible boundary when liveness is
    * unknown or lost. */
   assertLive(): Promise<void>;
+  /** Whether the last liveness check saw another session waiting for this lock.
+   * Only a direct mailbox write waits for it (sync passes try-lock), so a pass
+   * gives way at its next safe boundary instead of making the write wait out
+   * the whole pass. */
+  writerWaiting(): boolean;
   /** Mark that an irreversible provider action has been confirmed. From this
    * point, liveness/unlock failures are diagnostics, never retry signals. */
   confirmIrreversible(): void;
@@ -172,8 +177,10 @@ export function accountLockHeartbeatIntervalMs(staleThresholdMs: number): number
 async function persistAndValidateAccountLock(
   client: PgClient,
   lockId: string | number
-): Promise<void> {
-  let result: { rows: Array<{ heartbeat_persisted: boolean; lock_held: boolean }> };
+): Promise<boolean> {
+  let result: {
+    rows: Array<{ heartbeat_persisted: boolean; lock_held: boolean; writer_waiting: boolean }>;
+  };
   try {
     result = await client.query(
       `
@@ -195,7 +202,17 @@ async function persistAndValidateAccountLock(
             AND pl.locktype = 'advisory'
             AND pl.granted = true
             AND pl.pid = pg_backend_pid()
-        ) AS lock_held
+        ) AS lock_held,
+        EXISTS (
+          SELECT 1
+          FROM pg_locks waiter
+          WHERE waiter.locktype = 'advisory'
+            AND waiter.granted = false
+            AND waiter.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            AND waiter.classid::bigint = 0
+            AND waiter.objid::bigint = $1::bigint
+            AND waiter.objsubid = 1
+        ) AS writer_waiting
       `,
       [lockId]
     );
@@ -220,23 +237,24 @@ async function persistAndValidateAccountLock(
       false
     );
   }
+  return row.writer_waiting === true;
 }
 
 async function persistAndValidateAccountLockWithRetry(
   client: PgClient,
   lockId: string | number,
   maxAttempts = 3
-): Promise<void> {
+): Promise<boolean> {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      await persistAndValidateAccountLock(client, lockId);
-      return;
+      return await persistAndValidateAccountLock(client, lockId);
     } catch (error) {
       const retryable = error instanceof AccountLockLivenessError && error.retryable;
       if (!retryable || attempt >= maxAttempts) throw error;
       await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
     }
   }
+  throw new AccountLockLivenessError(`Account lock heartbeat was not attempted for lock ${lockId}`, false);
 }
 
 function asError(error: unknown, prefix: string): Error {
@@ -386,9 +404,12 @@ export async function withAccountLock<T>(
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatPending: Promise<void> | null = null;
     let lastHeartbeatError: unknown = null;
+    let writerWaiting = false;
     const refreshHeartbeat = async (): Promise<void> => {
       if (heartbeatPending) return await heartbeatPending;
-      const persist = () => persistAndValidateAccountLockWithRetry(client, lockId);
+      const persist = async () => {
+        writerWaiting = await persistAndValidateAccountLockWithRetry(client, lockId);
+      };
       const pending = (session
         ? session.exclusive(async () => {
             session.assertUsable();
@@ -413,6 +434,7 @@ export async function withAccountLock<T>(
       lockId,
       client,
       assertLive: refreshHeartbeat,
+      writerWaiting: () => writerWaiting,
       confirmIrreversible: () => {
         irreversibleConfirmed = true;
       }

@@ -109,6 +109,7 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
 - `MAX_LOCK_HOLD_MS` is a cooperative fairness budget. It is checked at safe boundaries, not by killing in-flight IMAP commands. A history metadata batch that has already finished its IMAP fetch persists and advances its watermark under its own bounded database-write deadline before yielding.
 - Priority folders may finish past the lock budget; non-priority folders and body batches stop at the next safe boundary.
 - A `hitLockBudget` cycle is normal completion and must not reset backoff counters.
+- A pass gives way to a waiting direct write (ADR 0048): the liveness check before each folder, body batch and history batch also reports a non-granted advisory lock on the account key, and once one unit has started the pass ends at that boundary with `yieldedToWriter`. That is normal completion: no backoff, unreached folders stay due, their mailbox changes stay unacknowledged.
 
 ## Folder And UID Semantics
 

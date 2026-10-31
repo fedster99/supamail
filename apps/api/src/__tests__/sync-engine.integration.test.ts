@@ -12,6 +12,7 @@ import type {
 import { getWindowCutoff, resetConfigForTests } from "../config.js";
 import { createApiApp } from "../api.js";
 import { MirrorEngine } from "../sync-engine.js";
+import { withInteractiveAccountLock } from "../interactive-lock.js";
 import type { ImapFolder } from "../types.js";
 import {
   plaintextMetadataProtection,
@@ -3177,6 +3178,99 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     } finally {
       nowSpy.mockRestore();
     }
+  });
+
+  it("Scenario G.4 — a pass gives the lock to a waiting direct write after one folder, without backoff", async () => {
+    const h = await setupIntegration("G-writer-yield", { INITIAL_SYNC_BATCH_SIZE: 50 });
+    activeAccountIds.push(h.account.id);
+    const folders: FixtureFolder[] = [
+      {
+        path: "INBOX",
+        delimiter: "/",
+        specialUse: "\\Inbox",
+        uidValidity: 100,
+        messages: [makeTextMessage({ uid: 1, subject: "inbox", from: "a@x.test", to: "u@x.test", body: "inbox" })]
+      },
+      {
+        path: "Project-Echo",
+        delimiter: "/",
+        uidValidity: 200,
+        messages: [makeTextMessage({ uid: 1, subject: "echo", from: "b@x.test", to: "u@x.test", body: "echo" })]
+      }
+    ];
+    const lockRow = await h.pool.query<{ lock_id: string }>(
+      "SELECT lock_id::text AS lock_id FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    const account = { id: h.account.id, lock_id: lockRow.rows[0].lock_id };
+    await h.pool.query(
+      `UPDATE public.imap_accounts
+       SET consecutive_successes = 7, consecutive_failures = 2
+       WHERE id = $1`,
+      [h.account.id]
+    );
+
+    let write: Promise<string> | null = null;
+    class WriterArrivesDuringFirstFolderClient extends FixtureImapClient {
+      async *fetch(
+        range: string | number[] | Record<string, unknown>,
+        query: Record<string, unknown>
+      ) {
+        if (write === null) {
+          write = withInteractiveAccountLock(h.pool, account, async () => "written");
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            const waiting = await h.pool.query<{ waiting: boolean }>(
+              `SELECT EXISTS (
+                 SELECT 1 FROM pg_locks
+                 WHERE locktype = 'advisory' AND NOT granted AND objid::bigint = $1::bigint
+               ) AS waiting`,
+              [account.lock_id]
+            );
+            if (waiting.rows[0].waiting) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        }
+        yield* super.fetch(range, query);
+      }
+    }
+
+    const engine = h.buildEngine({
+      folders,
+      clientFactory: async () => new WriterArrivesDuringFirstFolderClient(folders) as unknown as MirrorImapClient
+    });
+    const result = await engine.syncAccount(h.account.id, "manual");
+
+    expect(result.outcome).toBe("success");
+    expect(result.yieldedToWriter).toBe(true);
+    expect(result.hitLockBudget).toBe(false);
+    expect(result.foldersProcessed).toBe(1);
+    const checked = await h.pool.query<{ path: string }>(
+      "SELECT path FROM public.imap_folders WHERE id = $1",
+      [result.folderChecks![0].folderIds[0]]
+    );
+    expect(checked.rows[0].path).toBe("INBOX");
+    expect(write).not.toBeNull();
+    await expect(write).resolves.toBe("written");
+
+    const after = await h.pool.query<{ consecutive_successes: number; consecutive_failures: number }>(
+      "SELECT consecutive_successes, consecutive_failures FROM public.imap_accounts WHERE id = $1",
+      [h.account.id]
+    );
+    expect(after.rows[0]).toEqual({ consecutive_successes: 7, consecutive_failures: 2 });
+    const run = await h.pool.query<{ metadata: { yieldedToWriter: boolean } }>(
+      "SELECT metadata FROM public.imap_sync_runs WHERE id = $1",
+      [result.runId]
+    );
+    expect(run.rows[0].metadata.yieldedToWriter).toBe(true);
+
+    // With no writer waiting, the next pass picks up the folder the yield left.
+    const next = await engine.syncAccount(h.account.id, "manual");
+    expect(next.yieldedToWriter).toBe(false);
+    const rows = await h.pool.query<{ folder_path: string }>(
+      "SELECT DISTINCT folder_path FROM public.imap_messages WHERE account_id = $1 ORDER BY folder_path",
+      [h.account.id]
+    );
+    expect(rows.rows.map((row) => row.folder_path)).toEqual(["INBOX", "Project-Echo"]);
   });
 
   it("caps body backlog batches per tick", async () => {

@@ -94,6 +94,65 @@ liveDb("interactive account lock (live DB)", () => {
     }
   });
 
+  it("tells the holder when a direct write waits, but not for try-locks or other mailboxes", async () => {
+    const other = await pool.query<{ id: string; lock_id: string }>(
+      `INSERT INTO public.imap_accounts (email_address, host, port, username, encrypted_password)
+       VALUES ($1, 'imap.example.test', 993, $1, $2) RETURNING id, lock_id::text`,
+      [`interactive-lock-other-${process.pid}@example.test`, Buffer.from([0])]
+    );
+    const otherAccount = other.rows[0];
+    try {
+      const observed: boolean[] = [];
+      let otherWrite: Promise<string> | null = null;
+      let write: Promise<string> | null = null;
+      await withAccountLock(pool, account.lock_id, async (lock) => {
+        await lock.assertLive();
+        observed.push(lock.writerWaiting());
+
+        // A sync's try-lock never waits, so it is not a writer.
+        expect(await tryLock()).toBe(false);
+        await lock.assertLive();
+        observed.push(lock.writerWaiting());
+
+        // A write waiting for another mailbox's lock is not this mailbox's writer.
+        const otherHolder = await pool.connect();
+        await otherHolder.query("SELECT pg_advisory_lock($1::bigint)", [otherAccount.lock_id]);
+        otherWrite = withInteractiveAccountLock(pool, otherAccount, async () => "other written");
+        await waitForWaiter(otherAccount.lock_id);
+        await lock.assertLive();
+        observed.push(lock.writerWaiting());
+        await release(otherHolder);
+        await expect(otherWrite).resolves.toBe("other written");
+
+        write = withInteractiveAccountLock(pool, account, async () => "written");
+        await waitForWaiter(account.lock_id);
+        // The last proof is cached until the next one.
+        observed.push(lock.writerWaiting());
+        await lock.assertLive();
+        observed.push(lock.writerWaiting());
+      });
+      expect(observed).toEqual([false, false, false, false, true]);
+      await expect(write).resolves.toBe("written");
+    } finally {
+      await pool.query("DELETE FROM public.imap_accounts WHERE id = $1", [otherAccount.id]);
+    }
+  });
+
+  async function waitForWaiter(lockId: string): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const waiting = await pool.query<{ waiting: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM pg_locks
+           WHERE locktype = 'advisory' AND NOT granted AND objid::bigint = $1::bigint
+         ) AS waiting`,
+        [lockId]
+      );
+      if (waiting.rows[0].waiting) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`no session started waiting for lock ${lockId}`);
+  }
+
   it("leaves no statement timeout on the session after the wait", async () => {
     const timeout = await withAccountLock(pool, account.lock_id, async (lock) => {
       const result = await lock.client.query<{ statement_timeout: string }>("SHOW statement_timeout");

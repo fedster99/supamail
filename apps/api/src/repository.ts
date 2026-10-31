@@ -1113,6 +1113,7 @@ export class MirrorRepository {
         JSON.stringify({
           errors: diagnosticCodes,
           hitLockBudget: result.hitLockBudget,
+          yieldedToWriter: result.yieldedToWriter,
           metadataRowsCommitted: result.metadataRowsCommitted ?? 0,
           metadataWriteDurationMs: result.metadataWriteDurationMs ?? 0,
           metadataWriteBatchesAttempted: result.metadataWriteBatchesAttempted ?? 0,

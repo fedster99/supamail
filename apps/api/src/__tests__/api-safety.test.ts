@@ -58,6 +58,7 @@ function makeSyncResult(): SyncResult {
     flagsUpdated: 0,
     reconcileGapsFound: 0,
     hitLockBudget: false,
+    yieldedToWriter: false,
     errors: []
   };
 }
