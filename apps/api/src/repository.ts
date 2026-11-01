@@ -4597,7 +4597,7 @@ export class MirrorRepository {
   async getHistoryBacklog(account: ImapAccount, limit: number): Promise<HistoryBacklogFolder[]> {
     if (account.historical_backfill_mode === "off") return [];
 
-    // Archive bodies are the body lane's work (ADR 0044); history finds headers.
+    // Archive bodies are the body lane's work (ADR 0049); history finds headers.
     const result = await this.pool.query<HistoryBacklogFolder>(
       `
       SELECT
@@ -4792,6 +4792,8 @@ export class MirrorRepository {
     folder_path: string;
     uidvalidity: string;
     uid: string;
+    /** The body is still missing or its evidence is outdated: the same test as `getBodyBacklog`. */
+    due: boolean;
   }>> {
     if (messageIds.length === 0) return [];
     const result = await this.pool.query<{
@@ -4799,14 +4801,20 @@ export class MirrorRepository {
       folder_path: string;
       uidvalidity: string;
       uid: string;
+      due: boolean;
     }>(
       `
-      SELECT id::text, folder_path, uidvalidity::text, uid::text
-      FROM public.imap_messages
-      WHERE id = ANY($1::uuid[])
-        AND deleted_in_provider = false
+      SELECT m.id::text, m.folder_path, m.uidvalidity::text, m.uid::text,
+        (
+          m.body_fetched_at IS NULL
+          OR NOT coalesce(b.structured_evidence_extractor_version = ANY($2::text[]), false)
+        ) AS due
+      FROM public.imap_messages m
+      LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+      WHERE m.id = ANY($1::uuid[])
+        AND m.deleted_in_provider = false
       `,
-      [[...messageIds]]
+      [[...messageIds], EVIDENCE_VERSIONS_WITHOUT_REFETCH]
     );
     return result.rows;
   }

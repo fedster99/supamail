@@ -2,10 +2,11 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { closePool } from "../db.js";
 import { resetConfigForTests } from "../config.js";
 import { FixtureImapClient, type FixtureFolder, makeTextMessage } from "../smoke/fixture-imap.js";
-import type { MirrorImapClient } from "../imap-client.js";
+import { fetchFullMessageBody, type MirrorImapClient } from "../imap-client.js";
+import { DatabaseBodyStore } from "../body-store.js";
 import { setupIntegration, teardownIntegration, type IntegrationHarness } from "./helpers/integration-harness.js";
 
-// ADR 0044: bodies download beside the account lock and commit under it.
+// ADR 0049: bodies download beside the account lock and commit under it.
 const integration = process.env.DATABASE_URL ? describe : describe.skip;
 
 const OLD = new Date("2023-01-01T00:00:00Z");
@@ -139,7 +140,7 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     client.goneUids.add("1");
     // One batch: a later one would look for the body at the new UID.
     const bodies = h.buildEngine({ folders, clientFactory: async () => client })
-      .syncBodies(h.account.id, { maxUnits: 1 });
+      .syncBodies(h.account.id, { maxMessages: 5 });
     await client.entered;
 
     // A confirmed move keeps the id at a new UID (ADR 0037).
@@ -203,7 +204,10 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     await client.entered;
     abort.abort();
     client.open();
-    expect(await run).toMatchObject({ outcome: "success", bodies: null, bodyError: null });
+    // The stopped run still reports what it stored; bodies may remain.
+    expect(await run).toMatchObject({
+      outcome: "success", bodies: { committed: 0, gone: 0, skipped: 0, remaining: true }, bodyError: null
+    });
     expect(await rows()).toEqual([{ uid: "1", fetched: false, deleted: false, evidence: false }]);
   });
 
@@ -218,7 +222,7 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     });
     const result = await engine.syncAccountWithBodies(h.account.id, "manual");
     expect(result.outcome).toBe("success");
-    expect(result.bodies).toBeNull();
+    expect(result.bodies).toEqual({ committed: 0, gone: 0, skipped: 0, remaining: true });
     expect(result.bodyError).toEqual(expect.any(String));
     expect(result.bodyError).not.toContain("secret");
     const account = await h.repository.getAccount(h.account.id);
@@ -268,6 +272,89 @@ integration("body sync beside the account lock (real Postgres + fixture IMAP)", 
     expect(await uids({ includeArchive: true })).toEqual(["10", "1", "2"]);
     const [live] = await h.repository.getBodyBacklog(account!, 1);
     expect(await uids({ includeArchive: true, excludeIds: [live.id] })).toEqual(["1", "2"]);
+  });
+
+  it("runs one body run per Mailbox Account: a second run stores nothing and reports remaining", async () => {
+    const folders = inbox([message(1), message(2)]);
+    await setup("bodies-one-run", folders);
+    const client = new GatedBodyClient(folders);
+    const first = h.buildEngine({ folders, clientFactory: async () => client }).syncBodies(h.account.id);
+    await client.entered;
+
+    let secondOpened = false;
+    const second = await h.buildEngine({
+      folders,
+      clientFactory: async () => { secondOpened = true; return new FixtureImapClient(folders); }
+    }).syncBodies(h.account.id);
+    expect(second).toEqual({ committed: 0, gone: 0, skipped: 0, remaining: true });
+    expect(secondOpened).toBe(false);
+
+    client.open();
+    expect(await first).toEqual({ committed: 2, gone: 0, skipped: 0, remaining: false });
+    const folder = await h.pool.query<{ bodies_fetched_count: number }>(
+      "SELECT bodies_fetched_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    expect(folder.rows[0].bodies_fetched_count).toBe(2);
+  });
+
+  it("skips a body another path stored while it downloaded, unless the refetch is forced", async () => {
+    const folders = inbox([message(1)]);
+    await setup("bodies-stored-meanwhile", folders);
+    const client = new GatedBodyClient(folders);
+    const engine = h.buildEngine({ folders, clientFactory: async () => client });
+    const bodies = engine.syncBodies(h.account.id);
+    await client.entered;
+
+    // An action files the same message's bytes meanwhile (ADR 0046): evidence,
+    // store, completion, as the engine would.
+    const [row] = (await h.pool.query<{ id: string }>(
+      "SELECT id FROM public.imap_messages WHERE account_id = $1", [h.account.id]
+    )).rows;
+    const stored = await h.repository.getMessage(row.id);
+    const filed = await fetchFullMessageBody(new FixtureImapClient(folders) as MirrorImapClient, h.config, stored!);
+    await h.repository.storeBodyEvidence(filed);
+    await new DatabaseBodyStore(h.repository).store(filed);
+    await h.repository.completeBodyStorage(row.id);
+
+    client.open();
+    expect(await bodies).toEqual({ committed: 0, gone: 0, skipped: 1, remaining: false });
+    const folder = await h.pool.query<{ bodies_fetched_count: number }>(
+      "SELECT bodies_fetched_count FROM public.imap_folders WHERE account_id = $1 AND path = 'INBOX'",
+      [h.account.id]
+    );
+    expect(folder.rows[0].bodies_fetched_count).toBe(1);
+    // A forced refetch replaces it.
+    expect(await engine.fetchBody(row.id, true)).toBe(true);
+  });
+
+  it("records a provider that refuses the body connection, by provider and host", async () => {
+    const folders = inbox([message(1)]);
+    await setup("bodies-refused", folders);
+    const refusal = Object.assign(new Error("Command failed"), {
+      authenticationFailed: true,
+      serverResponseCode: "LIMIT",
+      response: "NO [LIMIT] Too many simultaneous connections"
+    });
+    // The pass's session logs in; the body run's extra session is refused.
+    let sessions = 0;
+    const engine = h.buildEngine({ folders, clientFactory: async () => {
+      if (sessions++ > 0) throw refusal;
+      return new FixtureImapClient(folders);
+    } });
+    const run = await engine.syncAccountWithBodies(h.account.id, "manual");
+    expect(run.outcome).toBe("success");
+    expect(run.bodies).toEqual({ committed: 0, gone: 0, skipped: 0, remaining: true });
+    expect(run.bodyError).not.toBeNull();
+    const events = await h.pool.query<{ payload: Record<string, unknown> }>(
+      "SELECT payload FROM public.imap_sync_events WHERE account_id = $1 AND event_type = 'BODY_CONNECTION_REFUSED'",
+      [h.account.id]
+    );
+    expect(events.rows).toHaveLength(1);
+    expect(events.rows[0].payload).toMatchObject({
+      provider: "generic-imap", host: "fake.imap.local", responseCode: "LIMIT", kind: "session_limit"
+    });
+    expect(await rows()).toEqual([{ uid: "1", fetched: false, deleted: false, evidence: false }]);
   });
 
   it("never runs a body download inside the sync pass", async () => {

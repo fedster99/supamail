@@ -108,8 +108,8 @@ async function main(): Promise<void> {
       clientFactory: async () => new FixtureImapClient(folders)
     });
     const result = await engine.syncAccount(account.id, "manual");
-    // One body batch beside the lock (ADR 0044) keeps the backlog bounded.
-    await engine.syncBodies(account.id, { maxUnits: 1 });
+    // One body batch beside the lock (ADR 0049) keeps the backlog bounded.
+    await engine.syncBodies(account.id, { maxMessages: 10 });
     peakRss = Math.max(peakRss, process.memoryUsage().rss);
 
     const counts = await countRows(account.id);

@@ -973,6 +973,9 @@ export class MessageMovedError extends Error {
  * empty result, so without this check a closed connection reads as a gone message.
  */
 export class ImapConnectionClosedError extends Error {
+  /** The code imapflow gives a dead client, so `isConnectionLostError` sees it. */
+  readonly code = "NoConnection";
+
   constructor(operation: string) {
     super(`IMAP connection closed during ${operation}`);
     this.name = "ImapConnectionClosedError";

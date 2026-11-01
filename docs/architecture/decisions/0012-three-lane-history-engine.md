@@ -1,6 +1,6 @@
 # ADR 0012: Three-Lane History Engine
 
-Status: Accepted; amended by ADR 0044
+Status: Accepted; amended by ADR 0049
 
 Date: 2026-05-24
 
@@ -12,7 +12,7 @@ PRs 1-7 made the shared account lock safe enough for this work: cooperative lock
 
 ## Decision
 
-> **Amended by [ADR 0044](0044-bodies-download-beside-the-lock.md).** The body lane left the lock acquisition: `syncBodies` downloads live, then archive, bodies on its own connection beside the lock and commits each unit under it. A pass runs the hot lane, then the history lane, which mirrors headers only.
+> **Amended by [ADR 0049](0049-bodies-download-beside-the-lock.md).** The body lane left the lock acquisition: `syncBodies` downloads live, then archive, bodies on its own connection beside the lock and commits each unit under it. A pass runs the hot lane, then the history lane, which mirrors headers only.
 
 Use one advisory-lock acquisition with three ordered lanes:
 

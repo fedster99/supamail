@@ -322,7 +322,7 @@ export interface SyncResult {
   errors: string[];
 }
 
-/** One `syncBodies` run: bodies download beside the account lock (ADR 0044). */
+/** One `syncBodies` run: bodies download beside the account lock (ADR 0049). */
 export interface BodySyncResult {
   /** Bodies stored and marked complete. */
   committed: number;
@@ -330,7 +330,7 @@ export interface BodySyncResult {
   gone: number;
   /** Downloaded rows another writer deleted or reset before the commit. */
   skipped: number;
-  /** Eligible bodies may remain: the run stopped at its unit limit or a busy lock. */
+  /** Eligible bodies may remain: the run stopped at its message limit, its time budget, a busy lock, another run, a moved row, or an error. */
   remaining: boolean;
 }
 

@@ -27,7 +27,7 @@ export interface WorkerSyncResult {
   metadataWriteBatchesAttempted?: number;
   metadataWriteBatchesFailed?: number;
   metadataWriteServiceRowsPerSecond?: number | null;
-  /** The body run after a full pass (ADR 0044); absent for Sent-only passes. */
+  /** The body run after a full pass (ADR 0049); absent for Sent-only passes. */
   bodies?: { committed: number } | null;
   bodyError?: string | null;
   errors: string[];

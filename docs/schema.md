@@ -179,7 +179,7 @@ Public mirror migrations live under `apps/api/supabase/migrations/public/` and a
 
 ## Sync runs no longer count bodies
 
-Since ADR 0044 bodies download beside the account lock, outside any sync run.
+Since ADR 0049 bodies download beside the account lock, outside any sync run.
 New `imap_sync_runs.bodies_fetched` values therefore stay 0; read body progress
 from `imap_account_progress` and the folder body counters. The column is dropped
 in a later release, once hosts stop reading it.

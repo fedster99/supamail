@@ -63,8 +63,8 @@ export { MailboxConflictError };
  * absent → the verb refuses rather than risk purging unrelated \Deleted messages.
  *
  * Every write waits for the account advisory lock (withInteractiveAccountLock), as
- * draft saves and sends do: one IMAP operation per Mailbox Account at a time, and a
- * sync can never interleave with a write. Without the lock, a flag scan that read a
+ * draft saves and sends do: one mirror-changing operation per Mailbox Account at a
+ * time, and a sync can never interleave with a write. Without the lock, a flag scan that read a
  * message before this STORE could write the old flags back over the write-through.
  *
  * Every library function accepts an optional AbortSignal. After abort no new

@@ -1419,7 +1419,7 @@ async function scenarioPendingVerificationRediscovery() {
 }
 
 async function scenarioThreeLaneHistory() {
-  console.log("\nScenario L: a pass runs hot then history headers; bodies follow beside the lock (ADR 0044)");
+  console.log("\nScenario L: a pass runs hot then history headers; bodies follow beside the lock (ADR 0049)");
   const oldDate = new Date("2023-01-01T00:00:00Z");
   const recentDate = new Date();
   const { pool, config, repository, account } = await setup("three-lane", {
@@ -1509,7 +1509,7 @@ async function scenarioThreeLaneHistory() {
       "a pass mirrors hot headers, then history headers, and no body",
       `events=${events.join(",")}`
     );
-    const bodies = await engine.syncBodies(account.id, { maxUnits: 2 });
+    const bodies = await engine.syncBodies(account.id, { maxMessages: 2 });
     const bodyEvents = events.filter((event) => event.startsWith("body:"));
     assert(
       bodies.committed === 2

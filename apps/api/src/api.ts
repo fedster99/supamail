@@ -529,7 +529,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const id = UUID_SCHEMA.parse(c.req.param("id"));
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
-    // The pass, then its bodies beside the lock (ADR 0044).
+    // The pass, then its bodies beside the lock (ADR 0049).
     const result = await options.engine.syncAccountWithBodies(id, "api");
     return c.json({ result });
   });

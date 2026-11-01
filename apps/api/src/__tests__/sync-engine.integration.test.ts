@@ -407,7 +407,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     const followupKeys = followupBacklog.map((message) => `${message.folder_path}:${message.uid}`);
     expect(followupKeys).toContain("INBOX:106");
     expect(followupKeys).toContain("Sent:201");
-    // Bodies download beside the lock on the host's session (ADR 0044).
+    // Bodies download beside the lock on the host's session (ADR 0049).
     const bodyFollowup = await engine.syncBodies(h.account.id, {
       openClient: async () => idleClient,
       clientAccountId: h.account.id
@@ -3165,7 +3165,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     }
   });
 
-  it("caps body backlog batches per tick", async () => {
+  it("caps a body run at its message limit, reading one unit at a time", async () => {
     const h = await setupIntegration("G-body-cap", {
       INITIAL_SYNC_BATCH_SIZE: 50,
       BODY_BACKFILL_BATCH_SIZE: 2,
@@ -3195,10 +3195,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(backlogSpy).not.toHaveBeenCalled();
+    // One read per unit, each bounded by the batch size and the run's message cap.
     const bodies = await engine.syncBodies(h.account.id);
     expect(bodies).toEqual({ committed: 4, gone: 0, skipped: 0, remaining: true });
-    expect(backlogSpy).toHaveBeenCalledTimes(2);
-    expect(backlogSpy.mock.calls.map((call) => call[1])).toEqual([2, 2]);
+    expect(backlogSpy).toHaveBeenCalledTimes(4);
+    expect(backlogSpy.mock.calls.map((call) => call[1])).toEqual([2, 2, 2, 2]);
 
     const bodyCount = await h.pool.query<{ count: string }>(
       `
@@ -4710,11 +4711,11 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(result.hitLockBudget).toBe(false);
     expect(events.indexOf("hot:INBOX:10")).toBeGreaterThanOrEqual(0);
     expect(events.indexOf("history:INBOX:1")).toBeGreaterThan(events.indexOf("hot:INBOX:10"));
-    // The pass holds the lock for metadata only (ADR 0044).
+    // The pass holds the lock for metadata only (ADR 0049).
     expect(events.filter((event) => event.startsWith("body:"))).toEqual([]);
 
     // Bodies download beside the lock: the live window first, then the archive.
-    expect(await engine.syncBodies(h.account.id, { maxUnits: 2 })).toMatchObject({ committed: 2 });
+    expect(await engine.syncBodies(h.account.id, { maxMessages: 2 })).toMatchObject({ committed: 2 });
     expect(events.filter((event) => event.startsWith("body:"))).toEqual([
       "body:IN_WINDOW:INBOX:10",
       "body:HISTORICAL:INBOX:1"
@@ -4801,7 +4802,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     });
     const blockedResult = await blockedEngine.syncAccount(blocked.account.id, "manual");
     expect(blockedResult.outcome).toBe("success");
-    // A slow body download no longer spends the pass's lock budget (ADR 0044).
+    // A slow body download no longer spends the pass's lock budget (ADR 0049).
     expect(bodySourceFetches).toBe(0);
     expect(blockedResult.hitLockBudget).toBe(false);
 
@@ -4920,7 +4921,7 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
     expect(sourceRanges).toEqual([]);
     // One read holds the live body and the newest archive body: one UID-set
     // FETCH; the last archive body streams alone.
-    expect(await engine.syncBodies(h.account.id, { maxUnits: 2 })).toMatchObject({ committed: 3 });
+    expect(await engine.syncBodies(h.account.id, { maxMessages: 3 })).toMatchObject({ committed: 3 });
     expect(sourceRanges).toEqual([[10, 2]]);
     expect(downloads).toBe(1);
     const historyBodies = await h.pool.query<{ count: string }>(

@@ -327,7 +327,7 @@ async function main(): Promise<void> {
 
     const engine = new MirrorEngine({ pool, config, repository });
     const result = await engine.syncAccount(account.id, "manual");
-    // Bodies download beside the lock after the pass (ADR 0044).
+    // Bodies download beside the lock after the pass (ADR 0049).
     await engine.syncBodies(account.id);
     await pool.query(
       `UPDATE public.imap_folders

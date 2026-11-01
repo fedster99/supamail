@@ -188,8 +188,8 @@ async function composeDraft(
 
 /**
  * Compose `req`, APPEND it to the account's Drafts folder, and write its mirror row,
- * under the per-account advisory lock: one IMAP operation per Mailbox Account at a
- * time. The save waits for a sync that holds the lock (withInteractiveAccountLock).
+ * under the per-account advisory lock: one mirror-changing operation per Mailbox
+ * Account at a time. The save waits for a sync that holds the lock (withInteractiveAccountLock).
  * The lock fences its writes, as sync's does: a save that lost the lock cannot write
  * a row that sync already read, and no sync interleaves with the mirror write.
  */
