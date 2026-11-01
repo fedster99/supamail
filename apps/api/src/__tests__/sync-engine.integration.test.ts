@@ -4919,10 +4919,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
 
     expect(result.outcome).toBe("success");
     expect(sourceRanges).toEqual([]);
-    // One read holds the live body and the newest archive body: one UID-set
-    // FETCH; the last archive body streams alone.
+    // Live rows are read first: the live body streams alone; the archive page
+    // then holds both archive bodies, which share one UID-set FETCH.
     expect(await engine.syncBodies(h.account.id, { maxMessages: 3 })).toMatchObject({ committed: 3 });
-    expect(sourceRanges).toEqual([[10, 2]]);
+    expect(sourceRanges).toEqual([[2, 1]]);
     expect(downloads).toBe(1);
     const historyBodies = await h.pool.query<{ count: string }>(
       `

@@ -99,7 +99,11 @@ interface ApiRepository {
 }
 
 interface ApiEngine {
-  syncAccountWithBodies(id: string, source: "api"): Promise<ScheduledSyncResult>;
+  syncAccountWithBodies(
+    id: string,
+    source: "api",
+    options?: { maxMessages?: number }
+  ): Promise<ScheduledSyncResult>;
   fetchBody(id: string, force?: boolean): Promise<boolean>;
 }
 
@@ -530,7 +534,9 @@ export function createApiApp(options: ApiAppOptions): Hono {
     const account = await options.repository.getAccount(id);
     if (!account) throw new NotFoundError(`Account not found: ${id}`);
     // The pass, then its bodies beside the lock (ADR 0049).
-    const result = await options.engine.syncAccountWithBodies(id, "api");
+    // One unit of bodies inside the request, so the call stays bounded; the
+    // worker's runs take the rest.
+    const result = await options.engine.syncAccountWithBodies(id, "api", { maxMessages: 1 });
     return c.json({ result });
   });
 

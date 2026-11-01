@@ -46,7 +46,7 @@ describe("sync engine safety", () => {
           historical_backfill_mode: "off",
           ...options.account
         })),
-        getBodyBacklog: vi.fn(async (_account: unknown, _limit: number, backlog: { excludeIds?: string[] }) =>
+        getBodyBacklog: vi.fn(async (_account: unknown, _limit: number, backlog: { includeArchive?: boolean; excludeIds?: string[] }) =>
           backlog.excludeIds?.includes(message.id) ? [] : [message]),
         storeBodyEvidence: vi.fn(async () => undefined)
       };
@@ -113,10 +113,7 @@ describe("sync engine safety", () => {
         // The next run skips the message for 1 min and opens no connection.
         expect(await engine.syncBodies("account-1", own))
           .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
-        expect(repository.getBodyBacklog.mock.calls[1][2]).toEqual({
-          includeArchive: false,
-          excludeIds: [message.id]
-        });
+        expect(repository.getBodyBacklog.mock.calls[1][2]).toEqual({ excludeIds: [message.id] });
 
         // After 1 min it is retried; a second failure backs it off for 2 min.
         const retry = tricklingClient();
@@ -215,14 +212,15 @@ describe("sync engine safety", () => {
     it("leaves a reset folder's bodies to metadata sync and goes on with the backlog", async () => {
       const second = { ...message, id: "message-2", uid: "6" };
       const { engine, repository } = bodyEngine({ client: promptClient() });
-      repository.getBodyBacklog.mockImplementation(async (_account: unknown, _limit: number, backlog: { excludeIds?: string[] }) =>
+      repository.getBodyBacklog.mockImplementation(async (_account: unknown, _limit: number, backlog: { includeArchive?: boolean; excludeIds?: string[] }) =>
         [message, second].filter((row) => !backlog.excludeIds?.includes(row.id)));
       const download = vi.spyOn(engine as never, "downloadBodyUnit" as never)
         .mockRejectedValueOnce(new BodySourceChangedError("INBOX"))
         .mockResolvedValue({ batches: [], single: [], gone: [] } as never);
       vi.spyOn(engine as never, "commitBodies" as never).mockResolvedValue({ committed: 0, gone: 0, skipped: 0, stillDue: 0 } as never);
-      expect(await engine.syncBodies("account-1")).toMatchObject({ remaining: false });
-      // The reset row is backed off; the next unit was the other row.
+      // The reset row is backed off and stays due, so bodies remain.
+      expect(await engine.syncBodies("account-1", { maxMessages: 2 })).toMatchObject({ remaining: true });
+      // The next unit was the other row.
       expect(download).toHaveBeenCalledTimes(2);
       expect((download.mock.calls[1] as unknown[])[1]).toEqual([second]);
     });
@@ -235,7 +233,7 @@ describe("sync engine safety", () => {
         client: promptClient(),
         config: { BODY_STORAGE_MODE: "parsed_only", BODY_BACKFILL_BATCH_SIZE: 3 }
       });
-      repository.getBodyBacklog.mockImplementation(async (_account: unknown, _limit: number, backlog: { excludeIds?: string[] }) =>
+      repository.getBodyBacklog.mockImplementation(async (_account: unknown, _limit: number, backlog: { includeArchive?: boolean; excludeIds?: string[] }) =>
         rows.filter((row) => !backlog.excludeIds?.includes(row.id)));
       const download = vi.spyOn(engine as never, "downloadBodyUnit" as never)
         .mockRejectedValueOnce(new Error("one message of the three timed out"))
@@ -308,7 +306,8 @@ describe("sync engine safety", () => {
         const { engine, repository } = bodyEngine({ client: tricklingClient(), account, config });
         repository.getBodyBacklog.mockResolvedValue([]);
         await engine.syncBodies("account-1");
-        expect(repository.getBodyBacklog.mock.calls[0][2]).toMatchObject({ includeArchive });
+        // Live rows are read first; the archive arm is read only when it applies.
+        expect(repository.getBodyBacklog.mock.calls.some((call) => call[2].includeArchive === true)).toBe(includeArchive);
       }
     });
   });

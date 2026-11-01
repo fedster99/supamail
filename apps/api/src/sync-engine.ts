@@ -429,7 +429,7 @@ export class MirrorEngine {
   async syncAccountWithBodies(
     accountId: string,
     triggerType: SyncTriggerType,
-    options: { signal?: AbortSignal } = {}
+    options: { signal?: AbortSignal; maxMessages?: number } = {}
   ): Promise<ScheduledSyncResult> {
     const pass = await this.syncAccount(accountId, triggerType, { signal: options.signal });
     let bodies: BodySyncResult | null = null;
@@ -439,7 +439,7 @@ export class MirrorEngine {
     // owns the bodies too.
     if (pass.outcome !== "failed" && pass.outcome !== "deferred" && !options.signal?.aborted) {
       try {
-        bodies = await this.syncBodies(accountId, { signal: options.signal });
+        bodies = await this.syncBodies(accountId, { signal: options.signal, maxMessages: options.maxMessages });
       } catch (error) {
         if (error instanceof BodySyncError) bodies = error.result;
         // A shutdown during the body run is a neutral stop, like the pass's.
@@ -452,11 +452,12 @@ export class MirrorEngine {
   /**
    * Download due bodies beside the account lock and commit each unit under it
    * (ADR 0049). Live-window bodies come first, then, in `metadata_and_bodies`
-   * mode inside the backfill window, archive bodies. Each unit is read from the
-   * backlog just before it downloads, so a message that arrived during the run
-   * is next. A run stops once it has handled `maxMessages` bodies (a unit may
-   * carry it past that by less than one batch) or at
-   * `MAX_LOCK_HOLD_MS`; `remaining` says bodies may be left. One run per
+   * mode inside the backfill window, archive bodies. Live rows are read from the
+   * backlog before every unit, so a message that arrived during the run is next;
+   * archive rows, which no arrival changes, are read a page at a time. A run
+   * stops once it has handled `maxMessages` bodies (a unit may carry it past
+   * that by less than one batch) or at `MAX_LOCK_HOLD_MS`, which also caps
+   * every unit's deadline; `remaining` says bodies may be left. One run per
    * Mailbox Account at a time: a second returns `remaining` without connecting.
    * A run that stops on an error throws `BodySyncError` carrying what it stored.
    * Writes no sync run and no account state. A host that reuses a session
@@ -494,6 +495,7 @@ export class MirrorEngine {
       };
       options.signal?.addEventListener("abort", interrupt, { once: true });
       let handled = 0;
+      let archivePage: ImapMessage[] = [];
       try {
         while (handled < maxMessages) {
           options.signal?.throwIfAborted();
@@ -501,17 +503,21 @@ export class MirrorEngine {
           // A full batch is read so same-folder messages can share one unit; the
           // cap ends the run once a unit carries it past maxMessages.
           const limit = this.config.BODY_BACKFILL_BATCH_SIZE;
-          const backlog = await this.repository.getBodyBacklog(account, limit, {
-            includeArchive,
-            excludeIds: this.backedOffBodyIds()
-          });
+          const excludeIds = this.backedOffBodyIds();
+          let backlog = await this.repository.getBodyBacklog(account, limit, { excludeIds });
+          if (backlog.length === 0 && includeArchive) {
+            // The archive arm sorts the whole mailbox, so it is read once per page.
+            if (archivePage.length === 0) {
+              archivePage = await this.repository.getBodyBacklog(account, limit, { includeArchive, excludeIds });
+            }
+            backlog = archivePage;
+          }
           if (backlog.length === 0) return result;
           client ??= await this.openBodyClient(account, options);
           const unit = this.nextBodyUnit(backlog);
-          if (!await this.syncBodyUnit(account, client, unit, result, options.signal)) break;
+          if (backlog === archivePage) archivePage = archivePage.filter((message) => !unit.includes(message));
+          if (!await this.syncBodyUnit(account, client, unit, result, budgetEndsAt, options.signal)) break;
           handled += unit.length;
-          // The read held more than this unit: more bodies are due.
-          if (backlog.length === unit.length && backlog.length < limit) return result;
         }
         result.remaining = true;
         return result;
@@ -1083,7 +1089,7 @@ export class MirrorEngine {
       try {
         const written = await this.commitBodies(
           account,
-          await this.downloadBodyUnit(client, [message], undefined),
+          await this.downloadBodyUnit(client, [message], this.bodyUnitDeadlineMs([message]), undefined),
           { force }
         );
         return written.committed > 0;
@@ -2591,14 +2597,18 @@ export class MirrorEngine {
         ? await options.openClient()
         : await this.clientFactory(account, { signal: options.signal });
     } catch (error) {
-      if (options.signal?.aborted || isConnectionLostError(error)) throw error;
+      if (options.signal?.aborted) throw error;
       const responseCode = extractImapResponseCode(error);
+      // A provider at its session cap may answer the login with a response code
+      // or just close the socket (BYE); both are refusals of this connection.
+      const kind = classifyLoginRefusal(error)
+        ?? (responseCode && TRANSIENT_RESPONSE_CODES.has(responseCode) ? "session_limit"
+          : isConnectionLostError(error) ? "connection_closed" : "connect_failed");
       await this.repository.logEvent(account.id, null, null, null, null, "BODY_CONNECTION_REFUSED", {
         provider: account.provider_profile,
         host: account.host,
         responseCode,
-        kind: classifyLoginRefusal(error)
-          ?? (responseCode && TRANSIENT_RESPONSE_CODES.has(responseCode) ? "session_limit" : "connect_failed"),
+        kind,
         reason: sanitizeErrorReason(describeSyncError(error))
       }).catch(() => undefined);
       throw error;
@@ -2624,27 +2634,37 @@ export class MirrorEngine {
    * Download one unit beside the lock and commit it under the lock as soon as it
    * arrives, so memory and the lock hold stay at one unit. A failed unit is
    * backed off and ends the run. Returns false when the run stops early: the
-   * lock stayed busy for the commit, or a row moved under the download and is
-   * still due, so the next run reads it again rather than this run twice.
+   * run budget is spent, the lock stayed busy for the commit, or a row moved
+   * under the download and is still due, so the next run reads it again rather
+   * than this run twice.
    */
   private async syncBodyUnit(
     account: ImapAccount,
     client: MirrorImapClient,
     unit: ImapMessage[],
     result: BodySyncResult,
+    budgetEndsAt: number,
     signal: AbortSignal | undefined
   ): Promise<boolean> {
+    // A unit never outlives the run budget, so a run stays bounded whatever the
+    // provider's speed: its deadline is capped to what remains of the budget.
+    const deadlineMs = Math.min(this.bodyUnitDeadlineMs(unit), budgetEndsAt - Date.now());
+    if (deadlineMs <= 0) return false;
     // A reused session selects the folder again, so it sees every UID the
     // backlog read just returned and a present message never looks gone.
     client.invalidateSelection?.();
     let downloaded: DownloadedBodies;
     try {
-      downloaded = await this.downloadBodyUnit(client, unit, signal);
+      downloaded = await this.downloadBodyUnit(client, unit, deadlineMs, signal);
     } catch (error) {
       if (signal?.aborted) throw error;
       this.backOffBodies(unit);
-      // Metadata sync owns a UIDVALIDITY reset; these rows wait for it.
-      if (error instanceof BodySourceChangedError) return true;
+      // Metadata sync owns a UIDVALIDITY reset; these rows wait for it and
+      // stay due, so the run reports them as remaining.
+      if (error instanceof BodySourceChangedError) {
+        result.remaining = true;
+        return true;
+      }
       throw error;
     }
 
@@ -2670,10 +2690,11 @@ export class MirrorEngine {
   private async downloadBodyUnit(
     client: MirrorImapClient,
     unit: ImapMessage[],
+    deadlineMs: number,
     signal: AbortSignal | undefined
   ): Promise<DownloadedBodies> {
     const downloaded: DownloadedBodies = { batches: [], single: [], gone: [] };
-    await this.withBodyDeadline(client, unit, signal, async () => {
+    await this.withBodyDeadline(client, unit, deadlineMs, signal, async () => {
       if (unit.length > 1) {
         const fetched = await fetchFullMessageBodyBatch(client, this.config, unit);
         // A set FETCH can omit a response or its source; that is no evidence
@@ -2689,24 +2710,29 @@ export class MirrorEngine {
     return downloaded;
   }
 
-  /**
-   * A unit may take 60 s plus 8 KiB/s of declared size, at most 30 min; on expiry
-   * this connection closes, which also ends a streamed download between chunks.
-   */
-  private async withBodyDeadline(
-    client: MirrorImapClient,
-    unit: readonly ImapMessage[],
-    signal: AbortSignal | undefined,
-    run: () => Promise<void>
-  ): Promise<void> {
+  /** A unit may take 60 s plus 8 KiB/s of declared size, at most 30 min. */
+  private bodyUnitDeadlineMs(unit: readonly ImapMessage[]): number {
     const declaredBytes = unit.reduce(
       (sum, message) => sum + Math.max(0, Number(message.size_bytes) || 0),
       0
     );
-    const deadlineMs = Math.min(
+    return Math.min(
       BODY_DOWNLOAD_MAX_MS,
       BODY_DOWNLOAD_BASE_MS + Math.ceil(declaredBytes * 1000 / BODY_DOWNLOAD_MIN_BYTES_PER_SECOND)
     );
+  }
+
+  /**
+   * On expiry of the unit's deadline this connection closes, which also ends a
+   * streamed download between chunks.
+   */
+  private async withBodyDeadline(
+    client: MirrorImapClient,
+    unit: readonly ImapMessage[],
+    deadlineMs: number,
+    signal: AbortSignal | undefined,
+    run: () => Promise<void>
+  ): Promise<void> {
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -2776,12 +2802,13 @@ export class MirrorEngine {
       }
 
       // ADR 0028 order: every search/threading input, then the payload, then completion.
-      for (const batch of downloaded.batches) {
-        await this.repository.storeBodyEvidenceBatch(batch.filter(isLive).map(({ body }) => body));
+      const liveBatches = downloaded.batches.map((batch) => batch.filter(isLive));
+      for (const batch of liveBatches) {
+        await this.repository.storeBodyEvidenceBatch(batch.map(({ body }) => body));
       }
       const single = downloaded.single.filter(isLive);
       for (const { body } of single) await this.repository.storeBodyEvidence(body);
-      const committed = [...downloaded.batches.flatMap((batch) => batch.filter(isLive)), ...single];
+      const committed = [...liveBatches.flat(), ...single];
       for (const { message, body } of committed) {
         await this.bodyStore.store(body);
         await this.repository.completeBodyStorage(body.messageId);

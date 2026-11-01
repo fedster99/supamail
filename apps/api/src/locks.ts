@@ -953,6 +953,10 @@ export async function withBodyRunLock<T>(
 ): Promise<T | null> {
   const client = await pool.connect();
   const key = `supamail.bodies:${accountId}`;
+  // The session sits idle for the whole run; a server-side close must fail the
+  // next query, not crash the process through an unhandled client error.
+  client.on?.("error", ignoreLockedSessionError);
+  let lost = false;
   try {
     const acquired = await client.query<{ locked: boolean }>(
       "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
@@ -962,9 +966,15 @@ export async function withBodyRunLock<T>(
     try {
       return await fn();
     } finally {
-      await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]).catch(() => undefined);
+      try {
+        await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
+      } catch {
+        // The session is gone with its lock; never return it to the pool.
+        lost = true;
+      }
     }
   } finally {
-    client.release();
+    client.removeListener?.("error", ignoreLockedSessionError);
+    client.release(lost ? new Error("body run session lost") : undefined);
   }
 }
