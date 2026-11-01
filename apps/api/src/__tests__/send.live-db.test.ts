@@ -30,12 +30,21 @@ vi.mock("../smtp-client.js", async (importOriginal) => {
       password: "secret"
     })),
     SentFolderAppender: {
-      connect: vi.fn(async () => ({
-        list: mocks.appenderList,
-        append: mocks.appenderAppend,
-        logout: mocks.appenderLogout,
-        close: mocks.appenderClose
-      }))
+      over: vi.fn(() => ({ list: mocks.appenderList, append: mocks.appenderAppend }))
+    }
+  };
+});
+
+vi.mock("../imap-connect.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../imap-connect.js")>();
+  return {
+    ...actual,
+    // The send's one action connection, torn down through the shared teardown.
+    ActionConnection: class {
+      async get() { return { client: {}, abort: {} }; }
+      async close() {
+        await actual.closeImap({ logout: mocks.appenderLogout, close: mocks.appenderClose });
+      }
     }
   };
 });

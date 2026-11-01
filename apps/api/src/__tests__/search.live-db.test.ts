@@ -1,6 +1,7 @@
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { closePool, getPool } from "../db.js";
-import { deliveryKeys } from "../delivery-identity.js";
+import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL, deliveryKeys } from "../delivery-identity.js";
 import { buildSyncStatus, searchMessages } from "../search/index.js";
 
 const LIVE_DB_AVAILABLE = process.env.LIVE_DB_TESTS === "1" && Boolean(process.env.DATABASE_URL);
@@ -203,6 +204,121 @@ liveDb("search layer live DB", () => {
     const keys = await deliveryKeys(pool, [...ids, idByUid.get(1)!]);
     expect(keys.get(ids[0])).toBe(keys.get(ids[1]));
     expect(keys.get(idByUid.get(1)!)).not.toBe(keys.get(ids[0]));
+  });
+
+  it("keeps delivery fallback identities exact when a host looks up candidates", async () => {
+    const client = await pool.connect();
+    const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+    const rawDigest = sha256("complete raw MIME");
+    const providerKey = `provider:${sha256("test-provider\u001fmessage-1")}`;
+    const rfcKey = `rfc-body:${sha256(`copy@example.test\u001f${rawDigest}`)}`;
+    // null expected means a distinct physical delivery; equal expected keys are
+    // intentional copies. Message-ID alone, or an absent digest, cannot merge.
+    const cases = [
+      { namespace: "test-provider", provider: "message-1", rfc: "copy@example.test", raw: rawDigest, expected: providerKey },
+      { namespace: "test-provider", provider: "message-1", rfc: null, raw: undefined, expected: providerKey },
+      { namespace: null, provider: null, rfc: "copy@example.test", raw: rawDigest, expected: rfcKey },
+      { namespace: "", provider: "message-1", rfc: "copy@example.test", raw: rawDigest, expected: rfcKey },
+      { namespace: "test-provider", provider: "", rfc: "copy@example.test", raw: rawDigest, expected: rfcKey },
+      { namespace: null, provider: null, rfc: "copy@example.test", raw: null, expected: null },
+      { namespace: null, provider: null, rfc: "copy@example.test", raw: undefined, expected: null },
+      { namespace: null, provider: null, rfc: "", raw: rawDigest, expected: null },
+      { namespace: null, provider: null, rfc: null, raw: rawDigest, expected: null },
+      { namespace: null, provider: null, rfc: "copy@example.test", raw: sha256("different MIME"),
+        expected: `rfc-body:${sha256(`copy@example.test\u001f${sha256("different MIME")}`)}` }
+    ];
+    try {
+      await client.query("BEGIN");
+      const expected = new Map<string, string>();
+      for (const [index, fixture] of cases.entries()) {
+        const id = randomUUID();
+        await client.query(
+          `INSERT INTO public.imap_messages (id, account_id, folder_path, uidvalidity, uid,
+             internal_date, provider_message_id_namespace, provider_message_id, message_id_normalized)
+           VALUES ($1, $2, 'Identity', $3, $4, now(), $5, $6, $7)`,
+          [id, accountId, UIDVALIDITY, index + 1, fixture.namespace, fixture.provider, fixture.rfc]
+        );
+        if (fixture.raw !== undefined) {
+          await client.query(
+            "INSERT INTO public.imap_message_bodies (message_id, raw_bytes, raw_mime_sha256) VALUES ($1, 0, $2)",
+            [id, fixture.raw]
+          );
+        }
+        expected.set(id, fixture.expected ?? `physical:${id}`);
+      }
+      const ids = [...expected.keys()];
+      expect(await deliveryKeys(client, [...ids, ids[0], randomUUID()])).toEqual(expected);
+      expect(await deliveryKeys(client, [])).toEqual(new Map());
+      // Joined readers and host candidate lookups must keep one identity contract.
+      const joined = await client.query<{ id: string; delivery_key: string }>(
+        `SELECT m.id, ${DELIVERY_KEY_SQL} AS delivery_key FROM public.imap_messages m
+         ${ACTIVE_ASSIGNMENT_JOIN}
+         LEFT JOIN public.imap_message_bodies b ON b.message_id = m.id
+         WHERE m.id = ANY($1::uuid[])`, [ids]
+      );
+      expect(new Map(joined.rows.map((row) => [row.id, row.delivery_key]))).toEqual(expected);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+  });
+
+  it("uses the current active delivery assignment before provider or body identity", async () => {
+    const client = await pool.connect();
+    const ids = [randomUUID(), randomUUID()];
+    const runs = [randomUUID(), randomUUID()];
+    const activeKey = "a".repeat(64);
+    const nextKeys = ["b".repeat(64), "c".repeat(64)];
+    try {
+      await client.query("BEGIN");
+      for (const [index, id] of ids.entries()) {
+        await client.query(
+          `INSERT INTO public.imap_messages (id, account_id, folder_path, uidvalidity, uid,
+             internal_date, provider_message_id_namespace, provider_message_id, message_id_normalized)
+           VALUES ($1, $2, 'Active identity', $3, $4, now(), 'test-provider', $5, 'copy@example.test')`,
+          [id, accountId, UIDVALIDITY, index + 1, `message-${index}`]
+        );
+        await client.query(
+          "INSERT INTO public.imap_message_bodies (message_id, raw_bytes, raw_mime_sha256) VALUES ($1, 0, $2)",
+          [id, "d".repeat(64)]
+        );
+      }
+      const fallback = await deliveryKeys(client, ids);
+      expect(fallback.get(ids[0])).not.toBe(fallback.get(ids[1]));
+      for (const [index, run] of runs.entries()) {
+        await client.query(
+          `INSERT INTO public.imap_thread_runs (id, account_id, algorithm_version, mode, status,
+             stage, completed_at, activated_at)
+           VALUES ($1, $2, 3, 'initial', $3, 'ready', now(), now())`,
+          [run, accountId, index === 0 ? "active" : "standby"]
+        );
+        for (const [messageIndex, id] of ids.entries()) {
+          await client.query(
+            `INSERT INTO public.imap_thread_assignments (run_id, message_id, account_id, delivery_key,
+               conversation_id, assignment_method, confidence, algorithm_version, input_hash, generation)
+             VALUES ($1, $2, $3, $4, $5, 'standalone', 'high', 3, $6, 1)`,
+            [run, id, accountId, index === 0 ? activeKey : nextKeys[messageIndex],
+              `thread_${"a".repeat(32)}`, "e".repeat(64)]
+          );
+        }
+      }
+      await client.query(
+        `INSERT INTO public.imap_thread_state (account_id, active_run_id) VALUES ($1, $2)
+         ON CONFLICT (account_id) DO UPDATE SET active_run_id = EXCLUDED.active_run_id`,
+        [accountId, runs[0]]
+      );
+      expect(await deliveryKeys(client, ids)).toEqual(new Map(ids.map((id) => [id, activeKey])));
+      await client.query("UPDATE public.imap_thread_runs SET status = 'standby' WHERE id = $1", [runs[0]]);
+      await client.query("UPDATE public.imap_thread_runs SET status = 'active' WHERE id = $1", [runs[1]]);
+      await client.query("UPDATE public.imap_thread_state SET active_run_id = $1 WHERE account_id = $2", [runs[1], accountId]);
+      expect(await deliveryKeys(client, ids)).toEqual(new Map(ids.map((id, index) => [id, nextKeys[index]])));
+      // A state pointer alone does not make an inactive run authoritative.
+      await client.query("UPDATE public.imap_thread_runs SET status = 'standby' WHERE id = $1", [runs[1]]);
+      expect(await deliveryKeys(client, ids)).toEqual(fallback);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
   });
 
   it("resolves in: to the account's folders by path, last name or role", async () => {

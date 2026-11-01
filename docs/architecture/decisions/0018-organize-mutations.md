@@ -135,3 +135,4 @@ a folder now scans flags over the whole mirrored window, using the existing
 full-window scan path, deadline and batch budgets. `RECONCILE_INTERVAL_MS` (6 hours
 by default) bounds flag staleness on those servers. Servers with a modseq are
 unchanged: CONDSTORE deltas already cover every change. No new state or schedule.
+ADR 0044 later extends this scan to every server, since a modseq is only a hint.

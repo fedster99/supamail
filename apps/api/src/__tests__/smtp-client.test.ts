@@ -36,7 +36,8 @@ const imap = vi.hoisted(() => ({
   append: vi.fn(async (..._args: unknown[]) => ({ destination: "Drafts", uidValidity: 7n, uid: 42 }) as unknown),
   getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
   search: vi.fn(async (..._args: unknown[]) => [5, 9] as unknown),
-  mailbox: { uidValidity: 7n } as { uidValidity: bigint } | false
+  fetch: vi.fn(async function* (..._args: unknown[]): AsyncGenerator<{ uid: number; headers: Buffer }> {}),
+  mailbox: { uidValidity: 7n, exists: 0 } as { uidValidity: bigint; exists: number } | false
 }));
 const connectImap = vi.hoisted(() => vi.fn(async () => imap));
 
@@ -106,14 +107,31 @@ describe("SentFolderAppender identity", () => {
     await expect(appender.append("Drafts", Buffer.from("x"), ["\\Draft"])).resolves.toBeNull();
   });
 
-  it("returns the selected mailbox UIDVALIDITY with a Message-ID search", async () => {
+  it("falls back to a Message-ID search when no newest message carries it", async () => {
     const { SentFolderAppender } = await import("../smtp-client.js");
     const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
-    await expect(appender.searchByMessageId("Drafts", "<d@example.test>")).resolves.toEqual({ uids: [5, 9], uidValidity: 7 });
+    await expect(appender.findByMessageId("Drafts", "<d@example.test>")).resolves.toEqual({ uids: [5, 9], uidValidity: 7 });
     imap.mailbox = false;
-    await expect(appender.searchByMessageId("Drafts", "<d@example.test>")).rejects.toThrow(/no UIDVALIDITY/);
-    imap.mailbox = { uidValidity: 7n };
+    await expect(appender.findByMessageId("Drafts", "<d@example.test>")).rejects.toThrow(/no UIDVALIDITY/);
+    imap.mailbox = { uidValidity: 7n, exists: 0 };
   });
+
+  it("finds a fresh APPEND among the newest messages before SEARCH can see it", async () => {
+    const { SentFolderAppender } = await import("../smtp-client.js");
+    const appender = await SentFolderAppender.connect({} as never, {} as never, {} as never);
+    imap.mailbox = { uidValidity: 7n, exists: 120 };
+    imap.search.mockClear();
+    imap.fetch.mockImplementationOnce(async function* () {
+      yield { uid: 300, headers: Buffer.from("Message-ID: <other@example.test>\r\n") };
+      yield { uid: 301, headers: Buffer.from("Message-ID:\r\n <D@Example.test>\r\n") };
+    });
+    await expect(appender.findByMessageId("Drafts", "<d@example.test>")).resolves.toEqual({ uids: [301], uidValidity: 7 });
+    // The 50 newest by sequence number, read by UID, and no SEARCH.
+    expect(imap.fetch).toHaveBeenLastCalledWith("71:*", { uid: true, headers: ["message-id"] });
+    expect(imap.search).not.toHaveBeenCalled();
+    imap.mailbox = { uidValidity: 7n, exists: 0 };
+  });
+
 });
 
 describe("buildRawMime header denylist", () => {

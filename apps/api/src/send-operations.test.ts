@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  hashSendRequest, isValidIdempotencyKey, replaySendOperation, runSendOperation,
+  hashSendRequest, isValidIdempotencyKey, replayDraftSaveOperation, replaySendOperation,
+  runDraftSaveOperation, runSendOperation,
   sameSendOperation, SendOperationError,
   type SendOperation, type SendOperationIdentity, type SendOperationStatus,
   type SendOperationStore, type StoredSendError,
@@ -232,5 +233,59 @@ describe("durable send operations", () => {
   it("does not let diagnostics change the result", async () => {
     const args = setup();
     expect(await runSendOperation({ ...args, onTransition: () => { throw new Error("diagnostics failed"); } })).toEqual(receipt);
+  });
+});
+
+describe("durable draft saves", () => {
+  const draft = { operationKey: "draft-1", accountId: "mailbox-1", request: { subject: "Plan", body: "One" } };
+  function draftSetup() {
+    return { ...draft, store: new MemoryStore(), execute: vi.fn(async () => receipt) };
+  }
+
+  it("files once, then returns the recorded draft without filing again", async () => {
+    const args = draftSetup();
+    expect(await runDraftSaveOperation(args)).toEqual(receipt);
+    expect(await runDraftSaveOperation(args)).toEqual(receipt);
+    expect(args.execute).toHaveBeenCalledOnce();
+    expect(await replayDraftSaveOperation(args)).toEqual({ found: true, result: receipt });
+    expect(args.store.rows.get("draft-1")).toMatchObject({ action: "save_draft", status: "succeeded", rfcMessageId: null });
+  });
+
+  it("rejects the key with a changed request, mailbox, or action", async () => {
+    const args = draftSetup();
+    await runDraftSaveOperation(args);
+    const changed = { ...args, request: { subject: "Plan", body: "Two" } };
+    await expect(runDraftSaveOperation(changed)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(replayDraftSaveOperation(changed)).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(runDraftSaveOperation({ ...args, accountId: "mailbox-2" })).rejects.toMatchObject({ code: "idempotency_conflict" });
+    const send = setup();
+    await runSendOperation({ ...send, operationKey: "shared" });
+    await expect(runDraftSaveOperation({ ...args, store: send.store, operationKey: "shared" }))
+      .rejects.toMatchObject({ code: "idempotency_conflict" });
+    expect(args.execute).toHaveBeenCalledOnce();
+  });
+
+  it("runs an attempt that recorded no result again", async () => {
+    const args = draftSetup();
+    args.execute.mockRejectedValueOnce(new Error("connection lost after APPEND"));
+    await expect(runDraftSaveOperation(args)).rejects.toThrow(/connection lost/);
+    expect(await replayDraftSaveOperation(args)).toEqual({ found: false });
+    expect(await runDraftSaveOperation(args)).toEqual(receipt);
+    expect(args.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns the provider result when recording it fails", async () => {
+    const args = draftSetup();
+    vi.spyOn(args.store, "finish").mockImplementationOnce(unavailable);
+    expect(await runDraftSaveOperation(args)).toEqual(receipt);
+  });
+
+  it("rejects an invalid key before storage or provider work", async () => {
+    const args = draftSetup();
+    const start = vi.spyOn(args.store, "start");
+    await expect(runDraftSaveOperation({ ...args, operationKey: " " })).rejects.toMatchObject({ code: "idempotency_required" });
+    await expect(replayDraftSaveOperation({ ...args, operationKey: "" })).rejects.toMatchObject({ code: "idempotency_required" });
+    expect(start).not.toHaveBeenCalled();
+    expect(args.execute).not.toHaveBeenCalled();
   });
 });
