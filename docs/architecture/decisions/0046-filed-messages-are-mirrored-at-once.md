@@ -34,20 +34,24 @@ and a draft send.
   `fetchMessageMetadata`, and writes it through sync's `upsertMessages`. The row
   has the server's flags, BODYSTRUCTURE, attachment rows and provider ids. The
   composed-metadata row of ADR 0033 is removed.
-- **The body is the filed bytes.** The action already holds the exact bytes it
+- **The body is the server's bytes.** The action already holds the exact bytes it
   filed. When the server reports exactly that many bytes, under
   `BODY_RAW_MAX_BYTES` and the body lane's 4 MiB batch bound, the action parses
   them and stores the body in the body lane's order: evidence, the host's
-  `BodyStore`, then `completeBodyStorage`. A larger body, or another byte count,
-  is left to the body lane, which streams it on a worker rather than in the
-  request. No stored body is fetched again.
+  `BodyStore`, then `completeBodyStorage`. When the server reports another byte
+  count for a message under those bounds (iCloud appends a line break on
+  APPEND: a 477-byte message is stored as 479, found in production on
+  2026-11-02), the action fetches that one message on its own connection and
+  stores the server's bytes, so a stored body is always what the server holds.
+  A larger body is left to the body lane, which streams it on a worker rather
+  than in the request. No stored body is fetched again.
   `buildRawMime` writes every line break as CRLF (RFC 5322), as servers store
   a filed message; with bare LF breaks a multi-line body never matched the
   server's byte count (found in production on 2026-10-28: 4 of 5 drafts).
 - **Keyed retries.** A keyed save that finds an earlier attempt's copy returns its
-  live row id. When that copy has no row yet, the retry mirrors the row only: the
-  earlier attempt's bytes may differ from this one's, so its body is left to the
-  body lane.
+  live row id. When that copy has no row yet, the retry mirrors the row and,
+  because the earlier attempt's bytes may differ from this one's, stores the
+  body from the server's bytes, as above.
 - **The host's body store.** `MailboxActionOptions.bodyStore` takes the store the
   host gives sync; without one the action uses the OSS database store, as sync
   does. Sync hooks do not run; they belong to sync.

@@ -27,11 +27,16 @@ async function fixture(text = "The filed bytes.") {
         envelope: { subject: "Server subject", messageId: "<server@example.test>" },
         headers: Buffer.from("Message-ID: <server@example.test>\r\n\r\n"),
         bodyStructure: { type: "text/plain", part: "1" } };
-    })
+    }),
+    download: vi.fn(async () => ({
+      content: (async function* () { yield Buffer.concat([raw, Buffer.from("\r\n")]); })()
+    }))
   };
   const repository = {
     getFoldersForWake: vi.fn(async (): Promise<unknown[]> => [folder]),
-    upsertMessages: vi.fn(async () => [{ id: rowId, body_fetched_at: null as Date | null, headers_json: {} }]),
+    upsertMessages: vi.fn(async () => [{ id: rowId, body_fetched_at: null as Date | null, headers_json: {},
+      account_id: account.id, folder_path: "Sent", uidvalidity: "100", uid: "7", size_bytes: String(server.size),
+      mime_structure: { type: "text/plain", part: "1" } }]),
     storeBodyEvidence: vi.fn(async () => {}),
     completeBodyStorage: vi.fn(async () => {})
   };
@@ -70,17 +75,30 @@ it("never writes a row without matching tracked and provider folder identities",
   expect(f.repository.upsertMessages).not.toHaveBeenCalled();
 });
 
-it("keeps the row but leaves unsafe or already stored bodies alone", async () => {
-  for (const reason of ["size changed", "at cap", "already stored", "no filed bytes", "over batch bound"]) {
+it("keeps the row but leaves large or already stored bodies alone", async () => {
+  for (const reason of ["at cap", "already stored", "over batch bound"]) {
     const f = reason === "over batch bound" ? await fixture("x".repeat(4 * 1024 * 1024)) : await fixture();
-    if (reason === "size changed") f.server.size++;
     if (reason === "already stored") {
-      f.repository.upsertMessages.mockResolvedValue([{ id: rowId, body_fetched_at: new Date(), headers_json: {} }]);
+      f.repository.upsertMessages.mockResolvedValue([{ ...(await f.repository.upsertMessages())[0], body_fetched_at: new Date() }]);
     }
-    expect(await f.mirror(reason === "at cap" ? { ...config, BODY_RAW_MAX_BYTES: f.raw.length } : config,
-      reason === "no filed bytes" ? null : f.raw)).toBe(rowId);
+    expect(await f.mirror(reason === "at cap" ? { ...config, BODY_RAW_MAX_BYTES: f.raw.length } : config)).toBe(rowId);
     expect(f.store.store).not.toHaveBeenCalled();
     expect(f.repository.completeBodyStorage).not.toHaveBeenCalled();
+    expect(f.client.download).not.toHaveBeenCalled();
+  }
+});
+
+it("stores the server's bytes when they differ from the filed ones or none were filed", async () => {
+  // iCloud appends a line break on APPEND, so the server holds two more bytes.
+  for (const reason of ["size changed", "no filed bytes"]) {
+    const f = await fixture();
+    if (reason === "size changed") f.server.size += 2;
+    expect(await f.mirror(config, reason === "no filed bytes" ? null : f.raw)).toBe(rowId);
+    expect(f.client.download).toHaveBeenCalledTimes(1);
+    expect(f.repository.storeBodyEvidence).toHaveBeenCalledTimes(1);
+    expect(f.store.store).toHaveBeenCalledTimes(1);
+    expect(f.repository.completeBodyStorage).toHaveBeenCalledWith(rowId);
+    expect(f.warn).not.toHaveBeenCalled();
   }
 });
 

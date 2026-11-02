@@ -1,6 +1,6 @@
 import { DatabaseBodyStore, type BodyStore } from "./body-store.js";
 import type { AppConfig } from "./config.js";
-import { fetchMessageMetadata, filedMessageBody, ThrottledImapClient } from "./imap-client.js";
+import { fetchFullMessageBody, fetchMessageMetadata, filedMessageBody, ThrottledImapClient } from "./imap-client.js";
 import { uidValidityMatches, type ActionConnection, type ActionSocket } from "./imap-connect.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import type { MirrorRepository } from "./repository.js";
@@ -30,9 +30,10 @@ export interface FiledMessage {
  * Mirror a message this action just filed, as sync would (ADR 0046). The server's
  * APPENDUID names it, so nothing is guessed: read that one UID's metadata on the
  * action's own connection, write the row through sync's upsert, then store the
- * body from the filed bytes when the server holds exactly that many bytes. A body
- * over the body lane's batch bound (4 MiB) is left to the body lane, which streams
- * it on a worker instead of the request.
+ * body: from the filed bytes when the server holds exactly that many bytes,
+ * otherwise from the server itself. A body over the body lane's batch bound
+ * (4 MiB) is left to the body lane, which streams it on a worker instead of the
+ * request.
  *
  * Only a tracked folder that sync already read at the APPENDUID's UIDVALIDITY
  * qualifies; otherwise this returns null and the next sync mirrors the message.
@@ -74,10 +75,18 @@ export async function mirrorFiledMessage(
   const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], { deadlineAt });
   if (!row) throw new Error("the mirror write returned no row");
   const raw = filed.raw;
-  if (raw && !row.body_fetched_at && metadata.sizeBytes === raw.length
-    && raw.length < config.BODY_RAW_MAX_BYTES && raw.length <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES) {
+  const small = metadata.sizeBytes > 0
+    && metadata.sizeBytes < config.BODY_RAW_MAX_BYTES
+    && metadata.sizeBytes <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES;
+  if (!row.body_fetched_at && small) {
     try {
-      const body = await filedMessageBody(config, row, raw, metadata.mimeStructure);
+      // The stored body is always the server's bytes: the filed bytes when the
+      // server holds exactly them, otherwise one small FETCH on this connection
+      // (a server may add a trailing line break on APPEND, as iCloud does, and
+      // a keyed retry may hold other bytes than the copy it found).
+      const body = raw && metadata.sizeBytes === raw.length
+        ? await filedMessageBody(config, row, raw, metadata.mimeStructure)
+        : await socket.abort.run(() => fetchFullMessageBody(client, config, row));
       await repository.storeBodyEvidence(body);
       await bodyStore.store(body);
       await repository.completeBodyStorage(row.id);
