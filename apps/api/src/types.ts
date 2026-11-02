@@ -161,7 +161,7 @@ export interface ImapFolder {
   updated_at: Date;
 }
 
-export type HistoryBacklogReason = "snapshot" | "metadata" | "body";
+export type HistoryBacklogReason = "snapshot" | "metadata";
 
 export type HistoryBacklogFolder = ImapFolder & {
   history_backlog_reason: HistoryBacklogReason;
@@ -313,7 +313,6 @@ export interface SyncResult {
   metadataWriteBatchesFailed?: number;
   /** Acknowledged records per cumulative metadata-write service second; null when no batch ran. */
   metadataWriteServiceRowsPerSecond?: number | null;
-  bodiesFetched: number;
   flagsUpdated: number;
   reconcileGapsFound: number;
   reconcileFoldersAttempted?: number;
@@ -321,6 +320,25 @@ export interface SyncResult {
   reconcileDurationMs?: number;
   hitLockBudget: boolean;
   errors: string[];
+}
+
+/** One `syncBodies` run: bodies download beside the account lock (ADR 0049). */
+export interface BodySyncResult {
+  /** Bodies stored and marked complete. */
+  committed: number;
+  /** Rows the provider no longer holds at the downloaded UID, now tombstoned. */
+  gone: number;
+  /** Downloaded rows another writer deleted or reset before the commit. */
+  skipped: number;
+  /** Eligible bodies may remain: the run stopped at its message limit, its time budget, a busy lock, another run, a moved row, or an error. */
+  remaining: boolean;
+}
+
+/** One scheduled account: its sync pass, then its body run beside the lock. */
+export interface ScheduledSyncResult extends SyncResult {
+  bodies: BodySyncResult | null;
+  /** The sanitized reason a body run failed; the next tick retries. */
+  bodyError: string | null;
 }
 
 export interface MirrorHooks {

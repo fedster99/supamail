@@ -2,17 +2,314 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
-  bodyBacklogReadLimit,
+  BodyDownloadTimeoutError,
+  BodySyncError,
   isConnectionLostError,
   isMissingMailboxError,
   MirrorEngine
 } from "../sync-engine.js";
+import { AccountBusyError, InvalidInputError } from "../errors.js";
+import { BodySourceChangedError, ImapConnectionClosedError } from "../imap-client.js";
 
 describe("sync engine safety", () => {
-  it("combines only whole configured body batches under the 500-row read cap", () => {
-    expect(bodyBacklogReadLimit(10, 4)).toBe(40);
-    expect(bodyBacklogReadLimit(200, 3)).toBe(400);
-    expect(bodyBacklogReadLimit(500, 3)).toBe(500);
+  describe("syncBodies beside the lock (ADR 0049)", () => {
+    const message = {
+      id: "message-1",
+      account_id: "account-1",
+      folder_path: "INBOX",
+      uidvalidity: "7",
+      uid: "5",
+      size_bytes: "81920",
+      mime_structure: { type: "text/plain" }
+    };
+
+    /** A pool whose only job is the body-run lock: every try-lock succeeds. */
+    function bodyRunLockPool() {
+      return {
+        connect: vi.fn(async () => ({
+          query: vi.fn(async () => ({ rows: [{ locked: true }] })),
+          release: vi.fn()
+        }))
+      };
+    }
+
+    function bodyEngine(options: {
+      client: Record<string, unknown>;
+      account?: Record<string, unknown>;
+      config?: Record<string, unknown>;
+    }) {
+      const repository = {
+        getAccount: vi.fn(async () => ({
+          id: "account-1",
+          lock_id: "42",
+          sync_state: "HEALTHY",
+          historical_backfill_mode: "off",
+          ...options.account
+        })),
+        getBodyBacklog: vi.fn(async (_account: unknown, _limit: number, backlog: { includeArchive?: boolean; excludeIds?: string[] }) =>
+          backlog.excludeIds?.includes(message.id) ? [] : [message]),
+        storeBodyEvidence: vi.fn(async () => undefined)
+      };
+      const engine = new MirrorEngine({
+        pool: bodyRunLockPool() as never,
+        config: {
+          BODY_STORAGE_MODE: "raw_mime",
+          BODY_RAW_MAX_BYTES: 1_000_000,
+          BODY_BACKFILL_BATCH_SIZE: 10,
+          MAX_BODY_BATCHES_PER_TICK: 4,
+          MAX_LOCK_HOLD_MS: 600_000,
+          ...options.config
+        } as never,
+        repository: repository as never,
+        clientFactory: async () => options.client as never
+      });
+      return { engine, repository };
+    }
+
+    /** A trickling provider: the FETCH ends only when the socket closes. */
+    function tricklingClient() {
+      let rejectFetch: (error: Error) => void = () => undefined;
+      const client = {
+        usable: true,
+        mailbox: { path: "INBOX", uidValidity: 7 } as Record<string, unknown> | false,
+        invalidateSelection: vi.fn(),
+        getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+        fetchOne: vi.fn(() => new Promise((_, reject) => { rejectFetch = reject; })),
+        close: vi.fn(() => {
+          client.usable = false;
+          client.mailbox = false;
+          rejectFetch(new Error("Connection closed"));
+        }),
+        logout: vi.fn(async () => undefined)
+      };
+      return client;
+    }
+
+    it("closes only the body connection at the deadline and backs the message off, doubling", async () => {
+      // The MIME parser schedules with setImmediate, which must stay real.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        const client = tricklingClient();
+        const { engine, repository } = bodyEngine({ client });
+        const own = { openClient: async () => client as never, clientAccountId: "account-1" };
+
+        const run = engine.syncBodies("account-1", own);
+        const settled = run.then(() => { throw new Error("resolved"); }, (error: unknown) => error);
+        // 60 s plus 8 KiB/s of the declared 80 KiB.
+        await vi.advanceTimersByTimeAsync(69_999);
+        expect(client.close).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        const error = await settled;
+        // The run reports what it stored beside the cause.
+        expect(error).toBeInstanceOf(BodySyncError);
+        expect((error as BodySyncError).cause).toBeInstanceOf(BodyDownloadTimeoutError);
+        expect((error as BodySyncError).result).toEqual({ committed: 0, gone: 0, skipped: 0, remaining: true });
+        expect(client.close).toHaveBeenCalledTimes(1);
+        expect(client.invalidateSelection).toHaveBeenCalledTimes(1);
+        // A host-owned session is never logged out, and nothing was written.
+        expect(client.logout).not.toHaveBeenCalled();
+        expect(repository.storeBodyEvidence).not.toHaveBeenCalled();
+
+        // The next run skips the message for 1 min and opens no connection.
+        expect(await engine.syncBodies("account-1", own))
+          .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+        expect(repository.getBodyBacklog.mock.calls[1][2]).toEqual({ excludeIds: [message.id] });
+
+        // After 1 min it is retried; a second failure backs it off for 2 min.
+        const retry = tricklingClient();
+        await vi.advanceTimersByTimeAsync(60_000);
+        const retried = engine.syncBodies("account-1", { openClient: async () => retry as never, clientAccountId: "account-1" });
+        const retriedSettled = expect(retried).rejects.toSatisfy((error: unknown) => (error as BodySyncError).cause instanceof BodyDownloadTimeoutError);
+        await vi.advanceTimersByTimeAsync(70_000);
+        await retriedSettled;
+        await vi.advanceTimersByTimeAsync(110_000);
+        expect((await engine.syncBodies("account-1", own)).committed).toBe(0);
+        expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [message.id] });
+        await vi.advanceTimersByTimeAsync(20_000);
+        const third = tricklingClient();
+        const thirdRun = engine.syncBodies("account-1", { openClient: async () => third as never, clientAccountId: "account-1" });
+        const thirdSettled = expect(thirdRun).rejects.toSatisfy((error: unknown) => (error as BodySyncError).cause instanceof BodyDownloadTimeoutError);
+        await vi.waitFor(() => expect(third.fetchOne).toHaveBeenCalled());
+        await vi.advanceTimersByTimeAsync(70_000);
+        await thirdSettled;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("never commits a stream that the deadline cut off between chunks", async () => {
+      // The MIME parser schedules with setImmediate, which must stay real.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        let endStream: () => void = () => undefined;
+        const client = {
+          usable: true,
+          mailbox: { path: "INBOX", uidValidity: 7 } as Record<string, unknown> | false,
+          getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+          fetchOne: vi.fn(async () => ({ uid: 5, bodyStructure: { type: "text/plain" }, size: 81_920 })),
+          // ImapFlow ends the chunk stream quietly once its connection closes.
+          download: vi.fn(async () => ({
+            content: (async function* () {
+              yield Buffer.from("Subject: cut\r\n\r\npartial");
+              await new Promise<void>((resolve) => { endStream = resolve; });
+            })()
+          })),
+          close: vi.fn(() => {
+            client.usable = false;
+            client.mailbox = false;
+            endStream();
+          }),
+          logout: vi.fn(async () => undefined)
+        };
+        const { engine, repository } = bodyEngine({ client, config: { BODY_STORAGE_MODE: "parsed_only" } });
+        const run = engine.syncBodies("account-1");
+        const settled = run.then(() => { throw new Error("resolved"); }, (error: unknown) => error);
+        await vi.advanceTimersByTimeAsync(70_000);
+        expect(((await settled) as BodySyncError).cause).toBeInstanceOf(BodyDownloadTimeoutError);
+        expect(repository.storeBodyEvidence).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("closes the body connection on shutdown and backs nothing off", async () => {
+      const client = tricklingClient();
+      const { engine, repository } = bodyEngine({ client });
+      const abort = new AbortController();
+      const run = engine.syncBodies("account-1", { signal: abort.signal });
+      await vi.waitFor(() => expect(client.fetchOne).toHaveBeenCalled());
+      abort.abort();
+      await expect(run).rejects.toThrow();
+      expect(client.close).toHaveBeenCalled();
+      expect(repository.storeBodyEvidence).not.toHaveBeenCalled();
+      await engine.syncBodies("account-1", { signal: new AbortController().signal }).catch(() => undefined);
+      expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [] });
+    });
+
+    /** A provider that answers every body FETCH at once. */
+    function promptClient(bodies: Record<string, string> = { "5": "hello" }) {
+      const client = {
+        usable: true,
+        mailbox: { path: "INBOX", uidValidity: 7 } as Record<string, unknown> | false,
+        invalidateSelection: vi.fn(),
+        getMailboxLock: vi.fn(async () => ({ release: () => undefined })),
+        fetchOne: vi.fn(async (uid: string) => ({ uid: Number(uid), source: Buffer.from(bodies[uid] ?? "") })),
+        close: vi.fn(() => { client.usable = false; }),
+        logout: vi.fn(async () => undefined)
+      };
+      return client;
+    }
+
+    it("ends the run without backing anything off when the commit finds the lock busy", async () => {
+      const { engine, repository } = bodyEngine({ client: promptClient() });
+      const busy = vi.spyOn(engine as never, "commitBodies" as never)
+        .mockRejectedValue(new AccountBusyError("busy"));
+      expect(await engine.syncBodies("account-1")).toEqual({ committed: 0, gone: 0, skipped: 0, remaining: true });
+      busy.mockRestore();
+      expect(repository.getBodyBacklog.mock.lastCall?.[2]).toMatchObject({ excludeIds: [] });
+    });
+
+    it("leaves a reset folder's bodies to metadata sync and goes on with the backlog", async () => {
+      const second = { ...message, id: "message-2", uid: "6" };
+      const { engine, repository } = bodyEngine({ client: promptClient() });
+      repository.getBodyBacklog.mockImplementation(async (_account: unknown, _limit: number, backlog: { includeArchive?: boolean; excludeIds?: string[] }) =>
+        [message, second].filter((row) => !backlog.excludeIds?.includes(row.id)));
+      const download = vi.spyOn(engine as never, "downloadBodyUnit" as never)
+        .mockRejectedValueOnce(new BodySourceChangedError("INBOX"))
+        .mockResolvedValue({ batches: [], single: [], gone: [] } as never);
+      vi.spyOn(engine as never, "commitBodies" as never).mockResolvedValue({ committed: 0, gone: 0, skipped: 0, stillDue: 0 } as never);
+      // The reset row is backed off and stays due, so bodies remain.
+      expect(await engine.syncBodies("account-1", { maxMessages: 2 })).toMatchObject({ remaining: true });
+      // The next unit was the other row.
+      expect(download).toHaveBeenCalledTimes(2);
+      expect((download.mock.calls[1] as unknown[])[1]).toEqual([second]);
+    });
+
+    it("downloads a failed unit's messages alone next time, so one bad message blocks no other", async () => {
+      const rows = Array.from({ length: 3 }, (_, index) => ({
+        ...message, id: `message-${index + 1}`, uid: String(index + 1)
+      }));
+      const { engine, repository } = bodyEngine({
+        client: promptClient(),
+        config: { BODY_STORAGE_MODE: "parsed_only", BODY_BACKFILL_BATCH_SIZE: 3 }
+      });
+      repository.getBodyBacklog.mockImplementation(async (_account: unknown, _limit: number, backlog: { includeArchive?: boolean; excludeIds?: string[] }) =>
+        rows.filter((row) => !backlog.excludeIds?.includes(row.id)));
+      const download = vi.spyOn(engine as never, "downloadBodyUnit" as never)
+        .mockRejectedValueOnce(new Error("one message of the three timed out"))
+        .mockResolvedValue({ batches: [], single: [], gone: [] } as never);
+      vi.spyOn(engine as never, "commitBodies" as never).mockResolvedValue({ committed: 0, gone: 0, skipped: 0, stillDue: 0 } as never);
+
+      // The whole 3-message unit fails and is backed off together.
+      await expect(engine.syncBodies("account-1")).rejects.toBeInstanceOf(BodySyncError);
+      expect((download.mock.calls[0] as unknown[])[1]).toHaveLength(3);
+      // Once its delay passes, each of those messages downloads on its own.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(Date.now() + 61_000);
+        await engine.syncBodies("account-1", { maxMessages: 3 });
+      } finally {
+        vi.useRealTimers();
+      }
+      const units = download.mock.calls.slice(1).map((call) => (call as unknown[])[1] as unknown[]);
+      expect(units.map((unit) => unit.length)).toEqual([1, 1, 1]);
+    });
+
+    it("rejects the retired bodyBacklogOnly option with a typed error", async () => {
+      const { engine } = bodyEngine({ client: promptClient() });
+      await expect(engine.syncAccount("account-1", "manual", { bodyBacklogOnly: true } as never))
+        .rejects.toBeInstanceOf(InvalidInputError);
+    });
+
+    it("treats a command on a closed connection as a lost connection", () => {
+      expect(isConnectionLostError(new ImapConnectionClosedError("FETCH"))).toBe(true);
+    });
+
+    it("opens a host session only once a body is due", async () => {
+      const { engine, repository } = bodyEngine({ client: tricklingClient() });
+      repository.getBodyBacklog.mockResolvedValue([]);
+      const openClient = vi.fn(async () => tricklingClient() as never);
+      expect(await engine.syncBodies("account-1", { openClient, clientAccountId: "account-1" }))
+        .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+      expect(openClient).not.toHaveBeenCalled();
+    });
+
+    it("refuses a host-owned client that names another Mailbox Account", async () => {
+      const { engine, repository } = bodyEngine({ client: tricklingClient() });
+      await expect(engine.syncBodies("account-1", { openClient: async () => ({}) as never }))
+        .rejects.toThrow("Host-owned client does not match the Mailbox Account");
+      await expect(engine.syncBodies("account-1", { openClient: async () => ({}) as never, clientAccountId: "account-2" }))
+        .rejects.toThrow("Host-owned client does not match the Mailbox Account");
+      expect(repository.getAccount).not.toHaveBeenCalled();
+    });
+
+    it.each(["PAUSED", "BROKEN"])("downloads nothing for a %s account", async (state) => {
+      const client = tricklingClient();
+      const { engine, repository } = bodyEngine({ client, account: { sync_state: state } });
+      expect(await engine.syncBodies("account-1"))
+        .toEqual({ committed: 0, gone: 0, skipped: 0, remaining: false });
+      expect(repository.getBodyBacklog).not.toHaveBeenCalled();
+    });
+
+    it("adds archive bodies only in metadata_and_bodies mode inside the backfill window", async () => {
+      const outside = new Date().getUTCHours();
+      const cases = [
+        [{ historical_backfill_mode: "metadata_and_bodies" }, {}, true],
+        [{ historical_backfill_mode: "metadata_only" }, {}, false],
+        [{ historical_backfill_mode: "metadata_and_bodies" }, {
+          BACKFILL_WINDOW_START_HOUR: (outside + 1) % 24,
+          BACKFILL_WINDOW_END_HOUR: (outside + 2) % 24,
+          BACKFILL_WINDOW_TIMEZONE: "UTC"
+        }, false]
+      ] as const;
+      for (const [account, config, includeArchive] of cases) {
+        const { engine, repository } = bodyEngine({ client: tricklingClient(), account, config });
+        repository.getBodyBacklog.mockResolvedValue([]);
+        await engine.syncBodies("account-1");
+        // Live rows are read first; the archive arm is read only when it applies.
+        expect(repository.getBodyBacklog.mock.calls.some((call) => call[2].includeArchive === true)).toBe(includeArchive);
+      }
+    });
   });
 
   it("records no run when account-lock acquisition throws", async () => {
@@ -45,7 +342,11 @@ describe("sync engine safety", () => {
     ["a live pass", { liveInboxOnly: true }]
   ])("defers %s while another session holds the account lock, recording nothing", async (_name, options) => {
     const client = {
-      query: vi.fn(async () => ({ rows: [{ locked: false }] })),
+      // A try-lock answers false; a waited lock ends in the statement timeout.
+      query: vi.fn(async (text: string) => {
+        if (text.includes("pg_advisory_lock(")) throw Object.assign(new Error("canceling statement"), { code: "57014" });
+        return { rows: [{ locked: false }] };
+      }),
       release: vi.fn()
     };
     const repository = {
@@ -127,13 +428,10 @@ describe("sync engine safety", () => {
   it("handles a moved-out body-fetch UID with a recoverable tombstone instead of bricking the account", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    // A UID gone from its folder at body-fetch time must be caught as a benign
-    // MessageMovedError and taken out of the backlog — NOT re-thrown into the
-    // account-level catch, which bricks the account to BROKEN and re-loops every
-    // backfill. The tombstone is the same in every lane and recoverable: the
-    // next reconcile revives a UID that is still listed.
+    // A UID gone from its folder at body-fetch time is a benign MessageMovedError.
+    // The commit tombstones the row only while it is still at that UID, so a
+    // confirmed move keeps it live; the next reconcile revives a UID still listed.
     expect(source).toContain("error instanceof MessageMovedError");
-    expect(source).toContain("markMessageGone(message.id)");
   });
 
   it("commits the search extract and threading evidence before handing off the body payload", async () => {
@@ -147,10 +445,7 @@ describe("sync engine safety", () => {
     expect(completionWrite).toBeGreaterThan(payloadWrite);
 
     const batchEvidenceWrite = source.indexOf("await this.repository.storeBodyEvidenceBatch(");
-    const batchPayloadWrite = source.indexOf(
-      "await this.commitBodyPayload(message, body)",
-      batchEvidenceWrite
-    );
+    const batchPayloadWrite = source.indexOf("await this.bodyStore.store(body)", batchEvidenceWrite);
     expect(batchEvidenceWrite).toBeGreaterThan(-1);
     expect(batchPayloadWrite).toBeGreaterThan(batchEvidenceWrite);
   });
@@ -295,12 +590,8 @@ describe("sync engine safety", () => {
 
     expect(source).toContain("isConnectionLostError(error)");
     expect(source).toContain("connectionLost = true");
-    // Both the body backlog and the history lane stop once the client is dead.
-    // The live metadata wake skips bodies; its dedicated body follow-up skips history.
-    expect(source).toContain(
-      "} else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {"
-    );
-    expect(source).toContain("&& !options.bodyBacklogOnly");
+    // The history lane stops once the client is dead; the live wake skips it.
+    expect(source).toMatch(/else if \(!options\.sentOnly\s*&& !options\.liveInboxOnly\s*&& !connectionLost\) \{/);
   });
 
   it("enforces the UIDVALIDITY reset cap (spec §11)", async () => {
@@ -357,12 +648,13 @@ describe("sync engine safety", () => {
     expect(source).toContain("reconcile UID SEARCH");
   });
 
-  it("runs history after the hot and body lanes under the same lock budget", async () => {
+  it("runs history after the hot lane and fetches bodies only beside the lock", async () => {
     const source = await readFile(resolve(process.cwd(), "src/sync-engine.ts"), "utf8");
 
-    expect(source.indexOf("getFoldersDueForSync")).toBeLessThan(source.indexOf("fetchBodyBacklog"));
-    expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
-    expect(source).toContain("account.max_backfill_rate");
+    expect(source.indexOf("getFoldersDueForSync")).toBeLessThan(source.indexOf("runHistoryLane"));
+    // ADR 0049: one body path, downloaded beside the lock and committed under it.
+    expect(source.match(/fetchFullMessageBody\(/g)).toHaveLength(1);
+    expect(source.match(/fetchFullMessageBodyBatch\(/g)).toHaveLength(1);
     expect(source).toContain("getHistoryBacklog(account, 1)");
     expect(source).toContain("setHistoryBackfillSnapshot");
     expect(source).toContain("advanceHistoryBackfillWatermark");
@@ -376,7 +668,6 @@ describe("sync engine safety", () => {
     expect(config).toContain("BACKFILL_WINDOW_END_HOUR");
     expect(config).toContain("BACKFILL_WINDOW_TIMEZONE");
     expect(source).toContain("isWithinBackfillWindow(this.config)");
-    expect(source.indexOf("fetchBodyBacklog")).toBeLessThan(source.indexOf("runHistoryLane"));
     expect(source.indexOf("isWithinBackfillWindow(this.config)")).toBeLessThan(source.indexOf("getHistoryBacklog(account, 1)"));
   });
 });

@@ -939,3 +939,42 @@ async function clearOrphanedLocksWithTakeover(
     return { terminatedBackends: 0, accountsReset: 0, runsClosed: 0 };
   }
 }
+
+/**
+ * One body run per Mailbox Account at a time (ADR 0049). A try-lock on a key of
+ * its own, held by one session for the whole run, so two runs never download and
+ * store the same bodies; it authorizes no mirror write, which the account lock
+ * still fences. Returns `null` when a run already holds it.
+ */
+export async function withBodyRunLock<T>(
+  pool: PgPool,
+  accountId: string,
+  fn: () => Promise<T>
+): Promise<T | null> {
+  const client = await pool.connect();
+  const key = `supamail.bodies:${accountId}`;
+  // The session sits idle for the whole run; a server-side close must fail the
+  // next query, not crash the process through an unhandled client error.
+  client.on?.("error", ignoreLockedSessionError);
+  let lost = false;
+  try {
+    const acquired = await client.query<{ locked: boolean }>(
+      "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+      [key]
+    );
+    if (!acquired.rows[0]?.locked) return null;
+    try {
+      return await fn();
+    } finally {
+      try {
+        await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
+      } catch {
+        // The session is gone with its lock; never return it to the pool.
+        lost = true;
+      }
+    }
+  } finally {
+    client.removeListener?.("error", ignoreLockedSessionError);
+    client.release(lost ? new Error("body run session lost") : undefined);
+  }
+}

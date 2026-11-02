@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../config.js";
 import {
+  ImapConnectionClosedError,
   fetchFullMessageBody,
   fetchFullMessageBodyBatch,
   fetchChangedMessageFlags,
@@ -117,6 +118,31 @@ describe("fetchMessageMetadata", () => {
     expect(source).toContain("withCommandTimeout");
     expect(source).toContain("IMAP_COMMAND_TIMEOUT_MS exceeded");
     expect(source).toContain("this.client.close()");
+  });
+
+  it("refuses a body command on a closed connection instead of reading it as a gone message", async () => {
+    // ImapFlow answers fetchOne and download on a closed connection with an
+    // empty result, which a body fetch would otherwise read as a gone UID.
+    const rawClient = Object.assign(new EventEmitter(), {
+      mailbox: false,
+      usable: false,
+      capabilities: new Map<string, boolean | number>(),
+      close: vi.fn(() => undefined),
+      fetchOne: vi.fn(async () => undefined),
+      download: vi.fn(async () => ({})),
+      fetch: vi.fn()
+    });
+    const client = new ThrottledImapClient(rawClient as never, 60, 1_000);
+    await expect(client.fetchOne("5", { source: true }, { uid: true }))
+      .rejects.toBeInstanceOf(ImapConnectionClosedError);
+    await expect(client.download("5", undefined, { uid: true }))
+      .rejects.toBeInstanceOf(ImapConnectionClosedError);
+    await expect((async () => {
+      for await (const _ of client.fetch([5], { source: true }, { uid: true })) break;
+    })()).rejects.toBeInstanceOf(ImapConnectionClosedError);
+    expect(rawClient.fetchOne).not.toHaveBeenCalled();
+    expect(rawClient.download).not.toHaveBeenCalled();
+    expect(rawClient.fetch).not.toHaveBeenCalled();
   });
 
   it("marks a command-timed-out client unusable", async () => {
@@ -363,39 +389,6 @@ describe("fetchFullMessageBody mailbox locking", () => {
 
     expect(individual.rawTruncated).toBe(false);
     expect(batch.bodies.map(({ body }) => body.rawTruncated)).toEqual([false, false]);
-  });
-
-  it("reuses the selected mailbox without re-locking when skipMailboxLock is set (no nested-lock deadlock)", async () => {
-    const client = notesClient();
-    await client.getMailboxLock("INBOX.Notes"); // caller already holds the lock
-    const locks = countLocks(client);
-    const body = await fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true });
-    expect(locks()).toBe(0);
-    expect(body.messageId).toBe("m1");
-    expect(body.rawBytes).toBeGreaterThan(0);
-  });
-
-  it("throws when skipMailboxLock is set but the wrong folder is selected", async () => {
-    const client = new FixtureImapClient([
-      {
-        path: "INBOX",
-        delimiter: ".",
-        specialUse: "\\Inbox",
-        uidValidity: 1,
-        messages: [makeTextMessage({ uid: 1, subject: "x", from: "a@example.test", to: "b@example.test", body: "x" })]
-      },
-      {
-        path: "INBOX.Notes",
-        delimiter: ".",
-        specialUse: undefined,
-        uidValidity: 1,
-        messages: [makeTextMessage({ uid: 1273, subject: "n", from: "a@example.test", to: "b@example.test", body: "n" })]
-      }
-    ]);
-    await client.getMailboxLock("INBOX"); // wrong folder selected
-    await expect(
-      fetchFullMessageBody(client, bodyConfig, notesMessage, { skipMailboxLock: true })
-    ).rejects.toThrow(/expected INBOX\.Notes to be selected/);
   });
 
   it("throws MessageMovedError when the UID is gone from the folder (moved/deleted)", async () => {

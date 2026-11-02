@@ -33,6 +33,8 @@ The historical backfill feature in `docs/agent/feature-list.json` (`issue-2-hist
 
 ### D2: One advisory lock, three priority-ordered lanes per acquisition
 
+> **Amended by [ADR 0049](decisions/0049-bodies-download-beside-the-lock.md).** The body lane left the lock acquisition: `syncBodies` downloads bodies on its own connection beside the lock, live window first and then archive bodies, and commits each unit under the write-fenced lock, one run per Mailbox Account at a time. A pass runs the hot lane, then the history lane, which mirrors headers only. The rest of this record is the original design.
+
 Spec §1 invariant stands: "Do not run two concurrent IMAP operations for the same account." There is no second worker, no second connection, no second advisory lock. The three lanes share `withAccountLock` and execute in priority order during a single lock acquisition:
 
 ```text

@@ -5,6 +5,7 @@ import type { PgPool } from "./db.js";
 import { getPool, isSupabaseSessionPoolerUrl } from "./db.js";
 import { performance } from "node:perf_hooks";
 import {
+  BodySourceChangedError,
   fetchFullMessageBody,
   fetchFullMessageBodyBatch,
   fetchMessageFlags,
@@ -25,8 +26,9 @@ import type {
   MailboxStatus,
   MirrorImapClient
 } from "./imap-client.js";
-import { AccountBusyError } from "./errors.js";
-import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock } from "./locks.js";
+import { AccountBusyError, InvalidInputError } from "./errors.js";
+import { withInteractiveAccountLock } from "./interactive-lock.js";
+import { AccountLockLivenessError, clearOrphanedLockForAccount, withAccountLock, withBodyRunLock } from "./locks.js";
 import type { MetadataProtectionAdapter } from "./metadata-protection.js";
 import { MirrorRepository, sanitizeErrorReason } from "./repository.js";
 import {
@@ -36,13 +38,16 @@ import {
 import type { MetadataWriteOptions } from "./repository.js";
 import { MAX_SYNC_BATCH_SIZE } from "./sync-limits.js";
 import type {
+  BodySyncResult,
   FolderCheck,
   ImapAccount,
   ImapFolder,
   ImapMessage,
   HistoryBacklogFolder,
+  MessageBodyInput,
   MessageMetadata,
   MirrorHooks,
+  ScheduledSyncResult,
   SyncResult,
   SyncTriggerType
 } from "./types.js";
@@ -62,6 +67,16 @@ const MAX_INCREMENTAL_BATCHES_PER_PASS = 20;
 /** How long a provider that did not activate QRESYNC is left alone before the next try. */
 const QRESYNC_UNAVAILABLE_RETRY_MS = 6 * 60 * 60_000;
 const MISSING_MAILBOX_RESPONSE_CODES = new Set(["NONEXISTENT", "TRYCREATE"]);
+/** A body unit may take 60 s plus 8 KiB/s of declared size, at most 30 min (ADR 0049). */
+const BODY_DOWNLOAD_BASE_MS = 60_000;
+const BODY_DOWNLOAD_MIN_BYTES_PER_SECOND = 8 * 1024;
+const BODY_DOWNLOAD_MAX_MS = 30 * 60_000;
+/** A failed or timed-out body unit waits 1 min, doubling to 1 h, before this engine retries it. */
+const BODY_RETRY_INITIAL_MS = 60_000;
+const BODY_RETRY_MAX_MS = 60 * 60_000;
+/** A live-change pass waits this long for a body commit holding the lock, so a
+ * wake queues behind one commit instead of retrying into several (ADR 0049). */
+const LIVE_PASS_LOCK_WAIT_MS = 5_000;
 
 const RACKSPACE_INBOX_ALIAS_PATH = "INBOX.INBOX";
 const RACKSPACE_INBOX_ALIAS_CANONICAL_PATH = "INBOX";
@@ -116,9 +131,18 @@ type ReconcileAttemptTelemetry = {
   durationMs: number;
 };
 
+type DownloadedBody = { message: ImapMessage; body: MessageBodyInput };
+
+type DownloadedBodies = {
+  /** One entry per parsed-only UID-set FETCH: its evidence commits in one transaction. */
+  batches: DownloadedBody[][];
+  single: DownloadedBody[];
+  /** The provider no longer holds these UIDs. */
+  gone: ImapMessage[];
+};
+
 type HistoryBatchResult = {
   messagesUpserted: number;
-  bodiesFetched: number;
   processed: boolean;
   hitLockBudget: boolean;
 };
@@ -134,14 +158,6 @@ export function metadataRowsPerSecond(rowsCommitted: number, durationMs: number)
   if (!Number.isFinite(rowsCommitted) || rowsCommitted < 0) return null;
   if (!Number.isFinite(durationMs) || durationMs <= 0) return null;
   return Math.round((rowsCommitted * 1000 / durationMs) * 100) / 100;
-}
-
-export function bodyBacklogReadLimit(batchSize: number, batchesRemaining: number): number {
-  const wholeBatches = Math.min(
-    batchesRemaining,
-    Math.max(1, Math.floor(MAX_SYNC_BATCH_SIZE / batchSize))
-  );
-  return batchSize * wholeBatches;
 }
 
 function applyMetadataWriteStats(result: SyncResult, stats: MetadataWriteStats): void {
@@ -299,6 +315,28 @@ export class AccountAlreadyFinalizedError extends Error {
   }
 }
 
+/** A body run stopped on an error after storing `result.committed` bodies (ADR 0049). */
+export class BodySyncError extends Error {
+  constructor(
+    public readonly result: BodySyncResult,
+    cause: unknown
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "BodySyncError";
+  }
+}
+
+/** A body download ran past its unit deadline; its connection was closed (ADR 0049). */
+export class BodyDownloadTimeoutError extends Error {
+  constructor(
+    public readonly messages: number,
+    public readonly deadlineMs: number
+  ) {
+    super(`Body download of ${messages} message(s) exceeded ${deadlineMs} ms`);
+    this.name = "BodyDownloadTimeoutError";
+  }
+}
+
 class SyncInterruptedError extends Error {
   constructor() {
     super("Sync interrupted by scheduler");
@@ -331,8 +369,6 @@ export interface SyncAccountOptions {
    * Limited to the source and destination of one mutation.
    */
   forceReconcileFolders?: readonly string[];
-  /** Fetch the current live body backlog without running folder or history work. */
-  bodyBacklogOnly?: boolean;
   /** EXPUNGE is only a hint; force authoritative UID reconciliation now. */
   forceInboxReconcile?: boolean;
   /** A flags notification may arrive before the normal flag deadline. */
@@ -353,6 +389,7 @@ export class MirrorEngine {
   private readonly bodyStore: BodyStore;
   private readonly hooks: MirrorHooks;
   private readonly qresyncUnavailableUntil = new Map<string, number>();
+  private readonly bodyRetries = new Map<string, { attempts: number; until: number }>();
   private readonly clientFactory: (
     account: ImapAccount,
     options?: { signal?: AbortSignal }
@@ -372,16 +409,127 @@ export class MirrorEngine {
   async syncDueAccounts(
     limit = 10,
     options: { signal?: AbortSignal } = {}
-  ): Promise<SyncResult[]> {
+  ): Promise<ScheduledSyncResult[]> {
     const accounts = await this.repository.getRunnableAccounts(limit);
-    const results: SyncResult[] = [];
+    const results: ScheduledSyncResult[] = [];
 
     for (const account of accounts) {
       if (options.signal?.aborted) break;
-      results.push(await this.syncAccount(account.id, "scheduled", { signal: options.signal }));
+      results.push(await this.syncAccountWithBodies(account.id, "scheduled", options));
     }
 
     return results;
+  }
+
+  /**
+   * One full sync: the pass, then its body run beside the lock (ADR 0049). A
+   * failed body run is reported beside the recorded pass, never instead of it;
+   * the next run retries.
+   */
+  async syncAccountWithBodies(
+    accountId: string,
+    triggerType: SyncTriggerType,
+    options: { signal?: AbortSignal; maxMessages?: number } = {}
+  ): Promise<ScheduledSyncResult> {
+    const pass = await this.syncAccount(accountId, triggerType, { signal: options.signal });
+    let bodies: BodySyncResult | null = null;
+    let bodyError: string | null = null;
+    // A failed pass has just backed the account off; its bodies wait with it. A
+    // deferred pass found another session on the account; that session's run
+    // owns the bodies too.
+    if (pass.outcome !== "failed" && pass.outcome !== "deferred" && !options.signal?.aborted) {
+      try {
+        bodies = await this.syncBodies(accountId, { signal: options.signal, maxMessages: options.maxMessages });
+      } catch (error) {
+        if (error instanceof BodySyncError) bodies = error.result;
+        // A shutdown during the body run is a neutral stop, like the pass's.
+        if (!options.signal?.aborted) bodyError = sanitizeErrorReason(describeSyncError(error));
+      }
+    }
+    return { ...pass, bodies, bodyError };
+  }
+
+  /**
+   * Download due bodies beside the account lock and commit each unit under it
+   * (ADR 0049). Live-window bodies come first, then, in `metadata_and_bodies`
+   * mode inside the backfill window, archive bodies. Live rows are read from the
+   * backlog before every unit, so a message that arrived during the run is next;
+   * archive rows, which no arrival changes, are read a page at a time. A run
+   * stops once it has handled `maxMessages` bodies (a unit may carry it past
+   * that by less than one batch) or at `MAX_LOCK_HOLD_MS`, which also caps
+   * every unit's deadline; `remaining` says bodies may be left. One run per
+   * Mailbox Account at a time: a second returns `remaining` without connecting.
+   * A run that stops on an error throws `BodySyncError` carrying what it stored.
+   * Writes no sync run and no account state. A host that reuses a session
+   * passes `openClient`, called only once a body is due, so an empty backlog
+   * costs no login; it must name its Mailbox Account. The engine never logs a
+   * host session out, and closes it only at a unit deadline or on abort.
+   */
+  async syncBodies(
+    accountId: string,
+    options: {
+      openClient?: () => Promise<MirrorImapClient>;
+      clientAccountId?: string;
+      signal?: AbortSignal;
+      maxMessages?: number;
+    } = {}
+  ): Promise<BodySyncResult> {
+    if (options.openClient && options.clientAccountId !== accountId) {
+      throw new Error("Host-owned client does not match the Mailbox Account");
+    }
+    const account = await this.repository.getAccount(accountId);
+    if (!account) throw new Error(`Account not found: ${accountId}`);
+    const result: BodySyncResult = { committed: 0, gone: 0, skipped: 0, remaining: false };
+    if (account.sync_state === "PAUSED" || account.sync_state === "BROKEN") return result;
+
+    const run = await withBodyRunLock(this.pool, accountId, async () => {
+      const includeArchive = account.historical_backfill_mode === "metadata_and_bodies"
+        && isWithinBackfillWindow(this.config);
+      const maxMessages = options.maxMessages
+        ?? this.config.MAX_BODY_BATCHES_PER_TICK * this.config.BODY_BACKFILL_BATCH_SIZE;
+      const budgetEndsAt = Date.now() + this.config.MAX_LOCK_HOLD_MS;
+      let client: MirrorImapClient | null = null;
+      // Shutdown closes the body connection, which also ends a streamed download.
+      const interrupt = () => {
+        if (client) this.abortClient(client);
+      };
+      options.signal?.addEventListener("abort", interrupt, { once: true });
+      let handled = 0;
+      let archivePage: ImapMessage[] = [];
+      try {
+        while (handled < maxMessages) {
+          options.signal?.throwIfAborted();
+          if (Date.now() >= budgetEndsAt) break;
+          // A full batch is read so same-folder messages can share one unit; the
+          // cap ends the run once a unit carries it past maxMessages.
+          const limit = this.config.BODY_BACKFILL_BATCH_SIZE;
+          const excludeIds = this.backedOffBodyIds();
+          let backlog = await this.repository.getBodyBacklog(account, limit, { excludeIds });
+          if (backlog.length === 0 && includeArchive) {
+            // The archive arm sorts the whole mailbox, so it is read once per page.
+            if (archivePage.length === 0) {
+              archivePage = await this.repository.getBodyBacklog(account, limit, { includeArchive, excludeIds });
+            }
+            backlog = archivePage;
+          }
+          if (backlog.length === 0) return result;
+          client ??= await this.openBodyClient(account, options);
+          const unit = this.nextBodyUnit(backlog);
+          if (backlog === archivePage) archivePage = archivePage.filter((message) => !unit.includes(message));
+          if (!await this.syncBodyUnit(account, client, unit, result, budgetEndsAt, options.signal)) break;
+          handled += unit.length;
+        }
+        result.remaining = true;
+        return result;
+      } catch (error) {
+        throw new BodySyncError({ ...result, remaining: true }, error);
+      } finally {
+        options.signal?.removeEventListener("abort", interrupt);
+        if (client && !options.openClient) await client.logout().catch(() => this.abortClient(client!));
+      }
+    });
+    if (run === null) return { ...result, remaining: true };
+    return run;
   }
 
   /** Refresh only due Sent folders, leaving expensive secondary lanes to the full sweep. */
@@ -410,11 +558,10 @@ export class MirrorEngine {
   ): Promise<SyncResult> {
     const supplementalModes = [
       options.sentOnly === true,
-      options.liveInboxOnly === true,
-      options.bodyBacklogOnly === true
+      options.liveInboxOnly === true
     ].filter(Boolean).length;
     if (supplementalModes > 1) {
-      throw new Error("sentOnly, liveInboxOnly, and bodyBacklogOnly cannot be combined");
+      throw new Error("sentOnly and liveInboxOnly cannot be combined");
     }
     if (options.client && options.keepClientOpen !== true) {
       throw new Error("A host-owned client requires keepClientOpen");
@@ -424,6 +571,9 @@ export class MirrorEngine {
     }
     if (options.client && options.clientAccountId !== accountId) {
       throw new Error("Host-owned client does not match the Mailbox Account");
+    }
+    if ("bodyBacklogOnly" in options) {
+      throw new InvalidInputError("bodyBacklogOnly is retired; bodies download through syncBodies (ADR 0049)");
     }
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);
@@ -446,7 +596,6 @@ export class MirrorEngine {
       metadataWriteBatchesAttempted: 0,
       metadataWriteBatchesFailed: 0,
       metadataWriteServiceRowsPerSecond: null,
-      bodiesFetched: 0,
       flagsUpdated: 0,
       reconcileGapsFound: 0,
       reconcileFoldersAttempted: 0,
@@ -545,9 +694,7 @@ export class MirrorEngine {
           ? new Set<string>()
           : await this.recordUnchangedFolders(account, client, result.folderChecks!, options.signal);
 
-        const folders = options.bodyBacklogOnly
-          ? []
-          : sentFolders ?? (options.liveInboxOnly
+        const folders = sentFolders ?? (options.liveInboxOnly
           ? liveFolderPaths.length > 0
             ? await this.repository.getFoldersForWake(
                 account.id,
@@ -732,20 +879,12 @@ export class MirrorEngine {
           result.errors.push("Live folder set no longer matches tracked folders");
         }
 
-        if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
-          result.hitLockBudget = true;
-        } else if (!options.sentOnly && !options.liveInboxOnly && !connectionLost) {
-          const bodyResult = await this.fetchBodyBacklog(account, client, lockDeadline, lock.assertLive);
-          throwIfInterrupted();
-          result.bodiesFetched += bodyResult.fetched;
-          if (bodyResult.hitLockBudget) result.hitLockBudget = true;
-        }
-
+        // Bodies download beside the lock (syncBodies, ADR 0049); a pass holds it
+        // for metadata only.
         if (!options.sentOnly && this.isLockBudgetExpired(lockDeadline)) {
           result.hitLockBudget = true;
         } else if (!options.sentOnly
           && !options.liveInboxOnly
-          && !options.bodyBacklogOnly
           && !connectionLost) {
           const historyResult = await this.runHistoryLane(
             account,
@@ -757,7 +896,6 @@ export class MirrorEngine {
           );
           throwIfInterrupted();
           result.messagesUpserted += historyResult.messagesUpserted;
-          result.bodiesFetched += historyResult.bodiesFetched;
           result.errors.push(...historyResult.errors);
           if (historyResult.hitLockBudget) result.hitLockBudget = true;
         }
@@ -870,7 +1008,12 @@ export class MirrorEngine {
           await client.logout().catch(() => this.abortClient(client!));
         }
       }
-    }, { fenceWrites: true });
+    }, {
+      fenceWrites: true,
+      // A live-change pass queues behind one body commit instead of retrying
+      // into several; a full pass still tries once and defers.
+      ...(options.liveInboxOnly ? { waitMs: LIVE_PASS_LOCK_WAIT_MS } : {})
+    });
 
     let runFinished = false;
     try {
@@ -939,18 +1082,24 @@ export class MirrorEngine {
     const account = await this.repository.getAccount(message.account_id);
     if (!account) throw new Error(`Account not found for message: ${messageId}`);
 
-    const fetched = await withAccountLock(this.pool, account.lock_id, async () => {
+    // Download beside the lock, then the same fenced commit as syncBodies (ADR 0049),
+    // under the same one-run-per-account rule.
+    const fetched = await withBodyRunLock(this.pool, account.id, async () => {
       const client = await this.clientFactory(account);
       try {
-        await this.fetchAndStoreBody(client, message);
-        return true;
+        const written = await this.commitBodies(
+          account,
+          await this.downloadBodyUnit(client, [message], this.bodyUnitDeadlineMs([message]), undefined),
+          { force }
+        );
+        return written.committed > 0;
       } finally {
-        await client.logout().catch(() => undefined);
+        await client.logout().catch(() => this.abortClient(client));
       }
     });
-
-    // A sync holds the lock, often right after new mail arrives: a short retry works.
-    if (fetched === null) throw new AccountBusyError(`Account ${account.id} is busy syncing; retry the body fetch shortly`);
+    if (fetched === null) {
+      throw new AccountBusyError(`Account ${account.id} is downloading bodies; retry shortly`);
+    }
     return fetched;
   }
 
@@ -2161,16 +2310,15 @@ export class MirrorEngine {
     metadataWriteStats: MetadataWriteStats,
     signal: AbortSignal | undefined,
     assertLive: () => Promise<void>
-  ): Promise<{ messagesUpserted: number; bodiesFetched: number; hitLockBudget: boolean; errors: string[] }> {
+  ): Promise<{ messagesUpserted: number; hitLockBudget: boolean; errors: string[] }> {
     if (account.historical_backfill_mode === "off") {
-      return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
+      return { messagesUpserted: 0, hitLockBudget: false, errors: [] };
     }
     if (!isWithinBackfillWindow(this.config)) {
-      return { messagesUpserted: 0, bodiesFetched: 0, hitLockBudget: false, errors: [] };
+      return { messagesUpserted: 0, hitLockBudget: false, errors: [] };
     }
 
     let messagesUpserted = 0;
-    let bodiesFetched = 0;
     let hitLockBudget = false;
     const errors: string[] = [];
     let batchesProcessed = 0;
@@ -2211,7 +2359,6 @@ export class MirrorEngine {
         break;
       }
       messagesUpserted += batch.messagesUpserted;
-      bodiesFetched += batch.bodiesFetched;
       if (batch.hitLockBudget) {
         hitLockBudget = true;
         break;
@@ -2224,7 +2371,7 @@ export class MirrorEngine {
       }
     }
 
-    return { messagesUpserted, bodiesFetched, hitLockBudget, errors };
+    return { messagesUpserted, hitLockBudget, errors };
   }
 
   private async runHistoryBatch(
@@ -2236,11 +2383,7 @@ export class MirrorEngine {
     signal?: AbortSignal
   ): Promise<HistoryBatchResult> {
     if (this.isLockBudgetExpired(lockDeadline)) {
-      return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
-    }
-
-    if (folder.history_backlog_reason === "body") {
-      return await this.fetchHistoricalBodyBatch(account, folder, client, lockDeadline, signal);
+      return { messagesUpserted: 0, processed: false, hitLockBudget: true };
     }
 
     const mailboxLock = await client.getMailboxLock(folder.path);
@@ -2266,7 +2409,7 @@ export class MirrorEngine {
             `UIDVALIDITY_RESET_LIMIT_EXCEEDED: ${folder.path}`
           );
         }
-        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+        return { messagesUpserted: 0, processed: false, hitLockBudget: false };
       }
 
       const windowCutoff = getWindowCutoff(account);
@@ -2294,7 +2437,7 @@ export class MirrorEngine {
             uidValidity,
             { deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS, signal }
           );
-          return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+          return { messagesUpserted: 0, processed: false, hitLockBudget: false };
         }
 
         targetMaxUid = sortedTargets[sortedTargets.length - 1];
@@ -2311,7 +2454,7 @@ export class MirrorEngine {
       }
 
       if (this.isLockBudgetExpired(lockDeadline)) {
-        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
+        return { messagesUpserted: 0, processed: false, hitLockBudget: true };
       }
 
       const batchSize = this.config.BODY_BACKFILL_BATCH_SIZE;
@@ -2321,7 +2464,7 @@ export class MirrorEngine {
           deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS,
           signal
         });
-        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
+        return { messagesUpserted: 0, processed: false, hitLockBudget: false };
       }
 
       // Search only the next bounded UID-address range. The previous implementation
@@ -2359,14 +2502,13 @@ export class MirrorEngine {
         );
         return {
           messagesUpserted: 0,
-          bodiesFetched: 0,
           processed: true,
           hitLockBudget: this.isLockBudgetExpired(lockDeadline)
         };
       }
 
       if (this.isLockBudgetExpired(lockDeadline)) {
-        return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: true };
+        return { messagesUpserted: 0, processed: false, hitLockBudget: true };
       }
 
       const metadata = await fetchMessageMetadata(client, batch, batchSize);
@@ -2386,21 +2528,6 @@ export class MirrorEngine {
         await this.hooks.onMessageUpsert?.(message);
       }
 
-      let bodiesFetched = 0;
-      if (account.historical_backfill_mode === "metadata_and_bodies") {
-        // We already hold the mailbox lock for `folder` here; skip re-locking
-        // inside the body helpers so imapflow's non-reentrant lock cannot
-        // deadlock.
-        bodiesFetched = await this.fetchAndStoreBodies(
-          client,
-          messages.filter((row) => !row.body_fetched_at),
-          {
-            skipMailboxLock: true,
-            shouldStop: () => this.isLockBudgetExpired(lockDeadline)
-          }
-        );
-      }
-
       const progressDeadline = Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS;
       await this.repository.advanceHistoryBackfillWatermark(
         folder.id,
@@ -2412,99 +2539,12 @@ export class MirrorEngine {
 
       return {
         messagesUpserted: messages.length,
-        bodiesFetched,
         processed: true,
         hitLockBudget: this.isLockBudgetExpired(lockDeadline)
       };
     } finally {
       mailboxLock.release();
     }
-  }
-
-  private async fetchHistoricalBodyBatch(
-    account: ImapAccount,
-    folder: ImapFolder,
-    client: MirrorImapClient,
-    lockDeadline: number,
-    signal?: AbortSignal
-  ): Promise<HistoryBatchResult> {
-    const backlog = await this.repository.getHistoricalBodyBacklog(
-      account,
-      folder,
-      this.config.BODY_BACKFILL_BATCH_SIZE
-    );
-    // A body batch can run during a walk; only a finished walk is marked complete.
-    if (backlog.length === 0 && !folder.backfill_in_progress) {
-      const expectedUidValidity = Number(folder.uidvalidity);
-      if (!Number.isSafeInteger(expectedUidValidity) || expectedUidValidity <= 0) {
-        throw new Error(`History completion missing UIDVALIDITY for ${folder.path}`);
-      }
-      await this.repository.markHistoryBackfillComplete(folder.id, expectedUidValidity, {
-        deadlineAt: Date.now() + HISTORY_METADATA_COMMIT_GRACE_MS,
-        signal
-      });
-      return { messagesUpserted: 0, bodiesFetched: 0, processed: false, hitLockBudget: false };
-    }
-
-    const fetched = await this.fetchAndStoreBodies(client, backlog, {
-      shouldStop: () => this.isLockBudgetExpired(lockDeadline)
-    });
-
-    return {
-      messagesUpserted: 0,
-      bodiesFetched: fetched,
-      processed: fetched > 0,
-      hitLockBudget: this.isLockBudgetExpired(lockDeadline)
-    };
-  }
-
-  private async fetchBodyBacklog(
-    account: ImapAccount,
-    client: MirrorImapClient,
-    lockDeadline: number,
-    assertLive: () => Promise<void>
-  ): Promise<{ fetched: number; hitLockBudget: boolean }> {
-    let fetched = 0;
-    let hitLockBudget = false;
-    let batchesRemaining = this.config.MAX_BODY_BATCHES_PER_TICK;
-
-    while (batchesRemaining > 0) {
-      if (this.isLockBudgetExpired(lockDeadline)) {
-        hitLockBudget = true;
-        break;
-      }
-
-      const readLimit = bodyBacklogReadLimit(
-        this.config.BODY_BACKFILL_BATCH_SIZE,
-        batchesRemaining
-      );
-      const backlog = await this.repository.getBodyBacklog(account, readLimit);
-      if (backlog.length === 0) break;
-
-      for (
-        let offset = 0;
-        offset < backlog.length && batchesRemaining > 0;
-        offset += this.config.BODY_BACKFILL_BATCH_SIZE
-      ) {
-        const logicalBatch = backlog.slice(
-          offset,
-          offset + this.config.BODY_BACKFILL_BATCH_SIZE
-        );
-
-        await assertLive();
-        fetched += await this.fetchAndStoreBodies(client, logicalBatch);
-
-        batchesRemaining -= 1;
-        if (this.isLockBudgetExpired(lockDeadline)) {
-          hitLockBudget = true;
-          break;
-        }
-      }
-
-      if (hitLockBudget || backlog.length < readLimit) break;
-    }
-
-    return { fetched, hitLockBudget };
   }
 
   private parsedBodyBatchAt(backlog: ImapMessage[], start: number): ImapMessage[] {
@@ -2521,10 +2561,14 @@ export class MirrorEngine {
     ) {
       const message = backlog[index];
       if (message.folder_path !== first.folder_path || !this.isSmallCompleteBody(message)) break;
+      // A message whose unit failed downloads alone, so one bad message cannot
+      // keep backing off the healthy messages that shared its unit.
+      if (this.bodyRetries.has(message.id) && messages.length > 0) break;
       const sourceBytes = Number(message.size_bytes);
       if (totalSourceBytes + sourceBytes > PARSED_BODY_BATCH_MAX_TOTAL_SOURCE_BYTES) break;
       messages.push(message);
       totalSourceBytes += sourceBytes;
+      if (this.bodyRetries.has(message.id)) break;
     }
     return messages;
   }
@@ -2537,120 +2581,262 @@ export class MirrorEngine {
       && size <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES;
   }
 
-  private async fetchAndStoreBodyBatch(
-    client: MirrorImapClient,
-    messages: ImapMessage[],
-    skipMailboxLock = false
-  ): Promise<number> {
-    const result = await fetchFullMessageBodyBatch(
-      client,
-      this.config,
-      messages,
-      { skipMailboxLock }
-    );
-    await this.repository.storeBodyEvidenceBatch(result.bodies.map(({ body }) => body));
-    let processed = 0;
-    for (const { message, body } of result.bodies) {
-      await this.commitBodyPayload(message, body);
-      processed += 1;
-    }
-    for (const message of result.missingMessages) {
-      // A successful set FETCH can still omit a response or its source. That
-      // is not enough evidence to tombstone the row. Retry the exact UID
-      // through the individual path, which tombstones the row only when the
-      // dedicated download confirms that the message is gone.
-      await this.fetchAndStoreBody(client, message, skipMailboxLock);
-      processed += 1;
-    }
-    return processed;
-  }
-
-  private async fetchAndStoreBodies(
-    client: MirrorImapClient,
-    messages: ImapMessage[],
-    options: {
-      skipMailboxLock?: boolean;
-      shouldStop?: () => boolean;
-    } = {}
-  ): Promise<number> {
-    const ordered = this.config.BODY_STORAGE_MODE === "parsed_only"
-      ? this.groupBodiesByFolder(messages)
-      : messages;
-    let processed = 0;
-
-    for (let index = 0; index < ordered.length;) {
-      if (options.shouldStop?.()) break;
-      const batchMessages = this.parsedBodyBatchAt(ordered, index);
-      if (batchMessages.length > 1) {
-        processed += await this.fetchAndStoreBodyBatch(
-          client,
-          batchMessages,
-          options.skipMailboxLock
-        );
-        index += batchMessages.length;
-        continue;
-      }
-
-      await this.fetchAndStoreBody(client, ordered[index], options.skipMailboxLock);
-      processed += 1;
-      index += 1;
-    }
-    return processed;
-  }
-
-  private groupBodiesByFolder(messages: ImapMessage[]): ImapMessage[] {
-    const byFolder = new Map<string, ImapMessage[]>();
-    for (const message of messages) {
-      const folder = byFolder.get(message.folder_path);
-      if (folder) {
-        folder.push(message);
-      } else {
-        byFolder.set(message.folder_path, [message]);
-      }
-    }
-    return [...byFolder.values()].flat();
-  }
-
-  private async fetchAndStoreBody(
-    client: MirrorImapClient,
-    message: ImapMessage,
-    skipMailboxLock = false
-  ): Promise<void> {
-    let body;
+  /**
+   * The body run's own provider session, one more than the account's pass holds.
+   * A provider that refuses it is recorded per Mailbox Account as a
+   * `BODY_CONNECTION_REFUSED` sync event (provider, host, response code, kind),
+   * so a session cap shows up by provider instead of as a generic failed run;
+   * the run then fails as any other error and the next one retries.
+   */
+  private async openBodyClient(
+    account: ImapAccount,
+    options: { openClient?: () => Promise<MirrorImapClient>; signal?: AbortSignal }
+  ): Promise<MirrorImapClient> {
     try {
-      body = await fetchFullMessageBody(client, this.config, message, { skipMailboxLock });
+      return options.openClient
+        ? await options.openClient()
+        : await this.clientFactory(account, { signal: options.signal });
     } catch (error) {
-      if (error instanceof MessageMovedError) {
-        await this.recordMovedBody(message);
-        return;
+      if (options.signal?.aborted) throw error;
+      const responseCode = extractImapResponseCode(error);
+      // A provider at its session cap may answer the login with a response code
+      // or just close the socket (BYE); both are refusals of this connection.
+      const kind = classifyLoginRefusal(error)
+        ?? (responseCode && TRANSIENT_RESPONSE_CODES.has(responseCode) ? "session_limit"
+          : isConnectionLostError(error) ? "connection_closed" : "connect_failed");
+      await this.repository.logEvent(account.id, null, null, null, null, "BODY_CONNECTION_REFUSED", {
+        provider: account.provider_profile,
+        host: account.host,
+        responseCode,
+        kind,
+        reason: sanitizeErrorReason(describeSyncError(error))
+      }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * The first unit of a backlog read: a bounded parsed-only UID-set fetch of
+   * same-folder messages, or one message. The read is grouped by folder first,
+   * so an interleaved backlog still batches.
+   */
+  private nextBodyUnit(backlog: ImapMessage[]): ImapMessage[] {
+    const byFolder = new Map<string, ImapMessage[]>();
+    for (const message of backlog) {
+      byFolder.get(message.folder_path)?.push(message) ?? byFolder.set(message.folder_path, [message]);
+    }
+    const ordered = this.config.BODY_STORAGE_MODE === "parsed_only" ? [...byFolder.values()].flat() : backlog;
+    const batch = this.parsedBodyBatchAt(ordered, 0);
+    return batch.length > 1 ? batch : [ordered[0]];
+  }
+
+  /**
+   * Download one unit beside the lock and commit it under the lock as soon as it
+   * arrives, so memory and the lock hold stay at one unit. A failed unit is
+   * backed off and ends the run. Returns false when the run stops early: the
+   * run budget is spent, the lock stayed busy for the commit, or a row moved
+   * under the download and is still due, so the next run reads it again rather
+   * than this run twice.
+   */
+  private async syncBodyUnit(
+    account: ImapAccount,
+    client: MirrorImapClient,
+    unit: ImapMessage[],
+    result: BodySyncResult,
+    budgetEndsAt: number,
+    signal: AbortSignal | undefined
+  ): Promise<boolean> {
+    // A unit never outlives the run budget, so a run stays bounded whatever the
+    // provider's speed: its deadline is capped to what remains of the budget.
+    const deadlineMs = Math.min(this.bodyUnitDeadlineMs(unit), budgetEndsAt - Date.now());
+    if (deadlineMs <= 0) return false;
+    // A reused session selects the folder again, so it sees every UID the
+    // backlog read just returned and a present message never looks gone.
+    client.invalidateSelection?.();
+    let downloaded: DownloadedBodies;
+    try {
+      downloaded = await this.downloadBodyUnit(client, unit, deadlineMs, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      this.backOffBodies(unit);
+      // Metadata sync owns a UIDVALIDITY reset; these rows wait for it and
+      // stay due, so the run reports them as remaining.
+      if (error instanceof BodySourceChangedError) {
+        result.remaining = true;
+        return true;
       }
       throw error;
     }
-    await this.commitBody(message, body);
+
+    let written: Omit<BodySyncResult, "remaining"> & { stillDue: number };
+    try {
+      written = await this.commitBodies(account, downloaded);
+    } catch (error) {
+      // A long lock holder: this unit downloads again on a later run.
+      if (error instanceof AccountBusyError) return false;
+      this.backOffBodies(unit);
+      throw error;
+    }
+    result.committed += written.committed;
+    result.gone += written.gone;
+    result.skipped += written.skipped;
+    return written.stillDue === 0;
   }
 
-  private async recordMovedBody(message: ImapMessage): Promise<void> {
-    // The UID vanished between metadata sync and body fetch. Get it out of the
-    // backlog without re-throwing into the account-level catch (which bricks the
-    // account to BROKEN and re-loops every backfill). The tombstone is
-    // recoverable in every lane: the next reconcile revives a UID still listed.
-    await this.repository.markMessageGone(message.id);
+  /**
+   * One unit's download. Its result is all or nothing: a unit that fails, passes
+   * its deadline or is aborted contributes no body and no gone message.
+   */
+  private async downloadBodyUnit(
+    client: MirrorImapClient,
+    unit: ImapMessage[],
+    deadlineMs: number,
+    signal: AbortSignal | undefined
+  ): Promise<DownloadedBodies> {
+    const downloaded: DownloadedBodies = { batches: [], single: [], gone: [] };
+    await this.withBodyDeadline(client, unit, deadlineMs, signal, async () => {
+      if (unit.length > 1) {
+        const fetched = await fetchFullMessageBodyBatch(client, this.config, unit);
+        // A set FETCH can omit a response or its source; that is no evidence
+        // the message is gone. The individual download decides.
+        for (const message of fetched.missingMessages) {
+          await this.downloadOneBody(client, message, downloaded);
+        }
+        downloaded.batches.push(fetched.bodies);
+      } else {
+        await this.downloadOneBody(client, unit[0], downloaded);
+      }
+    });
+    return downloaded;
   }
 
-  private async commitBody(
-    message: ImapMessage,
-    body: Awaited<ReturnType<typeof fetchFullMessageBody>>
+  /** A unit may take 60 s plus 8 KiB/s of declared size, at most 30 min. */
+  private bodyUnitDeadlineMs(unit: readonly ImapMessage[]): number {
+    const declaredBytes = unit.reduce(
+      (sum, message) => sum + Math.max(0, Number(message.size_bytes) || 0),
+      0
+    );
+    return Math.min(
+      BODY_DOWNLOAD_MAX_MS,
+      BODY_DOWNLOAD_BASE_MS + Math.ceil(declaredBytes * 1000 / BODY_DOWNLOAD_MIN_BYTES_PER_SECOND)
+    );
+  }
+
+  /**
+   * On expiry of the unit's deadline this connection closes, which also ends a
+   * streamed download between chunks.
+   */
+  private async withBodyDeadline(
+    client: MirrorImapClient,
+    unit: readonly ImapMessage[],
+    deadlineMs: number,
+    signal: AbortSignal | undefined,
+    run: () => Promise<void>
   ): Promise<void> {
-    await this.repository.storeBodyEvidence(body);
-    await this.commitBodyPayload(message, body);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      this.abortClient(client);
+    }, deadlineMs);
+    try {
+      await run();
+    } catch (error) {
+      if (timedOut) throw new BodyDownloadTimeoutError(unit.length, deadlineMs);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    // A closed connection can end a stream early instead of failing it.
+    if (timedOut) throw new BodyDownloadTimeoutError(unit.length, deadlineMs);
+    signal?.throwIfAborted();
   }
 
-  private async commitBodyPayload(
+  private async downloadOneBody(
+    client: MirrorImapClient,
     message: ImapMessage,
-    body: Awaited<ReturnType<typeof fetchFullMessageBody>>
+    downloaded: DownloadedBodies
   ): Promise<void> {
-    await this.bodyStore.store(body);
-    await this.repository.completeBodyStorage(body.messageId);
-    await this.hooks.onBodyFetched?.(message, body);
+    try {
+      downloaded.single.push({ message, body: await fetchFullMessageBody(client, this.config, message) });
+    } catch (error) {
+      if (!(error instanceof MessageMovedError)) throw error;
+      downloaded.gone.push(message);
+    }
+  }
+
+  /**
+   * Write downloaded bodies under the write-fenced account lock. Only rows that
+   * still exist and are not provider-deleted take a body; every writer that
+   * deletes, resets or moves a row holds this lock, and a confirmed move keeps the
+   * id (ADR 0037). A gone result tombstones only the row still at that UID.
+   */
+  private async commitBodies(
+    account: ImapAccount,
+    downloaded: DownloadedBodies,
+    options: { force?: boolean } = {}
+  ): Promise<Omit<BodySyncResult, "remaining"> & { stillDue: number }> {
+    const bodies = [...downloaded.batches.flat(), ...downloaded.single];
+    const ids = [...bodies.map(({ message }) => message.id), ...downloaded.gone.map(({ id }) => id)];
+    if (ids.length === 0) return { committed: 0, gone: 0, skipped: 0, stillDue: 0 };
+    const written = await withInteractiveAccountLock(this.pool, account, async () => {
+      const live = new Map((await this.repository.getBodyCommitRows(ids)).map((row) => [row.id, row]));
+      // A body another path stored meanwhile (an action filing its own bytes,
+      // ADR 0046) is no longer due; only a forced refetch replaces it.
+      const isLive = ({ message }: DownloadedBody) =>
+        live.has(message.id) && (options.force === true || live.get(message.id)!.due);
+
+      let gone = 0;
+      // A row that moved under the download is still due at its new UID.
+      let stillDue = 0;
+      for (const message of downloaded.gone) {
+        const row = live.get(message.id);
+        if (!row) continue;
+        if (row.folder_path !== message.folder_path
+          || row.uidvalidity !== String(message.uidvalidity)
+          || row.uid !== String(message.uid)) {
+          if (row.due) stillDue += 1;
+          continue;
+        }
+        await this.repository.markMessageGone(message);
+        gone += 1;
+      }
+
+      // ADR 0028 order: every search/threading input, then the payload, then completion.
+      const liveBatches = downloaded.batches.map((batch) => batch.filter(isLive));
+      for (const batch of liveBatches) {
+        await this.repository.storeBodyEvidenceBatch(batch.map(({ body }) => body));
+      }
+      const single = downloaded.single.filter(isLive);
+      for (const { body } of single) await this.repository.storeBodyEvidence(body);
+      const committed = [...liveBatches.flat(), ...single];
+      for (const { message, body } of committed) {
+        await this.bodyStore.store(body);
+        await this.repository.completeBodyStorage(body.messageId);
+        await this.hooks.onBodyFetched?.(message, body);
+      }
+      return { committed: committed.length, gone, skipped: ids.length - committed.length - gone, stillDue };
+    }, { fenceWrites: true });
+    for (const id of ids) this.bodyRetries.delete(id);
+    return written;
+  }
+
+  /** Rows this engine is backing off, dropping entries long past their delay. */
+  private backedOffBodyIds(): string[] {
+    const now = Date.now();
+    const ids: string[] = [];
+    for (const [id, retry] of this.bodyRetries) {
+      if (retry.until > now) ids.push(id);
+      else if (retry.until + BODY_RETRY_MAX_MS < now) this.bodyRetries.delete(id);
+    }
+    return ids;
+  }
+
+  private backOffBodies(messages: readonly ImapMessage[]): void {
+    const now = Date.now();
+    for (const { id } of messages) {
+      const attempts = (this.bodyRetries.get(id)?.attempts ?? 0) + 1;
+      const delay = Math.min(BODY_RETRY_MAX_MS, BODY_RETRY_INITIAL_MS * 2 ** (attempts - 1));
+      this.bodyRetries.set(id, { attempts, until: now + delay });
+    }
   }
 }

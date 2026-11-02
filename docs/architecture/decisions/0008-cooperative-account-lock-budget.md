@@ -1,8 +1,14 @@
 # ADR 0008: Enforce Account Lock Budget Cooperatively
 
-Status: Accepted
+Status: Accepted; amended by ADR 0049
 
 Date: 2026-05-23
+
+> **Amended by [ADR 0049](0049-bodies-download-beside-the-lock.md).** Body
+> downloads no longer run under the lock, so `MAX_BODY_BATCHES_PER_TICK` with
+> `BODY_BACKFILL_BATCH_SIZE` now bounds the messages one body run stores, and
+> `MAX_LOCK_HOLD_MS` bounds that run's duration; the budget below still governs
+> the metadata pass.
 
 ## Context
 
