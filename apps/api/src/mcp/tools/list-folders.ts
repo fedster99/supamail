@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
-import { formatZodIssues } from "../../errors.js";
+import { formatZodIssues, inputIssues } from "../../errors.js";
 import { readAccountsFor, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
@@ -90,7 +90,8 @@ export async function runListFolders(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass an optional { account } UUID string, or no arguments to list folders for every account."
+      "Pass an optional { account } UUID string, or no arguments to list folders for every account.",
+      inputIssues(parsed.error)
     );
   }
   const request = parsed.data;

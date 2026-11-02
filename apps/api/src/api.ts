@@ -411,7 +411,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
       return c.json({ error: err.code, message: err.message }, 400);
     }
     if (err instanceof InvalidInputError) {
-      return c.json({ error: err.code, message: err.message }, 400);
+      return c.json({ error: err.code, message: err.message, issues: err.issues }, 400);
     }
     if (err instanceof NotFoundError) {
       return c.json({ error: "not_found", message: err.message }, 404);

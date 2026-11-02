@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
-import { formatZodIssues } from "../../errors.js";
+import { formatZodIssues, inputIssues } from "../../errors.js";
 import { buildSyncStatus, type SyncStatus } from "../../search/index.js";
 import { toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
@@ -62,7 +62,8 @@ export async function runGetSyncStatus(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass an optional { account } UUID string, or no arguments to report every account."
+      "Pass an optional { account } UUID string, or no arguments to report every account.",
+      inputIssues(parsed.error)
     );
   }
   const accountId = parsed.data.account ?? null;

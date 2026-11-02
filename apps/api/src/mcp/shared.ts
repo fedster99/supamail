@@ -1,3 +1,4 @@
+import type { InputIssue } from "../errors.js";
 import { bareContentId } from "../inline-images.js";
 import type { PgClient, PgPool } from "../db.js";
 import {
@@ -539,13 +540,15 @@ export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => 
   }
 }
 
-/** The uniform error envelope. `hint` tells the agent what to do next. */
+/** The uniform error envelope. `hint` tells the agent what to do next; an
+ * `invalid_input` also names each rejected field by fixed rule in `issues`. */
 export function toolError(
   code: string,
   message: string,
-  hint: string
-): { error: { code: string; message: string; hint: string } } {
-  return { error: { code, message, hint } };
+  hint: string,
+  issues?: readonly InputIssue[]
+): { error: { code: string; message: string; hint: string; issues?: InputIssue[] } } {
+  return { error: { code, message, hint, ...(issues ? { issues: [...issues] } : {}) } };
 }
 
 /**

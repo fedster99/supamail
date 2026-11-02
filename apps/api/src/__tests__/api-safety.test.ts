@@ -1235,7 +1235,7 @@ describe("API safety", () => {
     const { InvalidInputError } = await import("../errors.js");
     const { app } = buildApp({
       send: async () => {
-        throw new InvalidInputError('Header "Bcc" cannot be set via custom headers');
+        throw new InvalidInputError('Header "Bcc" cannot be set via custom headers', [{ rule: "unknown_key", path: ["headers"] }]);
       }
     });
     const res = await app.request(`/accounts/${accountId}/send`, {
@@ -1246,7 +1246,8 @@ describe("API safety", () => {
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toEqual({
       error: "invalid_input",
-      message: 'Header "Bcc" cannot be set via custom headers'
+      message: 'Header "Bcc" cannot be set via custom headers',
+      issues: [{ rule: "unknown_key", path: ["headers"] }]
     });
   });
 

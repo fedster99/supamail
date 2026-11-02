@@ -12,7 +12,9 @@ describe("runReadMessage library options", () => {
       { message_id: "not-a-uuid" }
     );
 
-    expect(result).toMatchObject({ error: { code: "invalid_input", message: "message_id: Invalid uuid" } });
+    expect(result).toMatchObject({
+      error: { code: "invalid_input", message: "message_id: Invalid uuid", issues: [{ rule: "format", path: ["message_id"] }] }
+    });
     expect(connect).not.toHaveBeenCalled();
   });
 

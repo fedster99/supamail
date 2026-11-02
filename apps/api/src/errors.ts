@@ -13,27 +13,85 @@
  *   MailboxConflictError     → 409 mailbox_conflict
  */
 
-import type { ZodError } from "zod";
+import type { ZodError, ZodIssue } from "zod";
+
+/** Why an input was rejected, as a fixed id a host can count without reading the
+ * message. The vocabulary is small and independent of the validation library:
+ * `missing` (a required field is absent), `type` (wrong JSON type), `value` (not
+ * one of the accepted values), `unknown_key` (a field the operation does not
+ * accept), `too_small`, `too_big`, `format` (a string that is not a uuid, address,
+ * date or pattern), `constraint` (a rule across fields or on content). */
+export const INPUT_ISSUE_RULES = [
+  "missing", "type", "value", "unknown_key", "too_small", "too_big", "format", "constraint"
+] as const;
+export type InputIssueRule = (typeof INPUT_ISSUE_RULES)[number];
+
+/** One rejected input. `path` names the rejected field as the schema declares it
+ * (object keys and array indexes; the whole input is `[]`). It never carries
+ * caller text, so a host may record it; the readable message stays in `message`. */
+export interface InputIssue {
+  rule: InputIssueRule;
+  path: Array<string | number>;
+}
 
 /** The caller's input is malformed (wrong shape, invalid address or id, a field
  * the operation does not accept). A client error the caller must fix, never a
  * provider or server fault, so it is never retried. Mapped to 400. */
 export class InvalidInputError extends Error {
   readonly code = "invalid_input";
+  /** Why, as fixed ids. Empty only for a rule that no field owns. */
+  readonly issues: readonly InputIssue[];
 
-  constructor(message: string) {
+  constructor(message: string, issues: readonly InputIssue[] = []) {
     super(message);
     this.name = "InvalidInputError";
+    this.issues = issues;
   }
 }
+
+/** At most this many issues are reported, readable or typed. */
+const REPORTED_ISSUES = 5;
 
 /** One readable line per schema issue (`to.0.email: Invalid email`), joined with
  * "; " and capped at five, so hosts can show it as-is. */
 export function formatZodIssues(error: ZodError): string {
   return error.issues
-    .slice(0, 5)
+    .slice(0, REPORTED_ISSUES)
     .map((issue) => `${issue.path.length > 0 ? issue.path.join(".") : "input"}: ${issue.message}`)
     .join("; ");
+}
+
+function issueRule(issue: ZodIssue): InputIssueRule {
+  switch (issue.code) {
+    case "invalid_type":
+      if (issue.received === "undefined") return "missing";
+      return issue.expected === "undefined" ? "unknown_key" : "type";
+    case "unrecognized_keys":
+      return "unknown_key";
+    case "invalid_enum_value":
+    case "invalid_literal":
+    case "invalid_union":
+    case "invalid_union_discriminator":
+      return "value";
+    case "too_small":
+      return "too_small";
+    case "too_big":
+      return "too_big";
+    case "invalid_string":
+    case "invalid_date":
+      return "format";
+    default:
+      return "constraint";
+  }
+}
+
+/** The typed issues behind a schema failure: the same issues, order and cap as
+ * {@link formatZodIssues}. An unrecognized key is reported at the object's path,
+ * never by the caller's key. */
+export function inputIssues(error: ZodError): InputIssue[] {
+  return error.issues
+    .slice(0, REPORTED_ISSUES)
+    .map((issue) => ({ rule: issueRule(issue), path: [...issue.path] }));
 }
 
 /** A requested resource (message, draft, attachment, account) does not exist. */

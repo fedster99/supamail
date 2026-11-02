@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { InvalidInputError, formatZodIssues } from "./errors.js";
+import { InvalidInputError, formatZodIssues, inputIssues } from "./errors.js";
 
 /**
  * The one schema for compose input (send, draft create, draft update). The HTTP
@@ -111,6 +111,6 @@ export const DRAFT_UPDATE_SCHEMA = DRAFT_INPUT_SCHEMA.omit({ accountId: true });
 /** Parse `input`, or throw {@link InvalidInputError} with a readable message. */
 export function parseInput<S extends z.ZodTypeAny>(schema: S, input: unknown): z.output<S> {
   const parsed = schema.safeParse(input);
-  if (!parsed.success) throw new InvalidInputError(formatZodIssues(parsed.error));
+  if (!parsed.success) throw new InvalidInputError(formatZodIssues(parsed.error), inputIssues(parsed.error));
   return parsed.data;
 }

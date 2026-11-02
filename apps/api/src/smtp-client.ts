@@ -152,12 +152,14 @@ function assertSafeCustomHeaders(headers: Record<string, string>): void {
     const lower = name.toLowerCase();
     if (FORBIDDEN_CUSTOM_HEADERS.has(lower)) {
       throw new InvalidInputError(
-        `Header "${name}" cannot be set via custom headers — set it through the structured send fields instead`
+        `Header "${name}" cannot be set via custom headers — set it through the structured send fields instead`,
+        [{ rule: "unknown_key", path: ["headers"] }]
       );
     }
     if (lower.startsWith("x-") || ALLOWED_NON_X.has(lower)) continue;
     throw new InvalidInputError(
-      `Custom header "${name}" is not allowed — only X-* custom headers (and In-Reply-To/References/Message-ID) may be set`
+      `Custom header "${name}" is not allowed — only X-* custom headers (and In-Reply-To/References/Message-ID) may be set`,
+      [{ rule: "unknown_key", path: ["headers"] }]
     );
   }
 }
@@ -179,7 +181,7 @@ export const SENDER_NAME_SUPPORTED = true;
 
 export async function buildRawMime(req: SendRequest, from: SendRecipient): Promise<BuiltMime> {
   if (req.senderName !== undefined && (typeof req.senderName !== "string" || req.senderName.length > 120 || /[\x00-\x1f\x7f]/.test(req.senderName))) {
-    throw new InvalidInputError("Sender name must be a single line of at most 120 characters");
+    throw new InvalidInputError("Sender name must be a single line of at most 120 characters", [{ rule: "format", path: ["senderName"] }]);
   }
   validateInlineImages(req);
   const messageId = req.messageId ?? `<${randomUUID()}@${domainOf(from.email)}>`;
