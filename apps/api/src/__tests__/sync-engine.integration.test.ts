@@ -6367,6 +6367,8 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
         live_bodies_fetched_count: number;
         live_bodies_target_count: number;
         live_bodies_complete_pct: number;
+        live_bodies_truncated_count: number;
+        live_bodies_missing_count: number;
       }>(
         `
         SELECT
@@ -6378,7 +6380,9 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
           priority_bodies_complete_pct,
           live_bodies_fetched_count,
           live_bodies_target_count,
-          live_bodies_complete_pct
+          live_bodies_complete_pct,
+          live_bodies_truncated_count,
+          live_bodies_missing_count
         FROM public.imap_account_progress
         WHERE account_id = $1
         `,
@@ -6394,7 +6398,10 @@ integration("sync-engine integration (real Postgres + fixture IMAP)", () => {
       priority_bodies_complete_pct: 50,
       live_bodies_fetched_count: 2,
       live_bodies_target_count: 4,
-      live_bodies_complete_pct: 50
+      live_bodies_complete_pct: 50,
+      // uid 2 is stored at the cap; uid 4 has a fetch marker but no body row.
+      live_bodies_truncated_count: 1,
+      live_bodies_missing_count: 1
     });
 
     const details = await h.repository.getAccountDetails(h.account.id);
