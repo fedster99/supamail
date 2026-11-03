@@ -1047,7 +1047,9 @@ export async function createFolder(
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
   return await withInteractiveAccountLock(pool, account, async () => {
-    const mutator = await MailboxMutator.connect(pool, config, account, options);
+    // A folder change never reuses a parked session (ADR 0051): ImapFlow sends
+    // CLOSE before renaming or deleting a selected folder, and CLOSE expunges.
+    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
     try {
       const result = await mutator.createFolder(path);
       return { accountId, path: result.path, created: result.created };
@@ -1073,7 +1075,9 @@ export async function renameFolder(
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
   return await withInteractiveAccountLock(pool, account, async () => {
-    const mutator = await MailboxMutator.connect(pool, config, account, options);
+    // A folder change never reuses a parked session (ADR 0051): ImapFlow sends
+    // CLOSE before renaming or deleting a selected folder, and CLOSE expunges.
+    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
     try {
       const result = await mutator.renameFolder(path, newPath);
       return { accountId, path: result.path, newPath: result.newPath };
@@ -1098,7 +1102,9 @@ export async function deleteFolder(
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
   return await withInteractiveAccountLock(pool, account, async () => {
-    const mutator = await MailboxMutator.connect(pool, config, account, options);
+    // A folder change never reuses a parked session (ADR 0051): ImapFlow sends
+    // CLOSE before renaming or deleting a selected folder, and CLOSE expunges.
+    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
     try {
       const result = await mutator.deleteFolder(path);
       return { accountId, path: result.path };

@@ -68,7 +68,9 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   `ActionConnection`: one login, reopened only if the socket died, logged out
   once (ADR 0043). With a host session store, an action reuses a parked session
   for the same account and credentials after a NOOP, and parks its own only when
-  it was not aborted and the socket is usable; downloads never reuse (ADR 0051).
+  it was not aborted and the socket is usable. Attachment and header downloads and
+  folder changes never take a parked session: a rename or delete of the selected
+  folder makes ImapFlow send CLOSE (ADR 0051).
 - A host-owned sync client reused across passes is invalidated at the start of
   each pass, so the next lock on the still-selected mailbox sends SELECT and
   reads UIDNEXT again. Never CLOSE to force this: CLOSE expunges `\Deleted`.

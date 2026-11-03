@@ -504,6 +504,17 @@ describe("folder CRUD", () => {
     expect(deleted).toMatchObject({ accountId: "acc-1", path: "Work" });
   });
 
+  it("never gives a folder change a parked session, whose selected folder ImapFlow would CLOSE and expunge", async () => {
+    const { createFolder, renameFolder, deleteFolder } = await import("../mailbox-mutations.js");
+    const sessions = { take: vi.fn(() => null), park: vi.fn() };
+    connectSpy.mockClear();
+    await createFolder({} as never, config, "acc-1", "Projects", undefined, { sessions });
+    await renameFolder({} as never, config, "acc-1", "Projects", "Work", undefined, { sessions });
+    await deleteFolder({} as never, config, "acc-1", "Work", undefined, { sessions });
+    expect(connectSpy).toHaveBeenCalledTimes(3);
+    for (const call of connectSpy.mock.calls) expect(call[3]).not.toHaveProperty("sessions");
+  });
+
   it("throws when the account is unknown", async () => {
     repo.getAccount.mockResolvedValueOnce(null);
     const { createFolder } = await import("../mailbox-mutations.js");

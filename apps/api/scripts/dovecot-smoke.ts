@@ -572,9 +572,11 @@ async function main(): Promise<void> {
     };
     const firstParked = await saveWithSteps("parked-first");
     const secondParked = await saveWithSteps("parked-second");
+    const reusedBeforeFlag = reusedLogins;
     if (secondParked.saved.messageId) {
       await setMessageFlags(pool, sessionConfig, secondParked.saved.messageId, { add: ["flagged"] }, undefined, { sessions });
     }
+    const flagReusedLogin = reusedLogins === reusedBeforeFlag + 1;
     await new Promise((resolve) => setTimeout(resolve, 20_000));
     const afterIdle = await saveWithSteps("parked-after-idle");
     const parkedSessions = parked.size;
@@ -615,7 +617,7 @@ async function main(): Promise<void> {
       ["sync kept the draft id and body", draftSync.outcome === "success" && Boolean(draftAfterSync?.body?.includes(draftText))],
       ["first save with a session store logged in", firstParked.steps[0] === "connect"],
       ["second save reused the parked login", secondParked.steps[0] === "reuse"],
-      ["a flag change reused the parked login", reusedLogins >= 2],
+      ["a flag change reused the parked login", flagReusedLogin],
       ["a session parked past auto-IDLE was reused", afterIdle.steps[0] === "reuse"],
       ["saves on a reused login were mirrored at once", [firstParked, secondParked, afterIdle]
         .every(({ saved }) => saved.messageId !== null && saved.warnings.length === 0)],

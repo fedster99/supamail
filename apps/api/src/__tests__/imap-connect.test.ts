@@ -421,6 +421,20 @@ describe("parked action sessions (ADR 0051)", () => {
     }
   });
 
+  it("closes a parked session and fails as aborted when the action aborts during the check", async () => {
+    const store = sessionStore();
+    await actionSteps(store);
+    const abort = new AbortController();
+    fake.noop.mockImplementationOnce(() => new Promise(() => undefined));
+    const connection = new ActionConnection({} as never, config, account, { sessions: store, signal: abort.signal });
+    const opening = connection.get();
+    await Promise.resolve();
+    abort.abort(new Error("lease lost"));
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(fake.connectImpl).toHaveBeenCalledTimes(1);
+    expect(store.parked.size).toBe(0);
+  });
+
   it("never parks the session of an aborted action or a dead socket", async () => {
     const store = sessionStore();
     const abort = new AbortController();

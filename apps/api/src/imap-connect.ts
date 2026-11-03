@@ -151,15 +151,19 @@ function actionSessionKey(account: ImapAccount): string {
     .digest("hex");
 }
 
-/** True when a parked session still answers. A session that fails or stalls is closed. */
-async function answersNoop(client: ImapFlow): Promise<boolean> {
-  const stalled = setTimeout(() => client.close(), SESSION_REUSE_CHECK_MS);
+/** True when a parked session still answers. A session that fails, stalls or whose
+ * action aborts during the check is closed. */
+async function answersNoop(client: ImapFlow, signal?: AbortSignal): Promise<boolean> {
+  const close = () => client.close();
+  const stalled = setTimeout(close, SESSION_REUSE_CHECK_MS);
+  signal?.addEventListener("abort", close, { once: true });
   try {
     await client.noop();
   } catch {
     client.close();
   } finally {
     clearTimeout(stalled);
+    signal?.removeEventListener("abort", close);
   }
   return client.usable;
 }
@@ -186,7 +190,7 @@ export async function connectAbortableImap(
     const key = actionSessionKey(account);
     park = (client) => sessions.park(key, client);
     const parked = sessions.take(key);
-    if (parked && !signal?.aborted && await answersNoop(parked)) {
+    if (parked && !signal?.aborted && await answersNoop(parked, signal)) {
       return { client: parked, abort: new ImapAbortBinding(parked, signal, park), reused: true };
     }
     parked?.close();
