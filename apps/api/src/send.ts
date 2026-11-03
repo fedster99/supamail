@@ -92,7 +92,7 @@ async function sendMessageAttempt(
   config: AppConfig,
   req: SendRequest,
   metadataProtection: MetadataProtectionAdapter,
-  { signal, bodyStore: hostBodyStore }: MailboxActionOptions,
+  { signal, bodyStore: hostBodyStore, sessions }: MailboxActionOptions,
   confirmDelivery: () => void
 ): Promise<SendResult> {
   throwIfAborted(signal);
@@ -152,7 +152,7 @@ async function sendMessageAttempt(
       );
     }
     if (lockLiveForFiling) {
-      const connection = new ActionConnection(pool, config, account, signal);
+      const connection = new ActionConnection(pool, config, account, { signal, sessions });
       try {
         sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, addWarning);
       } finally {

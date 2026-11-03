@@ -11,6 +11,7 @@ import {
   type ActionConnection,
   type ActionSocket,
   type ImapAbortBinding,
+  type ActionSessionStore,
   type ImapStepTimer
 } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
@@ -81,6 +82,9 @@ export interface MailboxActionOptions {
   /** Where an action that files a message stores its body (ADR 0046); the host's
    * sync store. Defaults to the OSS database store, as sync does. */
   bodyStore?: BodyStore;
+  /** Where the host keeps signed-in sessions between actions (ADR 0051). Without
+   * it, every action logs in and logs out. */
+  sessions?: ActionSessionStore;
 }
 
 /** A SupaMail well-known flag name mapped to its IMAP system flag. */
@@ -185,7 +189,7 @@ export class MailboxMutator {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
     // mutation verb surface on top (ADR 0018/0022).
-    const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
+    const { client, abort } = await connectAbortableImap(pool, config, account, options);
     return new MailboxMutator(client, account.host, abort);
   }
 
@@ -732,7 +736,7 @@ async function deleteLoadedMessage(
   // A caller's action connection is reused and stays open for its next step.
   const mutator = options.connection
     ? MailboxMutator.over(await options.connection.get(), account)
-    : await MailboxMutator.connect(pool, config, account, { signal: options.signal });
+    : await MailboxMutator.connect(pool, config, account, options);
   let trashFolder: string | null = null;
   try {
     // The changed folders are durably due before the provider command, as for a move.

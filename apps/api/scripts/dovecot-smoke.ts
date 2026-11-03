@@ -10,7 +10,7 @@ import { getConfig } from "../src/config.js";
 import { applyPublicMigrations, closePool, getPool } from "../src/db.js";
 import { openInboxIdleSession } from "../src/inbox-idle.js";
 import { createDraft, getDraft } from "../src/drafts.js";
-import { MailboxMutator, moveMessages } from "../src/mailbox-mutations.js";
+import { MailboxMutator, moveMessages, setMessageFlags } from "../src/mailbox-mutations.js";
 import { MirrorRepository } from "../src/repository.js";
 import { MirrorEngine } from "../src/sync-engine.js";
 import { checkMoveFallback } from "./dovecot-move-fallback.js";
@@ -544,6 +544,42 @@ async function main(): Promise<void> {
     const draftSync = await engine.syncAccount(account.id, "manual");
     const draftAfterSync = savedDraft.messageId ? await getDraft(pool, config, savedDraft.messageId) : null;
 
+    // Parked sessions (ADR 0051): with a host store, later actions on the mailbox use
+    // the first action's login. The production command timeout (60 s) lets a session
+    // stay parked past ImapFlow's 15 s auto-IDLE, as it does in a host's 45 s window.
+    const parked = new Map<string, ImapFlow>();
+    let reusedLogins = 0;
+    const sessions = {
+      take: (key: string) => {
+        const client = parked.get(key) ?? null;
+        parked.delete(key);
+        if (client) reusedLogins += 1;
+        return client;
+      },
+      park: (key: string, client: ImapFlow) => { parked.set(key, client); }
+    };
+    const sessionConfig = { ...config, IMAP_COMMAND_TIMEOUT_MS: 60_000 };
+    const saveWithSteps = async (subject: string) => {
+      const steps: string[] = [];
+      const saved = await createDraft(pool, sessionConfig, {
+        accountId: account.id,
+        to: [{ email: "recipient@example.test" }],
+        subject,
+        body: { format: "plain", text: subject },
+        idempotencyKey: `dovecot-${subject}-${Date.now()}`
+      }, undefined, { sessions, onImapStep: (step) => steps.push(step) });
+      return { saved, steps };
+    };
+    const firstParked = await saveWithSteps("parked-first");
+    const secondParked = await saveWithSteps("parked-second");
+    if (secondParked.saved.messageId) {
+      await setMessageFlags(pool, sessionConfig, secondParked.saved.messageId, { add: ["flagged"] }, undefined, { sessions });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20_000));
+    const afterIdle = await saveWithSteps("parked-after-idle");
+    const parkedSessions = parked.size;
+    for (const client of parked.values()) await client.logout().catch(() => client.close());
+
     const assertions: Array<[string, boolean]> = [
       ["sync succeeded", result.outcome === "success"],
       ["discovered Dovecot folders", counts.folders >= 4],
@@ -576,7 +612,14 @@ async function main(): Promise<void> {
       ["draft save returned its mirror id without warnings", savedDraft.messageId !== null && savedDraft.warnings.length === 0],
       ["draft row is the server's view at once", draftStructure !== null],
       ["draft body readable at once", Boolean(draftAtOnce?.body?.includes(draftText))],
-      ["sync kept the draft id and body", draftSync.outcome === "success" && Boolean(draftAfterSync?.body?.includes(draftText))]
+      ["sync kept the draft id and body", draftSync.outcome === "success" && Boolean(draftAfterSync?.body?.includes(draftText))],
+      ["first save with a session store logged in", firstParked.steps[0] === "connect"],
+      ["second save reused the parked login", secondParked.steps[0] === "reuse"],
+      ["a flag change reused the parked login", reusedLogins >= 2],
+      ["a session parked past auto-IDLE was reused", afterIdle.steps[0] === "reuse"],
+      ["saves on a reused login were mirrored at once", [firstParked, secondParked, afterIdle]
+        .every(({ saved }) => saved.messageId !== null && saved.warnings.length === 0)],
+      ["one session stayed parked", parkedSessions === 1]
     ];
     const failed = assertions.filter(([, passed]) => !passed);
     if (failed.length > 0) {
@@ -604,7 +647,11 @@ async function main(): Promise<void> {
         inboxBefore: inboxBeforeMove.messages,
         inboxAfter: inboxAfterMove.messages
       },
-      draft: { savedDraft, bodyAtOnce: draftAtOnce?.body ?? null }
+      draft: { savedDraft, bodyAtOnce: draftAtOnce?.body ?? null },
+      parkedSessions: {
+        steps: [firstParked.steps, secondParked.steps, afterIdle.steps],
+        reusedLogins
+      }
     }, null, 2));
   } finally {
     const keepData = process.env.SUPAMAIL_DOVECOT_KEEP_DATA === "true";

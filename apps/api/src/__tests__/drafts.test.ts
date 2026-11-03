@@ -113,8 +113,11 @@ vi.mock("../imap-connect.js", async (importOriginal) => {
     // One fake socket per action: the first get() logs in, close() logs out once.
     ActionConnection: class {
       private open = false;
-      constructor(_pool: unknown, _config: unknown, _account: unknown, _signal?: unknown,
-        readonly onStep?: (step: string, ms: number) => void) {}
+      readonly onStep?: (step: string, ms: number) => void;
+      constructor(_pool: unknown, _config: unknown, _account: unknown,
+        options: { onImapStep?: (step: string, ms: number) => void } = {}) {
+        this.onStep = options.onImapStep;
+      }
       async get() {
         if (!this.open) mocks.logins.count += 1;
         this.open = true;

@@ -423,7 +423,7 @@ export class SentFolderAppender {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
     // append-only verb surface on top (ADR 0017/0022).
-    const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
+    const { client, abort } = await connectAbortableImap(pool, config, account, { signal: options.signal });
     return new SentFolderAppender(client, abort);
   }
 
