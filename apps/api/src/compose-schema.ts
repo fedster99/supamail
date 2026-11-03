@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { InvalidInputError, formatZodIssues } from "./errors.js";
+import { InvalidInputError, formatZodIssues, inputIssues } from "./errors.js";
 
 /**
  * The one schema for compose input (send, draft create, draft update). The HTTP
@@ -17,8 +17,12 @@ import { InvalidInputError, formatZodIssues } from "./errors.js";
 const NO_CRLF = (v: string) => !/[\r\n]/.test(v);
 const CRLF_MSG = "must not contain CR or LF characters";
 const headerSafe = (max: number) => z.string().max(max).refine(NO_CRLF, CRLF_MSG);
-// A record whose values are all header-safe (custom headers).
-const HEADER_RECORD = z.record(z.string().refine(NO_CRLF, CRLF_MSG));
+// A record whose values are all header-safe (custom headers). The rule reports at
+// the record, so an issue path never carries a caller-chosen header name (ADR 0050).
+const HEADER_RECORD = z.record(z.string()).refine(
+  (headers) => Object.values(headers).every(NO_CRLF),
+  `custom header values ${CRLF_MSG}`
+);
 
 /** Longest accepted References value; reply composition trims its chain to fit. */
 export const MAX_REFERENCES_LENGTH = 8000;
@@ -111,6 +115,6 @@ export const DRAFT_UPDATE_SCHEMA = DRAFT_INPUT_SCHEMA.omit({ accountId: true });
 /** Parse `input`, or throw {@link InvalidInputError} with a readable message. */
 export function parseInput<S extends z.ZodTypeAny>(schema: S, input: unknown): z.output<S> {
   const parsed = schema.safeParse(input);
-  if (!parsed.success) throw new InvalidInputError(formatZodIssues(parsed.error));
+  if (!parsed.success) throw new InvalidInputError(formatZodIssues(parsed.error), inputIssues(parsed.error));
   return parsed.data;
 }

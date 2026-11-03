@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
-import { formatZodIssues } from "../../errors.js";
+import { formatZodIssues, inputIssues } from "../../errors.js";
 import type { ReadAccount } from "../../search/index.js";
 import { buildReadAccounts } from "../../search/index.js";
 import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identity.js";
@@ -497,7 +497,8 @@ async function runReadThreadInternal(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass message_id, message_ids, or conversation_id/thread_id together with the account UUID."
+      "Pass message_id, message_ids, or conversation_id/thread_id together with the account UUID.",
+      inputIssues(parsed.error)
     );
   }
   const input: ReadThreadArgs = parsed.data;
@@ -512,7 +513,8 @@ async function runReadThreadInternal(
     return toolError(
       "invalid_input",
       "read_thread accepts one selector mode at a time.",
-      "Pass one message_id, one message_ids batch, or one account-scoped conversation/thread id."
+      "Pass one message_id, one message_ids batch, or one account-scoped conversation/thread id.",
+      [{ rule: "constraint", path: [] }]
     );
   }
 
@@ -566,7 +568,8 @@ async function runReadThreadInternal(
     return toolError(
       "invalid_input",
       "read_thread requires message_id, message_ids, conversation_id, or thread_id.",
-      "Pass message_id/message_ids, or pass conversation_id/thread_id together with account."
+      "Pass message_id/message_ids, or pass conversation_id/thread_id together with account.",
+      [{ rule: "missing", path: [] }]
     );
   }
 
@@ -576,7 +579,8 @@ async function runReadThreadInternal(
     return toolError(
       "invalid_input",
       `${conversationId ? "conversation_id" : "thread_id"} requires account.`,
-      "Provider and conversation identifiers are account-scoped; pass account as a UUID."
+      "Provider and conversation identifiers are account-scoped; pass account as a UUID.",
+      [{ rule: "missing", path: ["account"] }]
     );
   }
   const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;

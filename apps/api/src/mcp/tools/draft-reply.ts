@@ -1,3 +1,4 @@
+import { formatZodIssues, inputIssues } from "../../errors.js";
 import { bareContentId, referencedContentIds } from "../../inline-images.js";
 import { z } from "zod";
 import { MAX_REFERENCES_LENGTH } from "../../compose-schema.js";
@@ -325,7 +326,16 @@ export async function runDraftReply(
   args: unknown,
   metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection
 ): Promise<DraftReply | ReturnType<typeof toolError>> {
-  const request = draftReplyRequestSchema.parse(args);
+  const parsed = draftReplyRequestSchema.safeParse(args ?? {});
+  if (!parsed.success) {
+    return toolError(
+      "invalid_input",
+      formatZodIssues(parsed.error),
+      "Pass source_message_id as a UUID with the optional body, body_format and reply_all.",
+      inputIssues(parsed.error)
+    );
+  }
+  const request = parsed.data;
 
   const row = await withReadOnlyTx(pool, async (client) => {
     const result = await client.query<SourceRow>(

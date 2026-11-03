@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { ACTIVE_ASSIGNMENT_JOIN } from "../../delivery-identity.js";
-import { formatZodIssues } from "../../errors.js";
+import { formatZodIssues, inputIssues } from "../../errors.js";
 import {
   loadMessageAttachments,
   mapMessageRow,
@@ -161,7 +161,8 @@ export async function runReadMessage(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass one valid message_id and optional body range or header settings."
+      "Pass one valid message_id and optional body range or header settings.",
+      inputIssues(parsed.error)
     );
   }
   const request = parsed.data;

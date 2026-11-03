@@ -9,11 +9,14 @@ export * from "./drafts.js";
 export {
   AbortError,
   AccountBusyError,
+  INPUT_ISSUE_RULES,
   InvalidInputError,
   NoRecipientsError,
   NotFoundError,
-  UnfetchableContentError
+  UnfetchableContentError,
+  inputIssues
 } from "./errors.js";
+export type { InputIssue, InputIssueRule } from "./errors.js";
 export * from "./imap-client.js";
 export * from "./inbox-idle.js";
 export * from "./locks.js";

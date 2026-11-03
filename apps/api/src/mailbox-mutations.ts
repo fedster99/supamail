@@ -288,7 +288,7 @@ export class MailboxMutator {
     const [first] = targets;
     if (!first || targets.some((target) =>
       target.accountId !== first.accountId || target.folderPath !== first.folderPath || target.uidValidity !== first.uidValidity)) {
-      throw new InvalidInputError("move requires one or more targets from one mailbox and one folder at one UIDVALIDITY");
+      throw new InvalidInputError("move requires one or more targets from one mailbox and one folder at one UIDVALIDITY", [{ rule: "constraint", path: ["targets"] }]);
     }
     if (!this.hasCapability("MOVE") && !this.hasCapability("UIDPLUS")) {
       throw new MailboxCapabilityError(
@@ -579,7 +579,7 @@ export async function moveMessages(
   options: MailboxActionOptions = {}
 ): Promise<MoveOutcome[]> {
   if (!destination || destination.trim().length === 0) {
-    throw new InvalidInputError("moveMessages requires a non-empty destination folder");
+    throw new InvalidInputError("moveMessages requires a non-empty destination folder", [{ rule: "missing", path: ["destination"] }]);
   }
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);

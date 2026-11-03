@@ -573,7 +573,7 @@ export class MirrorEngine {
       throw new Error("Host-owned client does not match the Mailbox Account");
     }
     if ("bodyBacklogOnly" in options) {
-      throw new InvalidInputError("bodyBacklogOnly is retired; bodies download through syncBodies (ADR 0049)");
+      throw new InvalidInputError("bodyBacklogOnly is retired; bodies download through syncBodies (ADR 0049)", [{ rule: "unknown_key", path: ["bodyBacklogOnly"] }]);
     }
     const account = await this.repository.getAccount(accountId);
     if (!account) throw new Error(`Account not found: ${accountId}`);

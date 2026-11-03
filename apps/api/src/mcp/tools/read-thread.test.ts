@@ -476,14 +476,14 @@ describe("read_thread stored assignments", () => {
   });
 
   it.each([
-    [{ message_id: "not-a-uuid" }, "message_id: Invalid uuid"],
-    [{ message_ids: ["not-a-uuid"] }, "message_ids.0: Invalid uuid"]
-  ])("rejects invalid message ids before opening a database connection", async (args, message) => {
+    [{ message_id: "not-a-uuid" }, "message_id: Invalid uuid", ["message_id"]],
+    [{ message_ids: ["not-a-uuid"] }, "message_ids.0: Invalid uuid", ["message_ids", 0]]
+  ])("rejects invalid message ids before opening a database connection", async (args, message, path) => {
     const connect = vi.fn();
 
     const out = await runReadThread({ connect } as never, args);
 
-    expect(out).toMatchObject({ error: { code: "invalid_input", message } });
+    expect(out).toMatchObject({ error: { code: "invalid_input", message, issues: [{ rule: "format", path }] } });
     expect(connect).not.toHaveBeenCalled();
   });
 
@@ -694,7 +694,7 @@ describe("read_thread stored assignments", () => {
     const out = await runReadThread({ connect } as never, { [field]: value });
 
     expect(out).toMatchObject({
-      error: { code: "invalid_input", message: `${field} requires account.` }
+      error: { code: "invalid_input", message: `${field} requires account.`, issues: [{ rule: "missing", path: ["account"] }] }
     });
     expect(connect).not.toHaveBeenCalled();
   });

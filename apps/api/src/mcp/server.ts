@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ZodError } from "zod";
 import { closePool, getPool } from "../db.js";
+import { InvalidInputError, formatZodIssues, inputIssues } from "../errors.js";
 import { TOOLS } from "./index.js";
 import { MCP_INSTRUCTIONS } from "./instructions.js";
 import { toolError } from "./shared.js";
@@ -64,14 +66,14 @@ export async function createServer(): Promise<Server> {
       const payload = await entry.handler(getPool(), args ?? {});
       return { content: [{ type: "text" as const, text: JSON.stringify(payload) }] };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      // A rejected input is the caller's to fix and keeps its typed issues; anything else failed.
+      const envelope = error instanceof InvalidInputError
+        ? toolError("invalid_input", error.message, "Fix the arguments and retry.", error.issues)
+        : error instanceof ZodError
+          ? toolError("invalid_input", formatZodIssues(error), "Check the arguments against the tool's inputSchema and retry.", inputIssues(error))
+          : toolError("tool_failed", error instanceof Error ? error.message : String(error), "Check the arguments against the tool's inputSchema and retry.");
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(toolError("tool_failed", message, "Check the arguments against the tool's inputSchema and retry."))
-          }
-        ],
+        content: [{ type: "text" as const, text: JSON.stringify(envelope) }],
         isError: true
       };
     }

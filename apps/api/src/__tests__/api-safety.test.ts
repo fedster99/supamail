@@ -793,9 +793,10 @@ describe("API safety", () => {
       })
     });
     expect(res.status).toBe(400);
-    const json = await res.json() as { error: string; issues: Array<{ message: string }> };
+    const json = await res.json() as { error: string; message: string; issues: Array<{ rule: string; path: unknown[] }> };
     expect(json.error).toBe("invalid_input");
-    expect(json.issues.some((i) => i.message === "Bcc is not supported on saved drafts — set Bcc when you send the draft")).toBe(true);
+    expect(json.message).toContain("bcc: Bcc is not supported on saved drafts — set Bcc when you send the draft");
+    expect(json.issues).toContainEqual({ rule: "unknown_key", path: ["bcc"] });
     // The draft is never filed when Bcc is present.
     expect(drafts.create).not.toHaveBeenCalled();
   });
@@ -1235,7 +1236,7 @@ describe("API safety", () => {
     const { InvalidInputError } = await import("../errors.js");
     const { app } = buildApp({
       send: async () => {
-        throw new InvalidInputError('Header "Bcc" cannot be set via custom headers');
+        throw new InvalidInputError('Header "Bcc" cannot be set via custom headers', [{ rule: "unknown_key", path: ["headers"] }]);
       }
     });
     const res = await app.request(`/accounts/${accountId}/send`, {
@@ -1246,7 +1247,8 @@ describe("API safety", () => {
     expect(res.status).toBe(400);
     await expect(res.json()).resolves.toEqual({
       error: "invalid_input",
-      message: 'Header "Bcc" cannot be set via custom headers'
+      message: 'Header "Bcc" cannot be set via custom headers',
+      issues: [{ rule: "unknown_key", path: ["headers"] }]
     });
   });
 
