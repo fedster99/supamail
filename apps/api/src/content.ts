@@ -170,7 +170,7 @@ export class ContentImapClient {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
     // download/fetch read verb surface on top (ADR 0020/0022).
-    const { client, abort } = await connectAbortableImap(pool, config, account, options.signal);
+    const { client, abort } = await connectAbortableImap(pool, config, account, { signal: options.signal });
     return new ContentImapClient(client, abort);
   }
 

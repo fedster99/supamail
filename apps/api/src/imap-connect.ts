@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import { decryptPassword } from "./crypto.js";
@@ -121,32 +122,97 @@ export async function connectImap(
 }
 
 /**
+ * Where a host keeps signed-in action sessions between direct actions (ADR 0051).
+ * `take` removes and returns the session parked under `key`, or null; `park` keeps
+ * a healthy session for that key's next action, and the host closes it when it
+ * expires. Keys come from core and change with the account's server or credentials.
+ * Without a store, every action logs in and logs out.
+ */
+export interface ActionSessionStore {
+  take(key: string): ImapFlow | null;
+  park(key: string, client: ImapFlow): void;
+}
+
+/** Caller controls for an action's IMAP connection. */
+export interface ActionConnectOptions {
+  signal?: AbortSignal;
+  sessions?: ActionSessionStore;
+}
+
+/** A parked session that does not answer NOOP within this bound is replaced by a new login. */
+export const SESSION_REUSE_CHECK_MS = 5_000;
+
+/** A session parks only under the account's exact server and credentials, so a
+ * changed password or host can never reuse a session from before the change. */
+function actionSessionKey(account: ImapAccount): string {
+  return createHash("sha256")
+    .update(JSON.stringify([account.id, account.host, account.port, account.secure, account.username]))
+    .update(account.encrypted_password)
+    .digest("hex");
+}
+
+/** True when a parked session still answers. A session that fails, stalls or whose
+ * action aborts during the check is closed. */
+async function answersNoop(client: ImapFlow, signal?: AbortSignal): Promise<boolean> {
+  const close = () => client.close();
+  const stalled = setTimeout(close, SESSION_REUSE_CHECK_MS);
+  signal?.addEventListener("abort", close, { once: true });
+  try {
+    await client.noop();
+  } catch {
+    client.close();
+  } finally {
+    clearTimeout(stalled);
+    signal?.removeEventListener("abort", close);
+  }
+  return client.usable;
+}
+
+/**
  * Connect an action client (mutator, appender, content reader) under an optional
  * caller AbortSignal. The returned binding closes the socket on abort, which
  * rejects the in-flight command and every pending mailbox lock at once. Its `run`
  * refuses to start a command after abort and reports an interrupted command as
  * `AbortError`; its `logout` closes without sending LOGOUT after abort. Without a
  * signal every method behaves like the unbound client.
+ *
+ * With a session store, a parked session that answers NOOP is used instead of a new
+ * login (`reused`), and logout parks a still-usable session instead of ending it.
  */
 export async function connectAbortableImap(
   pool: PgPool,
   config: AppConfig,
   account: ImapAccount,
-  signal?: AbortSignal
-): Promise<{ client: ImapFlow; abort: ImapAbortBinding }> {
+  { signal, sessions }: ActionConnectOptions = {}
+): Promise<ActionSocket> {
+  let park: ((client: ImapFlow) => void) | undefined;
+  if (sessions) {
+    const key = actionSessionKey(account);
+    park = (client) => sessions.park(key, client);
+    const parked = sessions.take(key);
+    if (parked && !signal?.aborted && await answersNoop(parked, signal)) {
+      return { client: parked, abort: new ImapAbortBinding(parked, signal, park), reused: true };
+    }
+    parked?.close();
+  }
   const client = await runAbortable(signal, () => connectImap(pool, config, account, { signal }));
-  return { client, abort: new ImapAbortBinding(client, signal) };
+  return { client, abort: new ImapAbortBinding(client, signal, park), reused: false };
 }
 
 /**
  * The IMAP steps of a draft save or update, named for a caller's timing. `connect`
- * covers the host check, password decryption, TLS and login; `mirror` reads the
- * filed UID back and stores its row and body (ADR 0046); `delete` removes the
- * replaced draft, with its mirror update.
+ * covers the host check, password decryption, TLS and login; `reuse` checks a
+ * parked session instead (ADR 0051); `mirror` reads the filed UID back and stores
+ * its row and body (ADR 0046); `delete` removes the replaced draft, with its
+ * mirror update.
  */
-export const IMAP_STEPS = ["connect", "list", "find", "append", "mirror", "delete", "logout"] as const;
+export const IMAP_STEPS = ["connect", "reuse", "list", "find", "append", "mirror", "delete", "logout"] as const;
 export type ImapStep = (typeof IMAP_STEPS)[number];
 export type ImapStepTimer = (step: ImapStep, ms: number) => void;
+
+function reportImapStep(onStep: ImapStepTimer | undefined, step: ImapStep, startedAt: number): void {
+  try { onStep?.(step, performance.now() - startedAt); } catch { /* timing never changes an action */ }
+}
 
 /** Run one step and report its duration; a timer that throws never changes the step. */
 export async function timeImapStep<T>(onStep: ImapStepTimer | undefined, step: ImapStep, work: () => Promise<T>): Promise<T> {
@@ -155,14 +221,16 @@ export async function timeImapStep<T>(onStep: ImapStepTimer | undefined, step: I
   try {
     return await work();
   } finally {
-    try { onStep(step, performance.now() - startedAt); } catch { /* timing never changes an action */ }
+    reportImapStep(onStep, step, startedAt);
   }
 }
 
-/** A connected action client and the binding that closes it on abort. */
+/** A connected action client, the binding that closes it on abort, and whether it
+ * was a parked session rather than a new login. */
 export interface ActionSocket {
   client: ImapFlow;
   abort: ImapAbortBinding;
+  reused: boolean;
 }
 
 /**
@@ -173,21 +241,29 @@ export interface ActionSocket {
  */
 export class ActionConnection {
   private socket: ActionSocket | null = null;
+  readonly onStep?: ImapStepTimer;
 
   constructor(
     private readonly pool: PgPool,
     private readonly config: AppConfig,
     private readonly account: ImapAccount,
-    private readonly signal?: AbortSignal,
-    readonly onStep?: ImapStepTimer
-  ) {}
+    private readonly options: ActionConnectOptions & { onImapStep?: ImapStepTimer } = {}
+  ) {
+    this.onStep = options.onImapStep;
+  }
 
   async get(): Promise<ActionSocket> {
     if (this.socket?.client.usable) return this.socket;
     this.socket?.abort.close();
     this.socket = null;
-    this.socket = await timeImapStep(this.onStep, "connect",
-      () => connectAbortableImap(this.pool, this.config, this.account, this.signal));
+    const startedAt = performance.now();
+    let step: ImapStep = "connect";
+    try {
+      this.socket = await connectAbortableImap(this.pool, this.config, this.account, this.options);
+      if (this.socket.reused) step = "reuse";
+    } finally {
+      reportImapStep(this.onStep, step, startedAt);
+    }
     return this.socket;
   }
 
@@ -201,7 +277,11 @@ export class ActionConnection {
 export class ImapAbortBinding {
   private readonly closeOnAbort = () => this.client.close();
 
-  constructor(private readonly client: ImapFlow, private readonly signal?: AbortSignal) {
+  constructor(
+    private readonly client: ImapFlow,
+    private readonly signal?: AbortSignal,
+    private readonly park?: (client: ImapFlow) => void
+  ) {
     signal?.addEventListener("abort", this.closeOnAbort, { once: true });
   }
 
@@ -209,7 +289,15 @@ export class ImapAbortBinding {
     return runAbortable(this.signal, command);
   }
 
+  /** End the action's use of the session: park it when a store keeps sessions and it
+   * is still usable, close it after abort, and otherwise send LOGOUT. Every caller
+   * awaits its commands first, so a parked session has none in flight. */
   async logout(): Promise<void> {
+    if (this.park && this.client.usable && !this.signal?.aborted) {
+      this.signal?.removeEventListener("abort", this.closeOnAbort);
+      try { this.park(this.client); } catch { this.client.close(); }
+      return;
+    }
     try {
       if (this.signal?.aborted) this.client.close();
       else await this.client.logout();

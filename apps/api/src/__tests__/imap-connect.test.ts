@@ -19,6 +19,7 @@ const fake = vi.hoisted(() => ({
   connectImpl: vi.fn(async () => undefined),
   close: vi.fn(),
   logout: vi.fn(async () => undefined),
+  noop: vi.fn(async (_client: { usable: boolean }) => undefined),
   lastClient: undefined as { emit(event: string, error: Error): boolean } | undefined,
   lastOptions: undefined as unknown
 }));
@@ -33,8 +34,18 @@ vi.mock("imapflow", async () => {
         fake.lastOptions = options;
       }
       connect = fake.connectImpl;
-      close = fake.close;
+      // Like ImapFlow, a closed client is unusable and its pending command rejects.
+      private failPending: (error: Error) => void = () => undefined;
+      close = () => {
+        this.usable = false;
+        this.failPending(new Error("Connection not available"));
+        fake.close();
+      };
       logout = fake.logout;
+      noop = () => new Promise<void>((resolve, reject) => {
+        this.failPending = reject;
+        fake.noop(this).then(resolve, reject);
+      });
       usable = true;
     }
   };
@@ -54,6 +65,7 @@ vi.mock("../crypto.js", () => ({
 
 const {
   ActionConnection,
+  SESSION_REUSE_CHECK_MS,
   timeImapStep,
   connectAbortableImap,
   connectImap,
@@ -85,6 +97,7 @@ const account = {
 beforeEach(() => {
   vi.clearAllMocks();
   fake.connectImpl.mockResolvedValue(undefined);
+  fake.noop.mockResolvedValue(undefined);
   assertSafe.mockResolvedValue(undefined);
   decrypt.mockResolvedValue("secret");
 });
@@ -212,7 +225,7 @@ describe("action-client abort binding", () => {
     const abort = new AbortController();
     abort.abort(new Error("lease lost"));
 
-    const error = await connectAbortableImap({} as never, config, account, abort.signal).catch((value) => value);
+    const error = await connectAbortableImap({} as never, config, account, { signal: abort.signal }).catch((value) => value);
 
     expect(error.name).toBe("AbortError");
     expect(error.cause).toBe(abort.signal.reason);
@@ -311,10 +324,10 @@ describe("ActionConnection (one login per multi-step action)", () => {
 
   it("reports one connect and one logout, and a throwing timer changes nothing", async () => {
     const steps: string[] = [];
-    const connection = new ActionConnection({} as never, config, account, undefined, (step) => {
+    const connection = new ActionConnection({} as never, config, account, { onImapStep: (step) => {
       steps.push(step);
       throw new Error("timer failed");
-    });
+    } });
     await connection.get();
     await connection.get();
     await connection.close();
@@ -335,5 +348,105 @@ describe("ActionConnection (one login per multi-step action)", () => {
     await connection.close();
     expect(fake.connectImpl).not.toHaveBeenCalled();
     expect(fake.logout).not.toHaveBeenCalled();
+  });
+});
+
+/** A host store like Cloud's: one parked session per key. */
+function sessionStore() {
+  const parked = new Map<string, unknown>();
+  return {
+    parked,
+    take: (key: string) => {
+      const client = parked.get(key) ?? null;
+      parked.delete(key);
+      return client as never;
+    },
+    park: (key: string, client: unknown) => { parked.set(key, client); }
+  };
+}
+
+describe("parked action sessions (ADR 0051)", () => {
+  const actionSteps = async (store: ReturnType<typeof sessionStore>, forAccount = account) => {
+    const steps: string[] = [];
+    const connection = new ActionConnection({} as never, config, forAccount, {
+      sessions: store,
+      onImapStep: (step) => steps.push(step)
+    });
+    await connection.get();
+    await connection.close();
+    return steps;
+  };
+
+  it("lets the next action on a mailbox reuse the first one's login after a NOOP", async () => {
+    const store = sessionStore();
+    expect(await actionSteps(store)).toEqual(["connect", "logout"]);
+    expect(await actionSteps(store)).toEqual(["reuse", "logout"]);
+
+    expect(fake.connectImpl).toHaveBeenCalledTimes(1);
+    expect(fake.noop).toHaveBeenCalledTimes(1);
+    expect(fake.logout).not.toHaveBeenCalled();
+    expect(store.parked.size).toBe(1);
+  });
+
+  it("never reuses a session after the password or server changes", async () => {
+    const store = sessionStore();
+    await actionSteps(store);
+    const changed = { ...(account as object), encrypted_password: Buffer.from("y") } as never;
+    expect(await actionSteps(store, changed)).toEqual(["connect", "logout"]);
+    const moved = { ...(account as object), host: "imap.other.test" } as never;
+    expect(await actionSteps(store, moved)).toEqual(["connect", "logout"]);
+    expect(fake.connectImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("logs in again when a parked session no longer answers", async () => {
+    const store = sessionStore();
+    await actionSteps(store);
+    fake.noop.mockImplementationOnce(async (client) => { client.usable = false; });
+    expect(await actionSteps(store)).toEqual(["connect", "logout"]);
+    expect(fake.connectImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds a stalled NOOP and logs in again", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = sessionStore();
+      await actionSteps(store);
+      fake.noop.mockImplementationOnce(() => new Promise(() => undefined));
+      const second = actionSteps(store);
+      await vi.advanceTimersByTimeAsync(SESSION_REUSE_CHECK_MS);
+      expect(await second).toEqual(["connect", "logout"]);
+      expect(fake.connectImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes a parked session and fails as aborted when the action aborts during the check", async () => {
+    const store = sessionStore();
+    await actionSteps(store);
+    const abort = new AbortController();
+    fake.noop.mockImplementationOnce(() => new Promise(() => undefined));
+    const connection = new ActionConnection({} as never, config, account, { sessions: store, signal: abort.signal });
+    const opening = connection.get();
+    await Promise.resolve();
+    abort.abort(new Error("lease lost"));
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(fake.connectImpl).toHaveBeenCalledTimes(1);
+    expect(store.parked.size).toBe(0);
+  });
+
+  it("never parks the session of an aborted action or a dead socket", async () => {
+    const store = sessionStore();
+    const abort = new AbortController();
+    const aborted = new ActionConnection({} as never, config, account, { sessions: store, signal: abort.signal });
+    await aborted.get();
+    abort.abort(new Error("lease lost"));
+    await aborted.close();
+    expect(store.parked.size).toBe(0);
+
+    const dead = new ActionConnection({} as never, config, account, { sessions: store });
+    (await dead.get()).client.close();
+    await dead.close();
+    expect(store.parked.size).toBe(0);
   });
 });

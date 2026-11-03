@@ -207,7 +207,7 @@ async function saveDraft(
   // One array: the lock adds its post-confirmation warnings after the callback returns.
   const warnings: string[] = [];
   return await withInteractiveAccountLock(pool, account, async (lock) => {
-    const connection = new ActionConnection(pool, config, account, options.signal, options.onImapStep);
+    const connection = new ActionConnection(pool, config, account, options);
     try {
       return await fileAndMirrorDraft(repository, config, bodyStore, account, composed, lock, warnings, connection);
     } finally {
@@ -546,7 +546,7 @@ export async function updateDraft(
   // One lock across the APPEND and the delete, so no sync runs between them, and
   // one connection, so one login per update.
   const { saved, replacedDraftDeleted } = await withInteractiveAccountLock(pool, account, async (lock) => {
-    const connection = new ActionConnection(pool, config, account, options.signal, options.onImapStep);
+    const connection = new ActionConnection(pool, config, account, options);
     try {
       const saved = await fileAndMirrorDraft(repository, config, bodyStore, account, composed, lock, warnings, connection);
       // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
@@ -633,7 +633,7 @@ async function sendDraftAttempt(
   config: AppConfig,
   messageId: string,
   metadataProtection: MetadataProtectionAdapter,
-  { signal, bodyStore: hostBodyStore }: MailboxActionOptions,
+  { signal, bodyStore: hostBodyStore, sessions }: MailboxActionOptions,
   confirmDelivery: () => void
 ): Promise<SendDraftResult> {
   throwIfAborted(signal);
@@ -668,7 +668,7 @@ async function sendDraftAttempt(
   return await withInteractiveAccountLock(pool, account, async (lock) => {
     // One connection for the raw fetch, the Sent APPEND and the draft delete. It is
     // opened again only if it died while SMTP ran, which can outlast an idle socket.
-    const connection = new ActionConnection(pool, config, account, signal);
+    const connection = new ActionConnection(pool, config, account, { signal, sessions });
     let delivered = false;
     try {
       // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand

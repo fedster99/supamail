@@ -272,9 +272,10 @@ vi.mock("../imap-connect.js", async (importOriginal) => {
     // real connect does), close() logs out through the shared teardown.
     ActionConnection: class {
       private open = false;
-      constructor(_pool: unknown, _config: unknown, _account: unknown, private readonly signal?: AbortSignal) {}
+      constructor(_pool: unknown, _config: unknown, _account: unknown,
+        private readonly options: { signal?: AbortSignal } = {}) {}
       async get() {
-        throwIfAborted(this.signal);
+        throwIfAborted(this.options.signal);
         this.open = true;
         return { client: {}, abort: {} };
       }
