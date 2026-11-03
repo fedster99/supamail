@@ -2,7 +2,8 @@ import { Parser } from "htmlparser2";
 import { InvalidInputError } from "./errors.js";
 import type { SendRequest } from "./types.js";
 
-const malformedCidUrl = () => new InvalidInputError("Malformed cid URL in HTML.", [{ rule: "format", path: ["body", "html"] }]);
+/** `source` is the body field the HTML came from: `html`, or `text` with format html. */
+const malformedCidUrl = (source: "html" | "text") => new InvalidInputError("Malformed cid URL in HTML.", [{ rule: "format", path: ["body", source] }]);
 
 /** Bare, case-sensitive Content-ID. Angle brackets belong only in the MIME header. */
 const CONTENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$/;
@@ -12,15 +13,15 @@ export function bareContentId(value: string): string {
 }
 
 /** CID URLs may percent-encode the identifier (RFC 2392). Never rewrite authored HTML. */
-export function referencedContentIds(html: string | undefined): Set<string> {
+export function referencedContentIds(html: string | undefined, source: "html" | "text" = "html"): Set<string> {
   const ids = new Set<string>();
   const addUrl = (value: string) => {
     const url = value.trim();
     if (!/^cid:/i.test(url)) return;
     let id: string;
     try { id = decodeURIComponent(url.slice(4)); }
-    catch { throw malformedCidUrl(); }
-    if (!CONTENT_ID_PATTERN.test(id)) throw malformedCidUrl();
+    catch { throw malformedCidUrl(source); }
+    if (!CONTENT_ID_PATTERN.test(id)) throw malformedCidUrl(source);
     ids.add(id);
   };
   const addStyle = (css: string) => {
@@ -55,30 +56,31 @@ export function referencedContentIds(html: string | undefined): Set<string> {
 /** Validate the complete set after upload/reference resolution and reply composition. */
 export function validateInlineImages(request: Pick<SendRequest, "body" | "attachments">): void {
   const ids = new Set<string>();
+  const source = request.body.html !== undefined ? "html" : "text";
   const html = request.body.html ?? (request.body.format === "html" ? request.body.text : undefined);
-  for (const attachment of request.attachments ?? []) {
+  for (const [index, attachment] of (request.attachments ?? []).entries()) {
     if (attachment.cid === undefined) {
       // Non-image inline parts remain supported by the core API.
       continue;
     }
     if (!CONTENT_ID_PATTERN.test(attachment.cid)) {
-      throw new InvalidInputError("Content-ID must be a bare identifier of 1 to 255 letters, digits, dot, underscore, @, + or -.", [{ rule: "format", path: ["attachments"] }]);
+      throw new InvalidInputError("Content-ID must be a bare identifier of 1 to 255 letters, digits, dot, underscore, @, + or -.", [{ rule: "format", path: ["attachments", index] }]);
     }
-    if (ids.has(attachment.cid)) throw new InvalidInputError("Duplicate Content-ID in attachments.", [{ rule: "constraint", path: ["attachments"] }]);
+    if (ids.has(attachment.cid)) throw new InvalidInputError("Duplicate Content-ID in attachments.", [{ rule: "constraint", path: ["attachments", index] }]);
     // MailComposer already infers these types by extension for CLI/base64 callers.
     const extension = attachment.filename.split(".").pop()?.toLowerCase();
     const inferredType = extension === "jpg" ? "image/jpeg" : `image/${extension}`;
     if (attachment.inline === false || !/^image\/(png|jpeg|gif|webp)$/i.test(attachment.contentType ?? inferredType)) {
-      throw new InvalidInputError("CID images require inline disposition and image/png, image/jpeg, image/gif or image/webp (declare contentType or use its filename extension).", [{ rule: "constraint", path: ["attachments"] }]);
+      throw new InvalidInputError("CID images require inline disposition and image/png, image/jpeg, image/gif or image/webp (declare contentType or use its filename extension).", [{ rule: "constraint", path: ["attachments", index] }]);
     }
     // A repeated four-character group can overflow V8's regexp stack on valid
     // multi-megabyte uploads. A flat character class keeps validation stack-safe.
     if (!html || attachment.content.length === 0 || attachment.content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(attachment.content)) {
-      throw new InvalidInputError("CID images require an HTML body and non-empty image bytes.", [{ rule: "constraint", path: ["attachments"] }]);
+      throw new InvalidInputError("CID images require an HTML body and non-empty image bytes.", [{ rule: "constraint", path: ["attachments", index] }]);
     }
     ids.add(attachment.cid);
   }
-  for (const id of referencedContentIds(html)) {
-    if (!ids.has(id)) throw new InvalidInputError("An HTML cid reference has no matching inline attachment.", [{ rule: "constraint", path: ["body", "html"] }]);
+  for (const id of referencedContentIds(html, source)) {
+    if (!ids.has(id)) throw new InvalidInputError("An HTML cid reference has no matching inline attachment.", [{ rule: "constraint", path: ["body", source] }]);
   }
 }

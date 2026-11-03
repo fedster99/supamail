@@ -13,6 +13,8 @@ import { DRAFT_BODY_SCHEMA, SEND_BODY_SCHEMA } from "./compose-schema.js";
 import {
   AccountBusyError,
   InvalidInputError,
+  formatZodIssues,
+  inputIssues,
   NoRecipientsError,
   NotFoundError,
   UnfetchableContentError
@@ -472,7 +474,7 @@ export function createApiApp(options: ApiAppOptions): Hono {
       return c.json({ error: "mailbox_mutation_failed", message: err.message }, 502);
     }
     if (err instanceof z.ZodError) {
-      return c.json({ error: "invalid_input", issues: err.issues }, 400);
+      return c.json({ error: "invalid_input", message: formatZodIssues(err), issues: inputIssues(err) }, 400);
     }
     const pgCode = (err as { code?: string }).code;
     if (pgCode === "23505") {

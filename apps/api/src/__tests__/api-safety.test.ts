@@ -793,9 +793,10 @@ describe("API safety", () => {
       })
     });
     expect(res.status).toBe(400);
-    const json = await res.json() as { error: string; issues: Array<{ message: string }> };
+    const json = await res.json() as { error: string; message: string; issues: Array<{ rule: string; path: unknown[] }> };
     expect(json.error).toBe("invalid_input");
-    expect(json.issues.some((i) => i.message === "Bcc is not supported on saved drafts — set Bcc when you send the draft")).toBe(true);
+    expect(json.message).toContain("bcc: Bcc is not supported on saved drafts — set Bcc when you send the draft");
+    expect(json.issues).toContainEqual({ rule: "unknown_key", path: ["bcc"] });
     // The draft is never filed when Bcc is present.
     expect(drafts.create).not.toHaveBeenCalled();
   });

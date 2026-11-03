@@ -21,7 +21,10 @@ that.
   `too_big`, `format`, `constraint`. An `InputIssue` is one rule and the `path`
   of the rejected field as the schema declares it (object keys and array
   indexes; the whole input is `[]`). A path never carries caller text: an
-  unrecognized key is reported at its object's path, never by the key.
+  unrecognized key is reported at its object's path, never by the key, and a
+  rule over a record (custom headers) reports at the record, never under a
+  caller-chosen key. A union is typed by how its branches failed: absent is
+  `missing`, a wrong type is `type`, otherwise `value`.
 - **Every `invalid_input` carries issues.** `InvalidInputError` takes them as a
   second constructor argument; `toolError` takes them as a fourth and includes
   `issues` in the envelope only when given; `searchInputError` always includes
@@ -31,9 +34,13 @@ that.
   field, such as draft Bcc, is `unknown_key`). Hand-written rules name their
   rule and field in code: the read_thread selector rules, inline image and
   custom header checks, the sender name limit, and move targets.
-- **The message is unchanged.** Codes, hints and readable messages stay as they
-  were. `issues` is additive: the HTTP API's 400 body for an engine
-  `InvalidInputError` gains it beside `error` and `message`.
+- **One shape per code.** `issues` is additive and the same everywhere: the
+  HTTP API's 400 body carries `message` and typed `issues` for a schema failure
+  as for an engine `InvalidInputError` (it no longer returns raw Zod issues);
+  `draft_reply` validates with `safeParse` like the other tools; the stdio MCP
+  server answers a thrown `InvalidInputError` or `ZodError` as `invalid_input`
+  with its issues instead of `tool_failed`. Codes, hints and readable messages
+  of existing rejections are unchanged.
 
 ## Consequences
 

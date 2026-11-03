@@ -68,9 +68,17 @@ function issueRule(issue: ZodIssue): InputIssueRule {
       return issue.expected === "undefined" ? "unknown_key" : "type";
     case "unrecognized_keys":
       return "unknown_key";
+    case "invalid_union": {
+      // A union fails as its branches do. Every branch saw the same value: one
+      // that received nothing means the field is absent; all wrong types mean a
+      // wrong type; otherwise the value matched no accepted shape.
+      const branches = issue.unionErrors.flatMap((error) => error.issues);
+      if (branches.some((branch) => branch.code === "invalid_type" && branch.received === "undefined")) return "missing";
+      if (branches.every((branch) => branch.code === "invalid_type")) return "type";
+      return "value";
+    }
     case "invalid_enum_value":
     case "invalid_literal":
-    case "invalid_union":
     case "invalid_union_discriminator":
       return "value";
     case "too_small":

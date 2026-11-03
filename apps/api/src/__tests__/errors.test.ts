@@ -27,7 +27,8 @@ describe("inputIssues", () => {
     ["a value outside the enum", { id: "00000000-0000-4000-8000-000000000000", sort: "SECRET" }, [{ rule: "value", path: ["sort"] }]],
     ["a key the schema does not accept, named by the object, not the key", { id: "00000000-0000-4000-8000-000000000000", SECRET: 1 }, [{ rule: "unknown_key", path: [] }]],
     ["a number below its minimum", { id: "00000000-0000-4000-8000-000000000000", limit: 0, sort: "recent" }, [{ rule: "too_small", path: ["limit"] }]],
-    ["an array above its maximum", { id: "00000000-0000-4000-8000-000000000000", limit: 101, sort: "recent" }, [{ rule: "too_big", path: ["limit"] }]],
+    ["a number above its maximum", { id: "00000000-0000-4000-8000-000000000000", limit: 101, sort: "recent" }, [{ rule: "too_big", path: ["limit"] }]],
+    ["an array below its minimum", { id: "00000000-0000-4000-8000-000000000000", tags: [] }, [{ rule: "too_small", path: ["tags"] }]],
     ["a string that is not a uuid", { id: "SECRET" }, [{ rule: "format", path: ["id"] }]],
     ["a rule across fields", { id: "00000000-0000-4000-8000-000000000000", limit: 5 }, [{ rule: "constraint", path: [] }]],
     ["a nested field by its full path", { id: "00000000-0000-4000-8000-000000000000", nested: { flag: "no" } }, [{ rule: "type", path: ["nested", "flag"] }]]
@@ -37,12 +38,28 @@ describe("inputIssues", () => {
     for (const issue of inputIssues(error)) expect(INPUT_ISSUE_RULES).toContain(issue.rule);
   });
 
-  it("reports the same issues, in order and capped, as the readable message", () => {
+  it("reports at most five issues, in the schema's order, like the readable message", () => {
     const error = issuesFor({ id: 1, limit: "x", sort: "y", tags: [], nested: { flag: 1 }, extra: true });
-    const typed = inputIssues(error);
-    expect(typed).toHaveLength(5);
-    expect(formatZodIssues(error).split("; ")).toHaveLength(5);
-    expect(typed.map((issue) => issue.path[0] ?? "input")).toEqual(formatZodIssues(error).split("; ").map((line) => line.split(/[.:]/)[0]));
+    expect(inputIssues(error)).toEqual([
+      { rule: "type", path: ["id"] },
+      { rule: "type", path: ["limit"] },
+      { rule: "value", path: ["sort"] },
+      { rule: "too_small", path: ["tags"] },
+      { rule: "type", path: ["nested", "flag"] }
+    ]);
+    expect(formatZodIssues(error)).toBe(
+      "id: Expected string, received number; limit: Expected number, received string; " +
+      "sort: Invalid enum value. Expected 'recent' | 'oldest', received 'y'; " +
+      "tags: Array must contain at least 1 element(s); nested.flag: Expected boolean, received number"
+    );
+  });
+
+  it("types a union by how its branches failed", () => {
+    const union = z.object({ accounts: z.union([z.array(z.string()), z.literal("all")]) });
+    const rules = (schema: z.ZodTypeAny, input: unknown) => inputIssues(schema.safeParse(input).error!).map((issue) => issue.rule);
+    expect(rules(union, {})).toEqual(["missing"]);
+    expect(rules(union, { accounts: "SECRET" })).toEqual(["value"]);
+    expect(rules(z.object({ size: z.union([z.string(), z.number()]) }), { size: true })).toEqual(["type"]);
   });
 
   it("names a field the operation does not accept as unknown_key", () => {

@@ -17,8 +17,12 @@ import { InvalidInputError, formatZodIssues, inputIssues } from "./errors.js";
 const NO_CRLF = (v: string) => !/[\r\n]/.test(v);
 const CRLF_MSG = "must not contain CR or LF characters";
 const headerSafe = (max: number) => z.string().max(max).refine(NO_CRLF, CRLF_MSG);
-// A record whose values are all header-safe (custom headers).
-const HEADER_RECORD = z.record(z.string().refine(NO_CRLF, CRLF_MSG));
+// A record whose values are all header-safe (custom headers). The rule reports at
+// the record, so an issue path never carries a caller-chosen header name (ADR 0050).
+const HEADER_RECORD = z.record(z.string()).refine(
+  (headers) => Object.values(headers).every(NO_CRLF),
+  `custom header values ${CRLF_MSG}`
+);
 
 /** Longest accepted References value; reply composition trims its chain to fit. */
 export const MAX_REFERENCES_LENGTH = 8000;
