@@ -49,14 +49,13 @@ export class InvalidInputError extends Error {
   }
 }
 
-/** At most this many issues are reported, readable or typed. */
-const REPORTED_ISSUES = 5;
+/** The issues a rejection reports, readable or typed: the first five, in schema order. */
+const reportedIssues = (error: ZodError): ZodIssue[] => error.issues.slice(0, 5);
 
 /** One readable line per schema issue (`to.0.email: Invalid email`), joined with
  * "; " and capped at five, so hosts can show it as-is. */
 export function formatZodIssues(error: ZodError): string {
-  return error.issues
-    .slice(0, REPORTED_ISSUES)
+  return reportedIssues(error)
     .map((issue) => `${issue.path.length > 0 ? issue.path.join(".") : "input"}: ${issue.message}`)
     .join("; ");
 }
@@ -97,9 +96,7 @@ function issueRule(issue: ZodIssue): InputIssueRule {
  * {@link formatZodIssues}. An unrecognized key is reported at the object's path,
  * never by the caller's key. */
 export function inputIssues(error: ZodError): InputIssue[] {
-  return error.issues
-    .slice(0, REPORTED_ISSUES)
-    .map((issue) => ({ rule: issueRule(issue), path: [...issue.path] }));
+  return reportedIssues(error).map((issue) => ({ rule: issueRule(issue), path: [...issue.path] }));
 }
 
 /** A requested resource (message, draft, attachment, account) does not exist. */
