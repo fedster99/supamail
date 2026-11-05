@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { formatZodIssues, inputIssues } from "../../errors.js";
 import { buildSyncStatus, type SyncStatus } from "../../search/index.js";
-import { mailboxScope, mailboxScopeFields, mailboxScopeProperty, toolError, withMailboxScope, withReadOnlyTx } from "../shared.js";
+import { mailboxScope, mailboxScopeProperty, mailboxScopeRequestSchema, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
@@ -18,7 +18,7 @@ import {
  */
 
 /** Validated input. `account_id` scopes to one mailbox; omit for every account. */
-export const getSyncStatusRequestSchema = withMailboxScope(z.object(mailboxScopeFields()).strict());
+export const getSyncStatusRequestSchema = mailboxScopeRequestSchema;
 
 export const getSyncStatusDefinition: ToolDefinition = {
   name: "get_sync_status",
@@ -66,7 +66,7 @@ export async function runGetSyncStatus(
     return toolError(
       "not_found",
       `No mailbox with account id ${accountId}.`,
-      "Use an account_id from a read result, or omit account to report every mailbox."
+      "Use an account_id from a read result, or omit account_id to report every mailbox."
     );
   }
   return status;

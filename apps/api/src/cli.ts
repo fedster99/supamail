@@ -334,9 +334,9 @@ program
 program
   .command("thread [messageId]")
   .description("Read a full email conversation (read-only, JSON output)")
-  .option("--conversation-id <id>", "Select a durable SupaMail conversation (requires --account)")
+  .option("--conversation-id <id>", "Select a durable SupaMail conversation (requires --account-id)")
   .option("--thread-id <id>", "Select the thread directly by provider_thread_id")
-  .option("--account <id>", "Scope the thread to one account UUID")
+  .option("--account-id <id>", "Scope the thread to one mailbox")
   .option("--include-quoted", "Keep quoted reply tails + signatures in each body")
   .option("--max-messages <n>", "Max messages to return, newest kept when over the cap")
   .action(async (messageId: string | undefined, options) => {
@@ -349,7 +349,7 @@ program
       message_id: messageId ?? undefined,
       conversation_id: options.conversationId,
       thread_id: options.threadId,
-      account: options.account,
+      account_id: options.accountId,
       include_quoted: Boolean(options.includeQuoted),
       max_messages: options.maxMessages === undefined ? undefined : Number(options.maxMessages)
     });
@@ -359,18 +359,18 @@ program
 program
   .command("folders")
   .description("List mailbox folders with live counts (read-only, JSON output)")
-  .option("--account <id>", "Scope to one account UUID")
+  .option("--account-id <id>", "Scope to one mailbox")
   .action(async (options) => {
-    const result = await runListFolders(pool, { account: options.account });
+    const result = await runListFolders(pool, { account_id: options.accountId });
     console.log(JSON.stringify(result, null, 2));
   });
 
 program
   .command("sync-status")
   .description("Report how up to date the mirror is per mailbox (read-only, JSON output)")
-  .option("--account <id>", "Scope to one account UUID")
+  .option("--account-id <id>", "Scope to one mailbox")
   .action(async (options) => {
-    const result = await runGetSyncStatus(pool, { account: options.account });
+    const result = await runGetSyncStatus(pool, { account_id: options.accountId });
     console.log(JSON.stringify(result, null, 2));
   });
 

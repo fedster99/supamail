@@ -550,17 +550,18 @@ export interface MailboxScopeArgs {
   account_id?: string;
   account?: string;
 }
-export const mailboxScopeFields = () => ({
-  account_id: z.string().uuid().optional(),
-  account: z.string().uuid().optional()
-});
-/** Apply the one-mailbox rule to a request schema that spreads {@link mailboxScopeFields}. */
+const MAILBOX_ID = z.string().uuid();
+export const mailboxScopeFields = { account_id: MAILBOX_ID.optional(), account: MAILBOX_ID.optional() };
+/** Apply the one-mailbox rule to a request schema that spreads {@link mailboxScopeFields}.
+ * Two ids are judged only when both are valid; a malformed id is already its own issue. */
 export function withMailboxScope<T extends z.ZodType<MailboxScopeArgs>>(schema: T) {
   return schema.refine(
-    (value) => value.account_id === undefined || value.account === undefined || value.account_id === value.account,
+    ({ account_id, account }) => !(MAILBOX_ID.safeParse(account_id).success && MAILBOX_ID.safeParse(account).success) || account_id === account,
     { message: "account_id and account must name the same mailbox", path: ["account_id"] }
   );
 }
+/** The request of a tool whose only argument is the mailbox scope. */
+export const mailboxScopeRequestSchema = withMailboxScope(z.object(mailboxScopeFields).strict());
 export const mailboxScope = (value: MailboxScopeArgs): string | undefined => value.account_id ?? value.account;
 /** The published property for the mailbox scope. */
 export const mailboxScopeProperty = (description: string) => ({ type: "string", format: "uuid", description });

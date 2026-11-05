@@ -10,6 +10,8 @@ describe("runGetSyncStatus input", () => {
       .toMatchObject({ error: { code: "invalid_input", issues: [{ rule: "format", path: ["account_id"] }] } });
     expect(await runGetSyncStatus({ connect } as never, { account_id: a, account: b }))
       .toMatchObject({ error: { code: "invalid_input", issues: [{ rule: "constraint", path: ["account_id"] }] } });
+    const malformed = await runGetSyncStatus({ connect } as never, { account_id: "foo", account: "bar" });
+    expect("error" in malformed && malformed.error.issues).toEqual([{ rule: "format", path: ["account_id"] }, { rule: "format", path: ["account"] }]);
     expect(connect).not.toHaveBeenCalled();
   });
 });

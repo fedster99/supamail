@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { formatZodIssues, inputIssues } from "../../errors.js";
-import { mailboxScope, mailboxScopeFields, mailboxScopeProperty, readAccountsFor, toolError, withMailboxScope, withReadOnlyTx } from "../shared.js";
+import { mailboxScope, mailboxScopeProperty, mailboxScopeRequestSchema, readAccountsFor, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
@@ -23,7 +23,7 @@ import {
  */
 
 /** Validated input. `account_id` scopes to one mailbox; omit for every account. */
-export const listFoldersRequestSchema = withMailboxScope(z.object(mailboxScopeFields()).strict());
+export const listFoldersRequestSchema = mailboxScopeRequestSchema;
 
 interface FolderRow {
   account_id: string;

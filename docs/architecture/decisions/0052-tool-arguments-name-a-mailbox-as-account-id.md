@@ -26,6 +26,13 @@ UUID reached Postgres and failed as a cast error instead of a typed rejection.
 - **One definition.** `mcp/shared.ts` owns the scope fields, the agreement
   rule, the reader and the published property, so a fourth tool cannot drift.
 - **Search keeps `accounts`.** It scopes to a list or `all`, a different shape.
+- **First-party callers use the name.** The CLI's `thread`, `folders` and
+  `sync-status` commands take `--account-id`, as the sync commands already did.
+- **The alias is not published and not measured.** A fresh tool copy never
+  sends `account`, so publishing it would only invite a second spelling. Its use
+  by stale copies cannot be counted while it is accepted; if it is ever removed,
+  the hosted ledger counts the fallout as `unknown_key` on these tools, which is
+  the measurement that decides whether to keep it removed.
 
 ## Consequences
 

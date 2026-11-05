@@ -393,11 +393,11 @@ describe("durable conversation administration", () => {
   });
 
   it("reads a durable conversation with explicit account scope", async () => {
-    await runCli("thread", "--conversation-id", "thread_123", "--account", "acc-1");
+    await runCli("thread", "--conversation-id", "thread_123", "--account-id", "acc-1");
 
     expect(libs.runReadThread).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       conversation_id: "thread_123",
-      account: "acc-1"
+      account_id: "acc-1"
     }));
   });
 });

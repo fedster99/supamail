@@ -152,7 +152,7 @@ export const readThreadRequestSchema = withMailboxScope(z
     message_ids: z.array(z.string().uuid()).min(1).max(MAX_THREAD_BATCH).optional(),
     conversation_id: z.string().optional(),
     thread_id: z.string().optional(),
-    ...mailboxScopeFields(),
+    ...mailboxScopeFields,
     include_quoted: z.boolean().optional(),
     max_messages: z.number().int().min(1).max(MAX_MESSAGES_CEILING).optional()
   })
