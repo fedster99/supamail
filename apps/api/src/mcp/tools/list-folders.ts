@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { formatZodIssues, inputIssues } from "../../errors.js";
-import { readAccountsFor, toolError, withReadOnlyTx } from "../shared.js";
+import { mailboxScope, mailboxScopeProperty, mailboxScopeRequestSchema, readAccountsFor, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
@@ -22,12 +22,8 @@ import {
  * while it still holds live mirrored mail.
  */
 
-/** Validated input. `account` scopes to one account UUID; omit for every account. */
-export const listFoldersRequestSchema = z
-  .object({
-    account: z.string().optional()
-  })
-  .strict();
+/** Validated input. `account_id` scopes to one mailbox; omit for every account. */
+export const listFoldersRequestSchema = mailboxScopeRequestSchema;
 
 interface FolderRow {
   account_id: string;
@@ -53,8 +49,8 @@ export const listFoldersDefinition: ToolDefinition = {
     "total and unread count, plus totals (total, unread) summed over the listed folders. Counts " +
     "are over the non-deleted live mirror; unread excludes the IMAP \\Seen flag. " +
     "A folder excluded from sync is listed only while it still holds mirrored mail. Each folder carries its IMAP " +
-    "special_use (e.g. \\Inbox, \\Sent, \\Trash) and sync status. Scope to one account UUID via " +
-    "`account`, or omit to aggregate across all accounts (each folder row keeps its account_id). " +
+    "special_use (e.g. \\Inbox, \\Sent, \\Trash) and sync status. Scope to one mailbox via " +
+    "`account_id`, or omit to aggregate across all accounts (each folder row keeps its account_id). " +
     "Names the accounts listed; a notice appears only when a mailbox cannot give a complete " +
     "answer. READ-ONLY: never sends, " +
     "deletes, moves, or modifies mail.",
@@ -68,10 +64,7 @@ export const listFoldersDefinition: ToolDefinition = {
     type: "object",
     additionalProperties: false,
     properties: {
-      account: {
-        type: "string",
-        description: "Account UUID to scope to. Omit to aggregate across every account in this database."
-      }
+      account_id: mailboxScopeProperty("Mailbox Account ID to scope to. Omit to aggregate across every account in this database.")
     }
   }
 };
@@ -90,13 +83,13 @@ export async function runListFolders(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass an optional { account } UUID string, or no arguments to list folders for every account.",
+      "Pass an optional { account_id } UUID string, or no arguments to list folders for every account.",
       inputIssues(parsed.error)
     );
   }
   const request = parsed.data;
 
-  const accountId = request.account ?? null;
+  const accountId = mailboxScope(request) ?? null;
 
   const folders = await withReadOnlyTx(pool, async (client: PgClient) => {
     // `$1` is null when no account scope is requested.

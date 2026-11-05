@@ -7,7 +7,7 @@ import { ACTIVE_ASSIGNMENT_JOIN, DELIVERY_KEY_SQL } from "../../delivery-identit
 import { extractMessageIdTokens } from "../../threading.js";
 import { threadMembershipClause, threadSeedKeys, type ThreadSeedRow } from "../../thread-walk.js";
 import type { MessageDetail, MessageDetailRow, ToolDefinition, ToolEntry } from "../shared.js";
-import { loadMessageAttachments, mapMessageRow, toolError, withReadOnlyTx } from "../shared.js";
+import { loadMessageAttachments, mailboxScope, mailboxScopeFields, mailboxScopeProperty, mapMessageRow, toolError, withMailboxScope, withReadOnlyTx } from "../shared.js";
 import {
   METADATA_PROTECTED_FIELDS,
   plaintextMetadataProtection,
@@ -126,6 +126,7 @@ export interface ReadThreadArgs {
   message_ids?: string[];
   conversation_id?: string;
   thread_id?: string;
+  account_id?: string;
   account?: string;
   include_quoted?: boolean;
   max_messages?: number;
@@ -141,21 +142,21 @@ export interface ReadThreadOptions {
 
 /**
  * Strict input schema for `read_thread` (matches the list_folders validate
- * pattern). Only `account` is a UUID; provider and durable conversation ids are
- * opaque text, so they are NOT uuid-validated. The selector requirement is
- * enforced separately so it returns a clearer hint.
+ * pattern). Only the mailbox scope is a UUID; provider and durable conversation
+ * ids are opaque text, so they are NOT uuid-validated. The selector requirement
+ * is enforced separately so it returns a clearer hint.
  */
-export const readThreadRequestSchema = z
+export const readThreadRequestSchema = withMailboxScope(z
   .object({
     message_id: z.string().uuid().optional(),
     message_ids: z.array(z.string().uuid()).min(1).max(MAX_THREAD_BATCH).optional(),
     conversation_id: z.string().optional(),
     thread_id: z.string().optional(),
-    account: z.string().uuid().optional(),
+    ...mailboxScopeFields,
     include_quoted: z.boolean().optional(),
     max_messages: z.number().int().min(1).max(MAX_MESSAGES_CEILING).optional()
   })
-  .strict();
+  .strict());
 
 export interface ReadThreadResult {
   thread: {
@@ -190,7 +191,7 @@ export const readThreadDefinition: ToolDefinition = {
     "Reassemble and read one or more conversations from the SupaMail mirror. Supported selectors are " +
     "message_id (any message in the thread), message_ids (1 to 10 seeds), a durable " +
     "conversation_id, or a legacy provider thread_id. Direct conversation/thread selectors " +
-    "require account. Duplicate message_ids are collapsed in first-occurrence order; each " +
+    "require account_id. Duplicate message_ids are collapsed in first-occurrence order; each " +
     "distinct seed has its own result or error entry, and a seed in a conversation already returned " +
     "by an earlier seed gets same_thread_as with that seed's message_id. " +
     "Returns the thread's messages oldest-first. Replies contain newly authored plain text by default. " +
@@ -236,7 +237,7 @@ export const readThreadDefinition: ToolDefinition = {
         ] }
       },
       {
-        required: ["conversation_id", "account"],
+        required: ["conversation_id", "account_id"],
         not: { anyOf: [
           { required: ["message_id"] },
           { required: ["message_ids"] },
@@ -244,7 +245,7 @@ export const readThreadDefinition: ToolDefinition = {
         ] }
       },
       {
-        required: ["thread_id", "account"],
+        required: ["thread_id", "account_id"],
         not: { anyOf: [
           { required: ["message_id"] },
           { required: ["message_ids"] },
@@ -269,16 +270,13 @@ export const readThreadDefinition: ToolDefinition = {
       },
       conversation_id: {
         type: "string",
-        description: "A durable SupaMail conversation_id; account is required because ids are account-scoped."
+        description: "A durable SupaMail conversation_id; account_id is required because ids are account-scoped."
       },
       thread_id: {
         type: "string",
-        description: "A legacy provider_thread_id; account is required because provider ids are not globally unique."
+        description: "A legacy provider_thread_id; account_id is required because provider ids are not globally unique."
       },
-      account: {
-        type: "string",
-        description: "Optional account UUID to scope to. Defaults to the seed message's account."
-      },
+      account_id: mailboxScopeProperty("Optional Mailbox Account ID to scope to. Defaults to the seed message's account."),
       include_quoted: {
         type: "boolean",
         default: false,
@@ -497,7 +495,7 @@ async function runReadThreadInternal(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass message_id, message_ids, or conversation_id/thread_id together with the account UUID.",
+      "Pass message_id, message_ids, or conversation_id/thread_id together with account_id.",
       inputIssues(parsed.error)
     );
   }
@@ -533,7 +531,7 @@ async function runReadThreadInternal(
           try {
             const result = await runReadThreadInternal(pool, {
               message_id: messageId,
-              account: input.account,
+              account_id: mailboxScope(input),
               include_quoted: input.include_quoted,
               max_messages: input.max_messages
             }, metadataProtection, options);
@@ -568,19 +566,19 @@ async function runReadThreadInternal(
     return toolError(
       "invalid_input",
       "read_thread requires message_id, message_ids, conversation_id, or thread_id.",
-      "Pass message_id/message_ids, or pass conversation_id/thread_id together with account.",
+      "Pass message_id/message_ids, or pass conversation_id/thread_id together with account_id.",
       [{ rule: "missing", path: [] }]
     );
   }
 
   const includeQuoted = input.include_quoted === true;
-  const accountScope = typeof input.account === "string" ? input.account : null;
+  const accountScope = mailboxScope(input) ?? null;
   if ((conversationId || threadId) && !accountScope) {
     return toolError(
       "invalid_input",
-      `${conversationId ? "conversation_id" : "thread_id"} requires account.`,
-      "Provider and conversation identifiers are account-scoped; pass account as a UUID.",
-      [{ rule: "missing", path: ["account"] }]
+      `${conversationId ? "conversation_id" : "thread_id"} requires account_id.`,
+      "Provider and conversation identifiers are account-scoped; pass account_id as a UUID.",
+      [{ rule: "missing", path: ["account_id"] }]
     );
   }
   const maxMessages = input.max_messages ?? DEFAULT_MAX_MESSAGES;

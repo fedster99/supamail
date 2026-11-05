@@ -190,7 +190,7 @@ Common CLI reads:
 pnpm --filter @supamail/api exec tsx src/cli.ts search "from:alice@example.com is:unread"
 pnpm --filter @supamail/api exec tsx src/cli.ts message <message-id>
 pnpm --filter @supamail/api exec tsx src/cli.ts thread <message-id>
-pnpm --filter @supamail/api exec tsx src/cli.ts folders --account <account-id>
+pnpm --filter @supamail/api exec tsx src/cli.ts folders --account-id <account-id>
 pnpm --filter @supamail/api exec tsx src/cli.ts sync-status
 ```
 

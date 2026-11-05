@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { PgClient, PgPool } from "../../db.js";
 import { formatZodIssues, inputIssues } from "../../errors.js";
 import { buildSyncStatus, type SyncStatus } from "../../search/index.js";
-import { toolError, withReadOnlyTx } from "../shared.js";
+import { mailboxScope, mailboxScopeProperty, mailboxScopeRequestSchema, toolError, withReadOnlyTx } from "../shared.js";
 import type { ToolDefinition, ToolEntry } from "../shared.js";
 import {
   plaintextMetadataProtection,
@@ -17,12 +17,8 @@ import {
  * own call rather than part of every read. READ-ONLY.
  */
 
-/** Validated input. `account` scopes to one account UUID; omit for every account. */
-export const getSyncStatusRequestSchema = z
-  .object({
-    account: z.string().uuid().optional()
-  })
-  .strict();
+/** Validated input. `account_id` scopes to one mailbox; omit for every account. */
+export const getSyncStatusRequestSchema = mailboxScopeRequestSchema;
 
 export const getSyncStatusDefinition: ToolDefinition = {
   name: "get_sync_status",
@@ -31,7 +27,7 @@ export const getSyncStatusDefinition: ToolDefinition = {
     "Report each mailbox's sync state, last sync time, the share of recent mail and bodies stored, " +
     "whether older mail is still being stored, and a one-line summary. Call it only when the user " +
     "asks about syncing or results seem to be missing; read results already carry a notice when a " +
-    "mailbox cannot give a complete answer. Scope to one account UUID via `account`, or omit for " +
+    "mailbox cannot give a complete answer. Scope to one mailbox via `account_id`, or omit for " +
     "every account. READ-ONLY: never sends, deletes, moves, or modifies mail.",
   annotations: {
     readOnlyHint: true,
@@ -43,11 +39,7 @@ export const getSyncStatusDefinition: ToolDefinition = {
     type: "object",
     additionalProperties: false,
     properties: {
-      account: {
-        type: "string",
-        format: "uuid",
-        description: "Account UUID to scope to. Omit to report every account."
-      }
+      account_id: mailboxScopeProperty("Mailbox Account ID to scope to. Omit to report every account.")
     }
   }
 };
@@ -62,11 +54,11 @@ export async function runGetSyncStatus(
     return toolError(
       "invalid_input",
       formatZodIssues(parsed.error),
-      "Pass an optional { account } UUID string, or no arguments to report every account.",
+      "Pass an optional { account_id } UUID string, or no arguments to report every account.",
       inputIssues(parsed.error)
     );
   }
-  const accountId = parsed.data.account ?? null;
+  const accountId = mailboxScope(parsed.data) ?? null;
   const status = await withReadOnlyTx(pool, (client: PgClient) =>
     buildSyncStatus(client, accountId ? [accountId] : null, metadataProtection)
   );
@@ -74,7 +66,7 @@ export async function runGetSyncStatus(
     return toolError(
       "not_found",
       `No mailbox with account id ${accountId}.`,
-      "Use an account_id from a read result, or omit account to report every mailbox."
+      "Use an account_id from a read result, or omit account_id to report every mailbox."
     );
   }
   return status;

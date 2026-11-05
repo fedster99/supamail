@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { InputIssue } from "../errors.js";
 import { bareContentId } from "../inline-images.js";
 import type { PgClient, PgPool } from "../db.js";
@@ -539,6 +540,31 @@ export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => 
     client.release(releaseError);
   }
 }
+
+/**
+ * The mailbox a read scopes to. Tools and results name it `account_id`; `account`,
+ * the earlier spelling, stays accepted so a cached copy of a tool keeps working.
+ * Both may be given only when they agree (ADR 0053).
+ */
+export interface MailboxScopeArgs {
+  account_id?: string;
+  account?: string;
+}
+const MAILBOX_ID = z.string().uuid();
+export const mailboxScopeFields = { account_id: MAILBOX_ID.optional(), account: MAILBOX_ID.optional() };
+/** Apply the one-mailbox rule to a request schema that spreads {@link mailboxScopeFields}.
+ * Two ids are judged only when both are valid; a malformed id is already its own issue. */
+export function withMailboxScope<T extends z.ZodType<MailboxScopeArgs>>(schema: T) {
+  return schema.refine(
+    ({ account_id, account }) => !(MAILBOX_ID.safeParse(account_id).success && MAILBOX_ID.safeParse(account).success) || account_id === account,
+    { message: "account_id and account must name the same mailbox", path: ["account_id"] }
+  );
+}
+/** The request of a tool whose only argument is the mailbox scope. */
+export const mailboxScopeRequestSchema = withMailboxScope(z.object(mailboxScopeFields).strict());
+export const mailboxScope = (value: MailboxScopeArgs): string | undefined => value.account_id ?? value.account;
+/** The published property for the mailbox scope. */
+export const mailboxScopeProperty = (description: string) => ({ type: "string", format: "uuid", description });
 
 /** The uniform error envelope. `hint` tells the agent what to do next; an
  * `invalid_input` also names each rejected field by fixed rule in `issues`. */
