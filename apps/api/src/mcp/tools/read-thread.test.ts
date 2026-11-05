@@ -563,11 +563,19 @@ describe("read_thread stored assignments", () => {
     expect(conversationCall?.[1]).toEqual([ACCOUNT_ID, "conversation-1", 20]);
   });
 
+  it("names the mailbox as account_id and still accepts the earlier spelling, but not two different ones", async () => {
+    const connect = vi.fn();
+    const other = "00000000-0000-4000-8000-00000000ffff";
+    const out = await runReadThread({ connect } as never, { conversation_id: "conversation-1", account_id: ACCOUNT_ID, account: other });
+    expect(out).toMatchObject({ error: { code: "invalid_input", issues: [{ rule: "constraint", path: ["account_id"] }] } });
+    expect(connect).not.toHaveBeenCalled();
+  });
+
   it("accepts a direct account-scoped conversation selector", async () => {
     const { pool, query } = assignedConversationPool();
     const out = await runReadThread(
       pool as never,
-      { conversation_id: "conversation-1", account: ACCOUNT_ID },
+      { conversation_id: "conversation-1", account_id: ACCOUNT_ID },
       undefined,
       { includeBody: false }
     );
@@ -694,7 +702,7 @@ describe("read_thread stored assignments", () => {
     const out = await runReadThread({ connect } as never, { [field]: value });
 
     expect(out).toMatchObject({
-      error: { code: "invalid_input", message: `${field} requires account.`, issues: [{ rule: "missing", path: ["account"] }] }
+      error: { code: "invalid_input", message: `${field} requires account_id.`, issues: [{ rule: "missing", path: ["account_id"] }] }
     });
     expect(connect).not.toHaveBeenCalled();
   });
