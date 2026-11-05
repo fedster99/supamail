@@ -544,7 +544,7 @@ export async function withReadOnlyTx<T>(pool: PgPool, fn: (client: PgClient) => 
 /**
  * The mailbox a read scopes to. Tools and results name it `account_id`; `account`,
  * the earlier spelling, stays accepted so a cached copy of a tool keeps working.
- * Both may be given only when they agree (ADR 0052).
+ * Both may be given only when they agree (ADR 0053).
  */
 export interface MailboxScopeArgs {
   account_id?: string;

@@ -1,4 +1,4 @@
-# ADR 0052: Tool arguments name a mailbox as `account_id`
+# ADR 0053: Tool arguments name a mailbox as `account_id`
 
 Status: Accepted
 
