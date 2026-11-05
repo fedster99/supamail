@@ -9,6 +9,9 @@ export * from "./drafts.js";
 export {
   AbortError,
   AccountBusyError,
+  ACTION_WARNINGS,
+  ACTION_WARNING_CODES,
+  actionWarning,
   INPUT_ISSUE_RULES,
   InvalidInputError,
   NoRecipientsError,
@@ -16,7 +19,7 @@ export {
   UnfetchableContentError,
   inputIssues
 } from "./errors.js";
-export type { InputIssue, InputIssueRule } from "./errors.js";
+export type { ActionWarning, ActionWarningCode, InputIssue, InputIssueRule } from "./errors.js";
 export * from "./imap-client.js";
 export * from "./inbox-idle.js";
 export * from "./locks.js";

@@ -237,15 +237,14 @@ describe("deliverSmtp requireTLS decoupling (decision 3)", () => {
     expect(createTransport.mock.calls[0][0]).toMatchObject({ requireTLS: false, secure: true });
   });
 
-  it("returns a warning instead of overwriting confirmed delivery when transport close throws", async () => {
-    const warning = vi.fn();
+  it("returns the confirmed delivery when transport close throws", async () => {
     transport.close.mockImplementationOnce(() => {
       throw new Error("transport close failed");
     });
     const { deliverSmtp } = await import("../smtp-client.js");
-    await deliverSmtp(creds, Buffer.from("raw"), envelope, config, { onPostDeliveryWarning: warning });
+    const receipt = await deliverSmtp(creds, Buffer.from("raw"), envelope, config);
     expect(transport.sendMail).toHaveBeenCalledTimes(1);
-    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/Delivered.*transport close failed/i));
+    expect(receipt.accepted.length).toBeGreaterThan(0);
   });
 
   it("preserves the original SMTP error when send and close both fail", async () => {

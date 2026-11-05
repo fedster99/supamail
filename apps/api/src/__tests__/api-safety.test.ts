@@ -205,8 +205,8 @@ function buildApp(options: {
       accountId, draftsFolderPath: "Drafts", rfcMessageId: "<draft2@example.test>", appendedUid: 6, replacedMessageId: id
     })),
     send: vi.fn(options.draftSend ?? (async (id: string) => ({
-      send: { rfcMessageId: "<sent@example.test>", delivered: true, appendedToSent: true, appendedUid: 1, sentFolderPath: "Sent", warnings: [] },
-      deletedDraftId: id
+      send: { rfcMessageId: "<sent@example.test>", delivered: true, appendedToSent: true, appendedUid: 1, sentFolderPath: "Sent" },
+      deletedDraftId: id, draftDeleted: true, warnings: []
     }))),
     delete: vi.fn(async (id: string) => ({ messageId: id, fromFolder: "Drafts" }))
   };
@@ -650,6 +650,23 @@ describe("API safety", () => {
     });
     expect(res.status).toBe(404);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("relays a delivered send's typed warnings as they are", async () => {
+    const warnings = [{ code: "sent_copy_missing", message: "Delivered, but no copy was filed to Sent: APPEND failed" }];
+    const { app } = buildApp({
+      send: async () => ({
+        rfcMessageId: "<sent@example.test>", delivered: true, appendedToSent: false, appendedUid: null, sentFolderPath: null, warnings
+      })
+    });
+
+    const res = await app.request(`/accounts/${accountId}/send`, {
+      method: "POST",
+      headers: { ...auth(), "content-type": "application/json" },
+      body: JSON.stringify({ to: [{ email: "x@example.test" }], subject: "Hi", body: { format: "plain", text: "y" } })
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ result: { delivered: true, warnings } });
   });
 
   it("maps a busy direct send to 503 account_busy before delivery", async () => {

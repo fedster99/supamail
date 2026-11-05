@@ -115,13 +115,11 @@ that surface, exactly as 0014 required any write capability to be a new decision
   APPEND fails). v1 deliberately does not roll back a delivered email; it logs a
   warning and relies on the next sync to mirror the Sent copy if the provider
   auto-filed it. A retry queue is added only if it bites.
-- Once SMTP delivery is confirmed, Sent-appender logout/fallback-close failures
-  are warnings in the delivered result, never thrown failures that invite a
-  duplicate re-send.
-- Nodemailer transport close follows the same phase rule: `sendMail` failure
-  throws a typed outcome, but `transporter.close()` failure after acceptance is
-  reported through the delivered result's warnings and never overwrites
-  confirmation.
+- Once SMTP delivery is confirmed, nothing after it throws, so no failure can
+  invite a duplicate re-send. A Sent copy, mirror row or body that did not
+  finish is a typed warning on the delivered result (ADR 0052); appender and
+  transport teardown failures change nothing the caller sees (amended by
+  ADR 0052; they were free-text warnings).
 - Core returns accepted recipients, rejected recipients, and the final SMTP
   response. Only a complete SMTP 4xx or 5xx reply is a provider rejection. A
   partial positive reply, a lost final reply, or an unqualified connection loss

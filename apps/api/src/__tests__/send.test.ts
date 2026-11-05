@@ -355,7 +355,7 @@ describe("sendMessage orchestration", () => {
       account.lock_id,
       expect.any(Function),
       // Fenced writes: the Sent copy's mirror row shares fate with the lock (ADR 0046).
-      expect.objectContaining({ fenceWrites: true, heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
+      expect.objectContaining({ fenceWrites: true, heartbeatIntervalMs: 60_000 })
     );
 
     // The bytes delivered and the bytes appended must be byte-identical.
@@ -523,7 +523,9 @@ describe("sendMessage orchestration", () => {
     expect(result.delivered).toBe(true);
     expect(result.appendedToSent).toBe(false);
     expect(mocks.appenderAppend).not.toHaveBeenCalled();
-    expect(result.warnings.join(" ")).toMatch(/filing to Sent failed: Mailbox action aborted/);
+    expect(result.warnings).toEqual([
+      { code: "sent_copy_missing", message: expect.stringMatching(/no copy was filed to Sent: Mailbox action aborted/) }
+    ]);
   });
 
   it("returns delivered with a warning when liveness is lost after SMTP confirmation", async () => {
@@ -542,7 +544,9 @@ describe("sendMessage orchestration", () => {
     expect(result.delivered).toBe(true);
     expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
     expect(mocks.appenderAppend).not.toHaveBeenCalled();
-    expect(result.warnings.join(" ")).toMatch(/filing to Sent was skipped.*heartbeat refresh exhausted/i);
+    expect(result.warnings).toEqual([
+      { code: "sent_copy_missing", message: expect.stringMatching(/heartbeat refresh exhausted/) }
+    ]);
   });
 
   it("does NOT APPEND when delivery throws (nothing filed on a failed send)", async () => {
@@ -615,7 +619,7 @@ describe("sendMessage orchestration", () => {
     });
     expect(result.delivered).toBe(true);
     expect(result.appendedToSent).toBe(false);
-    expect(result.warnings.join(" ")).toMatch(/Sent failed/i);
+    expect(result.warnings.map((warning) => warning.code)).toEqual(["sent_copy_missing"]);
   });
 
   it("throws for an unknown account before any delivery", async () => {
@@ -754,7 +758,7 @@ describe("sendMessage orchestration", () => {
     expect(lockHeld).toBe(false);
   });
 
-  it("reports teardown failure as a warning after confirmed delivery instead of throwing", async () => {
+  it("a teardown failure after confirmed delivery is neither a throw nor a warning", async () => {
     mocks.appenderLogout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
     mocks.appenderClose.mockImplementationOnce(() => {
       throw new Error("socket close failed");
@@ -771,6 +775,6 @@ describe("sendMessage orchestration", () => {
 
     expect(result.delivered).toBe(true);
     expect(result.appendedToSent).toBe(true);
-    expect(result.warnings.join(" ")).toMatch(/closing the Sent connection failed: socket close failed/i);
+    expect(result.warnings).toEqual([]);
   });
 });

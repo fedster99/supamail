@@ -6,6 +6,7 @@ import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles
 import type { MirrorRepository } from "./repository.js";
 import { SentFolderAppender, type AppendedUid } from "./smtp-client.js";
 import { PARSED_BODY_BATCH_MAX_SOURCE_BYTES } from "./sync-limits.js";
+import { actionWarning, type ActionWarning } from "./errors.js";
 import type { ImapAccount, SendResult } from "./types.js";
 
 /** Bound on the row write; the provider already holds the message. The body store
@@ -48,7 +49,7 @@ export async function mirrorFiledMessage(
   socket: ActionSocket,
   accountId: string,
   filed: FiledMessage,
-  warn: (warning: string) => void
+  warn: (warning: ActionWarning) => void
 ): Promise<string | null> {
   const { uid, uidValidity } = filed.appended;
   const [folder] = await repository.getFoldersForWake(accountId, [filed.folderPath]);
@@ -82,7 +83,7 @@ export async function mirrorFiledMessage(
       await bodyStore.store(body);
       await repository.completeBodyStorage(row.id);
     } catch (error) {
-      warn(`Mirrored, but the body is readable only after the next sync: ${errorText(error)}.`);
+      warn(actionWarning("body_pending", error));
     }
   }
   return row.id;
@@ -103,7 +104,7 @@ export async function fileSentCopy(
   account: ImapAccount,
   connection: ActionConnection,
   raw: Buffer,
-  warn: (warning: string) => void
+  warn: (warning: ActionWarning) => void
 ): Promise<SentCopy> {
   const copy: SentCopy = { appendedToSent: false, appendedUid: null, sentFolderPath: null, messageId: null };
   let appended: AppendedUid | null;
@@ -116,7 +117,7 @@ export async function fileSentCopy(
     copy.appendedToSent = true;
     copy.appendedUid = appended?.uid ?? null;
   } catch (error) {
-    warn(`Delivered, but filing to Sent failed: ${errorText(error)}. The next sync will mirror the copy if the provider auto-filed it.`);
+    warn(actionWarning("sent_copy_missing", error));
     return copy;
   }
   if (!appended) return copy;
@@ -124,11 +125,7 @@ export async function fileSentCopy(
     copy.messageId = await mirrorFiledMessage(repository, config, bodyStore, socket, account.id,
       { folderPath: copy.sentFolderPath, appended, raw }, warn);
   } catch (error) {
-    warn(`Delivered, but the sent copy is readable only after the next sync: ${errorText(error)}.`);
+    warn(actionWarning("mirror_pending", error));
   }
   return copy;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

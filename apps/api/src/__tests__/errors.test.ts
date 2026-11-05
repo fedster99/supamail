@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { INPUT_ISSUE_RULES, InvalidInputError, formatZodIssues, inputIssues } from "../errors.js";
+import { INPUT_ISSUE_RULES, InvalidInputError, formatZodIssues, inputIssues, ACTION_WARNINGS, ACTION_WARNING_CODES, actionWarning } from "../errors.js";
 import { DRAFT_INPUT_SCHEMA, parseInput } from "../compose-schema.js";
 
 const schema = z
@@ -83,5 +83,21 @@ describe("InvalidInputError", () => {
 
   it("has no issues for a rule that no field owns", () => {
     expect(new InvalidInputError("retired option").issues).toEqual([]);
+  });
+});
+
+describe("actionWarning", () => {
+  it("names every code once, in the order of the vocabulary", () => {
+    expect(ACTION_WARNING_CODES).toEqual(["sent_copy_missing", "mirror_pending", "body_pending", "draft_kept"]);
+    expect(ACTION_WARNING_CODES).toEqual(Object.keys(ACTION_WARNINGS));
+  });
+
+  it("puts the fixed sentence before the cause, for an Error and for anything else", () => {
+    expect(actionWarning("draft_kept", new Error("no UIDPLUS"))).toEqual({
+      code: "draft_kept", message: "Done, but the superseded draft is still in Drafts: no UIDPLUS"
+    });
+    expect(actionWarning("body_pending", "storage down")).toEqual({
+      code: "body_pending", message: "Mirrored, but the body is readable only after the next sync: storage down"
+    });
   });
 });
