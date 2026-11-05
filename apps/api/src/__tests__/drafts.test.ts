@@ -1,4 +1,5 @@
 import { simpleParser } from "mailparser";
+import { actionWarning, type ActionWarning } from "../errors.js";
 import { buildReplyBody } from "../mcp/tools/draft-reply.js";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
@@ -373,8 +374,7 @@ describe("createDraft", () => {
     // and the save is confirmed once the provider holds the draft.
     expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), {
       fenceWrites: true,
-      waitMs: 25_000,
-      onPostIrreversibleWarning: expect.any(Function)
+      waitMs: 25_000
     });
     expect(mocks.lockConfirmIrreversible).toHaveBeenCalledTimes(1);
     expect(mocks.lockConfirmIrreversible.mock.invocationCallOrder[0]).toBeGreaterThan(mocks.append.mock.invocationCallOrder[0]);
@@ -410,9 +410,9 @@ describe("createDraft", () => {
     expect(result).toMatchObject({ messageId: null, appendedUid: 7, warnings: [] });
   });
 
-  it("reports a mirror warning on a saved draft", async () => {
+  it("reports a body left to the next sync on a saved draft", async () => {
     mocks.mirrorFiledMessage.mockImplementationOnce(async (...args: unknown[]) => {
-      (args[6] as (warning: string) => void)("Mirrored, but the body is readable only after the next sync: storage down.");
+      (args[6] as (warning: ActionWarning) => void)(actionWarning("body_pending", new Error("storage down")));
       return N1;
     });
     const { createDraft } = await import("../drafts.js");
@@ -420,23 +420,9 @@ describe("createDraft", () => {
       accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
     });
     expect(result).toMatchObject({
-      messageId: N1, warnings: ["Mirrored, but the body is readable only after the next sync: storage down."]
+      messageId: N1,
+      warnings: [{ code: "body_pending", message: "Mirrored, but the body is readable only after the next sync: storage down" }]
     });
-  });
-
-  it("reports a saved draft when the lock fails after the APPEND", async () => {
-    // e.g. the lock's session died, so unlock fails after the provider holds the draft.
-    mocks.withAccountLock.mockImplementationOnce(async (_pool: unknown, _lockId: unknown, fn: (lock: unknown) => Promise<unknown>, options: { onPostIrreversibleWarning: (warning: string) => void }) => {
-      const value = await fn(mockAccountLock());
-      options.onPostIrreversibleWarning("The provider already accepted the change; the lock release failed");
-      return value;
-    });
-    const { createDraft } = await import("../drafts.js");
-    const result = await createDraft({} as never, config, {
-      accountId: "11111111-1111-4111-8111-111111111111", to: [], subject: "s", body: { format: "plain", text: "b" }
-    });
-    expect(result.messageId).toBe(N1);
-    expect(result.warnings).toEqual(["The provider already accepted the change; the lock release failed"]);
   });
 
   it("reports a saved draft when its mirror write fails", async () => {
@@ -448,7 +434,7 @@ describe("createDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
     expect(result.messageId).toBeNull();
     expect(result.warnings).toEqual([
-      "Saved, but the draft id is available only after the next sync: database unavailable."
+      { code: "mirror_pending", message: "Filed, but the copy is mirrored only after the next sync: database unavailable" }
     ]);
   });
 
@@ -685,7 +671,7 @@ describe("updateDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
     expect(result.replacedMessageId).toBe(D1);
     expect(result.replacedDraftDeleted).toBe(false);
-    expect(result.warnings.join(" ")).toMatch(/removing the previous draft failed/i);
+    expect(result.warnings.map((warning) => warning.code)).toEqual(["draft_kept"]);
   });
 
   it("throws AccountBusyError before the delete when the account lock is held (no partial state)", async () => {
@@ -800,7 +786,7 @@ describe("sendDraft", () => {
       pool,
       account.lock_id,
       expect.any(Function),
-      expect.objectContaining({ heartbeatIntervalMs: 60_000, onPostIrreversibleWarning: expect.any(Function) })
+      expect.objectContaining({ heartbeatIntervalMs: 60_000 })
     );
 
     // The actual draft bytes are fetched (true round-trip), NOT rebuilt from the
@@ -984,9 +970,28 @@ describe("sendDraft", () => {
     expect(result.send.delivered).toBe(true);
     expect(result.deletedDraftId).toBe(D1);
     expect(result.draftDeleted).toBe(false);
-    expect(result.warnings.join(" ")).toMatch(/removing the draft from Drafts failed/i);
-    // The warning is also threaded onto the nested SendResult.
-    expect(result.send.warnings.join(" ")).toMatch(/removing the draft/i);
+    expect(result.warnings).toEqual([
+      { code: "draft_kept", message: expect.stringMatching(/still in Drafts: Hard delete needs the UIDPLUS extension/) }
+    ]);
+    // One list per result: the nested send carries none.
+    expect(result.send).not.toHaveProperty("warnings");
+  });
+
+  it("files nothing and removes nothing when the lock is no longer live after delivery", async () => {
+    const pool = mockPoolReturningDraft(draftRow);
+    mocks.lockAssertLive
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("heartbeat refresh exhausted"));
+    const { sendDraft } = await import("../drafts.js");
+
+    const result = await sendDraft(pool, config, D1);
+    expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
+    expect(mocks.append).not.toHaveBeenCalled();
+    expect(mocks.deleteMessageInLock).not.toHaveBeenCalled();
+    expect(result.send).toMatchObject({ delivered: true, appendedToSent: false, messageId: null });
+    expect(result.draftDeleted).toBe(false);
+    expect(result.warnings.map((warning) => warning.code)).toEqual(["sent_copy_missing", "draft_kept"]);
+    expect(result.warnings.every((warning) => warning.message.endsWith(": heartbeat refresh exhausted"))).toBe(true);
   });
 
   it("STILL reports delivered when the Sent-APPEND fails (best-effort filing)", async () => {
@@ -999,7 +1004,9 @@ describe("sendDraft", () => {
     expect(mocks.deliverSmtp).toHaveBeenCalledTimes(1);
     expect(result.send.delivered).toBe(true);
     expect(result.send.appendedToSent).toBe(false);
-    expect(result.warnings.join(" ")).toMatch(/filing to Sent failed/i);
+    expect(result.warnings).toEqual([
+      { code: "sent_copy_missing", message: expect.stringMatching(/APPEND to Sent failed/) }
+    ]);
   });
 
   it("holds the lock through SMTP, APPEND, fallback teardown, and draft cleanup", async () => {
@@ -1039,7 +1046,7 @@ describe("sendDraft", () => {
     expect(lockHeld).toBe(false);
   });
 
-  it("downgrades connection logout plus fallback-close failure after delivery to a warning", async () => {
+  it("a connection logout plus fallback-close failure after delivery is neither a throw nor a warning", async () => {
     const pool = mockPoolReturningDraft(draftRow);
     mocks.logout.mockRejectedValueOnce(new Error("LOGOUT timed out"));
     mocks.close.mockImplementationOnce(() => {
@@ -1049,7 +1056,7 @@ describe("sendDraft", () => {
     const { sendDraft } = await import("../drafts.js");
     const result = await sendDraft(pool, config, D1);
     expect(result.send.delivered).toBe(true);
-    expect(result.warnings.join(" ")).toMatch(/closing the mailbox connection failed: socket close failed/i);
+    expect(result.warnings).toEqual([]);
   });
 
   it("reports draftDeleted=true and no cleanup warning on the happy path", async () => {

@@ -1,3 +1,5 @@
+import type { ActionWarning } from "./errors.js";
+
 export type BodyFetchPolicy = "immediate" | "lazy" | "priority_then_backfill";
 export type BodyStorageMode = "raw_mime" | "parsed_only";
 export type LiveWindowDays = 30 | 90 | 180;
@@ -434,7 +436,8 @@ export interface SendResult {
    * APPENDUID, when Sent is not mirrored yet, or after a failed mirror write; the
    * next sync then mirrors the copy. */
   messageId: string | null;
-  warnings: string[];
+  /** Steps that did not finish after delivery; the mail is sent regardless. */
+  warnings: ActionWarning[];
 }
 
 export interface UpdateAccountSettingsInput {

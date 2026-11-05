@@ -93,8 +93,7 @@ describe("withAccountLock heartbeat", () => {
     expect(client.release).toHaveBeenCalledWith(expect.any(Error));
   });
 
-  it("warns instead of rejecting after confirmation when unlock fails, while still evicting", async () => {
-    const warning = vi.fn();
+  it("resolves after confirmation when unlock fails, while still evicting the client", async () => {
     const client = {
       query: vi.fn()
         .mockResolvedValueOnce({ rows: [{ locked: true }] })
@@ -107,8 +106,7 @@ describe("withAccountLock heartbeat", () => {
     await expect(withAccountLock(pool, "42", async (lock) => {
       lock.confirmIrreversible();
       return "delivered";
-    }, { onPostIrreversibleWarning: warning })).resolves.toBe("delivered");
-    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/already accepted the change.*unlock failed/i));
+    })).resolves.toBe("delivered");
     expect(client.release).toHaveBeenCalledWith(expect.any(Error));
   });
 });

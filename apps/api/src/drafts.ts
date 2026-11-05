@@ -3,7 +3,7 @@ import { DRAFT_INPUT_SCHEMA, DRAFT_UPDATE_SCHEMA, parseInput } from "./compose-s
 import type { AppConfig } from "./config.js";
 import { getRawMime } from "./content.js";
 import type { PgClient, PgPool } from "./db.js";
-import { NoRecipientsError, NotFoundError, throwIfAborted } from "./errors.js";
+import { NoRecipientsError, NotFoundError, throwIfAborted, actionWarning, type ActionWarning } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import type { BodyStore } from "./body-store.js";
 import { actionBodyStore, fileSentCopy, mirrorFiledMessage, type SentCopy } from "./filed-message.js";
@@ -118,10 +118,9 @@ export interface CreateDraftResult {
   messageId: string | null;
   /** From UIDPLUS APPENDUID when the server provides one, else null. */
   appendedUid: number | null;
-  /** Non-fatal warnings. The draft is saved in the provider regardless; e.g. the
-   * old draft of an update could not be EXPUNGEd on a non-UIDPLUS server, which
-   * self-heals on sync. */
-  warnings: string[];
+  /** Steps that did not finish after the provider accepted the draft: its mirror
+   * row or body, or (on an update) removing the version it replaced. */
+  warnings: ActionWarning[];
 }
 
 export interface UpdateDraftResult extends CreateDraftResult {
@@ -133,16 +132,16 @@ export interface UpdateDraftResult extends CreateDraftResult {
 }
 
 export interface SendDraftResult {
-  /** The send outcome (email-001 SendResult). */
-  send: SendResult;
+  /** The send outcome (email-001 SendResult); its warnings are this result's. */
+  send: Omit<SendResult, "warnings">;
   /** The mirror id of the draft that was deleted after sending. */
   deletedDraftId: string;
   /** True when the sent draft was actually removed from Drafts; false when the
    * post-send cleanup delete failed (the mail is ALREADY sent regardless). */
   draftDeleted: boolean;
-  /** Non-fatal warnings (e.g. the draft couldn't be EXPUNGEd on a non-UIDPLUS
-   * server). The send still succeeded; the leftover draft self-heals on sync. */
-  warnings: string[];
+  /** Steps that did not finish after delivery: the Sent copy, its mirror row or
+   * body, or removing the sent draft (`draft_kept`). */
+  warnings: ActionWarning[];
 }
 
 export interface DeleteDraftResult {
@@ -204,8 +203,7 @@ async function saveDraft(
 ): Promise<SavedDraft> {
   const composed = await composeDraft(account, req, idempotencyKey);
   const bodyStore = actionBodyStore(repository, options.bodyStore);
-  // One array: the lock adds its post-confirmation warnings after the callback returns.
-  const warnings: string[] = [];
+  const warnings: ActionWarning[] = [];
   return await withInteractiveAccountLock(pool, account, async (lock) => {
     const connection = new ActionConnection(pool, config, account, options);
     try {
@@ -213,7 +211,7 @@ async function saveDraft(
     } finally {
       await connection.close();
     }
-  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
+  }, { fenceWrites: true });
 }
 
 /** The locked part of a save: file the draft, then mirror it (ADR 0046). */
@@ -224,7 +222,7 @@ async function fileAndMirrorDraft(
   account: ImapAccount,
   composed: ComposedDraft,
   lock: AccountLock,
-  warnings: string[],
+  warnings: ActionWarning[],
   connection: ActionConnection
 ): Promise<SavedDraft> {
   const { raw, rfcMessageId, idempotencyKey } = composed;
@@ -253,9 +251,7 @@ async function fileAndMirrorDraft(
         { folderPath: filed.draftsFolderPath, appended, raw: filed.retried ? null : raw },
         (warning) => warnings.push(warning)));
   } catch (error) {
-    warnings.push(
-      `Saved, but the draft id is available only after the next sync: ${error instanceof Error ? error.message : String(error)}.`
-    );
+    warnings.push(actionWarning("mirror_pending", error));
   }
   return saved;
 }
@@ -542,32 +538,29 @@ export async function updateDraft(
 
   const composed = await composeDraft(account, { ...request, accountId: account.id });
   const bodyStore = actionBodyStore(repository, options.bodyStore);
-  const warnings: string[] = [];
+  const warnings: ActionWarning[] = [];
   // One lock across the APPEND and the delete, so no sync runs between them, and
   // one connection, so one login per update.
   const { saved, replacedDraftDeleted } = await withInteractiveAccountLock(pool, account, async (lock) => {
     const connection = new ActionConnection(pool, config, account, options);
     try {
       const saved = await fileAndMirrorDraft(repository, config, bodyStore, account, composed, lock, warnings, connection);
-      // Hard-delete the superseded draft (reuse email-002). Best-effort: the revised
-      // draft is ALREADY filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
-      // EXPUNGE) must NOT fail the update — we downgrade it to a warning and report
-      // the update as done. A lingering old draft self-heals on the next Drafts sync.
+      // Hard-delete the superseded draft (reuse email-002). The revised draft is
+      // already filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
+      // EXPUNGE) is `draft_kept`, not a failed update; the User removes the copy.
       try {
         await timeImapStep(connection.onStep, "delete", () => deleteMessageInLock(pool, config, messageId, {
           hard: true, metadataProtection, signal: options.signal, connection
         }));
         return { saved, replacedDraftDeleted: true };
       } catch (error) {
-        warnings.push(
-          `Updated, but removing the previous draft failed: ${error instanceof Error ? error.message : String(error)}. The old copy self-heals on the next sync.`
-        );
+        warnings.push(actionWarning("draft_kept", error));
         return { saved, replacedDraftDeleted: false };
       }
     } finally {
       await connection.close();
     }
-  }, { fenceWrites: true, onPostIrreversibleWarning: (warning) => warnings.push(warning) });
+  }, { fenceWrites: true });
 
   return { accountId: account.id, ...saved, replacedMessageId: messageId, replacedDraftDeleted };
 }
@@ -657,10 +650,7 @@ async function sendDraftAttempt(
   // Envelope recipients come from the SYNCED header fields only (never the lazy
   // body): MAIL FROM = the account email, RCPT TO = the draft's To + Cc.
   const envelope = { from: account.email_address, to: [...draft.toEmails, ...draft.ccEmails] };
-  const warnings: string[] = [];
-  const addWarning = (warning: string) => {
-    if (!warnings.includes(warning)) warnings.push(warning);
-  };
+  const warnings: ActionWarning[] = [];
 
   // The raw fetch can itself require IMAP, so acquire before it and keep the same
   // account lock through SMTP delivery, Sent APPEND, appender teardown, and draft
@@ -669,7 +659,6 @@ async function sendDraftAttempt(
     // One connection for the raw fetch, the Sent APPEND and the draft delete. It is
     // opened again only if it died while SMTP ran, which can outlast an idle socket.
     const connection = new ActionConnection(pool, config, account, { signal, sessions });
-    let delivered = false;
     try {
       // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
       // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
@@ -686,81 +675,48 @@ async function sendDraftAttempt(
       // irreversible SMTP boundary (the raw fetch may have taken time).
       await lock.assertLive();
       throwIfAborted(signal);
-      const delivery = await deliverSmtp(creds, raw, envelope, config, {
-        isPrivateHost,
-        onPostDeliveryWarning: addWarning
-      });
+      const delivery = await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
       confirmDelivery();
-      delivered = true;
       lock.confirmIrreversible();
 
+      // The mail is sent. A lock that is no longer live files nothing and removes
+      // nothing (its fenced writes would fail anyway); every other failure from
+      // here is a warning on a delivered result.
       let sent: SentCopy = { appendedToSent: false, appendedUid: null, sentFolderPath: null, messageId: null };
-      let providerWorkAllowed = true;
-      try {
-        await lock.assertLive();
-      } catch (error) {
-        providerWorkAllowed = false;
-        addWarning(
-          `Delivered, but filing to Sent and draft cleanup were skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
-        );
-      }
+      const liveness = await lock.assertLive().then(() => null, (error: unknown) => error);
+      if (liveness) warnings.push(actionWarning("sent_copy_missing", liveness));
       // File the same bytes to Sent and mirror the copy at once (ADR 0046).
-      if (providerWorkAllowed) {
-        sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, addWarning);
+      else sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, (warning) => warnings.push(warning));
+
+      // Remove the sent draft while the same account lock remains held.
+      let draftDeleted = false;
+      try {
+        if (liveness) throw liveness;
+        await lock.assertLive();
+        await deleteMessageInLock(pool, config, messageId, { hard: true, metadataProtection, signal, connection });
+        draftDeleted = true;
+      } catch (error) {
+        warnings.push(actionWarning("draft_kept", error));
       }
 
-      const send: SendResult = {
+      const send: Omit<SendResult, "warnings"> = {
         // The resent bytes carry the draft's ORIGINAL Message-ID (no recompose).
         rfcMessageId: draft.rfcMessageId ?? "",
         delivered: true,
         accepted: delivery.accepted,
         rejected: delivery.rejected,
         smtpResponse: delivery.response,
-        ...sent,
-        warnings
+        ...sent
       };
-
-      // Remove the sent draft while the same account lock remains held. This is
-      // best-effort after delivery; any mutation/teardown failure becomes a warning.
-      let draftDeleted = false;
-      if (providerWorkAllowed) {
-        try {
-          await lock.assertLive();
-        } catch (error) {
-          providerWorkAllowed = false;
-          addWarning(
-            `Delivered, but removing the draft from Drafts was skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
-          );
-        }
-      }
-      if (providerWorkAllowed) {
-        try {
-          await deleteMessageInLock(pool, config, messageId, { hard: true, metadataProtection, signal, connection });
-          draftDeleted = true;
-        } catch (error) {
-          addWarning(
-            `Delivered, but removing the draft from Drafts failed: ${error instanceof Error ? error.message : String(error)}. The leftover draft self-heals on the next sync.`
-          );
-        }
-      }
-
       return { send, deletedDraftId: messageId, draftDeleted, warnings };
     } finally {
-      try {
-        await connection.close();
-      } catch (error) {
-        // After delivery a teardown failure is a warning, never a retry signal.
-        if (delivered) {
-          addWarning(
-            `Delivered, but closing the mailbox connection failed: ${error instanceof Error ? error.message : String(error)}.`
-          );
-        }
-      }
+      // Teardown is never a result: before delivery the thrown error stands, and
+      // after it a thrown close could invite a duplicate send.
+      await connection.close().catch(() => undefined);
     }
   }, {
     fenceWrites: true,
-    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
-    onPostIrreversibleWarning: addWarning
+    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS)
   });
 }
 

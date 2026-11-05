@@ -1,7 +1,7 @@
 import { SEND_REQUEST_SCHEMA, parseInput } from "./compose-schema.js";
 import type { AppConfig } from "./config.js";
 import type { PgPool } from "./db.js";
-import { NotFoundError, throwIfAborted } from "./errors.js";
+import { NotFoundError, throwIfAborted, actionWarning, type ActionWarning } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { actionBodyStore, fileSentCopy, type SentCopy } from "./filed-message.js";
 import { ActionConnection } from "./imap-connect.js";
@@ -111,10 +111,7 @@ async function sendMessageAttempt(
   const from = { email: account.email_address };
   const { raw, messageId } = await buildRawMime(req, from);
   const envelope = buildSendEnvelope(account.email_address, req);
-  const warnings: string[] = [];
-  const addWarning = (warning: string) => {
-    if (!warnings.includes(warning)) warnings.push(warning);
-  };
+  const warnings: ActionWarning[] = [];
 
   // SMTP submission and the matching Sent APPEND are one account-scoped provider
   // operation. Hold the SAME advisory lock used by sync and draft APPENDs across
@@ -131,40 +128,26 @@ async function sendMessageAttempt(
 
     // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
     // it relaxes only when the target actually resolved private/loopback.
-    const delivery = await deliverSmtp(creds, raw, envelope, config, {
-      isPrivateHost,
-      onPostDeliveryWarning: addWarning
-    });
+    const delivery = await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
     confirmDelivery();
     lock.confirmIrreversible();
 
     // Delivery succeeded; file the identical bytes to Sent while the account lock
     // remains held, and mirror the copy at once (ADR 0046). Every failure from here
-    // is a warning — the mail is already sent.
+    // is a warning (the mail is already sent), and a lock that is no longer live
+    // files nothing: its fenced writes would fail anyway.
     let sent: SentCopy = { appendedToSent: false, appendedUid: null, sentFolderPath: null, messageId: null };
-    let lockLiveForFiling = true;
-    try {
-      await lock.assertLive();
-    } catch (error) {
-      lockLiveForFiling = false;
-      addWarning(
-        `Delivered, but filing to Sent was skipped because account-lock liveness was lost: ${error instanceof Error ? error.message : String(error)}.`
-      );
-    }
-    if (lockLiveForFiling) {
+    const liveness = await lock.assertLive().then(() => null, (error: unknown) => error);
+    if (liveness) {
+      warnings.push(actionWarning("sent_copy_missing", liveness));
+    } else {
       const connection = new ActionConnection(pool, config, account, { signal, sessions });
       try {
-        sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, addWarning);
+        sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, (warning) => warnings.push(warning));
       } finally {
-        try {
-          await connection.close();
-        } catch (error) {
-          // SMTP is already confirmed. Teardown failure is diagnostic only; never
-          // turn it into a thrown response that could invite a duplicate re-send.
-          addWarning(
-            `Delivered, but closing the Sent connection failed: ${error instanceof Error ? error.message : String(error)}.`
-          );
-        }
+        // Teardown after a confirmed delivery is never a result: a thrown close
+        // could invite a duplicate send.
+        await connection.close().catch(() => undefined);
       }
     }
 
@@ -179,7 +162,6 @@ async function sendMessageAttempt(
     };
   }, {
     fenceWrites: true,
-    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
-    onPostIrreversibleWarning: addWarning
+    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS)
   });
 }

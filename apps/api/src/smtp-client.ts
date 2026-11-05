@@ -325,7 +325,7 @@ export async function deliverSmtp(
   raw: Buffer,
   envelope: SmtpEnvelope,
   config: AppConfig,
-  opts: { isPrivateHost?: boolean; onPostDeliveryWarning?: (warning: string) => void } = {}
+  opts: { isPrivateHost?: boolean } = {}
 ): Promise<SmtpDeliveryReceipt> {
   // Require STARTTLS for any non-implicit-TLS target, UNLESS the resolved host is
   // actually private/loopback (dev/self-hosted GreenMail). The IMAP_ALLOW_PRIVATE_
@@ -358,14 +358,10 @@ export async function deliverSmtp(
 
   try {
     await transporter.close();
-  } catch (error) {
-    if (receipt) {
-      opts.onPostDeliveryWarning?.(
-        `Delivered, but closing the SMTP transport failed: ${error instanceof Error ? error.message : String(error)}.`
-      );
-    }
-    // When sendMail itself failed, preserve that original delivery uncertainty;
-    // a close failure must never overwrite the causally useful SMTP error.
+  } catch {
+    // A close failure changes nothing about the delivery: after a receipt it is
+    // teardown, and after a failed sendMail the delivery error must stay the one
+    // the caller sees.
   }
 
   if (deliveryError) {
