@@ -18,9 +18,6 @@ export interface AccountLockOptions {
    * Required for operations that can approach the stale-reaper threshold; bounded
    * operations and callers that persist their own heartbeat may omit it. */
   heartbeatIntervalMs?: number;
-  /** Receive a diagnostic that happened only after an irreversible action was
-   * confirmed. Callers should add it to their success warnings. */
-  onPostIrreversibleWarning?: (warning: string) => void;
   /** Run `fn` so that every query issued through `lockedSessionPool` uses the
    * lock's own session. Writes then share fate with the lock: once that session
    * ends, the holder cannot write anything else, however long it was frozen. */
@@ -244,10 +241,6 @@ function asError(error: unknown, prefix: string): Error {
   return new Error(`${prefix}: ${details}`);
 }
 
-function postIrreversibleWarning(message: string): string {
-  return `The provider already accepted the change; ${message}`;
-}
-
 async function validateAccountUnlock(
   client: PgClient,
   lockId: string | number
@@ -358,13 +351,6 @@ export async function withAccountLock<T>(
     }
 
     let irreversibleConfirmed = false;
-    const emittedWarnings = new Set<string>();
-    const warnAfterIrreversible = (message: string) => {
-      const warning = postIrreversibleWarning(message);
-      if (emittedWarnings.has(warning)) return;
-      emittedWarnings.add(warning);
-      options.onPostIrreversibleWarning?.(warning);
-    };
 
     const session = options.fenceWrites ? new LockedSession(client, lockId, pool) : null;
     if (session) {
@@ -454,22 +440,15 @@ export async function withAccountLock<T>(
         try {
           // Final synchronous proof catches a periodic failure that raced the end
           // of the callback. Before confirmation it is fail-closed; after
-          // confirmation it is diagnostic only.
+          // confirmation the result stands: every write since then ran on the
+          // fenced session, so what the lock lost, the caller's step reported.
           await refreshHeartbeat();
         } catch (error) {
-          if (irreversibleConfirmed) {
-            warnAfterIrreversible(
-              `account-lock liveness could not be revalidated: ${error instanceof Error ? error.message : String(error)}`
-            );
-          } else {
+          if (!irreversibleConfirmed) {
             callbackFailed = true;
             callbackError = error;
           }
         }
-      } else if (irreversibleConfirmed && lastHeartbeatError) {
-        warnAfterIrreversible(
-          `account-lock heartbeat failed after confirmation: ${lastHeartbeatError instanceof Error ? lastHeartbeatError.message : String(lastHeartbeatError)}`
-        );
       }
 
       try {
@@ -477,9 +456,7 @@ export async function withAccountLock<T>(
         if (!(await unlockSession(client, lockId, session))) releaseError = abandonedSessionError(lockId);
       } catch (error) {
         releaseError = asError(error, `Account lock release failed for lock ${lockId}`);
-        if (irreversibleConfirmed) {
-          warnAfterIrreversible(`the database lock client was evicted after unlock failed: ${releaseError.message}`);
-        } else if (!callbackFailed) {
+        if (!irreversibleConfirmed && !callbackFailed) {
           callbackFailed = true;
           callbackError = releaseError;
         }

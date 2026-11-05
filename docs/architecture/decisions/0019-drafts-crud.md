@@ -157,9 +157,10 @@ for `drafts.ts` only, exactly as 0017/0018 did for their modules.
   regression guard — that the SENT/Sent-APPENDed bytes CONTAIN the draft body even
   when the mirror body row is NULL; refuses a recipient-less draft; rejects lock
   contention before raw fetch/SMTP; holds the lock through SMTP, APPEND,
-  graceful/fallback teardown, and cleanup; treats post-delivery APPEND, teardown,
-  liveness loss, unlock, and delete failures as warnings; delete reuses the
-  email-002 mutation; list/get read the mirror only.
+  graceful/fallback teardown, and cleanup; reports a post-delivery APPEND or
+  delete failure and lost liveness as typed warnings (`sent_copy_missing`,
+  `draft_kept`, ADR 0052) and teardown or unlock faults as nothing; delete
+  reuses the email-002 mutation; list/get read the mirror only.
 - `api-safety.test.ts` covers the `API_TOKEN`-gated draft routes (create with
   optional recipients, create with `bcc` rejected 400 with the clear message, 404
   for unknown account/draft, list/get/update/send, and the `?hard` delete mapping).

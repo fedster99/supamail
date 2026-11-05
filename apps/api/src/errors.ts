@@ -34,6 +34,42 @@ export interface InputIssue {
   path: Array<string | number>;
 }
 
+/** What did not finish after the provider accepted an action's change, as a fixed
+ * code a host can show in its own words and count. The action succeeded and must
+ * not be repeated; each code names the one step left to the next sync or to the
+ * User. The sentence is the operator's readable prefix; `actionWarning` adds the
+ * cause after it. */
+export const ACTION_WARNINGS = {
+  /** Delivered, but this action filed no copy to Sent: the APPEND failed or the
+   * lock was no longer live, so filing was skipped. The provider may have filed
+   * its own copy; the next sync mirrors it if so. */
+  sent_copy_missing: "Delivered, but no copy was filed to Sent",
+  /** The copy is in the mailbox (a Sent copy or a draft) but has no mirror row
+   * yet, so its id is unknown until the next sync. */
+  mirror_pending: "Filed, but the copy is mirrored only after the next sync",
+  /** The row and its id exist; the body is stored by the next body run. */
+  body_pending: "Mirrored, but the body is readable only after the next sync",
+  /** A draft this action should have removed is still in Drafts: the version an
+   * update replaced, or the draft that was just sent. Sync never removes a
+   * provider copy, so the User deletes it. */
+  draft_kept: "Done, but the superseded draft is still in Drafts"
+} as const;
+export type ActionWarningCode = keyof typeof ACTION_WARNINGS;
+export const ACTION_WARNING_CODES = Object.keys(ACTION_WARNINGS) as readonly ActionWarningCode[];
+
+/** One step that did not finish after the provider accepted the change. Hosts
+ * record and relay `code`; `message` is the readable line for the CLI and HTTP
+ * operator, and may carry provider or database text. */
+export interface ActionWarning {
+  code: ActionWarningCode;
+  message: string;
+}
+
+export function actionWarning(code: ActionWarningCode, cause: unknown): ActionWarning {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return { code, message: `${ACTION_WARNINGS[code]}: ${detail}` };
+}
+
 /** The caller's input is malformed (wrong shape, invalid address or id, a field
  * the operation does not accept). A client error the caller must fix, never a
  * provider or server fault, so it is never retried. Mapped to 400. */
