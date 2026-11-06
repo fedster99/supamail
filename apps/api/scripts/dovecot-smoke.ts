@@ -22,6 +22,8 @@ const containerName = process.env.DOVECOT_CONTAINER ?? "supamail-dovecot-smoke";
 const mailbox = process.env.DOVECOT_MAILBOX ?? "supamail-dovecot@example.test";
 const password = process.env.DOVECOT_PASSWORD ?? "supamail-dovecot-password";
 const containerImapPort = 31_143;
+/** An action's own code between its named steps (ADR 0054) stays below this. */
+const UNTIMED_ACTION_MS = 50;
 
 async function docker(args: string[], allowFailure = false): Promise<string> {
   try {
@@ -559,26 +561,39 @@ async function main(): Promise<void> {
       park: (key: string, client: ImapFlow) => { parked.set(key, client); }
     };
     const sessionConfig = { ...config, IMAP_COMMAND_TIMEOUT_MS: 60_000 };
-    const saveWithSteps = async (subject: string) => {
+    // Every action names its steps (ADR 0054): what the steps do not cover is the
+    // action's own code between them, which stays a few milliseconds.
+    const timed = async <T>(run: (onStep: (step: string, ms: number) => void) => Promise<T>) => {
       const steps: string[] = [];
-      const saved = await createDraft(pool, sessionConfig, {
+      let stepMs = 0;
+      const startedAt = performance.now();
+      const result = await run((step, ms) => { steps.push(step); stepMs += ms; });
+      return { result, steps, untimedMs: Math.round(performance.now() - startedAt - stepMs) };
+    };
+    const saveWithSteps = async (subject: string) => {
+      const { result: saved, steps, untimedMs } = await timed((onStep) => createDraft(pool, sessionConfig, {
         accountId: account.id,
         to: [{ email: "recipient@example.test" }],
         subject,
         body: { format: "plain", text: subject },
         idempotencyKey: `dovecot-${subject}-${Date.now()}`
-      }, undefined, { sessions, onImapStep: (step) => steps.push(step) });
-      return { saved, steps };
+      }, undefined, { sessions, onStep }));
+      return { saved, steps, untimedMs };
     };
     const firstParked = await saveWithSteps("parked-first");
     const secondParked = await saveWithSteps("parked-second");
     const reusedBeforeFlag = reusedLogins;
-    if (secondParked.saved.messageId) {
-      await setMessageFlags(pool, sessionConfig, secondParked.saved.messageId, { add: ["flagged"] }, undefined, { sessions });
-    }
+    const flagChange = await timed((onStep) => secondParked.saved.messageId
+      ? setMessageFlags(pool, sessionConfig, secondParked.saved.messageId, { add: ["flagged"] }, undefined, { sessions, onStep })
+      : Promise.resolve(null));
     const flagReusedLogin = reusedLogins === reusedBeforeFlag + 1;
+    const draftMove = await timed((onStep) => secondParked.saved.messageId
+      ? moveMessages(pool, sessionConfig, [secondParked.saved.messageId], "Archive", undefined, { sessions, onStep })
+      : Promise.resolve([]));
     await new Promise((resolve) => setTimeout(resolve, 20_000));
     const afterIdle = await saveWithSteps("parked-after-idle");
+    const untimed = { firstSave: firstParked.untimedMs, reusedSave: secondParked.untimedMs,
+      flagChange: flagChange.untimedMs, move: draftMove.untimedMs, saveAfterIdle: afterIdle.untimedMs };
     const parkedSessions = parked.size;
     for (const client of parked.values()) await client.logout().catch(() => client.close());
 
@@ -615,10 +630,17 @@ async function main(): Promise<void> {
       ["draft row is the server's view at once", draftStructure !== null],
       ["draft body readable at once", Boolean(draftAtOnce?.body?.includes(draftText))],
       ["sync kept the draft id and body", draftSync.outcome === "success" && Boolean(draftAfterSync?.body?.includes(draftText))],
-      ["first save with a session store logged in", firstParked.steps[0] === "connect"],
-      ["second save reused the parked login", secondParked.steps[0] === "reuse"],
+      ["first save with a session store logged in", firstParked.steps.includes("imap_connect")],
+      ["second save reused the parked login", secondParked.steps.includes("imap_reuse") && !secondParked.steps.includes("imap_connect")],
       ["a flag change reused the parked login", flagReusedLogin],
-      ["a session parked past auto-IDLE was reused", afterIdle.steps[0] === "reuse"],
+      ["a session parked past auto-IDLE was reused", afterIdle.steps.includes("imap_reuse") && !afterIdle.steps.includes("imap_connect")],
+      ["a save, flag change and move name their IMAP, lock and mirror steps",
+        ["imap_find", "imap_append", "imap_fetch", "db_lock", "db_mirror", "compose", "db_load"].every((step) => firstParked.steps.includes(step))
+        && flagChange.steps.includes("imap_store") && draftMove.steps.includes("imap_move")],
+      ["named steps cover all but a few milliseconds of every action, and none overlap",
+        Object.values(untimed).every((ms) => ms < UNTIMED_ACTION_MS && ms >= -1)],
+      ["the timed move moved the draft", Array.isArray(draftMove.result) && draftMove.result.length === 1
+        && "result" in draftMove.result[0]],
       ["saves on a reused login were mirrored at once", [firstParked, secondParked, afterIdle]
         .every(({ saved }) => saved.messageId !== null && saved.warnings.length === 0)],
       ["one session stayed parked", parkedSessions === 1]
@@ -652,6 +674,7 @@ async function main(): Promise<void> {
       draft: { savedDraft, bodyAtOnce: draftAtOnce?.body ?? null },
       parkedSessions: {
         steps: [firstParked.steps, secondParked.steps, afterIdle.steps],
+        untimedMs: untimed,
         reusedLogins
       }
     }, null, 2));

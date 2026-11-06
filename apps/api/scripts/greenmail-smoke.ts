@@ -351,6 +351,18 @@ async function countRows(accountId: string): Promise<{
   };
 }
 
+/** An action's own code between its named steps (ADR 0054) stays below this. */
+const UNTIMED_ACTION_MS = 50;
+
+/** Run an action with a step timer: its named steps and the time they do not cover. */
+async function timed<T>(run: (onStep: (step: string, ms: number) => void) => Promise<T>) {
+  const steps: string[] = [];
+  let stepMs = 0;
+  const startedAt = performance.now();
+  const result = await run((step, ms) => { steps.push(step); stepMs += ms; });
+  return { result, steps, untimedMs: Math.round(performance.now() - startedAt - stepMs) };
+}
+
 async function main(): Promise<void> {
   await startGreenMail();
   await sendSmtpMessageWithRetry(plainMessage(1));
@@ -496,7 +508,7 @@ async function main(): Promise<void> {
     );
     const sourceRow = source.rows[0];
     const replyMessageId = `<greenmail-reply-${Date.now()}@example.test>`;
-    const sendResult = await sendMessage(pool, config, {
+    const timedSend = await timed((onStep) => sendMessage(pool, config, {
       accountId: account.id,
       to: [{ email: mailbox }],
       subject: "Re: GreenMail smoke 1",
@@ -504,7 +516,8 @@ async function main(): Promise<void> {
       inReplyTo: sourceRow?.rfc_message_id ?? undefined,
       references: sourceRow?.rfc_message_id ?? undefined,
       messageId: replyMessageId
-    });
+    }, undefined, { onStep }));
+    const sendResult = timedSend.result;
     const sentAtOnce = sendResult.messageId === null ? null : (await pool.query<{
       rfc_message_id: string | null;
       in_reply_to: string | null;
@@ -539,6 +552,9 @@ async function main(): Promise<void> {
 
     const sendAssertions: Array<[string, boolean]> = [
       ["send delivered", sendResult.delivered === true],
+      ["a send names its SMTP, Sent copy and mirror steps", ["smtp_send", "compose", "db_lock", "imap_append", "db_mirror"]
+        .every((step) => timedSend.steps.includes(step))],
+      ["named steps cover all but a few milliseconds of a send, and none overlap", timedSend.untimedMs < UNTIMED_ACTION_MS && timedSend.untimedMs >= -1],
       ["send appended to Sent", sendResult.appendedToSent === true],
       ["sent copy readable at once by its id", sentAtOnce?.rfc_message_id === replyMessageId],
       ["sent copy carries In-Reply-To at once", sentAtOnce?.in_reply_to === (sourceRow?.rfc_message_id ?? null)],
@@ -577,14 +593,15 @@ async function main(): Promise<void> {
       subject: `${draftSubject} (first save)`,
       body: { format: "plain", text: "first save" }
     });
-    const revised = firstSave.messageId === null
+    const timedUpdate = firstSave.messageId === null
       ? null
-      : await updateDraft(pool, config, firstSave.messageId, {
+      : await timed((onStep) => updateDraft(pool, config, firstSave.messageId!, {
         to: [{ email: mailbox }],
         subject: draftSubject,
         body: { format: "plain", text: draftBody },
         messageId: draftMessageId
-      });
+      }, undefined, { onStep }));
+    const revised = timedUpdate?.result ?? null;
     const savedDraft = revised?.messageId ? await getDraft(pool, config, revised.messageId) : null;
 
     await pool.query(
@@ -603,6 +620,8 @@ async function main(): Promise<void> {
 
     let sentDraftCopies = 0;
     let draftGoneFromDrafts = false;
+    let draftSendUntimedMs: number | null = null;
+    let draftSendSteps: string[] = [];
     let draftDelivered = false;
     let draftCleanupBestEffortOk = false;
     let deliveredBody: string | null = null;
@@ -612,7 +631,10 @@ async function main(): Promise<void> {
       // same bytes to Sent, then best-effort deletes the draft. Because it resends
       // the real bytes (not a mirror rebuild), the SENT/DELIVERED copy carries the
       // draft's ORIGINAL Message-ID and the real body.
-      const draftSend = await sendDraft(pool, config, mirroredDraft.messageId);
+      const timedDraftSend = await timed((onStep) => sendDraft(pool, config, mirroredDraft.messageId, undefined, { onStep }));
+      draftSendUntimedMs = timedDraftSend.untimedMs;
+      draftSendSteps = timedDraftSend.steps;
+      const draftSend = timedDraftSend.result;
       draftDelivered = draftSend.send.delivered === true;
       // The post-send hard-delete is best-effort (review decision 1): on a server
       // without UIDPLUS the UID-scoped EXPUNGE is refused and downgraded to a
@@ -658,6 +680,10 @@ async function main(): Promise<void> {
 
     const draftAssertions: Array<[string, boolean]> = [
       ["draft save returned its mirror id", firstSave.messageId !== null],
+      ["a draft update names its expunge of the old draft", Boolean(timedUpdate?.steps.includes("imap_expunge"))],
+      ["a draft send names its fetch, SMTP and Sent copy", ["imap_fetch", "smtp_send", "imap_append"].every((step) => draftSendSteps.includes(step))],
+      ["named steps cover all but a few milliseconds of a draft update and send",
+        [timedUpdate?.untimedMs, draftSendUntimedMs].every((ms) => ms != null && ms < UNTIMED_ACTION_MS && ms >= -1)],
       ["draft update by the saved id returned the revised draft's id", Boolean(revised?.messageId)],
       ["revised draft readable at once by its id", savedDraft?.subject === draftSubject],
       ["draft resync succeeded", draftResync.outcome === "success"],

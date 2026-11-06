@@ -68,7 +68,7 @@ vi.mock("../imap-connect.js", async (importOriginal) => {
   return {
     ...actual,
     ActionConnection: class {
-      async get() { return { client, abort: { run: <T>(command: () => Promise<T>) => command() } }; }
+      async get() { return { client, abort: { run: <T>(_step: string, command: () => Promise<T>) => command() } }; }
       async close() {}
     }
   };

@@ -116,8 +116,8 @@ vi.mock("../imap-connect.js", async (importOriginal) => {
       private open = false;
       readonly onStep?: (step: string, ms: number) => void;
       constructor(_pool: unknown, _config: unknown, _account: unknown,
-        options: { onImapStep?: (step: string, ms: number) => void } = {}) {
-        this.onStep = options.onImapStep;
+        options: { onStep?: (step: string, ms: number) => void } = {}) {
+        this.onStep = options.onStep;
       }
       async get() {
         if (!this.open) mocks.logins.count += 1;
@@ -298,20 +298,17 @@ describe("createDraft", () => {
     expect(mocks.append).toHaveBeenCalledTimes(1);
   });
 
-  it("reports each IMAP step it names, in order, without the lookup when unkeyed", async () => {
+  it("names every step of a save that it runs itself: the account read, the message, the lock and the due mark", async () => {
     const { createDraft } = await import("../drafts.js");
     const input = { accountId: "11111111-1111-4111-8111-111111111111", to: [{ email: "rcpt@example.test" }],
       subject: "s", body: { format: "plain" as const, text: "b" } };
     const steps: string[] = [];
-    await createDraft({} as never, config, input, undefined, { onImapStep: (step, ms) => {
+    await createDraft({} as never, config, input, undefined, { onStep: (step, ms) => {
       expect(ms).toBeGreaterThanOrEqual(0);
       steps.push(step);
     } });
-    expect(steps).toEqual(["list", "append", "mirror"]);
-    steps.length = 0;
-    await createDraft({} as never, config, { ...input, idempotencyKey: "k-1" }, undefined,
-      { onImapStep: (step) => steps.push(step) });
-    expect(steps).toEqual(["list", "find", "append", "mirror"]);
+    // The IMAP commands report themselves on the action's connection (imap-connect).
+    expect(new Set(steps)).toEqual(new Set(["db_load", "compose", "db_lock", "db_mirror"]));
   });
 
   it("does not APPEND when Drafts cannot be marked due first", async () => {
@@ -361,15 +358,15 @@ describe("createDraft", () => {
     });
 
     expect(mocks.mirrorFiledMessage).toHaveBeenCalledTimes(1);
-    const [, mirrorConfig, bodyStore, socket, accountId, filed] = mocks.mirrorFiledMessage.mock.calls[0];
+    const [, mirrorConfig, bodyStore, connection, accountId, filed] = mocks.mirrorFiledMessage.mock.calls[0];
     const [, raw] = mocks.append.mock.calls[0];
     expect(mirrorConfig).toBe(config);
     // Without a host store, the OSS database store that sync also defaults to.
     expect(bodyStore.constructor.name).toBe("DatabaseBodyStore");
-    expect(socket).toEqual({ client: {}, abort: {} });
     expect(accountId).toBe("11111111-1111-4111-8111-111111111111");
     expect(filed).toEqual({ folderPath: "Drafts", appended: { uid: 7, uidValidity: 100 }, raw });
     expect(mocks.logins.count).toBe(1);
+    expect(await connection.get()).toEqual({ client: {}, abort: {} });
     // The lock fences the write, as sync's lock does, waits for a sync holding it,
     // and the save is confirmed once the provider holds the draft.
     expect(mocks.withAccountLock).toHaveBeenCalledWith(expect.anything(), account.lock_id, expect.any(Function), {
@@ -572,13 +569,14 @@ describe("updateDraft", () => {
     expect(mocks.mirrorFiledMessage.mock.calls[0][2]).toBe(hostStore);
   });
 
-  it("reports the old draft's delete as its own step", async () => {
+  it("names the draft and account read, the message and the lock of an update", async () => {
     mocks.getMessage.mockResolvedValue(draftRow);
     const { updateDraft } = await import("../drafts.js");
     const steps: string[] = [];
     await updateDraft(draftPool, config, D1, { to: [{ email: "rcpt@example.test" }], subject: "s",
-      body: { format: "plain", text: "v2" } }, undefined, { onImapStep: (step) => steps.push(step) });
-    expect(steps).toEqual(["list", "append", "mirror", "delete"]);
+      body: { format: "plain", text: "v2" } }, undefined, { onStep: (step) => steps.push(step) });
+    expect(new Set(steps)).toEqual(new Set(["db_load", "compose", "db_lock", "db_mirror"]));
+    expect(mocks.deleteMessageInLock.mock.calls[0][3]).toHaveProperty("onStep");
   });
 
   it("holds one account lock across the new APPEND and the old draft's delete", async () => {

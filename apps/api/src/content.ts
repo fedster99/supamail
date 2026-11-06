@@ -1,4 +1,5 @@
 import type { Readable } from "node:stream";
+import { timeStep, type ActionStepTimer } from "./action-steps.js";
 import type { ImapFlow } from "imapflow";
 import type { AppConfig } from "./config.js";
 import type { PgClient, PgPool } from "./db.js";
@@ -165,12 +166,15 @@ export class ContentImapClient {
     pool: PgPool,
     config: AppConfig,
     account: ImapAccount,
-    options: { signal?: AbortSignal } = {}
+    options: { signal?: AbortSignal; onStep?: ActionStepTimer } = {}
   ): Promise<ContentImapClient> {
     // Socket + SSRF guard + decrypt + the close-on-connect-error guard come from the
     // one shared connect prelude (imap-connect.ts); this client only adds the
-    // download/fetch read verb surface on top (ADR 0020/0022).
-    const { client, abort } = await connectAbortableImap(pool, config, account, { signal: options.signal });
+    // download/fetch read verb surface on top (ADR 0020/0022). It never takes a
+    // parked session: a cancelled stream can leave a FETCH in flight (ADR 0051).
+    const { client, abort } = await connectAbortableImap(pool, config, account, {
+      signal: options.signal, onStep: options.onStep
+    });
     return new ContentImapClient(client, abort);
   }
 
@@ -188,7 +192,7 @@ export class ContentImapClient {
    * Extracted so `downloadPart`/`fetchOneSource` no longer copy-paste the scope.
    */
   private withUidScope<T>(folderPath: string, uidValidity: number, op: () => Promise<T>): Promise<T> {
-    return this.abort.run(async () => {
+    return this.abort.run("imap_fetch", async () => {
       const lock = await this.client.getMailboxLock(folderPath);
       try {
         this.assertUidValidity(folderPath, uidValidity);
@@ -237,18 +241,21 @@ export class ContentImapClient {
     part: string,
     maxBytes: number
   ): Promise<{ stream: Readable; release: () => void }> {
-    const lock = await this.client.getMailboxLock(folderPath);
-    try {
-      this.assertUidValidity(folderPath, uidValidity);
-      const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
-      if (!result.content) {
-        throw new NotFoundError(`Message UID ${uid} is no longer present in ${folderPath}`);
+    // Timed to the first byte; the caller streams the rest.
+    return this.abort.run("imap_fetch", async () => {
+      const lock = await this.client.getMailboxLock(folderPath);
+      try {
+        this.assertUidValidity(folderPath, uidValidity);
+        const result = await this.client.download(String(uid), part, { uid: true, maxBytes });
+        if (!result.content) {
+          throw new NotFoundError(`Message UID ${uid} is no longer present in ${folderPath}`);
+        }
+        return { stream: result.content as Readable, release: () => lock.release() };
+      } catch (err) {
+        lock.release();
+        throw err;
       }
-      return { stream: result.content as Readable, release: () => lock.release() };
-    } catch (err) {
-      lock.release();
-      throw err;
-    }
+    });
   }
 
   /** Fetch the whole RFC-822 source (capped at `maxBytes`). Used for raw MIME /
@@ -394,7 +401,7 @@ export async function downloadAttachment(
   pool: PgPool,
   config: AppConfig,
   attachmentId: string,
-  opts: { metadataProtection?: MetadataProtectionAdapter } = {}
+  opts: { metadataProtection?: MetadataProtectionAdapter; onStep?: ActionStepTimer } = {}
 ): Promise<AttachmentDownload> {
   const { stream, close, ...meta } = await downloadAttachmentStream(pool, config, attachmentId, opts);
   try {
@@ -418,10 +425,10 @@ export async function downloadAttachmentStream(
   pool: PgPool,
   config: AppConfig,
   attachmentId: string,
-  opts: { maxBytes?: number; metadataProtection?: MetadataProtectionAdapter } = {}
+  opts: { maxBytes?: number; metadataProtection?: MetadataProtectionAdapter; onStep?: ActionStepTimer } = {}
 ): Promise<AttachmentDownloadStream> {
   const metadataProtection = opts.metadataProtection ?? plaintextMetadataProtection;
-  const meta = await getAttachmentMetadata(pool, config, attachmentId, metadataProtection);
+  const meta = await timeStep(opts.onStep, "db_load", () => getAttachmentMetadata(pool, config, attachmentId, metadataProtection));
   if (!meta) throw new NotFoundError(`Attachment not found: ${attachmentId}`);
   if (!meta.partNumber) {
     throw new UnfetchableContentError(
@@ -431,9 +438,9 @@ export async function downloadAttachmentStream(
 
   const maxBytes = opts.maxBytes ?? config.BODY_RAW_MAX_BYTES;
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { message, account } = await loadMessageAndAccount(repository, meta.messageId);
+  const { message, account } = await timeStep(opts.onStep, "db_load", () => loadMessageAndAccount(repository, meta.messageId));
 
-  const reader = await ContentImapClient.connect(pool, config, account);
+  const reader = await ContentImapClient.connect(pool, config, account, { onStep: opts.onStep });
   let scope: { stream: Readable; release: () => void };
   try {
     scope = await reader.downloadPartStream(
@@ -482,22 +489,12 @@ export async function downloadAttachmentStream(
   return { ...meta, stream: scope.stream, close };
 }
 
-/**
- * Get the raw RFC-822 bytes of a message. Returns the mirrored `raw_mime` when it
- * was stored (BODY_STORAGE_MODE=raw_mime); under parsed_only (raw_mime NULL) it
- * does an on-demand IMAP FETCH of the whole message source (ADR 0020).
- */
-export async function getRawMime(
+/** The stored source of a live message, or null when its row is gone. */
+async function readMirroredRaw(
   pool: PgPool,
-  config: AppConfig,
-  messageId: string,
-  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
-  options: { signal?: AbortSignal; connection?: ActionConnection } = {}
-): Promise<RawMimeResult> {
-  throwIfAborted(options.signal);
-  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
+  messageId: string
+): Promise<{ raw_mime: Buffer | null; raw_truncated: boolean | null } | undefined> {
   const stored = await pool.connect();
-  let mirrored: { raw_mime: Buffer | null; raw_truncated: boolean | null } | undefined;
   try {
     // Only a live message: a removed row's bytes no longer belong to the mailbox.
     const result = await stored.query<{ raw_mime: Buffer | null; raw_truncated: boolean | null }>(
@@ -510,11 +507,27 @@ export async function getRawMime(
       `,
       [messageId]
     );
-    mirrored = result.rows[0];
+    return result.rows[0];
   } finally {
     stored.release();
   }
+}
 
+/**
+ * Get the raw RFC-822 bytes of a message. Returns the mirrored `raw_mime` when it
+ * was stored (BODY_STORAGE_MODE=raw_mime); under parsed_only (raw_mime NULL) it
+ * does an on-demand IMAP FETCH of the whole message source (ADR 0020).
+ */
+export async function getRawMime(
+  pool: PgPool,
+  config: AppConfig,
+  messageId: string,
+  metadataProtection: MetadataProtectionAdapter = plaintextMetadataProtection,
+  options: { signal?: AbortSignal; connection?: ActionConnection; onStep?: ActionStepTimer } = {}
+): Promise<RawMimeResult> {
+  throwIfAborted(options.signal);
+  if (!isMirrorId(messageId)) throw new NotFoundError(`Message not found: ${messageId}`);
+  const mirrored = await timeStep(options.onStep, "db_load", () => readMirroredRaw(pool, messageId));
   if (!mirrored) throw new NotFoundError(`Message ${messageId} was not found, or was moved or deleted in the mailbox`);
   if (mirrored.raw_mime !== null) {
     return { messageId, raw: mirrored.raw_mime, source: "mirror", truncated: mirrored.raw_truncated === true };
@@ -522,7 +535,7 @@ export async function getRawMime(
 
   // raw_mime not stored (parsed_only) or no body row yet → on-demand FETCH.
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await timeStep(options.onStep, "db_load", () => loadMessageAndAccount(repository, messageId));
   // A caller's action connection is reused and stays open for its next step.
   const reader = options.connection
     ? ContentImapClient.over(await options.connection.get())

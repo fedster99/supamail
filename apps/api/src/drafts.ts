@@ -7,7 +7,8 @@ import { NoRecipientsError, NotFoundError, throwIfAborted, actionWarning, type A
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import type { BodyStore } from "./body-store.js";
 import { actionBodyStore, fileSentCopy, mirrorFiledMessage, type SentCopy } from "./filed-message.js";
-import { ActionConnection, timeImapStep } from "./imap-connect.js";
+import { timeStep } from "./action-steps.js";
+import { ActionConnection } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { accountLockHeartbeatIntervalMs, type AccountLock } from "./locks.js";
 import { deleteMessage, deleteMessageInLock, type MailboxActionOptions } from "./mailbox-mutations.js";
@@ -201,7 +202,7 @@ async function saveDraft(
   idempotencyKey: string | null | undefined,
   options: MailboxActionOptions
 ): Promise<SavedDraft> {
-  const composed = await composeDraft(account, req, idempotencyKey);
+  const composed = await timeStep(options.onStep, "compose", () => composeDraft(account, req, idempotencyKey));
   const bodyStore = actionBodyStore(repository, options.bodyStore);
   const warnings: ActionWarning[] = [];
   return await withInteractiveAccountLock(pool, account, async (lock) => {
@@ -211,7 +212,7 @@ async function saveDraft(
     } finally {
       await connection.close();
     }
-  }, { fenceWrites: true });
+  }, { fenceWrites: true, onStep: options.onStep });
 }
 
 /** The locked part of a save: file the draft, then mirror it (ADR 0046). */
@@ -244,12 +245,13 @@ async function fileAndMirrorDraft(
     // not mirrored yet: that attempt's bytes may differ from these, so its body is
     // left to the body lane.
     saved.messageId = (filed.retried
-      ? await repository.getLiveMessageId({ accountId: account.id, folderPath: filed.draftsFolderPath, ...appended })
+      ? await timeStep(connection.onStep, "db_mirror", () => repository.getLiveMessageId({
+        accountId: account.id, folderPath: filed.draftsFolderPath, ...appended
+      }))
       : null)
-      ?? await timeImapStep(connection.onStep, "mirror", async () => mirrorFiledMessage(repository, config, bodyStore,
-        await connection.get(), account.id,
+      ?? await mirrorFiledMessage(repository, config, bodyStore, connection, account.id,
         { folderPath: filed.draftsFolderPath, appended, raw: filed.retried ? null : raw },
-        (warning) => warnings.push(warning)));
+        (warning) => warnings.push(warning));
   } catch (error) {
     warnings.push(actionWarning("mirror_pending", error));
   }
@@ -268,8 +270,7 @@ async function fileDraft(
 ): Promise<{ draftsFolderPath: string; appended: AppendedUid | null; retried: boolean }> {
   const appender = SentFolderAppender.over(await connection.get());
   const profile = getProviderProfile(account.provider_profile);
-  const step = connection.onStep;
-  const mailboxes = await timeImapStep(step, "list", () => appender.list());
+  const mailboxes = await appender.list();
   // Resolve Drafts via the shared role-keyed resolver: the "drafts" role uses its
   // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
   // The SQL draftFolderPaths stays a SEPARATE encoding (mirrored table, not LIST).
@@ -279,7 +280,7 @@ async function fileDraft(
   // APPEND and returns that UID instead of filing a duplicate draft. Runs under
   // the same lock as the APPEND, so lookup + append are atomic per account.
   if (idempotencyKey) {
-    const existing = await timeImapStep(step, "find", () => appender.findByMessageId(draftsFolderPath, rfcMessageId));
+    const existing = await appender.findByMessageId(draftsFolderPath, rfcMessageId);
     if (existing.uids.length > 0) {
       return {
         draftsFolderPath,
@@ -291,8 +292,8 @@ async function fileDraft(
 
   // Drafts is durably due before the provider command, as for a move, so a host
   // can reconcile it after acknowledgement without a prompt IDLE/NOTIFY event.
-  await repository.markFoldersForReconcile(account.id, [draftsFolderPath]);
-  const appended = await timeImapStep(step, "append", () => appender.append(draftsFolderPath, raw, DRAFT_FLAGS, new Date()));
+  await timeStep(connection.onStep, "db_mirror", () => repository.markFoldersForReconcile(account.id, [draftsFolderPath]));
+  const appended = await appender.append(draftsFolderPath, raw, DRAFT_FLAGS, new Date());
   return { draftsFolderPath, appended, retried: false };
 }
 
@@ -312,7 +313,7 @@ export async function createDraft(
   const request = parseInput(DRAFT_INPUT_SCHEMA, input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await repository.getAccount(request.accountId);
+  const account = await timeStep(options.onStep, "db_load", () => repository.getAccount(request.accountId));
   if (!account) throw new NotFoundError(`Account not found: ${request.accountId}`);
 
   const saved = await saveDraft(pool, config, repository, account, request, request.idempotencyKey, options);
@@ -532,11 +533,13 @@ export async function updateDraft(
   const request = parseInput(DRAFT_UPDATE_SCHEMA, input);
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const draft = await loadLiveDraft(pool, repository, messageId);
-  const account = await repository.getAccount(draft.account_id);
+  const { draft, account } = await timeStep(options.onStep, "db_load", async () => {
+    const draft = await loadLiveDraft(pool, repository, messageId);
+    return { draft, account: await repository.getAccount(draft.account_id) };
+  });
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.account_id}`);
 
-  const composed = await composeDraft(account, { ...request, accountId: account.id });
+  const composed = await timeStep(options.onStep, "compose", () => composeDraft(account, { ...request, accountId: account.id }));
   const bodyStore = actionBodyStore(repository, options.bodyStore);
   const warnings: ActionWarning[] = [];
   // One lock across the APPEND and the delete, so no sync runs between them, and
@@ -549,9 +552,9 @@ export async function updateDraft(
       // already filed, so a delete failure (e.g. no UIDPLUS for a UID-scoped
       // EXPUNGE) is `draft_kept`, not a failed update; the User removes the copy.
       try {
-        await timeImapStep(connection.onStep, "delete", () => deleteMessageInLock(pool, config, messageId, {
-          hard: true, metadataProtection, signal: options.signal, connection
-        }));
+        await deleteMessageInLock(pool, config, messageId, {
+          hard: true, metadataProtection, signal: options.signal, onStep: options.onStep, connection
+        });
         return { saved, replacedDraftDeleted: true };
       } catch (error) {
         warnings.push(actionWarning("draft_kept", error));
@@ -560,7 +563,7 @@ export async function updateDraft(
     } finally {
       await connection.close();
     }
-  }, { fenceWrites: true });
+  }, { fenceWrites: true, onStep: options.onStep });
 
   return { accountId: account.id, ...saved, replacedMessageId: messageId, replacedDraftDeleted };
 }
@@ -626,25 +629,28 @@ async function sendDraftAttempt(
   config: AppConfig,
   messageId: string,
   metadataProtection: MetadataProtectionAdapter,
-  { signal, bodyStore: hostBodyStore, sessions }: MailboxActionOptions,
+  { signal, bodyStore: hostBodyStore, sessions, onStep }: MailboxActionOptions,
   confirmDelivery: () => void
 ): Promise<SendDraftResult> {
   throwIfAborted(signal);
-  const draft = await getDraft(pool, config, messageId, metadataProtection);
+  const draft = await timeStep(onStep, "db_load", () => getDraft(pool, config, messageId, metadataProtection));
   if (!draft) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (draft.toEmails.length === 0) {
     throw new NoRecipientsError(`Draft ${messageId} has no recipients; add a To address before sending`);
   }
 
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await repository.getAccount(draft.accountId);
+  const account = await timeStep(onStep, "db_load", () => repository.getAccount(draft.accountId));
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.accountId}`);
   const bodyStore = actionBodyStore(repository, hostBodyStore);
 
   // Resolve SMTP creds + run the SSRF guard exactly as send.ts does.
-  const creds = await resolveSmtpCreds(pool, config, account);
-  const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
-    allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
+  const { creds, isPrivateHost } = await timeStep(onStep, "smtp_send", async () => {
+    const creds = await resolveSmtpCreds(pool, config, account);
+    const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
+      allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
+    });
+    return { creds, isPrivateHost };
   });
 
   // Envelope recipients come from the SYNCED header fields only (never the lazy
@@ -658,12 +664,12 @@ async function sendDraftAttempt(
   return await withInteractiveAccountLock(pool, account, async (lock) => {
     // One connection for the raw fetch, the Sent APPEND and the draft delete. It is
     // opened again only if it died while SMTP ran, which can outlast an idle socket.
-    const connection = new ActionConnection(pool, config, account, { signal, sessions });
+    const connection = new ActionConnection(pool, config, account, { signal, sessions, onStep });
     try {
       // The draft's ACTUAL bytes (true round-trip): mirrored raw_mime, or an on-demand
       // UIDVALIDITY-guarded FETCH from the Drafts folder+UID. This carries the real
       // body + HTML + formatting regardless of lazy mirror-body state.
-      const { raw, truncated } = await getRawMime(pool, config, messageId, metadataProtection, { signal, connection });
+      const { raw, truncated } = await getRawMime(pool, config, messageId, metadataProtection, { signal, connection, onStep });
       if (truncated) {
         // Fail closed before SMTP: the capped bytes would be a corrupt MIME message.
         throw new Error(
@@ -675,7 +681,7 @@ async function sendDraftAttempt(
       // irreversible SMTP boundary (the raw fetch may have taken time).
       await lock.assertLive();
       throwIfAborted(signal);
-      const delivery = await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
+      const delivery = await timeStep(onStep, "smtp_send", () => deliverSmtp(creds, raw, envelope, config, { isPrivateHost }));
       confirmDelivery();
       lock.confirmIrreversible();
 
@@ -693,7 +699,7 @@ async function sendDraftAttempt(
       try {
         if (liveness) throw liveness;
         await lock.assertLive();
-        await deleteMessageInLock(pool, config, messageId, { hard: true, metadataProtection, signal, connection });
+        await deleteMessageInLock(pool, config, messageId, { hard: true, metadataProtection, signal, onStep, connection });
         draftDeleted = true;
       } catch (error) {
         warnings.push(actionWarning("draft_kept", error));
@@ -716,7 +722,8 @@ async function sendDraftAttempt(
     }
   }, {
     fenceWrites: true,
-    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS)
+    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
+    onStep
   });
 }
 
@@ -731,7 +738,7 @@ export async function deleteDraft(
   options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
   const repository = new MirrorRepository(pool, config, options.metadataProtection ?? plaintextMetadataProtection);
-  await loadLiveDraft(pool, repository, messageId);
+  await timeStep(options.onStep, "db_load", () => loadLiveDraft(pool, repository, messageId));
   const result = await deleteMessage(pool, config, messageId, options);
   return { messageId: result.messageId, fromFolder: result.fromFolder, trashFolder: result.trashFolder };
 }

@@ -1,6 +1,7 @@
 import { DatabaseBodyStore, type BodyStore } from "./body-store.js";
 import type { AppConfig } from "./config.js";
 import { fetchMessageMetadata, filedMessageBody, ThrottledImapClient } from "./imap-client.js";
+import { timeStep } from "./action-steps.js";
 import { uidValidityMatches, type ActionConnection, type ActionSocket } from "./imap-connect.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
 import type { MirrorRepository } from "./repository.js";
@@ -41,26 +42,30 @@ export interface FiledMessage {
  * A failed read or row write throws; a failed body store only warns, because the
  * row and its id stand and the body lane stores the body later. Either way the
  * provider already holds the message, so callers never fail the action.
+ * The UID read is the step `imap_fetch`; the folder read and every write are
+ * `db_mirror` (ADR 0054).
  */
 export async function mirrorFiledMessage(
   repository: MirrorRepository,
   config: AppConfig,
   bodyStore: BodyStore,
-  socket: ActionSocket,
+  connection: ActionConnection,
   accountId: string,
   filed: FiledMessage,
   warn: (warning: ActionWarning) => void
 ): Promise<string | null> {
   const { uid, uidValidity } = filed.appended;
-  const [folder] = await repository.getFoldersForWake(accountId, [filed.folderPath]);
+  const onStep = connection.onStep;
+  const [folder] = await timeStep(onStep, "db_mirror", () => repository.getFoldersForWake(accountId, [filed.folderPath]));
   if (!folder || folder.uidvalidity === null || Number(folder.uidvalidity) !== uidValidity) return null;
 
   // The socket stays the action's: this view only adds sync's command timeout.
+  const socket = await connection.get();
   const client = new ThrottledImapClient(socket.client, config.IMAP_MAX_COMMANDS_PER_MINUTE, config.IMAP_COMMAND_TIMEOUT_MS);
   // The folder may still be selected from before the APPEND (a draft's idempotency
   // search); SELECT it again so the new UID is known before the FETCH.
   client.invalidateSelection();
-  const metadata = await socket.abort.run(async () => {
+  const metadata = await socket.abort.run("imap_fetch", async () => {
     const lock = await client.getMailboxLock(filed.folderPath);
     try {
       if (!uidValidityMatches(client.mailbox, uidValidity)) return null;
@@ -71,22 +76,24 @@ export async function mirrorFiledMessage(
   });
   if (!metadata) return null;
 
-  const deadlineAt = Date.now() + FILED_ROW_WRITE_TIMEOUT_MS;
-  const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], { deadlineAt });
-  if (!row) throw new Error("the mirror write returned no row");
-  const raw = filed.raw;
-  if (raw && !row.body_fetched_at && metadata.sizeBytes === raw.length
-    && raw.length < config.BODY_RAW_MAX_BYTES && raw.length <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES) {
-    try {
-      const body = await filedMessageBody(config, row, raw, metadata.mimeStructure);
-      await repository.storeBodyEvidence(body);
-      await bodyStore.store(body);
-      await repository.completeBodyStorage(row.id);
-    } catch (error) {
-      warn(actionWarning("body_pending", error));
+  return await timeStep(onStep, "db_mirror", async () => {
+    const deadlineAt = Date.now() + FILED_ROW_WRITE_TIMEOUT_MS;
+    const [row] = await repository.upsertMessages(accountId, folder, uidValidity, [metadata], { deadlineAt });
+    if (!row) throw new Error("the mirror write returned no row");
+    const raw = filed.raw;
+    if (raw && !row.body_fetched_at && metadata.sizeBytes === raw.length
+      && raw.length < config.BODY_RAW_MAX_BYTES && raw.length <= PARSED_BODY_BATCH_MAX_SOURCE_BYTES) {
+      try {
+        const body = await filedMessageBody(config, row, raw, metadata.mimeStructure);
+        await repository.storeBodyEvidence(body);
+        await bodyStore.store(body);
+        await repository.completeBodyStorage(row.id);
+      } catch (error) {
+        warn(actionWarning("body_pending", error));
+      }
     }
-  }
-  return row.id;
+    return row.id;
+  });
 }
 
 /** The delivered message's copy in Sent, as {@link fileSentCopy} filed it. */
@@ -122,7 +129,7 @@ export async function fileSentCopy(
   }
   if (!appended) return copy;
   try {
-    copy.messageId = await mirrorFiledMessage(repository, config, bodyStore, socket, account.id,
+    copy.messageId = await mirrorFiledMessage(repository, config, bodyStore, connection, account.id,
       { folderPath: copy.sentFolderPath, appended, raw }, warn);
   } catch (error) {
     warn(actionWarning("mirror_pending", error));
