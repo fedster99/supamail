@@ -633,16 +633,14 @@ async function sendDraftAttempt(
   confirmDelivery: () => void
 ): Promise<SendDraftResult> {
   throwIfAborted(signal);
-  const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { draft, account } = await timeStep(onStep, "db_load", async () => {
-    const draft = await getDraft(pool, config, messageId, metadataProtection);
-    return { draft, account: draft ? await repository.getAccount(draft.accountId) : null };
-  });
+  const draft = await timeStep(onStep, "db_load", () => getDraft(pool, config, messageId, metadataProtection));
   if (!draft) throw new NotFoundError(`Draft not found: ${messageId}`);
   if (draft.toEmails.length === 0) {
     throw new NoRecipientsError(`Draft ${messageId} has no recipients; add a To address before sending`);
   }
 
+  const repository = new MirrorRepository(pool, config, metadataProtection);
+  const account = await timeStep(onStep, "db_load", () => repository.getAccount(draft.accountId));
   if (!account) throw new Error(`Account not found for draft ${messageId}: ${draft.accountId}`);
   const bodyStore = actionBodyStore(repository, hostBodyStore);
 
@@ -740,7 +738,7 @@ export async function deleteDraft(
   options: MailboxActionOptions & { hard?: boolean; metadataProtection?: MetadataProtectionAdapter } = {}
 ): Promise<DeleteDraftResult> {
   const repository = new MirrorRepository(pool, config, options.metadataProtection ?? plaintextMetadataProtection);
-  await loadLiveDraft(pool, repository, messageId);
+  await timeStep(options.onStep, "db_load", () => loadLiveDraft(pool, repository, messageId));
   const result = await deleteMessage(pool, config, messageId, options);
   return { messageId: result.messageId, fromFolder: result.fromFolder, trashFolder: result.trashFolder };
 }

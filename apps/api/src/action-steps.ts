@@ -9,9 +9,10 @@
  * - `imap_*`: one IMAP command or login each. `imap_connect` covers the host check,
  *   password decryption, TLS and login; `imap_reuse` checks a parked session
  *   instead (ADR 0051); `imap_logout` ends or parks the session.
- * - `smtp_send`: the SMTP target check and the submission.
- * - `db_mirror`: mirror writes: a filed message's row and body, write-through of
- *   flags and moves, and folders marked due for reconcile.
+ * - `smtp_send`: the SMTP credentials, the target check and the submission.
+ * - `db_mirror`: mirror writes: a filed message's row and body (parsed and stored
+ *   in the host's body store), write-through of flags and moves, and folders
+ *   marked due for reconcile.
  */
 export const ACTION_STEPS = [
   "db_load", "compose", "db_lock",

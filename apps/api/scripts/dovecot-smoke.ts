@@ -637,8 +637,10 @@ async function main(): Promise<void> {
       ["a save, flag change and move name their IMAP, lock and mirror steps",
         ["imap_find", "imap_append", "imap_fetch", "db_lock", "db_mirror", "compose", "db_load"].every((step) => firstParked.steps.includes(step))
         && flagChange.steps.includes("imap_store") && draftMove.steps.includes("imap_move")],
-      ["named steps cover all but a few milliseconds of every action",
-        Object.values(untimed).every((ms) => ms < UNTIMED_ACTION_MS)],
+      ["named steps cover all but a few milliseconds of every action, and none overlap",
+        Object.values(untimed).every((ms) => ms < UNTIMED_ACTION_MS && ms >= -1)],
+      ["the timed move moved the draft", Array.isArray(draftMove.result) && draftMove.result.length === 1
+        && "result" in draftMove.result[0]],
       ["saves on a reused login were mirrored at once", [firstParked, secondParked, afterIdle]
         .every(({ saved }) => saved.messageId !== null && saved.warnings.length === 0)],
       ["one session stayed parked", parkedSessions === 1]

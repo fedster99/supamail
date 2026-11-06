@@ -554,7 +554,7 @@ async function main(): Promise<void> {
       ["send delivered", sendResult.delivered === true],
       ["a send names its SMTP, Sent copy and mirror steps", ["smtp_send", "compose", "db_lock", "imap_append", "db_mirror"]
         .every((step) => timedSend.steps.includes(step))],
-      ["named steps cover all but a few milliseconds of a send", timedSend.untimedMs < UNTIMED_ACTION_MS],
+      ["named steps cover all but a few milliseconds of a send, and none overlap", timedSend.untimedMs < UNTIMED_ACTION_MS && timedSend.untimedMs >= -1],
       ["send appended to Sent", sendResult.appendedToSent === true],
       ["sent copy readable at once by its id", sentAtOnce?.rfc_message_id === replyMessageId],
       ["sent copy carries In-Reply-To at once", sentAtOnce?.in_reply_to === (sourceRow?.rfc_message_id ?? null)],
@@ -683,7 +683,7 @@ async function main(): Promise<void> {
       ["a draft update names its expunge of the old draft", Boolean(timedUpdate?.steps.includes("imap_expunge"))],
       ["a draft send names its fetch, SMTP and Sent copy", ["imap_fetch", "smtp_send", "imap_append"].every((step) => draftSendSteps.includes(step))],
       ["named steps cover all but a few milliseconds of a draft update and send",
-        (timedUpdate?.untimedMs ?? Infinity) < UNTIMED_ACTION_MS && (draftSendUntimedMs ?? Infinity) < UNTIMED_ACTION_MS],
+        [timedUpdate?.untimedMs, draftSendUntimedMs].every((ms) => ms != null && ms < UNTIMED_ACTION_MS && ms >= -1)],
       ["draft update by the saved id returned the revised draft's id", Boolean(revised?.messageId)],
       ["revised draft readable at once by its id", savedDraft?.subject === draftSubject],
       ["draft resync succeeded", draftResync.outcome === "success"],

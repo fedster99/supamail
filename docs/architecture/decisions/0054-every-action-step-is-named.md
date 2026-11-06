@@ -28,11 +28,13 @@ Without names, a slow action could only be guessed at.
     check, and ending or parking the session.
   - `imap_list`, `imap_find`, `imap_fetch`, `imap_append`, `imap_store`,
     `imap_move`, `imap_expunge` and `imap_folder`: one IMAP command each.
-  - `smtp_send`: the SMTP target check and the submission.
-  - `db_mirror`: mirror writes, including folders marked due.
+  - `smtp_send`: the SMTP credentials, the target check and the submission.
+  - `db_mirror`: mirror writes: folders marked due, write-through, and a filed
+    message's row and body (parsing it and storing it in the host's body store).
 - `MailboxActionOptions.onStep` (formerly `onImapStep`) receives every step of
-  draft create, update and send, send, flags, moves, message and thread verbs,
-  folder changes and attachment downloads.
+  draft create, update, send and delete, send, flags, moves, message and thread
+  verbs, folder changes and attachment downloads. A streamed download logs out
+  when its stream closes, after the host may have recorded the request.
 - Every IMAP command of an action already ran through `ImapAbortBinding.run`,
   which now takes the step name, so no command run through it can go unnamed.
   The stream download, which used to bypass it, now runs through it too. Login,
