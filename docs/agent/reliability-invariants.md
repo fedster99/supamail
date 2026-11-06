@@ -71,6 +71,9 @@ This is the agent-readable reliability contract distilled from `docs/spec-confor
   it was not aborted and the socket is usable. Attachment and header downloads and
   folder changes never take a parked session: a rename or delete of the selected
   folder makes ImapFlow send CLOSE (ADR 0051).
+- Every IMAP command of a direct action runs through `ImapAbortBinding.run` with
+  its step name, and its other work through `timeStep`, so the action's steps
+  cover its time (ADR 0054). A new step needs a new name in `ACTION_STEPS`.
 - A host-owned sync client reused across passes is invalidated at the start of
   each pass, so the next lock on the still-selected mailbox sends SELECT and
   reads UIDNEXT again. Never CLOSE to force this: CLOSE expunges `\Deleted`.

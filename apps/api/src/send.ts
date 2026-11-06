@@ -4,6 +4,7 @@ import type { PgPool } from "./db.js";
 import { NotFoundError, throwIfAborted, actionWarning, type ActionWarning } from "./errors.js";
 import { assertSafeSmtpTarget } from "./host-validation.js";
 import { actionBodyStore, fileSentCopy, type SentCopy } from "./filed-message.js";
+import { timeStep } from "./action-steps.js";
 import { ActionConnection } from "./imap-connect.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { accountLockHeartbeatIntervalMs } from "./locks.js";
@@ -92,24 +93,27 @@ async function sendMessageAttempt(
   config: AppConfig,
   req: SendRequest,
   metadataProtection: MetadataProtectionAdapter,
-  { signal, bodyStore: hostBodyStore, sessions }: MailboxActionOptions,
+  { signal, bodyStore: hostBodyStore, sessions, onStep }: MailboxActionOptions,
   confirmDelivery: () => void
 ): Promise<SendResult> {
   throwIfAborted(signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
   const bodyStore = actionBodyStore(repository, hostBodyStore);
-  const account = await repository.getAccount(req.accountId);
+  const account = await timeStep(onStep, "db_load", () => repository.getAccount(req.accountId));
   if (!account) {
     throw new NotFoundError(`Account not found: ${req.accountId}`);
   }
 
-  const creds = await resolveSmtpCreds(pool, config, account);
-  const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
-    allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
+  const { creds, isPrivateHost } = await timeStep(onStep, "smtp_send", async () => {
+    const creds = await resolveSmtpCreds(pool, config, account);
+    const { isPrivateHost } = await assertSafeSmtpTarget(creds.host, creds.port, creds.secure, {
+      allowPrivateHosts: config.IMAP_ALLOW_PRIVATE_HOSTS
+    });
+    return { creds, isPrivateHost };
   });
 
   const from = { email: account.email_address };
-  const { raw, messageId } = await buildRawMime(req, from);
+  const { raw, messageId } = await timeStep(onStep, "compose", () => buildRawMime(req, from));
   const envelope = buildSendEnvelope(account.email_address, req);
   const warnings: ActionWarning[] = [];
 
@@ -128,7 +132,7 @@ async function sendMessageAttempt(
 
     // STARTTLS stays enforced for a public host even under IMAP_ALLOW_PRIVATE_HOSTS;
     // it relaxes only when the target actually resolved private/loopback.
-    const delivery = await deliverSmtp(creds, raw, envelope, config, { isPrivateHost });
+    const delivery = await timeStep(onStep, "smtp_send", () => deliverSmtp(creds, raw, envelope, config, { isPrivateHost }));
     confirmDelivery();
     lock.confirmIrreversible();
 
@@ -141,7 +145,7 @@ async function sendMessageAttempt(
     if (liveness) {
       warnings.push(actionWarning("sent_copy_missing", liveness));
     } else {
-      const connection = new ActionConnection(pool, config, account, { signal, sessions });
+      const connection = new ActionConnection(pool, config, account, { signal, sessions, onStep });
       try {
         sent = await fileSentCopy(repository, config, bodyStore, account, connection, raw, (warning) => warnings.push(warning));
       } finally {
@@ -162,6 +166,7 @@ async function sendMessageAttempt(
     };
   }, {
     fenceWrites: true,
-    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS)
+    heartbeatIntervalMs: accountLockHeartbeatIntervalMs(config.STALE_HEARTBEAT_MS),
+    onStep
   });
 }

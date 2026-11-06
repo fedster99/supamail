@@ -37,12 +37,13 @@ async function fixture(text = "The filed bytes.") {
   };
   const store = { store: vi.fn(async (_body: unknown) => {}) };
   const warn = vi.fn();
-  const socket = { client, abort: { run: <T>(fn: () => Promise<T>) => fn() } };
+  const socket = { client, abort: { run: <T>(_step: string, fn: () => Promise<T>) => fn() } };
+  const connection = { get: async () => socket, onStep: undefined };
   return { raw, server, client, repository, store, warn,
     mirror: (settings = config, filedRaw: Buffer | null = raw) => mirrorFiledMessage(repository as never, settings,
-      store, socket as never, account.id, { folderPath: "Sent", appended: { uid: 7, uidValidity: 100 }, raw: filedRaw }, warn),
+      store, connection as never, account.id, { folderPath: "Sent", appended: { uid: 7, uidValidity: 100 }, raw: filedRaw }, warn),
     sent: () => fileSentCopy(repository as never, config, store, account as never,
-      { get: async () => socket } as never, raw, warn) };
+      connection as never, raw, warn) };
 }
 
 it("stores the filed body as the body lane does: evidence, host store, then readable", async () => {

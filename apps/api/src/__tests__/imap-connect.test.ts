@@ -66,13 +66,13 @@ vi.mock("../crypto.js", () => ({
 const {
   ActionConnection,
   SESSION_REUSE_CHECK_MS,
-  timeImapStep,
   connectAbortableImap,
   connectImap,
   ImapAbortBinding,
   uidValidityMatches,
   uidValidityMismatchMessage
 } = await import("../imap-connect.js");
+const { timeStep } = await import("../action-steps.js");
 
 const config = {
   IMAP_ENCRYPTION_KEY: "0123456789abcdef",
@@ -243,7 +243,7 @@ describe("action-client abort binding", () => {
       logout: vi.fn(async () => undefined)
     };
     const binding = new ImapAbortBinding(client as never, abort.signal);
-    const inFlight = binding.run(() => new Promise((_, reject) => {
+    const inFlight = binding.run("imap_fetch", () => new Promise((_, reject) => {
       failCommand = reject;
     }));
 
@@ -253,7 +253,7 @@ describe("action-client abort binding", () => {
     expect(error.name).toBe("AbortError");
     expect(error.cause).toBe(abort.signal.reason);
     const later = vi.fn(async () => "never");
-    await expect(binding.run(later)).rejects.toMatchObject({ name: "AbortError" });
+    await expect(binding.run("imap_fetch", later)).rejects.toMatchObject({ name: "AbortError" });
     expect(later).not.toHaveBeenCalled();
     await binding.logout();
     expect(client.logout).not.toHaveBeenCalled();
@@ -264,7 +264,7 @@ describe("action-client abort binding", () => {
     const client = { close: vi.fn(), logout: vi.fn(async () => undefined) };
     const binding = new ImapAbortBinding(client as never);
 
-    await expect(binding.run(async () => { throw new Error("NO [TRYCREATE]"); })).rejects.toThrow("NO [TRYCREATE]");
+    await expect(binding.run("imap_store", async () => { throw new Error("NO [TRYCREATE]"); })).rejects.toThrow("NO [TRYCREATE]");
     await binding.logout();
     expect(client.logout).toHaveBeenCalledTimes(1);
     expect(client.close).not.toHaveBeenCalled();
@@ -324,23 +324,23 @@ describe("ActionConnection (one login per multi-step action)", () => {
 
   it("reports one connect and one logout, and a throwing timer changes nothing", async () => {
     const steps: string[] = [];
-    const connection = new ActionConnection({} as never, config, account, { onImapStep: (step) => {
+    const connection = new ActionConnection({} as never, config, account, { onStep: (step) => {
       steps.push(step);
       throw new Error("timer failed");
     } });
     await connection.get();
     await connection.get();
     await connection.close();
-    expect(steps).toEqual(["connect", "logout"]);
+    expect(steps).toEqual(["imap_connect", "imap_logout"]);
     expect(fake.logout).toHaveBeenCalledTimes(1);
   });
 
   it("reports a step that fails, and still rejects with its error", async () => {
     const steps: string[] = [];
-    await expect(timeImapStep((step) => steps.push(step), "append", async () => {
+    await expect(timeStep((step) => steps.push(step), "imap_append", async () => {
       throw new Error("NO quota");
     })).rejects.toThrow("NO quota");
-    expect(steps).toEqual(["append"]);
+    expect(steps).toEqual(["imap_append"]);
   });
 
   it("opens nothing for an action that never needed IMAP", async () => {
@@ -370,7 +370,7 @@ describe("parked action sessions (ADR 0051)", () => {
     const steps: string[] = [];
     const connection = new ActionConnection({} as never, config, forAccount, {
       sessions: store,
-      onImapStep: (step) => steps.push(step)
+      onStep: (step) => steps.push(step)
     });
     await connection.get();
     await connection.close();
@@ -379,8 +379,8 @@ describe("parked action sessions (ADR 0051)", () => {
 
   it("lets the next action on a mailbox reuse the first one's login after a NOOP", async () => {
     const store = sessionStore();
-    expect(await actionSteps(store)).toEqual(["connect", "logout"]);
-    expect(await actionSteps(store)).toEqual(["reuse", "logout"]);
+    expect(await actionSteps(store)).toEqual(["imap_connect", "imap_logout"]);
+    expect(await actionSteps(store)).toEqual(["imap_reuse", "imap_logout"]);
 
     expect(fake.connectImpl).toHaveBeenCalledTimes(1);
     expect(fake.noop).toHaveBeenCalledTimes(1);
@@ -392,9 +392,9 @@ describe("parked action sessions (ADR 0051)", () => {
     const store = sessionStore();
     await actionSteps(store);
     const changed = { ...(account as object), encrypted_password: Buffer.from("y") } as never;
-    expect(await actionSteps(store, changed)).toEqual(["connect", "logout"]);
+    expect(await actionSteps(store, changed)).toEqual(["imap_connect", "imap_logout"]);
     const moved = { ...(account as object), host: "imap.other.test" } as never;
-    expect(await actionSteps(store, moved)).toEqual(["connect", "logout"]);
+    expect(await actionSteps(store, moved)).toEqual(["imap_connect", "imap_logout"]);
     expect(fake.connectImpl).toHaveBeenCalledTimes(3);
   });
 
@@ -402,7 +402,7 @@ describe("parked action sessions (ADR 0051)", () => {
     const store = sessionStore();
     await actionSteps(store);
     fake.noop.mockImplementationOnce(async (client) => { client.usable = false; });
-    expect(await actionSteps(store)).toEqual(["connect", "logout"]);
+    expect(await actionSteps(store)).toEqual(["imap_connect", "imap_logout"]);
     expect(fake.connectImpl).toHaveBeenCalledTimes(2);
   });
 
@@ -414,7 +414,7 @@ describe("parked action sessions (ADR 0051)", () => {
       fake.noop.mockImplementationOnce(() => new Promise(() => undefined));
       const second = actionSteps(store);
       await vi.advanceTimersByTimeAsync(SESSION_REUSE_CHECK_MS);
-      expect(await second).toEqual(["connect", "logout"]);
+      expect(await second).toEqual(["imap_connect", "imap_logout"]);
       expect(fake.connectImpl).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();

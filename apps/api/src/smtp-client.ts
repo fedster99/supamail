@@ -434,7 +434,7 @@ export class SentFolderAppender {
     specialUse?: string | null;
     delimiter?: string | null;
   }>> {
-    const boxes = await this.abort.run(() => this.client.list());
+    const boxes = await this.abort.run("imap_list", () => this.client.list());
     return boxes.map((b) => ({
       path: b.path,
       specialUse: b.specialUse ?? null,
@@ -447,7 +447,7 @@ export class SentFolderAppender {
    * when the server provides one, else null — the next sync mirrors the copy regardless.
    */
   async append(path: string, raw: Buffer, flags: string[], date?: Date): Promise<AppendedUid | null> {
-    const result = await this.abort.run(() => this.client.append(path, raw, flags, date));
+    const result = await this.abort.run("imap_append", () => this.client.append(path, raw, flags, date));
     return result && typeof result.uid === "number" && typeof result.uidValidity === "bigint"
       ? { uidValidity: Number(result.uidValidity), uid: result.uid }
       : null;
@@ -464,7 +464,7 @@ export class SentFolderAppender {
     folderPath: string,
     rfcMessageId: string
   ): Promise<{ uids: number[]; uidValidity: number }> {
-    return this.abort.run(async () => {
+    return this.abort.run("imap_find", async () => {
       const lock = await this.client.getMailboxLock(folderPath);
       try {
         const selected = this.client.mailbox;

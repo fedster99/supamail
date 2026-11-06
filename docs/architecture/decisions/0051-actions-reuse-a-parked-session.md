@@ -27,8 +27,8 @@ action ending, and each of them pays the login again.
   host gave a store, the client is still usable and the action was not aborted.
   Callers await every command before logout, so a parked session has none in
   flight. An aborted action, or a dead socket, never parks.
-- `ActionConnection` reports a reused session as the IMAP step `reuse` instead
-  of `connect`, so a host sees how often it saves the login.
+- A reused session is reported as the step `imap_reuse` instead of
+  `imap_connect` (ADR 0054), so a host sees how often it saves the login.
 - Draft create, update and send, send, flags, moves and message deletes pass the
   store through; a draft send's raw fetch runs on its reused connection and is
   awaited before logout. Two paths never take the store:

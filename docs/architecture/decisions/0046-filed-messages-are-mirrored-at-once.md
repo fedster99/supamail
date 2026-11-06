@@ -74,7 +74,8 @@ named for it, and nothing else. The sync read adapter still gains no write verb.
   follow their existing processing paths; this change does not wait for them.
 - Each mirrored APPEND costs one SELECT and one FETCH of one UID's metadata on an
   open connection, and one body store write that sync would otherwise do later.
-  A draft save reports it as the `mirror` step of `IMAP_STEPS`. An action that
+  An action reports it as the steps `imap_fetch` (the UID read) and `db_mirror`
+  (the row and body writes) of `ACTION_STEPS` (ADR 0054). An action that
   files a message holds the account lock for that extra time.
 - A reply seeded from an assigned message joins its conversation in `read_thread`
   when the threading lane next assigns it, and hosted search sees it when its

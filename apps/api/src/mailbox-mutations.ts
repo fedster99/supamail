@@ -11,9 +11,9 @@ import {
   type ActionConnection,
   type ActionSocket,
   type ImapAbortBinding,
-  type ActionSessionStore,
-  type ImapStepTimer
+  type ActionSessionStore
 } from "./imap-connect.js";
+import { timeStep, type ActionStep, type ActionStepTimer } from "./action-steps.js";
 import { withInteractiveAccountLock } from "./interactive-lock.js";
 import { loadMessageAndAccount } from "./message-loader.js";
 import { getProviderProfile, resolveSpecialUseFolder } from "./provider-profiles.js";
@@ -77,8 +77,8 @@ export { MailboxConflictError };
 /** Caller controls for one direct mailbox action. */
 export interface MailboxActionOptions {
   signal?: AbortSignal;
-  /** Receives each IMAP step's duration where an action names its steps (draft save and update). */
-  onImapStep?: ImapStepTimer;
+  /** Receives the duration of each step the action runs (ADR 0054). */
+  onStep?: ActionStepTimer;
   /** Where an action that files a message stores its body (ADR 0046); the host's
    * sync store. Defaults to the OSS database store, as sync does. */
   bodyStore?: BodyStore;
@@ -210,7 +210,7 @@ export class MailboxMutator {
     specialUse?: string | null;
     delimiter?: string | null;
   }>> {
-    const boxes = await this.abort.run(() => this.client.list());
+    const boxes = await this.abort.run("imap_list", () => this.client.list());
     return boxes.map((b) => ({
       path: b.path,
       specialUse: b.specialUse ?? null,
@@ -225,8 +225,8 @@ export class MailboxMutator {
    * is deliberate: we refuse to act on a possibly-wrong message and let the next
    * sync re-establish identity.
    */
-  private withUidScope<T>(target: ResolvedMessageTarget, op: () => Promise<T>): Promise<T> {
-    return this.abort.run(async () => {
+  private withUidScope<T>(target: ResolvedMessageTarget, step: ActionStep, op: () => Promise<T>): Promise<T> {
+    return this.abort.run(step, async () => {
       const lock = await this.client.getMailboxLock(target.folderPath);
       try {
         const mailbox = this.client.mailbox;
@@ -253,7 +253,7 @@ export class MailboxMutator {
   /** STORE +FLAGS on the message's folder by UID. imapflow returns `false` on a
    * server-side STORE failure rather than throwing — we surface that as an error. */
   async addFlags(target: ResolvedMessageTarget, flags: string[]): Promise<boolean> {
-    return this.withUidScope(target, async () => {
+    return this.withUidScope(target, "imap_store", async () => {
       const ok = await this.client.messageFlagsAdd(String(target.uid), flags, { uid: true });
       if (!ok) {
         throw new MailboxMutationError(
@@ -266,7 +266,7 @@ export class MailboxMutator {
 
   /** STORE -FLAGS on the message's folder by UID. */
   async removeFlags(target: ResolvedMessageTarget, flags: string[]): Promise<boolean> {
-    return this.withUidScope(target, async () => {
+    return this.withUidScope(target, "imap_store", async () => {
       const ok = await this.client.messageFlagsRemove(String(target.uid), flags, { uid: true });
       if (!ok) {
         throw new MailboxMutationError(
@@ -302,7 +302,7 @@ export class MailboxMutator {
     const uids = targets.map((target) => target.uid).join(",");
     let removalUnconfirmed = false;
     try {
-      return await this.withUidScope(first, async () => {
+      return await this.withUidScope(first, "imap_move", async () => {
         let result;
         try {
           result = await this.client.messageMove(uids, destination, { uid: true });
@@ -340,7 +340,7 @@ export class MailboxMutator {
         `Hard delete needs the UIDPLUS extension for a UID-scoped EXPUNGE; ${this.host} does not advertise it`
       );
     }
-    return this.withUidScope(target, async () => {
+    return this.withUidScope(target, "imap_expunge", async () => {
       const stored = await this.client.messageFlagsAdd(String(target.uid), [SYSTEM_FLAGS.deleted], { uid: true });
       if (!stored) {
         throw new MailboxMutationError(
@@ -358,17 +358,17 @@ export class MailboxMutator {
   }
 
   async createFolder(path: string): Promise<{ path: string; created: boolean }> {
-    const result = await this.abort.run(() => this.client.mailboxCreate(path));
+    const result = await this.abort.run("imap_folder", () => this.client.mailboxCreate(path));
     return { path: result.path, created: result.created };
   }
 
   async renameFolder(path: string, newPath: string): Promise<{ path: string; newPath: string }> {
-    const result = await this.abort.run(() => this.client.mailboxRename(path, newPath));
+    const result = await this.abort.run("imap_folder", () => this.client.mailboxRename(path, newPath));
     return { path: result.path, newPath: result.newPath };
   }
 
   async deleteFolder(path: string): Promise<{ path: string }> {
-    const result = await this.abort.run(() => this.client.mailboxDelete(path));
+    const result = await this.abort.run("imap_folder", () => this.client.mailboxDelete(path));
     return { path: result.path };
   }
 
@@ -409,6 +409,7 @@ export interface FlagResult {
  * a stale count) — the lag self-heals on the next flag-scan sync.
  */
 async function writeFlagsThrough(
+  onStep: ActionStepTimer | undefined,
   repository: MirrorRepository,
   messageId: string,
   accountId: string,
@@ -416,7 +417,7 @@ async function writeFlagsThrough(
   remove: string[]
 ): Promise<boolean> {
   try {
-    const updated = await repository.applyMessageFlags(messageId, accountId, { add, remove });
+    const updated = await timeStep(onStep, "db_mirror", () => repository.applyMessageFlags(messageId, accountId, { add, remove }));
     if (updated === null) {
       console.warn(JSON.stringify({
         event: "organize.flag_write_through_missing_row",
@@ -458,9 +459,13 @@ function warnWriteThroughFailed(event: string, target: ResolvedMessageTarget, er
  * Tombstone the source row of a provider-confirmed EXPUNGE or Trash move (ADR 0034).
  * The provider action already happened, so a mirror failure only logs.
  */
-async function writeRemovalThrough(repository: MirrorRepository, target: ResolvedMessageTarget): Promise<void> {
+async function writeRemovalThrough(
+  onStep: ActionStepTimer | undefined,
+  repository: MirrorRepository,
+  target: ResolvedMessageTarget
+): Promise<void> {
   try {
-    await repository.markMessageRemovedByProvider(target);
+    await timeStep(onStep, "db_mirror", () => repository.markMessageRemovedByProvider(target));
   } catch (error) {
     warnWriteThroughFailed("organize.removal_write_through_failed", target, error);
   }
@@ -474,6 +479,7 @@ async function writeRemovalThrough(repository: MirrorRepository, target: Resolve
  * mirrors the copy under a new id. Returns whether the id still names the message.
  */
 async function writeMoveThrough(
+  onStep: ActionStepTimer | undefined,
   repository: MirrorRepository,
   target: ResolvedMessageTarget,
   destination: string,
@@ -481,11 +487,14 @@ async function writeMoveThrough(
 ): Promise<boolean> {
   const uid = moved.uidMap?.get(target.uid);
   try {
-    if (uid !== undefined && moved.uidValidity !== null
-      && await repository.relocateMovedMessage(target, { folderPath: destination, uidValidity: moved.uidValidity, uid })) {
-      return true;
-    }
-    await repository.markMessageRemovedByProvider(target);
+    return await timeStep(onStep, "db_mirror", async () => {
+      if (uid !== undefined && moved.uidValidity !== null
+        && await repository.relocateMovedMessage(target, { folderPath: destination, uidValidity: moved.uidValidity, uid })) {
+        return true;
+      }
+      await repository.markMessageRemovedByProvider(target);
+      return false;
+    });
   } catch (error) {
     warnWriteThroughFailed("organize.move_write_through_failed", target, error);
   }
@@ -514,7 +523,7 @@ export async function setMessageFlags(
   throwIfAborted(options.signal);
 
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await timeStep(options.onStep, "db_load", () => loadMessageAndAccount(repository, messageId));
   const target = toTarget(message);
 
   await withInteractiveAccountLock(pool, account, async () => {
@@ -525,8 +534,8 @@ export async function setMessageFlags(
     } finally {
       await closeImap(mutator);
     }
-    await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
-  }, { fenceWrites: true });
+    await writeFlagsThrough(options.onStep, repository, target.messageId, target.accountId, add, remove);
+  }, { fenceWrites: true, onStep: options.onStep });
 
   return { messageId, folderPath: target.folderPath, uid: target.uid, added: add, removed: remove };
 }
@@ -591,7 +600,7 @@ export async function moveMessages(
   const mailboxes = new Map<string, { account: ImapAccount; targets: ResolvedMessageTarget[] }>();
   for (const messageId of new Set(messageIds)) {
     try {
-      const { message, account } = await loadMessageAndAccount(repository, messageId);
+      const { message, account } = await timeStep(options.onStep, "db_load", () => loadMessageAndAccount(repository, messageId));
       const target = toTarget(message);
       // Already there: calling the provider anyway could leave the UID in place, and
       // the write-through would then hide a live row.
@@ -637,7 +646,7 @@ async function moveMailboxTargets(
   }
   try {
     await withInteractiveAccountLock(pool, account, async () => {
-      await repository.markFoldersForReconcile(account.id, [...new Set(targets.map((target) => target.folderPath)), destination]);
+      await timeStep(options.onStep, "db_mirror", () => repository.markFoldersForReconcile(account.id, [...new Set(targets.map((target) => target.folderPath)), destination]));
       const mutator = await MailboxMutator.connect(pool, config, account, options);
       try {
         for (const folder of folders.values()) {
@@ -649,7 +658,7 @@ async function moveMailboxTargets(
             continue;
           }
           for (const target of folder) {
-            const idKept = await writeMoveThrough(repository, target, destination, moved);
+            const idKept = await writeMoveThrough(options.onStep, repository, target, destination, moved);
             const newUid = moved.uidMap?.get(target.uid) ?? null;
             outcomes.set(target.messageId, { messageId: target.messageId, result: moveResult(target, destination, newUid, idKept) });
           }
@@ -657,7 +666,7 @@ async function moveMailboxTargets(
       } finally {
         await closeImap(mutator);
       }
-    }, { fenceWrites: true });
+    }, { fenceWrites: true, onStep: options.onStep });
   } catch (error) {
     for (const target of targets) {
       if (!outcomes.has(target.messageId)) outcomes.set(target.messageId, { messageId: target.messageId, error });
@@ -692,12 +701,12 @@ export async function deleteMessage(
     config,
     options.metadataProtection ?? plaintextMetadataProtection
   );
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await timeStep(options.onStep, "db_load", () => loadMessageAndAccount(repository, messageId));
   return await withInteractiveAccountLock(
     pool,
     account,
     () => deleteLoadedMessage(pool, config, repository, account, toTarget(message), options),
-    { fenceWrites: true }
+    { fenceWrites: true, onStep: options.onStep }
   );
 }
 
@@ -718,7 +727,7 @@ export async function deleteMessageInLock(
     config,
     options.metadataProtection ?? plaintextMetadataProtection
   );
-  const { message, account } = await loadMessageAndAccount(repository, messageId);
+  const { message, account } = await timeStep(options.onStep, "db_load", () => loadMessageAndAccount(repository, messageId));
   return await deleteLoadedMessage(pool, config, repository, account, toTarget(message), options);
 }
 
@@ -741,26 +750,27 @@ async function deleteLoadedMessage(
   try {
     // The changed folders are durably due before the provider command, as for a move.
     if (options.hard) {
-      await repository.markFoldersForReconcile(account.id, [target.folderPath]);
+      await timeStep(options.onStep, "db_mirror", () => repository.markFoldersForReconcile(account.id, [target.folderPath]));
       await mutator.expunge(target);
     } else {
       const profile = getProviderProfile(account.provider_profile);
       const mailboxes = await mutator.list();
       // Resolve Trash via the shared role-keyed resolver: the "trash" role uses its
       // leaf-name fallback and (unlike Sent) ignores the profile (behavior preserved).
-      trashFolder = resolveSpecialUseFolder(mailboxes, "trash", profile);
+      const trash = resolveSpecialUseFolder(mailboxes, "trash", profile);
+      trashFolder = trash;
       // Already in Trash → a non-hard delete is a no-op move onto itself; the
       // message stays where it is, live.
-      if (trashFolder === target.folderPath) {
+      if (trash === target.folderPath) {
         return { messageId, fromFolder: target.folderPath, mode: "trash", trashFolder };
       }
-      await repository.markFoldersForReconcile(account.id, [target.folderPath, trashFolder]);
-      await mutator.move([target], trashFolder);
+      await timeStep(options.onStep, "db_mirror", () => repository.markFoldersForReconcile(account.id, [target.folderPath, trash]));
+      await mutator.move([target], trash);
     }
   } finally {
     if (!options.connection) await closeImap(mutator);
   }
-  await writeRemovalThrough(repository, target);
+  await writeRemovalThrough(options.onStep, repository, target);
   return { messageId, fromFolder: target.folderPath, mode: options.hard ? "expunge" : "trash", trashFolder };
 }
 
@@ -923,8 +933,10 @@ export async function setThreadFlags(
   throwIfAborted(options.signal);
 
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId, metadataProtection);
-  const account = await repository.getAccount(accountId);
+  const { accountId, targets, truncated, account } = await timeStep(options.onStep, "db_load", async () => {
+    const resolved = await resolveThreadTargets(pool, messageId, metadataProtection);
+    return { ...resolved, account: await repository.getAccount(resolved.accountId) };
+  });
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
   // Interleave the mirror write-through INTO the per-member loop: each member's
@@ -940,14 +952,14 @@ export async function setThreadFlags(
       for (const target of targets) {
         if (add.length > 0) await mutator.addFlags(target, add);
         if (remove.length > 0) await mutator.removeFlags(target, remove);
-        const wrote = await writeFlagsThrough(repository, target.messageId, target.accountId, add, remove);
+        const wrote = await writeFlagsThrough(options.onStep, repository, target.messageId, target.accountId, add, remove);
         if (!wrote) mirrorWriteThroughStale += 1;
         appliedIds.push(target.messageId);
       }
     } finally {
       await closeImap(mutator);
     }
-  }, { fenceWrites: true });
+  }, { fenceWrites: true, onStep: options.onStep });
 
   return {
     seedMessageId: messageId,
@@ -988,28 +1000,30 @@ export async function moveThread(
   }
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const { accountId, targets, truncated } = await resolveThreadTargets(pool, messageId, metadataProtection);
-  const account = await repository.getAccount(accountId);
+  const { accountId, targets, truncated, account } = await timeStep(options.onStep, "db_load", async () => {
+    const resolved = await resolveThreadTargets(pool, messageId, metadataProtection);
+    return { ...resolved, account: await repository.getAccount(resolved.accountId) };
+  });
   if (!account) throw new Error(`Account not found for thread ${messageId}: ${accountId}`);
 
   const moved: string[] = [];
   const idsNotKept: string[] = [];
   const sources = new Set(targets.map((target) => target.folderPath).filter((path) => path !== destination));
   await withInteractiveAccountLock(pool, account, async () => {
-    if (sources.size > 0) await repository.markFoldersForReconcile(account.id, [...sources, destination]);
+    if (sources.size > 0) await timeStep(options.onStep, "db_mirror", () => repository.markFoldersForReconcile(account.id, [...sources, destination]));
     const mutator = await MailboxMutator.connect(pool, config, account, options);
     try {
       for (const target of targets) {
         if (target.folderPath === destination) continue;
         const location = await mutator.move([target], destination);
         // Per member, so a later member's failure keeps every earlier write.
-        if (!await writeMoveThrough(repository, target, destination, location)) idsNotKept.push(target.messageId);
+        if (!await writeMoveThrough(options.onStep, repository, target, destination, location)) idsNotKept.push(target.messageId);
         moved.push(target.messageId);
       }
     } finally {
       await closeImap(mutator);
     }
-  }, { fenceWrites: true });
+  }, { fenceWrites: true, onStep: options.onStep });
 
   return {
     seedMessageId: messageId,
@@ -1043,20 +1057,20 @@ export async function createFolder(
   if (!path || path.trim().length === 0) throw new Error("createFolder requires a non-empty path");
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await repository.getAccount(accountId);
+  const account = await timeStep(options.onStep, "db_load", () => repository.getAccount(accountId));
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
   return await withInteractiveAccountLock(pool, account, async () => {
     // A folder change never reuses a parked session (ADR 0051): ImapFlow sends
     // CLOSE before renaming or deleting a selected folder, and CLOSE expunges.
-    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
+    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal, onStep: options.onStep });
     try {
       const result = await mutator.createFolder(path);
       return { accountId, path: result.path, created: result.created };
     } finally {
       await closeImap(mutator);
     }
-  });
+  }, { onStep: options.onStep });
 }
 
 export async function renameFolder(
@@ -1071,20 +1085,20 @@ export async function renameFolder(
   if (!path || !newPath) throw new Error("renameFolder requires both path and newPath");
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await repository.getAccount(accountId);
+  const account = await timeStep(options.onStep, "db_load", () => repository.getAccount(accountId));
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
   return await withInteractiveAccountLock(pool, account, async () => {
     // A folder change never reuses a parked session (ADR 0051): ImapFlow sends
     // CLOSE before renaming or deleting a selected folder, and CLOSE expunges.
-    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
+    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal, onStep: options.onStep });
     try {
       const result = await mutator.renameFolder(path, newPath);
       return { accountId, path: result.path, newPath: result.newPath };
     } finally {
       await closeImap(mutator);
     }
-  });
+  }, { onStep: options.onStep });
 }
 
 export async function deleteFolder(
@@ -1098,18 +1112,18 @@ export async function deleteFolder(
   if (!path || path.trim().length === 0) throw new Error("deleteFolder requires a non-empty path");
   throwIfAborted(options.signal);
   const repository = new MirrorRepository(pool, config, metadataProtection);
-  const account = await repository.getAccount(accountId);
+  const account = await timeStep(options.onStep, "db_load", () => repository.getAccount(accountId));
   if (!account) throw new Error(`Account not found: ${accountId}`);
 
   return await withInteractiveAccountLock(pool, account, async () => {
     // A folder change never reuses a parked session (ADR 0051): ImapFlow sends
     // CLOSE before renaming or deleting a selected folder, and CLOSE expunges.
-    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal });
+    const mutator = await MailboxMutator.connect(pool, config, account, { signal: options.signal, onStep: options.onStep });
     try {
       const result = await mutator.deleteFolder(path);
       return { accountId, path: result.path };
     } finally {
       await closeImap(mutator);
     }
-  });
+  }, { onStep: options.onStep });
 }
